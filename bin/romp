@@ -1041,6 +1041,7 @@ resume_id=""
 detach=false
 dir_arg=""
 use_tmux=false
+use_codex=false
 
 case "${1:-}" in
     new)
@@ -1048,21 +1049,25 @@ case "${1:-}" in
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 -t|--tmux) use_tmux=true; shift ;;
+                --codex)   use_codex=true; shift ;;   # an OpenAI Codex session (docs/codex.md)
                 --detach)  detach=true; shift ;;
                 -d)        shift
                            if [[ $# -eq 0 || "$1" == -* ]]; then
-                               echo "usage: romp new [-t] [-d <dir>] <name>" >&2; exit 2
+                               echo "usage: romp new [-t|--codex] [-d <dir>] <name>" >&2; exit 2
                            fi
                            dir_arg="$1"; shift ;;
                 -*)        echo "romp new: unknown option: $1" >&2; exit 2 ;;
                 *)         if [[ -n "$session_arg" ]]; then
-                               echo "usage: romp new [-t] [-d <dir>] <name>" >&2; exit 2
+                               echo "usage: romp new [-t|--codex] [-d <dir>] <name>" >&2; exit 2
                            fi
                            session_arg="$1"; shift ;;
             esac
         done
         if [[ -z "$session_arg" ]]; then
-            echo "usage: romp new [-t] [-d <dir>] <name>" >&2; exit 2
+            echo "usage: romp new [-t|--codex] [-d <dir>] <name>" >&2; exit 2
+        fi
+        if $use_tmux && $use_codex; then
+            echo "romp new: --codex and -t are different session kinds — pick one" >&2; exit 2
         fi
         ;;
     resume|--resume)
@@ -1137,11 +1142,12 @@ if [[ -n "$session_arg" ]] && ! $use_tmux && ! $resume; then
     _tok="$(_romp_token)"
     _kport="${ROMP_KERNEL_PORT:-29855}"
     _dir="${dir_arg:-$PWD}"
+    _be="sdk"; $use_codex && _be="codex"
     if [[ -z "$_tok" ]]; then
         echo "romp new: the kernel isn't running (no serve token). Start romp (the login service, or \`romp up\`), or use \`romp new -t $session_arg\` for a terminal session." >&2
         exit 1
     fi
-    _payload="$(python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "dir": sys.argv[2], "backend": "sdk"}))' "$session_arg" "$_dir")"
+    _payload="$(python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "dir": sys.argv[2], "backend": sys.argv[3]}))' "$session_arg" "$_dir" "$_be")"
     _resp="$(curl -sf -m 15 -X POST "http://127.0.0.1:$_kport/new" \
                   -H "X-Romp-Token: $_tok" \
                   -H 'Content-Type: application/json' -d "$_payload")" \
@@ -1150,7 +1156,8 @@ if [[ -n "$session_arg" ]] && ! $use_tmux && ! $resume; then
         if [[ "$_resp" == *'"existing"'* ]]; then
             echo "romp new: \"$session_arg\" is already running; see the dashboard (romp)"
         else
-            echo "romp new: started \"$session_arg\" (SDK session, working in $_dir)"
+            _kind="SDK"; $use_codex && _kind="Codex"
+            echo "romp new: started \"$session_arg\" ($_kind session, working in $_dir)"
             echo "romp new: watch it on the dashboard: romp"
         fi
         exit 0

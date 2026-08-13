@@ -22719,7 +22719,17 @@ class Handler(BaseHTTPRequestHandler):
                 if nm in live:
                     return self._send(200, json.dumps({"ok": True, "id": live[nm], "existing": True}),
                                       "application/json")
-                if (b.get("backend") or "sdk") == "sdk":
+                be_req = (b.get("backend") or "sdk")
+                if be_req == "codex":             # parity with the WS op: same gate, same loud refusal
+                    if not _codex_ready():
+                        cxbe = _codex()
+                        why = (getattr(cxbe, "_client_err", "") or CODEX_SETUP_HINT) if cxbe else CODEX_SETUP_HINT
+                        return self._send(200, json.dumps({"ok": False, "error": why}),
+                                          "application/json")
+                    sid = _create_codex_session(nm, cwd)
+                    return self._send(200, json.dumps({"ok": True, "id": sid, "dir": cwd}),
+                                      "application/json")
+                if be_req == "sdk":
                     if not _sdk_ready():          # see _sdk_ready — a built backend is not a working one
                         return self._send(200, json.dumps({"ok": False, "error": SDK_SETUP_HINT}),
                                           "application/json")
