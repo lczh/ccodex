@@ -50,13 +50,21 @@ and **materializes them as the session's JSONL on disk**, at
 
 ## Verified mechanics
 
-Probed against **CLI 0.147.0** (`codex app-server --help`, subcommands incl.
-`generate-json-schema`) and the **generated protocol bindings** shipped in
-`openai-codex` 0.144.4 (`openai_codex/generated/v2_all.py` +
+Probed against **CLI 0.147.0** and the **generated protocol bindings** shipped
+in `openai-codex` 0.144.4 (`openai_codex/generated/v2_all.py` +
 `notification_registry.py`) — the bindings are generated from the server's own
-schema, so field names below are wire-exact. **Not yet probed live**: turns
-need an OpenAI login (`codex login`) this machine doesn't have; the live smoke
-test is the one step blocked on the user.
+schema, so field names below are wire-exact.
+
+**Live-verified against the running app-server (2026-08-13, no login):**
+`CodexClient.start()` + `initialize` handshake (SDK 0.144.4 ↔ CLI 0.147.0),
+`account_read` on a login-less box returns exactly the auth-gate signature the
+backend keys on (`requiresOpenaiAuth: true`, `account: null`), `model_list`
+works unauthenticated (gpt-5.6-sol/terra/luna, 5.5, 5.2), and `thread_start`
+accepts this plan's param spelling verbatim (`{"cwd", "approvalPolicy":
+"never", "sandbox": "workspace-write"}`) and mints a UUIDv7 thread id with the
+default model. **Still pending login** (`codex login` — the one user-provided
+step): a real turn's notification stream end-to-end (turn_start → items →
+tokenUsage → completed), steer, and interrupt.
 
 - **Client**: `CodexClient` — `thread_start/resume/fork/list/read/set_name/
   compact`, `turn_start(thread_id, input, params)`, `turn_interrupt(thread_id,
