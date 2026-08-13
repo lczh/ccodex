@@ -64,6 +64,7 @@ nav:
   - Overview: index.md
   - Install: install.md
   - Guide: guide.md
+  - Codex sessions: codex.md
   - Reference: reference.md
   - Internals:
       - How Romp works: architecture.md
