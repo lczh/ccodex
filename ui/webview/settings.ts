@@ -13,7 +13,7 @@ export interface RompSettings {
   showIndexJudges: boolean;
   showTriageJudges: boolean;
   debug?: boolean;    // LEGACY (the user 2026-06-17): the old single judging-band toggle; read as the migration fallback for the two judge-set toggles when those are unset. The ↻ restart button is always-visible (decoupled).
-  backend: "tmux" | "sdk";   // which backend a NEWLY-created session uses (the user 2026-06-22): "tmux" (terminal) or "sdk" (Agent SDK). Both coexist; this is only the default for the + button. Read at createSession time (render.ts). Default sdk (the user 2026-07-13).
+  backend: "tmux" | "sdk" | "codex";   // which backend a NEWLY-created session uses (the user 2026-06-22): "tmux" (terminal), "sdk" (Agent SDK) or "codex" (OpenAI Codex, plans/codex-backend.md). All coexist; this is only the default for the + button. Read at createSession time (render.ts). Default sdk (the user 2026-07-13).
   defaultDir: string;        // default working directory PREFILLED in the new-session field (the user 2026-06-22). A session's dir is fixed at creation. Empty → the kernel's serve dir. ~ / $VAR expanded server-side.
   showBranch: boolean;       // chat bottom-bar: show the session's git branch (if any) beside the dir (the user 2026-06-23). OFF by default (the user 2026-08-10, trimming the statusline for narrow panes; an explicit stored true keeps showing it).
   tabCtx: TabCtxMode;        // chat tabs: WHEN the context gauge shows beside each session name (the user 2026-08-08) — "over50" (default: only once half full, so quiet tabs stay clean), "always", or "never".

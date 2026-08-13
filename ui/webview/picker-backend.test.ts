@@ -8,10 +8,11 @@ import * as path from "node:path";
 const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
 const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "styles.css"), "utf8");
 
-test("the + dialog builds a tmux | SDK backend toggle, hidden in pick-mode", () => {
+test("the + dialog builds a SDK | tmux | Codex backend toggle, hidden in pick-mode", () => {
   assert.match(RENDER, /const beWrap = el\("div", "picker-backend"\)/);
   assert.match(RENDER, /mkBe\("tmux", "tmux"/);
   assert.match(RENDER, /mkBe\("sdk", "SDK"/);
+  assert.match(RENDER, /mkBe\("codex", "Codex"/);
   assert.match(RENDER, /box\.appendChild\(beWrap\)/);
   // hidden + reset to the gear default each open (overridable for this session)
   assert.match(RENDER, /beWrapEl\.style\.display = pick \? "none" : ""/);

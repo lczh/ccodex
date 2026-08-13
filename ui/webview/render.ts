@@ -3391,7 +3391,7 @@ function showTabTip(tab: HTMLElement, s: Session): void {
   if (s.status.effort) rows.push(["Effort", s.status.effort]);
   // Backend is a plain labelled FIELD now, under the others (the user 2026-07-08 — no longer a coloured
   // "SDK backend" badge at the top of the tooltip; it reads as one of the session's config fields).
-  if (be === "sdk" || be === "tmux") rows.push(["Backend", be === "sdk" ? "SDK" : "tmux"]);
+  if (be === "sdk" || be === "tmux" || be === "codex") rows.push(["Backend", be === "sdk" ? "SDK" : be === "codex" ? "Codex" : "tmux"]);
   // Billing: whether this tab bills the API key or the Claude login — and WHICH login account (the
   // user 2026-08-09: shown whenever the backend reports it, one-auth machines included; only a tmux
   // session, whose CLI env romp does not control, reports nothing). No key material, ever.
@@ -4736,7 +4736,8 @@ function openPicker(pick = false, prompt?: string, allowNew = false) {
       return b;
     };
     beWrap.append(beLabel, mkBe("sdk", "SDK", "Runs via the Claude Agent SDK."),   // not "headless" — same full chat UI (the user 2026-07-12)
-                  mkBe("tmux", "tmux", "Drives a real terminal pane (tmux)."));   // SDK first — the de-facto default (the user 2026-07-02)
+                  mkBe("tmux", "tmux", "Drives a real terminal pane (tmux)."),   // SDK first — the de-facto default (the user 2026-07-02)
+                  mkBe("codex", "Codex", "Runs an OpenAI Codex agent (the host needs romp-codex-setup + codex login)."));
     // the billing row exists only for SDK sessions — re-decide on every backend toggle
     beWrap.addEventListener("click", () => syncPickerAuth());
     // per-session BILLING row (the user 2026-08-08): Login | API key buttons when the selected host

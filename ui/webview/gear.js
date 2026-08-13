@@ -63,10 +63,10 @@ var GEAR_HTML =
   '<option value=ask>Check and ask</option><option value=auto>Install automatically</option><option value=off>Off</option>' +
   '</select></span></div>' +
   "<div class='rs-row rs-sep' style='cursor:default'><span style='flex:1 1 auto'><b>Default backend</b>" +
-  '<span class=rs-sub>What the + button uses for a NEW session — tmux drives a terminal pane; SDK runs via the Agent SDK. Both kinds run side by side; this only sets the default.</span>' +
+  '<span class=rs-sub>What the + button uses for a NEW session — tmux drives a terminal pane; SDK runs via the Agent SDK; Codex runs an OpenAI Codex agent. All kinds run side by side; this only sets the default.</span>' +
   "<select id=rs-backend style='margin-top:5px;width:100%;background:#1e1e1e;color:#ccc;" +
   "border:1px solid #3a3a3a;border-radius:5px;padding:3px 4px;cursor:pointer'>" +
-  '<option value=sdk>SDK</option><option value=tmux>tmux (terminal)</option>' +
+  '<option value=sdk>SDK</option><option value=tmux>tmux (terminal)</option><option value=codex>Codex</option>' +
   '</select></span></div>' +
   '<div class=rs-sec>Judges</div>' +
   "<div class='rs-row rs-jrow'><b>Triage model</b><span class=rs-sub>The model the triage judges use — planner, grouper, closer, distiller, courier (the judgment-heavy tier). Applies on the judges' next pass; no restart. A pick here follows to every connected machine's kernel.</span><select id=rs-judgemodel></select></div>" +
