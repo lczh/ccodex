@@ -53,8 +53,10 @@ export function provenanceRows(it: ProvItem, now: number, f: ProvFmt): ProvRow[]
     const rt = r.at || r.evT || 0;
     if (rt) rows.push({ when: stamp(rt, now, f), what: f.phrase(r), t: rt, kind: "event" });
   }
-  // sub-items in mint order: a resolved sub is stamped when it RESOLVED (mt — where it landed), an
-  // open one when it was minted (its resolution hasn't happened yet)
+  // sub-items: a resolved sub is stamped when it RESOLVED (mt — where it landed), an open one when it
+  // was minted (its resolution hasn't happened yet). The kernel ships the tree newest-subtree-activity
+  // FIRST (flatten's _fsubmax sort, for the ledger views) — the slice keeps that "8 most recent"
+  // selection; the sort below puts what's KEPT back on the clock.
   const subs = it.tree.filter((n) => n.id !== it.itemId && !n.cleared);
   for (const n of subs.slice(0, SUB_CAP)) {
     const mark = n.status === "done" ? "✓" : n.status === "question" ? "⏸" : "·";
@@ -62,6 +64,11 @@ export function provenanceRows(it: ProvItem, now: number, f: ProvFmt): ProvRow[]
     const txt = n.text.length > 48 ? n.text.slice(0, 47) + "…" : n.text;
     rows.push({ when: stamp(at, now, f), what: mark + " " + txt, t: at, kind: "sub" });
   }
+  // ONE story, ONE clock (the user 2026-08-13, who read the popover as shuffled): the root log runs
+  // ascending while the tree ships newest-first, so the sections read in opposite directions — strict
+  // chronological interleave, before the t:0 remainder and the pinned stamp join. The sort is stable,
+  // so equal-t rows keep their event-before-sub order.
+  rows.sort((a, b) => a.t - b.t);
   if (subs.length > SUB_CAP) rows.push({ when: "", what: "…and " + (subs.length - SUB_CAP) + " more", t: 0, kind: "more" });
   rows.push({ when: stamp(it.t, now, f), what: stampWhat(it.column), t: it.t, kind: "stamp" });
   return rows;

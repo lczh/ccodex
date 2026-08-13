@@ -229,6 +229,10 @@ def _block_to_dict(b):
 # UserMessages wrapped in these markers, and the LIVE atom must classify them exactly like the file
 # adapter classifies the matching transcript records.
 _COMMAND_NAME_RE = re.compile(r"^\s*<command-name>([^<]*)</command-name>")
+# …and the tag ANYWHERE inside a wrapper record (the event model's COMMAND_NAME_ANY_RE twin): a SKILL /
+# custom command writes <command-message> first, so the anchored form missed it and the live stream
+# swallowed the invocation as wrapper noise (2026-08-13 — the same shape the file adapter fixed 2026-07-22).
+_COMMAND_NAME_ANY_RE = re.compile(r"<command-name>([^<]*)</command-name>")
 _COMMAND_ARGS_RE = re.compile(r"<command-args>([\s\S]*?)</command-args>")
 _LOCAL_STDOUT_RE = re.compile(r"^\s*<local-command-stdout>([\s\S]*?)</local-command-stdout>")
 _CMD_WRAP_RE = re.compile(r"^\s*<(?:command-(?:name|message|args|contents)|local-command-(?:stdout|caveat))>")
@@ -298,7 +302,8 @@ def msg_to_atom(msg, sid, fsid, t, skill_tool_ids=()):
             return None
         text = " ".join(b.get("text", "") for b in content
                         if isinstance(b, dict) and b.get("type") == "text")
-        mcmd = _COMMAND_NAME_RE.match(text)
+        mcmd = _COMMAND_NAME_RE.match(text) or (_COMMAND_NAME_ANY_RE.search(text)
+                                                if _CMD_WRAP_RE.match(text) else None)
         if mcmd:                                     # the command INVOCATION → the command-flagged user atom
             name = mcmd.group(1).strip() or "/?"
             if not name.startswith("/"):
@@ -2637,6 +2642,14 @@ class SdkSession:
                 #   ready the moment it can take a message instead of wearing the opening dots until
                 #   its first turn writes a transcript (the user 2026-08-08, whose fresh session sat
                 #   on animated dots for minutes while fully up)
+                "spawning": not self.client,   # the spawn/handshake window is open RIGHT NOW (this
+                #   thread is up, the client isn't yet) — the ONLY window the kernel's opening chip
+                #   may cover. Its ABSENCE must mean "not opening": the chip once keyed on `connected`
+                #   being falsy, which a DORMANT created session also reports (a kernel restart kills
+                #   idle CLIs, boot reconcile leaves them lazy, and a never-messaged session has no
+                #   transcript either) — so the dots outlived the create by hours when one message
+                #   would wake it in seconds (the user 2026-08-13). Dormant rows carry no spawning
+                #   key at all, so they read ready.
                 "fast": self.fast,   # fast-mode state from init ("on"/"off"/"cooldown"; "" = unknown → no badge)
                 "fastReason": self.fast_reason,   # init's disabled_reason — non-empty hides the chat toggle
                 "retryCount": self.retry_count,   # api_retry backoff attempts in the current storm → the live 'attempt N' in the chat's retrying element

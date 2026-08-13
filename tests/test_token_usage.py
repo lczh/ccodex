@@ -57,44 +57,73 @@ class SessionTokens(unittest.TestCase):
                          {"in": 0, "out": 0, "cache_w": 0, "cache_r": 0})
 
 
-class TokenWindows(unittest.TestCase):
-    """_token_windows splits sessions + the judge pipeline across the two Claude meters (5h / 7d),
-    each windowed independently. _judge_usage reads jd.STATE, so point it at a temp dir."""
+class JudgeUsageIncrementalCache(unittest.TestCase):
+    """_judge_usage_rows (2026-08-13): the append-only, never-rotated judge-usage.jsonl used to be
+    re-read and re-parsed IN FULL by both the analytics modal and every timeline build (38.7 MB
+    measured) — the term that froze the dashboard as the log grew. Rows now parse once, appends parse
+    from the last byte offset, and the cache is keyed on the PATH too (a test repointing jd.STATE must
+    never inherit another dir's offset — the overrides-sandbox lesson)."""
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
         self.saved = jd.STATE
         jd.STATE = pathlib.Path(self.td.name)
+        km._JUDGE_USAGE_CACHE.update(path=None, size=-1, mtime=0.0, rows=[])
 
     def tearDown(self):
         jd.STATE = self.saved
+        km._JUDGE_USAGE_CACHE.update(path=None, size=-1, mtime=0.0, rows=[])
         self.td.cleanup()
 
-    def test_splits_sessions_and_pipeline_by_5h_and_week(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, dir=self.td.name) as f:
-            f.write(_asst({"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 5000}, iso(NOW - 3600)) + "\n")  # in 5h
-            f.write(_asst({"input_tokens": 40, "output_tokens": 10}, iso(NOW - 3 * 86400)) + "\n")    # in week, not 5h
-            f.write(_asst({"input_tokens": 999, "output_tokens": 999}, iso(NOW - 30 * 86400)) + "\n")  # older than a week
-            path = f.name
-        (jd.STATE / "judge-usage.jsonl").write_text("\n".join(json.dumps(r) for r in [
-            {"t": NOW - 1800, "judge": "captioner", "tier": "index", "in": 10, "out": 5, "cost": 0.01, "ms": 100},
-            {"t": NOW - 2 * 86400, "judge": "planner", "tier": "triage", "in": 70, "out": 30, "cost": 0.2, "ms": 200},
-            {"t": NOW - 20 * 86400, "judge": "planner", "tier": "triage", "in": 9, "out": 9, "cost": 9, "ms": 9},
-        ]) + "\n")
-        tk = km._token_windows([path], NOW)
-        # 5h: only the first transcript msg + the first judge call
-        self.assertEqual(tk["fiveHour"]["sessions"], {"in": 100, "out": 20, "cache_r": 5000})
-        self.assertEqual(tk["fiveHour"]["pipeline"]["total"]["in"], 10)
-        self.assertEqual(tk["fiveHour"]["pipeline"]["total"]["calls"], 1)
-        # week: first two transcript msgs + first two judge calls (the >week rows drop)
-        self.assertEqual(tk["week"]["sessions"], {"in": 140, "out": 30, "cache_r": 5000})
-        self.assertEqual(tk["week"]["pipeline"]["total"]["in"], 80)
-        self.assertEqual(tk["week"]["pipeline"]["total"]["calls"], 2)
-        self.assertEqual(tk["windows"], {"fiveHour": km.WIN_5H, "week": km.WIN_WEEK})
+    def _row(self, t, judge="captioner", **kw):
+        return json.dumps({"t": t, "judge": judge, "tier": kw.get("tier", "index"),
+                           "in": kw.get("i", 10), "out": kw.get("o", 5),
+                           "cost": kw.get("cost", 0.01), "ms": 100})
 
-    def test_no_paths_no_log_is_zero_but_shaped(self):
-        tk = km._token_windows([], NOW)
-        self.assertEqual(tk["fiveHour"]["sessions"], {"in": 0, "out": 0, "cache_r": 0})
-        self.assertEqual(tk["week"]["pipeline"]["total"]["calls"], 0)
+    def test_appends_parse_incrementally_and_rollup_reads_the_cache(self):
+        p = jd.STATE / "judge-usage.jsonl"
+        p.write_text(self._row(NOW - 1800) + "\n")
+        self.assertEqual(len(km._judge_usage_rows()), 1)
+        u = km._judge_usage(NOW - 3600)
+        self.assertEqual(u["total"]["calls"], 1)
+        with p.open("a") as fh:                          # an append parses from the offset, not from zero
+            fh.write(self._row(NOW - 600, judge="planner", tier="triage", i=70, o=30) + "\n")
+        rows = km._judge_usage_rows()
+        self.assertEqual(len(rows), 2)
+        u = km._judge_usage(NOW - 3600)
+        self.assertEqual(u["total"]["calls"], 2)
+        self.assertEqual(u["byJudge"]["planner"]["in"], 70)
+
+    def test_a_mid_append_partial_line_waits_for_its_newline(self):
+        p = jd.STATE / "judge-usage.jsonl"
+        p.write_text(self._row(NOW - 1800) + "\n")
+        self.assertEqual(len(km._judge_usage_rows()), 1)
+        with p.open("a") as fh:
+            fh.write('{"t": ')                           # the writer is mid-append
+        self.assertEqual(len(km._judge_usage_rows()), 1, "the fragment is left for the next read")
+        with p.open("a") as fh:
+            fh.write(str(NOW - 60) + ', "judge": "closer", "in": 1, "out": 1, "cost": 0, "ms": 1}\n')
+        self.assertEqual(len(km._judge_usage_rows()), 2, "…and picked up whole once complete")
+
+    def test_repointing_state_never_inherits_an_offset(self):
+        (jd.STATE / "judge-usage.jsonl").write_text(self._row(NOW - 1800) + "\n")
+        self.assertEqual(len(km._judge_usage_rows()), 1)
+        td2 = tempfile.TemporaryDirectory()
+        try:
+            jd.STATE = pathlib.Path(td2.name)            # a different state dir (the sandbox trap)
+            (jd.STATE / "judge-usage.jsonl").write_text(
+                self._row(NOW - 300, judge="grouper") + "\n")
+            rows = km._judge_usage_rows()
+            self.assertEqual([r["judge"] for r in rows], ["grouper"], "fresh path → fresh parse")
+        finally:
+            jd.STATE = pathlib.Path(self.td.name)
+            td2.cleanup()
+
+    def test_truncation_resets_cleanly(self):
+        p = jd.STATE / "judge-usage.jsonl"
+        p.write_text(self._row(NOW - 1800) + "\n" + self._row(NOW - 900) + "\n")
+        self.assertEqual(len(km._judge_usage_rows()), 2)
+        p.write_text(self._row(NOW - 60) + "\n")         # rotated/truncated
+        self.assertEqual(len(km._judge_usage_rows()), 1)
 
 
 class JudgeUsageRollup(unittest.TestCase):
@@ -205,6 +234,8 @@ class TokenAnalytics(unittest.TestCase):
         jd.STATE = pathlib.Path(self.td.name)
         km.PRICE_CONFIG = pathlib.Path(self.td.name) / "no-prices.json"   # nonexistent → defaults only
         km._refresh_remote_prices = lambda now: None                     # no network in tests
+        km._ANALYTICS_MEMO.clear()                                       # the TTL memo must not leak across tests
+        km._JUDGE_USAGE_CACHE.update(path=None, size=-1, mtime=0.0, rows=[])
 
     def tearDown(self):
         jd.STATE, jd.discover = self.saved_state, self.saved_discover
@@ -217,7 +248,7 @@ class TokenAnalytics(unittest.TestCase):
                       _asst({"input_tokens": 999, "output_tokens": 999}, iso(NOW - 99999)) + "\n")     # outside → dropped
         p2 = pathlib.Path(self.td.name) / "s2.jsonl"
         p2.write_text(_asst({"input_tokens": 30, "output_tokens": 8}, iso(NOW - 600)) + "\n")
-        jd.discover = lambda now: [("fs1", p1, "a1", "s1"), ("fs2", p2, "a2", "s2")]
+        jd.discover = lambda now, window=None, forks=True: [("fs1", p1, "a1", "s1"), ("fs2", p2, "a2", "s2")]
         (jd.STATE / "judge-usage.jsonl").write_text("\n".join(json.dumps(r) for r in [
             {"t": NOW - 900, "judge": "captioner", "tier": "index", "in": 10, "out": 4, "cost": 0.01, "ms": 50},
             {"t": NOW - 800, "judge": "archiver", "tier": "index", "in": 6, "out": 2, "cost": 0.01, "ms": 40},
@@ -234,7 +265,7 @@ class TokenAnalytics(unittest.TestCase):
         self.assertEqual(a["judges"]["byTier"]["triage"]["in"], 70)
 
     def test_empty_fleet_and_no_log_is_zero_but_shaped(self):
-        jd.discover = lambda now: []
+        jd.discover = lambda now, window=None, forks=True: []
         a = km._token_analytics(NOW, 86400)
         self.assertEqual((a["sessions"]["in"], a["sessions"]["out"], a["sessions"]["cost"]), (0, 0, 0.0))
         self.assertEqual(a["judges"]["total"]["calls"], 0)
@@ -254,6 +285,8 @@ class CostWeighting(unittest.TestCase):
         km._refresh_remote_prices = lambda now: None      # no network in tests → defaults/config only
         km._price_cache["remote"] = {}
         jd.STATE = pathlib.Path(self.td.name)
+        km._ANALYTICS_MEMO.clear()                        # the TTL memo must not leak across tests
+        km._JUDGE_USAGE_CACHE.update(path=None, size=-1, mtime=0.0, rows=[])
 
     def tearDown(self):
         km.PRICE_CONFIG, km._refresh_remote_prices = self.saved_cfg, self.saved_refresh
@@ -316,7 +349,7 @@ class CostWeighting(unittest.TestCase):
         p1 = pathlib.Path(self.td.name) / "s1.jsonl"
         p1.write_text(_asst({"input_tokens": 1000, "output_tokens": 200, "cache_read_input_tokens": 100000},
                             iso(NOW - 600), model="claude-opus-4-8") + "\n")
-        jd.discover = lambda now: [("fs1", p1, "a", "s1")]
+        jd.discover = lambda now, window=None, forks=True: [("fs1", p1, "a", "s1")]
         (jd.STATE / "judge-usage.jsonl").write_text(json.dumps(
             {"t": NOW - 500, "judge": "captioner", "tier": "index", "in": 10, "out": 4,
              "cost": 0.0123, "ms": 50}) + "\n")

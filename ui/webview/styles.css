@@ -1164,16 +1164,15 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
 }
 .slash-cmd-args { margin-left: 7px; }
 /* A slash COMMAND turn is a user GESTURE, not a message (the user 2026-08-13): it changes something
-   rather than saying something — so it sheds the blue bubble and reads in the system-event family
-   (the ✦ dividers): a dim, left-aligned, full-width row with the ✦ mark, the mono chip, the args. */
-.turn-user.turn-cmd:not(.injected) { align-items: flex-start; }
+   rather than saying something — so it sheds the blue bubble for the ✦ + mono-chip dress, but stays on
+   the USER's side of the chat (the user 2026-08-13, round 2: it is still something they did, so it sits
+   where their messages sit — right-aligned, riding .turn-user's own flex-end). */
 .user-bubble.cmd-row { max-width: none; background: none; border: none; border-radius: 0;
   padding: 2px 0; color: var(--dim); }
 .user-bubble.cmd-row::before { content: "✦"; margin-right: 8px; color: var(--dim); }
 .user-bubble.cmd-row .slash-cmd-chip { background: var(--code-bg); color: var(--fg);
   border-color: var(--box-border); }
 .user-bubble.cmd-row .slash-cmd-args { color: var(--dim); }
-.turn-cmd .msg-acts { align-self: flex-start; }   /* the hover actions follow the row to the left */
 /* ---------- romp-injected message (a feed nudge / follow-up) ----------
    A GRAY bubble in the SAME right-aligned spot as the blue user bubble (so it sits where "an outgoing
    message" goes), but clearly NOT you — gray, with a small "↯ romp" tag above it (the user 2026-06-19).
@@ -1201,6 +1200,14 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
 .romp-bubble .nudge-full { display: none; }
 .romp-bubble.expanded .nudge-full { display: block; }
 .romp-bubble.expanded .nudge-gist { display: none; }
+/* The Continue button's reply wears the SAME fold in the USER family (the user 2026-08-13): your
+   gesture in your colour — blue, judge-filed as your reply — but not your prose, so the gist speaks
+   and the canned words sit one click deeper. White-on-blue, not the dim gray of romp bookkeeping. */
+.user-bubble.nudge-collapsible { cursor: pointer; }
+.user-bubble .nudge-gist, .user-bubble .nudge-caret { color: rgba(255, 255, 255, 0.92); }
+.user-bubble .nudge-full { display: none; }
+.user-bubble.expanded .nudge-full { display: block; }
+.user-bubble.expanded .nudge-gist { display: none; }
 /* QUEUED: the user's messages submitted while the session is still working — pending,
    not yet a turn. Right-aligned like his sent bubbles, but faint + dashed to read
    as "waiting", with a header count. (Mirrors the queue Claude Code shows.) */

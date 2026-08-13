@@ -93,11 +93,21 @@ class OpeningChipStandsDownOnTheBackendEvent(_Base):
 
     def test_sdk_pre_handshake_reads_opening(self):
         # SDK snapshots carry a non-empty state from birth ("waiting"), so the state leg must not
-        # stand the override down for them — only the handshake does
-        self.assertEqual(self._chip(_row(state="waiting", backend="sdk", connected=False)), "opening")
+        # stand the override down for them — the chip covers the backend's live spawn window
+        # (`spawning`: thread up, client not yet), which the handshake closes
+        self.assertEqual(self._chip(_row(state="waiting", backend="sdk", connected=False,
+                                         spawning=True)), "opening")
 
     def test_sdk_handshake_ends_opening(self):
         self.assertEqual(self._chip(_row(state="waiting", backend="sdk", connected=True)), "ready")
+
+    def test_sdk_dormant_created_session_reads_ready(self):
+        # No spawn in flight and no connected flag — the dormant row every created-but-unmessaged
+        # SDK session reports after a kernel restart (idle CLIs die with the kernel, boot reconcile
+        # leaves them lazy, the transcript only lands with the first turn). Reading the missing
+        # `connected` as "still opening" wore the dots for hours (the user 2026-08-13); a send
+        # wakes a dormant session in seconds, so it is READY.
+        self.assertEqual(self._chip(_row(state="waiting", backend="sdk", connected=False)), "ready")
 
 
 class PushSessionNow(_Base):

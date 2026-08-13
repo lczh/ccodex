@@ -159,27 +159,34 @@ test("both bundles init the strip; the web pages never opt in", () => {
 });
 
 // ── the API spend CELL (the user 2026-08-11): the rail moved key spend to one compact cell — "API",
-// then the 5-hour burn and the month-to-date as designator → dollars·tokens pairs, no bars — and the
-// strip must mirror it. Spend-as-rows was the old grammar; on a key-billed machine it read as broken.
-test("apiCell arms on the spend windows' presence and carries the 5-hour burn + month-to-date", () => {
+// then designator → dollars·tokens pairs, no bars — and the strip must mirror it. Pay-per-token wears
+// calendar-ish windows (the user 2026-08-13): 1 day + 1 month on the cell, 1 week in the hover.
+test("apiCell arms on the spend windows' presence and carries 1 day + 1 month", () => {
   const cell = apiCell({ spend: {
-    fiveHour: { usd: 12.34, tok: 3_456_000, turns: 5 },
-    sevenDay: { usd: 40.2, tok: 9_000_000, turns: 21 },
+    day: { usd: 12.34, tok: 3_456_000, turns: 5 },
+    week: { usd: 40.2, tok: 9_000_000, turns: 21 },
     month: { usd: 87.9, tok: 20_500_000, turns: 60 },
   } });
   assert.ok(cell);
   assert.deepEqual(cell!.segs.map((s) => [s.key, s.label, s.short]),
-    [["fiveHour", "5 hours", "5h"], ["month", "Month", "mo"]],
-    "the collapsed cell shows 5h + month only — 7 days lives in the hover");
+    [["day", "1 day", "1d"], ["month", "1 month", "1mo"]],
+    "the collapsed cell shows 1 day + 1 month only — 1 week lives in the hover");
   assert.deepEqual(cell!.segs.map((s) => fmtUsd(s.usd)), ["$12", "$88"], "whole dollars, no cents");
   assert.match(cell!.title, /^API-key spend\n/);
-  assert.match(cell!.title, /7 days — \$40 · 9M tok · 21 turns/, "the hover keeps the full breakdown");
-  assert.match(cell!.title, /5 hours — \$12 · 3\.5M tok · 5 turns/);
+  assert.match(cell!.title, /1 week — \$40 · 9M tok · 21 turns/, "the hover keeps the full breakdown");
+  assert.match(cell!.title, /1 day — \$12 · 3\.5M tok · 5 turns/);
+});
+
+test("an older kernel's fiveHour window still arms the cell (version skew)", () => {
+  const cell = apiCell({ spend: { fiveHour: { usd: 3.2, tok: 900_000, turns: 2 } } });
+  assert.ok(cell, "day||fiveHour — a remote host on an older kernel must not blank its spend");
+  assert.deepEqual(cell!.segs.map((s) => [s.key, fmtUsd(s.usd)]), [["day", "$3"]],
+    "the 5h burn stands in under the 1-day designator until that host updates");
 });
 
 test("no key spend → no cell; and no fragment of any key ever reaches the strip", () => {
   assert.equal(apiCell(null), null);
-  assert.equal(apiCell({ spend: {} }), null, "presence of the 5h window is the whole test — the rail's hasSpend branch");
+  assert.equal(apiCell({ spend: {} }), null, "presence of the day window is the whole test — the rail's hasSpend branch");
   const ROOT = path.resolve(process.cwd(), "..");
   const src = fs.readFileSync(path.join(ROOT, "ui", "webview", "strip.ts"), "utf8");
   assert.ok(!src.includes("apiTail") && !src.includes("authTail"), "constant 'API' label — no key-tail plumbing");
@@ -199,15 +206,15 @@ test("the cell's dollars survive every tier; tokens fold at tier 2, labels at 3 
   assert.doesNotMatch(css, /ru-textonly/, "the ghost-row mechanism died with spend-as-rows");
 });
 
-test("an unknown window draws NO bars — just a '?' in their slot (the user 2026-07-31, round 2)", () => {
-  // a faded last-known fill still asserts a value we do not have: the length itself is the lie. The
-  // mark takes the bars' slot (so rows stay aligned, and it survives the narrow tiers where the %
-  // readout is hidden), and the % readout is dropped — the "?" IS the readout.
+test("an unknown window is not drawn on the bar at all — its last-known lives on hover (the user 2026-08-13)", () => {
+  // supersedes the 2026-07-31 '?' slot: the bar shows only what we know. The strip has no rich hover
+  // panel, so the hidden rows' last-known text rides the usage wrap's own title, labelled as such.
   const ROOT = path.resolve(process.cwd(), "..");
   const src = fs.readFileSync(path.join(ROOT, "ui", "webview", "strip.ts"), "utf8");
   const css = fs.readFileSync(path.join(ROOT, "ui", "webview", "strip.css"), "utf8");
-  assert.match(src, /if \(w\.unknown\) \{[\s\S]{0,700}q\.className = "ru-qmark";\s*\n\s*q\.textContent = "\?";/);
-  assert.match(src, /bars\.appendChild\(q\);\s*\n\s*box\.append\(name, bars\);/, "no .ru-pct on an unknown row");
-  assert.doesNotMatch(css, /\.ru-w\.ru-unk \.ru-fill \{ opacity: 0\.3; \}/, "the faded fill is gone");
-  assert.match(css, /\.ru-qmark \{ display: flex; align-items: center; justify-content: center; width: 100%;/);
+  assert.match(src, /if \(w\.unknown\) \{ unknownLines\.push\(w\.title\); continue; \}/);
+  assert.match(src, /usageWrap\.title = unknownLines\.length\s*\n\s*\? "Not shown \(no current reading\):\\n" \+ unknownLines\.join\("\\n"\) : "";/);
+  assert.doesNotMatch(src, /ru-qmark/, "the '?' slot is gone");
+  assert.doesNotMatch(css, /ru-qmark/);
+  assert.doesNotMatch(css, /\.ru-w\.ru-unk \.ru-fill \{ opacity: 0\.3; \}/, "the faded fill stays gone");
 });

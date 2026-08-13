@@ -55,12 +55,9 @@
 .ru-track { position: relative; width: auto; height: 5px; background: rgba(255, 255, 255, 0.12);
   border-radius: 3px; overflow: hidden; flex: 0 0 auto; display: block; }
 .ru-fill { position: absolute; left: 0; top: 0; height: 100%; border-radius: 3px; transition: width .3s ease; }
-/* UNKNOWN (the user 2026-07-31): the window reset since the last report, so the reading no longer
-   describes the present. NO BARS are drawn — a fill of any length asserts a value we do not have —
-   just a "?" in the bars' slot, which keeps the rows aligned and survives the narrow tiers where the
-   % readout is hidden. The last-known number lives in the hover, labelled as such. */
-.ru-qmark { display: flex; align-items: center; justify-content: center; width: 100%;
-  color: #8a97a6; font: 600 11px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+/* UNKNOWN (the user 2026-08-13; supersedes the 2026-07-31 '?' slot): a window whose reading no longer
+   describes the present is not drawn at all — the bar shows only what we know, and the last-known
+   number rides the usage wrap's hover title, labelled as such. */
 .ru-pct { font: 600 10px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: #cfe6ff;
   font-variant-numeric: tabular-nums; white-space: nowrap; }
 

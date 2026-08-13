@@ -122,8 +122,10 @@ class RemoteRevealReachesTheShell(unittest.TestCase):
         self.assertIn('else if (m.type === "confirmRevive" && m.id) {\n    revealSelfPane();', self.render)
 
     def test_the_mobile_shell_switches_tabs_on_that_window_message(self):
-        # the receiving half already existed (the Fleet pill posts the same shape); this pins the contract
-        self.assertIn("if(m.romp==='reveal'&&m.pane)show(m.pane);", km._LANDING_MOBILE_JS)
+        # the receiving half already existed (the Fleet pill posts the same shape); this pins the contract.
+        # reveal() = un-hide a desktop-toggled-off pane FIRST, then the mobile tab switch (the user
+        # 2026-08-13 — see tests/test_shell_reveal_unhide.py).
+        self.assertIn("if(m.romp==='reveal'&&m.pane)reveal(m.pane);", km._LANDING_MOBILE_JS)
 
 
 if __name__ == "__main__":

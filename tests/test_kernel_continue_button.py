@@ -59,7 +59,9 @@ class ContinueIsADriveOp(unittest.TestCase):
 
     def test_the_handler_body_supplies_the_canned_text(self):
         src = inspect.getsource(km._drive)
-        self.assertIn('text = CONTINUE_TEXT if msg.get("cont") else str(msg["text"])', src)
+        # the romp-canned marker rides the button's send only (the user 2026-08-13): the chat folds the
+        # canned words to a gesture gist; a typed follow-up stays unmarked
+        self.assertIn('text = (CONTINUE_TEXT + "\\n\\n<!-- romp-canned: continue -->") if msg.get("cont") else str(msg["text"])', src)
         self.assertIn('(msg.get("text") or msg.get("cont"))', src,
                       "the front door admits what the body supports — one contract")
 

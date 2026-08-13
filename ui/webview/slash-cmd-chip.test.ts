@@ -25,14 +25,15 @@ test("the chip is a monospace, outlined keyword pill that reads on the blue bubb
   assert.match(CSS, /\.slash-cmd-args \{ margin-left: 7px; \}/);
 });
 
-test("a command turn reads in the system-event family, not as a said thing (the user 2026-08-13)", () => {
-  // a command is a user GESTURE — it changes something rather than saying something — so the turn sheds
-  // the blue right-pinned bubble for a dim left-aligned ✦ row, rhyming with the context dividers
+test("a command turn wears the ✦ chip dress on the USER's side (the user 2026-08-13, round 2)", () => {
+  // a command is a user GESTURE — it sheds the blue bubble for the ✦ + mono chip, but it is still
+  // something THEY did, so it sits where their messages sit: right-aligned, riding .turn-user's own
+  // flex-end (round 1's left-aligned override is deliberately GONE)
   assert.match(RENDER, /turn\.classList\.add\("turn-cmd"\);\s*\n\s*bubble\.classList\.add\("cmd-row"\);/);
-  assert.match(CSS, /\.turn-user\.turn-cmd:not\(\.injected\) \{ align-items: flex-start; \}/);
+  assert.doesNotMatch(CSS, /\.turn-user\.turn-cmd:not\(\.injected\) \{ align-items: flex-start; \}/);
+  assert.doesNotMatch(CSS, /\.turn-cmd \.msg-acts \{ align-self: flex-start; \}/);
   assert.match(CSS, /\.user-bubble\.cmd-row \{ max-width: none; background: none; border: none;/);
   assert.match(CSS, /\.user-bubble\.cmd-row::before \{ content: "✦"; margin-right: 8px; color: var\(--dim\); \}/);
-  assert.match(CSS, /\.turn-cmd \.msg-acts \{ align-self: flex-start; \}/);
 });
 
 // guards on the regex's intent (executed): a whole leading token is chipped; a path is not.

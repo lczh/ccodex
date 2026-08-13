@@ -25,21 +25,23 @@ const NOW = 10_000;
 function item(over: Partial<ProvItem> = {}): ProvItem {
   return {
     itemId: "root", t: 9_400, column: "completed",
+    // NEWEST-subtree-activity FIRST, like the kernel's flatten actually ships it (_fsubmax, reverse) —
+    // the old ascending fixture was why the shuffled popover was never caught (the user 2026-08-13)
     tree: [
       { id: "root", text: "ship the notes-api", status: "done", t: 1_000, last: 9_400 },
-      { id: "s1", text: "write the parser", status: "done", t: 1_600, last: 5_000, mt: 5_200 },
-      { id: "s2", text: "ask about the schema", status: "question", t: 2_200, last: 7_000, mt: 7_000 },
       { id: "s3", text: "docs pass", status: "open", t: 8_800, last: 8_800 },
+      { id: "s2", text: "ask about the schema", status: "question", t: 2_200, last: 7_000, mt: 7_000 },
+      { id: "s1", text: "write the parser", status: "done", t: 1_600, last: 5_000, mt: 5_200 },
     ],
     ...over,
   };
 }
 
-test("the story: started at the root's mint, each sub at ITS time, the stamp explained last", () => {
+test("the story: started at the root's mint, each sub at ITS time, ONE clock throughout, the stamp last", () => {
   const rows = provenanceRows(item(), NOW, F);
   assert.deepEqual(rows[0], { when: "150m ago · @1000", what: "started", t: 1_000, kind: "start" });
   assert.deepEqual(rows[1], { when: "80m ago · @5200", what: "✓ write the parser", t: 5_200, kind: "sub" },
-    "a resolved sub stamps where it RESOLVED (mt)");
+    "a resolved sub stamps where it RESOLVED (mt) — the newest-first wire order re-sorts to the clock");
   assert.deepEqual(rows[2], { when: "50m ago · @7000", what: "⏸ ask about the schema", t: 7_000, kind: "sub" });
   assert.deepEqual(rows[3], { when: "20m ago · @8800", what: "· docs pass", t: 8_800, kind: "sub" },
     "an open sub stamps its mint (nothing resolved yet)");
@@ -47,24 +49,36 @@ test("the story: started at the root's mint, each sub at ITS time, the stamp exp
     "the visible age is named for what it marks");
 });
 
+test("events and subs INTERLEAVE on the clock — never section-by-section (the user 2026-08-13)", () => {
+  // the observed shuffle: root events ran up to now while the ✓ block jumped back a day — a sub whose
+  // resolution PRECEDES a root event must print before it
+  const it = item();
+  it.tree[0].log = [{ kind: "block", src: "romp", at: 6_000 }, { kind: "unblock", src: "romp", at: 8_000 }];
+  const rows = provenanceRows(it, NOW, F);
+  assert.deepEqual(rows.map((r) => [r.kind, r.t]),
+    [["start", 1_000], ["sub", 5_200], ["event", 6_000], ["sub", 7_000], ["event", 8_000],
+     ["sub", 8_800], ["stamp", 9_400]],
+    "one story, one clock: strict chronological, the stamp pinned last");
+});
+
 test("the final row matches the column: blocked / last update", () => {
   assert.equal(provenanceRows(item({ column: "needs_input" }), NOW, F).at(-1)!.what, "blocked");
   assert.equal(provenanceRows(item({ column: "working" }), NOW, F).at(-1)!.what, "last update");
 });
 
-test("the root's own verdict rows ride between start and subs, in the feed's outcome words", () => {
+test("the root's verdict rows land at their own times, in the feed's outcome words", () => {
   const it = item();
   it.tree[0].log = [{ kind: "block", src: "romp", at: 3_000 }, { kind: "unblock", src: "romp", evT: 4_000 }];
   const rows = provenanceRows(it, NOW, F);
   assert.deepEqual(rows[1], { when: "117m ago · @3000", what: "[block]", t: 3_000, kind: "event" });
   assert.deepEqual(rows[2], { when: "100m ago · @4000", what: "[unblock]", t: 4_000, kind: "event" },
     "evT is the time-nav fallback when `at` is absent");
-  assert.equal(rows[3].what, "✓ write the parser", "subs follow the root's events");
+  assert.equal(rows[3].what, "✓ write the parser", "the first sub follows — its mt (5200) postdates both events");
 });
 
 test("cleared subs stay out; a huge tree caps at 8 with an honest remainder", () => {
   const it = item();
-  it.tree[1].cleared = true;
+  it.tree.find((n) => n.id === "s1")!.cleared = true;   // by id — the fixture ships newest-first now
   assert.ok(!provenanceRows(it, NOW, F).some((r) => r.what.includes("write the parser")),
     "a cleared sub is not provenance");
   const big = item({

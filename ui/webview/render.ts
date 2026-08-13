@@ -75,7 +75,7 @@ type TaskOutputs = Record<string, { command: string; output: string }>;
 type ChatEvent = (
   // mid/mids: postal message ids the kernel could NOT resolve into cards, carried on the raw turn so a
   // timeline arc into it still lands (see _hydrate_postal's unresolved path)
-  | { kind: "user"; md: string; uuid?: string; ts?: string; reminders?: string[]; taskOutputs?: TaskOutputs; human?: boolean; romp?: boolean; rompAuto?: boolean; rompSystem?: boolean; followUp?: boolean; goal?: string; fuCtx?: string; mid?: string; mids?: string[]; images?: { src: string; path?: string }[]; undelivered?: boolean; echoT?: number; spacePaths?: string[]; pathLinks?: Record<string, string> }
+  | { kind: "user"; md: string; uuid?: string; ts?: string; reminders?: string[]; taskOutputs?: TaskOutputs; human?: boolean; romp?: boolean; rompAuto?: boolean; rompSystem?: boolean; followUp?: boolean; goal?: string; fuCtx?: string; canned?: string; mid?: string; mids?: string[]; images?: { src: string; path?: string }[]; undelivered?: boolean; echoT?: number; spacePaths?: string[]; pathLinks?: Record<string, string> }
   | { kind: "assistant"; md: string; uuid?: string; ts?: string; spacePaths?: string[]; pathLinks?: Record<string, string> }   // spacePaths: backticked filenames WITH spaces the kernel verified exist (build_session _space_paths) → whole-span links. pathLinks: path-shaped tokens the kernel verified against the filesystem, token → real open target (build_session _path_links) — the linkifier's gate
   | { kind: "thinking"; text: string; encrypted: boolean; uuid?: string; ts?: string }
   | {
@@ -1677,6 +1677,24 @@ function renderEventInner(ev: ChatEvent): HTMLElement {
         // system-event family (the ✦ dividers) — a dim left-aligned row: ✦ mark, mono chip, args
         turn.classList.add("turn-cmd");
         bubble.classList.add("cmd-row");
+      } else if (!romp && !injected && ev.md && ev.canned === "continue") {
+        // The card's Continue button (the user 2026-08-13): YOUR gesture in YOUR colour — the judges
+        // file it as your reply, the bubble stays blue — but not your prose: a one-line gist says what
+        // you did, and the exact canned words sit one click deeper (the nudge fold, in the user
+        // family). The ↩ follow-up header above already names the goal it answers.
+        const gistEl = el("div", "nudge-gist");
+        const c = el("span", "nudge-caret"); c.textContent = "▸"; gistEl.appendChild(c);
+        gistEl.appendChild(document.createTextNode("Continue — keep going; open calls are yours"));
+        bubble.appendChild(gistEl);
+        const full = el("div", "nudge-full md");
+        full.innerHTML = md(ev.md);
+        bubble.appendChild(full);
+        bubble.classList.add("nudge-collapsible");
+        bubble.dataset.act = "nudgetoggle";   // the stable body delegate, never a per-render listener (CLAUDE.md)
+        const ckey = ev.uuid ? "cont:" + ev.uuid : undefined;
+        if (ckey) bubble.dataset.nkey = ckey;
+        applyFold(bubble, "expanded", ckey);
+        bubble.title = bubble.classList.contains("expanded") ? "click to collapse" : "click to expand";
       } else if (romp && ev.md) {
         // A romp-injected NUDGE (auto status-check, Nudge button, injected follow-up) is mechanical
         // bookkeeping — progressive disclosure (the user 2026-07-17): default is a ONE-LINE gist with a
@@ -8492,7 +8510,14 @@ window.addEventListener("message", (e: MessageEvent) => {
     // id, no anchor) and would otherwise leave a scrolled-up chat parked in history, not at the prompt.
     if (m.live) { const v = views.get(m.id); if (v) v.stick = true; }
     if (m.live && activeId === m.id) {
-      const c = document.getElementById("content"); if (c) c.scrollTop = c.scrollHeight;
+      // one frame LATER, not now: when this focus is what un-hid the pane (the shell's reveal lands a
+      // task after revealSelfPane's postMessage), the pane is still display:none here and scrollHeight
+      // is 0 — the jump read as a no-op (the user 2026-08-13). Next frame the layout is real; when the
+      // pane was already visible the deferral is invisible. Anchored jumps need nothing: landOn's
+      // ResizeObserver realign already re-lands them when the pane sizes in.
+      window.requestAnimationFrame(() => {
+        const c = document.getElementById("content"); if (c) c.scrollTop = c.scrollHeight;
+      });
     } else {
       setActive(m.id, m.anchor, typeof m.anchorT === "number" ? m.anchorT : undefined, typeof m.anchorKind === "string" ? m.anchorKind : undefined);
     }

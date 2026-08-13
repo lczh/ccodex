@@ -1165,7 +1165,9 @@ class ViewBuilder(unittest.TestCase):
         # cardMove showed that a move with no message adds no information and parks the card in Working.
         import inspect
         src = inspect.getsource(km._drive)
-        self.assertIn('text = CONTINUE_TEXT if msg.get("cont") else str(msg["text"])', src)
+        # …plus the romp-canned marker (the user 2026-08-13): the chat folds the canned words to a
+        # gesture gist; a typed follow-up stays unmarked
+        self.assertIn('text = (CONTINUE_TEXT + "\\n\\n<!-- romp-canned: continue -->") if msg.get("cont") else str(msg["text"])', src)
         self.assertIn("jd.optimistic_followup(sid, iid, text=text, now=int(time.time()))", src)
         # the canned body covers its three arrival contexts (the user 2026-08-08). ALREADY WORKING is
         # the commonest press — the judge missed a continuation and the user sees the session busy —

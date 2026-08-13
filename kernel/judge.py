@@ -55,6 +55,10 @@ ERRORS   = STATE / "judge-errors.jsonl"  # swallowed judge-call failures (parse-
 USAGE    = STATE / "judge-usage.jsonl"   # one line per successful judge call: tokens/cost/ms — the kernel/UI roll up pipeline cost
 JUDGE_AUTH = STATE / "judge-auth.json"   # judge-auth-down latch {fsid: {t, mode, note}}: set by a credential-class error
                                          #   envelope, cleared by the session's next successful call — build_feed floors from it
+GONEDIR  = STATE / "gone"                # session-death markers {t, by[, endedAt]} — one small json per sid, written by the
+                                         #   kernel's death writers at the death EVENT (kill gesture / probe-confirmed absence),
+                                         #   read by a CLOSED list: _cli_epoch, run_close's death-pending drain, and the writers'
+                                         #   own idempotence check (2026-08-13; the reader list is test-pinned so it cannot creep)
 SDKDIR   = STATE / "sdk"                 # the SDK backend's per-session registry — lastSid tracks the CURRENT transcript fsid
 # Judge scratch cwd (the user 2026-07-20): every one-shot `claude -p` judge call writes a transcript
 # under the project dir of its CWD. With cwd=/tmp those piled into the SHARED -private-tmp project
@@ -70,9 +74,10 @@ def _rebind_state(path):
     save_goals wrote synthetic fixtures into the live goals/ and the triage pass then stormed
     judge-errors.jsonl over those orphans every pass forever (the user 2026-06-24). A test must call this
     instead of assigning jd.STATE alone. Not used in production (STATE is bound once at import)."""
-    global STATE, NAMES, CAPDIR, ARCHDIR, GOALDIR, GOALARCHDIR, STATESDIR, PCACHE, MESSAGES, ERRORS, USAGE, SDKDIR, EPIDIR, CODEXDIR
+    global STATE, NAMES, CAPDIR, ARCHDIR, GOALDIR, GOALARCHDIR, STATESDIR, PCACHE, MESSAGES, ERRORS, USAGE, SDKDIR, EPIDIR, GONEDIR, JUDGE_AUTH, CODEXDIR
     STATE = path
     NAMES, CAPDIR, ARCHDIR, GOALDIR = STATE / "names", STATE / "captions", STATE / "archive", STATE / "goals"
+    GONEDIR, JUDGE_AUTH = STATE / "gone", STATE / "judge-auth.json"
     GOALARCHDIR = STATE / "goals-archive"
     STATESDIR, PCACHE = STATE / "states", STATE / "judge-units-cache"
     MESSAGES, ERRORS, USAGE = STATE / "timeline" / "messages.jsonl", STATE / "judge-errors.jsonl", STATE / "judge-usage.jsonl"
@@ -145,7 +150,7 @@ JUDGE_FAIL_CAP = 3                       # the same rule for every other retryin
 #                                          model actually wrote. Closer / grouper / consolidator / courier; the
 #                                          planner (PLAN_PARSE_RETRIES) and distiller/briefer (DISTILL_FAIL_CAP)
 #                                          already had their own.
-PLACEMENTS_V = 7                         # placements-identity schema version (plan P2, the user 2026-07-06).
+PLACEMENTS_V = 8                         # placements-identity schema version (plan P2, the user 2026-07-06).
 #                                          v2 (2026-07-09): a 07-07/07-08 change to segment-text derivation
 #                                          stepped the text hash without this bump — dormant segments' old-hash
 #                                          placements stopped matching, and every restart/touch replayed them as
@@ -186,6 +191,12 @@ PLACEMENTS_V = 7                         # placements-identity schema version (p
 #                                          every compacted transcript (one live session: 5825 → 5850 atoms,
 #                                          25 messages recovered). Exactly v3's shape — a bigger atom set,
 #                                          not a shifted hash — so it takes the same seal.
+#                                          v8 (2026-08-13): the twin-drop pre-pass now matches
+#                                          <command-message>-FIRST wrappers like the emit path always did
+#                                          (COMMAND_NAME_ANY_RE) — the phantom raw-twin human atom beside
+#                                          every skill/custom-command invocation drops out. v5's shape in
+#                                          reverse: a SMALLER atom set for transcripts carrying shape-B
+#                                          commands, same seal.
 PLAN_SESSIONS = None                     # per-pass session cap — REMOVED (the user 2026-06-30): the fairness
                                          # caps were a recurring source of confusing starvation bugs (a goal/
                                          # nudge stuck behind a full per-pass window), never clearly needed.
@@ -4027,24 +4038,50 @@ def _bg_unresolved(path):
         return []
     hit = _BG_SCAN_CACHE.get(path)
     if hit and hit[0] == key:
-        return hit[1]
-    tasks = em._scan_bg_tasks(path)
-    if len(_BG_SCAN_CACHE) > 256:         # bounded by fleet size; a wholesale clear on overflow is fine
-        _BG_SCAN_CACHE.clear()
-    _BG_SCAN_CACHE[path] = (key, tasks)
-    return tasks
+        tasks = hit[1]
+    else:
+        tasks = em._scan_bg_tasks(path)
+        if len(_BG_SCAN_CACHE) > 256:     # bounded by fleet size; a wholesale clear on overflow is fine
+            _BG_SCAN_CACHE.clear()
+        _BG_SCAN_CACHE[path] = (key, tasks)
+    # expiry is applied OUTSIDE the cache with a fresh now: a monitor whose CLI died mid-watch has no
+    # terminal record, and an idle transcript never busts the mtime key — a cached verdict would say
+    # "running" forever (see em._bg_expired)
+    return [t for t in tasks if not em._bg_expired(t, time.time())]
 
 
-def _sdk_spawned_at(sid):
-    """When this SDK session's CURRENT CLI spawned (reg spawnedAt, stamped by SdkSession._run), or None
-    for tmux/never-spawned sessions. The bg-tasks ghost gate: a task launched before the live CLI died
-    with its old one — its <task-notification> can never arrive. (The kernel's copy delegates here.)"""
+def _death_marker(sid):
+    """STATE/gone/<sid>.json — the recorded death event, or None. Reg-file read cost by design: this
+    sits on _cli_epoch's per-push path, so it must never scan the growing states stream."""
+    try:
+        with open(GONEDIR / (sid + ".json")) as f:
+            m = json.load(f)
+        return m if isinstance(m, dict) else None
+    except Exception:
+        return None
+
+
+def _cli_epoch(sid):
+    """When this session's CURRENT CLI epoch began — the bg-tasks ghost gate, now backend-agnostic
+    (2026-08-13): max(reg spawnedAt, the recorded death marker's t), None when neither exists (the
+    pre-marker world, byte-for-byte today's SDK behavior). A task launched before the epoch died with
+    its CLI — its <task-notification> can never arrive — and keying the gate on the recorded death
+    EVENT is what finally gives a dead tmux session's still-'running' launches an end: the RC7
+    unretirable hold. max() stays correct across every cycle: an SDK revival's fresh CLI stamps reg
+    spawnedAt above the old marker; a re-stamped marker (death after revival) lifts the floor to the
+    second death. (The kernel's copy delegates here.)"""
+    sp = None
     try:
         with open(STATE / "sdk" / (sid + ".json")) as f:
             v = json.load(f).get("spawnedAt")
-        return v if isinstance(v, (int, float)) else None
+        sp = v if isinstance(v, (int, float)) else None
     except Exception:
+        sp = None
+    m = _death_marker(sid)
+    mt = m.get("t") if m and isinstance(m.get("t"), (int, float)) else None
+    if sp is None and mt is None:
         return None
+    return max(sp or 0, mt or 0)
 
 
 def _awaiting_bg_hold(fsid, path, session, store):
@@ -4070,7 +4107,7 @@ def _awaiting_bg_hold(fsid, path, session, store):
     tasks = _bg_unresolved(path)
     if not tasks:
         return False
-    sp = _sdk_spawned_at(fsid)
+    sp = _cli_epoch(fsid)
     tasks = [t for t in tasks if not (sp and t.get("t") and t["t"] < sp)]
     if not tasks:
         return False
@@ -7408,17 +7445,144 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
         swept.add(tid); sig[tid] = fp; did += 1        # remember the size we judged at → detect later growth
     store["closedTurns"] = sorted(swept)
     store["closedSig"] = sig
-    rollup_status(store, _session_settled(fsid, path, session, store))
+    settled = _session_settled(fsid, path, session, store)
+    rollup_status(store, settled)
     save_goals(fsid, store)
+    _death_finalize(fsid, store, settled)             # the death marker's one-shot epilogue (2026-08-13)
     return newly
+
+
+DEATH_DRAIN_PER_PASS = CONCURRENCY   # a QUEUE-DRAIN bound on death-pending finalizes per closer pass —
+#   NOT a fairness cap on live sessions (those were removed 2026-06-30 and stay removed): the pending
+#   set is a finite backlog that strictly shrinks (every drained marker gains endedAt, superseded ones
+#   retire), so the bound only spreads the one-time upgrade backfill over successive passes instead of
+#   letting the first post-upgrade pass submit hundreds of dead stores at once.
+DEATH_BACKFILL_WINDOW = 365 * 86400  # how far back the drain resolves a dead sid's transcript (cached
+#   per (window, forks) like the picker's wide walk — one filesystem walk, not one per marker)
+
+_gone_memo = {}                      # sid -> (marker mtime_ns, finalized) — a finalized marker is skipped
+#                                      with ZERO reads (the _namefp_memo idiom)
+
+
+def _write_death_marker(fsid, m):
+    """Atomic marker rewrite (tmp+rename), best-effort like every marker write."""
+    try:
+        GONEDIR.mkdir(parents=True, exist_ok=True)
+        tmp = GONEDIR / (fsid + ".json.tmp")
+        tmp.write_text(json.dumps(m))
+        os.replace(tmp, GONEDIR / (fsid + ".json"))
+        _gone_memo.pop(fsid, None)
+    except Exception:
+        pass
+
+
+def _newest_states_t(fsid):
+    """The newest states-row t for a sid, any row shape — the finalize's supersession read."""
+    try:
+        rows = (STATESDIR / (fsid + ".jsonl")).read_text().splitlines()
+        for ln in reversed(rows):
+            try:
+                r = json.loads(ln)
+                if isinstance(r, dict) and r.get("t") is not None:
+                    return int(r["t"])
+            except (ValueError, TypeError):
+                continue
+    except OSError:
+        pass
+    return 0
+
+
+def _death_pending(exclude):
+    """Up to DEATH_DRAIN_PER_PASS unfinalized death markers, oldest first, excluding sids the pass
+    already covers (a recently dead sid can appear in discover's file-based fleet too — a duplicate
+    would race two _close_session calls on one store; the final gate's second finding). Finalized
+    markers skip straight from the mtime memo with zero reads."""
+    out = []
+    try:
+        entries = sorted(((p.stat().st_mtime_ns, p) for p in GONEDIR.iterdir()
+                          if p.name.endswith(".json")), key=lambda x: x[0])
+    except OSError:
+        return out
+    for mt, p in entries:
+        sid = p.name[:-5]
+        if sid in exclude:
+            continue
+        memo = _gone_memo.get(sid)
+        if memo and memo[0] == mt and memo[1]:
+            continue
+        try:
+            m = json.loads(p.read_text())
+        except Exception:
+            continue
+        done = isinstance(m, dict) and "endedAt" in m
+        _gone_memo[sid] = (mt, bool(done))
+        if done:
+            continue
+        out.append(sid)
+        if len(out) >= DEATH_DRAIN_PER_PASS:
+            break
+    return out
+
+
+def _death_finalize(fsid, store, settled):
+    """The death marker's one-shot finalize, run at the end of every _close_session (2026-08-13).
+    No marker (the common case) → one small-json read, no-op. A marker SUPERSEDED by newer states
+    evidence — a revival's SessionStart row, or the re-anchor hook's supersededBy row — retires as
+    superseded (endedAt stamped) so the pending queue strictly shrinks; a marker stranded pending
+    forever was the final gate's third finding, and the retire is what keeps the drain's bound
+    honest. Otherwise, once the pass has SETTLED the dead store: endedAt stamps UNCONDITIONALLY
+    (nothing-open sessions included — the dedup must fire for the common case, the gate's second
+    finding), and only when open (non-complete, non-cleared) tops remain, ONE 'ended' settle record
+    (keyed on the marker's t, so it can never re-fire) lists the still-open cards on the same
+    episodes channel the /clear bell reads — cards end loudly instead of vanishing."""
+    m = _death_marker(fsid)
+    if not isinstance(m, dict) or "endedAt" in m:
+        return
+    mt = int(m.get("t") or 0)
+    if _newest_states_t(fsid) > mt:
+        m["endedAt"] = mt
+        m["superseded"] = True
+        _write_death_marker(fsid, m)
+        return
+    if not settled:
+        return
+    status = store.get("status") or {}
+    nodes = store.get("nodes") or {}
+    open_tops = [{"id": gid, "text": (nodes.get(gid) or {}).get("text") or ""}
+                 for gid, st in status.items() if st in ("working", "blocked")
+                 and (nodes.get(gid) or {}).get("parentId") is None]
+    m["endedAt"] = mt
+    _write_death_marker(fsid, m)
+    if open_tops:
+        append_episode_settle(fsid, "ended:%d" % mt, int(time.time()), open_tops)
 
 
 def run_close(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
     """One CLOSER pass (the turn-end completion backstop), triage tier, run after run_plan.
-    Per-session sequential (the tree accretes), sessions concurrent. Returns nodes completed."""
+    Per-session sequential (the tree accretes), sessions concurrent. Returns nodes completed.
+    The fleet is the discover set PLUS a bounded drain of death-pending sids (markers without
+    endedAt) — window-independent, so a session already dead longer than the caption horizon at
+    upgrade still gets its finalize (the promised backfill; the re-critique's population fix)."""
     if now is None:
         now = int(time.time())
     fleet = [s for s in discover(now) if not _hidden_from_feed(s[0])][:sessions_cap]   # muted sessions are out of task tracking
+    fleet_sids = {f[0] for f in fleet}
+    pending = _death_pending(exclude=fleet_sids)
+    if pending:
+        wide = {f[0]: f for f in discover(now, window=DEATH_BACKFILL_WINDOW)}
+        for sid in pending:
+            ent = wide.get(sid)
+            if ent is not None and not _hidden_from_feed(sid):
+                fleet.append(ent)
+            else:
+                # no transcript anywhere in the wide window (rotated away, or hidden): there is
+                # nothing left to settle and no card any surface renders — retire the marker so the
+                # queue shrinks, loudly enough to find in the state dir
+                m = _death_marker(sid)
+                if isinstance(m, dict) and "endedAt" not in m:
+                    m["endedAt"] = int(m.get("t") or 0)
+                    m["noTranscript"] = True
+                    _write_death_marker(sid, m)
     n = 0
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
         futs = {ex.submit(_close_session, fsid, str(path), now): fsid
@@ -9151,6 +9315,10 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
             _log_judge_error("courier", fsid, "give-up", seg=seg_id,
                              note="peer message unsummarized past the %dh retry horizon (usage-limited) — abandoned"
                                   % (COURIER_RETRY_HORIZON // 3600))
+            rollup_status(store, closed.get(fsid, False))   # the release its demote-only sibling always had
+            #                                                 (2026-08-13): without it, a node this abandoned
+            #                                                 unit was holding stayed un-rolled until some
+            #                                                 other pass happened to touch the store
             save_goals(fsid, store)
             continue
         if declared in ("coordinate", "question"):

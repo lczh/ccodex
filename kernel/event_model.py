@@ -176,8 +176,22 @@ def _parse_task_notification(txt):
         a += len(tag) + 2
         b = txt.find("</" + tag + ">", a)
         return txt[a:b].strip() if b >= 0 else ""
-    return {"status": (fld("status") or "completed").lower(), "summary": fld("summary"),
+    st = fld("status")
+    # has_status: whether <status> was PRESENT, distinct from the "completed" default. A Monitor's
+    # per-EVENT notification carries no status tag (only its terminal one does) — without this bit the
+    # default would let a wrapped event read as "completed" and end a watch that is still live.
+    return {"status": (st or "completed").lower(), "has_status": bool(st), "summary": fld("summary"),
             "output_file": fld("output-file"), "tool_use_id": fld("tool-use-id")}
+
+
+# A non-persistent Monitor records its own lifetime ceiling at launch (timeout_ms — the harness kills
+# it at the deadline), so a scan row still "running" past deadline+grace is a record whose terminal
+# notification can never arrive (the CLI died with the monitor out, and the transcript never learns).
+# Consumers apply this with THEIR now — baking it into the scan would freeze inside the mtime caches,
+# which an idle transcript never busts. The grace absorbs kill/notify latency.
+def _bg_expired(task, now, grace=120.0):
+    dl = (task or {}).get("deadline")
+    return bool(dl) and now > dl + grace
 
 
 def _scan_bg_tasks(path, want_all=False):
@@ -202,6 +216,8 @@ def _scan_bg_tasks(path, want_all=False):
         # a notification keyed by its INNER <tool-use-id> (the string/queue shapes have no wrapper block)
         tid = (note or {}).get("tool_use_id")
         if tid and tid in tasks:
+            if tasks[tid].get("monitor") and not note.get("has_status"):
+                return                     # a monitor EVENT (no <status> tag) — the watch is still live
             tasks[tid].update(status=note["status"], outputFile=note["output_file"],
                               summary=note["summary"] or tasks[tid]["summary"])
 
@@ -218,13 +234,35 @@ def _scan_bg_tasks(path, want_all=False):
                 c = (o.get("message") or {}).get("content")
                 if t == "assistant" and isinstance(c, list):
                     for b in c:
-                        if isinstance(b, dict) and b.get("type") == "tool_use" and (b.get("input") or {}).get("run_in_background"):
-                            tid, inp = b.get("id"), (b.get("input") or {})
-                            if tid and tid not in tasks:
-                                tasks[tid] = {"id": tid, "status": "running", "t": parse_z(o.get("timestamp")),
-                                              "summary": (inp.get("description") or b.get("name") or "Background task"),
-                                              "command": inp.get("command") or "", "outputFile": ""}
-                                order.append(tid)
+                        if not (isinstance(b, dict) and b.get("type") == "tool_use"):
+                            continue
+                        inp = b.get("input") or {}
+                        # The THIRD durable launch shape: a Monitor tool_use. A non-persistent monitor is
+                        # dispatched background work exactly like a backgrounded Bash — a session idle
+                        # behind one read as plain 'ready', its goal stamps could lift only by the 6h
+                        # backstop, and the nudge gates couldn't see the wait. A PERSISTENT monitor is
+                        # skipped: a session-length subscription (a log tail) never returns, so counting it
+                        # would hold "awaiting" forever — it is furniture, not awaited work.
+                        is_mon = b.get("name") == "Monitor"
+                        if is_mon and inp.get("persistent"):
+                            continue
+                        if not (inp.get("run_in_background") or is_mon):
+                            continue
+                        tid = b.get("id")
+                        if tid and tid not in tasks:
+                            tasks[tid] = {"id": tid, "status": "running", "t": parse_z(o.get("timestamp")),
+                                          "summary": (inp.get("description") or b.get("name") or "Background task"),
+                                          "command": inp.get("command") or (inp.get("ws") or {}).get("url", ""),
+                                          "outputFile": ""}
+                            if is_mon:
+                                tasks[tid]["monitor"] = True
+                                # its recorded lifetime ceiling → the deadline consumers expire on
+                                # (see _bg_expired); the harness clamps timeout_ms to [1s, 1h]
+                                tmo = inp.get("timeout_ms")
+                                tmo = float(tmo) if isinstance(tmo, (int, float)) else 300000.0
+                                if tasks[tid]["t"]:
+                                    tasks[tid]["deadline"] = tasks[tid]["t"] + min(max(tmo, 1000.0), 3600000.0) / 1000.0
+                            order.append(tid)
                 elif t == "user" and isinstance(c, list):
                     tur = o.get("toolUseResult")
                     tur = tur if isinstance(tur, dict) else {}
@@ -241,8 +279,16 @@ def _scan_bg_tasks(path, want_all=False):
                                 continue
                             note = _parse_task_notification(_result_text(b.get("content")))
                             if tid in tasks and note:      # its result landed → mark it done; the keep-filter drops it
+                                if tasks[tid].get("monitor") and not note.get("has_status"):
+                                    continue               # a wrapped monitor EVENT — not a terminal (see _mark)
                                 tasks[tid].update(status=note["status"], outputFile=note["output_file"],
                                                   summary=note["summary"] or tasks[tid]["summary"])
+                            elif tid in tasks and note is None and b.get("is_error") \
+                                    and tasks[tid]["status"] == "running":
+                                # the LAUNCH's own ack errored (refused permission, bad input) → nothing ever
+                                # started, and no notification will ever come. Without this, the phantom
+                                # reads "running" forever and holds awaiting/nudge gates open on nothing.
+                                tasks[tid]["status"] = "failed"
                 elif t == "user" and isinstance(c, str):
                     _mark(_parse_task_notification(c))
                 elif t == "queue-operation" and o.get("operation") == "enqueue":
@@ -740,7 +786,14 @@ class FileAdapter:
         for u in kept:
             r = self.by_uuid.get(u) or {}
             if r.get("type") == "user" and r.get("promptId"):
-                m = COMMAND_NAME_RE.match(_text_of(_content(r.get("message"))) or "")
+                btext = _text_of(_content(r.get("message"))) or ""
+                # the SAME matcher the emit path uses (COMMAND_NAME_ANY_RE inside a wrapper record): the
+                # anchored-only form missed every <command-message>-FIRST invocation (skills / custom
+                # commands), so shape-B twins survived as phantom human segments beside the real command
+                # atom — same hash, different t (2026-08-13; the emit path got this fix on 2026-07-22 and
+                # this pre-pass silently didn't).
+                m = COMMAND_NAME_RE.match(btext) or (COMMAND_NAME_ANY_RE.search(btext)
+                                                     if CMD_WRAP_RE.match(btext) else None)
                 if m:
                     name = m.group(1).strip() or "/?"
                     cmd_prompt_names.setdefault(r["promptId"], set()).add(

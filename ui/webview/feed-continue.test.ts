@@ -22,7 +22,8 @@ test("Continue posts askFollowUp cont:true — the kernel owns the canned body (
   assert.match(FEED, /vscodeApi\?\.postMessage\(\{ type: "askFollowUp", itemId: it\.itemId, sid: it\.sid, cont: true \}\);/);
   // the kernel substitutes its constant and the arm otherwise IS the typed-reply path (optimistic
   // reopen included) — pinned here because the button's whole design is "a reply, not a new mechanism"
-  assert.match(KERNEL, /text = CONTINUE_TEXT if msg\.get\("cont"\) else str\(msg\["text"\]\)/);
+  // …with the romp-canned marker riding the button's send (the chat folds it to a gesture gist)
+  assert.match(KERNEL, /text = \(CONTINUE_TEXT \+ "\\n\\n<!-- romp-canned: continue -->"\) if msg\.get\("cont"\) else str\(msg\["text"\]\)/);
   assert.match(KERNEL, /CONTINUE_TEXT = \("Nothing needed from me here\./);
 });
 

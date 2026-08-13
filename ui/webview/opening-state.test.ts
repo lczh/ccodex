@@ -14,25 +14,30 @@ const RENDER = fs.readFileSync(path.join(ROOT, "ui", "webview", "render.ts"), "u
 const CSS = fs.readFileSync(path.join(ROOT, "ui", "webview", "styles.css"), "utf8");
 const KERNEL = fs.readFileSync(path.join(ROOT, "kernel", "kernel.py"), "utf8");
 
-test("the kernel reports OPENING while the transcript doesn't exist — never a working chip on a broken clock", () => {
+test("the kernel reports OPENING while the transcript doesn't exist and the spawn is in flight — never a working chip on a broken clock", () => {
   assert.ok(KERNEL.includes('if chip in ("working", "ready") and not path_override and not os.path.exists(sess["path"]) \\'));
-  assert.ok(KERNEL.includes("and not cli_up:"));
+  assert.ok(KERNEL.includes("and spawn_inflight:"));
   assert.ok(KERNEL.includes('chip = "opening"'));
 });
 
-// The deciding event — "the CLI is up" — is per-backend (the user 2026-08-08, who read minutes of dots
-// as creation still running): a fresh session of EITHER backend writes NO transcript until its first
-// turn, so keying the chip on the file alone held a fully-up idle session on the opening dots until the
-// user typed. SDK: the handshake (snapshot `connected`, set the moment the client context opens).
-// tmux: the CLI's statusline hook publishing its first @claude-state (2026-08-10) — the matching event,
-// since the transcript's first record only lands with the first MESSAGE.
-test("each backend's own 'CLI is up' event ends OPENING before any transcript exists", () => {
+// The opening window is per-backend (the user 2026-08-08, who read minutes of dots as creation still
+// running): a fresh session of EITHER backend writes NO transcript until its first turn, so keying the
+// chip on the file alone held a fully-up idle session on the opening dots until the user typed.
+// SDK: the backend's live `spawning` report (session thread up, client not yet; the handshake closes
+// it). tmux: the CLI's statusline hook publishing its first @claude-state (2026-08-10). The SDK leg
+// must key on `spawning`, NOT on `connected` being falsy — a DORMANT created session (kernel restarts
+// kill idle CLIs; boot reconcile leaves them lazy) also reports no `connected`, and reading that as
+// "still opening" kept the dots up for hours on a session one message from answering (the user
+// 2026-08-13). A dormant row carries no spawning key, so it reads ready.
+test("OPENING covers exactly each backend's spawn window — a dormant created session reads ready", () => {
   const SDK = fs.readFileSync(path.join(ROOT, "kernel", "sdk_backend.py"), "utf8");
   assert.ok(SDK.includes('"connected": bool(self.client)'), "the snapshot carries the handshake event");
-  assert.ok(KERNEL.includes('"connected": bool(st.get("connected"))'), "the live merge threads it through");
-  assert.ok(KERNEL.includes('cli_up = bool(tm.get("connected")) or \\'), "SDK: the handshake");
-  assert.ok(KERNEL.includes('(tm.get("backend") == "tmux" and bool((tm.get("state") or "").strip()))'),
-    "tmux: the first published @claude-state");
+  assert.ok(SDK.includes('"spawning": not self.client'), "the snapshot carries the in-flight window");
+  assert.ok(KERNEL.includes('"connected": bool(st.get("connected"))'), "the live merge threads connected through");
+  assert.ok(KERNEL.includes('"spawning": bool(st.get("spawning"))'), "the live merge threads spawning through");
+  assert.ok(KERNEL.includes('spawn_inflight = bool(tm.get("spawning")) or \\'), "SDK: the live spawn window");
+  assert.ok(KERNEL.includes('(tm.get("backend") == "tmux" and not (tm.get("state") or "").strip())'),
+    "tmux: no @claude-state published yet");
 });
 
 // A per-session chip event must not ride the periodic full push cycle, which runs SECONDS on a busy

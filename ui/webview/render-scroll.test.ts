@@ -169,6 +169,8 @@ test("ResizeObservers on #tabbar AND #ledger compensate #content.scrollTop by th
 test("a focus with `live` lands on the live tail — a blocked card's picker/permission prompt (the user 2026-07-08)", () => {
   // stick the target view to bottom so showActive scrolls there
   assert.match(RENDER, /if \(m\.live\) \{ const v = views\.get\(m\.id\); if \(v\) v\.stick = true; \}/);
-  // cover the ALREADY-ACTIVE case, where setActive early-returns (activeId === id, no anchor) → jump to bottom now
-  assert.match(RENDER, /if \(m\.live && activeId === m\.id\) \{\s*\n\s*const c = document\.getElementById\("content"\); if \(c\) c\.scrollTop = c\.scrollHeight;/);
+  // cover the ALREADY-ACTIVE case, where setActive early-returns (activeId === id, no anchor) → jump to
+  // bottom ONE FRAME later (the user 2026-08-13): when this focus is what un-hid a closed pane, the
+  // synchronous scroll ran at display:none (scrollHeight 0) and the jump read as a no-op
+  assert.match(RENDER, /if \(m\.live && activeId === m\.id\) \{[\s\S]{0,700}?window\.requestAnimationFrame\(\(\) => \{\s*\n\s*const c = document\.getElementById\("content"\); if \(c\) c\.scrollTop = c\.scrollHeight;/);
 });

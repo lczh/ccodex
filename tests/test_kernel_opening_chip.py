@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The opening chip's deciding event is per-backend.
+"""The opening chip's deciding event is per-backend, and it covers ONLY a spawn in flight.
 
 A session whose transcript doesn't exist yet reads "opening" (2026-08-05: a just-spawned tab said
 "Working" over a clock with no honest base). For tmux the transcript's first record is the only
@@ -9,6 +9,13 @@ the animated opening dots until the user's first message — indefinitely (the u
 minutes of dots as creation still running). The SDK backend knows the earlier designed event — the
 handshake (snapshot `connected`, set the moment the client context opens) — and the override stands
 down on it.
+
+The override must also NOT outlive the create (the user 2026-08-13): `connected` is in-memory only, so
+a created-but-never-messaged session whose CLI isn't up right now — the normal state of every fresh SDK
+session after a kernel restart, since idle CLIs die with the kernel and boot reconcile leaves them
+lazy — read the missing flag as "still opening" and wore the dots for HOURS, while one message would
+wake it in seconds. The chip now keys on the backend's live `spawning` report (thread up, client not
+yet): opening covers exactly the spawn/handshake window, and a dormant created session reads ready.
 
 SYNTHETIC fixtures only (placeholder uuid, temp dirs), modeled on test_chat_payload_clock_invariant.
 """
@@ -72,9 +79,36 @@ class OpeningChipDecidingEvent(unittest.TestCase):
         self.assertIsNotNone(m, "fixture session must build")
         return (m.get("status") or {}).get("state")
 
-    def test_no_transcript_and_no_handshake_is_opening(self):
-        # spawned but the CLI hasn't proven up and nothing is on disk → opening (the 2026-08-05 rule)
+    def test_a_spawn_in_flight_with_no_transcript_is_opening(self):
+        # spawn/handshake window open (the backend's live `spawning` report: thread up, client not
+        # yet) and nothing on disk → opening (the 2026-08-05 rule, scoped to the in-flight window)
+        self.tm["spawning"] = True
         self.assertEqual(self._state(), "opening")
+
+    def test_a_dormant_created_session_is_ready_not_opening(self):
+        # Created, never messaged, CLI not up RIGHT NOW — every fresh SDK session lands here after a
+        # kernel restart (idle CLIs die with the kernel; boot reconcile leaves them lazy; the
+        # transcript only appears with the first turn). A dormant row carries NO spawning key, and
+        # the old gate read the equally-missing `connected` as "still opening" — dots for hours on a
+        # session one message from answering (the user 2026-08-13).
+        self.assertEqual(self._state(), "ready",
+                         "a created-but-unmessaged dormant session is ready (a send wakes it), not opening")
+
+    def test_the_live_merge_threads_spawning_through(self):
+        # The merge dropping a backend key is a known silent killer (the 2026-07-11 bgTasks lesson:
+        # the snapshot carried it, every consumer saw None). Guard the thread-through explicitly.
+        class _FakeBackend:
+            def live_sessions(self):
+                return {SID: {"state": "waiting", "since": "5", "model": "", "effort": "",
+                              "spawning": True}}
+        saved = km._sdk
+        km._sdk = lambda: _FakeBackend()
+        try:
+            row = km.Sessions.live().get(SID)
+        finally:
+            km._sdk = saved
+        self.assertIsNotNone(row)
+        self.assertTrue(row.get("spawning"), "Sessions.live must carry the backend's spawning bit")
 
     def test_the_sdk_handshake_ends_opening_before_any_transcript_exists(self):
         # a fresh SDK session is fully open the moment its client connects — its transcript only

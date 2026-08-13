@@ -28,13 +28,15 @@ test("the kernel serves spend windows for BOTH payload shapes, keyed-only beside
   // dollars nobody is billed — and only when key turns actually exist (the user 2026-08-08)
   assert.ok(KERNEL.includes("def _spend_windows(keyed_only=False):"));
   assert.ok(KERNEL.includes("ksp = _spend_windows(keyed_only=True)"));
-  assert.match(KERNEL, /if any\(\(ksp\.get\(k\) or \{\}\)\.get\("turns"\) for k in \("fiveHour", "sevenDay", "month"\)\):/);
+  assert.match(KERNEL, /if any\(\(ksp\.get\(k\) or \{\}\)\.get\("turns"\) for k in \("day", "week", "month"\)\):/);
   // no fragment of the key rides ANY payload (the user 2026-08-08, evening): the tail plumbing is
   // gone from the kernel wholesale, and the keyed-spend gate is a plain existence check
   assert.ok(KERNEL.includes("if _auth_key_present():"));
   assert.ok(!KERNEL.includes("apiTail"), "no key material in any usage payload");
   assert.ok(!KERNEL.includes("authTail"), "no key material in the status payload either");
-  // rolling 5h/7d read the HOUR buckets; month-to-date reads the day ledger
+  // rolling day/week read the HOUR buckets (192h = 8 days fits both); month-to-date reads the day
+  // ledger. fiveHour/sevenDay stay emitted ONE release for version skew (the user 2026-08-13).
+  assert.match(KERNEL, /"day": _rolling\(24\), "week": _rolling\(7 \* 24\)/);
   assert.match(KERNEL, /"fiveHour": _rolling\(5\), "sevenDay": _rolling\(7 \* 24\)/);
   assert.ok(KERNEL.includes("k.startswith(month)"));
   // the accumulator: cumulative-per-process DELTAS, and each bucket splits out the key's own turns
@@ -54,12 +56,14 @@ test("VS Code strip: spend is ONE API cell keyed on the windows' PRESENCE — th
   // presence, not the apiKey flag: a mixed host's payload carries bars AND spend at once — and the
   // 5h window is the whole test, the same hasSpend branch the rail runs
   assert.ok(STRIP.includes("const sp = usage && usage.spend;"));
-  assert.ok(STRIP.includes("if (!sp || !sp.fiveHour) return null;"));
+  // day||fiveHour: an older kernel ships no 'day' yet (version skew) — its 5h burn stands in
+  assert.ok(STRIP.includes("if (!sp || !(sp.day || sp.fiveHour)) return null;"));
+  assert.ok(STRIP.includes("const daySeg = sp.day || sp.fiveHour;"));
   assert.doesNotMatch(STRIP, /usage\.apiKey && usage\.spend/);
   assert.doesNotMatch(STRIP, /spendWindows/, "spend never renders as window rows any more");
-  // the collapsed cell carries 5h + month (like the rail's seg('fiveHour')+seg('month')); one display
-  // name per window, dollars AND tokens beside each other
-  assert.match(STRIP, /\[\["fiveHour", "5 hours", "5h"\], \["month", "Month", "mo"\]\]/);
+  // the collapsed cell carries 1 day + 1 month (the user 2026-08-13: pay-per-token has no reset
+  // windows); one display name per window, dollars AND tokens beside each other
+  assert.match(STRIP, /\[\["day", "1 day", "1d", daySeg\],\s*\n\s*\["month", "1 month", "1mo", sp\.month\]\]/);
   assert.match(STRIP, /tok\.textContent = " · " \+ fmtTok\(s\.tok\) \+ " tok";/);
   // the old one-off chip is gone, and with it any minted style
   assert.doesNotMatch(STRIP, /spendChip/);
@@ -74,7 +78,8 @@ test("the web rail's API cell is numbers under a constant label — no spend bar
   assert.ok(usageJS.includes("function apiCellHTML(live)"));
   assert.ok(usageJS.includes("'<div class=ru-name>API</div>'"));
   assert.ok(!usageJS.includes("_tail"), "no tail plumbing survives in the rail JS");
-  assert.ok(usageJS.includes("seg('fiveHour','5 hours')+seg('month','Month')"));
+  assert.ok(usageJS.includes("seg('day','1 day')+seg('month','1 month')"));
+  assert.ok(usageJS.includes("var d=sp.day||sp.fiveHour,m=sp.month;"), "older remote kernels stay visible");
   assert.ok(usageJS.includes("var seg=function(k,lbl){return '<div class=ru-name>'+lbl+'</div>'"));
   assert.ok(usageJS.includes("'<div class=ru-pct>'+fmtUsd(sum[k].usd)+' \\u00b7 '+fmtTok(sum[k].tok)+' tok</div>'"));
   // the graph and the budget fills are gone: no spend track, no spend color ramp, no shared scale
@@ -82,7 +87,7 @@ test("the web rail's API cell is numbers under a constant label — no spend bar
   assert.ok(!usageJS.includes("spendWinsHTML"), "spend never renders as window rows with tracks");
   assert.ok(!usageJS.includes("var mx=1;"), "the token auto-scale graph is gone");
   // presence-keyed, like the strip
-  assert.ok(usageJS.includes("function hasSpend(u){return !!(u&&u.spend&&u.spend.fiveHour);}"));
+  assert.ok(usageJS.includes("function hasSpend(u){return !!(u&&u.spend&&(u.spend.day||u.spend.fiveHour));}"));
 });
 
 test("one display name per window, worn everywhere: bars, hover sections, API cell, notices", () => {

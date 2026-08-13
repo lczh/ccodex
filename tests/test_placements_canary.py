@@ -116,7 +116,10 @@ class PlacementIdentityCanary(unittest.TestCase):
         # without a bump) should both fail loudly.
         # v6 (2026-07-22, the uuid-anchored text-less seg id) shifted the LAST pinned id off da39a3ee;
         # text-bearing ids are unchanged. Pins and version re-recorded together.
-        self.assertEqual(jd.PLACEMENTS_V, 7, "EXPECTED_SEG_IDS was pinned under PLACEMENTS_V=7 — "
+        # v8 (2026-08-13, the shape-B twin drop): this fixture carries no command wrappers, so every
+        # pinned id is UNCHANGED — the bump seals transcripts that DO carry shape-B commands, whose
+        # phantom twin atom drops out of the set.
+        self.assertEqual(jd.PLACEMENTS_V, 8, "EXPECTED_SEG_IDS was pinned under PLACEMENTS_V=8 — "
                          "re-pin the ids and this version together, in the same commit")
 
 

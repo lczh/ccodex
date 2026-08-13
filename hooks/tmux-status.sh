@@ -103,6 +103,15 @@ if [[ "$DISPLAY_TMUX" == 1 ]]; then
         if [[ -f "$ndir/$sid" && ! -e "$ndir/$HOOK_SID" ]]; then
             cp "$ndir/$sid" "$ndir/$HOOK_SID" 2>/dev/null || true
         fi
+        # Record the SUCCESSION this hook is the sole witness of (2026-08-13), BEFORE the var flip
+        # makes the old fsid's departure observable to the kernel's death sweep: at the pane, a
+        # /clear'd-or-resumed-away lane and a genuine death look identical (the sid vanishes from the
+        # live scan while its name stays occupied) — this row is what tells them apart, vetoing the
+        # death stamp so the episode machinery keeps owning supersessions. Second-shape row (no
+        # "state" key, like the awaiting overlays), so every state-keyed reader already skips it.
+        sdir="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}/states"
+        mkdir -p "$sdir" 2>/dev/null || true
+        printf '{"t":%s,"supersededBy":"%s"}\n' "$(date +%s)" "$HOOK_SID" >> "$sdir/$sid.jsonl" 2>/dev/null || true
         tmux set -t "$session_name" @romp-session-id "$HOOK_SID" 2>/dev/null || true
         sid="$HOOK_SID"                                 # everything below (state log, etc.) uses the LIVE fsid now
     fi

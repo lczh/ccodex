@@ -119,15 +119,13 @@ class RailUsage(unittest.TestCase):
                       self.html, "the reading survives the roll — it is last-known, not zeroed")
         self.assertIn("var tp=(!rolled&&seg.resetsAt&&w[1])", self.html,
                       "no pace bar against a window that already ended")
-        # NO BARS at all (round 2): a fill of any length asserts a value we do not have, so the bars'
-        # slot holds only a '?'. The last-known number survives in the tooltip, labelled as such.
-        # (2026-08-08: the aggregate draws the '?' only when EVERY host's reading of that window has
-        # rolled — one live reading is a real value, and an unknown never counts as one.)
-        self.assertIn("if(d.unk){anyRolled=true;return;}", self.html,
+        # NOT DRAWN at all (the user 2026-08-13; supersedes the 2026-07-31 '?' slot): the bar shows
+        # only what we know — an all-unknown window contributes no row. The last-known number keeps
+        # living in the tooltip, labelled as such (the pins below).
+        self.assertIn("if(d.unk)return;", self.html,
                       "a rolled reading never competes as a value in the aggregate")
-        self.assertIn(":'<div class=ru-bars><div class=ru-qmark>?</div></div>'", self.html,
-                      "an all-unknown window draws a '?' where its bars would be")
-        self.assertIn(".ru-qmark{width:54px", self.html, "the mark takes the bars' width, so rows stay aligned")
+        self.assertIn("if(!best)return;", self.html, "no known reading → no row at all")
+        self.assertNotIn("ru-qmark", self.html, "the '?' slot is gone from the bar")
         self.assertNotIn(".ru-unk .ru-fill{opacity:.3}", self.html, "no faded fill on the face any more")
         self.assertIn("<span class=ru-tip-k>last known</span>", self.html,
                       "the hover is the ONE place the stale number appears, and it says what it is")

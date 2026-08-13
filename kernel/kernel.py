@@ -13,7 +13,7 @@ Run:  bin/romp-kernel   → opens http://127.0.0.1:29855
 """
 import json, os, queue, random, re, signal, socket, sys, time, threading, traceback, base64, bisect, errno, hashlib, hmac, struct, subprocess, shutil, shlex, http.client, uuid
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote, urlencode
@@ -640,8 +640,16 @@ _cancel_pending = set()
 
 # ───────────────────────── helpers ─────────────────────────
 def iso(t):
+    """Epoch → the ISO-8601 UTC ('…Z') form the CLI's own transcript records wear.
+
+    The offset suffix is LOAD-BEARING: these strings ship in chat-event payloads and the client
+    recovers the epoch with Date.parse (render.ts eventEpoch), which reads an OFFSET-LESS string in
+    the BROWSER's timezone. The old naive form (box-local wall clock, no suffix) therefore rendered
+    every rail stamp at the kernel's wall time instead of the viewer's — invisible while both sat in
+    one timezone, wrong by the whole UTC offset the moment they didn't (found reading a UTC box's
+    dashboard from a laptop in another timezone)."""
     try:
-        return datetime.fromtimestamp(t).strftime("%Y-%m-%dT%H:%M:%S")
+        return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     except Exception:
         return ""
 
@@ -1244,12 +1252,31 @@ def _alive_sessions(now, tmux):
     So: tmux reachable (sessions present, or a tmux binary exists) → trust the empty result and show
     only living sessions; no tmux at all → fall back so a headless box isn't blank."""
     alive = [s for s in _sessions(now) if s["sid"] in tmux]
+    # LIVE IS ALWAYS VISIBLE (2026-08-13, generalizing the SDK-only exception below): a genuinely
+    # LIVE sid missing from the 48h _sessions set — a session idle longer than the caption window,
+    # which used to silently VANISH from every surface while still running — resolves through
+    # discover's cached wide walk (the picker's own (window, forks) cache key: one filesystem walk,
+    # not one per session). Liveness owns visibility; age owns nothing but caption/walk cost.
+    have = {s["sid"] for s in alive}
+    stale_live = [sid for sid in tmux if sid not in have]
+    if stale_live:
+        wide = {f[0]: f for f in jd.discover(now, window=jd.DEATH_BACKFILL_WINDOW)}
+        for sid in stale_live:
+            ent = wide.get(sid)
+            if ent is not None:
+                fsid, path, anchor, name = ent
+                try:
+                    mtime = os.stat(path).st_mtime
+                except OSError:
+                    mtime = 0
+                alive.append({"sid": fsid, "name": name or fsid[:8], "anchor": anchor,
+                              "path": str(path), "mtime": mtime})
+                have.add(sid)
     # SDK sessions that are alive (in the merged `tmux` map) but have no transcript on disk yet — a
     # just-created or never-run SDK session — aren't in discover()/_sessions, so add them here, else
     # their tab never opens (the user 2026-06-22). Once they run and write a transcript, discover takes over.
     be = _sdk()
     if be:
-        have = {s["sid"] for s in alive}
         for sid in tmux:
             if sid not in have and be.owns(sid):
                 alive.append(_sdk_sess(sid, now))
@@ -2954,7 +2981,10 @@ def _lift_spent_awaiting(now, tmux):
                     jd.save_goals(sid, store)
                     _mark_views_dirty()
                 continue
-            running = {t.get("id") for t in every if t.get("status") == "running"}
+            # a monitor past its recorded lifetime ceiling counts as RETURNED even with no terminal
+            # record (its CLI died mid-watch; the notification can never arrive) — see em._bg_expired
+            running = {t.get("id") for t in every
+                       if t.get("status") == "running" and not em._bg_expired(t, now)}
             placed = _bg_placed_tops(sid, s["path"], [t.get("id") for t in every])
             def _top_of(x):
                 seen = set()
@@ -5176,7 +5206,11 @@ def _drive(msg, client):
         # messageless cardMove is the cautionary tale: a move with no message adds no information, so
         # its natural end state was parked-in-Working. Human-authored like the modal's canned Check
         # status (no romp-injected marker): the gesture asserts the USER's own state, in their voice.
-        text = CONTINUE_TEXT if msg.get("cont") else str(msg["text"])
+        # The romp-canned marker (the user 2026-08-13) tells the CHAT ONLY that these are canned words
+        # behind a gesture, not typed prose — the bubble stays blue and folds to a "Continue" gist.
+        # Comment form (the markers rule); the agent ignores it like every romp-* comment; authorship,
+        # judge filing, and the planner's view are all unchanged.
+        text = (CONTINUE_TEXT + "\n\n<!-- romp-canned: continue -->") if msg.get("cont") else str(msg["text"])
         body = (_followup_body(iid, msg.get("title"), text, injected=bool(msg.get("nudge")))
                 if iid else text)
         # Optimistic echo for a tmux follow-up/nudge (the user 2026-06-29): without it, a follow-up sent while
@@ -5338,7 +5372,8 @@ def _drive(msg, client):
             client["send"](json.dumps({"type": "warn", "text": err}))
     elif t == "endSession":
         sys.stderr.write("kill: %s via endSession WS op\n" % sid)   # kill attribution (the user 2026-07-16)
-        be.kill(sid); _send_to_app("chat", {"type": "closed", "id": sid}); _push_soon()
+        be.kill(sid); _record_death(sid, int(time.time()), "kill")   # the one SDK event with no designed reviver
+        _send_to_app("chat", {"type": "closed", "id": sid}); _push_soon()
     elif t == "renameSession" and msg.get("name"):
         new = str(msg["name"]).strip()
         if not NAME_RE.match(new):
@@ -5641,6 +5676,27 @@ class TmuxBackend(sb.SessionBackend):
     def list_lines(self, fmt, t=2.5):
         r = self._run(["list-sessions", "-F", fmt], t)
         return r.stdout.splitlines() if (r and r.returncode == 0) else []
+
+    def alive_sids(self, t=3):
+        """The set of romp session ids the tmux SERVER answers for right now — the death writers'
+        corroboration primitive (2026-08-13). Identity-true: reads @romp-session-id, the key every
+        sid-keyed contract method resolves through — never a NAME (same-named generations coexist,
+        which is the whole reason kill-by-name is refused; a name probe would read a dead session as
+        alive whenever a different generation currently bears its name). None ONLY on a real probe
+        failure (exec error/timeout): a death writer must stand down then — never inherit
+        list_lines' error→[] collapse, which would read the whole board as dead. A NONZERO exit
+        whose stderr names a missing server IS the authoritative zero-sessions answer (verified:
+        `list-sessions` with no server exits 1 with 'error connecting … No such file or directory')
+        — the mass-death/reboot shape, and the boot backfill's normal world."""
+        r = self._run(["list-sessions", "-F", "#{@romp-session-id}"], t)
+        if r is None:
+            return None
+        if r.returncode != 0:
+            err = (r.stderr or "").lower()
+            if "no server running" in err or "error connecting" in err:
+                return set()
+            return None
+        return {ln.strip() for ln in r.stdout.splitlines() if ln.strip()}
 
     def send_keys(self, name, *keys, t=3):
         self._fire(["send-keys", "-t", name, *keys], t)
@@ -6086,6 +6142,7 @@ class Sessions:
                                 "retryCount": int(st.get("retryCount") or 0),   # api_retry backoff attempts → the chat's "API retrying — attempt N…" element
                                 "retryInfo": st.get("retryInfo") or None,   # the attempt's detail (attempt/max, error, next-attempt epoch) → the retrying element's context lines (the user 2026-07-10)
                                 "connected": bool(st.get("connected")),   # SDK handshake up → the opening-chip override stands down (fresh sessions have no transcript yet)
+                                "spawning": bool(st.get("spawning")),   # spawn/handshake in flight NOW — the ONLY window the opening chip covers (a dormant created session must read ready, the user 2026-08-13)
                                 "context": ctx if isinstance(ctx, (int, float)) else None, "compactPct": None,
                                 "fast": st.get("fast", ""),   # fast-mode state from the CLI's init ("on"/"off"/"cooldown"; "" = unknown → no badge)
                                 "fastReason": st.get("fastReason", ""),   # init's disabled_reason — non-empty hides the chat toggle
@@ -9115,6 +9172,128 @@ def _interrupt(name, _async=True):
     threading.Thread(target=go, daemon=True).start() if _async else go()
 
 
+_prev_live_sids = [None]   # last cycle's live-map sids — the set-diff death TRIGGER; corroboration decides
+
+
+def _death_sweep_tick(now, tmux):
+    """Stamp deaths as they happen: a sid that LEFT the live map since the last cycle is a candidate,
+    and the liveness OWNER answers before anything is written (per-batch TmuxBackend.alive_sids —
+    identity-true; probe failure → loud no-op, never a stamp). SDK-owned sids are skipped here: their
+    death event is the kill gesture (reg alive:False partitions ownership — alive:True is
+    revivable/crash-looped and must NEVER be stamped, the boot-resume contract rides on that bit)."""
+    cur = set(tmux or {})
+    prev = _prev_live_sids[0]
+    _prev_live_sids[0] = cur
+    if prev is None:
+        return
+    departed = [sid for sid in prev - cur if not (jd.SDKDIR / (sid + ".json")).exists()]
+    scan = None
+    for sid in departed:
+        if not _death_stamp_due(sid):
+            continue
+        if scan is None:
+            scan = _TMUX.alive_sids() if _TMUX.available() else set()
+            if scan is None:
+                sys.stderr.write("death-sweep: liveness probe failed — no stamps this tick\n")
+                return
+        if sid in scan:
+            continue                                 # the owner says alive — our snapshot blinked, not the session
+        _record_death(sid, now, "gone")
+
+
+def _death_boot_pass(now=None):
+    """One boot walk over the names/ registry (every romp session ever, tmux included — reg-less tmux
+    sids live only here): stamp the deaths no kernel was up to see. Same gate as the tick writer, so
+    it also covers re-deaths-after-revival that happened while the kernel was down, and the whole
+    upgrade backfill. SDK-owned sids stamp only on reg alive:False; tmux sids only when the fresh
+    identity scan lacks them; a failed probe stands down loudly."""
+    now = int(now or time.time())
+    if not jd.NAMES.is_dir():
+        return
+    scan = _TMUX.alive_sids() if _TMUX.available() else set()   # headless: no server IS zero-alive
+    if scan is None:
+        sys.stderr.write("death-boot: liveness probe failed — tmux sids skipped this boot\n")
+    n = 0
+    for f in sorted(jd.NAMES.iterdir()):
+        sid = f.name
+        reg = jd.SDKDIR / (sid + ".json")
+        if reg.exists():
+            try:
+                if bool(json.loads(reg.read_text()).get("alive")):
+                    continue                         # revivable/crash-looped: the resume contract owns it
+            except Exception:
+                continue
+        else:
+            if scan is None or sid in scan:
+                continue                             # probe failed (stand down) or genuinely alive
+        if _record_death(sid, now, "boot"):
+            n += 1
+    if n:
+        sys.stderr.write("death-boot: recorded %d session death(s) from before this kernel\n" % n)
+
+
+def _last_states_row(sid):
+    """The newest row of states/<sid>.jsonl, any shape (state rows, awaiting overlays, the re-anchor's
+    supersededBy row) — the death writers' idempotence/veto read. Event-rate only (a kill gesture, a
+    set-diff departure, one boot pass); never on a per-push path."""
+    try:
+        rows = (jd.STATE / "states" / (sid + ".jsonl")).read_text().splitlines()
+        for ln in reversed(rows):
+            try:
+                r = json.loads(ln)
+                if isinstance(r, dict):
+                    return r
+            except ValueError:
+                continue
+    except OSError:
+        pass
+    return None
+
+
+def _death_stamp_due(sid):
+    """May a death be recorded for this sid RIGHT NOW? One shared predicate for all three writers
+    (2026-08-13). Not due when the newest states row is a SUPERSESSION (the re-anchor hook's
+    supersededBy row — the fsid was re-anchored away, which the episode machinery owns; at the pane a
+    /clear'd lane and a death look identical, so only the recorded event tells them apart). Otherwise
+    due iff no marker exists, or a states row POSTDATES the marker — idempotence keyed on the marker
+    being the NEWEST event, not on file presence, so die → revive → die is recordable every cycle
+    (the first design keyed on presence, which made every death after the first invisible)."""
+    last = _last_states_row(sid)
+    if last is not None and last.get("supersededBy") and "state" not in last:
+        return False
+    m = None
+    try:
+        m = json.loads((jd.STATE / "gone" / (sid + ".json")).read_text())
+    except Exception:
+        m = None
+    if not isinstance(m, dict):
+        return True
+    return int((last or {}).get("t") or 0) > int(m.get("t") or 0)
+
+
+def _record_death(sid, now, by):
+    """Record a session's death: the marker (STATE/gone/<sid>.json, atomically — a re-stamp drops any
+    prior endedAt, re-arming the finalize) plus ONE plain idle row via _record_idle, byte-identical to
+    a Stop-hook idle so the states vocabulary stays one-flavored and every downstream (the idle atom,
+    _session_closed, _turn_open, the closer sweep, rollup settle) finalizes with zero new judge code.
+    The marker's t matches the idle row's (now-1), so the writer's own row never reads as 'newer'
+    to _death_stamp_due — a repeat stamp with no intervening revival is a no-op by the time key."""
+    if not sid or not _death_stamp_due(sid):
+        return False
+    try:
+        gd = jd.STATE / "gone"
+        gd.mkdir(parents=True, exist_ok=True)
+        tmp = gd / (sid + ".json.tmp")
+        tmp.write_text(json.dumps({"t": int(now) - 1, "by": by}))
+        os.replace(tmp, gd / (sid + ".json"))
+    except Exception:
+        sys.stderr.write("record-death %s: %s\n" % (sid, traceback.format_exc()))
+        return False
+    _record_idle(sid, now)
+    sys.stderr.write("death: %s recorded (by %s)\n" % (sid, by))   # kill-attribution convention
+    return True
+
+
 def _record_idle(sid, now):
     """Append a state:"idle" transition to states/<sid>.jsonl so the session reads as DONE on the next build.
     The chat status chip is driven by the event-model open-turn signal (open turn + no idle atom): a normal
@@ -9736,7 +9915,9 @@ def _bg_live_norm(sid, path):
     sp = _sdk_spawned_at(sid)
     return [{"tid": tk.get("id"), "desc": str(tk.get("summary") or "").strip(), "t": int(tk.get("t") or 0),
              "type": str(tk.get("type") or "")}
-            for tk in _bg_scan_cached(path) if not (sp and tk.get("t") and tk["t"] < sp)]
+            for tk in _bg_scan_cached(path)
+            if not (sp and tk.get("t") and tk["t"] < sp)
+            and not em._bg_expired(tk, time.time())]   # a monitor past its lifetime ceiling is not a live wait
 
 
 def _bg_pending(sid, path, tasks):
@@ -10229,11 +10410,11 @@ _scan_bg_tasks = em._scan_bg_tasks   # moved to event_model (2026-08-08) — see
 
 
 def _sdk_spawned_at(sid):
-    """When this SDK session's CURRENT CLI spawned (reg spawnedAt, stamped by SdkSession._run), or None
-    for tmux/never-spawned sessions. The bg-tasks ghost gate: a task launched before the live CLI died
-    with its old one — its <task-notification> can never arrive. Delegates to the judge's copy (its
-    settled gate applies the same ghost rule) so the two can never drift."""
-    return jd._sdk_spawned_at(sid)
+    """The session's current CLI-epoch start — the bg-tasks ghost gate, backend-agnostic since
+    2026-08-13 (reg spawnedAt OR the recorded death marker, whichever is newer). Delegates to the
+    judge's _cli_epoch (its settled gate applies the same ghost rule) so the two can never drift;
+    the name stays for the existing call sites."""
+    return jd._cli_epoch(sid)
 
 
 def _bg_scan_cached(path):
@@ -12901,6 +13082,11 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None):
                                     ev["goal"] = fu_goal
                                 if fu_ctx:                       # the FULL stripped quote — the ↩ header expands to show it
                                     ev["fuCtx"] = fu_ctx
+                            if author == "human" and "<!-- romp-canned: continue -->" in text:
+                                # the card's Continue button (the user 2026-08-13): the USER's gesture with
+                                # romp's canned words — still blue, but the chat folds it to a gist instead
+                                # of posing the prose as typed. Comment form only, like romp-system above.
+                                ev["canned"] = "continue"
                             if author == "romp":         # a feed nudge/follow-up romp injected → gray romp bubble
                                 ev["romp"] = True
                                 if a.get("rompAuto"):    # an AUTO-nudge (not the Nudge button) → the chat draws the romp swirl
@@ -13343,22 +13529,25 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None):
         # compaction stalls. After that, blocked is the strongest signal — the turn ended in an error, so it
         # beats the live tmux states (the session can't simultaneously be at a permission prompt mid-error).
         chip = _session_chip(sid, sess["path"], session, tm, now)   # THE shared derivation — identical to the timeline lane (the user 2026-07-03)
-        # A session whose transcript DOESN'T EXIST YET is OPENING, whatever the snapshot claims (the
+        # A session whose transcript DOESN'T EXIST YET reads OPENING while its spawn is IN FLIGHT (the
         # user 2026-08-05: a just-spawned tab said "Working" over a clock with no honest base). The
-        # deciding event — "the CLI is up" — is per-backend. SDK: the handshake (tm.connected) — a
-        # fresh SDK session writes NO transcript until its first turn, so keying its chip on the file
-        # left a fully-up, idle session wearing the opening dots until the user's first message,
-        # indefinitely (the user 2026-08-08, who read minutes of dots as creation still running).
-        # tmux: the CLI's statusline hook publishing its first @claude-state — the same wait, the
-        # matching event (2026-08-10; the transcript's first record only lands with the first MESSAGE,
-        # so keying on the file alone held a fully-up tmux session on the dots until the user typed).
-        # SDK snapshots always carry a non-empty state ("waiting" from birth), so the state leg is
-        # tmux-only by construction (backend == "tmux"). Never for an override render (a closed
-        # episode's path is historical).
-        cli_up = bool(tm.get("connected")) or \
-            (tm.get("backend") == "tmux" and bool((tm.get("state") or "").strip()))
+        # window is per-backend. SDK: the backend's live `spawning` report (session thread up, client
+        # not yet; the handshake closes it) — a fresh SDK session writes NO transcript until its first
+        # turn, so keying its chip on the file left a fully-up, idle session wearing the opening dots
+        # until the user's first message, indefinitely (the user 2026-08-08, who read minutes of dots
+        # as creation still running). tmux: no @claude-state published yet — the statusline hook's
+        # first publish is the matching CLI-up event (2026-08-10; tmux panes and their state vars
+        # outlive kernel restarts, so that leg needs no dormant case). The SDK leg keys on `spawning`,
+        # NOT on `connected` being falsy: a DORMANT created session — every fresh SDK session after a
+        # kernel restart, since idle CLIs die with the kernel and boot reconcile leaves them lazy —
+        # also reports no `connected`, and reading that as "still opening" kept the dots up for HOURS
+        # on a session one message from answering (the user 2026-08-13, whose created-but-unmessaged
+        # session "opened" all morning). A dormant row carries no spawning key, so it reads ready — a
+        # send wakes it. Never for an override render (a closed episode's path is historical).
+        spawn_inflight = bool(tm.get("spawning")) or \
+            (tm.get("backend") == "tmux" and not (tm.get("state") or "").strip())
         if chip in ("working", "ready") and not path_override and not os.path.exists(sess["path"]) \
-                and not cli_up:
+                and spawn_inflight:
             chip = "opening"
         faded = chip == "ready" and bool(tm["since"]) and now - tm["since"] > 3600
         # apiTooLong distinguishes a "prompt is too long" block (on YOU → red dashed tab) from a TRANSIENT API
@@ -14464,8 +14653,20 @@ def _boundary_clear_notices(alive):
     mirrors each into the shell's notification bell exactly once (client seen-set), so a clear that
     dropped open cards is always visible after the fact instead of the cards silently leaving the
     board (the user 2026-07-27). Newest-only bounds the payload; the log read is an mtime memo, so
-    this is cheap per push."""
+    this is cheap per push.
+
+    Since 2026-08-13 the same channel carries a DEAD session's end: the death finalize appends an
+    'ended:' settle record when a session died with cards still open, and those sessions are by
+    definition NOT in `alive` — so a second sweep reads the death-finalized sids (the gone/ markers,
+    endedAt-stamped, non-superseded) and mirrors their newest 'ended:' record too. Cards end loudly
+    instead of vanishing. One payload-only guard: no bell when the record's snapshotted NAME is
+    currently borne by a LIVE session under a different sid — the lifecycle on disk is identical,
+    only the interrupt is suppressed, because "web ended" ringing while a live web sits in front of
+    the user misreads as being about the live one (name reuse, and every pre-upgrade re-anchored
+    /clear lane the boot backfill stamps)."""
     out = []
+    live_names = {s["name"] for s in alive}
+    live_sids = {s["sid"] for s in alive}
     for s in alive:
         try:
             settles = jd.episode_settles(s["sid"])
@@ -14475,6 +14676,32 @@ def _boundary_clear_notices(alive):
             continue
         r = max(settles.values(), key=lambda x: x.get("t") or 0)
         out.append({"sid": s["sid"], "name": s["name"], "t": r.get("t") or 0,
+                    "titles": [str(d.get("text") or "") for d in (r.get("settled") or [])]})
+    try:
+        gone = [p.name[:-5] for p in (jd.STATE / "gone").iterdir() if p.name.endswith(".json")]
+    except OSError:
+        gone = []
+    for sid in gone:
+        if sid in live_sids:
+            continue
+        m = jd._death_marker(sid)
+        if not isinstance(m, dict) or "endedAt" not in m or m.get("superseded") or m.get("noTranscript"):
+            continue
+        try:
+            settles = jd.episode_settles(sid)
+        except Exception:
+            continue
+        ended = [v for k, v in settles.items() if str(k).startswith("ended:")]
+        if not ended:
+            continue                                   # died with nothing open: records on disk, no interrupt
+        r = max(ended, key=lambda x: x.get("t") or 0)
+        try:
+            name = (jd.NAMES / sid).read_text().split("\t")[0].strip()
+        except Exception:
+            name = sid[:8]
+        if name in live_names:
+            continue                                   # the payload-only name-reuse guard (see docstring)
+        out.append({"sid": sid, "name": name, "t": r.get("t") or 0, "ended": True,
                     "titles": [str(d.get("text") or "") for d in (r.get("settled") or [])]})
     return out
 
@@ -15484,7 +15711,7 @@ def _usage():
     # dollars belong on the rail next to the login's real %.
     if _auth_key_present():
         ksp = _spend_windows(keyed_only=True)
-        if any((ksp.get(k) or {}).get("turns") for k in ("fiveHour", "sevenDay", "month")):
+        if any((ksp.get(k) or {}).get("turns") for k in ("day", "week", "month")):
             out["spend"] = ksp
     return out
 
@@ -15565,7 +15792,13 @@ def _spend_windows(keyed_only=False):
         return _sum(v for k, v in hours.items() if k in keys)
 
     month = time.strftime("%Y-%m")
+    # day/week are the API-key cell's windows (the user 2026-08-13: pay-per-token has no reset windows,
+    # so "one day / one week / one month" is the honest read; the hour ledger holds 192h = 8 days, so
+    # both fit). fiveHour/sevenDay stay emitted for ONE release: a remote host on an older kernel still
+    # sums its cell from them (version skew), and the strip reads day||fiveHour meanwhile. month stays
+    # calendar month-to-date — it matches the bill.
     win = {"fiveHour": _rolling(5), "sevenDay": _rolling(7 * 24),
+           "day": _rolling(24), "week": _rolling(7 * 24),
            "month": _sum(v for k, v in days.items() if isinstance(k, str) and k.startswith(month))}
     for k, v in _spend_budgets().items():
         win[k]["budget"] = v
@@ -16255,23 +16488,77 @@ def _session_tokens(path, t0):
     return acc
 
 
+# judge-usage.jsonl is append-only, time-ordered, and never rotated (38.7 MB / 148k lines measured
+# 2026-08-13) — and BOTH the analytics modal and EVERY timeline build used to re-read and re-parse it
+# in full, on the GIL, so a slow /analytics also froze the pusher and the whole dashboard with it (the
+# user 2026-08-13, who watched the cost modal sit on "loading…"). One shared incremental reader now:
+# rows parse ONCE, appends parse from the last byte offset, and rows older than the widest consumer
+# window (30 days, plus a day of slack) are pruned so memory stays bounded. A shrunken file (rotation,
+# a fresh install) resets cleanly.
+_JUDGE_USAGE_RETAIN = 31 * 86400
+_JUDGE_USAGE_CACHE = {"path": None, "size": -1, "mtime": 0.0, "rows": []}
+
+
+def _judge_usage_rows():
+    """Every parsed judge-usage row from the last ~31 days, incrementally maintained. Fully defensive —
+    a missing or garbled log never breaks a build; a mid-append partial line is left for the next read.
+    Keyed on the PATH too (a test repointing jd.STATE must never inherit another dir's offset — the
+    overrides-sandbox lesson) and reset on a same-size mtime change (an in-place rewrite)."""
+    p = jd.STATE / "judge-usage.jsonl"
+    c = _JUDGE_USAGE_CACHE
+    try:
+        st = os.stat(p)
+        size = st.st_size
+    except OSError:
+        c["path"], c["size"], c["rows"] = str(p), -1, []
+        return c["rows"]
+    if str(p) != c["path"]:
+        c["path"], c["size"], c["rows"] = str(p), -1, []
+    if size == c["size"] and st.st_mtime == c["mtime"]:
+        return c["rows"]
+    if size <= c["size"] or c["size"] < 0:
+        c["size"], c["rows"] = 0, []                    # rotated/truncated/rewritten, or the first read
+    try:
+        with open(p, "rb") as fh:
+            fh.seek(c["size"])
+            chunk = fh.read()
+    except OSError:
+        return c["rows"]
+    cut = chunk.rfind(b"\n")
+    if cut < 0:
+        return c["rows"]                                # nothing complete beyond the offset yet
+    for ln in chunk[:cut].split(b"\n"):
+        if not ln.strip():
+            continue
+        try:
+            o = json.loads(ln.decode("utf-8", errors="replace"))
+        except Exception:
+            continue
+        if isinstance(o, dict):
+            c["rows"].append(o)
+    c["size"] += cut + 1
+    c["mtime"] = st.st_mtime
+    # retention keyed to the DATA's own newest row, never the wall clock (a replayed/synthetic log's
+    # history must not evaporate): rows arrive in time order, so prune the left edge only
+    newest = (c["rows"][-1].get("t") or 0) if c["rows"] else 0
+    floor = newest - _JUDGE_USAGE_RETAIN
+    if c["rows"] and (c["rows"][0].get("t") or 0) < floor:
+        i = 0
+        while i < len(c["rows"]) and (c["rows"][i].get("t") or 0) < floor:
+            i += 1
+        del c["rows"][:i]
+    return c["rows"]
+
+
 def _judge_usage(t0):
-    """Roll up the judge PIPELINE's token usage from judge-usage.jsonl (one line per judge call, written
-    by romp-judge) within [t0, now]: a grand total plus per-judge and per-tier {calls,in,out,cost,ms}.
-    Empty/zeros until the log exists. Fully defensive — a missing or garbled log never breaks the build."""
+    """Roll up the judge PIPELINE's token usage (one row per judge call, written by romp-judge) within
+    [t0, now]: a grand total plus per-judge and per-tier {calls,in,out,cost,ms}. Reads the shared
+    incremental row cache — never the file. Empty/zeros until the log exists."""
     def blank():
         return {"calls": 0, "in": 0, "out": 0, "cost": 0.0, "ms": 0}
     total, by_judge, by_tier = blank(), {}, {}
-    try:
-        lines = (jd.STATE / "judge-usage.jsonl").read_text(errors="replace").splitlines()
-    except OSError:
-        return {"total": total, "byJudge": by_judge, "byTier": by_tier}
-    for ln in lines:
-        try:
-            o = json.loads(ln)
-        except Exception:
-            continue
-        if not isinstance(o, dict) or (o.get("t") or 0) < t0:
+    for o in _judge_usage_rows():
+        if (o.get("t") or 0) < t0:
             continue
         for b in (total, by_judge.setdefault(o.get("judge") or "?", blank()),
                   by_tier.setdefault(o.get("tier") or "?", blank())):
@@ -16283,20 +16570,8 @@ def _judge_usage(t0):
     return {"total": total, "byJudge": by_judge, "byTier": by_tier}
 
 
-def _token_windows(paths, now):
-    """Token usage by the two windows Claude meters — 5h ("session") + 7d ("week") — each split into the
-    coding SESSIONS (summed transcript usage of `paths`) and the judge PIPELINE (_judge_usage), in/out kept
-    apart, cache_r carried for the tooltip. Both halves draw the same subscription quota, so the summed
-    in+out reflects what that window's /usage % is spending. Cheap: _session_tokens caches per-path rows,
-    so re-summing per window just re-iterates the cache."""
-    def split(t0):
-        s = {"in": 0, "out": 0, "cache_r": 0}
-        for p in paths:
-            d = _session_tokens(p, t0)
-            s["in"] += d["in"]; s["out"] += d["out"]; s["cache_r"] += d["cache_r"]
-        return {"sessions": s, "pipeline": _judge_usage(t0)}
-    return {"fiveHour": split(now - WIN_5H), "week": split(now - WIN_WEEK),
-            "windows": {"fiveHour": WIN_5H, "week": WIN_WEEK}}
+# (_token_windows, the footer's old fixed 5h/7d token split, was removed 2026-08-13 — it had no callers
+# left; the analytics modal's _token_analytics is the one arbitrary-window rollup.)
 
 
 # ── per-model $ prices for the cost-weighted analytics view ──────────────────────────────────────
@@ -16420,21 +16695,36 @@ def _session_cost(path, t0, prices):
     return c
 
 
+_ANALYTICS_MEMO = {}   # window -> {"t": epoch, "jkey": judge-usage cache size, "resp": the payload}
+
+
 def _token_analytics(now, window):
     """Token usage over the trailing `window` seconds for the analytics modal (the /analytics endpoint):
     the coding SESSIONS total (summed transcript usage of the discovered fleet) vs the judge PIPELINE
-    broken out per judge AND per tier (_judge_usage). One ARBITRARY window — the modal's period picker —
-    where the footer's _token_windows only does the two fixed Claude meters (5h/7d). Each side also carries
-    $ cost so the modal can toggle tokens↔cost without a refetch: judges = exact logged cost, sessions =
-    tokens × _model_prices. Cheap: _session_tokens caches per-path rows, so this re-sums the cache."""
+    broken out per judge AND per tier (_judge_usage). One ARBITRARY window — the modal's period picker.
+    Each side also carries $ cost so the modal can toggle tokens↔cost without a refetch: judges = exact
+    logged cost, sessions = tokens × _model_prices. Cheap: _session_tokens caches per-path rows and
+    _judge_usage reads the shared incremental row cache, so this re-sums memory."""
+    # a tiny TTL memo: the modal refetches on every period click and every reopen, and the recompute is
+    # honest-but-pointless within seconds of itself (the user 2026-08-13's fast-and-visible rule); a new
+    # judge row (cache size moved) invalidates early so the numbers never sit stale behind live judging
+    memo = _ANALYTICS_MEMO.get(window)
+    jkey = _JUDGE_USAGE_CACHE["size"]
+    if memo and memo["jkey"] == jkey and now - memo["t"] < 15:
+        return memo["resp"]
     t0 = now - window
     prices = _model_prices(now)
     s = {"in": 0, "out": 0, "cost": 0.0}
-    for fsid, path, anchor, name in jd.discover(now):
+    # discover at the MODAL's window, never the 48h default: the 7d/30d views used to sum judges over
+    # the full window but sessions over only the last 48h of activity — the "judges = N% of session
+    # cost" note was wrong there by construction (the user 2026-08-13's map)
+    for fsid, path, anchor, name in jd.discover(now, window=max(window, 48 * 3600)):
         d = _session_tokens(str(path), t0)
         s["in"] += d["in"]; s["out"] += d["out"]
         s["cost"] += _session_cost(str(path), t0, prices)
-    return {"window": window, "now": now, "sessions": s, "judges": _judge_usage(t0)}
+    resp = {"window": window, "now": now, "sessions": s, "judges": _judge_usage(t0)}
+    _ANALYTICS_MEMO[window] = {"t": now, "jkey": _JUDGE_USAGE_CACHE["size"], "resp": resp}
+    return resp
 
 
 # Usage/error logs carry one name per distinct prompt (the user 2026-07-08): gister, opener, placer,
@@ -16457,15 +16747,9 @@ def _attach_run_usage(judging, t0, alive_sids):
         mk["ms"] = mk["in"] = mk["out"] = 0
         mk["sent"] = mk["recv"] = None
     runs = {}                                            # (sid, judge) -> [{t,ms,in,out,sent,recv}] sorted by t
-    try:
-        lines = (jd.STATE / "judge-usage.jsonl").read_text(errors="replace").splitlines()
-    except OSError:
-        return
-    for ln in lines:
-        try:
-            o = json.loads(ln)
-        except Exception:
-            continue
+    # the shared incremental row cache (_judge_usage_rows) — this used to re-read + re-parse the whole
+    # append-only log on EVERY timeline build (0.46s at 38.7 MB, on the GIL, growing without bound)
+    for o in _judge_usage_rows():
         t, sid = o.get("t"), o.get("fsid")
         if not isinstance(t, (int, float)) or t < t0 or sid not in alive_sids:
             continue
@@ -16906,13 +17190,24 @@ def _ws_recv(rfile):
     masked = b[1] & 0x80
     ln = b[1] & 0x7F
     if ln == 126:
-        ln = struct.unpack(">H", rfile.read(2))[0]
+        ext = rfile.read(2)
+        if len(ext) < 2:
+            return None, None, True
+        ln = struct.unpack(">H", ext)[0]
     elif ln == 127:
-        ln = struct.unpack(">Q", rfile.read(8))[0]
+        ext = rfile.read(8)
+        if len(ext) < 8:
+            return None, None, True
+        ln = struct.unpack(">Q", ext)[0]
     mask = rfile.read(4) if masked else b"\x00\x00\x00\x00"
-    payload = bytearray(rfile.read(ln))
-    for i in range(len(payload)):
-        payload[i] ^= mask[i % 4]
+    payload = rfile.read(ln)
+    if len(mask) < 4 or len(payload) < ln:   # EOF mid-frame → a clean close, not a struct.error crash
+        return None, None, True
+    if masked and ln:
+        # C-speed unmask via big-int XOR: a per-byte Python loop takes seconds on a multi-MB
+        # attachment frame, blocking this client's reader thread the whole time.
+        rep = (mask * (ln // 4 + 1))[:ln]
+        payload = (int.from_bytes(payload, "big") ^ int.from_bytes(rep, "big")).to_bytes(ln, "big")
     return opcode, bytes(payload), fin
 
 
@@ -18742,6 +19037,10 @@ def _pusher_cycle_jobs(now, tmux, any_client):
         _lift_spent_awaiting(now, tmux)   # so the nudge tick below never wakes a wait that already ended
     except Exception:
         sys.stderr.write("awaiting-lift: %s\n" % traceback.format_exc())
+    try:                                  # death is a recorded EVENT: a sid that left the live map is
+        _death_sweep_tick(now, tmux)      # corroborated with the liveness owner, then stamped (2026-08-13)
+    except Exception:
+        sys.stderr.write("death-sweep: %s\n" % traceback.format_exc())
     try:                                  # deferral records retire on their reasons' own events — BEFORE
         _deferral_sweep_tick(now)         # the walk, independent of the nudge toggle (the stall/swirl
     except Exception:                     # surfaces read these records regardless)
@@ -19667,12 +19966,14 @@ function hasBars(u){return !!(u&&(u.fiveHour||u.sevenDay||u.fable));}
 // machine, spend INSTEAD of bars); with per-session auth one host carries bars AND its key's spend at
 // once (the user 2026-08-08), so presence of the windows is the whole test. strip.ts carries the same
 // branch; the two copies must stay in step (rail-spend pins).
-function hasSpend(u){return !!(u&&u.spend&&u.spend.fiveHour);}
+function hasSpend(u){return !!(u&&u.spend&&(u.spend.day||u.spend.fiveHour));}
 function fmtTok(n){if(n>=1e9)return (n/1e9).toFixed(1).replace(/\.0$/,'')+'B';
 if(n>=1e6)return (n/1e6).toFixed(1).replace(/\.0$/,'')+'M';
 if(n>=1e3)return (n/1e3).toFixed(1).replace(/\.0$/,'')+'k';return String(n);}
 function fmtUsd(v){return '$'+String(Math.round(v));}   // whole dollars everywhere — no cents (the user 2026-08-09)
-var SPEND_WINS=[['fiveHour','5 hours'],['sevenDay','7 days'],['month','Month']];
+// pay-per-token has no reset windows (the user 2026-08-13): the key's story is 1 day / 1 week / 1 month.
+// fiveHour/sevenDay fallbacks remain readable from older remote kernels (version skew) via day||fiveHour.
+var SPEND_WINS=[['day','1 day'],['week','1 week'],['month','1 month']];
 // The per-host SPEND detail for the rich hover: plain NUMBERS per window (dollars, tokens, turns).
 // No bars anywhere for spend (the user 2026-08-08: the spend bar graphs told you nothing. The old
 // hover scaled each window's bar to the largest window, a shape with no meaning, and the budget-fill
@@ -19700,25 +20001,24 @@ det[w[0]]={name:w[2],pct:pct,col:col,tp:tp,unk:rolled,ago:(rolled?fmtAgo(seg.res
 // every reporter has ROLLED is unknown ('?'), exactly as a single account's was; a shared login on two
 // hosts reports the same number twice and the max collapses it for free.
 function aggBarsHTML(live){var html='';
-WINS.forEach(function(w){var best=null,anyRolled=false;
+WINS.forEach(function(w){var best=null;
 live.forEach(function(e){var d=e.det[w[0]];if(!d)return;
-if(d.unk){anyRolled=true;return;}
+if(d.unk)return;
 if(!best||d.pct>best.pct)best=d;});
-if(!best&&!anyRolled)return;
+if(!best)return;
 // Horizontal fill bars (the user 2026-07-05): an expanded label, then TWO stacked horizontal tracks: the
 // used-% bar (colormap colour) ON TOP of the elapsed-% bar (slate) so you can compare pace at a glance (used
 // ahead of elapsed = burning too fast), then the used-% readout. All inline (label \u00b7 bars \u00b7 %).
-// An UNKNOWN window draws NO BARS (the user 2026-07-31, round 2): a faded last-known fill still
-// asserts a value we do not have; the length itself is the lie. Its slot holds a single '?' so the
-// rows stay aligned, and the last-known number lives in the hover, labelled as such.
-html+='<div class="ru-w'+(best?'':' ru-unk')+'" data-w="'+w[0]+'">'
+// An UNKNOWN window is not drawn AT ALL on the bar (the user 2026-08-13; supersedes the 2026-07-31 '?'
+// slot): the bar shows only what we know, and the last-known number keeps living in the hover,
+// labelled as such (winDet still computes unk/ago for exactly that).
+html+='<div class="ru-w" data-w="'+w[0]+'">'
 +'<div class=ru-name>'+w[2]+'</div>'
-+(best?('<div class=ru-bars>'
++'<div class=ru-bars>'
 +'<div class=ru-track><i class=ru-fill style="width:'+best.pct+'%;background:'+best.col+'"></i></div>'
 +'<div class=ru-track><i class=ru-fill style="width:'+(best.tp||0)+'%;background:#6b7a8c"></i></div>'
 +'</div>'
-+'<div class=ru-pct>'+best.pct+'%</div>')
-:'<div class=ru-bars><div class=ru-qmark>?</div></div>')
++'<div class=ru-pct>'+best.pct+'%</div>'
 +'</div>';});
 return html;}
 // The API cell (the user 2026-08-08): ONE compact entry for everything key-billed across the fleet \u2014
@@ -19729,15 +20029,19 @@ return html;}
 // constant 'API' \u2014 no fragment of any key, not even a last-4 tail, reaches a surface (2026-08-08,
 // evening: a tail is still key material, and the hover's HOST names already tell whose spend is
 // whose). The full per-window, per-host breakdown is the hover's job.
-function apiCellHTML(live){var sum={fiveHour:{usd:0,tok:0},month:{usd:0,tok:0}},any=false;
+function apiCellHTML(live){var sum={day:{usd:0,tok:0},month:{usd:0,tok:0}},any=false;
 live.forEach(function(e){var sp=e.det._spend;if(!sp)return;any=true;
-['fiveHour','month'].forEach(function(k){var s=sp[k];if(s){sum[k].usd+=s.usd;sum[k].tok+=s.tok||0;}});});
+// day||fiveHour: an older remote kernel ships no 'day' window yet (version skew) \u2014 its 5h burn is the
+// closest honest stand-in until it updates, and dropping it entirely would blank that host's spend
+var d=sp.day||sp.fiveHour,m=sp.month;
+if(d){sum.day.usd+=d.usd;sum.day.tok+=d.tok||0;}
+if(m){sum.month.usd+=m.usd;sum.month.tok+=m.tok||0;}});
 if(!any)return '';
 var seg=function(k,lbl){return '<div class=ru-name>'+lbl+'</div>'
 +'<div class=ru-pct>'+fmtUsd(sum[k].usd)+' \u00b7 '+fmtTok(sum[k].tok)+' tok</div>';};
 return '<div class="ru-w ru-api">'
 +'<div class=ru-name>API</div>'
-+seg('fiveHour','5 hours')+seg('month','Month')
++seg('day','1 day')+seg('month','1 month')
 +'</div>';}
 // The collapsed rail is the AGGREGATE story (the user 2026-08-08; supersedes the one-set-per-account
 // rendering of 2026-07-30): one set of window bars for the whole fleet plus one API cell, never a
@@ -20588,6 +20892,12 @@ var B=bar.querySelectorAll('button'),KT='romp-mobile-tab';
 function show(p){if(!F[p])return;document.body.setAttribute('data-tab',p);for(var k in F)F[k].classList.toggle('m-on',k===p);
 for(var i=0;i<B.length;i++)B[i].classList.toggle('on',B[i].getAttribute('data-pane')===p);
 try{localStorage.setItem(KT,p);}catch(e){}}
+// A REVEAL un-hides a desktop-toggled-off pane before the mobile tab switch (the user 2026-08-13: a feed
+// click that jumps into a CLOSED chat used to land invisibly — the hidden iframe's WS stays live, so the
+// scroll ran under display:none and nothing appeared to happen). Same __rompPaneToggle(…, true) the Log
+// jump (feed) and toggleFleet (chat) precedents use; it persists via romp-panes like any manual toggle.
+// Guarded: the collapse script that defines __rompPaneToggle parses after this one — fine at message time.
+function reveal(p){try{window.__rompPaneToggle&&window.__rompPaneToggle(p,true);}catch(e){}show(p);}
 for(var i=0;i<B.length;i++)(function(b){var pk=b.getAttribute('data-pane');if(pk){b.addEventListener('click',function(){show(pk);});}})(B[i]);
 // the rail's actions on mobile: settings opens the feed iframe's modal (same path as the desktop
 // gear), net opens the shell's remotes panel, usage opens the tooltip's window bars as a modal, and
@@ -20599,7 +20909,7 @@ restart:function(){try{window.__rompRestart&&window.__rompRestart();}catch(e){}}
 errs:function(){try{window.__rompOpenErrs&&window.__rompOpenErrs();}catch(e){}}};
 Array.prototype.forEach.call(bar.querySelectorAll('button[data-act]'),function(b){
 b.addEventListener('click',function(){var f=A[b.getAttribute('data-act')];if(f)f();});});
-window.addEventListener('message',function(e){var m=e.data;if(!m)return;if(m.romp==='reveal'&&m.pane)show(m.pane);// the chat header's Fleet pill / the fleet's back-to-chat post toggleFleet — on mobile that IS a tab switch
+window.addEventListener('message',function(e){var m=e.data;if(!m)return;if(m.romp==='reveal'&&m.pane)reveal(m.pane);// the chat header's Fleet pill / the fleet's back-to-chat post toggleFleet — on mobile that IS a tab switch
 if(m.romp==='toggleFleet')show(m.to==='chat'?'chat':'fleet');});
 function shellWS(){try{var proto=location.protocol==='https:'?'wss://':'ws://';
 var ws=new WebSocket(proto+location.host+'/ws?app=shell');
@@ -20607,7 +20917,7 @@ var ws=new WebSocket(proto+location.host+'/ws?app=shell');
 // its icon badge immediately instead of waiting for the next change (plans/ios-app.md proposal 3)
 ws.onopen=function(){try{ws.send(JSON.stringify({type:'ready'}));}catch(e){}};
 ws.onmessage=function(ev){var m;try{m=JSON.parse(ev.data);}catch(e){return;}
-if(m&&m.type==='reveal'&&m.pane)show(m.pane);
+if(m&&m.type==='reveal'&&m.pane)reveal(m.pane);
 // the app-icon badge: setAppBadge only exists where badging works (installed apps) — everyone
 // else falls through silently, so this needs no capability gymnastics
 else if(m&&m.type==='badge'&&'setAppBadge' in navigator){
@@ -21283,11 +21593,9 @@ def _landing():
             ".ru-bars{display:flex;flex-direction:column;gap:2px;flex:0 0 auto}"   # used bar stacked over elapsed bar
             ".ru-track{position:relative;width:54px;height:5px;background:rgba(255,255,255,0.12);border-radius:3px;overflow:hidden;flex:0 0 auto}"
             ".ru-fill{position:absolute;left:0;top:0;height:100%;border-radius:3px;transition:width .3s ease}"
-            # UNKNOWN (the user 2026-07-31): a rolled window draws NO bars at all — a fill of any length
-            # asserts a value we do not have — only a '?' in the bars' slot. The last-known reading survives
-            # in the tooltip, labelled "last known" and faded, which is honest because it says what it is.
-            ".ru-qmark{width:54px;display:flex;align-items:center;justify-content:center;"
-            "font:600 11px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#8a97a6}"
+            # UNKNOWN (the user 2026-08-13; supersedes the 2026-07-31 '?' slot): a rolled window is not
+            # drawn on the bar AT ALL — only what we know shows there. The last-known reading survives in
+            # the tooltip, labelled "last known" and faded, which is honest because it says what it is.
             ".ru-tip-row.ru-unk i{opacity:.3}.ru-tip-row.ru-unk .ru-tip-k,.ru-tip-row.ru-unk .ru-tip-v{color:#8a97a6}"
             ".ru-pct{font:600 10px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#cfe6ff;font-variant-numeric:tabular-nums;white-space:nowrap}"
             # ONE shared hover panel for BOTH windows (the user 2026-06-26): it reproduces exactly the used/
@@ -22382,6 +22690,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     sys.stderr.write("kill: %s via /kill route\n" % sid)   # kill attribution (the user 2026-07-16)
                     be.kill(sid)
+                    _record_death(sid, int(time.time()), "kill")
                     _send_to_app("chat", {"type": "closed", "id": sid})
                 _push_all()
                 return self._send(200, json.dumps({"ok": True}), "application/json")
@@ -23563,6 +23872,7 @@ def main():
     signal.signal(signal.SIGTERM, _graceful_term)             # drain, don't die mid-flight (see _graceful_term)
     _ensure_bundles()
     try:                                                      # the diary boot sweep (2026-07-07): migrate every
+        _death_boot_pass()                                    # deaths no kernel was up to see: stamp them
         _n = jd.migrate_all_stores()                          # goal store/archive BEFORE any judge pass runs —
         if _n:                                                # the hot paths carry no migration logic anymore
             sys.stderr.write("romp-kernel: diary sweep migrated %d store file(s)\n" % _n)
