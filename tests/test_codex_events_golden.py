@@ -62,15 +62,37 @@ def turn_completed(turn="t1", status="completed", error=None):
     return "turn/completed", {"threadId": TID, "turn": t}
 
 
-def token_usage(inp=1000, out=50, cached=800, reasoning=25, total=1875, window=272000):
+def token_usage(inp=1000, out=50, cached=800, reasoning=25, last_total=1875, window=272000,
+                cum_total=999999):
+    # last != total on purpose: `last` is the context-occupancy proxy, `total` the thread-cumulative
+    # cost number — a fixture where they coincide would hide a reader picking the wrong one
     return "thread/tokenUsage/updated", {
         "threadId": TID, "turnId": "t1",
         "tokenUsage": {"last": {"inputTokens": inp, "outputTokens": out,
                                 "cachedInputTokens": cached, "reasoningOutputTokens": reasoning,
-                                "totalTokens": total},
-                       "total": {"inputTokens": inp, "outputTokens": out, "cachedInputTokens": cached,
-                                 "reasoningOutputTokens": reasoning, "totalTokens": total},
+                                "totalTokens": last_total},
+                       "total": {"inputTokens": inp * 10, "outputTokens": out * 10,
+                                 "cachedInputTokens": cached * 10,
+                                 "reasoningOutputTokens": reasoning * 10, "totalTokens": cum_total},
                        "modelContextWindow": window}}
+
+
+def assert_chain(tc, recs, seed=None):
+    """The linearity invariant every stream must hold: uuids unique, each record parented on the
+    one before it (compact boundaries via logicalParentUuid, parentUuid null by design), never a
+    self-parent. Collisions orphan prior history in the FileAdapter walk (review finding #1)."""
+    seen = set()
+    prev = seed
+    for r in recs:
+        tc.assertNotIn(r["uuid"], seen, "duplicate uuid %s" % r["uuid"])
+        tc.assertNotEqual(r["uuid"], r.get("parentUuid"), "self-parent %s" % r["uuid"])
+        if r.get("subtype") == "compact_boundary":
+            tc.assertIsNone(r["parentUuid"])
+            tc.assertEqual(r["logicalParentUuid"], prev)
+        else:
+            tc.assertEqual(r.get("parentUuid"), prev, "chain break at %s" % r["uuid"])
+        seen.add(r["uuid"])
+        prev = r["uuid"]
 
 
 def user_item(text, iid="u1"):
@@ -137,6 +159,7 @@ class Chain(unittest.TestCase):
                          ("tool_use", "Bash", "pytest -x"))
         rblk = res["message"]["content"][0]
         self.assertEqual(rblk["tool_use_id"], blk["id"])
+        self.assertEqual(rblk["content"], "1 failed")         # plain string — the shape the readers render
         self.assertTrue(rblk["is_error"])
         self.assertEqual(res["toolUseResult"]["exitCode"], 1)
         self.assertNotIn("promptSource", res)                 # a tool_result is not a prompt
@@ -146,7 +169,7 @@ class Chain(unittest.TestCase):
         big = "x" * (cx.TOOL_OUTPUT_CAP + 500)
         recs = feed(n, item_completed({"type": "commandExecution", "id": "c1",
                                        "command": "yes", "aggregatedOutput": big, "exitCode": 0}))
-        text = recs[-1]["message"]["content"][0]["content"][0]["text"]
+        text = recs[-1]["message"]["content"][0]["content"]
         self.assertLess(len(text), len(big))
         self.assertIn("truncated", text)
 
@@ -159,8 +182,9 @@ class Chain(unittest.TestCase):
                                             "diff": "-a\n+b"}]}))
         names = [r["message"]["content"][0]["name"] for r in recs if r["type"] == "assistant"]
         self.assertEqual(names, ["Write", "Edit"])
-        diffs = [r["message"]["content"][0]["content"][0]["text"] for r in recs if r["type"] == "user"]
+        diffs = [r["message"]["content"][0]["content"] for r in recs if r["type"] == "user"]
         self.assertEqual(diffs, ["+print(1)", "-a\n+b"])
+        assert_chain(self, recs)
 
     def test_mcp_and_reasoning(self):
         n = norm()
@@ -224,20 +248,134 @@ class Chain(unittest.TestCase):
         self.assertEqual(recs, [])
         self.assertEqual(n.skipped, {"plan": 1, "subAgentActivity": 1})
 
-    def test_interrupt_mid_tool_leaves_turn_unterminated(self):
+    def test_interrupt_materializes_settle_record(self):
         n = norm()
         recs = feed(n,
                     item_completed(user_item("run it")),
                     item_started({"type": "commandExecution", "id": "c1", "command": "sleep 99"}),
                     turn_completed(status="interrupted"))
-        # no held text → nothing written at the settle; liveness comes from notifications (plan doc)
-        self.assertEqual([r["type"] for r in recs], ["user", "assistant"])
+        # the CLI-convention interrupt record ends the turn (is_interrupt_record) — without it the
+        # NEXT prompt is absorbed into this turn instead of opening its own (review finding #2)
+        self.assertEqual([r["type"] for r in recs], ["user", "assistant", "user"])
+        last = recs[-1]
+        self.assertTrue(em._text_of(last["message"]["content"]).startswith("[Request interrupted"))
+        self.assertNotIn("promptSource", last)
         self.assertFalse(n.turn_open)
+        assert_chain(self, recs)
 
-    def test_context_tracking(self):
+    def test_context_tracking_uses_last_not_cumulative(self):
         n = norm()
-        feed(n, token_usage(total=54000, window=272000))
-        self.assertEqual(n.context, (54000, 272000))
+        feed(n, token_usage(last_total=54000, window=272000, cum_total=500000))
+        self.assertEqual(n.context, (54000, 272000))   # `total` would read 184% full by turn ten
+
+
+class ReviewRegressions(unittest.TestCase):
+    """Record-level pins for the 2026-08-13 adversarial-review findings."""
+
+    def test_double_compaction_unique_boundaries(self):
+        n = norm()
+        recs = feed(n,
+                    turn_started("t1"),
+                    item_completed(user_item("start the refactor", "u1")),
+                    item_completed(agent_item("chunk one", "a1")),
+                    ("thread/compacted", {"threadId": TID, "turnId": "t1"}),
+                    item_completed(agent_item("chunk two", "a2")),
+                    ("thread/compacted", {"threadId": TID, "turnId": "t1"}),
+                    item_completed(agent_item("done", "a3")),
+                    turn_completed("t1"))
+        cbs = [r["uuid"] for r in recs if r.get("subtype") == "compact_boundary"]
+        self.assertEqual(len(cbs), 2)
+        self.assertEqual(len(set(cbs)), 2, "boundary uuids must not collide")
+        assert_chain(self, recs)
+
+    def test_compaction_flushes_held_reply_first(self):
+        n = norm()
+        recs = feed(n,
+                    item_completed(user_item("go", "u1")),
+                    item_completed(agent_item("all done", "a1")),
+                    ("thread/compacted", {"threadId": TID, "turnId": "t1"}))
+        # the held reply is pre-compaction content: it lands BEFORE the boundary, and the stitch
+        # points at it (review finding #4 — a same-second tie otherwise steals the reply)
+        self.assertEqual([r["type"] for r in recs], ["user", "assistant", "system"])
+        self.assertEqual(recs[2]["logicalParentUuid"], recs[1]["uuid"])
+
+    def test_terminal_error_then_failed_settle_single_card(self):
+        n = norm()
+        recs = feed(n,
+                    turn_started("t1"),
+                    item_completed(user_item("do a thing", "u1")),
+                    ("error", {"threadId": TID, "turnId": "t1", "willRetry": False,
+                               "error": {"message": "quota exhausted"}}),
+                    turn_completed("t1", status="failed", error={"message": "quota exhausted"}))
+        cards = [r for r in recs if r.get("isApiErrorMessage")]
+        self.assertEqual(len(cards), 1, "one failure, one card (review finding #5)")
+        assert_chain(self, recs)
+
+    def test_two_terminal_errors_keep_chain(self):
+        n = norm()
+        recs = feed(n,
+                    turn_started("t1"),
+                    item_completed(user_item("try it", "u1")),
+                    ("error", {"threadId": TID, "turnId": "t1", "willRetry": False,
+                               "error": {"message": "err one"}}),
+                    ("error", {"threadId": TID, "turnId": "t1", "willRetry": False,
+                               "error": {"message": "err two"}}))
+        assert_chain(self, recs)   # the second settle must uniquify, never self-parent
+
+    def test_declined_command_is_error(self):
+        n = norm()
+        recs = feed(n, item_completed({"type": "commandExecution", "id": "c1",
+                                       "command": "rm -rf /", "status": "declined",
+                                       "exitCode": None, "aggregatedOutput": ""}))
+        blk = recs[-1]["message"]["content"][0]
+        self.assertTrue(blk["is_error"], "a sandbox refusal must never read as success")
+        self.assertIn("declined", blk["content"])
+
+    def test_failed_patch_is_error(self):
+        n = norm()
+        recs = feed(n, item_completed({"type": "fileChange", "id": "f1", "status": "failed",
+                                       "changes": [{"path": "/TESTDIR/x.py", "kind": "update",
+                                                    "diff": "-a\n+b"}]}))
+        blk = recs[-1]["message"]["content"][0]
+        self.assertTrue(blk["is_error"])
+        self.assertIn("failed", blk["content"])
+
+    def test_usage_never_leaks_across_turns(self):
+        n = norm()
+        recs = feed(n,
+                    turn_started("t1"),
+                    item_completed(user_item("one", "u1")),
+                    token_usage(inp=111),
+                    turn_completed("t1", status="failed", error={"message": "boom"}),
+                    turn_started("t2"),
+                    item_completed(user_item("two", "u2")),
+                    item_completed(agent_item("fine now", "a2")),
+                    turn_completed("t2"))
+        settle = [r for r in recs if r["type"] == "assistant" and
+                  r["message"].get("stop_reason") == "end_turn" and
+                  not r.get("isApiErrorMessage")][-1]
+        self.assertNotIn("usage", settle["message"], "turn 1's usage on turn 2's settle (finding #9)")
+
+    def test_restart_seed_prevents_replay_damage(self):
+        # the file already carries u1 + the c1 tool_use; the process restarted between the
+        # command's started and completed (review finding #6)
+        n = norm(last_uuid="c1", seen_uuids={"u1", "c1"})
+        recs = feed(n,
+                    item_completed(user_item("run the suite", "u1")),       # replayed → dropped
+                    item_completed({"type": "commandExecution", "id": "c1", "command": "pytest",
+                                    "aggregatedOutput": "ok", "exitCode": 0}))
+        self.assertEqual(len(recs), 1)                    # just the result — no re-minted call
+        self.assertEqual(recs[0]["parentUuid"], "c1")
+        self.assertNotEqual(recs[0]["uuid"], "c1")
+        assert_chain(self, recs, seed="c1")
+
+    def test_drain_flushes_held_message(self):
+        n = norm()
+        feed(n, item_completed(agent_item("almost forgot this", "a1")))
+        recs = n.drain()
+        self.assertEqual(len(recs), 1)
+        self.assertIsNone(recs[0]["message"]["stop_reason"])   # the turn genuinely didn't settle
+        self.assertEqual(n.drain(), [])
 
 
 class ParseIntegration(unittest.TestCase):
@@ -305,6 +443,43 @@ class ParseIntegration(unittest.TestCase):
         s = self._parse(recs)
         flags = [a.get("isApiError") for t in s["turns"] for a in t["atoms"]]
         self.assertIn(True, flags)
+
+    def test_interrupt_then_next_prompt_opens_its_own_turn(self):
+        n = norm()
+        recs = feed(n,
+                    turn_started("t1"),
+                    item_completed(user_item("run it", "u1"), MS),
+                    item_started({"type": "commandExecution", "id": "c1", "command": "sleep 99"},
+                                 MS + 1000),
+                    turn_completed("t1", status="interrupted"),
+                    turn_started("t2"),
+                    item_completed(user_item("never mind, just lint", "u2"), MS + 9000),
+                    item_completed(agent_item("Linted.", "a2"), MS + 10000),
+                    turn_completed("t2"))
+        s = self._parse(recs)
+        # without the interrupt record the second prompt was ABSORBED into the interrupted turn
+        # (review finding #2) — it must be its own trigger
+        self.assertEqual(len(s["turns"]), 2)
+        self.assertEqual(s["turns"][1]["trigger"]["uuid"], "u2")
+        self.assertTrue(s["turns"][0]["ended"] and s["turns"][1]["ended"])
+
+    def test_double_compaction_keeps_early_history(self):
+        n = norm()
+        recs = feed(n,
+                    turn_started("t1"),
+                    item_completed(user_item("start the refactor", "u1"), MS),
+                    item_completed(agent_item("chunk one", "a1"), MS + 1000),
+                    ("thread/compacted", {"threadId": TID, "turnId": "t1"}),
+                    item_completed(agent_item("chunk two", "a2"), MS + 9000),
+                    ("thread/compacted", {"threadId": TID, "turnId": "t1"}),
+                    item_completed(agent_item("done", "a3"), MS + 20000),
+                    turn_completed("t1"))
+        s = self._parse(recs)
+        texts = [em._text_of(a["message"]["content"])
+                 for t in s["turns"] for a in t["atoms"] if a.get("message")]
+        # colliding boundary uuids used to orphan everything before the first compaction
+        self.assertTrue(any("start the refactor" in x for x in texts))
+        self.assertTrue(any("done" in x for x in texts))
 
 
 if __name__ == "__main__":
