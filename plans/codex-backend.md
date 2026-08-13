@@ -62,9 +62,26 @@ backend keys on (`requiresOpenaiAuth: true`, `account: null`), `model_list`
 works unauthenticated (gpt-5.6-sol/terra/luna, 5.5, 5.2), and `thread_start`
 accepts this plan's param spelling verbatim (`{"cwd", "approvalPolicy":
 "never", "sandbox": "workspace-write"}`) and mints a UUIDv7 thread id with the
-default model. **Still pending login** (`codex login` — the one user-provided
-step): a real turn's notification stream end-to-end (turn_start → items →
-tokenUsage → completed), steer, and interrupt.
+default model.
+
+**Live smoke, logged in (2026-08-13, `tests/smoke_codex_live.py`):** two real
+turns end-to-end — a file-writing task whose Write items materialized as
+tool_use/tool_result pairs and whose settle carried usage + context %, and a
+genuinely-running `sleep 300` interrupted live (`turn/interrupt` → interrupted
+settle → the `[Request interrupted by user]` record → the NEXT prompt opens
+its own parsed turn). Both turns parse ended through the real event model;
+the uuid chain stays linear; the normalizer's skipped-vocabulary counter came
+back empty. Failed patches on a sandbox-less box rendered as `is_error`
+results with the failure text — visible, never a fake success.
+
+**Host requirement (found live):** Codex's Linux sandbox is bubblewrap, which
+needs unprivileged user namespaces. Newer GCP/Ubuntu images restrict them
+(`kernel.apparmor_restrict_unprivileged_userns=1`) and then EVERY command and
+patch under `workspaceWrite` fails with `bwrap: setting up uid map: Permission
+denied` — loudly, as error-flagged results. Sandboxed operation needs the
+sysctl flipped (persist via /etc/sysctl.d); the smoke's
+`ROMP_SMOKE_SANDBOX=danger-full-access` override exercises the same protocol
+machinery on such boxes without it.
 
 - **Client**: `CodexClient` — `thread_start/resume/fork/list/read/set_name/
   compact`, `turn_start(thread_id, input, params)`, `turn_interrupt(thread_id,
