@@ -112,13 +112,14 @@ class _Session:
     """One Codex session: registry row + runtime state. The worker thread owns the normalizer and
     the file; everything else only reads or enqueues."""
 
-    def __init__(self, sid, tid, name, cwd, model="", effort=""):
+    def __init__(self, sid, tid, name, cwd, model="", effort="", color=""):
         self.sid = sid
         self.tid = tid                # Codex thread id == fsid == transcript filename stem
         self.name = name
         self.cwd = cwd
         self.model = model
         self.effort = effort
+        self.color = color            # identity bg — also in names/<sid> (fields 3/4), the shared store
         self.dead = False
         self.state = "waiting"        # waiting | working (the two states this backend can know)
         self.since = time.time()
@@ -166,7 +167,7 @@ class CodexBackend:
             rows = {}
         for sid, r in rows.items():
             s = _Session(sid, r["tid"], r.get("name", ""), r.get("cwd", ""),
-                         r.get("model", ""), r.get("effort", ""))
+                         r.get("model", ""), r.get("effort", ""), r.get("color", ""))
             s.dead = bool(r.get("dead"))
             s.queue = list(r.get("queue") or [])
             s.note = r.get("note", "")
@@ -177,7 +178,8 @@ class CodexBackend:
         # unserialized writers shared one tmp path — the loser's os.replace found it already gone
         with self._reg_lock:
             rows = {sid: {"tid": s.tid, "name": s.name, "cwd": s.cwd, "model": s.model,
-                          "effort": s.effort, "dead": s.dead, "queue": s.queue, "note": s.note}
+                          "effort": s.effort, "dead": s.dead, "queue": s.queue, "note": s.note,
+                          "color": s.color}
                     for sid, s in self._sessions.items()}
             tmp = self._reg_path().with_suffix(".tmp")
             tmp.write_text(json.dumps(rows, indent=1))
@@ -311,7 +313,8 @@ class CodexBackend:
                 ctx = max(0, min(100, round(100 * used / window)))
             out[sid] = {"state": s.state, "model": s.model, "effort": s.effort,
                         "mode": "sandboxed", "since": s.since, "context": ctx,
-                        "compactPct": None, "backend": "codex", "name": s.name, "cwd": s.cwd}
+                        "compactPct": None, "backend": "codex", "name": s.name, "cwd": s.cwd,
+                        "color": s.color or None}
         return out
 
     def busy(self, sid):
@@ -382,6 +385,20 @@ class CodexBackend:
         return False   # no Codex equivalent
 
     # ── lifecycle ────────────────────────────────────────────────────────────────────────────────
+    def _write_name(self, s, bg="", fg=""):
+        """The shared identity/discovery file names/<sid> (name, cwd, bg, fg) — the same four-field
+        format both other backends write, so name/identity surfaces read Codex sessions for free.
+        Discovery itself finds Codex transcripts via the codex registry, not this file."""
+        d = self.state / "names"
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            old = (d / s.sid).read_text().rstrip("\n").split("\t")
+        except OSError:
+            old = []
+        bg = bg or (old[2] if len(old) > 2 else "")
+        fg = fg or (old[3] if len(old) > 3 else "")
+        (d / s.sid).write_text("%s\t%s\t%s\t%s\n" % (s.name, s.cwd, bg, fg))
+
     def spawn(self, name, cwd, bg="", fg="", sid=None, auth=""):
         sid = sid or str(uuidlib.uuid4())
         c = self._get_client()
@@ -406,10 +423,14 @@ class CodexBackend:
             self._sessions[sid] = s
             self._save_registry()
             return sid
-        s = _Session(sid, tid, name, cwd, model=model)
+        s = _Session(sid, tid, name, cwd, model=model, color=bg)
         s.loaded = True
         self._sessions[sid] = s
         self._ensure_norm(s)
+        # touch the materialized transcript NOW: discovery lists real files, and an empty jsonl
+        # parses to an empty session — the tab opens immediately instead of waiting for turn one
+        self.transcript_path(sid).touch()
+        self._write_name(s, bg, fg)
         self._save_registry()
         self.push()
         return sid
@@ -447,6 +468,7 @@ class CodexBackend:
         if not s:
             return False
         s.name = new_name
+        self._write_name(s)               # keep the shared identity file in sync (colours preserved)
         self._save_registry()
         c = self._client
         if c is not None:

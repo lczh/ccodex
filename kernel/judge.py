@@ -43,6 +43,9 @@ GOALARCHDIR = STATE / "goals-archive"    # CLEARED (dismissed) goal subtrees mov
                                          #   keeps the live store flat so build_feed stops re-deriving dismissed cards every push
 EPIDIR   = STATE / "episodes"            # per-session append-only episode log, keyed by rompUuid: one row per observed
                                          #   /clear-style fork head ({head, fsid, t}) — the durable record of where each
+CODEXDIR = STATE / "codex"               # the Codex backend's root (plans/codex-backend.md): registry.json +
+                                         #   projects/<enc-cwd>/<thread-id>.jsonl — romp-materialized transcripts in
+                                         #   the SAME record vocabulary, discovered below alongside the Claude roots
                                          #   conversation episode began (the SDK registry's lastSid is OVERWRITTEN per fork,
                                          #   so without this log a multi-/clear session's past transcripts are unattributable)
 STATESDIR = STATE / "states"             # per-session real idle/compacting transitions → idle atoms (settled gate)
@@ -67,7 +70,7 @@ def _rebind_state(path):
     save_goals wrote synthetic fixtures into the live goals/ and the triage pass then stormed
     judge-errors.jsonl over those orphans every pass forever (the user 2026-06-24). A test must call this
     instead of assigning jd.STATE alone. Not used in production (STATE is bound once at import)."""
-    global STATE, NAMES, CAPDIR, ARCHDIR, GOALDIR, GOALARCHDIR, STATESDIR, PCACHE, MESSAGES, ERRORS, USAGE, SDKDIR, EPIDIR
+    global STATE, NAMES, CAPDIR, ARCHDIR, GOALDIR, GOALARCHDIR, STATESDIR, PCACHE, MESSAGES, ERRORS, USAGE, SDKDIR, EPIDIR, CODEXDIR
     STATE = path
     NAMES, CAPDIR, ARCHDIR, GOALDIR = STATE / "names", STATE / "captions", STATE / "archive", STATE / "goals"
     GOALARCHDIR = STATE / "goals-archive"
@@ -75,6 +78,7 @@ def _rebind_state(path):
     MESSAGES, ERRORS, USAGE = STATE / "timeline" / "messages.jsonl", STATE / "judge-errors.jsonl", STATE / "judge-usage.jsonl"
     SDKDIR = STATE / "sdk"
     EPIDIR = STATE / "episodes"
+    CODEXDIR = STATE / "codex"
     _lastsid_memo.clear()   # sdk-registry reads are mtime-memoized per sid — a rebind must not serve the old root's values
     _episode_memo.clear()   # ...and so are the episode-log reads
     _head_memo.clear()      # transcript heads are immutable per path, but a rebind swaps the whole world of paths
@@ -3711,6 +3715,13 @@ def _discover_fingerprint():
         live = {row[0] for row in fp}                           # walk → evict it, so the memo stays bounded
         for name in [k for k in _namefp_memo if k not in live]:  # by the sessions that currently EXIST
             del _namefp_memo[name]
+    # the Codex namespace: a session add/rename/kill rewrites registry.json (its mtime is the
+    # signal), and a NEW transcript file bumps its project dir's mtime — the same add-not-append
+    # semantics as the Claude roots above. A transcript append changes neither, on purpose.
+    try:
+        fp.append(("codex-reg", (CODEXDIR / "registry.json").stat().st_mtime))
+    except OSError:
+        pass
     return tuple(fp)
 
 
@@ -3828,7 +3839,35 @@ def _discover_impl(now, window=None, forks=True):
                 t = _custom_title(path_str); title_memo[path_str] = t
             if t == name:
                 seen.add(path_str); out.append((stem, Path(path_str), sid, name))
+    out.extend(_codex_rows(cutoff, seen))
     return out
+
+
+def _codex_rows(cutoff, seen):
+    """Discovery rows for Codex sessions — (fsid=thread-id, materialized path, anchor sid, name),
+    read from the Codex backend's registry (plans/codex-backend.md). The names/ loop above skips
+    these naturally (no <sid>.jsonl under the Claude roots); this is the ONE extra fact the read
+    side needs. Dead sessions keep discovering like dead tmux/SDK ones do — history stays browsable;
+    the WINDOW cutoff is what ages them out. No forks: a Codex thread id is stable across resumes."""
+    try:
+        reg = json.loads((CODEXDIR / "registry.json").read_text())
+    except Exception:
+        return []
+    rows = []
+    for sid, r in sorted(reg.items()):
+        tid, cwd = r.get("tid"), r.get("cwd") or ""
+        if not tid or not cwd:
+            continue
+        p = CODEXDIR / "projects" / re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(cwd)) / (tid + ".jsonl")
+        ps = str(p)
+        try:
+            mt = p.stat().st_mtime
+        except OSError:
+            continue
+        if mt >= cutoff and ps not in seen:
+            seen.add(ps)
+            rows.append((tid, p, sid, r.get("name", "")))
+    return rows
 
 
 # ───────────────────────── the pass ─────────────────────────
