@@ -11,9 +11,7 @@ understands — design in `plans/codex-backend.md`.
 
 ## Setup
 
-Romp itself still needs Claude Code signed in (romp's judges — the card
-summaries and attention routing — run on Claude regardless of what kind of
-agent a session runs). On top of that, Codex sessions need, once per machine:
+Codex sessions need, once per machine:
 
 1. **The Codex SDK for romp:**
 
@@ -30,6 +28,36 @@ agent a session runs). On top of that, Codex sessions need, once per machine:
 
 If either is missing, creating a Codex session tells you exactly what to run —
 romp never silently substitutes a different backend.
+
+By default romp's *own* intelligence — the judges that caption work, build the
+cards, and route your attention — runs on Claude, so the machine also wants a
+Claude Code login. On a Codex-only machine, switch the judges to Codex instead
+(next section) and no Claude login is needed at all.
+
+## Running the judges on Codex
+
+    echo codex > ~/.local/state/romp/judge-engine     # back to Claude: echo claude > …, or delete the file
+
+then restart the kernel (the ↻ button, or `romp restart`). Every judge becomes
+a one-shot `codex exec` call — ephemeral (no session files), read-only sandbox,
+billing the machine's Codex login. Verified live: the real caption and gist
+judges answer correctly in ~5–6s per call.
+
+Honest caveats while this is new:
+
+- **Quality**: the judge prompts were tuned on Claude models; on Codex they
+  validate well but have less mileage. If cards read oddly, switch back —
+  it's one file.
+- **Cost/quota**: judges make many small calls (every turn gets captioned);
+  on a ChatGPT plan they draw from the same usage pool as your Codex sessions.
+- **Accounting**: `codex exec` doesn't report token counts, so the analytics
+  show judge call counts and durations but not token costs; and the
+  Claude-account rate-limit gate doesn't apply (Codex limits surface per call
+  instead).
+- Model picks in the gear's judge-model settings are Claude aliases; on the
+  codex engine they're ignored (ChatGPT-plan accounts only allow the account's
+  default model — a `gpt-*` value in `~/.local/state/romp/judge-model` is
+  honored where the plan permits).
 
 ## Sandboxing
 

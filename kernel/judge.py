@@ -130,6 +130,9 @@ def _triage_model():  return _state_str("judge-model", TRIAGE_MODEL)   # gear "T
 def _index_model():   return _state_str("index-model", INDEX_MODEL)    # gear "Indexing model" → STATE/index-model
 def _triage_effort(): return _state_str("judge-effort", "")   # "" → pass NO --effort (the long-standing default)
 def _index_effort():  return _state_str("index-effort", "")
+def _judge_engine():  return _state_str("judge-engine", "claude")   # "claude" | "codex" — which model
+#   harness runs the judges (docs/codex.md §judges). "codex" lets a machine with no Claude login keep
+#   the board thinking: every judge becomes a one-shot `codex exec` billing the machine's codex login.
 WINDOW      = 48 * 3600                  # only caption transcripts touched in the last N hours (matches the parse horizon)
 COURIER_RETRY_HORIZON = WINDOW           # a usage-limited courier call comes back empty and retries every pass, but a
 #                                          peer message still unsummarized past this many seconds (matches discover()'s
@@ -373,6 +376,13 @@ def _judge_claude_bin():
             or os.path.expanduser("~/.local/bin/claude"))
 
 
+def _judge_codex_bin():
+    """The codex binary for engine-"codex" judge calls — same resolution ladder as the claude one
+    (env override for tests/federated hosts, PATH, the standard user install spot)."""
+    return (os.environ.get("ROMP_CODEX_BIN") or shutil.which("codex")
+            or os.path.expanduser("~/.local/bin/codex"))
+
+
 # Hard wall-clock cap on ONE judge call (perl alarm → SIGALRM, logged as "empty stdout (exit -14)").
 # Was 45s until 2026-07-27, when an API slow patch killed a burst of healthy-but-slow calls across four
 # sessions in one morning and the coerce floor minted a card titled with the user's raw message head from
@@ -399,6 +409,40 @@ def _judge_cmd(model, sys_prompt, effort=None):
     if effort:
         cmd += ["--effort", effort]
     return cmd
+
+
+def _judge_cmd_codex(model, effort, outpath):
+    """The `codex exec` argv for ONE judge call when STATE/judge-engine is "codex" (docs/codex.md).
+    The same isolation goals as the claude argv, by different means: --ephemeral (no session files —
+    the scratch-pruning problem doesn't exist), a read-only sandbox (a captioner must not run
+    commands), --skip-git-repo-check + -C scratch (never the user's repo), the prompt on stdin
+    (exec has no separate system-prompt flag — system + user are concatenated), and the reply
+    written to `outpath` via -o (the final agent message alone; no event-stream parsing).
+
+    Model: only an explicit gpt-* override is passed — a ChatGPT-plan account 400-refuses every
+    non-default model (probed live 2026-08-14), so the account's default is THE default and a
+    claude alias (the other engine's vocabulary, incl. the classify arms') is ignored rather than
+    sent to certain failure."""
+    cmd = ["perl", "-e", "alarm %d; exec @ARGV" % CALL_ALARM_S, _judge_codex_bin(), "exec",
+           "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "--color", "never",
+           "-C", JUDGE_SCRATCH, "-o", outpath]
+    if model and str(model).startswith("gpt"):
+        cmd += ["-m", model]
+    if effort:
+        cmd += ["-c", "model_reasoning_effort=%s" % effort]
+    return cmd
+
+
+def _codex_effort(effort, tier):
+    """Map a judge effort onto what codex accepts for the plan-account model family: low/medium/
+    high/xhigh pass through; minimal/none 400 there (probed) → low; max/ultracode are Claude-only →
+    xhigh/None. No explicit effort: index-tier work is mechanical → low (the cost lever, standing in
+    for the claude path's MAX_THINKING_TOKENS=0); triage keeps the model's default reasoning."""
+    m = {"low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh",
+         "minimal": "low", "none": "low", "max": "xhigh"}
+    if effort:
+        return m.get(effort)
+    return "low" if tier == "index" else None
 
 
 _DEBUG_CACHE = [None, None]                # (mtime_ns_or_None, bool) — one stat per check
@@ -707,27 +751,31 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage"):
             return ""                                 # from a real call failure — event-based, no time window
     except Exception:
         pass
-    try:
-        # RATE-LIMIT GATE (the user 2026-07-07): while the ACCOUNT is limit-exhausted, every judge call
-        # fleet-wide just burns a doomed API retry (the archiver postmortem: ~1160 wasted calls in one
-        # 90-min window). usage.json (the SDK backend's /usage poll) says so exactly; `resets_at` makes
-        # the gate self-expiring — a stale "limited" stops gating the moment the window resets, no age
-        # heuristics. Skips ride the SAME paused flag, so no give-up counter ever counts one as a
-        # failure. The `fable` bucket is deliberately ignored (judges run Sonnet). Unreadable/absent
-        # usage.json → never gate: the gate is an optimization, judging is the job.
-        u = json.loads((STATE / "usage.json").read_text())
-        for _b in ("five_hour", "seven_day"):
-            _lim = u.get(_b) or {}
-            if (_lim.get("pct") or 0) >= 100 and (_lim.get("resets_at") or 0) > time.time():
-                _judge_ctx.paused = True
-                if _RATE_GATE_LOGGED.get(_b) != _lim.get("resets_at"):   # one log line per limit window
-                    _RATE_GATE_LOGGED[_b] = _lim.get("resets_at")
-                    _log_judge_error(tier, None, "rate-limited",
-                                     note="%s at %d%% — judge calls skipped until the window resets"
-                                          % (_b, _lim.get("pct") or 0))
-                return ""
-    except Exception:
-        pass
+    engine = _judge_engine()
+    if engine != "codex":
+        try:
+            # RATE-LIMIT GATE (the user 2026-07-07): while the ACCOUNT is limit-exhausted, every judge call
+            # fleet-wide just burns a doomed API retry (the archiver postmortem: ~1160 wasted calls in one
+            # 90-min window). usage.json (the SDK backend's /usage poll) says so exactly; `resets_at` makes
+            # the gate self-expiring — a stale "limited" stops gating the moment the window resets, no age
+            # heuristics. Skips ride the SAME paused flag, so no give-up counter ever counts one as a
+            # failure. The `fable` bucket is deliberately ignored (judges run Sonnet). Unreadable/absent
+            # usage.json → never gate: the gate is an optimization, judging is the job. Claude-engine
+            # only: usage.json is the CLAUDE account's windows — gating codex calls on it would be wrong
+            # in both directions (codex limits surface per call as error replies instead).
+            u = json.loads((STATE / "usage.json").read_text())
+            for _b in ("five_hour", "seven_day"):
+                _lim = u.get(_b) or {}
+                if (_lim.get("pct") or 0) >= 100 and (_lim.get("resets_at") or 0) > time.time():
+                    _judge_ctx.paused = True
+                    if _RATE_GATE_LOGGED.get(_b) != _lim.get("resets_at"):   # one log line per limit window
+                        _RATE_GATE_LOGGED[_b] = _lim.get("resets_at")
+                        _log_judge_error(tier, None, "rate-limited",
+                                         note="%s at %d%% — judge calls skipped until the window resets"
+                                              % (_b, _lim.get("pct") or 0))
+                    return ""
+        except Exception:
+            pass
     fsid = getattr(_judge_ctx, "fsid", None)
     auth = _judge_auth(fsid)                          # this call bills what the judged session bills
     env = _judge_env(tier, auth)
@@ -742,6 +790,44 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage"):
     sent = time.time()                                # literal wall-clock: the prompt goes to the API now
     rid = _active_begin(judge or tier, fsid, sent)    # live bar starts NOW (deregistered in finally below)
     try:
+        if engine == "codex":
+            # docs/codex.md §Running the judges on Codex — the same bracket (pause skip, debug stash,
+            # live bar), a different one-shot engine. The reply lands in a temp file (-o); `codex exec`
+            # reports no token usage, so the usage row keeps the call's bracket + engine for the
+            # timeline and counts, and leaves tokens/cost null (absent, not faked).
+            os.makedirs(JUDGE_SCRATCH, exist_ok=True)
+            outp = os.path.join(JUDGE_SCRATCH, "codex-%d-%d.out" % (os.getpid(), rid))
+            try:
+                try:
+                    p = subprocess.run(_judge_cmd_codex(model, _codex_effort(effort, tier), outp),
+                                       input=(sys_prompt or "") + "\n\n" + (user or ""),
+                                       capture_output=True, text=True, cwd=JUDGE_SCRATCH, env=env,
+                                       timeout=CALL_ALARM_S + 5)
+                except Exception as e:
+                    _log_judge_error(judge or tier, fsid, "call", note=type(e).__name__)
+                    return ""
+                recv = time.time()
+                try:
+                    with open(outp, "r", encoding="utf-8") as f:
+                        reply = f.read().strip()
+                except OSError:
+                    reply = ""
+                if not reply:
+                    # dead/refused call — the -o file is the only success signal; record the evidence
+                    _log_judge_error(judge or tier, fsid, "call",
+                                     note="codex empty reply (exit %s): %s"
+                                          % (getattr(p, "returncode", "?"),
+                                             ((p.stderr or "") + (p.stdout or "")).strip()[-200:] or "no output"))
+                    return ""
+                _judge_ctx.last["reply"] = _mid_elide(reply)
+                _log_judge_usage(judge or tier, tier, (model if str(model).startswith("gpt") else "codex-default"),
+                                 fsid, {"duration_ms": int((recv - sent) * 1000)}, sent, recv)
+                return reply
+            finally:
+                try:
+                    os.unlink(outp)
+                except OSError:
+                    pass
         try:
             os.makedirs(JUDGE_SCRATCH, exist_ok=True)   # tmpfiles-cleaned /tmp: recreate per call
             p = subprocess.run(_judge_cmd(model, sys_prompt, effort), input=user,
