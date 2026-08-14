@@ -96,12 +96,29 @@ servers from `~/.codex/config.toml`).
 
 ## Installing ccodex
 
-This repo is the distribution — the installer takes any repo, ref, and
-directory:
+This repo is the distribution — the installer takes any repo and directory,
+and checks out the newest ccodex release (the `v*` tags on this repo):
 
     curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | \
-      ROMP_REPO=https://github.com/lczh/ccodex.git ROMP_REF=main ROMP_DIR=$HOME/ccodex bash
+      ROMP_REPO=https://github.com/lczh/ccodex.git ROMP_DIR=$HOME/ccodex bash
 
 Then, in a new terminal, the two setup steps above (`ccodex-setup`,
 `codex login`) — and `ccodex engine codex` if the machine should run
 Codex-only. `ccodex` opens the dashboard.
+
+## Updates
+
+Installed machines learn about new releases on their own: the kernel checks
+this repo's tags at boot and every few hours, and the dashboard offers the
+update as a banner — one click fetches the release, reinstalls, and restarts.
+The gear's **Updates** setting picks the behavior: *Check and ask* (default),
+*Install automatically*, or *Off*.
+
+Cutting a release (for whoever maintains this repo): bump `VERSION`, commit
+to `main`, then
+
+    git tag -a v<X.Y.Z> -m "ccodex v<X.Y.Z>" && git push <remote> main --follow-tags
+
+ccodex versions on its own line (v1.0.0 and up); upstream romp's tags stay
+behind it and are never pushed here, so the updater always resolves the
+newest ccodex release.

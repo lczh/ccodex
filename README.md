@@ -70,11 +70,13 @@ Claude sessions.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | \
-  ROMP_REPO=https://github.com/lczh/ccodex.git ROMP_REF=main ROMP_DIR=$HOME/ccodex bash
+  ROMP_REPO=https://github.com/lczh/ccodex.git ROMP_DIR=$HOME/ccodex bash
 ```
 
-This clones ccodex to `~/ccodex`, installs it, and adds `bin/` to your shell rc. Then,
-in a new terminal:
+This clones ccodex to `~/ccodex`, checks out the newest release, installs it, and adds
+`bin/` to your shell rc. Installed machines then learn about new releases on their own —
+the dashboard offers each update as a one-click banner (or installs it automatically;
+the gear's **Updates** setting decides). Then, in a new terminal:
 
 ```bash
 ccodex-setup           # provision the Codex backend (a pinned venv; never your system Python)
