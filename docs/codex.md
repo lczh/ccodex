@@ -61,12 +61,14 @@ cards, Codex plan items on the card checklist, subagent lanes, rate-limit
 gating, and MCP server management from the dashboard (Codex sessions read MCP
 servers from `~/.codex/config.toml`).
 
-## Installing from a fork
+## Installing romp-codex
 
-Romp's installer takes any repo and ref, so a fork carrying Codex support
-installs with the standard one-liner plus two variables:
+This repo (`romp-codex`) is the distribution: romp's installer takes any repo
+and ref, so it installs with the standard one-liner plus two variables:
 
-    curl -fsSL https://raw.githubusercontent.com/<owner>/romp/main/bootstrap.sh | \
-      ROMP_REPO=https://github.com/<owner>/romp.git ROMP_REF=main bash
+    curl -fsSL https://raw.githubusercontent.com/lczh/romp-codex/main/bootstrap.sh | \
+      ROMP_REPO=https://github.com/lczh/romp-codex.git ROMP_REF=main bash
 
-Then run the two setup steps above.
+Then run the two setup steps above. (The clone lands at `~/romp` by default —
+set `ROMP_DIR=$HOME/romp-codex` in the same command if you'd rather it match
+the repo name.)
