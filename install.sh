@@ -19,7 +19,8 @@ if [[ ! -x "$ROMP_DIR/bin/romp" ]]; then
     echo "install.sh: this doesn't look like a romp clone ($ROMP_DIR)." >&2
     echo "  install.sh installs the clone it lives in; it cannot be piped from curl." >&2
     echo "  To install from scratch:" >&2
-    echo "    curl -fsSL https://raw.githubusercontent.com/romp-on/romp/main/bootstrap.sh | bash" >&2
+    echo "    curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | \\" >&2
+    echo "      ROMP_REPO=https://github.com/lczh/ccodex.git ROMP_REF=main ROMP_DIR=\$HOME/ccodex bash" >&2
     exit 1
 fi
 

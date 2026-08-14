@@ -39,8 +39,8 @@ HERE = Path(os.path.dirname(os.path.realpath(__file__)))
 _events = SourceFileLoader("romp_codex_events", str(HERE / "codex_events.py")).load_module()
 
 SDK_PIN = "openai-codex==0.144.4"     # bin/romp-codex-setup installs exactly this into codexvenv
-SETUP_HINT = ("Session not created: romp's Codex backend isn't installed. "
-              "Run bin/romp-codex-setup, then try again.")
+SETUP_HINT = ("Session not created: the Codex backend isn't installed. "
+              "Run ccodex-setup, then try again.")
 LOGIN_HINT = "Codex isn't logged in on this machine — run: codex login"
 
 # The phase-1 posture: sandboxed full-auto (plans/codex-backend.md). Approvals never fire; the

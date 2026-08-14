@@ -377,10 +377,20 @@ def _judge_claude_bin():
 
 
 def _judge_codex_bin():
-    """The codex binary for engine-"codex" judge calls — same resolution ladder as the claude one
-    (env override for tests/federated hosts, PATH, the standard user install spot)."""
-    return (os.environ.get("ROMP_CODEX_BIN") or shutil.which("codex")
-            or os.path.expanduser("~/.local/bin/codex"))
+    """The codex binary for engine-"codex" judge calls — the claude one's resolution ladder (env
+    override, PATH, the standard user spot) plus the BUNDLED binary inside codexvenv: openai-codex
+    ships it at site-packages/codex_cli_bin/bin/codex with no PATH entry point (2026-08-14
+    proofread). ccodex-setup links it to ~/.local/bin, but a kernel started over non-login ssh may
+    not have that dir on PATH — the same failure mode _judge_claude_bin's docstring records."""
+    import glob
+    p = (os.environ.get("ROMP_CODEX_BIN") or shutil.which("codex")
+         or os.path.expanduser("~/.local/bin/codex"))
+    if os.path.exists(p):
+        return p
+    for c in sorted(glob.glob(str(STATE / "codexvenv" / "lib" / "python3.*" /
+                                  "site-packages" / "codex_cli_bin" / "bin" / "codex"))):
+        return c
+    return p
 
 
 # Hard wall-clock cap on ONE judge call (perl alarm → SIGALRM, logged as "empty stdout (exit -14)").

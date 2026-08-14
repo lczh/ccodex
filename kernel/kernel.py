@@ -4592,8 +4592,8 @@ def _sdk_locked():
 # A THIRD SessionBackend that drives OpenAI Codex threads via `codex app-server` and materializes
 # Claude-shaped transcripts under STATE/codex/projects/ (judge._codex_rows discovers them). Built
 # lazily like _sdk(); an absent dependency is a loud refusal at creation, never a silent tmux fallback.
-CODEX_SETUP_HINT = ("Session not created: romp's Codex backend isn't installed. "
-                    "Run bin/romp-codex-setup, then try again.")
+CODEX_SETUP_HINT = ("Session not created: the Codex backend isn't installed. "
+                    "Run ccodex-setup, then try again.")
 
 _codex_backend = None   # None = not built yet, False = module unavailable, else the CodexBackend
 _codex_lock = threading.Lock()

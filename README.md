@@ -2,16 +2,23 @@
   <img src="docs/assets/brand/romp-wordmark.png" alt="romp" width="440">
 </p>
 
-> **This is ccodex** — a fork of [romp](https://github.com/romp-on/romp) that runs
-> **OpenAI Codex** agents, alongside or instead of Claude Code: same board, cards,
-> chat, and coordination, with the agent kind picked per session — including running
-> entirely on a Codex login, no Claude required. Install and setup live in
-> [docs/codex.md](docs/codex.md). The command is `ccodex` (`romp` works too: ccodex
-> is built on romp, and everything below is the upstream project's documentation).
+# ccodex
 
-AI agents like Claude Code can work autonomously for long stretches, allowing several to be run in parallel. But this parallelism creates new management work: tracking what the agents are doing, scrolling through transcripts to find the background a decision needs, and coordinating handoffs of work and context.
+**ccodex** runs your AI coding agents — **OpenAI Codex** and **Claude Code**, side by
+side or either one alone — on one board. It is a fork of
+[romp](https://github.com/romp-on/romp) that adds first-class Codex support: the agent
+kind is picked per session, and a machine can run entirely on a Codex login, with no
+Claude account at all. The command is `ccodex` (`romp` works too — ccodex is built on
+romp, and everything below is romp's design, unchanged).
 
-Romp simplifies and automates this management: it tracks every agent and its tasks, surfaces what needs your attention, and keeps them moving and working together. *You* stay focused on what you're trying to accomplish.
+AI agents like Codex and Claude Code can work autonomously for long stretches, allowing
+several to be run in parallel. But this parallelism creates new management work: tracking
+what the agents are doing, scrolling through transcripts to find the background a
+decision needs, and coordinating handoffs of work and context.
+
+ccodex simplifies and automates this management: it tracks every agent and its tasks,
+surfaces what needs your attention, and keeps them moving and working together. *You*
+stay focused on what you're trying to accomplish.
 
 <!-- Feature sections. Real captures live in docs/assets/guide/; docs/index.md embeds them as
      <video> MP4s, and this README embeds the same captures as GIFs so GitHub autoplays them. -->
@@ -24,7 +31,7 @@ The timeline shows every session: what's running, what's idle, and what needs yo
 
 ### Task management
 
-Romp reads the agents' transcripts and tracks the work, so you don't have to.
+ccodex reads the agents' transcripts and tracks the work, so you don't have to.
 
 <img src="docs/assets/guide/task-cards.gif" alt="Work grouped into task cards" width="100%">
 
@@ -34,7 +41,7 @@ A card shows each task with the essential information: why the work is happening
 
 ### Coordination you can see
 
-The Romp Postal Service lets agents ask each other questions and hand off work.
+The postal service lets agents ask each other questions and hand off work.
 
 <img src="docs/assets/guide/coordination.gif" alt="A message crossing between two sessions, on the timeline and in the chat" width="100%">
 
@@ -44,11 +51,12 @@ Find any work by when it happened on the timeline or by the task it belonged to,
 
 <img src="docs/assets/guide/navigate.gif" alt="Clicking a message to jump to its place, then opening a card for the full detail" width="100%">
 
-Romp works with Claude Code today. It adds all of this on top of the sessions you already run, without changing how you work.
+ccodex adds all of this on top of the sessions you already run, without changing how you
+work — whichever vendor they run on.
 
 ## Self-hosted, reachable from anywhere
 
-You run Romp yourself, on your laptop or a server, with no hosted service in between.
+You run ccodex yourself, on your laptop or a server, with no hosted service in between.
 
 - **On your phone.** Reach the full dashboard over Tailscale.
 - **Across machines.** Connect several over SSH: agents on different machines message each other, and you steer them all from one place.
@@ -56,22 +64,38 @@ You run Romp yourself, on your laptop or a server, with no hosted service in bet
 
 ## Quick start
 
-Needs [Claude Code](https://claude.com/claude-code) (signed in), Python 3.10+, and Node.js.
+Needs Python 3.10+, Node.js, git — and at least one agent vendor: an OpenAI account for
+Codex sessions, and/or [Claude Code](https://claude.com/claude-code) (signed in) for
+Claude sessions.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/romp-on/romp/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | \
+  ROMP_REPO=https://github.com/lczh/ccodex.git ROMP_REF=main ROMP_DIR=$HOME/ccodex bash
 ```
 
-This clones Romp to `~/romp`, checks out the newest release, installs it, and adds `bin/` to your shell rc. Open a new terminal afterwards. [Installing by hand](https://romp-on.github.io/romp/install/#manual-and-custom-installs) works too.
+This clones ccodex to `~/ccodex`, installs it, and adds `bin/` to your shell rc. Then,
+in a new terminal:
 
-In that terminal, run `romp`. It opens the dashboard in your browser and prints
-the link as well, so a machine with no browser of its own still gives you a way
-in. Start a session from there.
+```bash
+ccodex-setup           # provision the Codex backend (a pinned venv; never your system Python)
+codex login            # or: codex login --device-auth on a headless box
+ccodex engine codex    # optional — run EVERYTHING on the Codex login (skip if you also use Claude Code)
+ccodex                 # opens the dashboard; start a session from there
+```
+
+By default ccodex's own intelligence — the judges that caption work and route your
+attention — runs on Claude, so a machine without Claude Code should run
+`ccodex engine codex` as above. Codex specifics — sandboxing, the judge engine, what's
+supported today — are in [docs/codex.md](docs/codex.md).
 
 ## Docs
 
-Requirements, remote-host setup, a guide to each capability, and how Romp works under the hood are in the [documentation](https://romp-on.github.io/romp/) (source in [`docs/`](docs/)).
+[docs/codex.md](docs/codex.md) covers everything Codex-specific. For the rest — remote
+hosts, a guide to each capability, and how it all works under the hood — upstream romp's
+[documentation](https://romp-on.github.io/romp/) applies to ccodex unchanged (source in
+[`docs/`](docs/)); read `romp` there as `ccodex` here.
 
 ## License
 
-[Apache-2.0](LICENSE).
+[Apache-2.0](LICENSE). ccodex is a fork of [romp](https://github.com/romp-on/romp); the
+romp name, wordmark, and upstream documentation belong to that project.

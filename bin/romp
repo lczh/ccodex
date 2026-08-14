@@ -623,12 +623,13 @@ if [[ "${1:-}" == "help" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
         printf '  %-28s %s\n' "$inv" "$*"
     }
     cat <<'EOF'
-romp — direct a fleet of Claude Code sessions; the dashboard is the front door
+romp — direct your Claude Code and Codex sessions; the dashboard is the front door
 
 Usage:
 EOF
     _romp_cmd "romp"                       -            "Open the dashboard in your browser (prints the link too)"
-    _romp_cmd "romp new <name>"            -            "Start a session (SDK; lives in the kernel, watch it on the dashboard)"
+    _romp_cmd "romp new <name>"            -            "Start a session (SDK by default; \`romp engine\` sets the machine default)"
+    _romp_cmd "romp new --codex <name>"    -            "Start it as an OpenAI Codex session (docs/codex.md)"
     _romp_cmd "romp new -t <name>"         -            "Start it as a terminal (tmux) session and attach (--detach: don't attach)"
     _romp_cmd "romp new -d <dir> <name>"   -            "Working directory for the new session (default: the current folder)"
     _romp_cmd "romp resume [<id>]"         -            "Resume a past conversation (full-screen picker; or an exact UUID)"
@@ -658,7 +659,7 @@ EOF
     _romp_cmd "romp checkin <host>"        -            "Publish this machine to an attached hub (romp checkout withdraws)"
     _romp_cmd "romp default-dir [PATH]"    -            "Default working dir for new sessions (no arg prints; \"\" clears)"
     _romp_cmd "romp debug [on|off|status]" -            "Judge debug mode (rejection rows carry full input+reply)"
-    _romp_cmd "romp engine [claude|codex|status]" -     "One switch: which vendor runs the judges + what new sessions default to"
+    _romp_cmd "romp engine claude|codex"   -            "One switch: which vendor runs the judges + what new sessions default to"
     exit 0
 fi
 
@@ -965,9 +966,13 @@ if [[ "${1:-}" == "engine" ]]; then
             mkdir -p "$_eng_state"
             printf 'codex\n' > "$_eng_state/judge-engine"
             printf 'codex\n' > "$_eng_state/default-backend"
-            _cx="$(command -v codex 2>/dev/null || echo "$HOME/.local/bin/codex")"
-            if [ ! -x "$_cx" ]; then
-                echo "[romp] note: no codex binary found — run romp-codex-setup, then: codex login" >&2
+            _cx="$(command -v codex 2>/dev/null || true)"
+            [ -z "$_cx" ] && [ -x "$HOME/.local/bin/codex" ] && _cx="$HOME/.local/bin/codex"
+            # the bundled binary lives INSIDE codexvenv (no PATH entry point) — ccodex-setup links
+            # it out, but probe the venv too so this note never cries wolf on a bundled-only box
+            [ -z "$_cx" ] && _cx="$(ls -d "$_eng_state"/codexvenv/lib/python3.*/site-packages/codex_cli_bin/bin/codex 2>/dev/null | head -n1 || true)"
+            if [ -z "$_cx" ] || [ ! -x "$_cx" ]; then
+                echo "[romp] note: no codex binary found — run ccodex-setup, then: codex login" >&2
             elif ! "$_cx" login status 2>&1 | grep -qi '^logged in'; then   # the status goes to STDERR; "Not logged in" must not match
                 echo "[romp] note: codex isn't logged in — run: codex login (or codex login --device-auth)" >&2
             fi

@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# One-line install for romp:
-#   curl -fsSL https://raw.githubusercontent.com/romp-on/romp/main/bootstrap.sh | bash
+# One-line install (ccodex — this fork; see README.md / docs/codex.md):
+#   curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | \
+#     ROMP_REPO=https://github.com/lczh/ccodex.git ROMP_REF=main ROMP_DIR=$HOME/ccodex bash
 #
-# Clones romp, checks out the newest release, runs install.sh, and puts bin/ on
-# your PATH. The clone IS the installation (install.sh symlinks the hooks, MCP
-# config and skills out of it, and bin/ links back into it), so this keeps the
-# clone at a stable location rather than a temp dir.
+# Clones the repo, checks out the requested ref (newest v* release by default —
+# NOTE: this fork's releases live on main, hence ROMP_REF=main above), runs
+# install.sh, and puts bin/ on your PATH. The clone IS the installation
+# (install.sh symlinks the hooks, MCP config and skills out of it, and bin/
+# links back into it), so this keeps the clone at a stable location rather
+# than a temp dir.
 #
 # Knobs:
+#   ROMP_REPO=<git url> which repo to clone (default the upstream romp)
 #   ROMP_DIR=~/romp     where to clone (default ~/romp)
 #   ROMP_REF=main       install a specific tag/branch instead of the newest release
 #   ROMP_NO_PATH=1      don't touch your shell rc

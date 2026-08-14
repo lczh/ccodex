@@ -152,8 +152,10 @@ picker's agent choice UI polish.
 
 ## Risks / open questions
 
-- `codex app-server` is labeled experimental; the venv pin + a boot version
-  check (`codex --version` against a tested floor) keep drift visible.
+- `codex app-server` is labeled experimental; the venv pin keeps upgrades
+  deliberate. (A boot version check against a tested floor was considered and
+  is NOT implemented — the pin alone bounds drift while the SDK and its
+  bundled binary move together.)
 - A turn that ends with no final agentMessage (interrupt mid-tool) leaves the
   file turn unterminated; state stays correct (it comes from notifications).
   Revisit if it confuses the judges.

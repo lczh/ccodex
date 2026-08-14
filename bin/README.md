@@ -24,6 +24,10 @@ no separate implementation to point at.
 | `romp-manager` | Node | The kernel **supervisor**: spawns kernels via `romp-serve`, respawns on crash, `up/ensure/restart-all/status/down`. Reached via `romp up` / `romp refresh` / `romp status`. |
 | `romp-serve` | Bash | The manager→kernel seam: maps the manager's spawn contract onto the kernel's env, picks the python, then `exec`s the kernel (PID preserved for the supervisor; the kernel self-builds stale UI bundles). |
 | `romp-sdk-setup` | Bash | Provisions the Agent SDK venv for the SDK backend. Run by `install.sh`. |
+| `romp-codex-setup` | Bash | Provisions the pinned openai-codex venv for the Codex backend and exposes its bundled `codex` CLI (docs/codex.md). |
+
+ccodex aliases: `ccodex → romp` and `ccodex-setup → romp-codex-setup` are symlinks, so
+every command above also answers to the fork's name.
 
 ## Symlinks → `kernel/` (the always-on core)
 

@@ -85,5 +85,29 @@ import openai_codex as m, sys
 v = getattr(m, "__version__", "?")
 print("romp-codex-setup: openai-codex %s ready (python %s)" % (v, ".".join(map(str, sys.version_info[:3]))))
 PY
+
+# Expose the BUNDLED codex CLI (2026-08-14 proofread finding): openai-codex ships the binary
+# INSIDE the venv (site-packages/codex_cli_bin/bin/codex) with no entry point on PATH — so
+# `codex login`, the very next setup step, was command-not-found on any machine without a
+# separate CLI install. An existing `codex` on PATH is respected (never clobbered); otherwise
+# the bundled one is symlinked to ~/.local/bin/codex, the spot the judges and `romp engine`
+# already probe.
+if command -v codex >/dev/null 2>&1; then
+    echo "romp-codex-setup: codex CLI already on PATH ($(command -v codex)) — leaving it be"
+else
+    _bundled="$(ls -d "$VENV"/lib/python3.*/site-packages/codex_cli_bin/bin/codex 2>/dev/null | head -n1 || true)"
+    if [ -n "$_bundled" ] && [ -x "$_bundled" ]; then
+        mkdir -p "$HOME/.local/bin"
+        ln -sf "$_bundled" "$HOME/.local/bin/codex"
+        echo "romp-codex-setup: bundled codex CLI linked to ~/.local/bin/codex"
+        case ":$PATH:" in
+            *":$HOME/.local/bin:"*) : ;;
+            *) echo "romp-codex-setup: note — ~/.local/bin isn't on this shell's PATH; add it, or call ~/.local/bin/codex directly" ;;
+        esac
+    else
+        echo "romp-codex-setup: warning — no bundled codex binary found in the venv; install the CLI yourself (npm i -g @openai/codex) before \`codex login\`" >&2
+    fi
+fi
+
 echo "romp-codex-setup: done. If this machine hasn't logged in yet, run: codex login"
-echo "romp-codex-setup: the kernel picks this up automatically (no restart-side config)."
+echo "romp-codex-setup: no restart needed — the kernel and judges pick this up automatically."
