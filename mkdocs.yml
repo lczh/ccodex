@@ -1,9 +1,11 @@
-site_name: Romp
-site_description: Manages multiple Claude Code sessions, so you don't have to.
+site_name: ccodex
+site_description: Manages multiple Codex and Claude Code sessions, so you don't have to.
 
-site_url: https://romp-on.github.io/romp/
-repo_url: https://github.com/romp-on/romp
-repo_name: romp-on/romp
+# No published site for this fork (yet) — site_url is what a `docs-serve.sh` local
+# preview and any future Pages build would announce; the repo links point here.
+site_url: https://lczh.github.io/ccodex/
+repo_url: https://github.com/lczh/ccodex
+repo_name: lczh/ccodex
 
 theme:
   name: material
