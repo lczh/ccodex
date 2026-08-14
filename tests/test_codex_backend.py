@@ -553,6 +553,24 @@ class Lifecycle(unittest.TestCase):
         texts = Path(be.transcript_path(sid)).read_text().splitlines()
         self.assertTrue(any("you have mail" in t for t in texts))
 
+    def test_push_session_may_reenter_live_sessions(self):
+        # The kernel's push_session synchronously re-enters Sessions.live() → live_sessions(),
+        # which takes every session's norm_lock. A notify issued while holding norm_lock
+        # self-deadlocked the worker on its first appended record and wedged the whole liveness
+        # merge behind it (2026-08-14 review, reproduced live). Wiring the reentrant push here is
+        # the regression: with the notify under the lock, this test hangs and times out.
+        tmp = tempfile.mkdtemp()
+        fake = FakeClient()
+        be = cb.CodexBackend(tmp, client_factory=lambda: fake,
+                             push_session=lambda sid: be.live_sessions())
+        sid = be.spawn("web", "/TESTDIR")
+        be.send(sid, "hello reentrant push")
+        self.assertTrue(until(lambda: not be.busy(sid) and not be.pending_queued(sid), timeout=10),
+                        "worker wedged — a notify ran under a lock live_sessions() needs")
+        recs = [json.loads(l) for l in Path(be.transcript_path(sid)).read_text().splitlines()]
+        self.assertTrue(any(r["type"] == "assistant" for r in recs))
+        self.assertTrue(be.kill(sid))   # kill's held-final drain notifies too — same reentry
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

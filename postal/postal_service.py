@@ -302,8 +302,14 @@ def read_box(sid, consume):
             continue
         try:
             text = f.read_text(errors="replace")
-        except OSError:
-            return []
+        except OSError as e:
+            # ONE unreadable file must not blank the whole inbox forever (a silent fallback hiding
+            # the breakage — the house rule): say so loudly and read past it, leaving the file in
+            # new/ where an operator can see it. Abandoning the batch here starved every later
+            # message behind a single EACCES/EIO file (2026-08-14 review).
+            sys.stderr.write("postal: unreadable inbox file %s (%s) — skipped, left in place\n"
+                             % (f.name, e))
+            continue
         head, _, body = text.partition("\n\n")
         meta = {}
         for line in head.splitlines():
@@ -2239,7 +2245,11 @@ def _relay_in(host, m, token_proven=False):
     body = m.get("body") or ""
     try:
         if len(body.encode("utf-8")) > 256 * 1024:
-            return "drop", None
+            # BOUNCE, not drop: identity fields already validated, so the refusal is addressable —
+            # and a drop never acks, leaving the sender's outbox retrying the same oversized message
+            # on every exchange forever with nobody told (2026-08-14 review). Parking must never
+            # outlive a definitive refusal (_bounce_apply's own rule).
+            return "bounce", {"mid": mid, "why": "message too large (over 256KB) — not delivered"}
     except UnicodeError:
         return "drop", None
     kind = m.get("kind") or ""

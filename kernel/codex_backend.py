@@ -414,6 +414,7 @@ class CodexBackend:
                 tid = p.get("threadId")
                 s = next((s for _, s in self._session_items() if s.tid == tid), None)
                 if s:
+                    wrote = False
                     with s.norm_lock:
                         # Placeholder recovery replaces the normalizer under this same lock. Recheck
                         # after acquiring it: a pre-lock `s.norm` test could race to None here.
@@ -421,6 +422,10 @@ class CodexBackend:
                             recs = s.norm.handle(getattr(n, "method", ""), p)
                             if recs:
                                 self._append(s, recs)
+                                wrote = True
+                    if wrote:                     # notify OUTSIDE norm_lock (see _append)
+                        self.poke()
+                        self.push_session(s.sid)
             except Exception:
                 self.log("global pump: %s" % traceback.format_exc())
 
@@ -446,6 +451,12 @@ class CodexBackend:
             return s.norm
 
     def _append(self, s, recs):
+        """File IO + echo-prune ONLY — never notifies. Every caller holds s.norm_lock, and the
+        kernel's push_session synchronously re-enters live_sessions(), which takes every session's
+        norm_lock: a push from in here self-deadlocked the worker on its first appended record and
+        wedged the whole liveness merge behind it (2026-08-14 review, reproduced live). Callers
+        poke/push AFTER releasing the lock — and an RLock would not save a push-under-lock: two
+        workers pushing concurrently AB-BA across their sessions' locks."""
         path = self.transcript_path(s.sid)
         with open(path, "a", encoding="utf-8") as f:
             for r in recs:
@@ -455,8 +466,6 @@ class CodexBackend:
         if landed:
             with s.lock:
                 s.echoes = [e for e in s.echoes if e["text"] not in landed]
-        self.poke()
-        self.push_session(s.sid)
 
     @staticmethod
     def _rec_text(rec):
@@ -700,10 +709,15 @@ class CodexBackend:
         if not worker_stopped:
             self.log("worker did not stop after kill: %s" % s.name)
         if worker_stopped:
+            drained = False
             with s.norm_lock:
                 held = s.norm.drain() if s.norm else []
                 if held:
                     self._append(s, held)  # never eat a held final message; serialize file appends
+                    drained = True
+            if drained:                    # notify OUTSIDE norm_lock (see _append)
+                self.poke()
+                self.push_session(s.sid)
         self._save_registry()
         return True
 
@@ -897,10 +911,15 @@ class CodexBackend:
             while True:
                 n = c.next_turn_notification(turn_id)
                 method = getattr(n, "method", "")
+                wrote = False
                 with s.norm_lock:
                     recs = norm.handle(method, _dump(getattr(n, "payload", None)))
                     if recs:
                         self._append(s, recs)
+                        wrote = True
+                if wrote:                          # notify OUTSIDE norm_lock (see _append)
+                    self.poke()
+                    self.push_session(s.sid)
                 if method == "turn/completed":
                     break
         finally:

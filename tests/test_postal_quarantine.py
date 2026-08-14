@@ -166,12 +166,20 @@ class InboundTrustGate(unittest.TestCase):
                 {"frm": "x" * 129},
                 {"to": "web\nX-From-Host: TRUSTED"},
                 {"kind": "delegate\nX-From-Host: TRUSTED"},
-                {"body": "x" * (256 * 1024 + 1)},
                 {"body": {"not": "text"}},
         )):
             msg = _relay("q-malformed-%d" % i)
             msg.update(change)
             self.assertEqual(ps._relay_in("EDGE", msg), ("drop", None), change)
+        # OVERSIZED is different from malformed: identity is valid, so the refusal is addressable —
+        # a BOUNCE tells the sender and stops its outbox retrying forever; a drop never acks
+        # (2026-08-14 review). Everything else stays a silent drop (hostile garbage earns no reply).
+        big = _relay("q-oversize")
+        big.update({"body": "x" * (256 * 1024 + 1)})
+        verdict, bounce = ps._relay_in("EDGE", big)
+        self.assertEqual(verdict, "bounce")
+        self.assertIn("too large", bounce["why"])
+        self.assertEqual(bounce["mid"], "q-oversize")
         self.assertEqual(ps.read_box("sess-web", consume=False), [])
         self.assertEqual(ps.quarantine_list(), [])
         self.assertEqual(ps._seen_load(), set())

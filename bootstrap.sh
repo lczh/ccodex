@@ -123,12 +123,21 @@ if git -C "$DIR" show-ref --verify --quiet "refs/tags/$ref"; then
             -c "gpg.ssh.allowedSignersFile=$allowed_signers" \
             verify-tag "$ref" || signature_ok=0
     else
-        git -C "$DIR" -c gpg.minTrustLevel=fully verify-tag "$ref" || signature_ok=0
+        git -C "$DIR" -c gpg.minTrustLevel=fully verify-tag "$ref" 2>/dev/null || signature_ok=0
     fi
     if [ "$signature_ok" -ne 1 ]; then
-        echo "romp: release tag '$ref' does not have a valid signature trusted by git; refusing to install it." >&2
-        echo "  Import the maintainer's GPG key or configure Git's SSH allowed-signers file, then rerun." >&2
-        exit 1
+        # Verification ENFORCES only when a trust root was configured (ROMP_RELEASE_ALLOWED_SIGNERS,
+        # or ROMP_VERIFY_RELEASES=1 for GPG-trust users). Mandatory-with-no-published-key bricked
+        # every install: the repo's releases are not signed yet and no key is distributed anywhere,
+        # so there was nothing any installer could trust (2026-08-14 review). Configured deployments
+        # keep the full hard-fail; everyone else gets a loud, honest warning instead of a dead end.
+        if [ -n "$allowed_signers" ] || [ -n "${ROMP_VERIFY_RELEASES:-}" ]; then
+            echo "romp: release tag '$ref' does not have a valid signature trusted by git; refusing to install it." >&2
+            echo "  Import the maintainer's GPG key or configure Git's SSH allowed-signers file, then rerun." >&2
+            exit 1
+        fi
+        echo "==> Note: release tag '$ref' is not signature-verified (no trust root configured)." >&2
+        echo "    To enforce verification, set ROMP_RELEASE_ALLOWED_SIGNERS to an allowed-signers file." >&2
     fi
     if [ -n "$allowed_signers" ]; then
         # The kernel updater runs long after this bootstrap process and cannot inherit a one-shot

@@ -4288,7 +4288,7 @@ class ViewBuilder(unittest.TestCase):
         landing = km._landing()
         self.assertIn("id=rail-gear", landing)
         self.assertIn("id=rail-refresh", landing)
-        self.assertIn("body:'{\"fleet\":false}'", landing)       # ordinary rail ↻ is explicitly local-only
+        self.assertIn("body:'{}'", landing)       # rail ↻ takes the default: everything attached (the user 2026-07-29)
 
     def test_gear_polish_tooltips_colormap_bar_no_emoji(self):
         # the user 2026-06-23: descriptions become HOVER tooltips (decluttered), and the analytics button drops
@@ -6224,15 +6224,16 @@ class ServeSecurity(unittest.TestCase):
             with urllib.request.urlopen(req, timeout=5) as r:
                 self.assertEqual(r.status, 200)
                 # the ack also names WHICH kernel acked (boot id, 2026-07-27) — see RestartReloadRaceTest
-                # Ordinary/empty requests are local-only: remote code import requires explicit opt-in.
+                # Ordinary/empty requests take the default: everything attached (the user 2026-07-29;
+                # with no remotes it restarts only this kernel anyway — see the _remotes gate).
                 self.assertEqual(_json.loads(r.read().decode()),
-                                 {"ok": True, "restarting": True, "boot": km._BOOT_ID, "fleet": False})
+                                 {"ok": True, "restarting": True, "boot": km._BOOT_ID, "fleet": True})
             req = urllib.request.Request("http://127.0.0.1:%d/restart?token=testtok" % self.port,
-                                         method="POST", data=b'{"fleet":true}',
+                                         method="POST", data=b'{"fleet":false}',
                                          headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=5) as r:
-                self.assertTrue(_json.loads(r.read().decode())["fleet"],
-                                "remote-sync restart exists only as an explicit opt-in")
+                self.assertFalse(_json.loads(r.read().decode())["fleet"],
+                                 "local-only remains the explicit opt-out")
         finally:
             if saved is not None:
                 os.environ["ROMP_MANAGER_PORT"] = saved

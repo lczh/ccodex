@@ -43,7 +43,10 @@ set -euo pipefail
 GH="${ROMP_GH:-gh}"                       # overridable so tests can stub the GitHub CLI
 POLL="${ROMP_RELEASE_POLL:-5}"            # seconds between checks while the run starts
 REF="${ROMP_RELEASE_REF:-main}"
-RELEASE_REMOTE="${ROMP_RELEASE_REMOTE:-origin}"
+# Default to the clone's own push target when one is configured (a dev clone whose origin is the
+# upstream repo but whose pushes go to a fork must never release AT upstream by default —
+# 2026-08-14 review); origin remains the fallback, which is right on a plain clone.
+RELEASE_REMOTE="${ROMP_RELEASE_REMOTE:-$(git config --get remote.pushDefault 2>/dev/null || echo origin)}"
 # Normally derived from RELEASE_REMOTE. The override is useful for local/non-GitHub remotes
 # (including the hermetic test fixture), but a GitHub remote and an explicit override must agree.
 RELEASE_REPO="${ROMP_RELEASE_REPO:-${ROMP_RELEASE_UPSTREAM:-}}"

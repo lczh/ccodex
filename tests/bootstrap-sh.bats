@@ -132,6 +132,19 @@ teardown() { rm -rf "$TEST_DIR"; }
     [ "$(git -C "$HOME/romp" rev-parse HEAD)" != "$(git -C "$ROMP_REPO" rev-parse v0.2.0^{})" ]
 }
 
+@test "bootstrap.sh: an unsigned release with NO trust root installs, with a loud note" {
+    # Enforcement requires a configured trust root (env / ROMP_VERIFY_RELEASES / persisted config).
+    # Mandatory-with-no-published-key bricked every friend install: releases were not signed and no
+    # key was distributed anywhere, so there was nothing to trust (2026-08-14 review).
+    git -C "$ROMP_REPO" tag -a v0.3.0 -m unsigned
+    unset ROMP_RELEASE_ALLOWED_SIGNERS
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"not signature-verified"* ]]
+    [[ "$output" == *STUB_INSTALL_RAN* ]]
+    [ "$(git -C "$HOME/romp" describe --tags)" = "v0.3.0" ]
+}
+
 @test "bootstrap.sh: rejects a release signed by a key outside the allowed-signers trust root" {
     ssh-keygen -q -t ed25519 -N '' -f "$TEST_DIR/untrusted-key"
     git -C "$ROMP_REPO" -c user.signingKey="$TEST_DIR/untrusted-key" \
