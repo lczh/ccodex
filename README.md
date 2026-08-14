@@ -2,11 +2,12 @@
   <img src="docs/assets/brand/romp-wordmark.png" alt="romp" width="440">
 </p>
 
-> **This is romp-codex** — a fork of [romp](https://github.com/romp-on/romp) that adds
-> **OpenAI Codex** sessions alongside Claude Code ones: same board, cards, chat, and
-> coordination, with the agent kind picked per session. Codex setup and install
-> instructions live in [docs/codex.md](docs/codex.md); everything below is the
-> upstream project's documentation and applies here unchanged.
+> **This is ccodex** — a fork of [romp](https://github.com/romp-on/romp) that runs
+> **OpenAI Codex** agents, alongside or instead of Claude Code: same board, cards,
+> chat, and coordination, with the agent kind picked per session — including running
+> entirely on a Codex login, no Claude required. Install and setup live in
+> [docs/codex.md](docs/codex.md). The command is `ccodex` (`romp` works too: ccodex
+> is built on romp, and everything below is the upstream project's documentation).
 
 AI agents like Claude Code can work autonomously for long stretches, allowing several to be run in parallel. But this parallelism creates new management work: tracking what the agents are doing, scrolling through transcripts to find the background a decision needs, and coordinating handoffs of work and context.
 

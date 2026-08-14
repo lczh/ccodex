@@ -1,9 +1,11 @@
-# Codex sessions
+# Codex sessions (ccodex)
 
-Romp can run **OpenAI Codex** agents alongside Claude Code sessions — same board,
-same cards, chat, timeline, and postal bus. A Codex session is just another kind
-of session: pick **Codex** in the new-session dialog's Backend toggle (or set it
-as the gear's Default backend).
+ccodex runs **OpenAI Codex** agents alongside — or instead of — Claude Code
+sessions: same board, same cards, chat, timeline, and postal bus. A Codex
+session is just another kind of session: pick **Codex** in the new-session
+dialog's Backend toggle (or set it as the gear's Default backend). The
+`ccodex` command and the `romp` command are the same program — ccodex is
+built on romp, and either name works everywhere below.
 
 Under the hood, romp drives Codex through the official `codex app-server`
 protocol and materializes each thread as a transcript romp's read side already
@@ -13,9 +15,9 @@ understands — design in `plans/codex-backend.md`.
 
 Codex sessions need, once per machine:
 
-1. **The Codex SDK for romp:**
+1. **The Codex SDK:**
 
-        romp-codex-setup
+        ccodex-setup
 
     This provisions a dedicated, pinned venv under romp's state dir (it never
     touches your system Python) and bundles the Codex binary.
@@ -36,9 +38,9 @@ Claude Code login. On a Codex-only machine, switch the judges to Codex instead
 
 ## Running the judges on Codex
 
-    romp engine codex        # back: romp engine claude — current posture: romp engine status
+    ccodex engine codex      # back: ccodex engine claude — current posture: ccodex engine status
 
-One switch, two knobs: the judges move to Codex, and new sessions (`romp new`,
+One switch, two knobs: the judges move to Codex, and new sessions (`ccodex new`,
 the kernel API) default to the Codex backend — the dashboard's + dialog keeps
 its own per-create toggle. No restart needed: judges read the setting on their
 next call, and running sessions are never touched. Every judge becomes a
@@ -92,14 +94,14 @@ cards, Codex plan items on the card checklist, subagent lanes, rate-limit
 gating, and MCP server management from the dashboard (Codex sessions read MCP
 servers from `~/.codex/config.toml`).
 
-## Installing romp-codex
+## Installing ccodex
 
-This repo (`romp-codex`) is the distribution: romp's installer takes any repo
-and ref, so it installs with the standard one-liner plus two variables:
+This repo is the distribution — the installer takes any repo, ref, and
+directory:
 
-    curl -fsSL https://raw.githubusercontent.com/lczh/romp-codex/main/bootstrap.sh | \
-      ROMP_REPO=https://github.com/lczh/romp-codex.git ROMP_REF=main bash
+    curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | \
+      ROMP_REPO=https://github.com/lczh/ccodex.git ROMP_REF=main ROMP_DIR=$HOME/ccodex bash
 
-Then run the two setup steps above. (The clone lands at `~/romp` by default —
-set `ROMP_DIR=$HOME/romp-codex` in the same command if you'd rather it match
-the repo name.)
+Then, in a new terminal, the two setup steps above (`ccodex-setup`,
+`codex login`) — and `ccodex engine codex` if the machine should run
+Codex-only. `ccodex` opens the dashboard.
