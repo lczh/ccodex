@@ -6,10 +6,12 @@
 # sys.path (see _ensure_sdk_on_path in bin/romp-kernel). The venv is built with the SAME python the
 # kernel runs (pick_python below matches bin/romp-serve's), so the ABI matches — and if the picked
 # python changes (say a 3.12 lands next to the 3.8 the venv was built with), the venv is REBUILT to
-# match. Idempotent; the tmux backend is unaffected whether or not this is run. Re-run to upgrade.
+# match. Idempotent; the tmux backend is unaffected whether or not this is run. Dependency upgrades
+# are deliberate: bump the exact pin below and validate the backend suite before publishing.
 set -euo pipefail
 STATE="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}"
 VENV="$STATE/sdkvenv"
+PIN="claude-agent-sdk==0.2.125"
 
 # The Agent SDK needs python >= 3.10; some hosts pin the system python3 older (Ubuntu 20.04 = 3.8)
 # with a newer one alongside (e.g. a uv-managed 3.12 in ~/.local/bin — probed explicitly because a
@@ -38,39 +40,11 @@ if ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; t
   exit 1
 fi
 
-# Debian/Ubuntu ship a python3 whose venv module cannot bootstrap pip: ensurepip is split into a
-# separate python3-venv package. `python3 -m venv` there still creates bin/python symlinks and THEN
-# fails, leaving a pip-less husk.
-#
-# This used to stop here and tell the user to `sudo apt install python3-venv`. But an installer cannot
-# sudo for you, so that turned romp's OWN critical dependency into homework — and the SDK backend is
-# what plain `romp new` uses, so a machine that skipped it has a romp that cannot start a session at
-# all (the user 2026-07-28, on a python3.14 box: install "succeeded", every session silently swallowed
-# its messages). So DON'T stop: build the venv without pip and bootstrap pip into it from PyPA's
-# canonical get-pip.py, which needs no root. Only when THAT fails too (offline, no fetcher) do we fall
-# back to naming the package. ROMP_GET_PIP_URL overrides the source; ROMP_NO_GET_PIP=1 opts out of the
-# fetch entirely for anyone who would rather install the OS package themselves.
-GET_PIP_URL="${ROMP_GET_PIP_URL:-https://bootstrap.pypa.io/get-pip.py}"
-
-fetch() {   # $1 url → $2 dest, with whichever fetcher the box has
-  if command -v curl >/dev/null 2>&1; then curl -fsSL --max-time 60 "$1" -o "$2"
-  elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1"
-  else return 1; fi
-}
-
 make_venv() {
-  if "$PY" -c 'import ensurepip' >/dev/null 2>&1; then
-    "$PY" -m venv "$VENV"
-    return
-  fi
-  if [ -n "${ROMP_NO_GET_PIP:-}" ]; then return 1; fi
-  echo "romp-sdk-setup: $PY has no 'ensurepip' — bootstrapping pip from $GET_PIP_URL (no sudo needed)"
-  "$PY" -m venv --without-pip "$VENV" || return 1
-  [ -x "$VENV/bin/python" ] || return 1
-  fetch "$GET_PIP_URL" "$VENV/get-pip.py" || return 1
-  "$VENV/bin/python" "$VENV/get-pip.py" -q || return 1
-  rm -f "$VENV/get-pip.py"
-  [ -x "$VENV/bin/pip" ]
+  # Never download and execute a mutable bootstrap script during installation. Distro pythons that
+  # split ensurepip into python3-venv fail with a precise package remedy below.
+  "$PY" -c 'import ensurepip' >/dev/null 2>&1 || return 1
+  "$PY" -m venv "$VENV"
 }
 
 mkdir -p "$STATE"
@@ -91,7 +65,7 @@ if [ ! -x "$VENV/bin/python" ] || [ ! -x "$VENV/bin/pip" ]; then
     rm -rf "$VENV"
     echo "romp-sdk-setup: could not build a venv with pip in it." >&2
     if ! "$PY" -c 'import ensurepip' >/dev/null 2>&1; then
-      echo "  $PY has no 'ensurepip', and bootstrapping pip from $GET_PIP_URL did not work (offline?)." >&2
+      echo "  $PY has no 'ensurepip'; romp will not execute an unverified downloaded pip bootstrap." >&2
       echo "  Debian/Ubuntu: sudo apt install python$(pyver "$PY")-venv   (or: sudo apt install python3-venv)" >&2
     fi
     echo "  Then re-run: $0" >&2
@@ -99,8 +73,10 @@ if [ ! -x "$VENV/bin/python" ] || [ ! -x "$VENV/bin/pip" ]; then
     exit 1
   fi
 fi
-"$VENV/bin/pip" install -q --upgrade pip >/dev/null
-"$VENV/bin/pip" install -q --upgrade claude-agent-sdk
+# Ignore ambient pip configuration/index overrides and refuse source distributions: dependency
+# installation must not run an arbitrary setup backend on the host.  The direct SDK is version-pinned;
+# its resolved wheel dependencies remain isolated inside this disposable venv.
+"$VENV/bin/pip" --isolated install -q --disable-pip-version-check --only-binary=:all: "$PIN"
 "$VENV/bin/python" - <<'PY'
 import claude_agent_sdk as m, sys
 print("romp-sdk-setup: claude-agent-sdk %s ready (python %s)" % (m.__version__, ".".join(map(str, sys.version_info[:3]))))

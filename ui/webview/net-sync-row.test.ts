@@ -1,6 +1,7 @@
 // The remote-kernel row says HOW a build differs and offers the action that can actually succeed
 // (the user 2026-07-27): "behind N" offers Push, "ahead N" offers Pull (fetched over THIS machine's
-// ssh — the remote has no route back, its own push died with "No route to host"), and an auto-sync in
+// ssh — the remote has no outbound ssh route, although a trusted check-in has an authenticated Romp
+// administration route), and an auto-sync in
 // flight ('pulling'/'asking' included) suppresses the manual buttons. A checked-in host, which no ssh
 // of ours can reach, offers Update when it is behind — the peer fast-forwards ITSELF over the link it
 // holds (the user 2026-07-28) — and nothing but an explanation otherwise. Pinned in BOTH copies —
@@ -54,7 +55,9 @@ test("VS Code strip: same row treatment", () => {
     "Push only where it can succeed — our ssh route and a provable fast-forward");
   assert.match(STRIP, /t\.status === "up" && t\.askPull && !apx/, "Update for a checked-in peer that is behind");
   assert.match(STRIP, /act\("\/tunnels\/askpull", t\.host, a, "Asking…"\)/);
-  assert.match(STRIP, /No ssh path from this machine \(it checked in over its own tunnel\)/);
+  assert.match(STRIP, /No outbound ssh path from this machine \(it checked in over its own reverse tunnel\)/);
+  assert.match(STRIP, /trusted check-in (?:still )?grants authenticated Romp administration/,
+    "the copy does not mistake missing outbound ssh for a one-way security boundary");
   assert.match(STRIP, /t\.autoPush\.phase === "pulling"/);
   assert.match(STRIP, /t\.autoPush\.phase === "asking"/);
 });

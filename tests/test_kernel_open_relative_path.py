@@ -52,6 +52,32 @@ class ResolveOpenPath(unittest.TestCase):
         # the openFile handler passes the message's session id so relatives resolve against the right session
         src = open(os.path.join(BIN, "romp-kernel")).read()
         self.assertIn('_open_file(str(msg["path"]), sid=msg.get("id"))', src)
+        self.assertIn('_reply(client, {"type": "warn", "text": err})', src)
+
+    def test_linux_open_uses_xdg_open(self):
+        old_platform, old_which, old_popen, old_exists = (
+            km.sys.platform, km.shutil.which, km.subprocess.Popen, km.os.path.exists)
+        calls = []
+        try:
+            km.sys.platform = "linux"
+            km.shutil.which = lambda name: "/usr/bin/xdg-open" if name == "xdg-open" else None
+            km.os.path.exists = lambda _path: True
+            km.subprocess.Popen = lambda argv, **kwargs: calls.append(argv)
+            self.assertIsNone(km._open_file("design/foo.md", SID))
+            self.assertEqual(calls, [["xdg-open", os.path.join(BASE, "design/foo.md")]])
+        finally:
+            km.sys.platform, km.shutil.which, km.subprocess.Popen, km.os.path.exists = (
+                old_platform, old_which, old_popen, old_exists)
+
+    def test_linux_open_reports_when_no_desktop_opener_exists(self):
+        old_platform, old_which, old_exists = km.sys.platform, km.shutil.which, km.os.path.exists
+        try:
+            km.sys.platform = "linux"
+            km.shutil.which = lambda _name: None
+            km.os.path.exists = lambda _path: True
+            self.assertIn("install xdg-utils", km._open_file("design/foo.md", SID))
+        finally:
+            km.sys.platform, km.shutil.which, km.os.path.exists = old_platform, old_which, old_exists
 
 
 if __name__ == "__main__":

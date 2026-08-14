@@ -268,5 +268,5 @@ fi
 
 echo
 echo "Reinstall from scratch with:"
-echo "  curl -fsSL https://raw.githubusercontent.com/romp-on/romp/main/bootstrap.sh | bash"
+echo "  curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | bash"
 echo "Open a NEW terminal afterwards (this one still has the old PATH)."

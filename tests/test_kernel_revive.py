@@ -9,6 +9,7 @@ pretending it worked. Synthetic fixtures only."""
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
@@ -129,7 +130,10 @@ class SdkResumePreservesLastSid(unittest.TestCase):
             sb.write_reg(state, SID, reg)
 
         class FakeBackend:
-            state_dir = state
+            def __init__(self):
+                self.state_dir = state
+                self._reg_lock = threading.RLock()
+            _mutate_reg = sb.SdkBackend._mutate_reg
             def _poke(self):
                 pass
         sb.SdkBackend.resume(FakeBackend(), "testsess", SID)

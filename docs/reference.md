@@ -36,7 +36,7 @@ These are for scripting and for agents rather than daily use:
 | `romp send <session> <text>` | Hand a session a message, on either backend |
 | `romp interrupt <session>` | Interrupt whatever turn a session is taking |
 | `romp end <session>` | End a session |
-| `romp checkin <host>` / `romp checkout <host>` | Publish this machine to an attached hub, or withdraw it |
+| `romp checkin <host>` / `romp checkout <host>` | For a trusted host you control, delegate authenticated Romp administration to that attached hub, or withdraw it |
 | `romp default-dir [PATH]` | The default working directory for new sessions; no argument prints it, `""` clears it |
 | `romp debug [on\|off\|status]` | Judge debug mode, where rejection rows carry the full input and reply |
 | `romp resume <id> [--name <n>] [--detach]` | Resume one exact conversation by UUID |
@@ -184,9 +184,13 @@ For `./install.sh`:
 For the one-line installer (`bootstrap.sh`), which passes all of the above
 through to `install.sh`:
 
-- `ROMP_DIR=<path>` where to clone; default `~/romp`.
+- `ROMP_DIR=<path>` where to clone; default `~/ccodex`.
 - `ROMP_REF=<tag|branch>` install a specific ref; default is the newest `v*`
-  release tag, falling back to `main` when none is published.
+  release tag. Tags must pass `git verify-tag`; no release or a failed signature stops
+  installation instead of falling back. `ROMP_REF=main` is an explicit development-code opt-in.
+- `ROMP_RELEASE_ALLOWED_SIGNERS=<absolute-path>` supplies Git's SSH allowed-signers file
+  to bootstrap and the in-app updater. OpenPGP signatures use Git's configured GPG keyring
+  and must meet `gpg.minTrustLevel=fully`.
 - `ROMP_NO_PATH=1` leaves your shell rc alone.
 
 ### Ports

@@ -1,40 +1,40 @@
 // Reviewing a session's uncommitted changes from the current window: parse
-// `git status --porcelain` into pickable entries. Pure decision core —
+// `git status --porcelain=v1 -z` into pickable entries. The NUL form is the only porcelain
+// representation that preserves every legal path byte without C-quoting or an ambiguous ` -> `.
+// Pure decision core —
 // extension.ts runs git and opens the native diff editor.
 
 export type ChangedFile = {
   path: string;          // repo-relative
   status: string;        // porcelain XY, trimmed (e.g. "M", "A", "??", "R")
   untracked: boolean;    // no HEAD side — diff against empty
-  renamedFrom?: string;  // "R  old -> new" keeps the old path for the HEAD side
+  renamedFrom?: string;  // rename/copy's second NUL record is the old HEAD-side path
 };
 
 export function parsePorcelain(out: string): ChangedFile[] {
   const files: ChangedFile[] = [];
-  for (const raw of String(out || "").split("\n")) {
+  const records = String(out || "").split("\0");
+  for (let i = 0; i < records.length; i += 1) {
+    const raw = records[i];
     if (raw.length < 4) continue;
     const xy = raw.slice(0, 2);
-    let rest = raw.slice(3);
-    if (!rest) continue;
+    const file = raw.slice(3);
+    if (!file) continue;
     let renamedFrom: string | undefined;
-    if ((xy[0] === "R" || xy[0] === "C") && rest.includes(" -> ")) {
-      const [from, to] = rest.split(" -> ");
-      renamedFrom = unquote(from);
-      rest = to;
+    if (xy[0] === "R" || xy[0] === "C" || xy[1] === "R" || xy[1] === "C") {
+      // In -z mode Git reverses the human short-format order: destination first, source second.
+      const source = records[i + 1];
+      if (source !== undefined && source !== "") {
+        renamedFrom = source;
+        i += 1;
+      }
     }
     files.push({
-      path: unquote(rest),
+      path: file,
       status: xy.trim(),
       untracked: xy === "??",
       renamedFrom,
     });
   }
   return files;
-}
-
-// git quotes paths with special characters ("a b.txt", with escapes); undo the
-// plain-quote case (escape sequences are rare enough to pass through).
-function unquote(p: string): string {
-  const s = p.trim();
-  return s.startsWith('"') && s.endsWith('"') ? s.slice(1, -1) : s;
 }

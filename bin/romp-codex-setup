@@ -34,28 +34,11 @@ if ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; t
   exit 1
 fi
 
-# ensurepip-less pythons: same get-pip bootstrap as romp-sdk-setup (see its comments for the why).
-GET_PIP_URL="${ROMP_GET_PIP_URL:-https://bootstrap.pypa.io/get-pip.py}"
-
-fetch() {
-  if command -v curl >/dev/null 2>&1; then curl -fsSL --max-time 60 "$1" -o "$2"
-  elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1"
-  else return 1; fi
-}
-
 make_venv() {
-  if "$PY" -c 'import ensurepip' >/dev/null 2>&1; then
-    "$PY" -m venv "$VENV"
-    return
-  fi
-  if [ -n "${ROMP_NO_GET_PIP:-}" ]; then return 1; fi
-  echo "romp-codex-setup: $PY has no 'ensurepip' — bootstrapping pip from $GET_PIP_URL (no sudo needed)"
-  "$PY" -m venv --without-pip "$VENV" || return 1
-  [ -x "$VENV/bin/python" ] || return 1
-  fetch "$GET_PIP_URL" "$VENV/get-pip.py" || return 1
-  "$VENV/bin/python" "$VENV/get-pip.py" -q || return 1
-  rm -f "$VENV/get-pip.py"
-  [ -x "$VENV/bin/pip" ]
+  # Never download and execute a mutable bootstrap script during installation. Distro pythons that
+  # split ensurepip into python3-venv fail with a precise package remedy below.
+  "$PY" -c 'import ensurepip' >/dev/null 2>&1 || return 1
+  "$PY" -m venv "$VENV"
 }
 
 mkdir -p "$STATE"
@@ -70,7 +53,7 @@ if [ ! -x "$VENV/bin/python" ] || [ ! -x "$VENV/bin/pip" ]; then
     rm -rf "$VENV"
     echo "romp-codex-setup: could not build a venv with pip in it." >&2
     if ! "$PY" -c 'import ensurepip' >/dev/null 2>&1; then
-      echo "  $PY has no 'ensurepip', and bootstrapping pip from $GET_PIP_URL did not work (offline?)." >&2
+      echo "  $PY has no 'ensurepip'; romp will not execute an unverified downloaded pip bootstrap." >&2
       echo "  Debian/Ubuntu: sudo apt install python$(pyver "$PY")-venv   (or: sudo apt install python3-venv)" >&2
     fi
     echo "  Then re-run: $0" >&2
@@ -78,8 +61,10 @@ if [ ! -x "$VENV/bin/python" ] || [ ! -x "$VENV/bin/pip" ]; then
     exit 1
   fi
 fi
-"$VENV/bin/pip" install -q --upgrade pip >/dev/null
-"$VENV/bin/pip" install -q "$PIN"
+# Ignore ambient pip configuration/index overrides and refuse source distributions: dependency
+# installation must not run an arbitrary setup backend on the host.  The direct SDK is version-pinned;
+# its resolved wheel dependencies remain isolated inside this disposable venv.
+"$VENV/bin/pip" --isolated install -q --disable-pip-version-check --only-binary=:all: "$PIN"
 "$VENV/bin/python" - <<'PY'
 import openai_codex as m, sys
 v = getattr(m, "__version__", "?")

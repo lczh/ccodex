@@ -656,7 +656,7 @@ EOF
     _romp_cmd "romp send <session> <text>" -            "Hand a session a message (kernel API, either backend)"
     _romp_cmd "romp interrupt <session>"   -            "Interrupt a session's current turn"
     _romp_cmd "romp end <session>"         -            "End a session"
-    _romp_cmd "romp checkin <host>"        -            "Publish this machine to an attached hub (romp checkout withdraws)"
+    _romp_cmd "romp checkin <host>"        -            "Delegate Romp administration to a trusted attached hub (checkout withdraws)"
     _romp_cmd "romp default-dir [PATH]"    -            "Default working dir for new sessions (no arg prints; \"\" clears)"
     _romp_cmd "romp debug [on|off|status]" -            "Judge debug mode (rejection rows carry full input+reply)"
     _romp_cmd "romp engine claude|codex"   -            "One switch: which vendor runs the judges + what new sessions default to"

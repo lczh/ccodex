@@ -64,17 +64,19 @@ You run ccodex yourself, on your laptop or a server, with no hosted service in b
 
 ## Quick start
 
-Needs Python 3.10+, Node.js, git — and at least one agent vendor: an OpenAI account for
+Needs Python 3.10+, Node.js 22+, git — and at least one agent vendor: an OpenAI account for
 Codex sessions, and/or [Claude Code](https://claude.com/claude-code) (signed in) for
 Claude sessions.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | \
-  ROMP_REPO=https://github.com/lczh/ccodex.git ROMP_DIR=$HOME/ccodex bash
+curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | bash
 ```
 
-This clones ccodex to `~/ccodex`, checks out the newest release, installs it, and adds
-`bin/` to your shell rc. Installed machines then learn about new releases on their own —
+This clones ccodex to `~/ccodex`, verifies the newest release tag with Git, installs it,
+and adds `bin/` to your shell rc. Release installs fail closed unless the tag has a valid
+signature from a signer trusted by your Git configuration; see
+[Release signature trust](docs/install.md#release-signature-trust). Installed machines then
+learn about new releases on their own —
 the dashboard offers each update as a one-click banner (or installs it automatically;
 the gear's **Updates** setting decides). Then, in a new terminal:
 
@@ -84,6 +86,10 @@ codex login            # or: codex login --device-auth on a headless box
 ccodex engine codex    # optional — run EVERYTHING on the Codex login (skip if you also use Claude Code)
 ccodex                 # opens the dashboard; start a session from there
 ```
+
+Migration note: `v1.0.0` predates this signature gate and is unsigned. After this change
+merges, a new signed release must be published before the default installer or updater can
+advance; the gate deliberately does not fall back to unsigned `main` or an older release.
 
 By default ccodex's own intelligence — the judges that caption work and route your
 attention — runs on Claude, so a machine without Claude Code should run

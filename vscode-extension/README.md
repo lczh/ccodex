@@ -16,7 +16,7 @@ the same UI — the pane sources live in `../ui/webview/` and are bundled here b
 
 - The **kernel** parses each session's transcript into an event tree
   (`kernel/event_model.py`) and pushes pane payloads over WebSocket.
-- `src/extension.ts` (extension host) spawn-or-attaches a kernel and hosts the
+- `src/extension.ts` (extension host) asks the manager to ensure a kernel, attaches to it, and hosts the
   webviews, piping `postMessage` both ways — it does not parse transcripts.
 - `../ui/webview/render.ts` + `feed.ts` + `styles.css` (webview) render the
   pushed events. Base colors/fonts come from VS Code theme variables; the
@@ -27,11 +27,13 @@ models store a signature-only block, so those render as a `Thinking…` placehol
 
 ## Develop
 
+Use Node.js 22 or newer (the pinned VSIX packager's supported runtime).
+
 ```sh
-npm install
+npm ci
 npm run build      # or: npm run watch
 ```
 
-Then open this folder in VS Code/Cursor and press **F5** (Run romp Chat View).
-In the dev host, run the command **“romp Chat: Open Session Viewer”** and pick a
-session.
+Then open this folder in VS Code/Cursor and press **F5** (Run ccodex Agent View).
+In the dev host, run **“ccodex: Open”**. The command id remains `rompChat.open`
+so existing keybindings and deep links continue to work.

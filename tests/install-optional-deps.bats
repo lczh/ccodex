@@ -51,7 +51,7 @@ bare_path() { echo "$STUB:$BAREBIN"; }
 
 # ── the bug that blanked the dashboard ────────────────────────────────────────
 # vscode-extension/install.sh used to check for an editor CLI FIRST and exit 0, so on an
-# editor-less machine npm install and esbuild never ran — and the kernel serves that same
+# editor-less machine npm ci and esbuild never ran — and the kernel serves that same
 # dist/ to the browser. The build must happen before, and regardless of, the editor check.
 
 @test "vscode-extension/install.sh: builds dist even with no editor CLI on the machine" {
@@ -71,7 +71,8 @@ EOF
 
     [ "$status" -eq 0 ]
     # The two steps the browser dashboard depends on both ran...
-    grep -q "npm install" "$CALL_LOG"
+    grep -q "npm ci" "$CALL_LOG"
+    ! grep -q "npm install" "$CALL_LOG"
     grep -q "node esbuild.js" "$CALL_LOG"
     # ...and it said so honestly, instead of the old "built dist/ is ready" on a path that built nothing.
     [[ "$output" == *"dist/ built"* ]]
@@ -93,7 +94,7 @@ EOF
 #!/usr/bin/env bash
 echo "code $*" >> "$CALL_LOG"
 EOF
-    # The PACKAGE_ONLY path reaches `npx @vscode/vsce package`; a real npx would
+    # The PACKAGE_ONLY path reaches the pinned `npx --no-install vsce package`; a real npx would
     # hit the network (or, on the allowlist PATH, not exist at all).
     cat > "$STUB/npx" <<'EOF'
 #!/usr/bin/env bash
@@ -104,10 +105,12 @@ EOF
     # PACKAGE_ONLY stops before the install-into-editor loop, so the run stays hermetic.
     PATH="$(bare_path)" ROMP_EXT_PACKAGE_ONLY=1 run "$ROMP_DIR/vscode-extension/install.sh"
 
-    npm_line="$(grep -n 'npm install' "$CALL_LOG" | head -1 | cut -d: -f1)"
+    [ "$status" -eq 0 ]
+    npm_line="$(grep -n 'npm ci' "$CALL_LOG" | head -1 | cut -d: -f1)"
     build_line="$(grep -n 'node esbuild.js' "$CALL_LOG" | head -1 | cut -d: -f1)"
     [ -n "$npm_line" ] && [ -n "$build_line" ]
     [ "$npm_line" -lt "$build_line" ]
+    grep -q '^npx --no-install vsce package ' "$CALL_LOG"
 }
 
 # ── tmux is optional, and its absence is advisory (never fatal) ───────────────
@@ -225,7 +228,7 @@ EOF
 if [ "${1:-}" = "-m" ] && [ "${2:-}" = "venv" ]; then
   echo "venv-rebuild $3" >> "$CALL_LOG"
   mkdir -p "$3/bin"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$3/bin/pip"
+  printf '#!/usr/bin/env bash\necho "pip $*" >> "$CALL_LOG"\nexit 0\n' > "$3/bin/pip"
   printf '#!/usr/bin/env bash\ncat >/dev/null\nexit 0\n' > "$3/bin/python"
   chmod +x "$3/bin/pip" "$3/bin/python"
   exit 0
@@ -243,6 +246,8 @@ EOF
 
     [ "$status" -eq 0 ]
     grep -q "venv-rebuild" "$CALL_LOG"
+    grep -q 'pip --isolated install -q --disable-pip-version-check --only-binary=:all: claude-agent-sdk==0.2.125' "$CALL_LOG"
+    ! grep -q -- '--upgrade' "$CALL_LOG"
 }
 
 # ── installs ship a PRODUCTION bundle ────────────────────────────────────────
@@ -302,65 +307,17 @@ EOF
     [[ "$output" == *"token=TESTTOKEN123"* ]]
 }
 
-# ── romp installs its own critical dependency, rather than assigning homework ──
-# The SDK backend is what plain `romp new` runs on, so a box without it has a romp that starts,
-# looks healthy and cannot run a single session. romp-sdk-setup used to stop at Debian's missing
-# ensurepip and tell the user to sudo — which an installer cannot do for them, and which is exactly
-# where a fresh python3.14 install stalled (the user 2026-07-28). It now builds the venv without pip
-# and bootstraps pip itself; the sudo message is the LAST resort, not the first answer.
+# ── dependency bootstrap is deterministic ───────────────────────────────────
 
-# A python that passes the >= 3.10 gate, has no ensurepip, and can fake `-m venv --without-pip`
-# well enough to exercise the bootstrap. Self-contained for the same reason as the test above: the
-# host's own python3 differs per machine.
-_pipless_python() {
-    cat > "$STUB/python3.12" <<EOF
-#!/usr/bin/env bash
-case "\$*" in
-  *"version_info >= (3, 10)"*) exit 0 ;;
-  *'print("%d.%d"'*)           echo "3.12"; exit 0 ;;
-  *"import ensurepip"*)        exit 1 ;;
-  *"-m venv --without-pip"*)
-      v="\${@: -1}"
-      mkdir -p "\$v/bin"
-      # the venv's python: running get-pip.py is what mints bin/pip
-      printf '#!/usr/bin/env bash\ncase "\$*" in *get-pip.py*) printf "#!/usr/bin/env bash\\nexit 0\\n" > "\$(dirname "\$0")/pip"; chmod +x "\$(dirname "\$0")/pip";; esac\nexit 0\n' > "\$v/bin/python"
-      chmod +x "\$v/bin/python"
-      exit 0 ;;
-esac
-exit 0
-EOF
-    chmod +x "$STUB/python3.12"
-}
-
-@test "romp-sdk-setup: bootstraps pip itself when ensurepip is missing — no sudo, no homework" {
-    _pipless_python
-    export ROMP_STATE_DIR="$TEST_DIR/state"
-    # file:// keeps the fetch hermetic — curl handles it, and no test may reach the network.
-    printf '# a stand-in for PyPA get-pip.py\n' > "$TEST_DIR/get-pip.py"
-
-    PATH="$(bare_path)" ROMP_PYTHON="$STUB/python3.12" \
-      ROMP_GET_PIP_URL="file://$TEST_DIR/get-pip.py" run "$ROMP_DIR/bin/romp-sdk-setup"
-
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"bootstrapping pip"* ]]
-    # the whole point: it must NOT send the user to sudo when it can do the job itself
-    [[ "$output" != *"sudo apt install"* ]]
-    [ -x "$TEST_DIR/state/sdkvenv/bin/pip" ]
-    # the downloaded bootstrap script is not left lying in the venv
-    [ ! -f "$TEST_DIR/state/sdkvenv/get-pip.py" ]
-}
-
-@test "romp-sdk-setup: ROMP_NO_GET_PIP opts out, and then it names the package" {
-    _pipless_python
-    export ROMP_STATE_DIR="$TEST_DIR/state"
-
-    PATH="$(bare_path)" ROMP_PYTHON="$STUB/python3.12" ROMP_NO_GET_PIP=1 \
-      run "$ROMP_DIR/bin/romp-sdk-setup"
-
-    [ "$status" -eq 1 ]
-    [[ "$output" == *"sudo apt install"* ]]           # the fallback is still there for anyone who wants it
-    [[ "$output" == *"romp still runs without this"* ]]
-    [ ! -x "$TEST_DIR/state/sdkvenv/bin/python" ]     # and never a husk for the next run to trip over
+@test "SDK setup scripts pin packages and never execute a downloaded pip bootstrap" {
+    grep -q 'PIN="claude-agent-sdk==0.2.125"' "$ROMP_DIR/bin/romp-sdk-setup"
+    grep -q 'PIN="openai-codex==0.144.4"' "$ROMP_DIR/bin/romp-codex-setup"
+    ! grep -q 'get-pip.py' "$ROMP_DIR/bin/romp-sdk-setup"
+    ! grep -q 'get-pip.py' "$ROMP_DIR/bin/romp-codex-setup"
+    ! grep -q 'pip.*--upgrade' "$ROMP_DIR/bin/romp-sdk-setup"
+    ! grep -q 'pip.*--upgrade' "$ROMP_DIR/bin/romp-codex-setup"
+    grep -q -- '--isolated install.*--only-binary=:all:' "$ROMP_DIR/bin/romp-sdk-setup"
+    grep -q -- '--isolated install.*--only-binary=:all:' "$ROMP_DIR/bin/romp-codex-setup"
 }
 
 @test "install.sh: a missing SDK backend is a BANNER, not an optional-pieces footnote" {

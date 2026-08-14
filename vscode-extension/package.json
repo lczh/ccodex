@@ -1,10 +1,15 @@
 {
   "name": "romp-chat-view",
-  "displayName": "romp Chat View",
-  "description": "Read-only, nicely-rendered live view of Claude Code (romp) sessions, styled like the official Claude Code panel.",
+  "displayName": "ccodex Agent View",
+  "description": "Live chat, feed, outline, and timeline views for OpenAI Codex and Claude Code sessions managed by ccodex.",
   "version": "0.4.337",
   "publisher": "romp",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lczh/ccodex.git",
+    "directory": "vscode-extension"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -22,70 +27,70 @@
     "commands": [
       {
         "command": "rompChat.open",
-        "title": "romp: Open",
+        "title": "ccodex: Open",
         "icon": "media/romp-swirl-glyph.svg"
       },
       {
         "command": "rompChat.addSession",
-        "title": "romp: Add Session Tab",
+        "title": "ccodex: Add Session Tab",
         "icon": "$(add)"
       },
       {
         "command": "rompChat.openCurrent",
-        "title": "romp: View This Transcript File"
+        "title": "ccodex: View This Transcript File"
       },
       {
         "command": "rompChat.nextTab",
-        "title": "romp: Next Tab"
+        "title": "ccodex: Next Tab"
       },
       {
         "command": "rompChat.prevTab",
-        "title": "romp: Previous Tab"
+        "title": "ccodex: Previous Tab"
       },
       {
         "command": "rompChat.pickSession",
-        "title": "romp: Pick a Session"
+        "title": "ccodex: Pick a Session"
       },
       {
         "command": "rompChat.openFeed",
-        "title": "romp: Open Feed",
+        "title": "ccodex: Open Feed",
         "icon": "$(list-unordered)"
       },
       {
         "command": "rompChat.openTimeline",
-        "title": "romp: Open Timeline"
+        "title": "ccodex: Open Timeline"
       },
       {
         "command": "rompChat.openFleet",
-        "title": "romp: Open Outline"
+        "title": "ccodex: Open Outline"
       },
       {
         "command": "rompChat.citeInComposer",
-        "title": "romp: Cite File in Chat Composer"
+        "title": "ccodex: Cite File in Chat Composer"
       },
       {
         "command": "rompChat.openSessionWorktree",
-        "title": "romp: Open Session Worktree"
+        "title": "ccodex: Open Session Worktree"
       },
       {
         "command": "rompChat.diffSessionChanges",
-        "title": "romp: Diff Session Changes"
+        "title": "ccodex: Diff Session Changes"
       },
       {
         "command": "rompChat.menu",
-        "title": "romp: Menu",
+        "title": "ccodex: Menu",
         "icon": "media/romp-swirl-glyph.svg"
       },
       {
         "command": "rompChat.updateExtension",
-        "title": "romp: Update Extension"
+        "title": "ccodex: Update Extension"
       }
     ],
     "viewsContainers": {
       "panel": [
         {
           "id": "rompPanel",
-          "title": "romp",
+          "title": "ccodex",
           "icon": "media/romp-swirl-glyph.svg"
         }
       ]
@@ -145,7 +150,7 @@
       }
     ],
     "configuration": {
-      "title": "romp",
+      "title": "ccodex",
       "properties": {
         "romp.kernelPort": {
           "type": "number",
@@ -172,12 +177,13 @@
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "3.9.2",
     "esbuild": "^0.21.5",
     "typescript": "^5.4.5"
   },
   "dependencies": {
     "@types/ws": "^8.18.1",
-    "dompurify": "^3.4.10",
+    "dompurify": "^3.4.13",
     "highlight.js": "^11.9.0",
     "katex": "^0.18.1",
     "marked": "^12.0.2",

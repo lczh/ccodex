@@ -21,15 +21,16 @@
 #      for it to land on main  (skipped entirely when VERSION is already correct)
 #   3. run the test suites
 #   4. the macOS gate (see below)
-#   5. tag, push the tag, and publish the GitHub release
+#   5. create and locally verify a cryptographically signed annotated tag, push it, and
+#      publish the GitHub release
 #
 # Two rules it has always existed to enforce, both easy to get wrong by hand and expensive
 # to get wrong in public:
 #
 #   * The tag MUST be v-prefixed. bootstrap.sh picks the release with
 #     `git tag -l 'v*' --sort=-v:refname | head -n1`. A tag like "0.1.0" matches NOTHING, so
-#     the one-line installer silently falls back to main instead of installing the release —
-#     no error, just the wrong thing. Deriving the tag guarantees the prefix.
+#     the strict one-line installer reports that no release exists. Deriving the tag guarantees
+#     the prefix.
 #   * macOS CI does not run on pushes (it is billed even on public repos, ~10x, so it is
 #     workflow_dispatch-only). A macOS-only breakage can therefore sit undetected until a
 #     user hits it. Releasing is exactly when that matters, so this triggers the macOS run
@@ -42,7 +43,10 @@ set -euo pipefail
 GH="${ROMP_GH:-gh}"                       # overridable so tests can stub the GitHub CLI
 POLL="${ROMP_RELEASE_POLL:-5}"            # seconds between checks while the run starts
 REF="${ROMP_RELEASE_REF:-main}"
-UPSTREAM="${ROMP_RELEASE_UPSTREAM:-romp-on/romp}"
+RELEASE_REMOTE="${ROMP_RELEASE_REMOTE:-origin}"
+# Normally derived from RELEASE_REMOTE. The override is useful for local/non-GitHub remotes
+# (including the hermetic test fixture), but a GitHub remote and an explicit override must agree.
+RELEASE_REPO="${ROMP_RELEASE_REPO:-${ROMP_RELEASE_UPSTREAM:-}}"
 skip_macos=0
 skip_tests=0
 dry_run=0
@@ -60,6 +64,8 @@ flags:
   --skip-macos    tag without waiting for the dispatch-only macOS run (loud, discouraged)
   --skip-tests    do not run the local suites before releasing
   --dry-run       print what would happen; change nothing
+
+The release tag is signed with Git's configured signing key and verified locally before push.
 USAGE
     exit 2
 }
@@ -83,12 +89,68 @@ die() { echo "release: $*" >&2; exit 1; }
 say() { echo "release: $*"; }
 step() { if [ "$dry_run" -eq 1 ]; then echo "release: [dry-run] $*"; else "$@"; fi; }
 
+verify_release_tag() {
+    local release_tag="$1"
+    if [ -n "${ROMP_RELEASE_ALLOWED_SIGNERS:-}" ]; then
+        if [ ! -f "$ROMP_RELEASE_ALLOWED_SIGNERS" ] || [ ! -r "$ROMP_RELEASE_ALLOWED_SIGNERS" ]; then
+            echo "release: ROMP_RELEASE_ALLOWED_SIGNERS is not a readable regular file: $ROMP_RELEASE_ALLOWED_SIGNERS" >&2
+            return 1
+        fi
+        git -c gpg.minTrustLevel=fully \
+            -c "gpg.ssh.allowedSignersFile=$ROMP_RELEASE_ALLOWED_SIGNERS" \
+            verify-tag "$release_tag"
+    else
+        git -c gpg.minTrustLevel=fully verify-tag "$release_tag"
+    fi
+}
+
 # Resolve the repo from THIS SCRIPT's location, never the caller's cwd. With
 # `git rev-parse --show-toplevel` the script would inspect — and tag — whatever repo you
 # happened to be standing in, reading that tree's cleanliness and VERSION instead of the one
 # being released.
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
+
+github_repo_from_url() {
+    local url="$1" slug=""
+    case "$url" in
+        git@github.com:*) slug="${url#git@github.com:}" ;;
+        http://github.com/*|https://github.com/*|ssh://git@github.com/*)
+            slug="${url#*github.com/}" ;;
+    esac
+    slug="${slug%.git}"
+    case "$slug" in
+        */*/*|/*|*/|"") return 0 ;;
+        */*) printf '%s\n' "$slug" ;;
+    esac
+}
+
+# A release must be created in the same GitHub repository that receives its tag. Previously
+# this was hard-coded to romp-on/romp, so a ccodex run pushed a tag to lczh/ccodex and then
+# failed after the irreversible step while trying to publish the release in another repo.
+release_url="$(git remote get-url "$RELEASE_REMOTE" 2>/dev/null || true)"
+[ -n "$release_url" ] || die "release remote '$RELEASE_REMOTE' does not exist."
+release_push_url="$(git remote get-url --push "$RELEASE_REMOTE" 2>/dev/null || true)"
+fetch_repo="$(github_repo_from_url "$release_url")"
+push_repo="$(github_repo_from_url "$release_push_url")"
+if [ -n "$fetch_repo" ] && [ -n "$push_repo" ] && [ "$fetch_repo" != "$push_repo" ]; then
+    die "$RELEASE_REMOTE fetches '$fetch_repo' but pushes tags to '$push_repo'; the tag and release must share a repository."
+fi
+# A GitHub push URL is authoritative. A non-GitHub push URL occurs in hermetic/local release
+# fixtures; there an explicit repository override may be used, or the GitHub fetch URL supplies it.
+remote_repo="${push_repo:-$fetch_repo}"
+if [ -z "$RELEASE_REPO" ]; then
+    [ -n "$remote_repo" ] || die "cannot derive a GitHub repository from '$release_url'; set ROMP_RELEASE_REPO=owner/repo."
+    RELEASE_REPO="$remote_repo"
+elif [ -n "$remote_repo" ] && [ "$RELEASE_REPO" != "$remote_repo" ]; then
+    die "ROMP_RELEASE_REPO '$RELEASE_REPO' does not match $RELEASE_REMOTE '$remote_repo'; the tag and release must share a repository."
+fi
+case "$RELEASE_REPO" in
+    */*/*|/*|*/|"") die "release repository '$RELEASE_REPO' must be exactly owner/repo." ;;
+    */*) ;;
+    *) die "release repository '$RELEASE_REPO' must be owner/repo." ;;
+esac
+PROJECT="${RELEASE_REPO##*/}"
 
 [ -f VERSION ] || die "no VERSION file at the repo root — it is the source of truth and must exist."
 current="$(tr -d '[:space:]' < VERSION)"
@@ -153,7 +215,7 @@ if [ "$current" != "$target" ]; then
         # "no pull requests found for branch release-0.3.0" and the release died one step after
         # opening the PR, leaving VERSION merged-but-untagged, exactly the half-finished state this
         # script exists to prevent. A number is unambiguous in any repo.
-        pr_url="$("$GH" pr create --repo "$UPSTREAM" --title "VERSION $target" \
+        pr_url="$("$GH" pr create --repo "$RELEASE_REPO" --title "VERSION $target" \
             --body "Version bump for \`$tag\`, opened by scripts/release.sh.")" \
             || die "could not open the version PR."
         pr="${pr_url##*/}"
@@ -161,21 +223,22 @@ if [ "$current" != "$target" ]; then
             ''|*[!0-9]*) die "could not read the PR number from '$pr_url'." ;;
         esac
         say "opened PR #$pr."
-        "$GH" pr merge "$pr" --repo "$UPSTREAM" --auto --merge \
+        "$GH" pr merge "$pr" --repo "$RELEASE_REPO" --auto --merge \
             || die "could not arm auto-merge on PR #$pr."
         say "waiting for the version PR to land on $REF (its CI is the first gate)..."
         state=""
         for _ in $(seq 1 120); do
-            state="$("$GH" pr view "$pr" --repo "$UPSTREAM" --json state -q .state 2>/dev/null || true)"
+            state="$("$GH" pr view "$pr" --repo "$RELEASE_REPO" --json state -q .state 2>/dev/null || true)"
             if [ "$state" = "MERGED" ]; then break; fi
             if [ "$state" = "CLOSED" ]; then die "the version PR was closed without merging."; fi
             if [ "$POLL" = "0" ]; then break; fi
             sleep "$POLL"
         done
-        [ "$state" = "MERGED" ] || die "the version PR did not merge — check $UPSTREAM."
+        [ "$state" = "MERGED" ] || die "the version PR did not merge — check $RELEASE_REPO."
         git switch "$REF" >/dev/null 2>&1 || die "could not switch back to $REF."
-        git fetch -q origin
-        git merge --ff-only "origin/$REF" >/dev/null || die "could not fast-forward $REF after the merge."
+        git fetch -q "$RELEASE_REMOTE"
+        git merge --ff-only "$RELEASE_REMOTE/$REF" >/dev/null \
+            || die "could not fast-forward $REF from $RELEASE_REMOTE after the merge."
         say "version PR merged; $REF now carries $target."
     fi
 else
@@ -194,11 +257,39 @@ if [ "$skip_tests" -eq 1 ]; then
 else
     say "running the Python suite..."
     step python3 -m pytest tests/ -q || die "the Python suite failed — NOT releasing."
-    if [ -d vscode-extension/node_modules ]; then
-        say "running the webview suite..."
-        step sh -c 'cd vscode-extension && npm test' || die "the webview suite failed — NOT releasing."
+
+    # A release cannot inherit whatever dependency tree happens to be on the maintainer's machine.
+    # Install exactly the reviewed lock, then exercise the same type/build/package path as CI and
+    # the installer. The old node_modules-exists check silently skipped this entire gate on a clean
+    # checkout, which made the least-prepared release environment the least-tested one.
+    run_in_extension() { (cd vscode-extension && "$@"); }
+    say "installing the locked webview dependencies..."
+    step run_in_extension npm ci --silent \
+        || die "npm ci failed — the locked webview dependencies are not reproducible; NOT releasing."
+    say "type-checking the webview and extension..."
+    step run_in_extension npm run typecheck \
+        || die "the webview typecheck failed — NOT releasing."
+    say "running the webview suite..."
+    step run_in_extension npm test || die "the webview suite failed — NOT releasing."
+
+    if [ "$dry_run" -eq 1 ]; then
+        step run_in_extension npx --no-install vsce package --no-dependencies \
+            --allow-missing-repository -o '<temporary-vsix>'
     else
-        say "vscode-extension/node_modules is absent — skipping the webview suite (npm install to include it)."
+        vsix_tmp="$(mktemp -d "${TMPDIR:-/tmp}/ccodex-release-vsix.XXXXXX")" \
+            || die "could not create a temporary directory for the VSIX smoke test."
+        vsix_out="$vsix_tmp/romp-chat-view.vsix"
+        if ! run_in_extension npx --no-install vsce package --no-dependencies \
+                --allow-missing-repository -o "$vsix_out"; then
+            rm -rf "$vsix_tmp"
+            die "the pinned VSIX package smoke test failed — NOT releasing."
+        fi
+        if [ ! -s "$vsix_out" ]; then
+            rm -rf "$vsix_tmp"
+            die "the VSIX package smoke test produced no artifact — NOT releasing."
+        fi
+        rm -rf "$vsix_tmp"
+        say "VSIX package smoke passed."
     fi
 fi
 
@@ -255,21 +346,33 @@ fi
 # never pick itself.
 prev="$(git tag -l 'v*' --sort=-v:refname | head -n1 || true)"
 
-step git tag -a "$tag" -m "romp $tag"
-say "created tag $tag."
+if [ "$dry_run" -eq 1 ]; then
+    step git tag -s "$tag" -m "$PROJECT $tag"
+    step git -c gpg.minTrustLevel=fully verify-tag "$tag"
+else
+    git tag -s "$tag" -m "$PROJECT $tag" \
+        || die "could not create signed tag $tag. Configure Git signing (user.signingKey and, if needed, gpg.format) and retry."
+    # A configured private key is not enough: prove the resulting tag is parseable and verifies
+    # under the same Git trust configuration installers use before it leaves this machine.
+    if ! verify_release_tag "$tag"; then
+        git tag -d "$tag" >/dev/null 2>&1 || true
+        die "the new tag's signature did not verify locally; deleted $tag and did not push it."
+    fi
+fi
+say "created and verified signed tag $tag."
 
-# The tag goes to the UPSTREAM: rulesets block branch pushes there, but a tag is how a
-# release is published, and a tag that exists only locally installs for nobody.
-step git push -q origin "$tag" || die "could not push $tag to origin."
+# The tag goes to the validated release remote: a tag that exists only locally installs for
+# nobody, and publishing it in a different GitHub repository would leave a half-release.
+step git push -q "$RELEASE_REMOTE" "$tag" || die "could not push $tag to $RELEASE_REMOTE."
 say "pushed $tag."
 
 if [ -n "$prev" ]; then
-    step "$GH" release create "$tag" --repo "$UPSTREAM" --title "romp $tag" \
+    step "$GH" release create "$tag" --repo "$RELEASE_REPO" --title "$PROJECT $tag" \
         --generate-notes --notes-start-tag "$prev" \
         || die "$tag is pushed, but publishing the release failed — finish with:
-  gh release create $tag --repo $UPSTREAM --generate-notes"
+  gh release create $tag --repo $RELEASE_REPO --generate-notes"
 else
-    step "$GH" release create "$tag" --repo "$UPSTREAM" --title "romp $tag" --generate-notes \
+    step "$GH" release create "$tag" --repo "$RELEASE_REPO" --title "$PROJECT $tag" --generate-notes \
         || die "$tag is pushed, but publishing the release failed."
 fi
 say "published. $tag is live — bootstrap.sh will install it."

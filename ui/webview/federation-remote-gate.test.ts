@@ -23,7 +23,13 @@ test("the /tunnels poll refreshes live from t.status and re-dials a closed conn 
   assert.match(FED, /c\.live = t\.status === "up";/);
   assert.match(FED, /if \(c\.live && \(!c\.ws \|\| c\.ws\.readyState === 3\)\) this\.connect\(c\);/);
   // openRemote seeds the flag from the same status so the first dial is gated too
-  assert.match(FED, /this\.openRemote\(host, t\.token, t\.status === "up"\)/);
+  assert.match(FED, /this\.openRemote\(host, t\.status === "up"\)/);
+});
+
+test("remote tokens remain server-side behind the authenticated relay", () => {
+  assert.match(FED, /t\.hasToken && t\.localPort/);
+  assert.doesNotMatch(FED, /t\.token/);
+  assert.doesNotMatch(FED, /token=\$\{encodeURIComponent\(token\)\}/);
 });
 
 test("remotes are dialed through the kernel's /remote relay on the page origin, never a loopback port", () => {

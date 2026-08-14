@@ -44,7 +44,8 @@ test("web popover: rows expand into that machine's connections, fetched on deman
   // Python string, so its \uXXXX escapes are literally TWO backslashes in the file — hence \\\\)
   assert.match(KERNEL, /Reading '\+via\+'\\\\u2019s connections/);
   assert.match(KERNEL, /Couldn\\\\u2019t read '\+via\+'\\\\u2019s connections/);
-  assert.match(KERNEL, /data-xr=/);
+  assert.match(KERNEL, /setAttribute\('data-xr',via\)/,
+    "Retry is built as a DOM node; the far host's error never becomes innerHTML");
 });
 
 test("web popover: sub-row actions ride the normal routes with {via}, refusals alert loudly", () => {

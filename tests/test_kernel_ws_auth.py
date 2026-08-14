@@ -41,7 +41,8 @@ os.environ.setdefault("ROMP_SERVE_TOKEN", "test-token-DO-NOT-USE")
 km = SourceFileLoader("romp_kernel", os.path.join(BIN, "romp-kernel")).load_module()
 
 
-def _ws_handshake(port, origin=None, host=None, path="/ws?app=chat", token=None, timeout=2.0):
+def _ws_handshake(port, origin=None, host=None, path="/ws?app=chat", token=None,
+                  cookie=None, fetch_site=None, timeout=2.0):
     """Send one raw WebSocket upgrade; return the numeric HTTP status (e.g. 101, 403)."""
     if token is not None:
         path = path + ("&" if "?" in path else "?") + "token=" + token
@@ -56,6 +57,10 @@ def _ws_handshake(port, origin=None, host=None, path="/ws?app=chat", token=None,
     ]
     if origin is not None:
         lines.append("Origin: %s" % origin)
+    if cookie is not None:
+        lines.append("Cookie: romp_token=%s" % cookie)
+    if fetch_site is not None:
+        lines.append("Sec-Fetch-Site: %s" % fetch_site)
     req = ("\r\n".join(lines) + "\r\n\r\n").encode()
     s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
     try:
@@ -121,6 +126,17 @@ class WsOriginGuard(unittest.TestCase):
         self.assertEqual(
             _ws_handshake(self.port, origin="http://localhost:9999", token=km.TOKEN), 101,
             "a valid token must authorize a tunnel'd /ws from a foreign-origin dashboard")
+
+    def test_cookie_ws_rejects_cross_port_origin(self):
+        self.assertEqual(
+            _ws_handshake(self.port, origin="http://127.0.0.1:39999", cookie=km.TOKEN), 403,
+            "a cookie from another localhost port must not authorize a WebSocket")
+
+    def test_cookie_ws_accepts_navigation_provenance_without_origin(self):
+        for fetch_site in ("none", "same-origin"):
+            self.assertEqual(
+                _ws_handshake(self.port, origin=None, cookie=km.TOKEN, fetch_site=fetch_site), 101,
+                "cookie WebSocket with %s browser provenance should upgrade" % fetch_site)
 
     def test_invalid_token_foreign_origin_rejected(self):
         # The bypass requires a VALID token — a wrong token + foreign Origin is still ClawJacked.

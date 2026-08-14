@@ -85,7 +85,7 @@ class FakeClient:
                                model="gpt-5-test")
 
     def thread_resume(self, tid, params=None):
-        self._rec("thread_resume", tid)
+        self._rec("thread_resume", tid, params)
         return SimpleNamespace(thread=SimpleNamespace(id=tid))
 
     def thread_set_name(self, tid, name):
@@ -140,8 +140,8 @@ class FakeClient:
     def unregister_turn_notifications(self, turn_id):
         self._rec("unregister", turn_id)
 
-    def turn_steer(self, tid, params=None):
-        self._rec("turn_steer", tid, params)
+    def turn_steer(self, tid, expected_turn_id, input_items):
+        self._rec("turn_steer", tid, expected_turn_id, input_items)
 
     def turn_interrupt(self, tid, turn_id):
         self._rec("turn_interrupt", tid, turn_id)
@@ -167,6 +167,22 @@ class Conformance(unittest.TestCase):
                    if not callable(getattr(cb.CodexBackend, m, None))]
         self.assertEqual(missing, [], "CodexBackend must duck-type the full ABC")
 
+    def test_only_deterministic_rpc_rejections_park(self):
+        def error_type(name, code, message):
+            cls = type(name, (RuntimeError,), {})
+            err = cls(message)
+            err.code, err.message = code, message
+            return err
+
+        self.assertTrue(cb._is_permanent_turn_rejection(
+            error_type("InvalidParamsError", -32602, "invalid model")))
+        self.assertTrue(cb._is_permanent_turn_rejection(
+            error_type("CodexRpcError", -32000, "model gpt-x is not supported for this account")))
+        self.assertFalse(cb._is_permanent_turn_rejection(
+            error_type("InternalRpcError", -32603, "internal error")))
+        self.assertFalse(cb._is_permanent_turn_rejection(
+            error_type("CodexRpcError", -32001, "temporary backend failure")))
+
 
 class Lifecycle(unittest.TestCase):
     def test_spawn_send_turn_materializes_transcript(self):
@@ -187,10 +203,17 @@ class Lifecycle(unittest.TestCase):
         self.assertTrue(until(lambda: be.live_atoms(sid) == []))
         # context % from tokenUsage: 54400/272000 = 20
         self.assertEqual(be.live_sessions()[sid]["context"], 20)
-        # turn params carried the sandboxed-full-auto posture
+        # Both thread creation and each turn carry the pinned runtime's named workspace profile.
+        # The stale legacy workspaceWrite shape has unrestricted reads and must never reappear.
+        thread_params = fake.called("thread_start")[0][1]
+        self.assertEqual(thread_params["permissions"], "ccodex_workspace")
+        self.assertEqual(thread_params["runtimeWorkspaceRoots"], ["/TESTDIR"])
+        self.assertNotIn("sandbox", thread_params)
         _, tid, items, params, _ = fake.called("turn_start")[0]
         self.assertEqual(params["approvalPolicy"], "never")
-        self.assertEqual(params["sandboxPolicy"]["type"], "workspaceWrite")
+        self.assertEqual(params["permissions"], "ccodex_workspace")
+        self.assertEqual(params["runtimeWorkspaceRoots"], ["/TESTDIR"])
+        self.assertNotIn("sandboxPolicy", params)
 
     def test_send_during_open_turn_steers(self):
         be, fake, _ = build()
@@ -206,8 +229,9 @@ class Lifecycle(unittest.TestCase):
         self.assertTrue(until(lambda: be.live_sessions()[sid]["state"] == "working"))
         self.assertTrue(be.send(sid, "also check the docs"))
         self.assertEqual(len(fake.called("turn_steer")), 1)
-        _, tid, params = fake.called("turn_steer")[0]
-        self.assertEqual(params["expectedTurnId"], "t-1")
+        _, tid, expected_turn_id, input_items = fake.called("turn_steer")[0]
+        self.assertEqual(expected_turn_id, "t-1")
+        self.assertEqual(input_items, [{"type": "text", "text": "also check the docs"}])
         fake.turn_queues["t-1"].put(note("turn/completed",
                                          {"threadId": tid,
                                           "turn": {"id": "t-1", "items": [],
@@ -242,7 +266,194 @@ class Lifecycle(unittest.TestCase):
         self.assertTrue(be.owns(sid))
         be.send(sid, "two")
         self.assertTrue(until(lambda: len(fake.called("thread_resume")) == 1))
+        resume_params = fake.called("thread_resume")[0][2]
+        self.assertEqual(resume_params["permissions"], "ccodex_workspace")
+        self.assertEqual(resume_params["runtimeWorkspaceRoots"], ["/TESTDIR"])
+        self.assertNotIn("sandbox", resume_params)
         self.assertTrue(until(lambda: not be.busy(sid) and not be.pending_queued(sid)))
+
+    def test_turn_start_failure_keeps_the_unacknowledged_batch_for_retry(self):
+        class FailOnceClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.attempts = []
+                self.failed = threading.Event()
+                self.retry_entered = threading.Event()
+                self.allow_retry = threading.Event()
+
+            def turn_start(self, tid, input_items, params=None):
+                self.attempts.append([i["text"] for i in input_items])
+                if len(self.attempts) == 1:
+                    self.failed.set()
+                    raise RuntimeError("synthetic pre-ack failure")
+                self.retry_entered.set()
+                self.allow_retry.wait(5)
+                return super().turn_start(tid, input_items, params)
+
+        fake = FailOnceClient()
+        be, _, tmp = build(factory=lambda: fake)
+        sid = be.spawn("web", "/TESTDIR")
+        # Build one deterministic two-message batch before allowing the worker to start.
+        ensure = be._ensure_worker
+        be._ensure_worker = lambda s: None
+        self.assertTrue(be.send(sid, "first"))
+        self.assertTrue(be.send(sid, "second"))
+        be._ensure_worker = ensure
+        self.assertTrue(be.wake(sid))
+        self.assertTrue(fake.failed.wait(2))
+        self.assertEqual(be.pending_queued(sid), ["first", "second"])
+        rows = json.loads((Path(tmp) / "codex" / "registry.json").read_text())
+        self.assertEqual(rows[sid]["queue"], ["first", "second"])
+        self.assertTrue(fake.retry_entered.wait(2))
+        fake.allow_retry.set()
+        self.assertTrue(until(lambda: not be.busy(sid) and not be.pending_queued(sid)))
+        self.assertEqual(fake.attempts, [["first", "second"], ["first", "second"]])
+
+    def test_permanent_turn_rejection_parks_without_spin_until_explicit_change(self):
+        class InvalidParamsError(RuntimeError):
+            def __init__(self, message):
+                super().__init__(message)
+                self.code = -32602
+
+        class RejectingClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.attempts = []
+
+            def turn_start(self, tid, input_items, params=None):
+                self.attempts.append((list(input_items), dict(params or {})))
+                raise InvalidParamsError("model is not available")
+
+        fake = RejectingClient()
+        be, _, _ = build(factory=lambda: fake)
+        sid = be.spawn("web", "/TESTDIR")
+        self.assertTrue(be.send(sid, "keep this durable"))
+        self.assertTrue(until(lambda: len(fake.attempts) == 1))
+        time.sleep(0.65)  # exceeds the old 0.25s retry; a permanent rejection has no timer
+        self.assertEqual(len(fake.attempts), 1)
+        self.assertEqual(be.pending_queued(sid), ["keep this durable"])
+        self.assertIn("model is not available", be.launch_error(sid)["text"])
+        self.assertTrue(be.wake(sid))
+        time.sleep(0.35)
+        self.assertEqual(len(fake.attempts), 1, "an ordinary wake must not repeat a rejected RPC")
+        self.assertTrue(be.set_model(sid, "gpt-5-fixed"))
+        self.assertTrue(until(lambda: len(fake.attempts) == 2))
+        self.assertEqual(fake.attempts[1][1]["model"], "gpt-5-fixed")
+        time.sleep(0.65)
+        self.assertEqual(len(fake.attempts), 2, "the replacement request parks if it is rejected too")
+        self.assertTrue(be.kill(sid))
+
+    def test_new_client_generation_retries_a_parked_permanent_rejection(self):
+        class InvalidRequestError(RuntimeError):
+            code = -32600
+
+        class RejectOnceClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.rejected = threading.Event()
+
+            def turn_start(self, tid, input_items, params=None):
+                self.rejected.set()
+                raise InvalidRequestError("old server rejected request")
+
+        old, replacement = RejectOnceClient(), FakeClient()
+        clients = [old, replacement]
+        be, _, _ = build(factory=lambda: clients.pop(0))
+        sid = be.spawn("web", "/TESTDIR")
+        self.assertTrue(be.send(sid, "retry on replacement"))
+        self.assertTrue(old.rejected.wait(2))
+        with be._client_lock:
+            be._record_client_failure_locked(RuntimeError("replace generation"), old)
+            be._client_retry_at = 0.0
+        self.assertTrue(be.available())
+        self.assertTrue(until(lambda: not be.busy(sid) and not be.pending_queued(sid)))
+        self.assertEqual(len(replacement.called("turn_start")), 1)
+
+    def test_client_factory_failure_backs_off_then_recovers_queued_session(self):
+        fake = FakeClient()
+        attempts = []
+
+        def flaky_factory():
+            attempts.append(time.monotonic())
+            if len(attempts) == 1:
+                raise RuntimeError("synthetic unavailable client")
+            return fake
+
+        be, _, _ = build(factory=flaky_factory)
+        sid = be.spawn("web", "/TESTDIR")
+        self.assertTrue(be.send(sid, "retry me"))
+        time.sleep(0.03)
+        self.assertEqual(len(attempts), 1, "unavailable client must not hot-spin")
+        self.assertTrue(until(lambda: len(attempts) == 2 and not be.busy(sid), timeout=3))
+        self.assertEqual(len(fake.called("thread_start")), 1,
+                         "the pending placeholder must become a real Codex thread")
+        self.assertFalse(be.pending_queued(sid))
+
+    def test_kill_interrupts_an_active_turn_and_worker_exits(self):
+        be, fake, _ = build()
+        fake.hold_open = True
+        fake.scripts = [[("item/completed",
+                          {"threadId": "T-1", "turnId": "t-1", "completedAtMs": 1781100000000,
+                           "item": {"type": "userMessage", "id": "u-1",
+                                    "content": [{"type": "text", "text": "keep running"}]}})]]
+        sid = be.spawn("web", "/TESTDIR")
+        be.send(sid, "keep running")
+        self.assertTrue(until(lambda: be.live_sessions()[sid]["state"] == "working"))
+        worker = be._sessions[sid].worker
+        self.assertTrue(be.kill(sid))
+        self.assertEqual(fake.called("turn_interrupt")[0][2], "t-1")
+        self.assertTrue(until(lambda: not worker.is_alive()))
+        self.assertFalse(be.owns(sid))
+
+    def test_kill_can_mark_dead_while_turn_start_is_in_flight_then_interrupts_the_ack(self):
+        class BlockingStartClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.start_entered = threading.Event()
+                self.release_start = threading.Event()
+
+            def turn_start(self, tid, input_items, params=None):
+                self.start_entered.set()
+                self.release_start.wait(2)
+                return super().turn_start(tid, input_items, params)
+
+        fake = BlockingStartClient()
+        be, _, _ = build(factory=lambda: fake)
+        sid = be.spawn("web", "/TESTDIR")
+        self.assertTrue(be.send(sid, "start slowly"))
+        self.assertTrue(fake.start_entered.wait(1))
+        result = []
+        killer = threading.Thread(target=lambda: result.append(be.kill(sid)))
+        killer.start()
+        self.assertTrue(until(lambda: not be.owns(sid), timeout=0.5),
+                        "turn/start must not hold the session lock needed by kill")
+        fake.release_start.set()
+        killer.join(2)
+        self.assertFalse(killer.is_alive())
+        self.assertEqual(result, [True])
+        self.assertEqual(fake.called("turn_interrupt")[0][2], "t-1",
+                         "an ACK that races kill must be interrupted as soon as its id exists")
+
+    def test_concurrent_worker_ensure_starts_exactly_one_thread(self):
+        be, _, _ = build()
+        sid = be.spawn("web", "/TESTDIR")
+        s = be._sessions[sid]
+        started = []
+        release = threading.Event()
+
+        def parked_worker(session):
+            started.append(threading.get_ident())
+            release.wait(5)
+
+        be._work = parked_worker
+        callers = [threading.Thread(target=be._ensure_worker, args=(s,)) for _ in range(20)]
+        for t in callers:
+            t.start()
+        for t in callers:
+            t.join(2)
+        self.assertEqual(len(started), 1)
+        release.set()
+        self.assertTrue(until(lambda: not s.worker.is_alive()))
 
     def test_registry_and_chain_survive_backend_restart(self):
         be, fake, tmp = build()
@@ -260,6 +471,26 @@ class Lifecycle(unittest.TestCase):
             self.assertEqual(r["parentUuid"], prev["uuid"],
                              "chain broke across the restart at %s" % r["uuid"])
         self.assertEqual(len({r["uuid"] for r in recs}), len(recs))
+
+    def test_backend_restart_rearms_a_persisted_queue_without_another_send(self):
+        be, fake, tmp = build()
+        sid = be.spawn("web", "/TESTDIR")
+        ensure = be._ensure_worker
+        be._ensure_worker = lambda s: None
+        self.assertTrue(be.send(sid, "survive restart"))
+        be._ensure_worker = ensure
+        self.assertEqual(be.pending_queued(sid), ["survive restart"])
+        be2 = cb.CodexBackend(tmp, client_factory=lambda: fake)
+        self.assertTrue(until(lambda: not be2.busy(sid) and not be2.pending_queued(sid)))
+        self.assertIn("survive restart", Path(be2.transcript_path(sid)).read_text())
+
+    def test_launch_error_survives_backend_restart(self):
+        def bad_factory():
+            raise RuntimeError(cb.LOGIN_HINT)
+        be, _, tmp = build(factory=bad_factory)
+        sid = be.spawn("web", "/TESTDIR")
+        be2 = cb.CodexBackend(tmp, client_factory=bad_factory)
+        self.assertIn("codex login", be2.launch_error(sid)["text"])
 
     def test_missing_login_is_loud_not_silent(self):
         def bad_factory():
@@ -286,6 +517,26 @@ class Lifecycle(unittest.TestCase):
         # a Claude alias would 400 the next turn — refused here so the kernel warns instead
         self.assertFalse(be.set_model(sid, "sonnet"))
         self.assertEqual(be.live_sessions()[sid]["model"], "gpt-5-codex")
+
+    def test_client_launch_defines_the_fail_closed_workspace_profile(self):
+        captured = []
+
+        class CaptureConfig:
+            def __init__(self, **kwargs):
+                captured.append(kwargs)
+
+        cb._codex_config(CaptureConfig, "/opt/codex")
+        self.assertEqual(captured[0]["codex_bin"], "/opt/codex")
+        self.assertEqual(captured[0]["client_name"], "romp")
+        overrides = captured[0]["config_overrides"]
+        self.assertEqual(overrides, cb.CODEX_CONFIG_OVERRIDES)
+        profile = overrides[0]
+        self.assertIn('":minimal" = "read"', profile)
+        self.assertIn('"." = "write"', profile)
+        for metadata in (".git", ".agents", ".codex"):
+            self.assertNotIn('"%s"' % metadata, profile)
+        self.assertIn("network = { enabled = true }", profile)
+        self.assertEqual(overrides[1], 'default_permissions="ccodex_workspace"')
 
     def test_model_catalog_from_app_server(self):
         be, fake, _ = build()

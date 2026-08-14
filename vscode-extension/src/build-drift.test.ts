@@ -54,8 +54,8 @@ test("updateExtension rebuilds+reinstalls the VSIX, then offers a USER-gated rel
     "$HOME-collapses rompDir back to a real path (same machine as the local kernel)");
   assert.ok(upd.includes("runInstall(script, extDir)") && upd.includes('"install.sh"'),
     "runs vscode-extension/install.sh");
-  assert.ok(upd.includes("packaged romp-chat-view\\.vsix") && upd.includes("install into:"),
-    "a clean exit is not enough — require the packaged + installed markers (install.sh skips gracefully)");
+  assert.ok(upd.includes("ROMP_EXT_INSTALL_RESULT installed=[1-9][0-9]* failed=[0-9]+"),
+    "a clean exit is not enough — require install.sh's machine-readable positive install count");
   // Reload is behind an explicit button click, never automatic (prefer-reload-banner-not-auto).
   assert.ok(upd.includes('"Reload window"') && upd.includes('choice === "Reload window"') &&
     upd.includes('executeCommand("workbench.action.reloadWindow")'),
@@ -74,7 +74,7 @@ test("a palette command exposes the update anytime a faded toast can't be clicke
   assert.ok(EXT.includes('registerCommand("rompChat.updateExtension", updateExtension)'),
     "the command is registered");
   const pkg = fs.readFileSync(path.resolve(process.cwd(), "package.json"), "utf8");
-  assert.ok(pkg.includes('"rompChat.updateExtension"') && pkg.includes('"romp: Update Extension"'),
+  assert.ok(pkg.includes('"rompChat.updateExtension"') && pkg.includes('"ccodex: Update Extension"'),
     "declared in package.json so it shows in the command palette");
 });
 

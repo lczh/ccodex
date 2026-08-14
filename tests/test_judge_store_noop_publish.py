@@ -120,13 +120,24 @@ class NoOpPublish(unittest.TestCase):
         self.assertEqual(jd._store_content(s), jd._store_content(t),
                          "same content, different revision + key order → the same publish")
 
-    def test_an_unreadable_file_falls_through_to_a_real_write(self):
+    def test_a_corrupt_file_is_quarantined_before_recovery(self):
         self._seed()
         self._file().write_text("{not json")
-        s = jd.load_goals(SID)                          # load recovers a fresh store
+        s = jd.load_goals(SID)                          # load recovers fresh without destroying evidence
+        quarantined = list(jd.GOALDIR.glob(SID + ".json.corrupt.*"))
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(quarantined[0].read_text(), "{not json")
+        self.assertFalse(self._file().exists())
         jd.save_goals(SID, s)
         self.assertEqual(json.loads(self._file().read_text())["rompUuid"], SID,
-                         "an unparseable file is republished, never mistaken for a match")
+                         "a new store can be published after the corrupt original is preserved")
+
+    def test_a_direct_save_refuses_to_overwrite_corrupt_state(self):
+        self._seed()
+        self._file().write_text("{not json")
+        with self.assertRaises(ValueError):
+            jd.save_goals(SID, {"rompUuid": SID, "nodes": {}, "status": {}})
+        self.assertEqual(self._file().read_text(), "{not json")
 
 
 if __name__ == "__main__":

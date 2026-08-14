@@ -264,10 +264,13 @@ instead:
 2. **Tick "Share my sessions there"** on that machine's row.
 
 Your sessions now show up in its interface from whatever network you are on.
-Because the laptop is the end that connects, the always-on machine never holds a
-way in to it; untick the box and it forgets you. Romp calls this checking in,
-and the always-on machine the hub, which is where `romp checkin` and
-`romp checkout` get their names.
+This is a **trusted-host-only** operation. The laptop opens the connection, but
+the reverse tunnel and the credential it hands over deliberately give the
+always-on machine authenticated administrative access to Romp on the laptop,
+including its sessions and control routes. Enable it only for a hub you fully
+control, never rented or shared compute. Unticking the box closes that route and
+withdraws the laptop. Romp calls this checking in, and the always-on machine the
+hub, which is where `romp checkin` and `romp checkout` get their names.
 
 #### Hand the connection to a different machine
 
@@ -390,8 +393,11 @@ your machine reads that host's token over ssh and stores it locally (in
 Dashboard traffic to a remote never crosses the network in the open; it rides
 the ssh tunnel, which supplies encryption and machine identity, while the token
 authorizes at the far end. Checking a laptop in to a hub reverses which end opens
-the connection, so credentials still flow outward from the machine that
-initiates, and a hub never holds a way in.
+the connection and hands the laptop's token to the hub. Together with the
+reverse forward, that is an authenticated administrative path back to the
+laptop's Romp kernel, not a one-way publication channel. Romp therefore permits
+check-in only between hosts marked **trusted**; use it only with a hub you fully
+control.
 
 **Trust levels for attached hosts.** Attaching two kernels lets their sessions
 message each other, which means a session on the remote machine can put text
@@ -421,7 +427,7 @@ actually enforce are per-user (the token file) and per-machine (the trust
 level).
 
 Full details, including how to report a vulnerability, are in
-[SECURITY.md](https://github.com/romp-on/romp/blob/main/SECURITY.md).
+[SECURITY.md](https://github.com/lczh/ccodex/blob/main/SECURITY.md).
 
 ## How many tokens does Romp use?
 

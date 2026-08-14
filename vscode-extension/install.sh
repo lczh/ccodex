@@ -38,14 +38,16 @@ PACKAGE_ONLY="${ROMP_EXT_PACKAGE_ONLY:-}"
 # dist/ is NOT just the extension's — the kernel serves these same bundles to the
 # BROWSER dashboard (kernel.py's DIST/_ensure_bundles point at vscode-extension/dist).
 # So the build must never be gated on an editor being present. It used to be: the
-# editor-CLI check below sat here, above `npm install`, and exited 0 on a machine with
+# editor-CLI check below sat here, above dependency installation, and exited 0 on a machine with
 # no VS Code family installed — leaving node_modules AND dist absent, so every dashboard
 # pane fetched /dist/*.js and got a 404 and the UI came up blank (a browser-only Linux
 # box, the user 2026-07-27). The old skip message even claimed "built dist/ is ready",
 # which was never true on that path. Editor presence gates only the PACKAGE + INSTALL
 # steps at the bottom, which is all it ever meant.
-echo "==> npm install"
-npm install --silent   # idempotent; ensures dev deps (esbuild, types) exist
+echo "==> npm ci"
+# Reproduce the reviewed lock exactly. `npm install` can rewrite/resynthesize the tree and defeats
+# pinning the local vsce binary that `npx --no-install` must use below.
+npm ci --silent
 
 # --production => minified, no sourcemaps. An INSTALL is not a dev loop: without it the dashboard
 # shipped a DEVELOPMENT bundle, and render.js — the chat pane's code — was 591 KB of unminified JS
@@ -102,7 +104,7 @@ node -e 'const fs=require("fs"),f="package.json",p=JSON.parse(fs.readFileSync(f)
 
 # Fixed output name (overwritten each run) so .vsix artifacts don't pile up.
 echo "==> package .vsix"
-npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository -o romp-chat-view.vsix >/dev/null
+npx --no-install vsce package --no-dependencies --allow-missing-repository -o romp-chat-view.vsix >/dev/null
 echo "    packaged romp-chat-view.vsix"
 
 if [ -n "$PACKAGE_ONLY" ]; then
@@ -112,10 +114,26 @@ fi
 
 # ":-" guard: bash 3.2 (the macOS system bash) treats "${arr[@]}" on an EMPTY array
 # as an unbound variable under `set -u`.
+installed=0
+failed=0
 for cli in "${CLIS[@]:-}"; do
-  echo "==> install into: $cli"
-  "$cli" --install-extension romp-chat-view.vsix --force </dev/null || echo "   (failed for $cli — continuing)"
+  echo "==> installing into: $cli"
+  if "$cli" --install-extension romp-chat-view.vsix --force </dev/null; then
+    installed=$((installed + 1))
+    echo "    installed into: $cli"
+  else
+    failed=$((failed + 1))
+    echo "    failed for $cli"
+  fi
 done
+
+# Stable, machine-readable outcome for the extension host and automated installers. A package
+# build is not an update unless at least one editor accepted it.
+echo "ROMP_EXT_INSTALL_RESULT installed=$installed failed=$failed"
+if [ "$installed" -eq 0 ]; then
+  echo "!! romp-chat-view was packaged, but no editor installed it." >&2
+  exit 1
+fi
 
 echo "==> done. Reload the editor (Cmd+Shift+P -> 'Developer: Reload Window')"
 echo "    or quit + reopen; the extension is then permanently active."

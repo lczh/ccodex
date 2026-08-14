@@ -32,7 +32,7 @@ km = SourceFileLoader("romp_kernel_rpanel", os.path.join(BIN, "romp-kernel")).lo
 TUNNELS = {
     "tunnels": [{
         "host": "TESTHOST", "kernelPort": 29855, "localPort": 51000, "busPort": 51001,
-        "checkin": False, "checkinPeer": False, "token": "tok", "status": "up", "detail": "",
+        "checkin": False, "checkinPeer": False, "hasToken": True, "status": "up", "detail": "",
         "sids": ["11111111-2222-3333-4444-555555555555"], "trust": "directed",
         "kernelSha": "abc1234", "localSha": "abc1234", "outOfDate": False,
         "behindBy": 0, "aheadBy": 0, "kernelDate": "",
@@ -64,6 +64,7 @@ const ELS = {};
 const document = {
   getElementById(id){ if(!ELS[id]) ELS[id]=mkEl(id); return ELS[id]; },
   createElement(t){ return mkEl(t); },
+  createTextNode(t){ const e=mkEl('#text'); e.textContent=String(t); return e; },
   querySelector(){ return null; }, querySelectorAll(){ return []; },
   addEventListener(){}, body:mkEl('body'),
 };
@@ -110,7 +111,7 @@ setTimeout_(() => {
     const html = list.children.map(collect).join(' | ');
     const add = ELS['rnet-add'], plus = ELS['rnet-plus'], dl = ELS['rnet-hosts'];
     process.stdout.write(JSON.stringify({rows:rows, html:html, errors:console_err,
-      addHidden:!!add.hidden, plusHidden:!!plus.hidden, hostsHtml:String(dl.innerHTML||''),
+      addHidden:!!add.hidden, plusHidden:!!plus.hidden, hostsHtml:collect(dl),
       posts:POSTS, alerts:ALERTS}));
     process.exit(0);   // the panel re-arms its own poll timer forever, so exit once measured
   }, 40);
@@ -146,6 +147,41 @@ class RemotesPanelRender(unittest.TestCase):
         # pmode rides the cached args (which also let a pairs answer repaint without a new /tunnels)
         self.assertIn("_lastArgs=[ts,(d&&d.known)||[],pmode,(d&&d.viaReach)||[],(d&&d.remoteHolds)||[],(d&&d.peerTiers)||{}]", js)
         self.assertIn("render.apply(null,_lastArgs)", js)
+
+    def test_peer_hold_metadata_is_rendered_as_text_not_html(self):
+        tn = json.loads(json.dumps(TUNNELS))
+        attack = '<img src=x onerror="globalThis.pwned=1">'
+        tn["remoteHolds"] = [{"atHost": "SAFEHOST", "mid": "hold-1", "frm": attack,
+                               "to": "reviewer", "origin": "ORIGIN", "gist": attack}]
+        out = self._run(tunnels=tn)
+        self.assertEqual(out.get("errors"), [])
+        self.assertNotIn("<img", out.get("html", ""), "peer prose must never become panel markup")
+        js = km._LANDING_REMOTES_JS
+        self.assertIn("hb.textContent=hn", js)
+        self.assertIn("hs.title=gl", js)
+
+    def test_remote_build_and_status_metadata_cannot_become_row_markup(self):
+        tn = json.loads(json.dumps(TUNNELS))
+        attack = '<img src=x onerror="globalThis.pwned=1">'
+        tn["tunnels"][0].update({"status": attack, "kernelSha": attack, "kernelVer": attack,
+                                  "localSha": attack, "localVer": attack, "kernelDate": attack,
+                                  "autoPush": {"phase": attack, "detail": attack}})
+        out = self._run(tunnels=tn)
+        self.assertEqual(out.get("errors"), [])
+        self.assertNotIn("<img", out.get("html", ""))
+        self.assertIn("error", out.get("html", ""), "an invalid status fails visibly, as a safe enum")
+        self.assertIn("var ts=remoteRows((d&&d.tunnels)||[])", km._LANDING_REMOTES_JS)
+
+    def test_subconnection_errors_are_text_nodes_and_rows_are_schemed(self):
+        js = km._LANDING_REMOTES_JS
+        self.assertIn("var rows=remoteRows(d.tunnels||[])", js)
+        self.assertIn("er.textContent='Couldn\\u2019t read '+via", js)
+        self.assertNotIn("Couldn\\u2019t read '+via+'\\u2019s connections: '+(d.error", js)
+
+    def test_connect_from_options_are_built_as_text_nodes(self):
+        js = km._LANDING_REMOTES_JS
+        self.assertIn("op.textContent='from: '+h", js)
+        self.assertNotIn("ups.map(function(h){return '<option", js)
 
     def test_reverse_trust_mismatch_renders_the_direction_and_a_match_button(self):
         # Both directions of the pair on one row (the user 2026-07-26): ours is the select, theirs is
@@ -248,8 +284,13 @@ class RemotesPanelRender(unittest.TestCase):
 
     def test_the_checkin_box_is_named_for_what_it_does(self):
         # It publishes THIS machine to the remote. Its old label, "keep connected", read as the reconnect
-        # setting, so the tooltip had to spend a sentence denying that.
-        out = self._run()
+        # setting, so the tooltip had to spend a sentence denying that. The credential/reverse-forward
+        # control is intentionally available only after this host is explicitly trusted.
+        directed = self._run()
+        self.assertNotIn("Share my sessions there", directed.get("html", ""))
+        tn = json.loads(json.dumps(TUNNELS))
+        tn["tunnels"][0]["trust"] = "trusted"
+        out = self._run(tunnels=tn)
         self.assertIn("Share my sessions there", out.get("html", ""))
         self.assertNotIn("keep connected", out.get("html", ""))
 

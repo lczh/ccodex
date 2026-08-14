@@ -15,6 +15,7 @@ const PREVIEW = fs.readFileSync(path.join(UI, "preview.ts"), "utf8");
 const FEED_CSS = fs.readFileSync(path.join(UI, "feed.css"), "utf8");
 const CHAT_CSS = fs.readFileSync(path.join(UI, "styles.css"), "utf8");
 const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "bin", "romp-kernel"), "utf8");
+const EXTENSION = fs.readFileSync(path.resolve(process.cwd(), "src", "extension.ts"), "utf8");
 
 test("preview.ts: kind classification, kernel /file URL, and self-removing thumbs", () => {
   // the client's renderable-extension list must stay in step with the kernel's _PREVIEW_MIME
@@ -65,6 +66,9 @@ test("feed modal: artifacts strip below the tree — previews on the web, open-t
   assert.match(FEED, /const sig = arts\.join\("\\n"\);\n  if \(strip && \(strip as any\)\._sig === sig\) return;/, "sig-guarded so a kernel repush doesn't re-fetch every thumb");
   assert.match(FEED, /chip\.onclick = \(ev: Event\) => \{ ev\.stopPropagation\(\); vscodeApi\?\.postMessage\(\{ type: "openFile", path: p, id: it\.sid \}\); \};/, "no-preview fallback still opens the file");
   assert.match(FEED_CSS, /\.fmodal-arts \{ margin-top: 12px;/);
+  const feedHost = EXTENSION.slice(EXTENSION.indexOf("function wireFeedPanel"), EXTENSION.indexOf("// ---- fleet status"));
+  assert.match(feedHost, /m\.type === "openFile" && m\.path[\s\S]*?openFileInEditor\(String\(m\.path\), m\.line, m\.id\)/,
+    "the VS Code feed handles the artifact locally instead of forwarding it to the OS-specific kernel opener");
 });
 
 test("kernel: distiller artifacts are existence-filtered and shipped on the feed item", () => {

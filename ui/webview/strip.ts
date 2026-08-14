@@ -159,7 +159,8 @@ export function initStrip(openSettings: () => void, post?: (m: Record<string, un
   refresh.addEventListener("click", (e) => {
     e.stopPropagation();
     refresh.disabled = true;
-    fetch(kernelUrl("/restart"), { method: "POST" }).catch(() => { /* the reconnect machinery reports */ });
+    fetch(kernelUrl("/restart"), { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fleet: false }) }).catch(() => { /* the reconnect machinery reports */ });
     setTimeout(() => { refresh.disabled = false; }, 8000);   // pure failsafe re-arm; the reload normally lands first
   });
   // Remote kernels — the rail's #rail-net twin (same endpoints; the shell keeps
@@ -411,11 +412,22 @@ function initNetPopover(button: HTMLButtonElement, post?: (m: Record<string, unk
 
   function loadHosts() {
     fetch(kernelUrl("/ssh-hosts"), { cache: "no-store" }).then((r) => r.json()).then((d) => {
-      const hs: string[] = (d && d.hosts) || [];
-      sel.innerHTML = hs.length
-        ? hs.map((h) => `<option value="${h}">${h}</option>`).join("")
-        : `<option value="">(no ~/.ssh/config hosts)</option>`;
-    }).catch(() => { sel.innerHTML = `<option value="">(kernel unreachable)</option>`; });   // loud, never silently empty
+      const hs: string[] = Array.isArray(d && d.hosts) ? d.hosts.filter((h: unknown) => typeof h === "string") : [];
+      sel.textContent = "";
+      for (const h of hs.slice(0, 512)) {
+        const o = document.createElement("option");
+        o.value = h; o.textContent = h;       // ~/.ssh/config is local input, not option markup
+        sel.appendChild(o);
+      }
+      if (!hs.length) {
+        const o = document.createElement("option");
+        o.value = ""; o.textContent = "(no ~/.ssh/config hosts)"; sel.appendChild(o);
+      }
+    }).catch(() => {
+      sel.textContent = "";
+      const o = document.createElement("option");
+      o.value = ""; o.textContent = "(kernel unreachable)"; sel.appendChild(o);   // loud, never silently empty
+    });
   }
 
   function act(path: string, host: string, b: HTMLButtonElement, busyText: string, via?: string) {
@@ -566,8 +578,8 @@ function initNetPopover(button: HTMLButtonElement, post?: (m: Record<string, unk
         + (stale && t.outOfDate ? `\nLast confirmed ${seen || "not since this kernel started"}; not re-checked while ${LBL[t.status] || t.status}.` : "")
         + (t.outOfDate && t.checkinPeer
           ? (t.askPull
-            ? " No ssh path from this machine (it checked in over its own tunnel), so Update asks it to fast-forward itself over the link it holds."
-            : " No ssh path from this machine (it checked in over its own tunnel) — sync from its own dashboard.")
+            ? " No outbound ssh path from this machine (it checked in over its own reverse tunnel). The trusted check-in still grants authenticated Romp administration; Update uses it to ask the peer to fast-forward itself."
+            : " No outbound ssh path from this machine (it checked in over its own reverse tunnel). The trusted check-in still grants authenticated Romp administration; sync from its own dashboard.")
           : "");
       r.append(dot, nm);
       // Federation trust (per-host): trusted = full two-way postal; directed (default) = its mail is
@@ -627,8 +639,9 @@ function initNetPopover(button: HTMLButtonElement, post?: (m: Record<string, unk
       if (t.status === "up" && t.askPull && !apx) {
         const a = document.createElement("button");
         a.textContent = "Update";
-        a.title = `${t.host} checked in over its own tunnel, so this machine cannot push to it. This asks its romp `
-          + `to pull these commits from here and restart, over the link it already holds.`;
+        a.title = `${t.host} checked in over its own reverse tunnel, so this machine has no outbound ssh `
+          + `route to push over. The trusted check-in grants authenticated Romp administration; Update uses `
+          + `that route to ask the peer to pull these commits and restart.`;
         a.addEventListener("click", () => act("/tunnels/askpull", t.host, a, "Asking…"));
         r.appendChild(a);
       }
@@ -937,8 +950,9 @@ function initNetPopover(button: HTMLButtonElement, post?: (m: Record<string, unk
     if (s.status === "up" && s.askPull && !apx) {
       const a = document.createElement("button");
       a.textContent = "Update";
-      a.title = `${s.host} checked in to ${via} over its own tunnel, so ${via} cannot push to it. This asks `
-        + `it to pull ${via}'s commits over the link it already holds.`;
+      a.title = `${s.host} checked in to ${via} over its own reverse tunnel, so ${via} has no outbound ssh `
+        + `route to push over. The trusted check-in grants authenticated Romp administration; Update uses `
+        + `that route to ask the peer to pull ${via}'s commits and restart.`;
       a.addEventListener("click", () => act("/tunnels/askpull", s.host, a, "Asking…", via));
       r.appendChild(a);
     }

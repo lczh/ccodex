@@ -11,6 +11,8 @@ import json
 import os
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -124,6 +126,41 @@ class GoalCompactionTest(unittest.TestCase):
         # restore must precede the flag un-set so _mark_nodes_cleared finds the nodes
         self.assertLess(body.index("_restore_goal_archive(restored)"),
                         body.index("_mark_nodes_cleared(restored, False)"))
+
+    def test_g_simultaneous_archive_remove_and_add_retain_both_edits(self):
+        old, keep, added = self.g("old"), self.g("keep"), self.g("added")
+        jd.save_goal_archive(SID, {
+            "rompUuid": SID, "status": {},
+            "nodes": {old: _node(old, None), keep: _node(keep, None)},
+        })
+        remover_entered = threading.Event()
+        release_remover = threading.Event()
+        adder_done = threading.Event()
+
+        def remove_one(arch):
+            remover_entered.set()
+            self.assertTrue(release_remover.wait(2))
+            arch["nodes"].pop(old)
+
+        def add_one(arch):
+            arch["nodes"][added] = _node(added, None)
+            adder_done.set()
+
+        remove_thread = threading.Thread(target=jd.mutate_goal_archive,
+                                         args=(SID, remove_one))
+        add_thread = threading.Thread(target=jd.mutate_goal_archive,
+                                      args=(SID, add_one))
+        remove_thread.start()
+        self.assertTrue(remover_entered.wait(1))
+        add_thread.start()
+        time.sleep(0.05)
+        self.assertFalse(adder_done.is_set(), "the second mutation must wait for the archive transaction")
+        release_remover.set()
+        remove_thread.join(2)
+        add_thread.join(2)
+        self.assertFalse(remove_thread.is_alive())
+        self.assertFalse(add_thread.is_alive())
+        self.assertEqual(set(jd.load_goal_archive(SID)["nodes"]), {keep, added})
 
 
 if __name__ == "__main__":

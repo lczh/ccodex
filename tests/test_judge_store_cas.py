@@ -13,9 +13,12 @@ events never really conflicted: the right answer is both sets. All fixtures SYNT
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bin")
 # Hermetic state BEFORE the loads — they resolve their state root at import time, and only
@@ -134,6 +137,57 @@ class StoreCas(unittest.TestCase):
         jd.record_verdict(s, s["nodes"][gid], "planner", "done", T0 + 30, why="shipped")
         jd.save_goals(SID, s)                        # nobody else wrote → straight publish
         self.assertTrue(jd.load_goals(SID)["nodes"][gid].get("nodeComplete"))
+
+    def test_simultaneous_threads_publish_once_at_a_time_and_keep_both_events(self):
+        """The old PID-only temp name let both threads write/rename the same file: one raised
+        FileNotFoundError and its event was lost. The store lock must cover rebase through replace."""
+        self._seed()
+        gid = self._nid(1)
+        a, b = jd.load_goals(SID), jd.load_goals(SID)
+        jd.record_verdict(a, a["nodes"][gid], "planner", "block", T0 + 50, why="a's block")
+        jd.record_verdict(b, b["nodes"][gid], "closer", "done", T0 + 60, why="b's done")
+
+        original_atomic = jd._atomic_json
+        active = 0
+        max_active = 0
+        counter_lock = threading.Lock()
+
+        def slow_atomic(*args, **kwargs):
+            nonlocal active, max_active
+            with counter_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.02)                     # make an unlocked overlap deterministic
+                return original_atomic(*args, **kwargs)
+            finally:
+                with counter_lock:
+                    active -= 1
+
+        start = threading.Barrier(3)
+        errors = []
+
+        def publish(store):
+            try:
+                start.wait()
+                jd.save_goals(SID, store)
+            except Exception as exc:                 # surface thread failures in the test thread
+                errors.append(exc)
+
+        with mock.patch.object(jd, "_atomic_json", side_effect=slow_atomic):
+            threads = [threading.Thread(target=publish, args=(s,)) for s in (a, b)]
+            for thread in threads:
+                thread.start()
+            start.wait()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        self.assertFalse(errors)
+        self.assertEqual(max_active, 1, "the read/rebase/publish critical sections never overlap")
+        log = jd.load_goals(SID)["nodes"][gid].get("log") or []
+        kinds = {(e.get("src"), e.get("kind")) for e in log}
+        self.assertIn(("planner", "block"), kinds)
+        self.assertIn(("closer", "done"), kinds)
 
 
 if __name__ == "__main__":

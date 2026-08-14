@@ -1094,6 +1094,9 @@ def _defaults_path(state_dir: Path) -> Path:
     return Path(state_dir) / "sdk-defaults.json"
 
 
+_SDK_DEFAULTS_LOCK = threading.Lock()   # setters on separate handler threads merge one shared file
+
+
 def read_sdk_defaults(state_dir: Path) -> dict:
     """{'model': <alias|'default'>, 'effort': <level>, 'mode': <permission mode>} — whatever the user last
     picked on any session, seeded into the next new session by spawn(); {} if never set."""
@@ -1107,13 +1110,20 @@ def read_sdk_defaults(state_dir: Path) -> dict:
 def write_sdk_default(state_dir: Path, **fields) -> None:
     """Merge {model?, effort?} into the remembered defaults (atomic tmp+rename). Only non-None keys passed
     are touched, so remembering a model never clobbers the remembered effort and vice-versa."""
-    d = read_sdk_defaults(state_dir)
-    d.update({k: v for k, v in fields.items() if v is not None})
-    p = _defaults_path(state_dir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(d))
-    os.replace(tmp, p)
+    with _SDK_DEFAULTS_LOCK:
+        d = read_sdk_defaults(state_dir)
+        d.update({k: v for k, v in fields.items() if v is not None})
+        p = _defaults_path(state_dir)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name("%s.%d.%s.tmp" % (p.name, os.getpid(), uuid.uuid4().hex[:8]))
+        try:
+            tmp.write_text(json.dumps(d))
+            os.replace(tmp, p)
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 _WORK_KEY: str | None = None   # process-lifetime stash; None = not yet claimed from the environment
@@ -2725,8 +2735,7 @@ class SdkBackend:
         self._log_cb = log
         self.sessions: dict[str, SdkSession] = {}
         self._lock = threading.Lock()
-        self._reg_lock = threading.Lock()         # serializes _update_reg read-modify-writes (queue mirror
-        #                                           writes come from kernel AND loop threads)
+        self._reg_lock = threading.RLock()        # every registry RMW, from kernel and loop threads
         self._pending_ask: dict[str, bool] = {}   # sid -> has an ask awaiting answer
         self._live: dict[str, dict] = {}          # sid -> {key -> atom}: the in-memory LIVE TAIL (ahead of disk)
         self._rl_lock = threading.Lock()          # serializes usage.json read-merge-write (_record_rate_limit)
@@ -3430,7 +3439,8 @@ class SdkBackend:
         a = auth if auth in ("login", "key") else (d.get("auth") if d.get("auth") in ("login", "key") else "")
         if a:
             reg["auth"] = a
-        write_reg(self.state_dir, sid, reg)
+        with self._reg_lock:
+            write_reg(self.state_dir, sid, reg)
         append_state(self.state_dir, sid, "waiting")
         self._poke()
         return sid
@@ -3460,7 +3470,8 @@ class SdkBackend:
             reg["model"] = parent["model"]
         if parent.get("auth") in ("login", "key"):
             reg["auth"] = parent["auth"]
-        write_reg(self.state_dir, sid, reg)
+        with self._reg_lock:
+            write_reg(self.state_dir, sid, reg)
         # the names/ entry LAST — it is the discoverability trigger (discover() iterates names/), and
         # everything above must exist before any judge pass can see the session
         write_name(self.state_dir, sid, name, cwd, bg, fg)
@@ -3474,12 +3485,14 @@ class SdkBackend:
         fsid (a /clear or relaunch mints new fsids under the same romp sid) and SdkSession resumes from
         it; stamping the original sid here would silently resume an OLD conversation state (the
         picker-revive fix, the user 2026-07-05)."""
-        reg = read_reg(self.state_dir, sid) or {}
-        cwd = cwd or reg.get("cwd") or os.path.expanduser("~")
-        write_reg(self.state_dir, sid, {**reg, "sid": sid, "name": name, "cwd": cwd,
-                                        "mode": reg.get("mode", "acceptEdits"),
-                                        "effort": reg.get("effort", DEFAULT_EFFORT),
-                                        "lastSid": reg.get("lastSid") or sid, "alive": True})
+        requested_cwd = cwd
+        def revive(reg):
+            resumed_cwd = requested_cwd or reg.get("cwd") or os.path.expanduser("~")
+            reg.update({"sid": sid, "name": name, "cwd": resumed_cwd,
+                        "mode": reg.get("mode", "acceptEdits"),
+                        "effort": reg.get("effort", DEFAULT_EFFORT),
+                        "lastSid": reg.get("lastSid") or sid, "alive": True})
+        self._mutate_reg(sid, revive, create=True)
         append_state(self.state_dir, sid, "waiting")
         self._poke()
         return True
@@ -3499,7 +3512,8 @@ class SdkBackend:
             if s and s.thread.is_alive():
                 _settled_now()
                 return s
-            reg = read_reg(self.state_dir, sid)
+            with self._reg_lock:
+                reg = read_reg(self.state_dir, sid)
             if not reg or not reg.get("alive"):
                 _settled_now()
                 return None
@@ -3841,22 +3855,20 @@ class SdkBackend:
         return s._clearing
 
     def kill(self, sid: str) -> bool:
-        reg = read_reg(self.state_dir, sid)
-        if reg:
-            reg["alive"] = False
-            write_reg(self.state_dir, sid, reg)
-        s = self.sessions.pop(sid, None)
+        # Same lifecycle lock as _ensure: once kill begins, no session can be installed from an
+        # alive snapshot behind it; if ensure already began, kill waits and shuts that instance down.
+        with self._lock:
+            self._mutate_reg(sid, lambda reg: reg.update(alive=False))
+            s = self.sessions.pop(sid, None)
         if s:
             s.shutdown()
         self._poke()
         return True
 
     def rename(self, sid: str, new_name: str) -> bool:
-        reg = read_reg(self.state_dir, sid)
+        reg = self._mutate_reg(sid, lambda row: row.update(name=new_name))
         if not reg:
             return False
-        reg["name"] = new_name
-        write_reg(self.state_dir, sid, reg)
         # keep the shared names/ identity file in sync (preserve colours)
         try:
             parts = (Path(self.state_dir) / "names" / sid).read_text().rstrip("\n").split("\t")
@@ -3873,12 +3885,20 @@ class SdkBackend:
         """Change the session's model. Persisted in the registry (so a reconnect keeps it) and applied
         LIVE on a connected session via the SDK control channel — NOT a /model slash injection, which the
         SDK input stream does not interpret. 'default' resets to the CLI default (set_model(None))."""
-        reg = read_reg(self.state_dir, sid)
+        s = self.sessions.get(sid)
+        pending = bool(s and not _model_reflects_alias(s.model, value))
+        def remember_model(reg):
+            reg["model"] = value
+            if s:
+                reg["modelPending"] = pending
+            else:
+                # No live turn can resolve the badge, so land the best-effort label in this same RMW.
+                reg["liveModel"] = _alias_label(value)
+                reg["modelPending"] = False
+        reg = self._mutate_reg(sid, remember_model)
         if not reg:
             return False
-        reg["model"] = value
         write_sdk_default(self.state_dir, model=value)   # remember as the seed for the NEXT new session (the user 2026-06-27)
-        s = self.sessions.get(sid)
         if s:
             s.chosen_model = value
             # PENDING: show switching-dots, NOT a premature/stale name, until the LIVE model reflects the
@@ -3887,10 +3907,7 @@ class SdkBackend:
             # a turn in the new model kept showing the OLD name. Now the pick marks pending; _do_set_model
             # pulls the real name, which clears it (and the dormant/never-driven trap can't happen — the
             # refresh resolves an idle session, and _on_session_gone resolves a thread that exits mid-switch).
-            already = _model_reflects_alias(s.model, value)
-            s._model_pending = "" if already else value
-            reg["modelPending"] = bool(s._model_pending)
-            write_reg(self.state_dir, sid, reg)
+            s._model_pending = value if pending else ""
             s.set_model_live(None if value in ("", "default") else value)
             # Synthesize the INVOCATION atom the CLI never streams (it streams only the stdout
             # confirmation): the chat gets the same "/model sonnet" command chip the tmux path reads from
@@ -3905,13 +3922,6 @@ class SdkBackend:
                 "t": t, "author": "human", "command": "/model", "_echo_text": disp,
                 "message": {"role": "user", "content": [{"type": "text", "text": disp}]}}
             self._wake_push()
-        else:
-            # DORMANT (no live thread): no turn is coming to report a real name, so resolve to the chosen
-            # alias's best-effort label immediately — never leave the badge on a stale liveModel or trapped
-            # on dots. The value applies for real on the next connect (chosen_model → _options).
-            reg["liveModel"] = _alias_label(value)
-            reg["modelPending"] = False
-            write_reg(self.state_dir, sid, reg)
         return True
 
     def set_fast(self, sid: str, value: str) -> bool:
@@ -3934,13 +3944,11 @@ class SdkBackend:
           if idle, at the end of the current turn if busy (request_reconnect, the /effort machinery)."""
         if value not in ("on", "off"):
             return False
-        reg = read_reg(self.state_dir, sid)
+        reg = self._mutate_reg(
+            sid, lambda row: row.update(fast=(value == "on"), liveFast=value))
         if not reg:
             return False
-        reg["fast"] = (value == "on")
-        reg["liveFast"] = value   # mirror the optimistic flip where the badge reads it while dormant /
-        #                           across a restart; _adopt_fast_state re-asserts at the next connect
-        write_reg(self.state_dir, sid, reg)
+        # liveFast mirrors the optimistic flip for dormant/restarted badges; init re-asserts truth.
         s = self.sessions.get(sid)
         if not s or not s.thread.is_alive():
             return True                        # dormant: the persisted ask applies at the next connect
@@ -3962,11 +3970,9 @@ class SdkBackend:
     def set_mode(self, sid: str, mode: str) -> bool:
         """Change the permission mode. Persisted in the registry and applied LIVE via the SDK control
         channel (set_permission_mode) — not merely stored for the next reconnect."""
-        reg = read_reg(self.state_dir, sid)
+        reg = self._mutate_reg(sid, lambda row: row.update(mode=mode))
         if not reg:
             return False
-        reg["mode"] = mode
-        write_reg(self.state_dir, sid, reg)
         write_sdk_default(self.state_dir, mode=mode)   # remember as the seed for the NEXT new session, like model/effort (the user 2026-06-27)
         s = self.sessions.get(sid)
         if s:
@@ -4001,12 +4007,11 @@ class SdkBackend:
         if the session is idle, at the end of the current turn if it's busy. The label updates at once."""
         if value not in EFFORT_LEVELS:
             return False
-        reg = read_reg(self.state_dir, sid)
+        reg = self._mutate_reg(
+            sid, lambda row: row.update(effort=value, effortPending=True))
         if not reg:
             return False
-        reg["effort"] = value
-        reg["effortPending"] = True   # the reconnect that applies it hasn't completed yet → dots + "Reloading session…"
-        write_reg(self.state_dir, sid, reg)
+        # The reconnect that applies it hasn't completed yet → dots + "Reloading session…".
         if value != "ultracode":   # ultracode is per-session by design (the CLI: "this session only") — never a seed
             write_sdk_default(self.state_dir, effort=value)   # remember as the seed for the NEXT new session (the user 2026-06-27)
         s = self.sessions.get(sid)
@@ -4039,12 +4044,10 @@ class SdkBackend:
             return False
         if value == "key" and not self.work_key:
             return False   # nothing to inject — the UI never offers this; refuse rather than half-apply
-        reg = read_reg(self.state_dir, sid)
+        reg = self._mutate_reg(
+            sid, lambda row: row.update(auth=value, authPending=True))
         if not reg:
             return False
-        reg["auth"] = value
-        reg["authPending"] = True   # the applying reconnect hasn't completed → badge dots
-        write_reg(self.state_dir, sid, reg)
         write_sdk_default(self.state_dir, auth=value)   # the seed for the NEXT new session, like model/effort
         s = self.sessions.get(sid)
         if s:
@@ -4291,11 +4294,21 @@ class SdkBackend:
                         "apiError": bool(a.get("isApiError")), "hasText": bool(_atom_text(a).strip())})
         return out
 
-    def _update_reg(self, sid: str, **fields):
-        with self._reg_lock:                       # kernel + loop threads both write (queue mirror);
-            reg = read_reg(self.state_dir, sid) or {"sid": sid}   # unserialized RMWs would drop fields
-            reg.update(fields)
+    def _mutate_reg(self, sid: str, mutate, create=False):
+        """Serialize one complete registry read-modify-write. Returns the committed row, or None
+        when the row is absent and create=False. Public setters and loop mirrors share this lock."""
+        with self._reg_lock:
+            reg = read_reg(self.state_dir, sid)
+            if reg is None:
+                if not create:
+                    return None
+                reg = {"sid": sid}
+            mutate(reg)
             write_reg(self.state_dir, sid, reg)
+            return reg
+
+    def _update_reg(self, sid: str, **fields):
+        return self._mutate_reg(sid, lambda reg: reg.update(fields), create=True)
 
     def _record_launch_error(self, sess: SdkSession, exc: BaseException) -> None:
         """A session's CLI refused to start — persist WHY onto the session so the user is told, loudly,

@@ -71,11 +71,31 @@ class JudgeEngine(unittest.TestCase):
         out = jd._judge_run("sonnet", "SYS PROMPT", "USER TEXT", judge="captioner", tier="index")
         self.assertEqual(out, '{"caption":"stub-reply"}')
         argv = self._argv()
-        for flag in ("exec", "--ephemeral", "--skip-git-repo-check", "read-only", "--color"):
+        for flag in ("exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
+                     "--strict-config", "--skip-git-repo-check",
+                     'default_permissions="ccodex_judge"', "--color"):
             self.assertIn(flag, argv)
+        profile = next((x for x in argv if x.startswith("permissions.ccodex_judge=")), "")
+        self.assertIn('":minimal" = "read"', profile)
+        self.assertIn('":workspace_roots" = { "." = "read"', profile)
+        self.assertIn("network = { enabled = false }", profile)
+        self.assertNotIn('":root"', profile, "judge profile must not restore host-wide reads")
+        self.assertNotIn("-s", argv, "legacy read-only permits host-wide reads")
         self.assertNotIn("-m", argv, "a claude alias must never be sent to codex (plan accounts 400)")
         self.assertIn("model_reasoning_effort=low", argv, "index tier defaults to low effort")
         self.assertEqual((self.rec / "stdin").read_text(), "SYS PROMPT\n\nUSER TEXT")
+
+    def test_successful_codex_call_clears_the_sessions_auth_latch(self):
+        self._engine("codex")
+        sid = "11111111-2222-3333-4444-555555555555"
+        jd._judge_ctx.fsid = sid
+        jd._auth_down_mark(sid, "login", "Not logged in")
+        self.assertIn(sid, jd._auth_down_map())
+        try:
+            self.assertTrue(jd._judge_run("sonnet", "S", "U", judge="planner", tier="triage"))
+        finally:
+            del jd._judge_ctx.fsid
+        self.assertNotIn(sid, jd._auth_down_map())
 
     def test_gpt_override_and_triage_default_effort(self):
         self._engine("codex")

@@ -40,32 +40,33 @@ class CheckinTrust(unittest.TestCase):
         with km._known_lock:
             km._known.clear()
 
-    def test_a_first_checkin_is_directed_the_safe_default(self):
+    def test_a_first_checkin_is_refused_until_the_host_is_trusted(self):
         payload, status = km.checkin_apply(dict(BODY))
-        self.assertEqual(status, 200)
-        self.assertTrue(payload["ok"])
-        self.assertEqual(km._remotes["TESTHOST"]["trust"], "directed")
+        self.assertEqual(status, 403)
+        self.assertFalse(payload["ok"])
+        self.assertNotIn("TESTHOST", km._remotes)
 
     def test_a_LEVEL_YOU_SET_survives_the_next_handshake(self):
         # this is the bug: the mobile reconnects (or its kernel restarts) and hands in the same details
+        km._known_note("TESTHOST", "trusted")
         km.checkin_apply(dict(BODY))
-        km.set_trust("TESTHOST", "trusted")
         self.assertEqual(km._remotes["TESTHOST"]["trust"], "trusted")
         km.checkin_apply(dict(BODY))
         self.assertEqual(km._remotes["TESTHOST"]["trust"], "trusted",
                          "a reconnect must not silently re-gate a host you trusted")
 
-    def test_isolated_survives_too_the_refusal_is_a_boundary(self):
-        # an isolation refusal is the user's boundary; a reconnect re-opening it would be worse than
-        # the directed case, since isolation means no postal contact at all
+    def test_downgrade_tears_down_the_checked_in_row_and_blocks_reconnect(self):
+        km._known_note("TESTHOST", "trusted")
         km.checkin_apply(dict(BODY))
         km.set_trust("TESTHOST", "isolated")
-        km.checkin_apply(dict(BODY))
-        self.assertEqual(km._remotes["TESTHOST"]["trust"], "isolated")
+        self.assertNotIn("TESTHOST", km._remotes, "downgrade removes the pushed token immediately")
+        payload, status = km.checkin_apply(dict(BODY))
+        self.assertEqual(status, 403)
+        self.assertFalse(payload["ok"])
 
     def test_the_level_is_remembered_so_it_survives_a_kernel_restart_too(self):
+        km._known_note("TESTHOST", "trusted")
         km.checkin_apply(dict(BODY))
-        km.set_trust("TESTHOST", "trusted")
         self.assertEqual(km.known_trust("TESTHOST"), "trusted", "the remembered entry tracks the choice")
         # a restart loses _remotes' live rows; the next handshake rebuilds from what was remembered
         km._remotes.clear()
@@ -75,10 +76,16 @@ class CheckinTrust(unittest.TestCase):
     def test_a_checkin_under_a_NEW_name_carries_nothing_over(self):
         # the same mobile re-checking in as another name is a different key: it must not inherit a level
         # chosen for the old one, since trust is judged by origin name at the gate
+        km._known_note("TESTHOST", "trusted")
         km.checkin_apply(dict(BODY))
-        km.set_trust("TESTHOST", "trusted")
-        km.checkin_apply(dict(BODY, host="OTHERHOST"))
-        self.assertEqual(km._remotes["OTHERHOST"]["trust"], "directed")
+        payload, status = km.checkin_apply(dict(BODY, host="OTHERHOST"))
+        self.assertEqual(status, 403)
+        self.assertNotIn("OTHERHOST", km._remotes)
+        self.assertIn("TESTHOST", km._remotes, "a refused rename cannot delete the trusted old row")
+        km._known_note("OTHERHOST", "trusted")
+        payload, status = km.checkin_apply(dict(BODY, host="OTHERHOST"))
+        self.assertEqual(status, 200)
+        self.assertEqual(set(km._remotes), {"OTHERHOST"})
 
     def test_an_ssh_attached_row_of_the_same_name_is_still_refused(self):
         km._remotes["TESTHOST"] = {"host": "TESTHOST", "trust": "trusted", "checkin_peer": False}

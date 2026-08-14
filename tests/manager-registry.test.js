@@ -9,9 +9,30 @@ const assert = require('node:assert');
 const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
-const { loadSpecs, specEnv, fileStamp } = require(path.join(__dirname, '..', 'bin', 'romp-manager'));
+const { loadSpecs, specEnv, fileStamp, configuredPort, ensurePort, validControlToken } =
+  require(path.join(__dirname, '..', 'bin', 'romp-manager'));
 
 const MAIN = 29855, CTRL = 7432;
+
+test('manager and ensure ports are strict bounded integers', () => {
+  assert.equal(configuredPort('1024', 9999, 'TEST_PORT'), 1024);
+  assert.equal(configuredPort('65535', 9999, 'TEST_PORT'), 65535);
+  for (const bad of ['1', '65536', '7.5', 'nope']) {
+    assert.throws(() => configuredPort(bad, 9999, 'TEST_PORT'), /integer in \[1024,65535\]/);
+  }
+  assert.equal(ensurePort(String(CTRL)).status, 409, 'the control listener can never become a worker');
+  assert.equal(ensurePort('65536').status, 400);
+  assert.equal(ensurePort('7432.0').status, 400);
+});
+
+test('manager bearer tokens require a transport-safe high-entropy shape', () => {
+  assert.equal(validControlToken('a'.repeat(32)), true);
+  assert.equal(validControlToken('Az_09-' + 'b'.repeat(26)), true);
+  for (const bad of ['', 'x', 'a'.repeat(31), 'a'.repeat(513), 'a'.repeat(31) + '\n',
+                     'a'.repeat(31) + ':']) {
+    assert.equal(validControlToken(bad), false, JSON.stringify(bad));
+  }
+});
 
 function withFile(content, fn) {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), 'romp-kernels-'));
@@ -75,7 +96,7 @@ test('a main entry overrides only the port — the stale-env escape hatch', () =
 
 test('specEnv carries the whole isolation story, and only what the spec sets', () => {
   const base = { PATH: '/usr/bin', HOME: '/home/u' };
-  const ids = { managerPid: 42, controlPort: CTRL };
+  const ids = { managerPid: 42, controlPort: CTRL, managerToken: 'manager-test-token' };
   const full = specEnv({ id: 'alice', port: 30001, postalPort: 30002, stateDir: '/tmp/ra',
                          claudeConfigDir: '/tmp/ca', tmuxSocket: 'romp-alice' }, base, ids);
   assert.equal(full.ROMP_SERVE_PORT, '30001');
@@ -85,6 +106,7 @@ test('specEnv carries the whole isolation story, and only what the spec sets', (
   assert.equal(full.CLAUDE_CONFIG_DIR, '/tmp/ca');
   assert.equal(full.ROMP_TMUX_SOCKET, 'romp-alice');
   assert.equal(full.ROMP_MANAGER_PID, '42');
+  assert.equal(full.ROMP_MANAGER_TOKEN, 'manager-test-token');
   assert.equal(full.PATH, '/usr/bin', 'base env rides through');
   const bare = specEnv({ id: 'main', port: MAIN }, base, ids);
   for (const k of ['ROMP_POSTAL_PORT', 'ROMP_STATE_DIR', 'CLAUDE_CONFIG_DIR', 'ROMP_TMUX_SOCKET']) {

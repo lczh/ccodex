@@ -103,11 +103,13 @@ test("a queued bubble with no ✕ says where the message actually is", () => {
 
 test("the qx click stashes the composer before/after so a failed cancel can undo the restore", () => {
   assert.match(RENDER, /const pendingCancelRestores = new Map<string, \{ before: string; after: string \}>\(\);/);
-  assert.match(RENDER, /pendingCancelRestores\.set\(activeId \+ " " \+ qmd, \{ before, after: ta \? ta\.value : "" \}\);/);
+  assert.match(RENDER, /pendingCancelRestores\.set\(queuedCancelKey\(activeId, qmd\), \{ before, after: ta \? ta\.value : "" \}\);/);
 });
 
 test("cancelResult ok:false toasts the kernel's 'too late' and reverts an untouched composer restore", () => {
   assert.match(RENDER, /m\.type === "cancelResult" && typeof m\.id === "string"/);
+  assert.match(RENDER, /const key = queuedCancelKey\(m\.id, typeof m\.md === "string" \? m\.md : ""\);/,
+    "the result uses the exact same key helper as the click");
   assert.match(RENDER, /pendingCancelRestores\.delete\(key\);/, "the stash is one-shot, ok or not");
   assert.match(RENDER, /if \(typeof m\.text === "string" && m\.text\) warnToast\(m\.text\);/);
   // the undo fires ONLY when the draft still exactly equals the post-restore value — an edited draft
@@ -189,7 +191,8 @@ test("the kernel parks every drive op while the account can't serve one, and dra
   assert.match(KERNEL, /or _limit_hold\(sid\) is not None\)/, "the gate /model, /effort and /compact pass");
   // the send path needs its OWN arm, ahead of the forwards_sends handoff: an SDK backend takes a send even
   // mid-turn, so without this the message goes straight out and comes back an API error
-  assert.match(KERNEL, /if _compacting_now\(sid\) or _pending_ops\.get\(sid\) or _limit_hold\(sid\):/);
+  assert.match(KERNEL, /with _pending_ops_lock:\s+queued = bool\(_pending_ops\.get\(sid\)\)\s+if _compacting_now\(sid\) or queued or _limit_hold\(sid\):/,
+    "the send gate reads the queue under the pending-op lock before the forwarding handoff");
   assert.match(KERNEL, /if _compacting_now\(sid\) or _working_now\(sid\) or _limit_hold\(sid\):/, "the drain gate");
   // RELEASE rides the API's own stamp — no romp-invented timer, and no clock promised without one
   assert.match(KERNEL, /"resetsAt": max\(known\) if len\(known\) == len\(resets\) else None,/);

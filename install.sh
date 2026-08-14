@@ -19,8 +19,7 @@ if [[ ! -x "$ROMP_DIR/bin/romp" ]]; then
     echo "install.sh: this doesn't look like a romp clone ($ROMP_DIR)." >&2
     echo "  install.sh installs the clone it lives in; it cannot be piped from curl." >&2
     echo "  To install from scratch:" >&2
-    echo "    curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | \\" >&2
-    echo "      ROMP_REPO=https://github.com/lczh/ccodex.git ROMP_REF=main ROMP_DIR=\$HOME/ccodex bash" >&2
+    echo "    curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | bash" >&2
     exit 1
 fi
 
@@ -30,9 +29,16 @@ fi
 # tell. ROMP_SKIP_PREFLIGHT=1 bypasses; ROMP_NODE overrides the node binary.
 if [[ -z "${ROMP_SKIP_PREFLIGHT:-}" ]]; then
     preflight_missing=0
-    if ! command -v "${ROMP_NODE:-node}" >/dev/null 2>&1; then
-        echo "install.sh: Node.js not found — the kernel manager runs on it." >&2
-        echo "  macOS:  brew install node    Linux: your distro's nodejs package" >&2
+    node_bin="${ROMP_NODE:-node}"
+    if ! command -v "$node_bin" >/dev/null 2>&1; then
+        echo "install.sh: Node.js not found — the kernel manager and extension build need Node 22+." >&2
+        echo "  macOS:  brew install node    Linux: install Node 22+ from nodejs.org" >&2
+        preflight_missing=1
+    elif ! "$node_bin" -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)' \
+            >/dev/null 2>&1; then
+        node_ver="$("$node_bin" --version 2>/dev/null || true)"
+        echo "install.sh: Node.js 22 or newer is required; found ${node_ver:-an unreadable version}." >&2
+        echo "  macOS:  brew upgrade node    Linux: install Node 22+ from nodejs.org" >&2
         preflight_missing=1
     fi
     if ! command -v python3 >/dev/null 2>&1; then
@@ -198,8 +204,8 @@ if [[ -z "${ROMP_NO_SDK:-}" && -x "$ROMP_DIR/bin/romp-sdk-setup" ]]; then
 fi
 
 # The webview bundles live here too — this step builds vscode-extension/dist, which the KERNEL serves
-# to the browser dashboard, editor or no editor. A failure here means a blank dashboard, so it is
-# remembered and reported at the end rather than echoed past.
+# to the browser dashboard, editor or no editor. A failure means either that build or every editor
+# install failed, so it is remembered and reported at the end rather than echoed past.
 ROMP_EXT_FAILED=""
 if [[ -z "${ROMP_NO_EXT:-}" && -x "$ROMP_DIR/vscode-extension/install.sh" ]]; then
     echo "  Building the dashboard UI (and installing romp-chat-view where an editor is present)..."
@@ -272,8 +278,8 @@ fi
 # The SDK backend is NOT an optional piece: it is what plain `romp new` uses, so without it romp
 # starts, looks healthy, and cannot run a single session. Listing it among the optional ones let a
 # fresh install read as fine when it wasn't (the user 2026-07-28). It gets its own banner, above the
-# link, in the language of what the user can't do — and it is now rare, since romp-sdk-setup
-# bootstraps pip itself rather than sending anyone to sudo.
+# link, in the language of what the user can't do; romp-sdk-setup names the missing python3-venv
+# package rather than mutating the environment with a downloaded pip bootstrap.
 if [[ -n "$ROMP_SDK_MISSING" ]]; then
     echo
     echo "  ══════════════════════════════════════════════════════════════════"
@@ -290,8 +296,8 @@ if [[ -n "$ROMP_TMUX_MISSING$ROMP_EXT_FAILED$ROMP_CLAUDE_OLD$ROMP_CLAUDE_MISSING
     echo
     echo "  Some optional pieces aren't set up:"
     if [[ -n "$ROMP_EXT_FAILED" ]]; then
-        echo "   ! The dashboard UI failed to build — the browser dashboard will come up blank."
-        echo "     Retry:  (cd $ROMP_DIR/vscode-extension && npm install && node esbuild.js)"
+        echo "   ! The dashboard/VS Code extension setup did not complete."
+        echo "     Retry:  (cd $ROMP_DIR/vscode-extension && ./install.sh)"
     fi
     if [[ -n "$ROMP_CLAUDE_MISSING" ]]; then
         echo "   ! Claude Code isn't on PATH — romp drives Claude Code, so sessions need it."

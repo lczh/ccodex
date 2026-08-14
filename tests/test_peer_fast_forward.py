@@ -114,7 +114,8 @@ class AskingThePeer(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual([c[1] for c in calls], ["/tunnels/pull", "/restart"],
                          "a pull alone leaves the OLD kernel running and still reporting the old sha")
-        self.assertEqual(calls[0][2], {"host": "hubname"}, "the peer is handed the name it knows us by")
+        self.assertEqual(calls[0][2], {"host": "hubname", "expectedSha": LOCAL},
+                         "the peer is handed both the source name and the exact approved commit")
         self.assertIn("pulled 8 commits", detail)
         self.assertIn("restarting it", detail)
 

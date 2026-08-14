@@ -292,26 +292,51 @@ def read_box(sid, consume):
         return []
     if consume:
         (mb / "cur").mkdir(parents=True, exist_ok=True)
-    out = []
+    # Parse the whole candidate batch before claiming any file.  A consumer must never move the
+    # first messages to cur/ and then lose ownership of them because a later read/rename failed.
+    # The rename pass below also rolls back anything it moved before a mid-batch race or I/O error;
+    # only files that could not be restored are returned to the caller as real claims.
+    parsed = []
     for f in sorted(newd.iterdir(), key=lambda p: p.name):   # oldest first
         if not f.is_file():
             continue
-        text = f.read_text(errors="replace")
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            return []
         head, _, body = text.partition("\n\n")
         meta = {}
         for line in head.splitlines():
             k, _, v = line.partition(": ")
             meta[k.lower()] = v
-        out.append({"from": meta.get("from", "?"), "from_id": meta.get("from-id", ""),
-                    "date": meta.get("date", ""), "body": body.rstrip("\n"), "id": f.name,
-                    "park": bool(meta.get("x-park")), "kind": meta.get("x-kind", ""),
-                    "from_host": meta.get("x-from-host", "")})
-        if consume:
+        parsed.append((f, meta, {"from": meta.get("from", "?"), "from_id": meta.get("from-id", ""),
+                                 "date": meta.get("date", ""), "body": body.rstrip("\n"), "id": f.name,
+                                 "park": bool(meta.get("x-park")), "kind": meta.get("x-kind", ""),
+                                 "from_host": meta.get("x-from-host", "")}))
+    if not consume:
+        return [row for _f, _meta, row in parsed]
+
+    claimed = []
+    try:
+        for f, meta, row in parsed:
             f.rename(mb / "cur" / f.name)
-            _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "exec", "id": f.name})
-            _queue_read_receipt(meta, dmid=f.name)   # cross-host mail: the sender's host learns it was read
-            #   dmid = THIS host's delivery mid — the id the recipient's transcript markers carry, so the
-            #   sender's timeline can join the connector to the true process turn (the user 2026-08-06)
+            claimed.append((f, meta, row))
+    except OSError:
+        stranded = []
+        for f, meta, row in reversed(claimed):
+            try:
+                (mb / "cur" / f.name).rename(f)
+            except OSError:
+                stranded.append((f, meta, row))
+        claimed = list(reversed(stranded))
+
+    out = []
+    for _f, meta, row in claimed:
+        out.append(row)
+        _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "exec", "id": row["id"]})
+        _queue_read_receipt(meta, dmid=row["id"])   # cross-host mail: the sender's host learns it was read
+        #   dmid = THIS host's delivery mid — the id the recipient's transcript markers carry, so the
+        #   sender's timeline can join the connector to the true process turn (the user 2026-08-06)
     if consume:
         _mark_pending(sid)         # cleared the box -> drop the marker (no-op if more arrived)
     return out
@@ -1442,6 +1467,81 @@ def is_client_only():
 # reads it to dial RELAYs; until then it is inert bookkeeping, visible at GET /peers.
 PEERS = {}
 
+_TRUST_LEVELS = ("trusted", "directed", "isolated")
+
+
+def _peer_tier(value):
+    """A peer-declared tier is display metadata, never an open-ended string.
+
+    Keeping the protocol value as an enum prevents a hostile peer from carrying HTML/script through
+    PEER_STATE -> /peers -> the kernel's network panel.  Unknown values are omitted (the same behavior
+    as an older peer that does not send the additive field), never reflected back to a browser.
+    """
+    value = str(value or "").strip()
+    return value if value in _TRUST_LEVELS else ""
+
+
+def _peer_presence_rows(value):
+    """Narrow untrusted exchange presence to the fields consumers actually use.
+
+    Session ids and the optional one-hop host/bus labels are protocol/path identifiers.  A session
+    name is user-facing display text: normalize whitespace and bound it, but preserve ordinary spaces
+    and punctuation.  Browser consumers must render it as text, never markup.  The cap prevents one
+    peer response from growing every subsequent exchange and /agents response without bound.
+    """
+    out = []
+    if not isinstance(value, list):
+        return out
+    for row in value[:2000]:
+        if not isinstance(row, dict):
+            continue
+        name = " ".join(str(row.get("name") or "").split())[:128]
+        sid = str(row.get("id") or "")
+        via, via_bus = str(row.get("via") or ""), str(row.get("viaBus") or "")
+        if not name or not _safe_id(sid):
+            continue
+        if via and not _safe_id(via):
+            continue
+        if via_bus and not _safe_id(via_bus):
+            continue
+        clean = {"name": name, "id": sid}
+        if via:
+            clean["via"] = via
+        if via_bus:
+            clean["viaBus"] = via_bus
+        out.append(clean)
+    return out
+
+
+def _peer_hold_rows(value):
+    """Validate hold summaries received from a peer; display text is normalized and bounded."""
+    out = []
+    if not isinstance(value, list):
+        return out
+    for row in value[:100]:
+        if not isinstance(row, dict):
+            continue
+        mid = str(row.get("mid") or "")
+        frm = " ".join(str(row.get("frm") or "?").split())[:128] or "?"
+        to = " ".join(str(row.get("to") or "?").split())[:128] or "?"
+        origin, via = str(row.get("origin") or ""), str(row.get("via") or "")
+        if not _safe_id(mid):
+            continue
+        if origin and not _safe_id(origin):
+            continue
+        if via and not _safe_id(via):
+            continue
+        try:
+            at = max(0, int(row.get("at") or 0))
+        except (TypeError, ValueError):
+            at = 0
+        clean = {"mid": mid, "frm": frm, "to": to, "origin": origin, "at": at,
+                 "gist": " ".join(str(row.get("gist") or "").split())[:90]}
+        if via:
+            clean["via"] = via
+        out.append(clean)
+    return out
+
 def peer_update(data):
     """Apply one kernel notify. Returns (payload, status). `token` is the PEER machine's serve token
     (the kernel learned it at attach/checkin) — the dialer needs it because the peer's bus is
@@ -1614,9 +1714,14 @@ BUS_EPOCH = int(time.time())               # this bus process's boot — peers k
 BUS_ID = os.urandom(16).hex()
 OUTBOX = STATE / "outbox"                  # outbox/<host>/<mid>.json — cross-host mail awaiting its ACK
 READBOX = STATE / "readbox"                # readbox/<host>/<mid>.json — read receipts awaiting their peer
+CORRUPT = STATE / "corrupt"                 # preserved unreadable durable records, grouped by store
 PEER_SEEN = STATE / "peer-seen.jsonl"      # append-only receipt log — the idempotence window
 _SEEN_CAP = 4000
 _seen_ids = None                           # lazy in-memory mirror of PEER_SEEN's tail
+_seen_order = None                         # oldest -> newest, unique; eviction order for the bounded window
+_seen_appends = 0                          # additions since the last atomic compaction
+_SEEN_COMPACT_EVERY = 256                  # disk stays within CAP + this many crash-safe append records
+_seen_lock = threading.Lock()              # check + delivery + receipt publish is one idempotence claim
 EXCHANGE_WAIT = int(os.environ.get("ROMP_POSTAL_EXCHANGE_WAIT", "20"))
 PEER_STATE = {}                            # host -> {"presence": [...], "epoch": int, "seenAt": t, "drift": str}
 _peer_wakes = {}                           # host -> threading.Event (long-poll release + dialer poke)
@@ -1709,25 +1814,131 @@ def _peer_wake(host):
         return ev
 
 def _seen_load():
-    global _seen_ids
+    global _seen_ids, _seen_order, _seen_appends
     if _seen_ids is None:
         try:
-            _seen_ids = set(PEER_SEEN.read_text().split()[-_SEEN_CAP:])
+            rows = PEER_SEEN.read_text().split()
         except Exception:
-            _seen_ids = set()
+            rows = []
+        # Keep the newest occurrence of each valid id.  Older versions appended duplicates and never
+        # compacted; loading them must neither weaken the window nor retain attacker-shaped lines.
+        keep, have = [], set()
+        for mid in reversed(rows):
+            if _safe_id(mid) and mid not in have:
+                keep.append(mid)
+                have.add(mid)
+                if len(keep) >= _SEEN_CAP:
+                    break
+        _seen_order = list(reversed(keep))
+        _seen_ids = set(_seen_order)
+        _seen_appends = 0
+        if len(rows) != len(_seen_order):
+            _peer_seen_compact_locked()             # heal a pre-existing unbounded/duplicate/corrupt log
     return _seen_ids
 
 def peer_seen_check(mid):
-    return mid in _seen_load()
+    with _seen_lock:
+        return mid in _seen_load()
 
 def peer_seen_add(mid):
-    _seen_load().add(mid)
+    with _seen_lock:
+        _peer_seen_add_locked(mid)
+
+def _peer_seen_add_locked(mid):
+    """Publish one receipt while _seen_lock is held; retain one bounded, ordered dedupe window."""
+    global _seen_appends
+    if not _safe_id(mid):
+        return
+    seen = _seen_load()
+    if mid in seen:
+        return
+    seen.add(mid)
+    _seen_order.append(mid)
+    while len(_seen_order) > _SEEN_CAP:
+        seen.discard(_seen_order.pop(0))
     try:
         PEER_SEEN.parent.mkdir(parents=True, exist_ok=True)
         with PEER_SEEN.open("a") as f:
             f.write(mid + "\n")
+            f.flush()
+            os.fsync(f.fileno())                    # an ack means the receipt survives a process crash
+        _seen_appends += 1
+        if _seen_appends >= _SEEN_COMPACT_EVERY:
+            _peer_seen_compact_locked()
     except Exception as e:
         _log("peer-seen append failed: %s" % e)     # dedupe degrades to the in-memory window
+
+
+def _fsync_dir(path):
+    """Best-effort directory sync after replace; unsupported directory fsync must not break portability."""
+    fd = None
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _atomic_text_put(path, text):
+    """Durably publish text with a unique same-directory temporary and atomic replace."""
+    tmp = path.with_name(".%s.%d.%d.%016x.tmp" %
+                         (path.name, os.getpid(), threading.get_ident(), random.getrandbits(64)))
+    try:
+        with tmp.open("x") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _peer_seen_compact_locked():
+    """Replace the receipt log with exactly the in-memory window. Caller holds _seen_lock."""
+    global _seen_appends
+    try:
+        PEER_SEEN.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_text_put(PEER_SEEN, "".join(mid + "\n" for mid in (_seen_order or [])))
+        _seen_appends = 0
+        return True
+    except Exception as e:
+        _log("peer-seen compaction failed: %s" % e)
+        return False
+
+
+def _atomic_json_put(path, value):
+    """Durably and atomically publish JSON without sharing a temporary name between writers."""
+    _atomic_text_put(path, json.dumps(value))
+
+
+def _quarantine_corrupt_json(path, store, error, fingerprint=None):
+    """Move a stable unreadable final aside and report it, so a durable retry is never skipped forever."""
+    try:
+        if fingerprint is not None:
+            cur = path.stat()
+            now = (cur.st_dev, cur.st_ino, cur.st_size, cur.st_mtime_ns)
+            if now != fingerprint:
+                return                              # a concurrent atomic writer already replaced it
+        dst_dir = CORRUPT / store
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = dst_dir / ("%s.%d.%016x.corrupt" %
+                         (path.name, int(time.time() * 1000), random.getrandbits(64)))
+        os.replace(path, dst)
+        _fsync_dir(path.parent)
+        _fsync_dir(dst_dir)
+        _log("%s: quarantined unreadable durable record %s -> %s (%s)" %
+             (store, path, dst, str(error)[:160]))
+    except FileNotFoundError:
+        pass                                         # consumed/replaced concurrently
+    except Exception as e:
+        _log("%s: unreadable durable record %s could not be quarantined: %s" % (store, path, e))
 
 def outbox_put(host, msg):
     """Park one cross-host message for `host` and poke its exchange (long-poll release + dialer).
@@ -1740,7 +1951,7 @@ def outbox_put(host, msg):
         return
     d = OUTBOX / host
     d.mkdir(parents=True, exist_ok=True)
-    (d / (mid + ".json")).write_text(json.dumps(msg))
+    _atomic_json_put(d / (mid + ".json"), msg)
     _peer_wake(host).set()
 
 def outbox_list(host):
@@ -1749,10 +1960,13 @@ def outbox_list(host):
     try:
         out = []
         for f in sorted((OUTBOX / host).glob("*.json")):
+            fingerprint = None
             try:
+                st = f.stat()
+                fingerprint = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
                 out.append(json.loads(f.read_text()))
-            except Exception:
-                pass
+            except Exception as e:
+                _quarantine_corrupt_json(f, "outbox", e, fingerprint)
         return out
     except Exception:
         return []
@@ -1785,7 +1999,7 @@ def readbox_put(host, rec):
         return
     d = READBOX / host
     d.mkdir(parents=True, exist_ok=True)
-    (d / (mid + ".json")).write_text(json.dumps(rec))
+    _atomic_json_put(d / (mid + ".json"), rec)
     _peer_wake(host).set()
 
 def readbox_list(host):
@@ -1794,10 +2008,13 @@ def readbox_list(host):
     try:
         out = []
         for f in sorted((READBOX / host).glob("*.json")):
+            fingerprint = None
             try:
+                st = f.stat()
+                fingerprint = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
                 out.append(json.loads(f.read_text()))
-            except Exception:
-                pass
+            except Exception as e:
+                _quarantine_corrupt_json(f, "readbox", e, fingerprint)
         return out
     except Exception:
         return []
@@ -1846,13 +2063,15 @@ def _bounce_apply(host, b):
     loudly, and drop it from the outbox. Parking never outlives a definitive refusal."""
     mid = (b or {}).get("mid") or ""
     msg = outbox_get(host, mid)
-    outbox_del(host, mid)
     if not msg:
         return
     note = ("undeliverable to '%s' on %s: %s\n\n(your message follows)\n%s"
             % (msg.get("to") or "?", host, (b or {}).get("why") or "refused", msg.get("body") or ""))
     if msg.get("frm_id"):
         deliver(msg["frm_id"], "romp-postal", "", note, kind="coordinate")
+    # The parked source is our retry record.  Retire it only after the return note was successfully
+    # written; if delivery raises, the next exchange can retry the bounce instead of losing both.
+    outbox_del(host, mid)
     _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "bounced", "id": mid,
                                   "to": msg.get("to") or "?", "host": host,
                                   "why": (b or {}).get("why") or "refused"})
@@ -1993,32 +2212,75 @@ def _relay_in(host, m, token_proven=False):
     tier, and an EXPLICIT tier the user set for the dialer (directed/isolated) still wins — the
     exemption replaces only the unknown-origin default. The dialer side (peer_exchange_apply) proves
     nothing: whatever answers the tunnel port never showed our token, so tiers gate it as before."""
-    mid = m.get("mid") or ""
-    if not mid:
+    if not isinstance(m, dict):
         return "drop", None
-    if peer_seen_check(mid):
-        return "ack", None                           # duplicate → re-ack, deliver nothing
-    to = m.get("to") or ""
+    # Relays cross an authenticated *machine* boundary, not a schema/trust boundary.  Narrow the
+    # record before it can reach a mail header, quarantine JSON/browser metadata, or another peer's
+    # durable outbox.  In particular, origin is a claimed routing identity; only safe protocol ids
+    # may participate in trust lookup.  Display text stays literal (the browser uses text nodes), but
+    # control characters and unbounded values are refused rather than reflected or written to disk.
+    for key in ("mid", "to", "frm", "frm_id", "body", "kind", "origin"):
+        if key in m and m[key] is not None and not isinstance(m[key], str):
+            return "drop", None
+    mid = m.get("mid") or ""
+    if not _safe_id(mid):
+        return "drop", None
+    origin = m.get("origin") or ""
+    frm_id = m.get("frm_id") or ""
+    if (origin and not _safe_id(origin)) or (frm_id and not _safe_id(frm_id)):
+        return "drop", None
+    raw_to, raw_frm = m.get("to") or "", m.get("frm") or "?"
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_to + raw_frm):
+        return "drop", None
+    to = " ".join(raw_to.split())
+    frm = " ".join(raw_frm.split()) or "?"
+    if len(to) > 128 or len(frm) > 128:
+        return "drop", None
+    body = m.get("body") or ""
+    try:
+        if len(body.encode("utf-8")) > 256 * 1024:
+            return "drop", None
+    except UnicodeError:
+        return "drop", None
+    kind = m.get("kind") or ""
+    if kind not in ("", "delegate", "coordinate", "question"):
+        return "drop", None
+    # Strip unknown peer-controlled keys before forwarding or persistence.
+    m = {"mid": mid, "to": to, "frm": frm, "frm_id": frm_id, "body": body, "kind": kind}
+    if origin:
+        m["origin"] = origin
     match = [a for a in local_agents() if a["name"] == to and not _postal_off(a["id"])]
     if match:
-        # Trust key = the true ORIGIN (the forwarding host stamps m["origin"]; else the direct peer).
-        # Unknown host (a race before the kernel's notify lands) defaults to directed — never auto-inject.
-        origin = m.get("origin") or host
-        prow = PEERS.get(origin)
-        trust = (prow or {}).get("trust") or "directed"
-        if prow is None and token_proven and not m.get("origin"):
-            trust = "trusted"                        # token-proven direct dialer, no explicit tier → deliver (see docstring)
-        if trust == "trusted":
-            deliver(match[0]["id"], m.get("frm") or "?", m.get("frm_id") or "", m.get("body") or "",
-                    kind=m.get("kind") or "", from_host=origin,
-                    relay_mid=mid, relay_via=host)       # read-receipt route: back through the direct peer
-        elif trust == "directed":
-            _quarantine_put(origin, m, match[0]["id"], via=host)   # HELD for human approve/deny/edit; never injects
-        # else isolated → drop: ack so the sender stops resending, but deliver nothing (no communication).
-        # An isolated host normally never peers at all (the kernel forces its notify down), so this is a
-        # defensive backstop for the checkin-peer path where the mobile dials our /peer-exchange.
-        peer_seen_add(mid)
+        # Hold the idempotence claim across the effect and receipt publish.  Two exchange threads can
+        # carry the same mid concurrently; neither may pass a separate check before either appends.
+        with _seen_lock:
+            if mid in _seen_load():
+                return "ack", None                       # duplicate → re-ack, deliver nothing
+            # Trust key = the true ORIGIN (the forwarding host stamps m["origin"]; else the direct peer).
+            # Unknown host (a race before the kernel's notify lands) defaults to directed — never auto-inject.
+            origin = m.get("origin") or host
+            prow = PEERS.get(origin)
+            trust = (prow or {}).get("trust") or "directed"
+            if prow is None and token_proven and not m.get("origin"):
+                trust = "trusted"                    # token-proven direct dialer, no explicit tier → deliver
+            elif m.get("origin"):
+                # A relay may name the original sender, but the authenticated DIRECT peer is the only
+                # identity this hop proved. A claimed origin cannot raise mail above the direct gate.
+                direct = (PEERS.get(host) or {}).get("trust") or "directed"
+                rank = {"isolated": 0, "directed": 1, "trusted": 2}
+                trust = min((trust, direct), key=lambda level: rank.get(level, 1))
+            if trust == "trusted":
+                deliver(match[0]["id"], m.get("frm") or "?", m.get("frm_id") or "", m.get("body") or "",
+                        kind=m.get("kind") or "", from_host=origin,
+                        relay_mid=mid, relay_via=host)   # read-receipt route: back through direct peer
+            elif trust == "directed":
+                if not _quarantine_put(origin, m, match[0]["id"], via=host):
+                    return "drop", None               # no ack: retry after the local write failure
+            # else isolated → ack and remember, but deliver nothing (no communication).
+            _peer_seen_add_locked(mid)
         return "ack", None
+    if peer_seen_check(mid):
+        return "ack", None                           # a duplicate whose recipient has since vanished
     if any(a["name"] == to for a in local_agents()):
         return "bounce", {"mid": mid, "why": "recipient '%s' has its mailbox off (postal isolation)" % to}
     if not m.get("origin"):                          # one hop MAX: a message that already hopped never re-forwards
@@ -2050,10 +2312,10 @@ def _bounce_arrived(host, b):
     mid = (b or {}).get("mid") or ""
     msg = outbox_get(host, mid)
     if msg and msg.get("origin"):
-        outbox_del(host, mid)
         p = _pending(msg["origin"])
         with _peer_lock:
             p["bounces"].append(b)
+        outbox_del(host, mid)                         # enqueue backward first; source remains on failure
         _peer_wake(msg["origin"]).set()
     else:
         _bounce_apply(host, b)
@@ -2101,6 +2363,8 @@ def peer_exchange_handle(data):
     # Canonicalize BEFORE anything keys on the name: presence files under the alias (no duplicate
     # session rows), and the relays below are trust-judged under the alias the user actually tiered.
     bus_id = str((data or {}).get("busId") or "")
+    if bus_id and not _safe_id(bus_id):
+        bus_id = ""                                      # identity metadata is bounded to protocol ids
     host = _canon_peer_name(host, bus_id)
     if not _safe_id(host):
         # An unkeyable name would HALF-work: presence lands (PEER_STATE is a dict), but outbox_put
@@ -2111,13 +2375,14 @@ def peer_exchange_handle(data):
         # declare such a name (self_host falls back); this guards against un-updated ones.
         return {"error": "unsafe host name %r — this machine's hostname fails path-safety; fix its "
                          "hostname (or set ROMP_POSTAL_HOST) and redial" % host}, 400
-    PEER_STATE[host] = {"presence": data.get("presence") or [], "epoch": data.get("epoch"),
-                        "holds": data.get("holds") or [], "seenAt": int(time.time())}
+    PEER_STATE[host] = {"presence": _peer_presence_rows(data.get("presence")), "epoch": data.get("epoch"),
+                        "holds": _peer_hold_rows(data.get("holds")), "seenAt": int(time.time())}
     if bus_id:
         PEER_STATE[host]["busId"] = bus_id
         _drop_peer_name_dupes(host, bus_id)
-    if data.get("tier"):                             # the dialer's declared tier-of-us (additive; older peers omit it)
-        PEER_STATE[host]["theirTier"] = str(data["tier"])
+    tier = _peer_tier(data.get("tier"))
+    if tier:                                         # the dialer's declared tier-of-us (additive; older peers omit it)
+        PEER_STATE[host]["theirTier"] = tier
     for mid in data.get("acks") or []:               # the dialer confirmed relays landed — end-to-end:
         _ack_arrived(host, mid)                      # a forwarded one relays its ack back to the origin
     for b in data.get("bounces") or []:              # ...or refused them → backward, or to our sender
@@ -2128,6 +2393,8 @@ def peer_exchange_handle(data):
         _read_arrived(host, r)
     acks, bounces = [], []
     for m in data.get("relays") or []:
+        if not isinstance(m, dict):
+            continue
         verdict, bounce = _relay_in(host, m, token_proven=True)   # past the HTTP gate = showed OUR serve token
         if verdict == "ack":
             acks.append(m.get("mid"))
@@ -2181,14 +2448,17 @@ def peer_exchange_apply(host, req_sent, resp):
         p["readAcks"] = [a for a in p.get("readAcks") or [] if a not in (req_sent.get("readAcks") or [])]
     for r in req_sent.get("reads") or []:
         readbox_del(host, r)
-    PEER_STATE[host] = {"presence": resp.get("presence") or [], "epoch": resp.get("epoch"),
-                        "holds": resp.get("holds") or [], "seenAt": int(time.time())}
+    PEER_STATE[host] = {"presence": _peer_presence_rows(resp.get("presence")), "epoch": resp.get("epoch"),
+                        "holds": _peer_hold_rows(resp.get("holds")), "seenAt": int(time.time())}
     bus_id = str(resp.get("busId") or "")
+    if bus_id and not _safe_id(bus_id):
+        bus_id = ""
     if bus_id:                                       # the dialed alias is canonical for this bus: fold any
         PEER_STATE[host]["busId"] = bus_id           # row it left under its self-declared hostname
         _drop_peer_name_dupes(host, bus_id)
-    if resp.get("tier"):                             # the dialed side's declared tier-of-us
-        PEER_STATE[host]["theirTier"] = str(resp["tier"])
+    tier = _peer_tier(resp.get("tier"))
+    if tier:                                         # the dialed side's declared tier-of-us
+        PEER_STATE[host]["theirTier"] = tier
     for mid in resp.get("acks") or []:
         _ack_arrived(host, mid)
     for b in resp.get("bounces") or []:
@@ -2198,6 +2468,8 @@ def peer_exchange_apply(host, req_sent, resp):
         with _peer_lock:
             p["readAcks"].append({"mid": r.get("mid"), "unread": bool(r.get("unread"))})
     for m in resp.get("relays") or []:
+        if not isinstance(m, dict):
+            continue
         verdict, bounce = _relay_in(host, m)
         with _peer_lock:
             if verdict == "ack":

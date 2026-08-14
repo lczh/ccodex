@@ -85,7 +85,7 @@ class ParkOrApply(unittest.TestCase):
         self.assertEqual(self.be.calls, [(SID, "opus")], "compaction over → the parked switch fires")
         self.assertNotIn(SID, km._pending_ops, "consumed — never re-fired")
 
-    def test_dead_session_park_is_dropped_not_retried(self):
+    def test_backend_lookup_failure_keeps_the_park_for_retry(self):
         km._pending_ops[SID] = [("model", "opus")]
         km._compacting_now = lambda sid: False
 
@@ -93,7 +93,8 @@ class ParkOrApply(unittest.TestCase):
             raise RuntimeError("no such session")
         km.Sessions.backend_for = dead
         km._apply_pending_ops()                         # must not raise
-        self.assertNotIn(SID, km._pending_ops, "a dead session's park is dropped, never retried forever")
+        self.assertEqual(km._pending_ops.get(SID), [("model", "opus")],
+                         "a retryable backend failure must never eat a parked setting")
 
     def test_producer_ticks_the_apply(self):
         import inspect

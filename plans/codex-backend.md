@@ -59,10 +59,21 @@ schema, so field names below are wire-exact.
 `CodexClient.start()` + `initialize` handshake (SDK 0.144.4 ↔ CLI 0.147.0),
 `account_read` on a login-less box returns exactly the auth-gate signature the
 backend keys on (`requiresOpenaiAuth: true`, `account: null`), `model_list`
-works unauthenticated (gpt-5.6-sol/terra/luna, 5.5, 5.2), and `thread_start`
-accepts this plan's param spelling verbatim (`{"cwd", "approvalPolicy":
-"never", "sandbox": "workspace-write"}`) and mints a UUIDv7 thread id with the
-default model.
+works unauthenticated (gpt-5.6-sol/terra/luna, 5.5, 5.2). That live probe also
+showed that `thread_start` accepts the legacy `sandbox:workspace-write`
+spelling, but it is not the shipped policy: in pinned 0.144.4 both that legacy
+policy and built-in `:workspace` include `:root=read`. ccodex injects a custom
+`ccodex_workspace` profile (`:minimal=read`, runtime workspace `.=write`,
+network enabled), then passes
+`permissions:"ccodex_workspace"` and `runtimeWorkspaceRoots:[cwd]`. The SDK
+passes those raw dict fields and profile config overrides through unchanged.
+Pinned 0.144.4 does confine arbitrary-process reads to the workspace plus its
+minimal platform roots, but its direct custom-policy process sandbox does not
+enforce narrower child access under a writable root: live probes could still
+write all three metadata paths. Built-in `:workspace` protected the metadata
+paths but retained `:root=read`. Until the runtime can enforce both properties,
+the backend prioritizes host user-file confidentiality and records the metadata
+integrity limitation explicitly.
 
 **Live smoke, logged in (2026-08-13, `tests/smoke_codex_live.py`):** two real
 turns end-to-end — a file-writing task whose Write items materialized as
@@ -77,7 +88,7 @@ results with the failure text — visible, never a fake success.
 **Host requirement (found live):** Codex's Linux sandbox is bubblewrap, which
 needs unprivileged user namespaces. Newer GCP/Ubuntu images restrict them
 (`kernel.apparmor_restrict_unprivileged_userns=1`) and then EVERY command and
-patch under `workspaceWrite` fails with `bwrap: setting up uid map: Permission
+patch under a sandboxed profile fails with `bwrap: setting up uid map: Permission
 denied` — loudly, as error-flagged results. Sandboxed operation needs the
 sysctl flipped (persist via /etc/sysctl.d); the smoke's
 `ROMP_SMOKE_SANDBOX=danger-full-access` override exercises the same protocol
@@ -88,8 +99,9 @@ machinery on such boxes without it.
   turn_id)`, `turn_steer`, `model_list`, `next_notification()` queues, login
   APIs (`account_login_start`, API-key and ChatGPT device-code flows).
 - **Per-turn params**: model, reasoning effort, cwd, `approvalPolicy`
-  (never/onRequest/unlessTrusted), `sandboxPolicy` (readOnly/workspaceWrite/
-  dangerFullAccess), output schema.
+  (never/onRequest/unlessTrusted), custom named `permissions`,
+  `runtimeWorkspaceRoots`, output schema. The legacy `sandboxPolicy` shape is
+  retained only by the explicit danger-full-access live-smoke override.
 - **Notifications** (exact methods): `turn/started`, `turn/completed`,
   `item/started`, `item/completed` (+ delta streams), `thread/compacted`,
   `thread/tokenUsage/updated`, `account/rateLimits/updated`, `error`
@@ -136,8 +148,10 @@ enqueue, as the SDK backend).
 
 Documented-empty (loud, not faked): `set_fast` False (no Codex equivalent),
 `set_mode` False in phase 1 — spawn pins `approvalPolicy:never` +
-`sandboxPolicy:workspaceWrite` (sandboxed full-auto; the approval→ask-picker
-bridge is phase 2), `set_auth` False (Codex auth is machine-global via
+`permissions:"ccodex_workspace"` + exactly one `runtimeWorkspaceRoots` entry;
+the client launch defines that fail-closed filesystem profile with network on
+(sandboxed full-auto with user-file reads confined to the workspace; the
+approval→ask-picker bridge is phase 2), `set_auth` False (Codex auth is machine-global via
 `codex login`), `stop_task`/`rewind_files` False, `mcp_status` explains Codex
 MCP servers live in `~/.codex/config.toml`, `on_ask`/`current_ask` None.
 

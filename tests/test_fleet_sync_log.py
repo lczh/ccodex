@@ -111,7 +111,8 @@ class VersionTag(unittest.TestCase):
 
     def test_a_remote_poll_carries_the_tag_alongside_the_sha(self):
         src = inspect.getsource(km._poll_remote_version)
-        self.assertIn('"ver": str(j.get("kernel_ver") or "")', src)
+        self.assertIn('"ver": _public_version(j.get("kernel_ver"))', src,
+                      "the remote tag is carried only after the hostile-response schema gate")
         self.assertIn('"sha": sha', src)
 
     def test_the_row_publishes_both_sides(self):
@@ -244,7 +245,8 @@ class SharePublishMemory(unittest.TestCase):
 
     def test_re_attaching_restores_the_publish_and_its_ports(self):
         src = inspect.getsource(km.attach_remote)
-        self.assertIn('"checkin": known_share(host),', src)
+        self.assertIn('"checkin": bool(known_share(host) and known_trust(host) == "trusted"),', src,
+                      "remembered publishing resumes only across the trusted credential boundary")
         # the reverse forwards go in the tunnel argv at SPAWN, and checkin_set is not what runs here
         self.assertIn('r["rk_port"], r["rb_port"] = _free_port(), _free_port()', src)
 

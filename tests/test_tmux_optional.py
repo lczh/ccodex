@@ -130,6 +130,21 @@ class TmuxOptional(unittest.TestCase):
         self.assertTrue(seen, "with tmux present the backend must actually shell out again")
         self.assertEqual(seen[0][0], "tmux")
 
+    def test_rename_uses_the_profile_tmux_socket(self):
+        self._has_tmux()
+        spawn = _SpawnCounter()
+        km.subprocess.run = spawn
+        old = os.environ.get("ROMP_TMUX_SOCKET")
+        try:
+            os.environ["ROMP_TMUX_SOCKET"] = "romp-alt"
+            self.tb.rename_by_name("web", "api")
+        finally:
+            if old is None:
+                os.environ.pop("ROMP_TMUX_SOCKET", None)
+            else:
+                os.environ["ROMP_TMUX_SOCKET"] = old
+        self.assertEqual(spawn.calls, [["tmux", "-L", "romp-alt", "rename-session", "-t", "web", "api"]])
+
 
 if __name__ == "__main__":
     unittest.main()

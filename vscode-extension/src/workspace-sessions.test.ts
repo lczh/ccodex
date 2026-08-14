@@ -34,14 +34,14 @@ test("citeText: bare file, single line, and range", () => {
   assert.equal(citeText("/a/f.ts", 5, 9, true), "/a/f.ts:5-9");
 });
 
-test("parsePorcelain: modified, added, untracked, renamed, quoted", () => {
+test("parsePorcelain: modified, added, untracked, and renamed in -z form", () => {
   const out = [
     " M ui/webview/render.ts",
     "A  vscode-extension/src/new.ts",
     "?? notes.txt",
-    'R  "old name.ts" -> "new name.ts"',
+    "R  new name.ts", "old name.ts",
     "",
-  ].join("\n");
+  ].join("\0");
   const files = parsePorcelain(out);
   assert.deepEqual(files.map((f) => f.path),
     ["ui/webview/render.ts", "vscode-extension/src/new.ts", "notes.txt", "new name.ts"]);
@@ -50,7 +50,22 @@ test("parsePorcelain: modified, added, untracked, renamed, quoted", () => {
   assert.equal(files[3].renamedFrom, "old name.ts");
 });
 
+test("parsePorcelain preserves special names and both staged and unstaged renames", () => {
+  const odd = "notes/雪 \\ line\nwith -> arrow.txt";
+  const out = [
+    ` M ${odd}`,
+    "R  staged-new.ts", "staged-old.ts",
+    " R unstaged-new.ts", "unstaged-old.ts",
+    "",
+  ].join("\0");
+  assert.deepEqual(parsePorcelain(out), [
+    { path: odd, status: "M", untracked: false, renamedFrom: undefined },
+    { path: "staged-new.ts", status: "R", untracked: false, renamedFrom: "staged-old.ts" },
+    { path: "unstaged-new.ts", status: "R", untracked: false, renamedFrom: "unstaged-old.ts" },
+  ]);
+});
+
 test("parsePorcelain tolerates junk", () => {
   assert.deepEqual(parsePorcelain(""), []);
-  assert.deepEqual(parsePorcelain("\n\nxx"), []);
+  assert.deepEqual(parsePorcelain("\0xx\0"), []);
 });

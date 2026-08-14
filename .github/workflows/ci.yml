@@ -86,7 +86,7 @@ jobs:
       - name: Install bats + tmux (macOS)
         if: runner.os == 'macOS'
         run: brew install bats-core tmux
-      - name: Run bats
+      - name: Run bats (including bootstrap, installer, and release regressions)
         run: bats --print-output-on-failure tests/*.bats
 
   vscode-extension:
@@ -109,9 +109,14 @@ jobs:
           cache-dependency-path: vscode-extension/package-lock.json
       - name: Install deps
         run: npm ci
+      - name: Audit production and build dependencies
+        # Moderate advisories are reported in the log; high/critical findings block a release build.
+        run: npm audit --audit-level=high
       - name: Typecheck
         run: npm run typecheck
       - name: Test
         run: npm test
-      - name: Build
-        run: npm run build
+      - name: Build production VSIX
+        run: |
+          npx --no-install vsce package --no-dependencies -o "$RUNNER_TEMP/romp-chat-view.vsix"
+          test -s "$RUNNER_TEMP/romp-chat-view.vsix"

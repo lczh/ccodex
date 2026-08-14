@@ -101,8 +101,8 @@ class SurfacedToTheUI(unittest.TestCase):
     def test_the_row_carries_the_attempts_and_the_next_dial(self):
         # the 2026-07-22 objection, kept: a forever-retry must never look like an idle row
         src = inspect.getsource(km._remote_public)
-        self.assertIn('"fails": int(r.get("fails") or 0)', src)
-        self.assertIn('"nextTry": int(r.get("next_try") or 0)', src)
+        self.assertIn('"fails": _public_nonnegative_int(r.get("fails"), cap=10 ** 6)', src)
+        self.assertIn('"nextTry": _public_timestamp(r.get("next_try"))', src)
         self.assertNotIn("gaveUp", src)
         self.assertNotIn("maxTries", src)
 

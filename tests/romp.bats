@@ -84,6 +84,7 @@ MOCK
     # names map under XDG_STATE_HOME (was polluting the REAL state dir).
     export HOME="$TEST_DIR/home"
     export XDG_STATE_HOME="$HOME/.local/state"
+    export ROMP_MANAGER_TOKEN=manager_test_token_0123456789abcdef
     mkdir -p "$HOME"
     cd "$WORK_DIR"
 }
@@ -640,36 +641,53 @@ MOCK
     local cport=7541 mport=7542 kport=7543
     # Launch the manager in the background; it auto-spawns 'main' on mport via the fake launcher.
     ROMP_MANAGER_PORT=$cport ROMP_SERVE_PORT=$mport ROMP_SERVE_BIN="$fake" \
+        ROMP_MANAGER_MAX_DYNAMIC_KERNELS=1 \
         node "$mgr" up >/dev/null 2>&1 &
     MGR_PID=$!   # teardown reaps this
 
     # Wait for the control endpoint to come up (≤ ~3s)
     local i
     for i in $(seq 1 30); do
-        curl -fsS "http://127.0.0.1:$cport/status" >/dev/null 2>&1 && break
+        curl -fsS -H "X-Romp-Manager-Token: $ROMP_MANAGER_TOKEN" \
+            "http://127.0.0.1:$cport/status" >/dev/null 2>&1 && break
         sleep 0.1
     done
 
     # Ensure a second kernel on kport → freshly spawned
-    run curl -fsS -X POST "http://127.0.0.1:$cport/ensure?port=$kport"
+    run curl -fsS -H "X-Romp-Manager-Token: $ROMP_MANAGER_TOKEN" -X POST \
+        "http://127.0.0.1:$cport/ensure?port=$kport"
     [ "$status" -eq 0 ]
     [[ "$output" == *'"spawned":true'* ]]
     [[ "$output" == *"\"port\":$kport"* ]]
     [[ "$output" == *"\"id\":\"k$kport\""* ]]
 
     # Ensuring the same port again is idempotent — no second spawn
-    run curl -fsS -X POST "http://127.0.0.1:$cport/ensure?port=$kport"
+    run curl -fsS -H "X-Romp-Manager-Token: $ROMP_MANAGER_TOKEN" -X POST \
+        "http://127.0.0.1:$cport/ensure?port=$kport"
     [ "$status" -eq 0 ]
     [[ "$output" == *'"spawned":false'* ]]
 
     # /status now lists both the default 'main' kernel and the on-demand one
-    run curl -fsS "http://127.0.0.1:$cport/status"
+    run curl -fsS -H "X-Romp-Manager-Token: $ROMP_MANAGER_TOKEN" \
+        "http://127.0.0.1:$cport/status"
     [ "$status" -eq 0 ]
     [[ "$output" == *'"id":"main"'* ]]
     [[ "$output" == *"\"id\":\"k$kport\""* ]]
 
+    # Invalid/reserved ports and an unbounded stream of ad-hoc workers fail closed.
+    run curl -s -o /dev/null -w '%{http_code}' -H "X-Romp-Manager-Token: $ROMP_MANAGER_TOKEN" \
+        -X POST "http://127.0.0.1:$cport/ensure?port=65536"
+    [ "$output" = "400" ]
+    run curl -s -o /dev/null -w '%{http_code}' -H "X-Romp-Manager-Token: $ROMP_MANAGER_TOKEN" \
+        -X POST "http://127.0.0.1:$cport/ensure?port=$cport"
+    [ "$output" = "409" ]
+    run curl -s -o /dev/null -w '%{http_code}' -H "X-Romp-Manager-Token: $ROMP_MANAGER_TOKEN" \
+        -X POST "http://127.0.0.1:$cport/ensure?port=$((kport + 1))"
+    [ "$output" = "429" ]
+
     # Graceful shutdown (teardown also reaps via MGR_PID as a backstop)
-    curl -fsS -X POST "http://127.0.0.1:$cport/stop" >/dev/null 2>&1 || true
+    curl -fsS -H "X-Romp-Manager-Token: $ROMP_MANAGER_TOKEN" -X POST \
+        "http://127.0.0.1:$cport/stop" >/dev/null 2>&1 || true
 }
 
 @test "romp-manager: /restart-all kicks every kernel in the registry (romp refresh)" {
@@ -685,17 +703,21 @@ MOCK
         node "$mgr" up >/dev/null 2>&1 &
     MGR_PID=$!
     local i
-    for i in $(seq 1 30); do curl -fsS "http://127.0.0.1:$cport/status" >/dev/null 2>&1 && break; sleep 0.1; done
-    curl -fsS -X POST "http://127.0.0.1:$cport/ensure?port=$kport" >/dev/null   # a 2nd kernel in the registry
+    for i in $(seq 1 30); do curl -fsS -H "X-Romp-Manager-Token: $ROMP_MANAGER_TOKEN" \
+        "http://127.0.0.1:$cport/status" >/dev/null 2>&1 && break; sleep 0.1; done
+    curl -fsS -H "X-Romp-Manager-Token: $ROMP_MANAGER_TOKEN" -X POST \
+        "http://127.0.0.1:$cport/ensure?port=$kport" >/dev/null   # a 2nd kernel in the registry
 
-    run curl -fsS -X POST "http://127.0.0.1:$cport/restart-all"
+    run curl -fsS -H "X-Romp-Manager-Token: $ROMP_MANAGER_TOKEN" -X POST \
+        "http://127.0.0.1:$cport/restart-all"
     [ "$status" -eq 0 ]
     # the response lists EVERY kernel it kicked — the default 'main' AND the on-demand one (not just main)
     [[ "$output" == *'"restarted"'* ]]
     [[ "$output" == *'main'* ]]
     [[ "$output" == *"k$kport"* ]]
 
-    curl -fsS -X POST "http://127.0.0.1:$cport/stop" >/dev/null 2>&1 || true
+    curl -fsS -H "X-Romp-Manager-Token: $ROMP_MANAGER_TOKEN" -X POST \
+        "http://127.0.0.1:$cport/stop" >/dev/null 2>&1 || true
 }
 
 # ─── Help (-h / --help) ──────────────────────────────────────────────

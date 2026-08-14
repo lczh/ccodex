@@ -133,6 +133,132 @@ class QueuePersistence(unittest.TestCase):
                          "restores strings only — junk entries never wedge delivery")
 
 
+class RegistrySerialization(unittest.TestCase):
+    SID = "11111111-2222-3333-4444-888888888888"
+
+    @staticmethod
+    def _gate_two_reads(real_read, sid):
+        """Make two named mutator threads snapshot the same old file when no shared lock exists.
+        With serialization, the first read times out and commits before the second can enter."""
+        first = threading.Event()
+        second = threading.Event()
+        count_lock = threading.Lock()
+        count = [0]
+
+        def gated(state, target):
+            value = real_read(state, target)
+            if target != sid or not threading.current_thread().name.startswith("reg-mutator"):
+                return value
+            with count_lock:
+                count[0] += 1
+                n = count[0]
+            if n == 1:
+                first.set()
+                second.wait(0.2)
+            elif n == 2:
+                second.set()
+            return value
+        return gated, first
+
+    def test_public_setter_and_queue_mirror_cannot_lose_each_others_fields(self):
+        d = tempfile.mkdtemp()
+        be = _backend(d)
+        _reg(d, self.SID, queue=["old"], mode="acceptEdits")
+        real_read = sb.read_reg
+        gated, first = self._gate_two_reads(real_read, self.SID)
+        with mock.patch.object(sb, "read_reg", side_effect=gated):
+            a = threading.Thread(name="reg-mutator-mode",
+                                 target=lambda: be.set_mode(self.SID, "plan"))
+            b = threading.Thread(name="reg-mutator-queue",
+                                 target=lambda: be._update_reg(self.SID, queue=["owed"]))
+            a.start(); b.start()
+            self.assertTrue(first.wait(1))
+            a.join(2); b.join(2)
+        self.assertFalse(a.is_alive() or b.is_alive())
+        reg = real_read(Path(d), self.SID)
+        self.assertEqual(reg["mode"], "plan")
+        self.assertEqual(reg["queue"], ["owed"])
+
+    def test_remembered_defaults_merge_is_one_serialized_rmw(self):
+        d = tempfile.mkdtemp()
+        real_read = sb.read_sdk_defaults
+        first = threading.Event()
+        second = threading.Event()
+        count_lock = threading.Lock()
+        count = [0]
+
+        def gated(state):
+            value = real_read(state)
+            if not threading.current_thread().name.startswith("defaults-mutator"):
+                return value
+            with count_lock:
+                count[0] += 1
+                n = count[0]
+            if n == 1:
+                first.set()
+                second.wait(0.2)
+            elif n == 2:
+                second.set()
+            return value
+
+        with mock.patch.object(sb, "read_sdk_defaults", side_effect=gated):
+            a = threading.Thread(name="defaults-mutator-model",
+                                 target=lambda: sb.write_sdk_default(Path(d), model="opus"))
+            b = threading.Thread(name="defaults-mutator-effort",
+                                 target=lambda: sb.write_sdk_default(Path(d), effort="high"))
+            a.start(); b.start()
+            self.assertTrue(first.wait(1))
+            a.join(2); b.join(2)
+        self.assertFalse(a.is_alive() or b.is_alive())
+        self.assertEqual(real_read(Path(d)), {"model": "opus", "effort": "high"})
+
+    def test_kill_waits_out_ensure_then_shuts_down_the_created_session(self):
+        d = tempfile.mkdtemp()
+        be = _backend(d)
+        _reg(d, self.SID)
+        constructing = threading.Event()
+        release = threading.Event()
+        instances = []
+
+        class FakeThread:
+            def __init__(self):
+                self.alive = False
+            def is_alive(self):
+                return self.alive
+
+        class FakeSession:
+            def __init__(self, backend, reg):
+                self.sid = reg["sid"]
+                self.thread = FakeThread()
+                self.on_boot_settled = None
+                self.shutdown_called = False
+                instances.append(self)
+                constructing.set()
+                release.wait(2)
+            def start(self):
+                self.thread.alive = True
+            def shutdown(self):
+                self.shutdown_called = True
+                self.thread.alive = False
+
+        ensured = []
+        killed = threading.Event()
+        with mock.patch.object(sb, "SdkSession", FakeSession):
+            starter = threading.Thread(target=lambda: ensured.append(be._ensure(self.SID)))
+            starter.start()
+            self.assertTrue(constructing.wait(1))
+            killer = threading.Thread(target=lambda: (be.kill(self.SID), killed.set()))
+            killer.start()
+            time.sleep(0.05)
+            self.assertFalse(killed.is_set(), "kill must serialize with an in-progress _ensure")
+            release.set()
+            starter.join(2); killer.join(2)
+        self.assertFalse(starter.is_alive() or killer.is_alive())
+        self.assertNotIn(self.SID, be.sessions)
+        self.assertTrue(instances[0].shutdown_called)
+        self.assertFalse(sb.read_reg(Path(d), self.SID)["alive"])
+
+
 class BootReconcile(unittest.TestCase):
     def _setup(self):
         d = tempfile.mkdtemp()

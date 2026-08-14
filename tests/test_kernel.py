@@ -4288,7 +4288,7 @@ class ViewBuilder(unittest.TestCase):
         landing = km._landing()
         self.assertIn("id=rail-gear", landing)
         self.assertIn("id=rail-refresh", landing)
-        self.assertIn("fetch('/restart',{method:'POST'})", landing)                 # the rail ↻ POSTs /restart
+        self.assertIn("body:'{\"fleet\":false}'", landing)       # ordinary rail ↻ is explicitly local-only
 
     def test_gear_polish_tooltips_colormap_bar_no_emoji(self):
         # the user 2026-06-23: descriptions become HOVER tooltips (decluttered), and the analytics button drops
@@ -6206,7 +6206,8 @@ class ServeSecurity(unittest.TestCase):
         # form authorizes: ?token= (browser bootstrap), the cookie it seeds, X-Romp-Token (CLI/hooks).
         self.assertEqual(self._code("/feed", {}), 403)
         self.assertEqual(self._code("/feed?token=testtok", {}), 200)
-        self.assertEqual(self._code("/feed", {"Cookie": "romp_token=testtok"}), 200)
+        self.assertEqual(self._code("/feed", {"Cookie": "romp_token=testtok",
+                                               "Sec-Fetch-Site": "same-origin"}), 200)
         self.assertEqual(self._code("/feed", {"X-Romp-Token": "testtok"}), 200)
         self.assertEqual(self._code("/feed", {"X-Romp-Token": "wrong"}), 403)
 
@@ -6223,10 +6224,15 @@ class ServeSecurity(unittest.TestCase):
             with urllib.request.urlopen(req, timeout=5) as r:
                 self.assertEqual(r.status, 200)
                 # the ack also names WHICH kernel acked (boot id, 2026-07-27) — see RestartReloadRaceTest
-                # `fleet` says which kind of restart it took (the user 2026-07-29): with remotes attached
-                # this covers the whole fleet, so the ack names it rather than leaving the caller guessing
+                # Ordinary/empty requests are local-only: remote code import requires explicit opt-in.
                 self.assertEqual(_json.loads(r.read().decode()),
-                                 {"ok": True, "restarting": True, "boot": km._BOOT_ID, "fleet": True})
+                                 {"ok": True, "restarting": True, "boot": km._BOOT_ID, "fleet": False})
+            req = urllib.request.Request("http://127.0.0.1:%d/restart?token=testtok" % self.port,
+                                         method="POST", data=b'{"fleet":true}',
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                self.assertTrue(_json.loads(r.read().decode())["fleet"],
+                                "remote-sync restart exists only as an explicit opt-in")
         finally:
             if saved is not None:
                 os.environ["ROMP_MANAGER_PORT"] = saved
@@ -7240,14 +7246,17 @@ class PostalPeerTunnels(unittest.TestCase):
 class CheckinMechanics(unittest.TestCase):
     """Peer-bus stage 3a (plans/postal-peer-buses.md; resolved decisions 1-3): the mobile machine
     publishes itself to a hub over its own OUTBOUND ssh — reverse forwards plus a token-PUSH
-    handshake — and the hub records it like an attached remote it owns no ssh for. All credentials
-    flow outward; the hub never holds a way into the mobile machine."""
+    handshake — and the hub records it like an attached remote it owns no ssh for. The reverse
+    forwards plus pushed token are an administrative path back, restricted to trusted hosts."""
 
     def tearDown(self):
         os.environ.pop("ROMP_POSTAL_PEERS", None)
         os.environ.pop("ROMP_HOST_NAME", None)
         km._remotes.pop("TESTHOST", None)
         km._remotes.pop("hubhost", None)
+        with km._known_lock:
+            km._known.pop("TESTHOST", None)
+            km._known.pop("hubhost", None)
 
     def test_checkin_argv_adds_the_reverse_forwards(self):
         os.environ["ROMP_POSTAL_PEERS"] = "1"
@@ -7270,6 +7279,7 @@ class CheckinMechanics(unittest.TestCase):
         self.assertTrue(p["token"], "the token is HANDED to the hub — it never fetches credentials")
 
     def test_checkin_apply_records_a_sshless_row(self):
+        km._known_note("TESTHOST", "trusted")
         payload, status = km.checkin_apply({"host": "TESTHOST", "kernelPort": 50003,
                                             "busPort": 50004, "token": "tok"})
         self.assertEqual(status, 200)
@@ -7285,12 +7295,14 @@ class CheckinMechanics(unittest.TestCase):
             payload, status = km.checkin_apply(bad)
             self.assertEqual(status, 400, repr(bad))
         km._remotes["TESTHOST"] = {"host": "TESTHOST", "kernel_port": 29855, "local_port": 1, "proc": None}
-        payload, status = km.checkin_apply({"host": "TESTHOST", "kernelPort": 50003, "busPort": 50004})
+        payload, status = km.checkin_apply({"host": "TESTHOST", "kernelPort": 50003,
+                                            "busPort": 50004, "token": "tok"})
         self.assertEqual(status, 409, "an ssh-attached row is never silently converted")
 
     def test_checkin_set_flags_ports_and_checkout_clears(self):
         km._remotes["TESTHOST"] = {"host": "TESTHOST", "kernel_port": 29855, "local_port": 50001,
-                                   "bus_port": 50002, "proc": None, "status": "up", "detail": "", "sids": []}
+                                   "bus_port": 50002, "proc": None, "status": "up", "detail": "", "sids": [],
+                                   "trust": "trusted"}
         saved = km._checkin_stop_hub
         km._checkin_stop_hub = lambda r: None
         try:
@@ -7302,6 +7314,41 @@ class CheckinMechanics(unittest.TestCase):
             self.assertIsNone(km.checkin_set("NOSUCH", True), "unknown host: attach it first")
         finally:
             km._checkin_stop_hub = saved
+
+    def test_checkin_set_refuses_a_nontrusted_host(self):
+        km._remotes["TESTHOST"] = {"host": "TESTHOST", "trust": "directed", "proc": None}
+        with self.assertRaises(PermissionError):
+            km.checkin_set("TESTHOST", True)
+        self.assertFalse(km._remotes["TESTHOST"].get("checkin"))
+
+    def test_trust_downgrade_revokes_outbound_checkin_and_bounces_tunnel(self):
+        class Proc:
+            terminated = False
+
+            def terminate(self):
+                self.terminated = True
+
+        proc = Proc()
+        km._remotes["TESTHOST"] = {"host": "TESTHOST", "trust": "trusted", "checkin": True,
+                                   "_handshook": True, "local_port": 50001, "token": "hub-token",
+                                   "kernel_port": 29855, "bus_port": 50002, "proc": proc,
+                                   "status": "up", "detail": "", "sids": []}
+        stopped = []
+        saved = km._checkin_stop_hub
+        km._checkin_stop_hub = lambda row: stopped.append(dict(row))
+        try:
+            pub, err = km.set_trust("TESTHOST", "directed")
+        finally:
+            km._checkin_stop_hub = saved
+        self.assertIsNone(err)
+        self.assertEqual(pub["trust"], "directed")
+        row = km._remotes["TESTHOST"]
+        self.assertFalse(row.get("checkin"), "the next ssh argv must omit reverse forwards")
+        self.assertNotIn("_handshook", row, "a stale successful handshake cannot survive revocation")
+        self.assertTrue(proc.terminated, "terminate removes the live -R forwards immediately")
+        self.assertEqual(len(stopped), 1, "the hub is told to discard the pushed token while reachable")
+        with km._known_lock:
+            self.assertFalse(km._known["TESTHOST"].get("share"), "re-attach must not restore check-in")
 
     def test_checkin_stop_only_forgets_checked_in_rows(self):
         os.environ["ROMP_POSTAL_PEERS"] = "0"          # keep detach's bus notify away from the real bus

@@ -118,6 +118,9 @@ class VisibilityScoping(unittest.TestCase):
         src = (ROOT / "kernel/kernel.py").read_text()
         self.assertIn('sock = os.environ.get("ROMP_TMUX_SOCKET")', src)
         self.assertIn('(["tmux", "-L", sock] if sock else ["tmux"]) + list(args)', src)
+        self.assertIn('subprocess.run(self._tmux_argv(["rename-session", "-t", old, new])', src,
+                      "rename must target the same aux-kernel tmux server as every other primitive")
+        self.assertNotIn('subprocess.run(["tmux", "rename-session"', src)
         # functional: build the argv both ways without importing the kernel (import runs boot
         # reconcile against the live fleet) — execute just the builder body.
         ns = {"os": os}

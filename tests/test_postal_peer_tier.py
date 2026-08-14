@@ -78,6 +78,37 @@ class TierDeclaration(unittest.TestCase):
         self.assertEqual(snap["peers"]["BOXC"]["trust"], "trusted",
                          "both directions ride one row: ours from PEERS, theirs from the exchange")
 
+    def test_exchange_rejects_script_tier_but_keeps_bounded_display_names_as_text(self):
+        bad = _req("BOXD", tier='<img src=x onerror="globalThis.pwned=1">')
+        bad["busId"] = '<svg onload="globalThis.pwned=1">'
+        bad["presence"] = [
+            {"name": '<img src=x onerror="globalThis.pwned=1">', "id": "sid-bad"},
+            {"name": "  Web Reviewer / audit  ", "id": "sid-space", "via": "safe-host"},
+            {"name": "must drop", "id": "../unsafe"},
+        ]
+        resp, status = ps.peer_exchange_handle(bad)
+        self.assertEqual(status, 200)
+        row = ps.PEER_STATE["BOXD"]
+        self.assertNotIn("theirTier", row)
+        self.assertNotIn("busId", row)
+        self.assertEqual(row["presence"], [
+            {"name": '<img src=x onerror="globalThis.pwned=1">', "id": "sid-bad"},
+            {"name": "Web Reviewer / audit", "id": "sid-space", "via": "safe-host"},
+        ], "names are bounded display text; protocol ids remain path-safe")
+
+    def test_hold_prose_is_bounded_text_and_unsafe_identity_is_dropped(self):
+        req = _req("BOXE", tier="directed")
+        req["holds"] = [
+            {"mid": "hold-1", "frm": '<img src=x onerror="globalThis.pwned=1">',
+             "to": "Web Reviewer", "origin": "ORIGIN", "gist": '<svg onload="x()"> ' * 30},
+            {"mid": "../bad", "frm": "api", "to": "web", "gist": "must drop"},
+        ]
+        ps.peer_exchange_handle(req)
+        holds = ps.PEER_STATE["BOXE"]["holds"]
+        self.assertEqual(len(holds), 1)
+        self.assertLessEqual(len(holds[0]["gist"]), 90)
+        self.assertEqual(holds[0]["to"], "Web Reviewer")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

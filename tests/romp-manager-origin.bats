@@ -1,10 +1,6 @@
 #!/usr/bin/env bats
 
-# CSRF / drive-by guard for the manager control port (M2). A browser cross-site
-# request carries an Origin the page cannot forge; the manager must reject any
-# non-loopback Origin so a malicious tab can't POST /restart-all or /stop and
-# kill the user's kernels. Server-side clients (the kernel's Restart proxy, the
-# `romp on` CLI) send no Origin and must keep working.
+# Authentication, CSRF and pre-auth body guards for the manager control port.
 
 setup() {
     TEST_DIR="$(mktemp -d)"
@@ -14,6 +10,9 @@ setup() {
     printf '#!/usr/bin/env bash\nexec sleep 30\n' > "$FAKE"
     chmod +x "$FAKE"
     CPORT=7571; MPORT=7572
+    TOKEN=manager_test_token_0123456789abcdef
+    export ROMP_MANAGER_TOKEN="$TOKEN"
+    export XDG_STATE_HOME="$TEST_DIR/state"
 }
 
 teardown() {
@@ -21,7 +20,7 @@ teardown() {
     rm -rf "$TEST_DIR"
 }
 
-@test "manager rejects cross-site Origin, allows no-Origin clients" {
+@test "manager requires its token, rejects cross-site Origin, and caps bodies before auth" {
     command -v node >/dev/null 2>&1 || skip "node not available"
     command -v curl >/dev/null 2>&1 || skip "curl not available"
 
@@ -31,26 +30,51 @@ teardown() {
 
     local i
     for i in $(seq 1 40); do
-        curl -fsS "http://127.0.0.1:$CPORT/status" >/dev/null 2>&1 && break
+        curl -fsS -H "X-Romp-Manager-Token: $TOKEN" \
+            "http://127.0.0.1:$CPORT/status" >/dev/null 2>&1 && break
         sleep 0.1
     done
 
-    # No Origin (server-side client) → 200.
+    # A loopback caller without the same-user credential is still unauthorized.
     run curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$CPORT/status"
+    [ "$output" = "401" ]
+
+    # No Origin + the token (server-side client) → 200.
+    run curl -s -o /dev/null -w '%{http_code}' -H "X-Romp-Manager-Token: $TOKEN" \
+        "http://127.0.0.1:$CPORT/status"
     [ "$output" = "200" ]
 
-    # Cross-site Origin on a read → 403.
-    run curl -s -o /dev/null -w '%{http_code}' -H 'Origin: http://evil.example' \
+    # Cross-site Origin wins even when the caller knows the token.
+    run curl -s -o /dev/null -w '%{http_code}' -H "X-Romp-Manager-Token: $TOKEN" \
+        -H 'Origin: http://evil.example' \
         "http://127.0.0.1:$CPORT/status"
     [ "$output" = "403" ]
 
     # Cross-site state-changing POST (the real attack) → 403.
-    run curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Origin: http://evil.example' \
+    run curl -s -o /dev/null -w '%{http_code}' -X POST -H "X-Romp-Manager-Token: $TOKEN" \
+        -H 'Origin: http://evil.example' \
         "http://127.0.0.1:$CPORT/restart-all"
     [ "$output" = "403" ]
 
+    # Framing is checked before provenance/auth: even a foreign request cannot make the manager
+    # retain or parse an unauthenticated body on a keep-alive connection.
+    run curl -s -o /dev/null -w '%{http_code}' -X POST -d x \
+        -H 'Origin: http://evil.example' \
+        "http://127.0.0.1:$CPORT/restart-all"
+    [ "$output" = "413" ]
+
     # A loopback Origin (the local web UI, if it ever calls directly) → allowed.
-    run curl -s -o /dev/null -w '%{http_code}' -H "Origin: http://127.0.0.1:$CPORT" \
+    run curl -s -o /dev/null -w '%{http_code}' -H "X-Romp-Manager-Token: $TOKEN" \
+        -H "Origin: http://127.0.0.1:$CPORT" \
+        "http://127.0.0.1:$CPORT/status"
+    [ "$output" = "200" ]
+
+    # All operations are bodyless. Reject declared/chunked bodies before checking auth and
+    # leave the manager healthy after closing the unread connection.
+    run curl -s -o /dev/null -w '%{http_code}' -X POST -d x \
+        "http://127.0.0.1:$CPORT/restart-all"
+    [ "$output" = "413" ]
+    run curl -s -o /dev/null -w '%{http_code}' -H "X-Romp-Manager-Token: $TOKEN" \
         "http://127.0.0.1:$CPORT/status"
     [ "$output" = "200" ]
 }

@@ -9,6 +9,8 @@ Synthetic only — hermetic temp state dir, placeholder mids, invented notes-dom
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -38,6 +40,11 @@ class InboundTrustGate(unittest.TestCase):
         os.environ["ROMP_SESSIONS_FILE"] = _SESS   # pin OUR sessions seam (read live; a later-collected postal test clobbers it)
         # fresh peer table + empty stores each test
         ps.PEERS.clear()
+        ps._seen_ids = None
+        try:
+            ps.PEER_SEEN.unlink()
+        except OSError:
+            pass
         for d in (ps.QUARANTINE, ps.MAILROOT / "sess-web" / "new"):
             try:
                 for f in d.glob("*"):
@@ -101,6 +108,73 @@ class InboundTrustGate(unittest.TestCase):
         verdict, _ = ps._relay_in("EDGE", _relay("q-fwd-1", origin="ORIGIN"))
         self.assertEqual(verdict, "ack")
         self.assertEqual(len(ps.quarantine_list()), 1, "the ORIGIN's directed level must hold it")
+
+    def test_relay_cannot_spoof_a_more_trusted_origin(self):
+        # The direct exchange peer is the authenticated boundary. A directed peer may carry an
+        # origin stamp for routing, but that assertion cannot upgrade its own delivery authority.
+        self._set_trust("EDGE", "directed")
+        self._set_trust("ORIGIN", "trusted")
+        verdict, _ = ps._relay_in("EDGE", _relay("q-spoof-1", origin="ORIGIN"))
+        self.assertEqual(verdict, "ack")
+        self.assertEqual([r["mid"] for r in ps.quarantine_list()], ["q-spoof-1"])
+        self.assertEqual(ps.read_box("sess-web", consume=False), [])
+
+    def test_isolated_relay_cannot_spoof_a_trusted_origin(self):
+        self._set_trust("EDGE", "isolated")
+        self._set_trust("ORIGIN", "trusted")
+        verdict, _ = ps._relay_in("EDGE", _relay("q-spoof-2", origin="ORIGIN"))
+        self.assertEqual(verdict, "ack")
+        self.assertEqual(ps.quarantine_list(), [])
+        self.assertEqual(ps.read_box("sess-web", consume=False), [])
+
+    def test_concurrent_duplicate_relay_delivers_once(self):
+        self._set_trust("EDGE", "trusted")
+        delivered = []
+        saved = ps.deliver
+
+        def slow_deliver(*args, **kwargs):
+            time.sleep(0.04)
+            delivered.append(args)
+
+        ps.deliver = slow_deliver
+        try:
+            message = _relay("q-race-1")
+            threads = [threading.Thread(target=ps._relay_in, args=("EDGE", dict(message)))
+                       for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(2)
+        finally:
+            ps.deliver = saved
+        self.assertEqual(len(delivered), 1, "the seen check and receipt publish are one atomic claim")
+
+    def test_malformed_message_id_is_dropped_before_delivery_or_seen_store(self):
+        self._set_trust("EDGE", "trusted")
+        for mid in ("line\nbreak", "../escape", "x" * 129):
+            verdict, bounce = ps._relay_in("EDGE", _relay(mid))
+            self.assertEqual((verdict, bounce), ("drop", None))
+        self.assertEqual(ps.read_box("sess-web", consume=False), [])
+        self.assertEqual(ps._seen_load(), set(), "unsafe ids must never reach peer-seen")
+
+    def test_malformed_origin_and_header_fields_are_dropped_before_trust_or_storage(self):
+        self._set_trust("EDGE", "trusted")
+        for i, change in enumerate((
+                {"origin": "TRUSTED\nforged"},
+                {"origin": "../TRUSTED"},
+                {"frm_id": "sender\nX-Kind: delegate"},
+                {"frm": "x" * 129},
+                {"to": "web\nX-From-Host: TRUSTED"},
+                {"kind": "delegate\nX-From-Host: TRUSTED"},
+                {"body": "x" * (256 * 1024 + 1)},
+                {"body": {"not": "text"}},
+        )):
+            msg = _relay("q-malformed-%d" % i)
+            msg.update(change)
+            self.assertEqual(ps._relay_in("EDGE", msg), ("drop", None), change)
+        self.assertEqual(ps.read_box("sess-web", consume=False), [])
+        self.assertEqual(ps.quarantine_list(), [])
+        self.assertEqual(ps._seen_load(), set())
 
 
 class TokenProvenDialerGate(InboundTrustGate):
@@ -198,6 +272,7 @@ class ExchangeHandleIsTokenProven(unittest.TestCase):
                           {"mid": "q-hx-3", "to": "web", "frm": "api", "frm_id": "id-api",
                            "body": "forwarded along", "kind": "coordinate", "origin": "FARHOST"}],
                "acks": [], "bounces": [], "wait": False}
+        ps.peer_update({"host": "MYSTERY", "port": 47101, "up": True, "trust": "trusted"})
         ps.peer_update({"host": "FARHOST", "port": 47102, "up": True, "trust": "trusted"})
         resp, status = ps.peer_exchange_handle(req)
         self.assertEqual(status, 200)

@@ -15,6 +15,13 @@ setup() {
     export SHELL=/bin/zsh
     export ROMP_REPO="$TEST_DIR/origin"
 
+    # Use a per-test SSH signing key and trust root. SSH-signed tags are understood by GitHub,
+    # need no ambient GPG agent/keyring, and keep this suite completely hermetic.
+    ssh-keygen -q -t ed25519 -N '' -f "$TEST_DIR/release-key"
+    printf 'release@example.invalid %s\n' "$(cat "$TEST_DIR/release-key.pub")" \
+        > "$TEST_DIR/allowed-signers"
+    export ROMP_RELEASE_ALLOWED_SIGNERS="$TEST_DIR/allowed-signers"
+
     # A fake romp origin: enough structure for bootstrap's clone check, plus a
     # non-release tag alongside two releases so tag selection is exercised.
     mkdir -p "$ROMP_REPO/kernel"
@@ -22,13 +29,18 @@ setup() {
     chmod +x "$ROMP_REPO/install.sh"
     touch "$ROMP_REPO/kernel/.keep"
     git -C "$ROMP_REPO" init -q -b main .
+    git -C "$ROMP_REPO" config gpg.format ssh
+    git -C "$ROMP_REPO" config user.signingKey "$TEST_DIR/release-key"
+    git -C "$ROMP_REPO" config user.email release@example.invalid
+    git -C "$ROMP_REPO" config user.name 'Release Fixture'
+    git -C "$ROMP_REPO" config gpg.ssh.allowedSignersFile "$TEST_DIR/allowed-signers"
     git -C "$ROMP_REPO" add -A
     git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -qm init
     git -C "$ROMP_REPO" tag not-a-release
     git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m r1
-    git -C "$ROMP_REPO" tag v0.1.0
+    git -C "$ROMP_REPO" tag -s v0.1.0 -m v0.1.0
     git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m r2
-    git -C "$ROMP_REPO" tag v0.2.0
+    git -C "$ROMP_REPO" tag -s v0.2.0 -m v0.2.0
     git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m post-release
 }
 
@@ -43,6 +55,16 @@ teardown() { rm -rf "$TEST_DIR"; }
     grep -qF "$HOME/romp/bin" "$HOME/.zshrc"
 }
 
+@test "bootstrap.sh: verifies with Git's configured trust when no allowed-signers env is set" {
+    git config --global gpg.ssh.allowedSignersFile "$TEST_DIR/allowed-signers"
+    unset ROMP_RELEASE_ALLOWED_SIGNERS
+    GIT_TRACE2_EVENT="$TEST_DIR/git-trace" ROMP_DIR="$HOME/romp" run /bin/bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *STUB_INSTALL_RAN* ]]
+    [ "$(git -C "$HOME/romp" describe --tags)" = "v0.2.0" ]
+    grep -q '"gpg.minTrustLevel=fully","verify-tag","v0.2.0"' "$TEST_DIR/git-trace"
+}
+
 @test "bootstrap.sh: re-running updates in place and does not duplicate the PATH line" {
     ROMP_DIR="$HOME/romp" bash "$REPO_ROOT/bootstrap.sh"
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
@@ -51,18 +73,101 @@ teardown() { rm -rf "$TEST_DIR"; }
     [ "$(grep -cF "$HOME/romp/bin" "$HOME/.zshrc")" = "1" ]
 }
 
+@test "bootstrap.sh: persists one-shot SSH trust in the clone for later updater verification" {
+    ROMP_DIR="$HOME/romp" bash "$REPO_ROOT/bootstrap.sh"
+    expected_signers="$(cd "$TEST_DIR" && pwd -P)/allowed-signers"
+    [ "$(git -C "$HOME/romp" config --local --get gpg.ssh.allowedSignersFile)" = "$expected_signers" ]
+
+    unset ROMP_RELEASE_ALLOWED_SIGNERS
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *STUB_INSTALL_RAN* ]]
+}
+
 @test "bootstrap.sh: ROMP_REF pins a branch instead of the newest release" {
     ROMP_DIR="$HOME/romp" ROMP_REF=main run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -eq 0 ]
     [ "$(git -C "$HOME/romp" rev-parse --abbrev-ref HEAD)" = "main" ]
 }
 
-@test "bootstrap.sh: falls back to main when no release is tagged yet" {
+@test "bootstrap.sh: refuses to hide a non-fast-forward branch update" {
+    ROMP_DIR="$HOME/romp" ROMP_REF=main bash "$REPO_ROOT/bootstrap.sh"
+    git -C "$HOME/romp" config user.email t@t
+    git -C "$HOME/romp" config user.name t
+    git -C "$HOME/romp" commit -q --allow-empty -m local
+    git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m remote
+
+    ROMP_DIR="$HOME/romp" ROMP_REF=main run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"cannot fast-forward"* ]]
+    [[ "$output" != *STUB_INSTALL_RAN* ]]
+}
+
+@test "bootstrap.sh: refuses to reuse a checkout from a different origin" {
+    ROMP_DIR="$HOME/romp" bash "$REPO_ROOT/bootstrap.sh"
+    git -C "$HOME/romp" remote set-url origin "$TEST_DIR/not-the-requested-repo"
+
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"different origin"* ]]
+    [[ "$output" == *"expected: $ROMP_REPO"* ]]
+    [[ "$output" != *STUB_INSTALL_RAN* ]]
+}
+
+@test "bootstrap.sh: refuses to fall back to unsigned main when no release is tagged" {
     git -C "$ROMP_REPO" tag -d v0.1.0 v0.2.0
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"no release tag is published"* ]]
+    [[ "$output" == *"ROMP_REF=main"* ]]
+    [[ "$output" != *STUB_INSTALL_RAN* ]]
+}
+
+@test "bootstrap.sh: rejects the newest unsigned release instead of installing an older signed tag" {
+    git -C "$ROMP_REPO" tag -a v0.3.0 -m unsigned
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"does not have a valid signature"* ]]
+    [[ "$output" != *STUB_INSTALL_RAN* ]]
+    [ "$(git -C "$HOME/romp" rev-parse HEAD)" != "$(git -C "$ROMP_REPO" rev-parse v0.2.0^{})" ]
+}
+
+@test "bootstrap.sh: rejects a release signed by a key outside the allowed-signers trust root" {
+    ssh-keygen -q -t ed25519 -N '' -f "$TEST_DIR/untrusted-key"
+    git -C "$ROMP_REPO" -c user.signingKey="$TEST_DIR/untrusted-key" \
+        tag -s v0.3.0 -m untrusted
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"does not have a valid signature"* ]]
+    [[ "$output" != *STUB_INSTALL_RAN* ]]
+}
+
+@test "bootstrap.sh: fails closed when the configured SSH trust file is missing" {
+    ROMP_RELEASE_ALLOWED_SIGNERS="$TEST_DIR/missing" ROMP_DIR="$HOME/romp" \
+        run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not a readable regular file"* ]]
+    [[ "$output" != *STUB_INSTALL_RAN* ]]
+}
+
+@test "bootstrap.sh: a verified tag wins over an unsigned remote branch with the same name" {
+    git -C "$ROMP_REPO" branch v0.2.0 main
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"No release tag published yet"* ]]
-    [ "$(git -C "$HOME/romp" rev-parse --abbrev-ref HEAD)" = "main" ]
+    [ "$(git -C "$HOME/romp" rev-parse HEAD)" = "$(git -C "$ROMP_REPO" rev-parse v0.2.0^{})" ]
+    [ "$(git -C "$HOME/romp" rev-parse --abbrev-ref HEAD)" = "HEAD" ]
+}
+
+@test "bootstrap.sh: ignores a higher local-only signed tag when choosing the origin release" {
+    ROMP_DIR="$HOME/romp" bash "$REPO_ROOT/bootstrap.sh"
+    git -C "$HOME/romp" -c gpg.format=ssh -c user.signingKey="$TEST_DIR/release-key" \
+        tag -s v999.0.0 -m local-only main
+
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -eq 0 ]
+    [ "$(git -C "$HOME/romp" rev-parse HEAD)" = "$(git -C "$ROMP_REPO" rev-parse v0.2.0^{})" ]
+    [[ "$output" == *"Verifying release signature for v0.2.0"* ]]
+    [[ "$output" != *"v999.0.0"* ]]
 }
 
 @test "bootstrap.sh: refuses a target directory that is not a romp clone, leaving it untouched" {

@@ -13,10 +13,15 @@ CLI:
   romp-judge --once               # one caption pass over the live fleet (writes captions/)
   romp-judge --test <transcript>  # caption one transcript's recent units, print them (no write)
 """
-import contextlib, json, os, re, shutil, sys, time, subprocess, threading
+import contextlib, json, os, re, shutil, sys, tempfile, time, subprocess, threading
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    import fcntl
+except ImportError:                                    # pragma: no cover - romp targets Unix, but keep imports portable
+    fcntl = None
 
 HERE = Path(__file__).resolve().parent
 em = SourceFileLoader("romp_event_model", str(HERE / "event_model.py")).load_module()
@@ -424,17 +429,25 @@ def _judge_cmd(model, sys_prompt, effort=None):
 def _judge_cmd_codex(model, effort, outpath):
     """The `codex exec` argv for ONE judge call when STATE/judge-engine is "codex" (docs/codex.md).
     The same isolation goals as the claude argv, by different means: --ephemeral (no session files —
-    the scratch-pruning problem doesn't exist), a read-only sandbox (a captioner must not run
-    commands), --skip-git-repo-check + -C scratch (never the user's repo), the prompt on stdin
-    (exec has no separate system-prompt flag — system + user are concatenated), and the reply
-    written to `outpath` via -o (the final agent message alone; no event-stream parsing).
+    the scratch-pruning problem doesn't exist), an invocation-local custom permission profile that
+    grants only Codex's minimal runtime paths plus READ access to the scratch workspace (the built-in
+    `:read-only` profile deliberately grants read access to the whole host), --skip-git-repo-check +
+    -C scratch (never the user's repo), the prompt on stdin (exec has no separate system-prompt flag
+    — system + user are concatenated), and the reply written to `outpath` via -o (the final agent
+    message alone; no event-stream parsing).
 
     Model: only an explicit gpt-* override is passed — a ChatGPT-plan account 400-refuses every
     non-default model (probed live 2026-08-14), so the account's default is THE default and a
     claude alias (the other engine's vocabulary, incl. the classify arms') is ignored rather than
     sent to certain failure."""
+    judge_permissions = (
+        'permissions.ccodex_judge={ filesystem = { ":minimal" = "read", '
+        '":workspace_roots" = { "." = "read" } }, network = { enabled = false } }'
+    )
     cmd = ["perl", "-e", "alarm %d; exec @ARGV" % CALL_ALARM_S, _judge_codex_bin(), "exec",
-           "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "--color", "never",
+           "--ephemeral", "--ignore-user-config", "--ignore-rules", "--strict-config",
+           "--skip-git-repo-check", "-c", judge_permissions,
+           "-c", 'default_permissions="ccodex_judge"', "--color", "never",
            "-C", JUDGE_SCRATCH, "-o", outpath]
     if model and str(model).startswith("gpt"):
         cmd += ["-m", model]
@@ -832,6 +845,7 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage"):
                 _judge_ctx.last["reply"] = _mid_elide(reply)
                 _log_judge_usage(judge or tier, tier, (model if str(model).startswith("gpt") else "codex-default"),
                                  fsid, {"duration_ms": int((recv - sent) * 1000)}, sent, recv)
+                _auth_down_clear(fsid)                # a successful billed call clears either engine's latch
                 return reply
             finally:
                 try:
@@ -1834,16 +1848,120 @@ def _guard_nodes(store):
     return store
 
 
-def load_goals(fsid):
+_STORE_LOCKS_GUARD = threading.Lock()
+_STORE_LOCKS = {}
+
+
+@contextlib.contextmanager
+def _store_file_lock(path):
+    """Serialize a JSON store's read/merge/publish transaction across threads and processes.
+
+    Atomic rename prevents torn readers, but it does not make the read-modify-write sequence atomic.  A
+    per-path RLock closes that window between threads in this kernel; flock on a private sidecar closes it
+    between the kernel and standalone ``romp-judge --once`` processes.  The sidecar intentionally remains
+    in place, like a pidfile: unlinking a lock file can split contenders across two different inodes.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = str(path.resolve())
+    with _STORE_LOCKS_GUARD:
+        thread_lock = _STORE_LOCKS.setdefault(key, threading.RLock())
+    with thread_lock:
+        lock_path = path.with_name(path.name + ".lock")
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+def _atomic_json(path, value):
+    """Durably publish JSON through a unique 0600 temp file in the destination directory."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=str(path.parent))
+    tmp = Path(tmp_name)
+    owned_fd = fd
     try:
-        store = _guard_nodes(json.loads((GOALDIR / (fsid + ".json")).read_text()))
-    except Exception:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            owned_fd = None
+            json.dump(value, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+        try:                                          # persist the rename too when the filesystem supports it
+            dfd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+    finally:
+        if owned_fd is not None:
+            os.close(owned_fd)
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _quarantine_corrupt_json(path, detail):
+    """Move an invalid store aside so recovery never destroys the only forensic copy."""
+    path = Path(path)
+    suffix = ".corrupt.%d.%d.%d" % (time.time_ns(), os.getpid(), threading.get_ident())
+    quarantined = path.with_name(path.name + suffix)
+    os.replace(path, quarantined)
+    print("romp-judge: quarantined corrupt JSON %s as %s (%s)"
+          % (path, quarantined, detail), file=sys.stderr)
+    return quarantined
+
+
+def _read_store_json(path, *, quarantine=False):
+    """Read one store; missing is ``None``, while unreadable/corrupt data never masquerades as missing."""
+    path = Path(path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except UnicodeError as exc:
+        if quarantine:
+            _quarantine_corrupt_json(path, str(exc))
+            return None
+        raise
+    try:
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError("top-level JSON value is not an object")
+        return value
+    except (json.JSONDecodeError, ValueError) as exc:
+        if quarantine:
+            _quarantine_corrupt_json(path, str(exc))
+            return None
+        raise
+
+
+def load_goals(fsid):
+    path = GOALDIR / (fsid + ".json")
+    with _store_file_lock(path):
+        raw = _read_store_json(path, quarantine=True)
+    if raw is None:
         # a FRESH store is born at the current identity version — only stores with history recorded
         # under an OLDER derivation are ever sealed (see _migrate_placements)
         store = {"rompUuid": fsid, "seq": 0, "nodes": {}, "placements": {}, "status": {},
                  "placementsV": PLACEMENTS_V}
         store["_baseRev"] = 0            # no file yet; a writer that CREATES one still trips the CAS
         return store
+    store = _guard_nodes(raw)
     if _replay_overrides(fsid, store):
         # the replay WROTE (a clobbered user resolve/clear re-flagged): the published status/confirming
         # predate it, and every reader now trusts those exports as the one truth (no raw-flag second
@@ -1857,11 +1975,13 @@ def load_goals(fsid):
 
 
 def _disk_rev(fsid):
-    """The revision currently published on disk (0 when absent/unreadable)."""
-    try:
-        return int((json.loads((GOALDIR / (fsid + ".json")).read_text()) or {}).get("rev") or 0)
-    except Exception:
-        return 0
+    """The revision currently published on disk (0 only when absent).
+
+    Corruption and permission failures propagate: treating either as an empty store lets the next writer
+    silently replace evidence it could not read.
+    """
+    disk = _read_store_json(GOALDIR / (fsid + ".json"))
+    return int((disk or {}).get("rev") or 0)
 
 
 def _rebase_onto_disk(fsid, store):
@@ -1876,10 +1996,10 @@ def _rebase_onto_disk(fsid, store):
 
     Verdict identity is (ev_t, src, kind) — the same triple _replay_overrides dedups a re-recorded block
     on — so a replayed/duplicated event folds instead of doubling."""
-    try:
-        disk = _guard_nodes(json.loads((GOALDIR / (fsid + ".json")).read_text()))
-    except Exception:
-        return                                       # nothing readable to rebase onto → publish as-is
+    raw = _read_store_json(GOALDIR / (fsid + ".json"))
+    if raw is None:
+        return                                       # no published store to rebase onto
+    disk = _guard_nodes(raw)
     d_nodes, m_nodes = disk.get("nodes") or {}, store.get("nodes") or {}
     # MERGE TOMBSTONES (2026-08-13): presence-in-a-snapshot is not truth — a stale pre-merge writer
     # publishing across a grouper merge used to RESURRECT the merged-away node (its id absent from the
@@ -2155,12 +2275,11 @@ def _store_content(store):
 
 def _matches_disk(fsid, store):
     """True when publishing `store` would write back exactly what the file already holds (see save_goals).
-    Anything unreadable, absent or unserializable answers False, so the real write still happens and still
-    raises on its own terms — a no-op check must never swallow a publish it merely failed to understand."""
-    try:
-        disk = json.loads((GOALDIR / (fsid + ".json")).read_text())
-    except Exception:
-        return False                                 # no file yet (a create), or unreadable → publish
+    An absent file answers False. Corruption and permission failures propagate so the publish cannot
+    overwrite state it failed to understand."""
+    disk = _read_store_json(GOALDIR / (fsid + ".json"))
+    if disk is None:
+        return False                                 # no file yet (a create)
     try:
         return _store_content(disk) == _store_content(store)
     except (TypeError, ValueError):
@@ -2176,10 +2295,9 @@ def save_goals(fsid, store):
     card flashed back to 'working' for one push. Now the revision we loaded at (`_baseRev`) is compared
     against the one on disk; if it moved we rebase onto disk (union of verdict logs) instead of clobbering.
 
-    Bounded retries, and no file lock (this codebase takes none), so a vanishingly small TOCTOU window
-    remains between the last check and the rename — but a merged publish beats an unconditional stomp, and
-    the override journal still backstops the state. Stores built without load_goals carry no `_baseRev`
-    and keep the old unconditional behavior (nothing to rebase onto).
+    The complete compare/rebase/publish transaction is serialized by a per-store thread + process lock;
+    the final file is an fsynced unique-temp ``os.replace``. Stores built without load_goals carry no
+    `_baseRev` and keep the old unconditional behavior (nothing to rebase onto).
 
     A publish that would write back EXACTLY what the file already holds is skipped (the user 2026-07-22).
     Callers save unconditionally on purpose — `_plan_session` ends every pass with a rollup + save whether or
@@ -2190,23 +2308,21 @@ def save_goals(fsid, store):
     fleet forever. Skipping is safe precisely BECAUSE nothing changed: we have no events to contribute, so
     declining to publish can neither lose our work nor clobber a concurrent writer's. `rev` does not advance
     on a no-op, which is the honest reading of a counter that means "publications"."""
-    GOALDIR.mkdir(parents=True, exist_ok=True)
-    if "_baseRev" in store and _matches_disk(fsid, store):
-        return                                       # nothing of ours to publish → leave the file (and its
-    base = store.pop("_baseRev", None)               # mtime) alone.  transient: never serialized
-    if base is not None:
-        for _ in range(4):                           # a busy store settles in a pass or two
+    path = GOALDIR / (fsid + ".json")
+    with _store_file_lock(path):
+        _read_store_json(path)                       # validate before any path (including no-base writers)
+        if "_baseRev" in store and _matches_disk(fsid, store):
+            return                                   # nothing of ours to publish → leave file + mtime alone
+        candidate = store
+        base = candidate.pop("_baseRev", None)       # transient: never serialized
+        if base is not None:
             disk = _disk_rev(fsid)
-            if disk == base:
-                break                                # nobody published since we loaded → ours is current
-            _rebase_onto_disk(fsid, store)           # fold their events in, then re-check
-            base = disk
-        store["rev"] = _disk_rev(fsid) + 1
-    else:
-        store["rev"] = int(store.get("rev") or 0) + 1
-    tmp = GOALDIR / (fsid + ".json.tmp.%d" % os.getpid())
-    tmp.write_text(json.dumps(store))
-    tmp.rename(GOALDIR / (fsid + ".json"))            # atomic publish
+            if disk != base:
+                _rebase_onto_disk(fsid, candidate)   # fold the current writer's events into our snapshot
+            candidate["rev"] = _disk_rev(fsid) + 1
+        else:
+            candidate["rev"] = int(candidate.get("rev") or 0) + 1
+        _atomic_json(path, candidate)
 
 
 def load_goal_archive(fsid):
@@ -2215,17 +2331,50 @@ def load_goal_archive(fsid):
     (nodes/status). The judge reads this ONLY as read-only context (_cleared_context, for the live re-plan's
     <recently-cleared> block) — its placements dedup + view-cleared sealing keep it from ever re-minting an
     archived node; the kernel's undo-clear restore and the ledger merge are the mutating readers."""
-    try:
-        return _guard_nodes(json.loads((GOALARCHDIR / (fsid + ".json")).read_text()))
-    except Exception:
-        return {"rompUuid": fsid, "nodes": {}, "status": {}}
+    path = GOALARCHDIR / (fsid + ".json")
+    with _store_file_lock(path):
+        raw = _read_store_json(path, quarantine=True)
+    return _guard_nodes(raw) if raw is not None else {"rompUuid": fsid, "nodes": {}, "status": {}}
 
 
 def save_goal_archive(fsid, store):
-    GOALARCHDIR.mkdir(parents=True, exist_ok=True)
-    tmp = GOALARCHDIR / (fsid + ".json.tmp.%d" % os.getpid())
-    tmp.write_text(json.dumps(store))
-    tmp.rename(GOALARCHDIR / (fsid + ".json"))        # atomic publish
+    """Replace an archive wholesale.
+
+    Production read-modify-write callers must use :func:`mutate_goal_archive`; this replacement
+    helper remains for imports/tests that already hold the complete desired value.
+    """
+    path = GOALARCHDIR / (fsid + ".json")
+    with _store_file_lock(path):
+        # Refuse to replace a store we cannot parse. The normal recovery path is load_goal_archive,
+        # which quarantines the bad bytes first and returns a fresh archive to its caller.
+        _read_store_json(path)
+        _atomic_json(path, store)
+
+
+def mutate_goal_archive(fsid, mutate):
+    """Run ``mutate(archive)`` and publish its edits in one archive-lock transaction.
+
+    Atomic rename prevents torn JSON, but archive movers also need the READ and WRITE protected by
+    the same lock: otherwise a compactor adding one node and undo-clear removing another can each
+    publish a stale snapshot and silently erase the other's edit.  The callback's return value is
+    passed through.  An exception publishes nothing, which lets restore journal/live-store failures
+    leave the archive as the durable fallback.
+
+    Callbacks must not call load_goal_archive/save_goal_archive for this fsid (that would attempt a
+    nested flock on a new fd).  They may save the distinct LIVE goal store: load_goals releases its
+    file lock before archive-aware override replay, so the production restore path has no inverse
+    live-lock -> archive-lock nesting.
+    """
+    path = GOALARCHDIR / (fsid + ".json")
+    with _store_file_lock(path):
+        raw = _read_store_json(path, quarantine=True)
+        archive = (_guard_nodes(raw) if raw is not None
+                   else {"rompUuid": fsid, "nodes": {}, "status": {}})
+        before = json.dumps(archive, sort_keys=True, separators=(",", ":"))
+        result = mutate(archive)
+        if json.dumps(archive, sort_keys=True, separators=(",", ":")) != before:
+            _atomic_json(path, archive)
+        return result
 
 
 def drop_goals_after(fsid, cut_t):
@@ -2260,15 +2409,21 @@ def drop_goals_after(fsid, cut_t):
     if not move:
         return 0
     status = store.get("status") or {}
-    arch = load_goal_archive(fsid)
-    a_nodes = arch.setdefault("nodes", {}); a_status = arch.setdefault("status", {})
+    move_nodes = {nid: nodes[nid] for nid in move if nid in nodes}
+    move_status = {nid: status[nid] for nid in move if nid in status}
+
+    def _archive_drop(arch):
+        arch.setdefault("nodes", {}).update(move_nodes)
+        arch.setdefault("status", {}).update(move_status)
+        arch["rompUuid"] = store.get("rompUuid", fsid)
+
+    # Archive FIRST: a crash before the live publish leaves duplicates, never lost nodes.  The
+    # transaction retains unrelated simultaneous compaction/restore edits instead of replacing a
+    # stale archive snapshot.
+    mutate_goal_archive(fsid, _archive_drop)
     for nid in move:
-        if nid in nodes:
-            a_nodes[nid] = nodes.pop(nid)              # a whole-node dict delete is UNGUARDED (not a PROTECTED key)
-        if nid in status:
-            a_status[nid] = status.pop(nid)
-    arch["rompUuid"] = store.get("rompUuid", fsid)
-    save_goal_archive(fsid, arch)
+        nodes.pop(nid, None)                           # whole-node delete is not a protected-key write
+        status.pop(nid, None)
     # a dangling lastNode is tolerated (focus→None), but that would prematurely settle the pre-cut focus card;
     # re-point it at the newest SURVIVING node so rollup_status keeps a sane focus.
     if store.get("lastNode") not in nodes:

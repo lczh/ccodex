@@ -60,9 +60,42 @@ class VersionDrift(unittest.TestCase):
     def test_remote_public_exposes_version_fields(self):
         pub = km._remote_public({"host": "TESTHOST", "kernel_port": 29855, "local_port": 8801, "token": "t",
                                  "status": "up", "sids": [], "kernel_sha": "def5678"})
+        self.assertTrue(pub["hasToken"])
+        self.assertNotIn("token", pub, "remote credentials stay server-side behind the relay")
         self.assertEqual(pub["kernelSha"], "def5678")
         self.assertEqual(pub["localSha"], "abc1234", "localSha is the live HEAD short (what a push would send)")
         self.assertTrue(pub["outOfDate"])
+
+    def test_remote_public_rejects_malicious_version_metadata(self):
+        attack = '<img src=x onerror="globalThis.pwned=1">'
+        pub = km._remote_public({"host": "TESTHOST", "kernel_port": 29855, "local_port": 8801,
+                                 "status": "up", "kernel_sha": attack, "kernel_ver": attack})
+        self.assertEqual((pub["kernelSha"], pub["kernelVer"]), ("", ""))
+        self.assertFalse(pub["outOfDate"], "an invalid revision must not reach drift git commands")
+
+    def test_version_poll_accepts_only_sha_and_safe_release_atoms(self):
+        old = km.http.client.HTTPConnection
+
+        class Resp:
+            status = 200
+            def __init__(self, payload): self.payload = payload
+            def read(self): return json.dumps(self.payload).encode()
+
+        class Conn:
+            payload = {"kernel_sha": "def5678", "kernel_ver": '<svg onload="pwned=1">'}
+            def __init__(self, *a, **k): pass
+            def request(self, *a, **k): pass
+            def getresponse(self): return Resp(self.payload)
+            def close(self): pass
+
+        try:
+            km.http.client.HTTPConnection = Conn
+            self.assertEqual(km._poll_remote_version({"local_port": 1, "token": "t"}),
+                             {"sha": "def5678", "ver": ""})
+            Conn.payload = {"kernel_sha": '<img src=x onerror="pwned=1">', "kernel_ver": "v1.2.3"}
+            self.assertIsNone(km._poll_remote_version({"local_port": 1, "token": "t"}))
+        finally:
+            km.http.client.HTTPConnection = old
 
 
 class UpdateRemote(unittest.TestCase):

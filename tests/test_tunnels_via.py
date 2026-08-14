@@ -58,7 +58,35 @@ class TunnelsOf(_Stubbed):
         self.assertTrue(d["ok"])
         self.assertEqual(d["of"], "TESTHOST")
         self.assertEqual(d["tunnels"][0]["host"], "third")
-        self.assertEqual(d["tunnels"][0]["behindBy"], 2, "row fields pass through untouched")
+        self.assertEqual(d["tunnels"][0]["behindBy"], 2, "typed public fields survive the schema")
+        self.assertNotIn("known", d, "unconsumed far-host extensions do not cross the browser boundary")
+
+    def test_malicious_far_host_metadata_is_schemed_before_browser_delivery(self):
+        km._remotes["TESTHOST"] = {"host": "TESTHOST", "status": "up", "local_port": 1, "token": "t"}
+        attack = '<img src=x onerror="globalThis.pwned=1">'
+        km._remote_kernel_call = lambda *a, **k: (
+            200, {"tunnels": [
+                {"host": "third", "status": attack, "trust": attack,
+                 "kernelSha": attack, "kernelVer": attack, "localSha": "abc1234",
+                 "localVer": "v1.2.3", "kernelDate": attack,
+                 "behindBy": "2", "aheadBy": -1, "fastForward": "yes",
+                 "checkinPeer": "yes", "autoPush": {"phase": attack, "detail": attack},
+                 "token": "far-secret", "unknownMarkup": attack},
+                {"host": attack, "status": "up"},
+            ], "token": "top-secret"}, None)
+        d = km.tunnels_of("TESTHOST")
+        self.assertTrue(d["ok"])
+        self.assertEqual(len(d["tunnels"]), 1, "an unsafe action target is dropped")
+        row = d["tunnels"][0]
+        self.assertEqual(row["status"], "error")
+        self.assertEqual(row["trust"], "directed")
+        self.assertEqual((row["kernelSha"], row["kernelVer"], row["kernelDate"]), ("", "", ""))
+        self.assertEqual((row["behindBy"], row["aheadBy"]), (None, None))
+        self.assertFalse(row["fastForward"])
+        self.assertFalse(row["checkinPeer"])
+        self.assertIsNone(row["autoPush"])
+        self.assertNotIn("token", row)
+        self.assertNotIn("unknownMarkup", row)
 
     def test_a_failed_read_carries_the_transport_error(self):
         km._remotes["TESTHOST"] = {"host": "TESTHOST", "status": "up", "local_port": 1, "token": "t"}

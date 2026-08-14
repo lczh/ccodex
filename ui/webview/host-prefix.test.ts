@@ -56,6 +56,18 @@ test("every surface renders the prefix through the shared treatment", () => {
   assert.match(TL, /'font-style': 'italic', 'font-size': 10\.5/);
 });
 
+test("peer-provided session display names reach text nodes, never HTML sinks", () => {
+  const HP = read("host-prefix.ts"), FLEET = read("fleet.ts");
+  // Presence names may legitimately contain spaces and punctuation, including literal HTML-looking
+  // text.  The common chat/feed renderer and outline renderer both construct text nodes/textContent.
+  assert.match(HP, /if \(!p\) return \[document\.createTextNode\(name\)\]/);
+  assert.match(HP, /h\.textContent = p\.host/);
+  assert.match(HP, /document\.createTextNode\(p\.rest\)/);
+  assert.match(FLEET, /if \(!p\) \{ highlightInto\(elm, name, q\); return; \}/);
+  assert.match(FLEET, /const h = el\("span", "host-prefix"\); h\.textContent = p\.host/);
+  assert.match(FLEET, /highlightInto\(rest, p\.rest, q\)/);
+});
+
 test("the host prefix FADES in tandem with the name it precedes (the user 2026-07-22)", () => {
   // .host-prefix declares its OWN color, so an at-rest tab's inline faded color cannot inherit into it —
   // a remote session's "host:" stayed bright while its name dimmed, often outshining it. Both surfaces

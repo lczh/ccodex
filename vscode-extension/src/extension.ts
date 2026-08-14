@@ -97,10 +97,9 @@ async function updateExtension(): Promise<void> {
     const out = await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: "romp: updating the extension…", cancellable: false },
       () => runInstall(script, extDir));
-    // install.sh exits 0 even when it SKIPS (no node / no editor CLI found) — so a clean exit is NOT
-    // proof it worked. The real success markers are that it packaged the VSIX AND installed into a CLI.
-    // Anything else is a failure we surface loudly with the manual remedy (fail loudly, don't degrade).
-    const ok = out.code === 0 && /packaged romp-chat-view\.vsix/.test(out.text) && /install into:/.test(out.text);
+    // A clean exit or a packaging line is not proof that an editor accepted the VSIX. install.sh
+    // emits this stable result only after the install attempts and itself fails when installed=0.
+    const ok = out.code === 0 && /^ROMP_EXT_INSTALL_RESULT installed=[1-9][0-9]* failed=[0-9]+$/m.test(out.text);
     if (ok) {
       void vscode.window.showInformationMessage(
         "romp extension updated — reload this window to apply.", "Reload window").then((choice) => {
@@ -118,7 +117,7 @@ async function updateExtension(): Promise<void> {
 
 // Run vscode-extension/install.sh via bash, inheriting the host's resolved env (its PATH finds
 // node/npm/npx/code). install.sh cd's to its own dir; capture stdout+stderr and the exit code so the
-// caller can tell a real install from a graceful skip. 5-minute cap (npm install + vsce package).
+// caller can tell a real install from a graceful skip. 5-minute cap (npm ci + vsce package).
 function runInstall(script: string, cwd: string): Promise<{ code: number; text: string }> {
   return new Promise((resolve) => {
     execFile("bash", [script], { cwd, env: process.env, maxBuffer: 16 * 1024 * 1024, timeout: 300000 },
@@ -136,6 +135,8 @@ function updateHint(out: { code: number; text: string }): string {
   const t = out.text;
   if (/node not found/.test(t)) return "node isn't on the extension host's PATH.";
   if (/No VS Code-family editor CLI found/.test(t)) return "no editor CLI was found to install into.";
+  const failed = t.match(/^ROMP_EXT_INSTALL_RESULT installed=0 failed=([0-9]+)$/m);
+  if (failed) return `all ${failed[1]} editor installation attempt${failed[1] === "1" ? "" : "s"} failed.`;
   const last = t.trim().split(/\r?\n/).filter((l) => l.trim()).slice(-1)[0] || "";
   return last ? "the build reported: " + last.slice(0, 200) : "see the terminal for details.";
 }
@@ -152,6 +153,17 @@ function cfgPort(key: "kernelPort" | "managerPort", env: string | undefined, dfl
 // of silently trying the default one.
 function kernelPort(): number { return cfgPort("kernelPort", process.env.ROMP_SERVE_PORT || process.env.ROMP_KERNEL_PORT, 29855); }
 function managerPort(): number { return cfgPort("managerPort", process.env.ROMP_MANAGER_PORT, 7432); }
+function managerToken(): string {
+  const env = (process.env.ROMP_MANAGER_TOKEN || "").trim();
+  if (env) return env;
+  try {
+    const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
+    const root = process.env.ROMP_STATE_DIR || path.join(base, "romp");
+    return fs.readFileSync(path.join(root, "manager-token"), "utf8").trim();
+  } catch {
+    return "";
+  }
+}
 
 let ctx: vscode.ExtensionContext;
 let extUri: vscode.Uri;
@@ -398,8 +410,10 @@ function ensureKernel(): Promise<boolean> {
 // answered (i.e. one is running) — we never spawn the kernel ourselves.
 function askManagerEnsure(port: number): Promise<boolean> {
   return new Promise((resolve) => {
+    const token = managerToken();
     const req = http.request(
-      { host: HOST, port: managerPort(), path: `/ensure?port=${port}`, method: "POST", timeout: 4000 },
+      { host: HOST, port: managerPort(), path: `/ensure?port=${port}`, method: "POST", timeout: 4000,
+        headers: token ? { "X-Romp-Manager-Token": token } : {} },
       (res) => { res.resume(); resolve((res.statusCode ?? 500) < 400); });
     req.on("timeout", () => { req.destroy(); resolve(false); });
     req.on("error", () => resolve(false));
@@ -542,7 +556,7 @@ function wirePanel(p: vscode.WebviewPanel) {
     if (!m) return;
     // CLIENT capabilities — VS Code does these locally; the browser shim has
     // its own versions. Everything else goes to the kernel verbatim.
-    if (m.type === "openFile" && m.path) { openFileInEditor(String(m.path), m.line); return; }
+    if (m.type === "openFile" && m.path) { void openFileInEditor(String(m.path), m.line, m.id); return; }
     if (m.type === "openLink" && typeof m.href === "string") { openLink(String(m.href)); return; }
     if (m.type === "openPane") { openPaneByKey(String(m.pane)); return; }   // strip quick-open
     if (m.type === "settingsSync") { broadcastSettings(m.settings, p.webview); return; }   // gear save → other panes
@@ -626,6 +640,7 @@ function wireFeedPanel(p: vscode.WebviewPanel) {
     }
     if (m.type === "openPane") { openPaneByKey(String(m.pane)); return; }   // strip quick-open
     if (m.type === "settingsSync") { broadcastSettings(m.settings, p.webview); return; }   // gear save → other panes
+    if (m.type === "openFile" && m.path) { void openFileInEditor(String(m.path), m.line, m.id); return; }
     // Clicking into a session (or locating a card's chat turn) should bring
     // the CHAT panel forward — panel reveal is this host's job; the kernel
     // opens/focuses the tab itself. The rules live in view-routing.ts.
@@ -982,7 +997,7 @@ async function diffSessionChanges() {
   if (!s || !s.dir) return;
   let files;
   try {
-    files = parsePorcelain(await gitIn(s.dir, ["status", "--porcelain"]));
+    files = parsePorcelain(await gitIn(s.dir, ["status", "--porcelain=v1", "-z"]));
   } catch {
     vscode.window.showWarningMessage(`romp: ${s.dir} is not a git repository (or git failed).`);
     return;
@@ -1010,18 +1025,32 @@ async function diffSessionChanges() {
 
 // Open a file (that a tool touched) in the real editor — in the main group,
 // NOT the locked romp group beside it. {type:"openFile", path, line?} (1-based).
-function openFileInEditor(file: string, line?: number) {
+async function openFileInEditor(file: string, line?: number, sessionId?: unknown): Promise<void> {
   try {
-    const uri = vscode.Uri.file(file);
+    let target = file.startsWith("~/") ? path.join(os.homedir(), file.slice(2)) : file;
+    if (!path.isAbsolute(target)) {
+      const sid = typeof sessionId === "string" ? sessionId : "";
+      let session = sessionDirs.find((s) => s.id === sid);
+      if (!session && sid) {
+        sessionDirs = await fetchSessions();
+        session = sessionDirs.find((s) => s.id === sid);
+      }
+      if (!session?.dir) {
+        void vscode.window.showWarningMessage(`romp: couldn't resolve ${file} without its session directory.`);
+        return;
+      }
+      target = path.resolve(session.dir, target);
+    }
+    const uri = vscode.Uri.file(target);
     const opts: vscode.TextDocumentShowOptions = { preview: true, viewColumn: vscode.ViewColumn.One };
     if (typeof line === "number" && line > 0) {
       const pos = new vscode.Position(line - 1, 0);
       opts.selection = new vscode.Range(pos, pos);
     }
-    vscode.window.showTextDocument(uri, opts).then(undefined, () => {
-      vscode.window.showWarningMessage(`romp: couldn't open ${file}`);
-    });
-  } catch { /* ignore */ }
+    await vscode.window.showTextDocument(uri, opts);
+  } catch {
+    void vscode.window.showWarningMessage(`romp: couldn't open ${file}`);
+  }
 }
 
 // A link clicked inside a chat webview. Deep links addressed to THIS extension

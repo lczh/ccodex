@@ -19,6 +19,8 @@ pending-ops.json and every state write — stays out of the live user state (see
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 from importlib.machinery import SourceFileLoader
@@ -65,12 +67,44 @@ class PendingOpsPersistence(unittest.TestCase):
     def test_delivery_shrinks_the_disk_mirror(self):
         km._park_op("sid-2", ("effort", "high"))
         fake = mock.Mock()
+        fake.set_effort.return_value = True
         with mock.patch.object(km, "_compacting_now", return_value=False), \
              mock.patch.object(km, "_working_now", return_value=False), \
              mock.patch.object(km.Sessions, "backend_for", staticmethod(lambda sid: fake)):
             km._apply_pending_ops()
         fake.set_effort.assert_called_once_with("sid-2", "high")
         self.assertEqual(km._load_pending_ops(), {}, "a delivered op leaves the disk mirror")
+
+    def test_concurrent_parks_publish_one_complete_snapshot(self):
+        """A slow old snapshot cannot overwrite a newer park after it releases."""
+        entered = threading.Event()
+        release = threading.Event()
+        second_done = threading.Event()
+        original = km.Path.write_text
+
+        def slow_first(path, data, *args, **kwargs):
+            if threading.current_thread().name == "first-park" and path.name.startswith("pending-ops.tmp."):
+                entered.set()
+                release.wait(2)
+            return original(path, data, *args, **kwargs)
+
+        with mock.patch.object(km.Path, "write_text", slow_first):
+            first = threading.Thread(target=km._park_op,
+                                     args=("sid-race", ("send", "first", None)),
+                                     name="first-park")
+            second = threading.Thread(
+                target=lambda: (km._park_op("sid-race", ("send", "second", None)), second_done.set()),
+                name="second-park")
+            first.start()
+            self.assertTrue(entered.wait(2))
+            second.start()
+            time.sleep(0.03)
+            self.assertFalse(second_done.is_set(), "the second mutation waits for the first snapshot publish")
+            release.set()
+            first.join(2)
+            second.join(2)
+        self.assertEqual(km._load_pending_ops(),
+                         {"sid-race": [("send", "first", None), ("send", "second", None)]})
 
     def test_missing_file_loads_empty(self):
         self.assertEqual(km._load_pending_ops(), {})

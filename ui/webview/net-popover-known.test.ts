@@ -160,8 +160,14 @@ test("the How-it-works fold explains the security posture and every per-host set
   assert.match(fold, /<b>isolated<\/b> is no postal at all/);
   assert.match(fold, /It is the default/, "which one you get if you never touch it");
   // 3. the check-in box, which points the OTHER way and is the easiest to misread
-  assert.match(fold, /<b>Share my sessions there<\/b> publishes this machine to that host/);
-  assert.match(fold, /Leave it off for a box you only want to watch/, "when NOT to use it");
+  assert.match(fold, /<b>Share my sessions there<\/b> is available only for a trusted host/);
+  assert.match(fold, /reverse forwards and a kernel credential/,
+    "the fold names the administrative path granted to the far end");
+  // The source splits this sentence across adjacent Python string literals; pin both halves.
+  assert.match(fold, /Turn it on only when you control and trust /, "when to use it");
+  assert.match(fold, /the far end; turn it off before downgrading/, "when to withdraw it");
+  assert.match(fold, /turn it off before downgrading or handing that machine to someone else/,
+    "the copy names the revocation boundary");
 });
 
 test("the fold stays folded: the panel still opens on one gist line", () => {

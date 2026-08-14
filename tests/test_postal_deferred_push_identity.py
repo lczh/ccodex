@@ -18,6 +18,7 @@ import os
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
+from unittest import mock
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
@@ -103,6 +104,26 @@ class DeferredPushKeepsOneIdentity(unittest.TestCase):
     def test_restore_rejects_a_traversing_id(self):
         self.assertFalse(pm.restore(TO, "../../../../etc/passwd"))
         self.assertFalse(pm.restore("../../../../etc", "x"))
+
+    def test_partial_batch_claim_rolls_back_earlier_files(self):
+        first = pm.deliver(TO, "api", FROM, "first", kind="coordinate")
+        second = pm.deliver(TO, "api", FROM, "second", kind="coordinate")
+        real_rename = pm.Path.rename
+        claims = {"n": 0}
+
+        def fail_second_claim(path, target):
+            if path.parent.name == "new" and pm.Path(target).parent.name == "cur":
+                claims["n"] += 1
+                if claims["n"] == 2:
+                    raise OSError("synthetic mid-batch rename failure")
+            return real_rename(path, target)
+
+        with mock.patch.object(pm.Path, "rename", new=fail_second_claim):
+            self.assertEqual(pm.read_box(TO, consume=True), [])
+        self.assertTrue((pm.MAILROOT / TO / "new" / first).is_file())
+        self.assertTrue((pm.MAILROOT / TO / "new" / second).is_file())
+        self.assertFalse((pm.MAILROOT / TO / "cur" / first).exists(),
+                         "a failed batch cannot strand an earlier claim in cur/")
 
 
 class DeferredPushEndToEnd(unittest.TestCase):

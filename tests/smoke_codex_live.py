@@ -47,7 +47,8 @@ def main():
         # Boxes whose kernel restricts unprivileged user namespaces can't run Codex's bwrap
         # sandbox at all (bwrap: setting up uid map: Permission denied) — every command/patch
         # fails. This override exercises the SAME protocol machinery without the sandbox; the
-        # shipped default stays workspaceWrite. Fix the box for sandboxed operation:
+        # shipped default stays ccodex's custom profile with one runtime workspace root.
+        # Fix the box for sandboxed operation:
         #   sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0   (+ persist in sysctl.d)
         cb.TURN_SANDBOX = {"type": "dangerFullAccess"}
         print("(sandbox override: dangerFullAccess — bwrap unavailable on this box)")

@@ -5,8 +5,10 @@ over POST /peer on tunnel transitions. Synthetic only."""
 import json
 import os
 import tempfile
+import threading
 import unittest
 from importlib.machinery import SourceFileLoader
+from unittest import mock
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
@@ -110,6 +112,75 @@ class PeerMode(unittest.TestCase):
         src = inspect.getsource(pm)
         self.assertIn('if u.path == "/peer":', src)
         self.assertIn('if u.path == "/peers":', src)
+
+    def test_outbox_publish_uses_distinct_atomic_temporaries(self):
+        import shutil
+        shutil.rmtree(pm.OUTBOX / "TESTHOST", ignore_errors=True)
+        real_replace = pm.os.replace
+        rendezvous = threading.Barrier(2)
+        sources = []
+
+        def delayed_replace(src, dst):
+            sources.append(str(src))
+            rendezvous.wait(timeout=2)
+            return real_replace(src, dst)
+
+        def write(body):
+            pm.outbox_put("TESTHOST", {"mid": "same-mid", "body": body})
+
+        with mock.patch.object(pm.os, "replace", side_effect=delayed_replace):
+            threads = [threading.Thread(target=write, args=(body,)) for body in ("one", "two")]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(3)
+        self.assertEqual(len(set(sources)), 2, "concurrent writers must not share one .tmp path")
+        self.assertIn(pm.outbox_get("TESTHOST", "same-mid")["body"], ("one", "two"))
+        self.assertEqual(list((pm.OUTBOX / "TESTHOST").glob("*.tmp")), [])
+
+    def test_durable_publish_flushes_file_and_directory(self):
+        import shutil
+        shutil.rmtree(pm.OUTBOX / "TESTHOST", ignore_errors=True)
+        calls = []
+        with mock.patch.object(pm.os, "fsync", side_effect=lambda fd: calls.append(fd)):
+            pm.outbox_put("TESTHOST", {"mid": "durable-mid", "body": "survive power loss"})
+        self.assertGreaterEqual(len(calls), 2, "publish syncs both the new file and its directory entry")
+        self.assertEqual(pm.outbox_get("TESTHOST", "durable-mid")["body"], "survive power loss")
+
+    def test_corrupt_outbox_and_readbox_finals_are_preserved_and_surfaced(self):
+        import shutil
+        shutil.rmtree(pm.CORRUPT, ignore_errors=True)
+        for root, list_fn, store in ((pm.OUTBOX, pm.outbox_list, "outbox"),
+                                     (pm.READBOX, pm.readbox_list, "readbox")):
+            shutil.rmtree(root / "TESTHOST", ignore_errors=True)
+            d = root / "TESTHOST"; d.mkdir(parents=True)
+            bad = d / ("bad-%s.json" % store)
+            bad.write_text("{torn json")
+            self.assertEqual(list_fn("TESTHOST"), [])
+            self.assertFalse(bad.exists(), "a corrupt final cannot be silently retried forever")
+            held = list((pm.CORRUPT / store).glob("bad-%s.json.*.corrupt" % store))
+            self.assertEqual(len(held), 1)
+            self.assertEqual(held[0].read_text(), "{torn json")
+
+    def test_peer_seen_window_and_disk_log_are_bounded_without_losing_recent_dedupe(self):
+        old = (pm._SEEN_CAP, pm._SEEN_COMPACT_EVERY, pm._seen_ids, pm._seen_order, pm._seen_appends)
+        try:
+            pm._SEEN_CAP, pm._SEEN_COMPACT_EVERY = 5, 2
+            pm._seen_ids = pm._seen_order = None
+            pm._seen_appends = 0
+            try: pm.PEER_SEEN.unlink()
+            except OSError: pass
+            for i in range(10):
+                pm.peer_seen_add("seen-%02d" % i)
+            self.assertEqual(pm._seen_ids, {"seen-%02d" % i for i in range(5, 10)})
+            self.assertEqual(pm.PEER_SEEN.read_text().splitlines(),
+                             ["seen-%02d" % i for i in range(5, 10)])
+            pm._seen_ids = pm._seen_order = None       # a process restart rebuilds the same window
+            self.assertFalse(pm.peer_seen_check("seen-04"))
+            self.assertTrue(pm.peer_seen_check("seen-09"))
+        finally:
+            (pm._SEEN_CAP, pm._SEEN_COMPACT_EVERY, pm._seen_ids,
+             pm._seen_order, pm._seen_appends) = old
 
 
 if __name__ == "__main__":
@@ -227,6 +298,19 @@ class TwoBusExchange(unittest.TestCase):
         self.assertIn("undeliverable to 'ghost'", back[0]["body"])
         self.assertEqual(back[0]["from"], "romp-postal", "bus-authored, clearly not a peer message")
 
+    def test_failed_bounce_write_keeps_the_parked_source_for_retry(self):
+        pm.outbox_put("srv", {"mid": "bounce-retry", "to": "ghost", "frm": "alpha",
+                               "frm_id": "sid-a", "body": "keep me", "kind": "", "t": 1})
+        saved = pm.deliver
+        pm.deliver = lambda *a, **k: (_ for _ in ()).throw(OSError("synthetic maildir failure"))
+        try:
+            with self.assertRaises(OSError):
+                pm._bounce_apply("srv", {"mid": "bounce-retry", "why": "gone"})
+        finally:
+            pm.deliver = saved
+        self.assertIsNotNone(pm.outbox_get("srv", "bounce-retry"),
+                             "retry record is deleted only after the return note is written")
+
     def test_return_mail_rides_the_response_and_acks_the_next_request(self):
         pmb.outbox_put("hosta", {"mid": "m4", "to": "alpha", "frm": "beta", "frm_id": "sid-b",
                                  "body": "reply", "kind": "", "t": 1})
@@ -292,6 +376,7 @@ class ThreeBusRelay(unittest.TestCase):
         # whose origin is "hosta" (B stamps origin when it forwards). Trust itself: test_postal_quarantine.
         pmb.PEERS["hosta"] = {"port": 1, "up": True, "trust": "trusted"}
         pmc.PEERS["hosta"] = {"port": 1, "up": True, "trust": "trusted"}
+        pmc.PEERS["hub"] = {"port": 1, "up": True, "trust": "trusted"}
 
     def tearDown(self):
         os.environ.pop("ROMP_POSTAL_PEERS", None)

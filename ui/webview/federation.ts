@@ -623,8 +623,8 @@ export class FederationManager {
     } catch (e) {
       return;
     }
-    const want = new Map<string, any>(tunnels.filter((t) => t.token && t.localPort).map((t) => [t.host, t]));
-    for (const [host, t] of want) if (!this.conns.has(host)) this.openRemote(host, t.token, t.status === "up");
+    const want = new Map<string, any>(tunnels.filter((t) => t.hasToken && t.localPort).map((t) => [t.host, t]));
+    for (const [host, t] of want) if (!this.conns.has(host)) this.openRemote(host, t.status === "up");
     for (const host of [...this.conns.keys()]) if (!want.has(host)) this.closeRemote(host);
     // The kernel's tunnel state gates dialing: it health-checks its own ssh tunnels, so "up" is
     // authoritative for whether anything listens on the local port at all. Blind 2s retries against
@@ -649,20 +649,20 @@ export class FederationManager {
     if (changed) window.dispatchEvent(new Event("romp-hosts"));   // panes repaint their disconnected marks
   }
 
-  private openRemote(host: string, token: string, live: boolean): void {
+  private openRemote(host: string, live: boolean): void {
     // Dial the remote through THIS kernel's /remote/<host>/ws relay, on the same origin that served
     // the page — never at 127.0.0.1:<forwarded port>, which only exists on the kernel's machine:
     // from a phone reading the dashboard over `tailscale serve`, that address is the phone itself,
     // and every remote host silently vanished with no disconnected mark (the user 2026-07-30).
-    // Same-origin also means the local auth cookie rides the upgrade; the ?token (the remote
-    // kernel's credential, from /tunnels) is re-checked and rewritten by the relay either way.
+    // Same-origin also means the local auth cookie rides the upgrade. The relay injects the remote
+    // kernel's credential server-side, so /tunnels never has to expose it to browser JavaScript.
     const proto = location.protocol === "https:" ? "wss://" : "ws://";
     // …carrying this dashboard's `wid`, exactly as the pane's own local socket does. Without it a remote
     // kernel sees every federated viewer as one anonymous client and BROADCASTS its per-viewer messages,
     // so one dashboard's jump to a remote session yanked every other open dashboard to that tab — the
     // very cross-window yank the local path fixed (the user 2026-07-29).
     const w = dashboardWid();
-    const url = `${proto}${location.host}/remote/${encodeURIComponent(host)}/ws?app=${encodeURIComponent(this.app)}&token=${encodeURIComponent(token)}`
+    const url = `${proto}${location.host}/remote/${encodeURIComponent(host)}/ws?app=${encodeURIComponent(this.app)}`
       + (w ? `&wid=${encodeURIComponent(w)}` : "");
     const conn: Conn = { host, ws: null, url, closed: false, live };
     this.conns.set(host, conn);

@@ -95,15 +95,18 @@ class RemoteIdentity(unittest.TestCase):
     def test_checkin_from_an_unknown_machine_still_lands(self):
         self.tokens = {"boxalias": "TOK-A"}
         km.attach_remote("boxalias")
+        km._known_note("mobile", "trusted")
         payload, status = km.checkin_apply(
             {"host": "mobile", "kernelPort": 12345, "busPort": 12346, "token": "TOK-OTHER"})
         self.assertEqual(status, 200)
         self.assertEqual(set(km._remotes), {"boxalias", "mobile"})
 
     def test_checkin_rename_replaces_its_own_old_row(self):
+        km._known_note("mobile-old", "trusted")
         payload, status = km.checkin_apply(
             {"host": "mobile-old", "kernelPort": 12345, "busPort": 12346, "token": "TOK-M"})
         self.assertEqual(status, 200)
+        km._known_note("mobile-new", "trusted")
         payload, status = km.checkin_apply(
             {"host": "mobile-new", "kernelPort": 12345, "busPort": 12346, "token": "TOK-M"})
         self.assertEqual(status, 200)

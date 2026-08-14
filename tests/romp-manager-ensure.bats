@@ -13,11 +13,18 @@ setup() {
     printf '#!/usr/bin/env bash\nexec sleep 30\n' > "$FAKE"
     chmod +x "$FAKE"
     CPORT=7561 MPORT=7562
+    TOKEN=manager_test_token_0123456789abcdef
+    export ROMP_MANAGER_TOKEN="$TOKEN"
+    export XDG_STATE_HOME="$TEST_DIR/state"
+}
+
+mcurl() {
+    curl -H "X-Romp-Manager-Token: $TOKEN" "$@"
 }
 
 teardown() {
     # Graceful stop, then reap the detached manager (it is orphaned, not our child).
-    curl -fsS -X POST "http://127.0.0.1:${CPORT:-0}/stop" >/dev/null 2>&1 || true
+    mcurl -fsS -X POST "http://127.0.0.1:${CPORT:-0}/stop" >/dev/null 2>&1 || true
     [[ -n "${MGR_PID:-}" ]] && kill "$MGR_PID" 2>/dev/null || true
     rm -rf "$TEST_DIR"
 }
@@ -37,10 +44,10 @@ teardown() {
     # The detached manager comes up on the control port.
     local i
     for i in $(seq 1 40); do
-        curl -fsS "http://127.0.0.1:$CPORT/status" >/dev/null 2>&1 && break
+        mcurl -fsS "http://127.0.0.1:$CPORT/status" >/dev/null 2>&1 && break
         sleep 0.1
     done
-    run curl -fsS "http://127.0.0.1:$CPORT/status"
+    run mcurl -fsS "http://127.0.0.1:$CPORT/status"
     [ "$status" -eq 0 ]
     [[ "$output" == *'"id":"main"'* ]]
     MGR_PID="$(printf '%s' "$output" | grep -oE '"pid":[ ]*[0-9]+' | head -1 | grep -oE '[0-9]+')"
@@ -48,7 +55,7 @@ teardown() {
     # A second ensure is a harmless no-op; the manager stays up (no double-start).
     run env ROMP_MANAGER_PORT=$CPORT ROMP_SERVE_PORT=$MPORT ROMP_SERVE_BIN="$FAKE" node "$MGR" ensure
     [ "$status" -eq 0 ]
-    run curl -fsS "http://127.0.0.1:$CPORT/status"
+    run mcurl -fsS "http://127.0.0.1:$CPORT/status"
     [ "$status" -eq 0 ]
     [[ "$output" == *'"id":"main"'* ]]
 }
@@ -66,7 +73,7 @@ teardown() {
 
     # Run `up` directly on a UNIQUE port (so it doesn't no-op against the other test's manager); the
     # manager calls startTmuxServer() at startup, before it ever binds the control port.
-    env PATH="$BIN:$PATH" ROMP_MANAGER_PORT=7571 ROMP_SERVE_PORT=7572 ROMP_SERVE_BIN="$FAKE" node "$MGR" up >/dev/null 2>&1 &
+    env PATH="$BIN:$PATH" ROMP_MANAGER_PORT=7573 ROMP_SERVE_PORT=7574 ROMP_SERVE_BIN="$FAKE" node "$MGR" up >/dev/null 2>&1 &
     MGR_PID=$!
     local i
     for i in $(seq 1 50); do [ -f "$CALLS" ] && break; sleep 0.1; done
@@ -94,7 +101,7 @@ teardown() {
     MGR_PID=$!
     local i
     for i in $(seq 1 50); do [ -s "$envdump" ] && break; sleep 0.1; done
-    curl -fsS -X POST "http://127.0.0.1:7581/stop" >/dev/null 2>&1 || true
+    mcurl -fsS -X POST "http://127.0.0.1:7581/stop" >/dev/null 2>&1 || true
     [ -s "$envdump" ]
     ! grep -q '^TMUX=' "$envdump"
     ! grep -q '^TMUX_PANE=' "$envdump"
@@ -134,15 +141,15 @@ PYEOF
     MGR_PID=$!
     local i
     for i in $(seq 1 50); do
-        curl -fsS "http://127.0.0.1:7591/status" >/dev/null 2>&1 && [ -s "$SPAWNS" ] && break
+        mcurl -fsS "http://127.0.0.1:7591/status" >/dev/null 2>&1 && [ -s "$SPAWNS" ] && break
         sleep 0.1
     done
     [ "$(grep -c spawn "$SPAWNS")" -eq 1 ]
 
     # Two quiet-mode refreshes while turns are in flight: both defer, the second coalesces.
-    run curl -fsS -X POST "http://127.0.0.1:7591/restart-all?when=quiet"
+    run mcurl -fsS -X POST "http://127.0.0.1:7591/restart-all?when=quiet"
     [[ "$output" == *'"deferred":true'* ]]
-    run curl -fsS -X POST "http://127.0.0.1:7591/restart-all?when=quiet"
+    run mcurl -fsS -X POST "http://127.0.0.1:7591/restart-all?when=quiet"
     [[ "$output" == *'"coalesced":2'* ]]
 
     # Still busy after several poll cycles -> no bounce happened.
@@ -153,5 +160,5 @@ PYEOF
     echo 0 > "$BUSY"
     for i in $(seq 1 60); do [ "$(grep -c spawn "$SPAWNS")" -ge 2 ] && break; sleep 0.1; done
     [ "$(grep -c spawn "$SPAWNS")" -eq 2 ]
-    curl -fsS -X POST "http://127.0.0.1:7591/stop" >/dev/null 2>&1 || true
+    mcurl -fsS -X POST "http://127.0.0.1:7591/stop" >/dev/null 2>&1 || true
 }

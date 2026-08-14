@@ -44,8 +44,11 @@ One switch, two knobs: the judges move to Codex, and new sessions (`ccodex new`,
 the kernel API) default to the Codex backend — the dashboard's + dialog keeps
 its own per-create toggle. No restart needed: judges read the setting on their
 next call, and running sessions are never touched. Every judge becomes a
-one-shot `codex exec` call — ephemeral (no session files), read-only sandbox,
-billing the machine's Codex login. Verified live: the real caption and gist
+one-shot `codex exec` call — ephemeral (no session files), using ccodex's custom
+`ccodex_judge` permission profile, and billing the machine's Codex login. The
+profile grants only Codex's minimal runtime files plus read access to the fresh
+empty scratch workspace supplied by `-C`; it denies writes, network access, and
+host-wide reads. Verified live: the real caption and gist
 judges answer correctly in ~5–6s per call.
 
 Honest caveats while this is new:
@@ -66,9 +69,21 @@ Honest caveats while this is new:
 
 ## Sandboxing
 
-Codex runs its commands inside its own Linux sandbox (bubblewrap), in
-`workspace-write` mode: the session can edit its working directory and reach
-the network, and nothing else. Two host notes:
+Codex runs its commands inside its own Linux sandbox (bubblewrap). Every
+thread and turn selects ccodex's custom `ccodex_workspace` permission profile
+and supplies exactly that session's working directory in
+`runtimeWorkspaceRoots`. The profile permits only Codex's minimal runtime
+files plus that workspace, so other user files on the host are not readable.
+Network remains enabled so git and web work keep working.
+
+There is an important pinned-runtime limitation: Codex 0.144.4 does not enforce
+narrower child rules against arbitrary processes inside a custom writable root.
+A shell command can therefore still modify `.git`, `.agents`, and `.codex`.
+The built-in `:workspace` profile enforces the metadata masks, but also grants
+read access to the whole host; ccodex currently chooses user-file
+confidentiality and documents this
+remaining metadata-integrity gap rather than silently restoring host-wide
+reads. Two host notes:
 
 - The sandbox needs **unprivileged user namespaces**. Some images (notably
   newer GCP Ubuntu) restrict them; every command then fails visibly with
@@ -97,10 +112,9 @@ servers from `~/.codex/config.toml`).
 ## Installing ccodex
 
 This repo is the distribution — the installer takes any repo and directory,
-and checks out the newest ccodex release (the `v*` tags on this repo):
+cryptographically verifies the newest ccodex release tag, and checks it out:
 
-    curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | \
-      ROMP_REPO=https://github.com/lczh/ccodex.git ROMP_DIR=$HOME/ccodex bash
+    curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | bash
 
 Then, in a new terminal, the two setup steps above (`ccodex-setup`,
 `codex login`) — and `ccodex engine codex` if the machine should run
@@ -111,13 +125,25 @@ Codex-only. `ccodex` opens the dashboard.
 Installed machines learn about new releases on their own: the kernel checks
 this repo's tags at boot and every few hours, and the dashboard offers the
 update as a banner — one click fetches the release, reinstalls, and restarts.
+Both bootstrap and the in-app updater require `git verify-tag` at Git's **full**
+trust level to succeed; a bad or unknown signature stops before install or
+restart and never falls back. Git must already trust the maintainer's OpenPGP
+key or SSH allowed-signers entry; see
+[Release signature trust](install.md#release-signature-trust).
 The gear's **Updates** setting picks the behavior: *Check and ask* (default),
 *Install automatically*, or *Off*.
 
-Cutting a release (for whoever maintains this repo): bump `VERSION`, commit
-to `main`, then
+Cutting a release (for whoever maintains this repo) is handled by the release
+script. It derives and validates the GitHub repository from the remote that receives
+the tag, runs the test and macOS gates, creates a signed annotated tag using Git's
+configured signing key, verifies it locally, and publishes the matching release:
 
-    git tag -a v<X.Y.Z> -m "ccodex v<X.Y.Z>" && git push <remote> main --follow-tags
+    scripts/release.sh patch       # or minor, major, or an explicit X.Y.Z
+
+The maintainer must configure `user.signingKey` (and `gpg.format ssh` plus an
+allowed-signers file when using SSH signing) before running the script, and upload the
+same public signing key to GitHub. The historical `v1.0.0` tag is unsigned; after this
+gate merges, cut a new signed release rather than weakening verification.
 
 ccodex versions on its own line (v1.0.0 and up); upstream romp's tags stay
 behind it and are never pushed here, so the updater always resolves the

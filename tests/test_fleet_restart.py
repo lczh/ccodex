@@ -78,16 +78,22 @@ class Plan(unittest.TestCase):
     def test_a_host_strictly_ahead_fast_forwards_THIS_machine_onto_it(self):
         # "make sure that both kernels have the latest code via fast forwarding from each other"
         self._stub(out_of_date=True, pull=True)
-        action, why = km._fleet_restart_plan(row(kernel_sha=REMOTE_SHA))
+        action, why = km._fleet_restart_plan(row(kernel_sha=REMOTE_SHA, trust="trusted"))
         self.assertEqual(action, "sync-pull")
         self.assertIn("ahead", why)
 
     def test_a_pull_is_refused_when_this_checkout_is_not_on_main(self):
         self._stub(out_of_date=True, pull=True)
         km._local_branch = lambda: "some-feature"
-        action, why = km._fleet_restart_plan(row(kernel_sha=REMOTE_SHA))
+        action, why = km._fleet_restart_plan(row(kernel_sha=REMOTE_SHA, trust="trusted"))
         self.assertEqual(action, "skip")
         self.assertIn("isn't on main", why)
+
+    def test_a_nontrusted_ahead_host_is_never_pulled(self):
+        self._stub(out_of_date=True, pull=True, behind=0, ahead=4)
+        action, why = km._fleet_restart_plan(row(kernel_sha=REMOTE_SHA, trust="directed"))
+        self.assertEqual(action, "skip")
+        self.assertIn("not trusted", why)
 
     def test_a_diverged_host_is_skipped_and_the_reason_counts_its_commits(self):
         self._stub(out_of_date=True, behind=3, ahead=4)
@@ -106,10 +112,12 @@ class Plan(unittest.TestCase):
 
     def test_a_checked_in_peer_is_ASKED_because_there_is_no_ssh_route_here(self):
         self._stub(out_of_date=True, ask=True)
-        action, _ = km._fleet_restart_plan(row(checkin_peer=True, kernel_sha=REMOTE_SHA))
+        action, _ = km._fleet_restart_plan(row(checkin_peer=True, kernel_sha=REMOTE_SHA,
+                                                trust="trusted"))
         self.assertEqual(action, "ask")
         self._stub(out_of_date=True, ask=False)
-        action, why = km._fleet_restart_plan(row(checkin_peer=True, kernel_sha=REMOTE_SHA))
+        action, why = km._fleet_restart_plan(row(checkin_peer=True, kernel_sha=REMOTE_SHA,
+                                                  trust="trusted"))
         self.assertEqual(action, "skip")
         self.assertIn("its own dashboard", why)
 
@@ -156,6 +164,9 @@ class ReportSurvivesTheRestart(unittest.TestCase):
         # It rides the block that owns the Restart button itself, so the two can never drift apart.
         js = km._LANDING_SETTINGS_JS
         self.assertIn("window.__rompRestart", js, "the report lives with the button that causes it")
+        self.assertIn("body:'{\"fleet\":false}'", js,
+                      "the routine Restart button never opts into remote code import")
+        self.assertIn('_fleet = False', src, "a bodyless/API restart also defaults local-only")
         self.assertIn("fetch('/fleet-restart'", js)
         self.assertIn("romp:fleetSeen", js)
         self.assertIn("_fleetReport();", js, "and runs on load, after the restart brought the page back")

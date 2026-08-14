@@ -71,6 +71,7 @@ class Fresh(unittest.TestCase):
         jd.STATE = Path(self.td.name)
         km._UPDATE_AVAIL[0] = ""
         km._UPDATE_STATE[0] = ""
+        km._UPDATE_ERROR[0] = ""
         with km._SYNC_LOCK:
             del km._SYNC_NOTICES[:]
 
@@ -261,6 +262,10 @@ class RunUpdate(Fresh):
         # EXACTLY the release commit, never the branch tip (the user 2026-08-09): the tag is fetched
         # by explicit refspec and fast-forwarded onto — an update to v0.7.0 means running v0.7.0
         self.assertIn("git fetch origin refs/tags/v0.7.0:refs/tags/v0.7.0", script)
+        self.assertIn("gpg.minTrustLevel=fully", script)
+        self.assertIn("verify-tag v0.7.0", script)
+        self.assertLess(script.index("verify-tag v0.7.0"), script.index("git merge --ff-only v0.7.0"),
+                        "signature verification is the gate immediately before code moves")
         self.assertIn("git merge --ff-only v0.7.0", script)
         self.assertNotIn("git pull", script, "a pull takes whatever the branch has gained past the tag")
         self.assertIn("./install.sh", script)
@@ -269,6 +274,13 @@ class RunUpdate(Fresh):
         # the failure branch does not
         ok_branch, fail_branch = script.split("else\n", 1)
         self.assertIn("/restart-all", ok_branch)
+        self.assertIn("X-Romp-Manager-Token", ok_branch)
+        self.assertNotIn("$ROMP_MANAGER_TOKEN", ok_branch,
+                         "the manager bearer must not be expanded into curl/process argv")
+        self.assertIn("os.environ.get", ok_branch, "the detached helper reads the token in memory")
+        self.assertIn("http.client.HTTPConnection", ok_branch,
+                      "the localhost control hop must not consult ambient proxy settings")
+        self.assertNotIn("urllib.request", ok_branch)
         self.assertNotIn("/restart-all", fail_branch)
         self.assertEqual(km._UPDATE_STATE[0], "running")
 
@@ -286,6 +298,75 @@ class RunUpdate(Fresh):
         with mock.patch.object(km.subprocess, "Popen"):
             self.assertTrue(km._run_update("v0.7.0"))
             self.assertFalse(km._run_update("v0.7.0"), "one update at a time")
+
+    def test_allowed_signers_path_is_resolved_and_shell_quoted(self):
+        with tempfile.TemporaryDirectory() as td:
+            signers = Path(td) / "release signers"
+            signers.write_text("release@example ssh-ed25519 AAAATEST\n")
+            with mock.patch.dict(km.os.environ, {"ROMP_RELEASE_ALLOWED_SIGNERS": str(signers)}):
+                argv = km._release_verify_argv("v0.7.0")
+            self.assertEqual(argv[:3], ["git", "-c", "gpg.minTrustLevel=fully"])
+            self.assertIn("gpg.ssh.allowedSignersFile=%s" % signers.resolve(), argv)
+            self.assertEqual(argv[-2:], ["verify-tag", "v0.7.0"])
+
+    def test_missing_directory_or_unreadable_allowed_signers_refuses_before_spawn(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(km.subprocess, "Popen", side_effect=AssertionError("must not spawn")):
+            for configured in (str(Path(td) / "missing"), td):
+                km._UPDATE_ERROR[0] = ""
+                with mock.patch.dict(km.os.environ, {"ROMP_RELEASE_ALLOWED_SIGNERS": configured}):
+                    self.assertFalse(km._run_update("v0.7.0"))
+                self.assertIn("readable regular file", km._UPDATE_ERROR[0])
+            signers = Path(td) / "signers"; signers.write_text("synthetic")
+            with mock.patch.dict(km.os.environ, {"ROMP_RELEASE_ALLOWED_SIGNERS": str(signers)}), \
+                 mock.patch.object(km.os, "access", return_value=False):
+                self.assertFalse(km._run_update("v0.7.0"))
+            self.assertIn("readable regular file", km._UPDATE_ERROR[0])
+
+    def _execute_captured_updater(self, verify_rc):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "repo"; root.mkdir()
+            state = Path(td) / "state"; state.mkdir()
+            fakebin = Path(td) / "bin"; fakebin.mkdir()
+            calls = Path(td) / "git-calls"
+            git = fakebin / "git"
+            git.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_CALLS\"\n"
+                           "case \" $* \" in *' verify-tag '*) exit \"$VERIFY_RC\";; esac\nexit 0\n")
+            git.chmod(0o755)
+            install = root / "install.sh"
+            install.write_text("#!/bin/sh\nprintf 'install\\n' >> \"$GIT_CALLS\"\n")
+            install.chmod(0o755)
+            spawned = []
+            env = {k: v for k, v in km.os.environ.items()
+                   if k not in ("ROMP_MANAGER_PORT", "ROMP_RELEASE_ALLOWED_SIGNERS")}
+            env.update(PATH=str(fakebin) + os.pathsep + env.get("PATH", ""),
+                       GIT_CALLS=str(calls), VERIFY_RC=str(verify_rc))
+            with mock.patch.object(km, "ROOT", root), mock.patch.object(km.jd, "STATE", state), \
+                 mock.patch.object(km.subprocess, "Popen", side_effect=lambda *a, **kw: spawned.append(a)), \
+                 mock.patch.dict(km.os.environ, env, clear=True):
+                self.assertTrue(km._run_update("v0.7.0"))
+            script = spawned[0][0][2]
+            ran = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+            rows = calls.read_text().splitlines()
+            report = json.loads((state / "update-report.json").read_text())
+            return ran.returncode, rows, report
+
+    def test_good_signature_verifier_allows_merge_and_install(self):
+        rc, rows, report = self._execute_captured_updater(0)
+        self.assertEqual(rc, 0)
+        self.assertTrue(any("gpg.minTrustLevel=fully" in row and "verify-tag v0.7.0" in row for row in rows))
+        self.assertIn("merge --ff-only v0.7.0", rows)
+        self.assertIn("install", rows)
+        self.assertTrue(report["ok"])
+
+    def test_unsigned_or_bad_tag_stops_before_merge_install_and_restart(self):
+        rc, rows, report = self._execute_captured_updater(1)
+        self.assertEqual(rc, 0, "the detached reporter records a refusal rather than crashing")
+        self.assertTrue(any("gpg.minTrustLevel=fully" in row and "verify-tag v0.7.0" in row for row in rows))
+        self.assertFalse(any(row.startswith("merge ") for row in rows))
+        self.assertNotIn("install", rows)
+        self.assertFalse(report["ok"])
+        self.assertIn("signature verification", report["why"])
 
 
 class ReportConsumption(Fresh):

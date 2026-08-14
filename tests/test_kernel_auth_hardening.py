@@ -16,7 +16,9 @@ Synthetic only — no real session data; the gate decision touches no session st
 Mirrors tests/test_kernel_ws_auth.py's module load order.
 """
 import os
+import io
 import unittest
+from email.message import Message
 from importlib.machinery import SourceFileLoader
 import tempfile
 
@@ -42,7 +44,7 @@ def _inst(peer="127.0.0.1", headers=None):
     (Host / Origin / Cookie / X-Romp-Token)."""
     h = km.Handler.__new__(km.Handler)
     h.client_address = None if peer is None else (peer, 0)
-    h.headers = dict(headers or {})
+    h.headers = headers if hasattr(headers, "get_all") else dict(headers or {})
     return h
 
 
@@ -87,9 +89,31 @@ class TokenRequiredEverywhere(unittest.TestCase):
         self.assertEqual(cookie, TOK)     # ?token= sets the cookie so the browser never re-prompts
 
     def test_cookie_authorizes(self):
-        ok, cookie, _ = _auth(headers={"Cookie": "romp_token=" + TOK})
+        ok, cookie, _ = _auth(headers={"Cookie": "romp_token=" + TOK,
+                                        "Host": "127.0.0.1:29855",
+                                        "Origin": "http://127.0.0.1:29855"})
         self.assertTrue(ok)
         self.assertIsNone(cookie)         # already has it — no re-set
+
+    def test_cookie_requires_browser_provenance_and_rejects_cross_port_localhost(self):
+        ok, _, why = _auth(headers={"Cookie": "romp_token=" + TOK})
+        self.assertFalse(ok)
+        self.assertIn("browser provenance", why)
+        ok, _, why = _auth(headers={"Cookie": "romp_token=" + TOK,
+                                     "Host": "127.0.0.1:29855",
+                                     "Origin": "http://127.0.0.1:39999"})
+        self.assertFalse(ok, "a page on another localhost port receives host cookies but is not same-origin")
+        self.assertIn("browser provenance", why)
+
+    def test_cookie_navigation_and_reload_use_fetch_metadata(self):
+        for fetch_site in ("none", "same-origin"):
+            ok, _, why = _auth(headers={"Cookie": "romp_token=" + TOK,
+                                         "Sec-Fetch-Site": fetch_site})
+            self.assertTrue(ok, "%s is valid browser provenance: %s" % (fetch_site, why))
+        for fetch_site in ("same-site", "cross-site", ""):
+            ok, _, _ = _auth(headers={"Cookie": "romp_token=" + TOK,
+                                       "Sec-Fetch-Site": fetch_site})
+            self.assertFalse(ok, "%s must not authorize a host-wide cookie" % (fetch_site or "missing"))
 
     def test_header_authorizes(self):
         # X-Romp-Token: the CLI/hook/daemon form (read from the 0600 file). Safe to accept
@@ -117,6 +141,60 @@ class TokenRequiredEverywhere(unittest.TestCase):
         ok, _, why = _auth(peer="100.92.170.123")
         self.assertFalse(ok)
         self.assertIn("token", why)
+
+
+class PostBodyGate(unittest.TestCase):
+    class NoRead(io.BytesIO):
+        def __init__(self):
+            super().__init__(b"")
+            self.called = False
+
+        def read(self, *args, **kwargs):
+            self.called = True
+            raise AssertionError("body must not be read")
+
+    def _post(self, headers):
+        h = _inst(headers=headers)
+        h.path = "/send"
+        h.rfile = self.NoRead()
+        h.close_connection = False
+        h._send = lambda code, body, ctype, **kwargs: code
+        return h, h.do_POST()
+
+    def test_unauthenticated_post_is_rejected_before_body_read(self):
+        h, code = self._post({"Content-Length": str(km._POST_MAX_BYTES + 1)})
+        self.assertEqual(code, 403)
+        self.assertFalse(h.rfile.called)
+        self.assertTrue(h.close_connection)
+
+    def test_authenticated_oversize_post_is_rejected_before_body_read(self):
+        h, code = self._post({"X-Romp-Token": TOK,
+                              "Content-Length": str(km._POST_MAX_BYTES + 1)})
+        self.assertEqual(code, 413)
+        self.assertFalse(h.rfile.called)
+        self.assertTrue(h.close_connection)
+
+    def test_authenticated_transfer_encoding_is_rejected_without_read(self):
+        h, code = self._post({"X-Romp-Token": TOK, "Transfer-Encoding": "chunked"})
+        self.assertEqual(code, 413)
+        self.assertFalse(h.rfile.called)
+        self.assertTrue(h.close_connection)
+
+    def test_duplicate_content_length_is_rejected_without_read(self):
+        headers = Message()
+        headers.add_header("X-Romp-Token", TOK)
+        headers.add_header("Content-Length", "0")
+        headers.add_header("Content-Length", "1")
+        h, code = self._post(headers)
+        self.assertEqual(code, 400)
+        self.assertFalse(h.rfile.called)
+        self.assertTrue(h.close_connection)
+
+    def test_non_decimal_content_length_is_rejected_without_read(self):
+        h, code = self._post({"X-Romp-Token": TOK, "Content-Length": "+1"})
+        self.assertEqual(code, 400)
+        self.assertFalse(h.rfile.called)
+        self.assertTrue(h.close_connection)
 
 
 if __name__ == "__main__":

@@ -91,6 +91,15 @@ by the ssh tunnel the message arrives on — no separate signing. The gate is
 enforced at the receiving bus's delivery point, so it holds regardless of which
 host originated the message (a forwarded message is judged by its true origin).
 
+**Check-in / “Share my sessions there” is trusted-only administrative
+delegation.** The machine that checks in opens a reverse ssh tunnel and hands
+the hub its kernel credential. That combination gives the hub authenticated
+access to Romp's session and administrative control routes on the checked-in
+machine; it is not merely a one-way session listing. Both ends must mark the
+other host **trusted**, and you should enable it only for a hub you fully
+control—not rented or shared compute. Checking out, or lowering the trust level,
+withdraws the share and tears down the reverse route.
+
 The one thing romp can NOT firewall this way is same-machine peers: two sessions
 running as the same user share a UID, so mailbox trust between them is policy,
 not a security boundary (the enforceable lines are per-UID, from the serve token,

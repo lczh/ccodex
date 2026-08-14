@@ -1806,6 +1806,7 @@ def _set_auto_nudge(enabled):
 # machines. `romp update [host]` remains the other direction (pushing THIS build to remotes).
 _UPDATE_AVAIL = [""]     # newest remote release tag when newer than ours ("" = none/unknown)
 _UPDATE_STATE = [""]     # "" | "running" — one update at a time; the banner reads this
+_UPDATE_ERROR = [""]     # synchronous policy refusal (for /update + /update-check), cleared on a valid launch
 _UPDATE_MODES = ("ask", "auto", "off")
 
 
@@ -1848,6 +1849,31 @@ def _latest_release_tag():
     return best
 
 
+def _release_verify_argv(tag):
+    """Exact fail-closed tag-verification command for the detached updater.
+
+    Git auto-detects the tag's signature format.  SSH signatures need an allowed-signers file; when
+    ROMP_RELEASE_ALLOWED_SIGNERS is set, resolve it now and refuse anything except a readable regular
+    file rather than passing a typo to the child and hoping another trust store applies.
+    """
+    if not _semver(tag):
+        raise ValueError("release tag is not a plain semantic version")
+    # `git verify-tag` verifies cryptographic validity but, for OpenPGP, otherwise accepts an
+    # imported key whose ownertrust is undefined.  Code installation requires a fully trusted
+    # signer, matching SSH allowed-signers semantics.
+    argv = ["git", "-c", "gpg.minTrustLevel=fully"]
+    configured = (os.environ.get("ROMP_RELEASE_ALLOWED_SIGNERS") or "").strip()
+    if configured:
+        try:
+            signers = Path(configured).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise ValueError("ROMP_RELEASE_ALLOWED_SIGNERS must name a readable regular file")
+        if not signers.is_file() or not os.access(str(signers), os.R_OK):
+            raise ValueError("ROMP_RELEASE_ALLOWED_SIGNERS must name a readable regular file")
+        argv += ["-c", "gpg.ssh.allowedSignersFile=%s" % signers]
+    return argv + ["verify-tag", tag]
+
+
 def _run_update(tag):
     """Start the self-update: fetch the tag, fast-forward EXACTLY onto it, install, report (+ restart
     on success), in a DETACHED child. Returns True when the child was launched. The tree lands on the
@@ -1859,23 +1885,46 @@ def _run_update(tag):
     shell script."""
     if not _semver(tag) or _UPDATE_STATE[0] == "running":
         return False
+    try:
+        verify_argv = _release_verify_argv(tag)
+    except ValueError as e:
+        why = str(e)
+        _UPDATE_ERROR[0] = why
+        try:
+            _atomic_write(jd.STATE / "update-report.json", json.dumps(
+                {"ok": False, "tag": tag, "why": why}))
+            _consume_update_report()
+        except Exception:
+            sys.stderr.write("romp-kernel: update refused: %s\n" % why)
+        return False
+    _UPDATE_ERROR[0] = ""
     _UPDATE_STATE[0] = "running"
     q = shlex.quote
     log, rep = q(str(jd.STATE / "update.log")), q(str(jd.STATE / "update-report.json"))
     mport = os.environ.get("ROMP_MANAGER_PORT") or ""
-    restart = ("  curl -s -X POST http://127.0.0.1:%d/restart-all >/dev/null 2>&1\n" % int(mport)) if mport.isdigit() \
+    # Keep the control token out of argv/process listings: the helper reads it from its inherited
+    # environment and constructs the HTTP header in memory. The Python program and port are public.
+    manager_post = ("import http.client,os,sys;"
+                    "c=http.client.HTTPConnection('127.0.0.1',int(sys.argv[1]),timeout=4);"
+                    "c.request('POST','/restart-all',headers={'X-Romp-Manager-Token':"
+                    "os.environ.get('ROMP_MANAGER_TOKEN','')});"
+                    "r=c.getresponse();r.read();c.close();sys.exit(0 if r.status<400 else 1)")
+    restart = ("  %s -c %s %d >/dev/null 2>&1\n" %
+               (q(sys.executable), q(manager_post), int(mport))) if mport.isdigit() \
         else "  : # no manager — the new code arms on the next romp start (the report says so)\n"
     ok_rep = {"ok": True, "tag": tag, "restarted": bool(mport.isdigit())}
     script = (
         "cd %s || exit 1\n" % q(str(ROOT))
         + "{ echo; echo \"== romp self-update to %s ==\"; date; } >> %s 2>&1\n" % (tag, log)
-        + "if git fetch origin refs/tags/%s:refs/tags/%s >> %s 2>&1 && git merge --ff-only %s >> %s 2>&1 "
-          "&& ./install.sh >> %s 2>&1; then\n" % (tag, tag, log, tag, log, log)
+        + "if git fetch origin refs/tags/%s:refs/tags/%s >> %s 2>&1 && %s >> %s 2>&1 "
+          "&& git merge --ff-only %s >> %s 2>&1 && ./install.sh >> %s 2>&1; then\n"
+          % (tag, tag, log, " ".join(q(x) for x in verify_argv), log, tag, log, log)
         + "  printf '%%s' %s > %s\n" % (q(json.dumps(ok_rep)), rep)
         + restart
         + "else\n"
         + "  printf '%%s' %s > %s\n" % (q(json.dumps({"ok": False, "tag": tag,
-                                                      "why": "the fetch, fast-forward or install failed"})), rep)
+                                                      "why": "the fetch, signature verification, "
+                                                             "fast-forward or install failed"})), rep)
         + "fi\n")
     subprocess.Popen(["bash", "-c", script], start_new_session=True, cwd=str(ROOT),
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -5190,10 +5239,18 @@ def _drive(msg, client):
         # Mid-turn (or behind an existing queue) the click PARKS as a queued /compact chip and fires when
         # the turn ends (the user 2026-07-02, who saw the icon blink with nothing happening while working — now
         # the queued chip IS the acknowledgement, and later messages chain behind it in press order).
-        if _ops_gate(sid):
-            _park_op(sid, ("compact",))
-        else:
-            be.send(sid, "/compact"); _mark_compacting(sid)   # idle → /compact now + the instant 'compacting' cue
+        with _pending_ops_lock:                       # gate + handoff share the drive-op ordering lock
+            if _ops_gate(sid):
+                _park_op(sid, ("compact",))
+            else:
+                try:
+                    accepted = bool(be.send(sid, "/compact"))
+                except Exception:
+                    accepted = False
+                if accepted:
+                    _mark_compacting(sid)             # idle → /compact now + the instant 'compacting' cue
+                else:
+                    _park_op(sid, ("compact",))       # refusal is retryable, never a fake compacting state
     elif t == "sendCommand" and msg.get("cmd"):
         cmd = str(msg["cmd"]).strip()                     # the timeline lane menu sends "/model X" / "/effort X"
         if cmd.startswith("/model "):
@@ -5754,7 +5811,7 @@ class TmuxBackend(sb.SessionBackend):
         if not self.available():          # no tmux → nothing to rename; stay inert like every primitive above
             return
         try:
-            subprocess.run(["tmux", "rename-session", "-t", old, new], timeout=t,
+            subprocess.run(self._tmux_argv(["rename-session", "-t", old, new]), timeout=t,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             sys.stderr.write("tmux rename '%s': %s\n" % (old, traceback.format_exc()))
@@ -6634,7 +6691,8 @@ def _tunnel_argv(r):
             # CHECK-IN (stage 3): the SAME outbound ssh also publishes this machine to the hub —
             # reverse forwards land our kernel + bus on the hub's loopback, and the handshake
             # (_checkin_handshake, once per tunnel incarnation) tells it the ports + hands over our
-            # token. All credentials flow OUTWARD: the hub never holds a way into this machine.
+            # token. That credential is an administrative path back through the reverse forward,
+            # which is why check-in is restricted to a host explicitly marked trusted.
             argv += ["-R", "%d:127.0.0.1:%d" % (r["rk_port"], PORT),
                      "-R", "%d:127.0.0.1:%d" % (r["rb_port"], BUS_PORT)]
         return argv + ["--", r["host"]]
@@ -6882,6 +6940,8 @@ def checkin_set(host, on):
         r = _remotes.get(host)
         if r is None:
             return None
+        if on and (r.get("trust") or "directed") != "trusted":
+            raise PermissionError("Share my sessions is available only for a trusted host")
         r["checkin"] = bool(on)
         if on:
             r.setdefault("rk_port", _free_port())
@@ -6923,13 +6983,38 @@ def set_trust(host, level):
     host = (host or "").strip()
     if not host:
         return None, "host required"
+    stop_outbound = stop_inbound = False
+    stop_row, proc = None, None
     with _remotes_lock:
         r = _remotes.get(host)
         if r is not None:
             r["trust"] = level
+            if level != "trusted" and r.get("checkin"):
+                # Check-in hands this machine's administrative credential + reverse forwards to
+                # the host.  A downgrade is the revocation event: notify it, remove the forwards by
+                # bouncing ssh, and forget the persisted share flag.
+                r["checkin"] = False
+                r.pop("_handshook", None)
+                stop_outbound, stop_row, proc = True, dict(r), r.get("proc")
+            if level != "trusted" and r.get("checkin_peer"):
+                # The inverse relationship leaves that machine's main token in this process.  Drop
+                # the row immediately; a later handshake is refused until explicitly trusted again.
+                stop_inbound = True
     if r is None:
         _known_note(host, level)           # the remembered entry IS the origin-trust store
         _notify_bus_origin_trust(host, level)   # best-effort now; the supervisor pass retries
+        return {"host": host, "trust": level, "originOnly": True}, None
+    if stop_outbound:
+        _checkin_stop_hub(stop_row)
+        if proc:
+            try:
+                proc.terminate()           # supervisor respawns the same attachment without -R
+            except Exception:
+                pass
+        _known_note(host, level, share=False, attached=True)
+    if stop_inbound:
+        detach_remote(host)                # removes the pushed token + tells the postal bus it is down
+        _known_note(host, level, share=False, attached=True)
         return {"host": host, "trust": level, "originOnly": True}, None
     _remotes_save()
     _known_note(host, level)               # the remembered entry tracks the level, so a re-attach keeps it
@@ -7085,10 +7170,18 @@ def tunnels_of(host):
     st, j, err = _remote_kernel_call(r, "GET", "/tunnels", timeout=6)
     if err or not isinstance(j, dict):
         return {"ok": False, "error": err or ("HTTP %s from %s" % (st, host))}
-    j = dict(j)
-    j["ok"] = True
-    j["of"] = host
-    return j
+    # The far kernel is authenticated with the credential we hold for it, but it is still a
+    # separate trust domain: every byte in its JSON can be chosen by that machine.  Do not pass
+    # its response through to browser renderers.  In particular, the web panel historically built
+    # these rows with innerHTML, so a hostile kernelVer/host/status was stored XSS in this dashboard.
+    rows = []
+    raw_rows = j.get("tunnels")
+    if isinstance(raw_rows, list):
+        for raw in raw_rows[:128]:
+            row = _remote_payload_public_row(raw)
+            if row is not None:
+                rows.append(row)
+    return {"ok": True, "of": host, "tunnels": rows}
 
 
 # Forwarded row actions block on the via machine's own ssh work; update/start push code and wait
@@ -7174,10 +7267,13 @@ def checkin_apply(body):
 
     def _bad(p):
         return not isinstance(p, int) or isinstance(p, bool) or not (0 < p < 65536)
-    if not host or _bad(kp) or _bad(bp):
+    if not _safe_id(host) or _bad(kp) or _bad(bp):
         return {"ok": False, "error": "host, kernelPort, busPort required"}, 400
     tok = str((body or {}).get("token") or "")
+    if not tok or len(tok) > 512:
+        return {"ok": False, "error": "a bounded serve token is required"}, 400
     with _remotes_lock:
+        rename_old = None
         if tok:
             for oh, o in list(_remotes.items()):
                 if o.get("token") != tok:
@@ -7190,7 +7286,7 @@ def checkin_apply(body):
                     # incarnation, and there is nothing here to fix (the user 2026-07-27).
                     return {"ok": True, "host": oh, "alreadyAttached": True}, 200
                 if oh != host:
-                    _remotes.pop(oh, None)         # same mobile re-checking in under a new name
+                    rename_old = oh               # remove only after the NEW identity clears trust below
         r = _remotes.get(host)
         if r is not None and not r.get("checkin_peer"):
             return {"ok": False, "error": "host '%s' is already an ssh-attached remote here" % host}, 409
@@ -7203,6 +7299,11 @@ def checkin_apply(body):
         # (The mismatch is invisible from the other end: the level a peer DECLARES is read from its own
         # row, so the sending side went on showing 'trusted' while the receiver quarantined its mail.)
         trust = (r or {}).get("trust") or known_trust(host) or "directed"
+        if trust != "trusted":
+            return {"ok": False, "error": ("check-in from '%s' is not authorized — set that host to "
+                                             "trusted first" % host)}, 403
+        if rename_old:
+            _remotes.pop(rename_old, None)         # same trusted mobile re-checking in under a new name
         _remotes[host] = {"host": host, "checkin_peer": True, "kernel_port": kp, "local_port": kp,
                           "bus_port": bp, "token": str((body or {}).get("token") or ""),
                           "trust": trust,
@@ -7370,6 +7471,121 @@ def _tunnel_status(proc_alive, port_up, remote_answered):
     return "starting"
 
 
+_REMOTE_PUBLIC_STATUSES = frozenset(("up", "authorizing", "connecting", "starting",
+                                     "no-kernel", "down", "error"))
+_REMOTE_PUBLIC_PHASES = frozenset(("pushing", "waiting", "failed", "pulling", "asking", "pulled"))
+_PUBLIC_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}(?:-dirty)?$")
+_PUBLIC_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+_PUBLIC_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+
+
+def _bounded_public_text(value, cap=512):
+    """A bounded display string for a DOM text-node sink; reject containers and strip controls."""
+    if not isinstance(value, str):
+        return ""
+    return "".join(c for c in value[:cap] if c >= " " or c in "\t\n")
+
+
+def _public_sha(value):
+    value = value if isinstance(value, str) else ""
+    return value.lower() if _PUBLIC_SHA_RE.fullmatch(value) else ""
+
+
+def _public_version(value):
+    value = value if isinstance(value, str) else ""
+    return value if _PUBLIC_VERSION_RE.fullmatch(value) else ""
+
+
+def _public_nonnegative_int(value, cap=2 ** 31 - 1, default=0):
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        pass
+    elif isinstance(value, float) and value.is_integer():
+        value = int(value)
+    else:
+        return default
+    return value if 0 <= value <= cap else default
+
+
+def _public_optional_count(value):
+    if value is None:
+        return None
+    return _public_nonnegative_int(value, cap=10 ** 7, default=None)
+
+
+def _public_timestamp(value):
+    """A bounded epoch timestamp, accepting legacy time.time() floats and publishing whole seconds."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    # Comparisons reject NaN and infinities without importing another module.  Truncation preserves
+    # the prior API's `int(time.time())` semantics for persisted rows written by older kernels.
+    if not (0 <= value <= 2 ** 53 - 1):
+        return 0
+    return int(value)
+
+
+def _public_port(value):
+    return _public_nonnegative_int(value, cap=65535, default=0)
+
+
+def _public_auto_push(value):
+    if not isinstance(value, dict) or value.get("phase") not in _REMOTE_PUBLIC_PHASES:
+        return None
+    return {"phase": value["phase"],
+            "detail": _bounded_public_text(value.get("detail"), 1024),
+            "at": _public_timestamp(value.get("at"))}
+
+
+def _remote_payload_public_row(raw):
+    """Schema the public row supplied by another kernel before it crosses into this browser.
+
+    An attached machine is an authenticated administrative endpoint, not a source of trusted HTML.
+    Keep only fields the two remote panels consume, require safe alphabets for every value later
+    interpolated into markup, require exact JSON booleans for action gates, and omit credentials and
+    unknown extension fields.  Invalid host rows are dropped rather than rendered or actioned.
+    """
+    if not isinstance(raw, dict):
+        return None
+    host = raw.get("host")
+    if not _safe_ssh_host(host):
+        return None
+    status = raw.get("status") if raw.get("status") in _REMOTE_PUBLIC_STATUSES else "error"
+    trust = raw.get("trust") if raw.get("trust") in TRUST_LEVELS else "directed"
+    date = raw.get("kernelDate") if isinstance(raw.get("kernelDate"), str) else ""
+    date = date if _PUBLIC_DATE_RE.fullmatch(date) else ""
+    sids = raw.get("sids") if isinstance(raw.get("sids"), list) else []
+    return {
+        "host": host,
+        "kernelPort": _public_port(raw.get("kernelPort")),
+        "localPort": _public_port(raw.get("localPort")),
+        "busPort": _public_port(raw.get("busPort")),
+        "checkin": raw.get("checkin") is True,
+        "checkinPeer": raw.get("checkinPeer") is True,
+        "hasToken": raw.get("hasToken") is True,
+        "status": status,
+        "detail": _bounded_public_text(raw.get("detail"), 1024),
+        "sids": [sid for sid in sids[:512] if isinstance(sid, str) and _safe_id(sid)],
+        "trust": trust,
+        "kernelSha": _public_sha(raw.get("kernelSha")),
+        "localSha": _public_sha(raw.get("localSha")),
+        "kernelVer": _public_version(raw.get("kernelVer")),
+        "localVer": _public_version(raw.get("localVer")),
+        "outOfDate": raw.get("outOfDate") is True,
+        "behindBy": _public_optional_count(raw.get("behindBy")),
+        "aheadBy": _public_optional_count(raw.get("aheadBy")),
+        "kernelDate": date,
+        "fastForward": raw.get("fastForward") is True,
+        "fastPull": raw.get("fastPull") is True,
+        "askPull": raw.get("askPull") is True,
+        "autoPush": _public_auto_push(raw.get("autoPush")),
+        "fails": _public_nonnegative_int(raw.get("fails"), cap=10 ** 6),
+        "nextTry": _public_timestamp(raw.get("nextTry")),
+        "stale": raw.get("stale") is True,
+        "lastOk": _public_timestamp(raw.get("lastOk")),
+    }
+
+
 def _remote_public(r):
     """The API view of a remote row — everything the browser needs to open its own WS, minus the Popen.
     kernelSha/localSha/outOfDate let the dashboard flag a remote running older code + offer to update it;
@@ -7382,32 +7598,49 @@ def _remote_public(r):
     Keep sending the cached values (they remain the best available answer, and the row should not go blank)
     but SAY they are remembered and when they were last confirmed, so the UI can mark them instead of
     passing memory off as fact."""
-    ood = _remote_out_of_date(r)
-    drift = _behind_info(r.get("kernel_sha") or "") if ood else {"behind": 0, "ahead": 0, "date": ""}
-    stale = (r.get("status") or "down") != "up"
+    # kernel_sha/kernel_ver are populated from the far kernel's /version response.  Validate again
+    # here so persisted rows from an older build cannot reach git argv construction or HTML sinks.
+    remote_sha = _public_sha(r.get("kernel_sha"))
+    remote_ver = _public_version(r.get("kernel_ver"))
+    safe_r = dict(r)
+    safe_r["kernel_sha"] = remote_sha
+    ood = _remote_out_of_date(safe_r)
+    drift = _behind_info(remote_sha) if ood else {"behind": 0, "ahead": 0, "date": ""}
+    status = r.get("status") if r.get("status") in _REMOTE_PUBLIC_STATUSES else "error"
+    stale = status != "up"
     # ONE commit, ONE version (the user 2026-08-02, reading "v0.3.0 4a0beaa" here and "v0.2.0+ 4a0beaa"
     # for a host on that same commit). The release is a property of the CODE, so two machines at one
     # commit cannot honestly be on two releases: the remote is simply naming it from a tag graph its
     # clone never received (see _kernel_ver — tags don't travel with a pushed commit, and a remote
     # running a kernel from before that fix keeps reporting the old way forever). When the shas agree,
     # this machine's name for that commit is the one both rows wear.
-    ver = r.get("kernel_ver") or ""
-    if _shas_agree(r.get("kernel_sha"), _local_head(short=True)):
-        ver = _kernel_ver() or ver
-    return {"host": r["host"], "kernelPort": r["kernel_port"], "localPort": r["local_port"],
-            "busPort": r.get("bus_port") or 0,   # peer-bus mode: a restarted bus reseeds its peer table from this
+    ver = remote_ver
+    if _shas_agree(remote_sha, _local_head(short=True)):
+        ver = _public_version(_kernel_ver()) or ver
+    local_sha = _public_sha(_local_head(short=True) or _kernel_sha())
+    local_ver = _public_version(_kernel_ver())
+    auto_push = _public_auto_push(_auto_push_state(r["host"]))
+    return {"host": r["host"], "kernelPort": _public_port(r.get("kernel_port")),
+            "localPort": _public_port(r.get("local_port")),
+            "busPort": _public_port(r.get("bus_port")),   # peer-bus mode: a restarted bus reseeds its peer table from this
             "checkin": bool(r.get("checkin")),           # we publish ourselves to this hub (stage 3)
             "checkinPeer": bool(r.get("checkin_peer")),  # this host checked in to US (no ssh of ours)
-            "token": r.get("token") or "", "status": r.get("status") or "down",
-            "detail": r.get("detail") or "", "sids": list(r.get("sids") or []),
-            "trust": r.get("trust") or "directed",   # per-host federation trust: trusted|directed|isolated
-            "kernelSha": r.get("kernel_sha") or "", "localSha": (_local_head(short=True) or _kernel_sha() or ""),
+            # The browser talks to remote kernels through this kernel's authenticated relays, which
+            # inject the remote credential server-side.  Publish only capability state, never the
+            # reusable remote/check-in token itself.
+            "hasToken": bool(r.get("token")), "status": status,
+            "detail": _bounded_public_text(r.get("detail"), 1024),
+            "sids": [sid for sid in list(r.get("sids") or [])[:512]
+                     if isinstance(sid, str) and _safe_id(sid)],
+            "trust": r.get("trust") if r.get("trust") in TRUST_LEVELS else "directed",
+            "kernelSha": remote_sha, "localSha": local_sha,
             # The RELEASE each side descends from (the user 2026-07-30): a sha alone says nothing without
             # your own sha in your head, and the whole point of the row is a comparison. "" when the remote
             # kernel predates the field — the row then shows the sha alone rather than guessing a version.
-            "kernelVer": ver, "localVer": (_kernel_ver() or ""),
-            "outOfDate": ood, "behindBy": drift["behind"], "aheadBy": drift["ahead"],
-            "kernelDate": drift["date"],
+            "kernelVer": ver, "localVer": local_ver,
+            "outOfDate": ood, "behindBy": _public_optional_count(drift["behind"]),
+            "aheadBy": _public_optional_count(drift["ahead"]),
+            "kernelDate": (drift["date"] if _PUBLIC_DATE_RE.fullmatch(str(drift["date"] or "")) else ""),
             # fastForward: a push here would only ADD commits (the remote's is an ancestor of ours) — the
             # exact condition the automatic update fires on, so the row can say why it will or won't.
             # autoPush: that host's live phase (pushing / waiting / failed) → the popover's progress line and
@@ -7417,15 +7650,17 @@ def _remote_public(r):
             # askPull: a CHECKED-IN peer that is strictly behind. No ssh runs from here, so a push can
             # only be refused — the row offers "tell it to update itself" instead (_ask_peer_to_pull),
             # which is the one route that exists between the two machines (the user 2026-07-28).
-            "fastForward": _is_fast_forward(r), "fastPull": _is_fast_pull(r), "askPull": _is_ask_pull(r),
-            "autoPush": _auto_push_state(r["host"]),
+            "fastForward": _is_fast_forward(safe_r), "fastPull": _is_fast_pull(safe_r),
+            "askPull": _is_ask_pull(safe_r),
+            "autoPush": auto_push,
             # reconnect state (the user 2026-07-22, kept when the give-up went away 2026-07-29): a
             # forever-retry must never look identical to a healthy idle row, so the popover can say how
             # many dials have failed and when the next one lands.
-            "fails": int(r.get("fails") or 0), "nextTry": int(r.get("next_try") or 0),
+            "fails": _public_nonnegative_int(r.get("fails"), cap=10 ** 6),
+            "nextTry": _public_timestamp(r.get("next_try")),
             # not live: everything above derived from kernel_sha / the peer's declared tier is a memory of
             # the last successful exchange. lastOk is when that was (0 = never seen up this process).
-            "stale": stale, "lastOk": int(r.get("last_ok") or 0)}
+            "stale": stale, "lastOk": _public_timestamp(r.get("last_ok"))}
 
 
 _remotes_saved_sig = None   # signature of the last blob written — lets the supervisor save ONLY on a real
@@ -7504,6 +7739,10 @@ def _remotes_load():
             r.pop("gave_up", None)             #   a long backoff (and drops any pre-2026-07-29 give-up)
             r.setdefault("sids", [])
             r.setdefault("trust", "directed")   # pre-trust remotes.json rows read as directed (safe default)
+            if r.get("trust") != "trusted":
+                r["checkin"] = False             # migrate stale share flags below the new credential boundary
+                if r.get("checkin_peer"):
+                    continue                      # never rehydrate a downgraded row carrying a peer token
             r.setdefault("kernel_port", _REMOTE_KERNEL_PORT)
             r.setdefault("local_port", _free_port())
             r.setdefault("bus_port", _free_port())   # peer-bus mode's -L to the remote's bus (allocated
@@ -7534,7 +7773,7 @@ def attach_remote(host, kernel_port=None):
                  # coming back unchecked): detach pops the row, so without this memory a re-attach
                  # rebuilt it with the publish turned off. The reverse-forward ports go with it —
                  # the tunnel argv needs them at spawn, and checkin_set is not what runs here.
-                 "checkin": known_share(host),
+                 "checkin": bool(known_share(host) and known_trust(host) == "trusted"),
                  # phase the browser popover surfaces: authorizing (ssh + token) → connecting
                  # (tunnel up, waiting for the port) → up. See _LANDING_REMOTES_JS's LBL map.
                  "status": "authorizing", "detail": "", "sids": []}
@@ -7853,8 +8092,13 @@ def _poll_remote_version(r):
         if resp.status != 200:
             return None
         j = json.loads(data.decode("utf-8")) or {}
-        sha = j.get("kernel_sha") or None
-        return {"sha": sha, "ver": str(j.get("kernel_ver") or "")} if sha else None
+        if not isinstance(j, dict):
+            return None
+        # This response comes from another machine.  Only a hexadecimal commit name and a
+        # markup-safe release atom enter persisted remote state; invalid metadata is not allowed
+        # to become either a git revision argument or browser HTML on later /tunnels reads.
+        sha = _public_sha(j.get("kernel_sha"))
+        return {"sha": sha, "ver": _public_version(j.get("kernel_ver"))} if sha else None
     except Exception:
         return None
 
@@ -7948,6 +8192,28 @@ def _shas_agree(a, b):
     other — the remote and local shorten independently). Both must be non-empty; '-dirty' is ignored."""
     a, b = _sha_base(a), _sha_base(b)
     return bool(a and b and (a.startswith(b) or b.startswith(a)))
+
+
+def _exact_commit_pin(value):
+    """Resolve a displayed/abbreviated SHA to one exact 40-hex commit already known locally.
+
+    A full SHA is already unambiguous (and may name the ahead commit before this checkout has its
+    object). Short values from /version must resolve uniquely in the local object database; otherwise
+    they are not a code-source pin. This strict helper is for fetch/execute authorization only — UI
+    drift comparisons deliberately remain abbreviation-tolerant in _shas_agree.
+    """
+    base = _sha_base(value).lower()
+    if not re.fullmatch(r"[0-9a-f]{7,40}", base or ""):
+        return ""
+    if len(base) == 40:
+        return base
+    try:
+        r = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--verify", "--quiet",
+                            base + "^{commit}"], capture_output=True, text=True, timeout=10)
+        full = (r.stdout or "").strip().lower() if r.returncode == 0 else ""
+        return full if re.fullmatch(r"[0-9a-f]{40}", full) else ""
+    except Exception:
+        return ""
 
 
 def _remote_out_of_date(r):
@@ -8110,7 +8376,9 @@ def _auto_pull_remote(host):
     removes it. Failures stay visible and red, exactly like a failed push."""
     _set_auto_push(host, "pulling", "pulling %s's newer commits over SSH" % host)
     try:
-        ok, detail = _pull_remote(host)
+        with _remotes_lock:
+            expected = (_remotes.get(host) or {}).get("kernel_sha") or ""
+        ok, detail = _pull_remote(host, expected_sha=expected)
     except Exception as e:
         ok, detail = False, str(e)
     _set_auto_push(host, "pulled" if ok else "failed", detail or ("" if ok else "pull failed"))
@@ -8348,7 +8616,9 @@ def _is_fast_pull(r):
     known. The mirror of _is_fast_forward, for the other direction (the user 2026-07-27: the attaching
     side owns BOTH directions of sync — the remote has no ssh route back). None is NOT zero, same as
     the push gate: an unprovable relationship is exactly what must not be pulled automatically."""
-    if not _remote_out_of_date(r):
+    # Pulling imports and then executes the peer's code here.  Unlike a push, that is a trust
+    # decision as well as a graph decision; directed/isolated hosts can never be code sources.
+    if (r.get("trust") or "directed") != "trusted" or not _remote_out_of_date(r):
         return False
     d = _behind_info(r.get("kernel_sha") or "")
     b, a = d.get("behind"), d.get("ahead")
@@ -8367,7 +8637,7 @@ def _local_branch():
         return ""
 
 
-def _pull_remote(host):
+def _pull_remote(host, expected_sha=None):
     """PEER-TO-PEER pull — the other direction of _update_remote (the user 2026-07-27, who wanted sync
     to ride the attaching side's own ssh: the remote pushing back can only fail, connectivity is
     one-way). Fetch the remote clone's committed HEAD over the same BatchMode ssh and FAST-FORWARD the
@@ -8384,6 +8654,9 @@ def _pull_remote(host):
     if _rr is not None and _rr.get("checkin_peer"):
         return False, ("no ssh path to %s from this machine (it checked in here over its own tunnel) — "
                        "sync from that machine's own dashboard" % host)
+    if ((_rr or {}).get("trust") or "directed") != "trusted":
+        return False, ("refusing to pull executable code from %s while it is not trusted — mark it "
+                       "trusted only if you control it" % host)
     lfull = _local_head()
     if not lfull:
         return False, "local kernel isn't a git checkout — nowhere to pull to"
@@ -8394,9 +8667,19 @@ def _pull_remote(host):
         return False, str(e)[:200]
     if (st.stdout or "").strip():
         return False, "this machine's tree has uncommitted changes — commit or stash them first (won't clobber)"
+    expected = _exact_commit_pin(expected_sha or ((_rr or {}).get("kernel_sha") or ""))
+    if not expected:
+        return False, ("refusing to pull executable code from %s without an exact, unambiguous "
+                       "expected commit — refresh its build first" % host)
     rdir, rhead, _rdirty, derr = _discover_remote_clone(host)   # a DIRTY remote is fine: we take its COMMITS
     if derr:
         return False, derr
+    rhead = str(rhead or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", rhead):
+        return False, "the remote clone did not report one exact commit"
+    if rhead != expected:
+        return False, ("%s changed build after it was polled (expected %s, now %s) — refresh and try again"
+                       % (host, expected[:12], rhead[:12]))
     if rhead and rhead == lfull:
         return True, "already up to date (%s)" % (_local_head(short=True) or lfull[:8])
     env = dict(os.environ, GIT_SSH_COMMAND="%s %s" % (SSH_BIN, " ".join(_SSH_OPTS)))
@@ -8408,6 +8691,17 @@ def _pull_remote(host):
     if f.returncode != 0:
         return False, "git fetch from %s failed: %s" % (host, (_ssh_err(f.stderr) or f.stdout or "").strip()[:160])
     try:
+        fetched = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "FETCH_HEAD"],
+                                 capture_output=True, text=True, timeout=10)
+        fetched_sha = (fetched.stdout or "").strip().lower() if fetched.returncode == 0 else ""
+        # HEAD can move between ssh discovery and git fetch.  Never merge a merely-newer response:
+        # the exact commit the authenticated status poll/discovery named is the approved input.
+        if not re.fullmatch(r"[0-9a-f]{40}", fetched_sha) or fetched_sha != rhead:
+            return False, ("%s changed HEAD during the pull (expected %s, fetched %s) — nothing merged"
+                           % (host, rhead[:12], fetched_sha[:12] or "unknown"))
+        if fetched_sha != expected:
+            return False, ("%s did not supply the expected commit %s — nothing merged"
+                           % (host, expected[:12]))
         anc = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"],
                              capture_output=True, text=True, timeout=10)
         if anc.returncode != 0:
@@ -8416,6 +8710,14 @@ def _pull_remote(host):
         n = subprocess.run(["git", "-C", str(ROOT), "rev-list", "--count", "HEAD..FETCH_HEAD"],
                            capture_output=True, text=True, timeout=10)
         count = (n.stdout or "").strip() or "?"
+        # Trust can change while ssh/fetch is in flight.  The merge is the code-execution boundary,
+        # so re-check immediately before moving HEAD; a concurrent downgrade/remove must win.
+        with _remotes_lock:
+            current = _remotes.get(host)
+            still_trusted = bool(current and not current.get("checkin_peer")
+                                 and current.get("trust") == "trusted")
+        if not still_trusted:
+            return False, ("%s trust changed during the pull — nothing merged" % host)
         m = subprocess.run(["git", "-C", str(ROOT), "merge", "--ff-only", "FETCH_HEAD"],
                            capture_output=True, text=True, timeout=30)
     except Exception as e:
@@ -8501,12 +8803,16 @@ def _ask_peer_to_pull(host):
         return False, "no attached host '%s'" % host
     if not r.get("checkin_peer"):
         return False, "%s is attached over this machine's own ssh — push to it instead" % host
+    if (r.get("trust") or "directed") != "trusted":
+        return False, "refusing to exchange executable code with %s while it is not trusted" % host
     if not (r.get("local_port") and r.get("token")):
         return False, ("no admin path to %s (missing forward or token) — sync from that machine's own "
                        "dashboard" % host)
     if not _local_head():
         return False, "local kernel isn't a git checkout — there is nothing for %s to pull" % host
-    st, j = _peer_call(r, "POST", "/tunnels/pull", {"host": _peer_hub_name(r)}, timeout=_ASK_PULL_TIMEOUT)
+    st, j = _peer_call(r, "POST", "/tunnels/pull",
+                       {"host": _peer_hub_name(r), "expectedSha": _local_head()},
+                       timeout=_ASK_PULL_TIMEOUT)
     if st == 0:
         return False, "couldn't reach %s's kernel: %s" % (host, j.get("error") or "no answer")
     if st == 404:
@@ -8595,12 +8901,15 @@ def _fleet_restart_plan(r):
                           "dashboard")
     if _is_fast_forward(r):
         return "sync-push", "behind this build; pushing and restarting"
+    d = _behind_info(r.get("kernel_sha") or "")
+    b, a = d.get("behind"), d.get("ahead")
+    if (r.get("trust") or "directed") != "trusted" and isinstance(a, int) and a > 0 and b == 0:
+        return "skip", ("%s is ahead, but it is not trusted — never pulling executable code from it"
+                        % host)
     if _is_fast_pull(r):
         if _local_branch() != "main":
             return "skip", "%s is ahead, but this checkout isn't on main — pull it yourself" % host
         return "sync-pull", "ahead of this build; fast-forwarding this machine onto it"
-    d = _behind_info(r.get("kernel_sha") or "")
-    b, a = d.get("behind"), d.get("ahead")
     if isinstance(b, int) and isinstance(a, int) and b > 0 and a > 0:
         return "skip", "diverged (it has %d commit(s) this machine lacks) — not clobbering either side" % a
     return "skip", "its build isn't in this repo's history, so nothing can be proven safe to sync"
@@ -8623,7 +8932,7 @@ def _fleet_restart_run():
             if action == "sync-push":
                 ok, detail = _update_remote(host)
             elif action == "sync-pull":
-                ok, detail = _pull_remote(host)
+                ok, detail = _pull_remote(host, expected_sha=r.get("kernel_sha"))
                 if ok:
                     detail += "; this machine restarts below"
             elif action == "ask":
@@ -8667,7 +8976,9 @@ def _restart_this_kernel(reason=""):
         return
     try:
         c = http.client.HTTPConnection("127.0.0.1", int(mport), timeout=4)
-        c.request("POST", "/restart-all"); c.getresponse(); c.close()
+        c.request("POST", "/restart-all", headers={"X-Romp-Manager-Token":
+                                                     os.environ.get("ROMP_MANAGER_TOKEN") or ""})
+        c.getresponse(); c.close()
     except Exception:
         pass                                       # no manager reachable → nothing to restart
 
@@ -8676,7 +8987,8 @@ def _is_ask_pull(r):
     """Whether this remote can be TOLD to fast-forward itself: a checked-in peer (no ssh from here) that is
     strictly BEHIND us, so what it pulls only ADDS commits. Same provable-fast-forward bar as the push gate
     — a diverged or unknown relationship is never driven automatically, and never offered as one click."""
-    return bool(r.get("checkin_peer")) and _is_fast_forward(r)
+    return (bool(r.get("checkin_peer")) and (r.get("trust") or "directed") == "trusted"
+            and _is_fast_forward(r))
 
 
 def _start_remote(host):
@@ -11826,6 +12138,7 @@ def _session_chip(sid, path, session, tm, now):
 # the moment compaction ends. A repeated model/effort pick REPLACES its earlier parked op in place (last
 # pick wins — one queued chip, not a pile), since only the final setting can matter.
 _PENDING_OPS_FILE = Path(jd.STATE) / "pending-ops.json"
+_pending_ops_lock = threading.RLock()   # WS/HTTP handler threads mutate while the producer drains
 
 
 def _load_pending_ops():
@@ -11847,12 +12160,26 @@ def _load_pending_ops():
 def _save_pending_ops():
     """Mirror _pending_ops to disk on every mutation, atomically, so parked ops survive a kernel
     death. Tiny file, mutation-rate writes (a park or a delivery), not a hot path."""
-    try:
-        tmp = _PENDING_OPS_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps({k: [list(o) for o in v] for k, v in _pending_ops.items() if v}))
-        os.replace(tmp, _PENDING_OPS_FILE)
-    except Exception:
-        sys.stderr.write("pending-ops save: %s\n" % traceback.format_exc())
+    tmp = None
+    with _pending_ops_lock:
+        try:
+            # Writer-unique even though in-process writers are serialized: an outgoing kernel and its
+            # replacement can overlap briefly during refresh, and must never steal one another's temp.
+            tmp = _PENDING_OPS_FILE.with_name(
+                "%s.tmp.%d.%s" % (_PENDING_OPS_FILE.stem, os.getpid(), uuid.uuid4().hex[:8]))
+            tmp.write_text(json.dumps({k: [list(o) for o in v]
+                                       for k, v in _pending_ops.items() if v}))
+            os.replace(tmp, _PENDING_OPS_FILE)
+            return True
+        except Exception:
+            sys.stderr.write("pending-ops save: %s\n" % traceback.format_exc())
+            return False
+        finally:
+            if tmp is not None:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
 
 _pending_ops = _load_pending_ops()   # sid -> [("send", text, echo) | ("model", v) | ("effort", v) | ("fast", v) | ("compact",), …] in park order
@@ -11970,8 +12297,9 @@ def _ops_gate(sid):
     sequence pressed). Interrupt itself is the one exception — it must always fire immediately (the
     escape hatch), and it is what a user reaches for when they want the storm to stop, not the queue."""
     sid = str(sid)
-    return (_compacting_now(sid) or _working_now(sid) or bool(_pending_ops.get(sid))
-            or _limit_hold(sid) is not None)
+    with _pending_ops_lock:
+        queued = bool(_pending_ops.get(sid))
+    return (_compacting_now(sid) or _working_now(sid) or queued or _limit_hold(sid) is not None)
 
 
 def _park_op(sid, op):
@@ -11979,17 +12307,18 @@ def _park_op(sid, op):
     appears immediately, never waiting out the backstop poll). A repeat model/effort pick REPLACES the
     earlier parked op of the same kind IN PLACE — its queue position stands, its value updates — so the
     chat shows one "/model …" chip carrying the latest pick. Messages always append."""
-    q = _pending_ops.setdefault(str(sid), [])
-    if op[0] in ("model", "effort", "fast"):
-        for i, o in enumerate(q):
-            if o[0] == op[0]:
-                q[i] = op
-                break
+    with _pending_ops_lock:
+        q = _pending_ops.setdefault(str(sid), [])
+        if op[0] in ("model", "effort", "fast"):
+            for i, o in enumerate(q):
+                if o[0] == op[0]:
+                    q[i] = op
+                    break
+            else:
+                q.append(op)
         else:
             q.append(op)
-    else:
-        q.append(op)
-    _save_pending_ops()               # mirror the park to disk (survives a kernel death)
+        _save_pending_ops()           # mirror the mutation while the same lock still owns its snapshot
     _mark_views_dirty()               # the queue lives in memory — no sig sees it; the woken push renders the chip
 
 
@@ -12026,15 +12355,16 @@ def _cancel_parked(sid, park, md):
     read as a successful cancel while the message got answered anyway (the user 2026-07-20). Persists +
     wakes the pusher like every queue mutation."""
     sid = str(sid)
-    ops = _pending_ops.get(sid) or []
-    if not (0 <= park < len(ops)) or (md and _parked_md(ops[park]) != md):
-        park = next((j for j, op in enumerate(ops) if _parked_md(op) == md), -1) if md else -1
-        if park < 0:
-            return _cancel_miss_text(md)
-    ops.pop(park)
-    if not ops:
-        _pending_ops.pop(sid, None)
-    _save_pending_ops()
+    with _pending_ops_lock:
+        ops = _pending_ops.get(sid) or []
+        if not (0 <= park < len(ops)) or (md and _parked_md(ops[park]) != md):
+            park = next((j for j, op in enumerate(ops) if _parked_md(op) == md), -1) if md else -1
+            if park < 0:
+                return _cancel_miss_text(md)
+        ops.pop(park)
+        if not ops:
+            _pending_ops.pop(sid, None)
+        _save_pending_ops()
     _mark_views_dirty()
     return None
 
@@ -12119,36 +12449,49 @@ def _send_or_park(be, sid, text, echo=None):
     at turn end (never folded into a send batch, which would bury it as text the same way)."""
     cmd = _is_slash_command(text)
     op = ("command", text, echo) if cmd else ("send", text, echo)
-    if _compacting_now(sid) or _pending_ops.get(sid) or _limit_hold(sid):
-        _park_op(sid, op)
-        return
-    if _working_now(sid) and (cmd or not _forwards_sends(be)):
-        _park_op(sid, op)
-        return
-    be.send(sid, text)
-    if echo:
-        _optimistic_echo(sid, text, author=echo)
+    # Gate and handoff are one ordering transaction. If another handler parks an op first, this
+    # send must see it and line up behind it; if this send wins, no later park can overtake it.
+    with _pending_ops_lock:
+        queued = bool(_pending_ops.get(sid))
+        if _compacting_now(sid) or queued or _limit_hold(sid):
+            _park_op(sid, op)
+            return
+        if _working_now(sid) and (cmd or not _forwards_sends(be)):
+            _park_op(sid, op)
+            return
+        try:
+            accepted = bool(be.send(sid, text))
+        except Exception:
+            sys.stderr.write("send-or-park: %s\n" % traceback.format_exc())
+            accepted = False
+        if not accepted:
+            _park_op(sid, op)             # refusal/failure is retryable; visible queue is the receipt
+            return
+        if echo:
+            _optimistic_echo(sid, text, author=echo)
 
 
 def _set_model_or_park(be, sid, value):
     """Apply a model change now — or park it in the sid's FIFO op queue while the session compacts. Either
     way, the pick is ACCEPTED now: stamp the shared pending signal (_mark_model_pending) so chat + timeline
     both show switching-dots immediately, from whichever surface the click came from (the user 2026-07-03)."""
-    _mark_model_pending(sid, value)
-    if _ops_gate(sid):
-        _park_op(sid, ("model", value))
-    else:
-        be.set_model(sid, value)
+    with _pending_ops_lock:
+        _mark_model_pending(sid, value)
+        if _ops_gate(sid):
+            _park_op(sid, ("model", value))
+        else:
+            be.set_model(sid, value)
 
 
 def _set_effort_or_park(be, sid, value):
     """Apply an effort change now — or park it while the session compacts (the user 2026-07-02: /effort
     is a slash command like /model, so it must queue the same way — it used to slip straight through,
     with no queued chip and the same derail risk the /model park was built for)."""
-    if _ops_gate(sid):
-        _park_op(sid, ("effort", value))
-    else:
-        be.set_effort(sid, value)
+    with _pending_ops_lock:
+        if _ops_gate(sid):
+            _park_op(sid, ("effort", value))
+        else:
+            be.set_effort(sid, value)
 
 
 def _set_auth_or_park(be, sid, value):
@@ -12157,10 +12500,11 @@ def _set_auth_or_park(be, sid, value):
     exactly the way a model switch would). Returns the backend's verdict so the caller can be loud."""
     if value not in ("login", "key"):
         return False
-    if _ops_gate(sid):
-        _park_op(sid, ("auth", value))
-        return True
-    return be.set_auth(sid, value)
+    with _pending_ops_lock:
+        if _ops_gate(sid):
+            _park_op(sid, ("auth", value))
+            return True
+        return be.set_auth(sid, value)
 
 
 def _set_fast_or_park(be, sid, value):
@@ -12169,10 +12513,11 @@ def _set_fast_or_park(be, sid, value):
     verdict so the caller can be loud when a live apply refuses (dormant SDK session)."""
     if value not in ("on", "off"):
         return False
-    if _ops_gate(sid):
-        _park_op(sid, ("fast", value))
-        return True
-    return be.set_fast(sid, value)
+    with _pending_ops_lock:
+        if _ops_gate(sid):
+            _park_op(sid, ("fast", value))
+            return True
+        return be.set_fast(sid, value)
 
 
 def _deliver_send_batch(be, sid, run):
@@ -12182,18 +12527,29 @@ def _deliver_send_batch(be, sid, run):
     MERGE them into a single message (the user okayed merging for tmux). Each fired send stamps its optimistic
     echo (a no-op on the SDK, which echoes inside send(); the kernel-side tmux echo otherwise)."""
     if not run:
-        return
+        return 0, None
     if _forwards_sends(be):
-        for op in run:
-            be.send(sid, op[1])
+        for i, op in enumerate(run):
+            try:
+                accepted = bool(be.send(sid, op[1]))
+            except Exception as e:
+                return i, e
+            if not accepted:
+                return i, None
             if op[2]:
                 _optimistic_echo(sid, op[1], author=op[2])
-        return
+        return len(run), None
     merged = "\n\n".join(op[1] for op in run)          # tmux: one message, blank-line separated between turns
-    be.send(sid, merged)
+    try:
+        accepted = bool(be.send(sid, merged))
+    except Exception as e:
+        return 0, e
+    if not accepted:
+        return 0, None
     author = next((op[2] for op in run if op[2]), None)
     if author:
         _optimistic_echo(sid, merged, author=author)
+    return len(run), None
 
 
 def _apply_pending_ops():
@@ -12207,62 +12563,77 @@ def _apply_pending_ops():
     once; the SDK folds the run into one turn, tmux merges it). Event-gated throughout (_compacting
     + the event-model open-turn signal, both off cached parses refreshed by turn-end pokes, plus
     _limit_hold's account gate — a queue held by a usage limit drains on the pass after the API's own
-    reset stamp passes, so the whole sequence goes in at the reset in the order it was typed); a dead
-    session's queue is dropped (fails once, logged), never retried."""
-    for sid, ops in list(_pending_ops.items()):
-        if not ops:
-            _pending_ops.pop(sid, None)
-            continue
-        if _compacting_now(sid) or _working_now(sid) or _limit_hold(sid):
-            continue                                  # …or the account can't serve a request yet
-        try:
-            be = Sessions.backend_for(sid)
-            while ops:
-                op = ops[0]
-                if op[0] == "send":
-                    run = []                          # coalesce the leading run of sends → deliver them AT ONCE
-                    while ops and ops[0][0] == "send":
-                        run.append(ops.pop(0))
-                    _deliver_send_batch(be, sid, run)
-                    break                             # the delivered turn must END before any op behind it fires
-                elif op[0] == "command":
-                    # a typed slash command fires ALONE as its own fresh top-level prompt — folded into a
-                    # send batch (or forwarded mid-turn) it reaches the model as text instead of executing
-                    # (the user 2026-08-13: /autocompact absorbed mid-turn got a polite reply and no
-                    # setting change). Echo stamped at fire time, like a delivered send.
-                    be.send(sid, op[1])
-                    if len(op) > 2 and op[2]:
-                        _optimistic_echo(sid, op[1], author=op[2])
-                    if op[1].strip().split()[0] == "/compact":
-                        _mark_compacting(sid)         # a TYPED /compact gets the same instant cue as the button's op
-                    ops.pop(0)
-                    break                             # its turn must end before anything behind it fires
-                elif op[0] == "compact":
-                    be.send(sid, "/compact")
-                    _mark_compacting(sid)
-                    ops.pop(0)
-                    break                             # the compaction must finish first
-                elif op[0] == "model":
-                    be.set_model(sid, op[1])
-                    ops.pop(0)
-                elif op[0] == "effort":
-                    be.set_effort(sid, op[1])
-                    ops.pop(0)
-                elif op[0] == "fast":
-                    be.set_fast(sid, op[1])
-                    ops.pop(0)
-                elif op[0] == "auth":
-                    be.set_auth(sid, op[1])
-                    ops.pop(0)
-                else:
-                    ops.pop(0)                        # unknown op kind → drop, never wedge the queue
-        except Exception:
-            sys.stderr.write("pending ops apply: %s\n" % traceback.format_exc())
-            _pending_ops.pop(sid, None)               # a dead session's queue is dropped, never retried
-        if not _pending_ops.get(sid):
-            _pending_ops.pop(sid, None)
-        _save_pending_ops()               # every delivery/drop shrinks the disk mirror too
-        _mark_views_dirty()               # the queue shrank (in-memory) → rebuild past the sig so chips retire
+    reset stamp passes, so the whole sequence goes in at the reset in the order it was typed). Backend
+    refusal or lookup/delivery failure leaves the unaccepted suffix durable for a later retry."""
+    with _pending_ops_lock:
+        for sid in list(_pending_ops):
+            ops = _pending_ops.get(sid) or []
+            if not ops:
+                _pending_ops.pop(sid, None)
+                continue
+            if _compacting_now(sid) or _working_now(sid) or _limit_hold(sid):
+                continue                              # …or the account can't serve a request yet
+            changed = False
+            failure = None
+            try:
+                be = Sessions.backend_for(sid)
+                while ops:
+                    op = ops[0]
+                    if op[0] == "send":
+                        n = 0                         # snapshot the leading run; dequeue only ACCEPTED sends
+                        while n < len(ops) and ops[n][0] == "send":
+                            n += 1
+                        accepted, failure = _deliver_send_batch(be, sid, ops[:n])
+                        if accepted:
+                            del ops[:accepted]
+                            changed = True
+                        break                         # accepted send(s) open one turn; refusal stays at the head
+                    elif op[0] == "command":
+                        # A typed slash command fires ALONE as its own fresh top-level prompt — folded into
+                        # a send batch (or forwarded mid-turn) it reaches the model as text instead of
+                        # executing (the user 2026-08-13: /autocompact absorbed mid-turn got a polite reply
+                        # and no setting change). Echo stamped at fire time, like a delivered send.
+                        if not bool(be.send(sid, op[1])):
+                            break
+                        if len(op) > 2 and op[2]:
+                            _optimistic_echo(sid, op[1], author=op[2])
+                        if op[1].strip().split()[0] == "/compact":
+                            _mark_compacting(sid)     # a TYPED /compact gets the same instant cue as the button's op
+                        ops.pop(0); changed = True
+                        break                         # its turn must end before anything behind it fires
+                    elif op[0] == "compact":
+                        if not bool(be.send(sid, "/compact")):
+                            break
+                        _mark_compacting(sid)
+                        ops.pop(0); changed = True
+                        break                         # the compaction must finish first
+                    elif op[0] == "model":
+                        if not bool(be.set_model(sid, op[1])):
+                            break
+                        ops.pop(0); changed = True
+                    elif op[0] == "effort":
+                        if not bool(be.set_effort(sid, op[1])):
+                            break
+                        ops.pop(0); changed = True
+                    elif op[0] == "fast":
+                        if not bool(be.set_fast(sid, op[1])):
+                            break
+                        ops.pop(0); changed = True
+                    elif op[0] == "auth":
+                        if not bool(be.set_auth(sid, op[1])):
+                            break
+                        ops.pop(0); changed = True
+                    else:
+                        ops.pop(0); changed = True      # unknown op kind → drop, never wedge the queue
+            except Exception as e:
+                failure = e                            # RETAIN the current + remaining ops for a later tick
+            if failure is not None:
+                sys.stderr.write("pending ops apply (%s): %s\n" % (sid, failure))
+            if not ops:
+                _pending_ops.pop(sid, None)
+            if changed:
+                _save_pending_ops()                    # only accepted/dropped ops shrink the durable mirror
+                _mark_views_dirty()                    # queue shrank → retire its visible chips
 
 
 # ── the chat's pinned "system context" card (the user 2026-06-19) ──────────────────────────────────
@@ -14147,15 +14518,20 @@ def _compact_goal_store(fsid):
                 stack.extend(children.get(x, []))
     if not move:
         return 0
-    arch = jd.load_goal_archive(fsid)
-    a_nodes = arch.setdefault("nodes", {})
-    a_status = arch.setdefault("status", {})
+    move_nodes = {nid: nodes[nid] for nid in move}
+    move_status = {nid: status[nid] for nid in move if nid in status}
+
+    def _archive_compacted(arch):
+        arch.setdefault("nodes", {}).update(move_nodes)
+        arch.setdefault("status", {}).update(move_status)
+        arch["rompUuid"] = store.get("rompUuid", fsid)
+
+    # Archive first and atomically merge with any simultaneous undo/revert mutation. A crash before
+    # the live save leaves a duplicate, which is recoverable; reversing the order could lose nodes.
+    jd.mutate_goal_archive(fsid, _archive_compacted)
     for nid in move:
-        a_nodes[nid] = nodes.pop(nid)
-        if nid in status:
-            a_status[nid] = status.pop(nid)
-    arch["rompUuid"] = store.get("rompUuid", fsid)
-    jd.save_goal_archive(fsid, arch)
+        nodes.pop(nid, None)
+        status.pop(nid, None)
     jd.save_goals(fsid, store)                          # placements/seq/lastNode stay → judge dedup intact
     return len(move)
 
@@ -14196,43 +14572,49 @@ def _restore_goal_archive(item_ids):
     for iid in item_ids:
         by_sid.setdefault(iid.rsplit(":", 1)[0], []).append(iid)
     for sid, ids in by_sid.items():
-        arch = jd.load_goal_archive(sid)
-        a_nodes = arch.get("nodes", {})
-        if not a_nodes:
-            continue
-        a_status = arch.get("status", {})
-        a_children = {}
-        for nid, nd in a_nodes.items():
-            a_children.setdefault(nd.get("parentId"), []).append(nid)
-        move = []
-        for iid in ids:
-            if iid in a_nodes:
-                stack = [iid]
-                while stack:
-                    x = stack.pop()
-                    if x in a_nodes:
-                        move.append(x)
-                        stack.extend(a_children.get(x, []))
-        if not move:
-            continue
         store = jd.load_goals(sid)
-        nodes = store.setdefault("nodes", {})
-        status = store.setdefault("status", {})
-        # Journal the payload FIRST (the user 2026-07-10): once the archive save below lands, these nodes
-        # exist only in the live store's save — a stale triage-pass save racing it would drop them from
-        # BOTH files, permanently. The journal carries the node payloads; jd.load_goals re-inserts any
-        # that end up in neither file (and defers to the archive if the user re-clears later).
-        jd.append_restore(sid, {nid: a_nodes[nid] for nid in move},
-                          {nid: a_status[nid] for nid in move if nid in a_status}, int(time.time()))
-        for nid in move:
-            nodes[nid] = a_nodes.pop(nid)
-            if nid in a_status:
-                status[nid] = a_status.pop(nid)
-        # (Sticky completion restore lives in _mark_nodes_cleared now — 2026-07-07: the settle event must
-        # land AFTER the undo reopen it records, or the fold consumes it and the card returns to Working.)
-        jd.save_goals(sid, store)
-        jd.save_goal_archive(sid, arch)
-        _compact_seen.pop(sid, None)                   # force a re-stat next sweep (we just changed the live file)
+
+        def _restore(arch):
+            a_nodes = arch.get("nodes", {})
+            if not a_nodes:
+                return 0
+            a_status = arch.get("status", {})
+            a_children = {}
+            for nid, nd in a_nodes.items():
+                a_children.setdefault(nd.get("parentId"), []).append(nid)
+            move, seen = [], set()
+            for iid in ids:
+                if iid in a_nodes:
+                    stack = [iid]
+                    while stack:
+                        x = stack.pop()
+                        if x in a_nodes and x not in seen:
+                            seen.add(x)
+                            move.append(x)
+                            stack.extend(a_children.get(x, []))
+            if not move:
+                return 0
+            payload = {nid: a_nodes[nid] for nid in move}
+            payload_status = {nid: a_status[nid] for nid in move if nid in a_status}
+            # Journal FIRST (the user 2026-07-10), while the archive transaction still owns the
+            # exact payload it will remove. If either journal/live publish fails, the callback raises
+            # and mutate_goal_archive leaves these nodes safely archived. A stale triage save can
+            # then be repaired by load_goals replay (which defers if the user re-clears later).
+            jd.append_restore(sid, payload, payload_status, int(time.time()))
+            nodes = store.setdefault("nodes", {})
+            status = store.setdefault("status", {})
+            nodes.update(payload)
+            status.update(payload_status)
+            # Sticky completion restore lives in _mark_nodes_cleared; its settle must land after
+            # the undo reopen it records, or the fold consumes it and the card returns to Working.
+            jd.save_goals(sid, store)
+            for nid in move:
+                a_nodes.pop(nid, None)
+                a_status.pop(nid, None)
+            return len(move)
+
+        if jd.mutate_goal_archive(sid, _restore):
+            _compact_seen.pop(sid, None)               # live file changed → force a re-stat next sweep
 
 
 def _resolve_node(sid, node_id):
@@ -17766,6 +18148,7 @@ _img_cache = {}                                  # "path:mtime:size" → dataURL
 #      their own agents, on their own machine.
 _PREVIEW_MIME = dict(_IMG_MIME, **{".pdf": "application/pdf"})
 _PREVIEW_MAX_BYTES = 50_000_000                  # a plot/report, not a dataset — bigger 413s (fail loudly)
+_POST_MAX_BYTES = 2_000_000                       # JSON control requests only; reject before allocation/read
 
 
 def _img_data_url(p0):
@@ -17998,12 +18381,28 @@ def _path_links(md, sid, uuid, memo):
 
 
 def _open_file(p, sid=None):
-    """Open a path in the user's default app/editor (macOS `open`); best-effort, never raises."""
+    """Open a path in the user's default app/editor on the kernel machine. Return an error for the
+    websocket client instead of silently swallowing a missing desktop opener."""
+    target = _resolve_open_path(p, sid)
+    if not os.path.exists(target):
+        return "couldn't open %s: the path does not exist" % p
     try:
-        subprocess.Popen(["open", _resolve_open_path(p, sid)], stdin=subprocess.DEVNULL,
+        if sys.platform == "darwin":
+            argv = ["open", target]
+        elif os.name == "nt":
+            os.startfile(target)  # type: ignore[attr-defined]
+            return None
+        elif shutil.which("xdg-open"):
+            argv = ["xdg-open", target]
+        elif shutil.which("gio"):
+            argv = ["gio", "open", target]
+        else:
+            return "couldn't open %s: install xdg-utils (xdg-open) or gio" % p
+        subprocess.Popen(argv, stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError:
-        pass
+        return None
+    except OSError as exc:
+        return "couldn't open %s: %s" % (p, exc)
 
 
 # ── native file/folder dialogs ─────────────────────────────────────────────────────────────────────
@@ -20257,7 +20656,7 @@ window.__rompRestart=function(){
 var boot=document.getElementById('romp-boot');
 if(!boot){boot=document.createElement('div');boot.id='romp-boot';boot.innerHTML=__ROMP_LOADER__;document.body.appendChild(boot);}
 boot.classList.remove('gone');
-try{fetch('/restart',{method:'POST'}).catch(function(){});}catch(e){}
+try{fetch('/restart',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"fleet":false}'}).catch(function(){});}catch(e){}
 var n=0;(function again(){setTimeout(function(){n++;
 fetch('/healthz',{cache:'no-store'}).then(function(r){var b=(r&&r.ok)?r.headers.get('X-Romp-Boot'):null;
 if(b&&b!==__ROMP_BOOT__)location.reload();else if(n<240)again();else location.reload();})
@@ -20352,8 +20751,8 @@ fetch('/tunnels/of?host='+encodeURIComponent(h),{cache:'no-store'}).then(functio
 if(_openSub[h])repaint();});}
 function pendLvl(map,host,current){var p=map[host];if(p&&current===p){delete map[host];p=null;}return p;}
 function fillHosts(){if(!dl)return;var hs=[];
-[[mruHost()],_seen,_cfg].forEach(function(g){(g||[]).forEach(function(h){if(h&&hs.indexOf(h)<0)hs.push(h);});});   // most-recently-connected first, not just ssh-config order
-dl.innerHTML=hs.map(function(h){return '<option value=\"'+h+'\"></option>';}).join('');}
+[[mruHost()],_seen,_cfg].forEach(function(g){(g||[]).forEach(function(h){if(typeof h==='string'&&h&&hs.indexOf(h)<0)hs.push(h);});});   // most-recently-connected first, not just ssh-config order
+dl.textContent='';hs.slice(0,512).forEach(function(h){var o=document.createElement('option');o.value=h;o.textContent=h;dl.appendChild(o);});}
 function loadHosts(){fetch('/ssh-hosts',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
 _cfg=(d&&d.hosts)||[];fillHosts();}).catch(function(){});}
 var LBL={up:'connected',authorizing:'authorizing\\u2026',connecting:'connecting\\u2026',starting:'connecting\\u2026','no-kernel':'kernel not answering',down:'disconnected',error:'error'};
@@ -20386,6 +20785,30 @@ return (t.aheadBy>0&&t.behindBy>0)?('diverged: '+a):a;}
 // and the commit (the user 2026-07-30 — a bare sha says nothing unless you happen to know your own).
 // Either half alone if that is all there is; a kernel older than the version field reports no tag.
 function buildWord(v,s){v=v||'';s=s||'';return v?(s?(v+' '+s):v):s;}   // mid-attach (authorizing/connecting); no-kernel is SETTLED (no marching dashes)
+// Treat both /tunnels and /tunnels/of as hostile JSON boundaries. The latter is fetched from another
+// machine and the former contains metadata polled from one; several row fragments below use innerHTML.
+// Server-side schema checks are authoritative, while this copy keeps a stale/compromised endpoint from
+// turning host, build, status, or automatic-update fields into markup.
+var RSTAT={up:1,authorizing:1,connecting:1,starting:1,'no-kernel':1,down:1,error:1};
+var RPHASE={pushing:1,waiting:1,failed:1,pulling:1,asking:1,pulled:1};
+var RTRUST={trusted:1,directed:1,isolated:1};
+function remoteRows(xs){if(!Array.isArray(xs))return [];
+return xs.slice(0,128).filter(function(x){return x&&typeof x==='object'&&typeof x.host==='string'&&
+x.host.length<=255&&x.host.charAt(0)!=='-'&&x.host.split('').every(function(c){return 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._@:-[]'.indexOf(c)>=0;});}).map(function(x){
+function atom(v,re){return typeof v==='string'&&re.test(v)?v:'';}
+function num(v,max,empty){return typeof v==='number'&&isFinite(v)&&Math.floor(v)===v&&v>=0&&v<=max?v:empty;}
+var ap=(x.autoPush&&typeof x.autoPush==='object'&&RPHASE[x.autoPush.phase])?{
+phase:x.autoPush.phase,detail:(typeof x.autoPush.detail==='string'?x.autoPush.detail.slice(0,1024):''),
+at:num(x.autoPush.at,9007199254740991,0)}:null;
+return {host:x.host,status:RSTAT[x.status]?x.status:'error',trust:RTRUST[x.trust]?x.trust:'directed',
+kernelSha:atom(x.kernelSha,/^[0-9a-f]{7,40}(?:-dirty)?$/i),localSha:atom(x.localSha,/^[0-9a-f]{7,40}(?:-dirty)?$/i),
+kernelVer:atom(x.kernelVer,/^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/),localVer:atom(x.localVer,/^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/),
+kernelDate:atom(x.kernelDate,/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/),outOfDate:x.outOfDate===true,
+behindBy:num(x.behindBy,10000000,null),aheadBy:num(x.aheadBy,10000000,null),
+checkin:x.checkin===true,checkinPeer:x.checkinPeer===true,hasToken:x.hasToken===true,
+fastForward:x.fastForward===true,fastPull:x.fastPull===true,askPull:x.askPull===true,autoPush:ap,
+sids:Array.isArray(x.sids)?x.sids.slice(0,512):[],fails:num(x.fails,1000000,0),
+nextTry:num(x.nextTry,9007199254740991,0),stale:x.stale===true,lastOk:num(x.lastOk,9007199254740991,0)};});}
 // ONE loader for the whole panel (the user 2026-07-30, who wanted the motion wherever work is actually
 // happening, not only on a connecting row). The repo's loading rule spelled small: the romp swirl glyph,
 // reverse-spun. Anything in this panel that is WAITING on work — a connecting tunnel, a sync mid-flight,
@@ -20437,7 +20860,7 @@ el.classList.remove('rn-drop');void el.offsetWidth;   // reflow: a second drop r
 el.classList.add('rn-drop');
 el.addEventListener('animationend',function(){el.classList.remove('rn-drop');},{once:true});});}
 function refresh(){fetch('/tunnels',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
-var ts=(d&&d.tunnels)||[];var pmode=!!(d&&d.peersMode);var busy=ts.some(function(t){return busyStatus(t.status);});
+var ts=remoteRows((d&&d.tunnels)||[]);var pmode=!!(d&&d.peersMode);var busy=ts.some(function(t){return busyStatus(t.status);});
 _auto=!!(d&&d.autoUpdate);
 // This machine's own release + commit, so the host rows below have something to be read against.
 var me=document.getElementById('rnet-me'),lc=(d&&d.local)||{};
@@ -20459,7 +20882,7 @@ var _head=!ts.length?'':(_bad?(_bad+' host'+(_bad===1?'':'s')+' need'+(_bad===1?
 icon.title=ts.length?('Remote kernels \\u00b7 '+_head+'\\n'+ts.map(function(t){var n=(t.sids&&t.sids.length)||0;
 var ap=t.autoPush?('\\n    auto-update: '+(t.autoPush.detail||t.autoPush.phase)):'';
 var dw=t.outOfDate?(' \\u00b7 '+(t.status==='up'?'':'last known ')+driftWord(t)):'';
-return '\\u2022 '+t.host+': '+(LBL[t.status]||t.status)+' ('+n+' session'+(n===1?'':'s')+')'+dw+(t.token?'':' \\u00b7 no token')+ap;}).join('\\n')):'Remote kernels \\u2014 none attached (click to connect)';
+return '\\u2022 '+t.host+': '+(LBL[t.status]||t.status)+' ('+n+' session'+(n===1?'':'s')+')'+dw+(t.hasToken?'':' \\u00b7 no token')+ap;}).join('\\n')):'Remote kernels \\u2014 none attached (click to connect)';
 _lastArgs=[ts,(d&&d.known)||[],pmode,(d&&d.viaReach)||[],(d&&d.remoteHolds)||[],(d&&d.peerTiers)||{}];
 _lastUp=ts.filter(function(t){return t.status==='up';}).length;
 if(!back.hidden){render.apply(null,_lastArgs);refreshPairs();}   // pmode is refresh-local — render must be GIVEN it (it rides _lastArgs)
@@ -20507,7 +20930,9 @@ var live={};ts.forEach(function(t){live[t.host]=1;});
 // owner; hidden while this machine is the only choice. Rebuilt per render, keeping the selection.
 if(fromSel){var ups=ts.filter(function(t){return t.status==='up';}).map(function(t){return t.host;});
 var fcur=fromSel.value;
-fromSel.innerHTML="<option value=''>from: this machine</option>"+ups.map(function(h){return '<option value="'+h+'"'+(fcur===h?' selected':'')+'>from: '+h+'</option>';}).join('');
+fromSel.innerHTML='';
+var ownOpt=document.createElement('option');ownOpt.value='';ownOpt.textContent='from: this machine';fromSel.appendChild(ownOpt);
+ups.forEach(function(h){var op=document.createElement('option');op.value=h;op.textContent='from: '+h;if(fcur===h)op.selected=true;fromSel.appendChild(op);});
 fromSel.hidden=!ups.length;}
 via=via.filter(function(v){return !live[v.host];});
 var viaHosts={};via.forEach(function(v){viaHosts[v.host]=1;});
@@ -20519,10 +20944,13 @@ var TRUSTW={trusted:'trusted (auto-accept)',directed:'directed (held for you)',i
 // failed read say so (with Retry), never a silent blank.
 function subBlock(via){var box=document.createElement('div');box.className='rnet-subwrap';
 var d=_subInfo[via];
-if(!d){box.innerHTML='<div class=\"rnet-empty rnet-subnote\">'+spin()+'Reading '+via+'\\u2019s connections\\u2026</div>';return box;}
-if(!d.ok){box.innerHTML='<div class=\"rnet-empty rnet-subnote\">Couldn\\u2019t read '+via+'\\u2019s connections: '+(d.error||'unknown error')+' <button data-xr=\"'+via+'\">Retry</button></div>';return box;}
-var rows=d.tunnels||[];
-if(!rows.length){box.innerHTML='<div class=\"rnet-empty rnet-subnote\">'+via+' has no hosts attached.</div>';return box;}
+if(!d){var ld=document.createElement('div');ld.className='rnet-empty rnet-subnote';
+ld.innerHTML=spin();ld.appendChild(document.createTextNode('Reading '+via+'\\u2019s connections\\u2026'));box.appendChild(ld);return box;}
+if(!d.ok){var er=document.createElement('div');er.className='rnet-empty rnet-subnote';
+er.textContent='Couldn\\u2019t read '+via+'\\u2019s connections: '+(typeof d.error==='string'?d.error.slice(0,512):'unknown error')+' ';
+var rb=document.createElement('button');rb.setAttribute('data-xr',via);rb.textContent='Retry';er.appendChild(rb);box.appendChild(er);return box;}
+var rows=remoteRows(d.tunnels||[]);
+if(!rows.length){var em=document.createElement('div');em.className='rnet-empty rnet-subnote';em.textContent=via+' has no hosts attached.';box.appendChild(em);return box;}
 rows.forEach(function(s){
 var sr=document.createElement('div');sr.className='rnet-row rnet-subrow';
 var sdot=s.status==='up'?'background:var(--accent)':(s.status==='error'||s.status==='no-kernel')?'background:#E5534B':(s.status==='down')?'background:#8a8a8a':'background:transparent;box-shadow:inset 0 0 0 1.5px var(--accent)';
@@ -20618,7 +21046,7 @@ var retry=(t.status!=='up'&&t.status!=='starting')?'<button data-ra=\"'+t.host+'
 // The check-in publishes THIS machine TO that host, which is the opposite direction from everything else
 // in the row. Its old label, "keep connected", read as the reconnect setting so plainly that the tooltip
 // had to spend a sentence saying what it was NOT. Name it for what it does instead.
-var keep=(pmode&&!t.checkinPeer)?'<label class=rnet-keep title=\"Publish this machine to '+t.host+' over your own outbound ssh, so its dashboard gains your sessions and its bus peers with yours. Uncheck to be forgotten there. Attach and Detach control the other direction.\"><input type=checkbox data-k=\"'+t.host+'\"'+(t.checkin?' checked':'')+'>Share my sessions there</label>':'';
+var keep=(pmode&&!t.checkinPeer&&t.trust==='trusted')?'<label class=rnet-keep title=\"Publish this machine to '+t.host+' over your own outbound ssh, so its dashboard gains your sessions and its bus peers with yours. This hands the host administrative access, so it is available only while the host is trusted. Uncheck to be forgotten there.\"><input type=checkbox data-k=\"'+t.host+'\"'+(t.checkin?' checked':'')+'>Share my sessions there</label>':'';
 // Federation trust (per-host): trusted = full two-way postal; directed (default) = its mail is HELD for
 // your approval, never auto-injected; isolated = dashboard only, no postal. The gate lives in the bus.
 // Each option carries its own plain gloss: the bare words are romp's vocabulary, not English, and a
@@ -20645,7 +21073,7 @@ row.innerHTML='<span class=rnet-dot style=\"'+dot+'\" title=\"'+(TIP[t.status]||
 // A host mid-attach gets the romp loader inline (the user 2026-07-29): the swirl glyph spinning beside
 // the status word, so "connecting" reads as something HAPPENING rather than a label that might be stuck.
 // The repo's loading rule spelled small: same glyph, same reverse spin as the composer's slash spinner.
-'<span class=nm><b>'+t.host+'</b> <span class=st title=\"'+(TIP[t.status]||'')+'\">'+(busyStatus(t.status)?spin():'')+(LBL[t.status]||t.status)+(t.checkinPeer?' \\u00b7 checked in here':'')+(t.token?'':' \\u00b7 no token')+(again?' \\u00b7 '+again:'')+ver+'</span></span>'+
+'<span class=nm><b>'+t.host+'</b> <span class=st title=\"'+(TIP[t.status]||'')+'\">'+(busyStatus(t.status)?spin():'')+(LBL[t.status]||t.status)+(t.checkinPeer?' \\u00b7 checked in here':'')+(t.hasToken?'':' \\u00b7 no token')+(again?' \\u00b7 '+again:'')+ver+'</span></span>'+
 retry+pull+ask+upd+strt+'<button data-h=\"'+t.host+'\" title=\"Close the ssh tunnel to '+t.host+'. It stays in this list as a previously-attached host, keeping its trust level, so you can re-attach in one click.\">Detach</button>'+
 // ITS CONNECTIONS toggle — the keyed expand (progressive disclosure): compact row by default,
 // that machine's own attached list one click deeper, fetched on the click, never the poll.
@@ -20753,8 +21181,14 @@ list.appendChild(hh);
 Object.keys(byHost).sort().forEach(function(hn){var rows=byHost[hn];
 var gl=rows.slice(0,6).map(function(r){return r.frm+' \\u2192 '+r.to+((r.origin&&r.origin!==hn)?' (from '+r.origin+')':'')+': '+(r.gist||'');}).join('\\n');
 var hr=document.createElement('div');hr.className='rnet-row rnet-known';
-hr.innerHTML='<span class=rnet-dot style=\"background:#b58900\" title=\"Mail is waiting for approval on '+hn+'.\"></span>'+
-'<span class=nm><b>'+hn+'</b> <span class=st title=\"'+gl.replace(/\"/g,'&quot;')+'\">'+rows.length+' message'+(rows.length===1?'':'s')+' held for your approval</span></span>';
+var hd=document.createElement('span');hd.className='rnet-dot';hd.style.background='#b58900';
+hd.title='Mail is waiting for approval on '+hn+'.';
+var hm=document.createElement('span');hm.className='nm';
+var hb=document.createElement('b');hb.textContent=hn;
+var hs=document.createElement('span');hs.className='st';hs.title=gl;
+hs.textContent=rows.length+' message'+(rows.length===1?'':'s')+' held for your approval';
+hm.appendChild(hb);hm.appendChild(document.createTextNode(' '));hm.appendChild(hs);
+hr.appendChild(hd);hr.appendChild(hm);
 list.appendChild(hr);});}
 // Pending is recorded ON THE CLICK (ack now — the buttons rule), so any re-render in the round-trip
 // window repaints the chosen level + applying cue instead of the stale snapshot's old value. A
@@ -21983,11 +22417,10 @@ def _landing():
             "shared compute: you can drive the box, it cannot drive you.</li>"
             "<li><b>isolated</b> is no postal at all. Its sessions still appear in your dashboard.</li>"
             "</ul>"
-            "<p><b>Share my sessions there</b> publishes this machine to that host over your own outbound "
-            "ssh, so its dashboard gains your sessions and its bus peers with yours. Turn it on for a machine "
-            "you sit at and want your own fleet visible from. Leave it off for a box you only want to watch, "
-            "since attaching already gives you that. The credentials flow outward from whoever switches it "
-            "on, so the far end never holds a way back in here.</p>"
+            "<p><b>Share my sessions there</b> is available only for a trusted host. It publishes this machine "
+            "through your outbound ssh tunnel, including reverse forwards and a kernel credential that let "
+            "that host's romp dashboard administer these sessions. Turn it on only when you control and trust "
+            "the far end; turn it off before downgrading or handing that machine to someone else.</p>"
             "</div>"
             # The LIST is the panel's subject, so it comes first and the add control sits under it as a
             # secondary action (the user 2026-07-22, who wanted rows and a +, not a permanent dropdown).
@@ -22122,7 +22555,7 @@ class Handler(BaseHTTPRequestHandler):
         return ""
 
     def _authorize(self, q):
-        """(ok, cookie_to_set, reason). A valid token IS sufficient auth and bypasses the Origin gate.
+        """(ok, cookie_to_set, reason). An explicit bearer token is sufficient auth and bypasses Origin.
         This is what lets the FEDERATED dashboard work: a browser served by ANOTHER kernel opens a
         tunnel'd /ws (or fetch) here carrying ?token — a foreign Origin, but the unguessable token is
         the credential, and a cross-site page can't forge it. The token is REQUIRED for every gated
@@ -22134,10 +22567,22 @@ class Handler(BaseHTTPRequestHandler):
         ClawJacked/WS hole) so a denial names the real reason."""
         if TOKEN and _ct_eq((q.get("token") or [""])[0], TOKEN):
             return True, TOKEN, ""                    # valid ?token → authorize (any origin) + set cookie
-        if TOKEN and _ct_eq(self._cookie_token(), TOKEN):
-            return True, None, ""                     # valid token cookie → authorize (any origin)
         if TOKEN and _ct_eq(self.headers.get("X-Romp-Token") or "", TOKEN):
             return True, None, ""                     # header form — local CLI/hook/daemon clients
+        if TOKEN and _ct_eq(self._cookie_token(), TOKEN):
+            # Cookies are scoped to a host, not a port.  Without this origin proof, a page on any
+            # other localhost port receives the kernel cookie automatically and can drive HTTP/WS.
+            # Ordinary top-level GETs and installed-app launches may omit Origin, so accept only
+            # browser provenance that cannot come from a cross-site document in that case. A
+            # missing provenance signal is deliberately not treated as local; native clients have
+            # the explicit header/query-token forms above.
+            origin = self.headers.get("Origin")
+            if origin and self._origin_ok():
+                return True, None, ""
+            fetch_site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+            if not origin and fetch_site in ("same-origin", "none"):
+                return True, None, ""
+            return False, None, "browser provenance required for cookie authentication"
         if not self._origin_ok():
             return False, None, "cross-site origin"
         return False, None, "token required (loopback included; token file: ~/.local/state/romp/serve-token)"
@@ -22425,7 +22870,7 @@ class Handler(BaseHTTPRequestHandler):
                 # kernel answering after a successful update (same trick as the restart flow); polling
                 # this route is also what consumes a report the still-running kernel would otherwise
                 # sit on (the failure path, and the no-manager success).
-                failed = updated = ""
+                failed, updated = _UPDATE_ERROR[0], ""
                 if _UPDATE_STATE[0] == "running":
                     # PEEK before consuming: a success that is about to restart belongs to the NEXT
                     # kernel's boot — consuming it here would file the notice into this dying
@@ -22487,32 +22932,54 @@ class Handler(BaseHTTPRequestHandler):
         # runs; the _authorize call site then refines it (a valid token authorizes a
         # foreign origin — the federated dashboard — and a denial clears the echo).
         self._cors_origin = self.headers.get("Origin") if self._origin_ok() else None
-        raw_body = b""
-        try:
-            n = int(self.headers.get("Content-Length") or 0)   # read the body (keep-alive safety + POST payloads)
-            if n:
-                raw_body = self.rfile.read(n)
-        except Exception:
-            pass
         try:
             ok, self._set_cookie, why = self._authorize(q)
             self._cors_origin = self.headers.get("Origin") if ok else None   # echoed by _send (CORS delivery)
             if not ok:
+                # Do not consume an attacker-controlled body before authentication.  This connection
+                # cannot be reused with unread bytes, so close it after the denial.
+                self.close_connection = True
                 return self._send(403, "forbidden: " + why, "text/plain")
+            if self.headers.get("Transfer-Encoding"):
+                self.close_connection = True
+                return self._send(413, "request body transfer encoding not accepted", "text/plain")
+            get_all = getattr(self.headers, "get_all", None)
+            if callable(get_all):
+                lengths = get_all("Content-Length") or []
+            else:
+                one_length = self.headers.get("Content-Length")
+                lengths = [] if one_length is None else [one_length]
+            if len(lengths) > 1:
+                self.close_connection = True
+                return self._send(400, "multiple Content-Length headers", "text/plain")
+            try:
+                raw_length = lengths[0] if lengths else "0"
+                if not str(raw_length).isdigit():
+                    raise ValueError("non-decimal Content-Length")
+                n = int(raw_length)
+            except (TypeError, ValueError):
+                self.close_connection = True
+                return self._send(400, "invalid Content-Length", "text/plain")
+            if n < 0:
+                self.close_connection = True
+                return self._send(400, "invalid Content-Length", "text/plain")
+            if n > _POST_MAX_BYTES:
+                self.close_connection = True
+                return self._send(413, "request body too large", "text/plain")
+            raw_body = self.rfile.read(n) if n else b""
             if u.path == "/restart":
                 # The web Restart button (↻ in the rail). Ack FIRST, then restart — the manager SIGTERMs
                 # this kernel and its exit handler spawns a fresh one, so new Python code loads (the
                 # button then polls /healthz and reloads). Standalone (no manager) → nothing to restart;
                 # the ack still returns.
                 #
-                # FLEET (the user 2026-07-29): with remotes attached, Restart means the whole fleet, not
-                # just this box — the remotes were being left on their old processes and old code with
-                # nothing saying so. The remote half runs in a thread (each host is seconds of network)
-                # and writes its report to disk BEFORE restarting this kernel, because this process does
-                # not survive to report anything. `fleet:false` keeps the local-only behaviour.
-                _fleet = True
+                # Remote restart can import and execute a trusted host's newer commits. It therefore
+                # requires an explicit remote-sync request; ordinary UI restart is local-only. The remote
+                # half runs in a thread and writes its report before restarting this kernel, because this
+                # process does not survive to report anything.
+                _fleet = False
                 try:
-                    _fleet = json.loads(raw_body or b"{}").get("fleet", True)
+                    _fleet = json.loads(raw_body or b"{}").get("fleet", False) is True
                 except Exception:
                     pass
                 # WHO ASKED, on the record (the user 2026-07-31): a restart blinks every dashboard, and
@@ -22545,7 +23012,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(409, "no newer release known to this kernel", "text/plain")
                 if _UPDATE_STATE[0] != "running":
                     _audit_restart_request("self-update", tag=tag, addr=str(self.client_address[0]))
-                    _run_update(tag)
+                    if not _run_update(tag):
+                        return self._send(422, json.dumps({"ok": False,
+                                                          "error": _UPDATE_ERROR[0] or
+                                                                   "release verification refused"}),
+                                          "application/json")
                 return self._send(200, json.dumps({"ok": True, "state": _UPDATE_STATE[0]}), "application/json")
             if u.path == "/notify-all":
                 # the master bell's toggle (the user 2026-08-09). Kernel-authoritative: the click
@@ -22914,7 +23385,10 @@ class Handler(BaseHTTPRequestHandler):
                 host = str((body or {}).get("host") or "").strip() if isinstance(body, dict) else ""
                 if not host:
                     return self._send(400, json.dumps({"ok": False, "error": "host required"}), "application/json")
-                pub = checkin_set(host, bool((body or {}).get("on")))
+                try:
+                    pub = checkin_set(host, bool((body or {}).get("on")))
+                except PermissionError as e:
+                    return self._send(403, json.dumps({"ok": False, "error": str(e)}), "application/json")
                 if pub is None:
                     return self._send(404, json.dumps({"ok": False, "error": "no attached host '%s' — attach it first" % host}), "application/json")
                 return self._send(200, json.dumps({"ok": True, "tunnel": pub}), "application/json")
@@ -23053,7 +23527,11 @@ class Handler(BaseHTTPRequestHandler):
                 host = str((body or {}).get("host") or "").strip() if isinstance(body, dict) else ""
                 if not host:
                     return self._send(400, json.dumps({"ok": False, "error": "host required"}), "application/json")
-                ok, detail = _pull_remote(host)
+                expected = str((body or {}).get("expectedSha") or "") if isinstance(body, dict) else ""
+                if not expected:
+                    with _remotes_lock:
+                        expected = (_remotes.get(host) or {}).get("kernel_sha") or ""
+                ok, detail = _pull_remote(host, expected_sha=expected)
                 return self._send(200 if ok else 502, json.dumps({"ok": ok, "detail": detail}), "application/json")
             if u.path == "/tunnels/askpull":
                 # ASK a checked-in peer to fast-forward ITSELF to this machine's build — the third
@@ -23562,7 +24040,9 @@ class Handler(BaseHTTPRequestHandler):
                 # chip up from the moment the file was picked, and only this reply can retire it
                 _reply(client, {"type": "dropSaveFailed", "name": str(msg["name"])})
         elif msg and msg.get("type") == "openFile" and msg.get("path"):
-            _open_file(str(msg["path"]), sid=msg.get("id"))       # caption / linkified path click → open it (relative → resolved vs the session cwd)
+            err = _open_file(str(msg["path"]), sid=msg.get("id"))  # relative → session cwd
+            if err:
+                _reply(client, {"type": "warn", "text": err})
         elif msg and msg.get("type") == "pickFile":
             if not _native_dialogs():                             # same silent-nothing as Browse… — say it instead
                 client["send"](json.dumps({"type": "warn", "text": _no_dialog_why("file")}))

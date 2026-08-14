@@ -97,6 +97,20 @@ PY
     [ ! -e "$HOME/.claude/hooks/tmux-status.sh" ]
 }
 
+@test "install.sh: preflight rejects Node older than the locked build requires" {
+    cat > "$TEST_DIR/old-node" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == --version ]]; then echo v20.19.0; exit 0; fi
+exit 1
+SH
+    chmod +x "$TEST_DIR/old-node"
+
+    ROMP_NODE="$TEST_DIR/old-node" run "$ROMP_DIR/install.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Node.js 22 or newer is required; found v20.19.0"* ]]
+    [ ! -e "$HOME/.claude/hooks/tmux-status.sh" ]
+}
+
 @test "install.sh: ROMP_SKIP_PREFLIGHT bypasses the checks" {
     ROMP_NODE=romp-test-no-such-node ROMP_SKIP_PREFLIGHT=1 run "$ROMP_DIR/install.sh"
     [ "$status" -eq 0 ]
@@ -263,6 +277,31 @@ PY
     [ "$status" -ne 0 ]                            # the failure still surfaces
     [ "$(cat "$EXT/package.json")" = "$before" ]   # ...and the trap still restored
     [ ! -f "$EXT/package.json.orig" ]
+}
+
+@test "vscode-extension/install.sh: fails when every editor rejects the VSIX" {
+    ext_setup
+    for cli in code code-insiders cursor codium; do
+        printf '#!/bin/sh\nexit 7\n' > "$TEST_DIR/stub/$cli"
+        chmod +x "$TEST_DIR/stub/$cli"
+    done
+    ROMP_EDITOR_APPS="$TEST_DIR/no-apps" run "$EXT/install.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"ROMP_EXT_INSTALL_RESULT installed=0 failed="* ]]
+    [[ "$output" != *"    installed into:"* ]]
+}
+
+@test "vscode-extension/install.sh: reports a machine-readable successful install" {
+    ext_setup
+    for cli in code code-insiders cursor codium; do
+        printf '#!/bin/sh\nexit 0\n' > "$TEST_DIR/stub/$cli"
+        chmod +x "$TEST_DIR/stub/$cli"
+    done
+    ROMP_EDITOR_APPS="$TEST_DIR/no-apps" run "$EXT/install.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ROMP_EXT_INSTALL_RESULT installed="* ]]
+    [[ "$output" != *"ROMP_EXT_INSTALL_RESULT installed=0"* ]]
+    [[ "$output" == *"    installed into:"* ]]
 }
 
 # ── git pre-push identifier hook ──────────────────────────────────────

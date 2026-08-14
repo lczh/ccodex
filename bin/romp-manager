@@ -27,14 +27,27 @@ const { spawn, execFileSync } = require('child_process');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 const HOST = '127.0.0.1';
-const CONTROL_PORT = Number(process.env.ROMP_MANAGER_PORT) || 7432;
+function configuredPort(raw, fallback, label) {
+  if (raw == null || String(raw).trim() === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1024 || n > 65535) {
+    throw new Error(`${label} must be an integer in [1024,65535]`);
+  }
+  return n;
+}
+const CONTROL_PORT = configuredPort(process.env.ROMP_MANAGER_PORT, 7432, 'ROMP_MANAGER_PORT');
 // ROMP_SERVE_PORT and ROMP_KERNEL_PORT are two spellings of the primary kernel's listen port
 // (bin/romp-serve owns that seam). Accept either, so a profile renumbered with only the
 // documented ROMP_KERNEL_PORT doesn't leave the manager defaulting to 29855 and spawning a
 // kernel straight into the other instance's port.
-const KERNEL_PORT = Number(process.env.ROMP_SERVE_PORT) || Number(process.env.ROMP_KERNEL_PORT) || 29855;
+const KERNEL_PORT = configuredPort(
+  process.env.ROMP_SERVE_PORT != null && String(process.env.ROMP_SERVE_PORT).trim() !== ''
+    ? process.env.ROMP_SERVE_PORT : process.env.ROMP_KERNEL_PORT,
+  29855, 'ROMP_SERVE_PORT/ROMP_KERNEL_PORT');
+if (KERNEL_PORT === CONTROL_PORT) throw new Error('manager and kernel ports must differ');
 
 // The PRIMARY kernel's state root — where the aux-kernel registry file lives (plans/multi-kernel.md
 // phase 3). Aux kernels get their OWN roots via their spec's stateDir; the registry itself is the
@@ -42,6 +55,56 @@ const KERNEL_PORT = Number(process.env.ROMP_SERVE_PORT) || Number(process.env.RO
 const STATE_ROOT = process.env.ROMP_STATE_DIR ||
   path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'romp');
 const KERNELS_FILE = path.join(STATE_ROOT, 'kernels.json');
+const CONTROL_TOKEN_FILE = path.join(STATE_ROOT, 'manager-token');
+const MAX_CONTROL_BODY = 0;       // every control operation is fully expressed by method/path/query
+const MAX_DYNAMIC_KERNELS = (() => {
+  const n = Number(process.env.ROMP_MANAGER_MAX_DYNAMIC_KERNELS || 16);
+  return Number.isInteger(n) && n >= 1 && n <= 128 ? n : 16;
+})();
+let managerControlToken = '';
+
+function tokenOk(value) {
+  const a = Buffer.from(String(value || ''));
+  const b = Buffer.from(String(managerControlToken || ''));
+  return !!b.length && a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function validControlToken(value) {
+  return /^[A-Za-z0-9_-]{32,512}$/.test(String(value || ''));
+}
+
+function loadControlToken(create) {
+  const fromEnv = String(process.env.ROMP_MANAGER_TOKEN || '').trim();
+  if (fromEnv) {
+    if (!validControlToken(fromEnv)) {
+      throw new Error('ROMP_MANAGER_TOKEN must be 32-512 characters from [A-Za-z0-9_-]');
+    }
+    return fromEnv;
+  }
+  const read = () => {
+    try {
+      const v = fs.readFileSync(CONTROL_TOKEN_FILE, 'utf8').trim();
+      if (!validControlToken(v)) throw new Error('manager-token is empty or malformed');
+      try { fs.chmodSync(CONTROL_TOKEN_FILE, 0o600); } catch (e) { /* best effort on odd filesystems */ }
+      return v;
+    } catch (e) {
+      if (e && e.code === 'ENOENT') return '';
+      throw e;
+    }
+  };
+  const prior = read();
+  if (prior || !create) return prior;
+  fs.mkdirSync(STATE_ROOT, { recursive: true, mode: 0o700 });
+  const minted = crypto.randomBytes(32).toString('base64url');
+  try {
+    const fd = fs.openSync(CONTROL_TOKEN_FILE, 'wx', 0o600);
+    try { fs.writeFileSync(fd, minted + '\n'); } finally { fs.closeSync(fd); }
+    return minted;
+  } catch (e) {
+    if (e && e.code === 'EEXIST') return read();
+    throw e;
+  }
+}
 
 // $TMUX scrub (2026-07-20): a manager launched by hand from INSIDE a tmux session leaks $TMUX to
 // its kernels and their SDK-session children — whose tmux-status hooks then resolve `#S` to
@@ -136,6 +199,7 @@ function specEnv(spec, base, ids) {
     ROMP_MANAGER_PID: String(ids.managerPid),  // → kernel's parent-death watchdog
     ROMP_MANAGER_PORT: String(ids.controlPort),
   });
+  if (ids.managerToken) env.ROMP_MANAGER_TOKEN = String(ids.managerToken);
   if (spec.postalPort) env.ROMP_POSTAL_PORT = String(spec.postalPort);
   if (spec.stateDir) env.ROMP_STATE_DIR = spec.stateDir;
   if (spec.claudeConfigDir) env.CLAUDE_CONFIG_DIR = spec.claudeConfigDir;
@@ -214,7 +278,8 @@ function spawnKernel(spec) {
   // exits itself instead of orphaning. ROMP_SERVE_PORT is the kernel's listen port; the rest of the
   // profile env (state root, Claude config dir, postal port, tmux socket) is the kernel's whole
   // isolation story (specEnv).
-  const env = specEnv(spec, process.env, { managerPid: process.pid, controlPort: CONTROL_PORT });
+  const env = specEnv(spec, process.env, { managerPid: process.pid, controlPort: CONTROL_PORT,
+                                           managerToken: managerControlToken });
   // stdio inherited → the kernel's own logs surface in this foreground terminal (visible owner).
   const child = spawn(rompServeBin(), ['--port', String(spec.port)], { stdio: 'inherit', env });
   kernels.set(spec.id, {
@@ -250,6 +315,26 @@ function ensureKernel(port) {
   spawnKernel({ id, port: Number(port) });
   const rec = kernels.get(id);
   return { id, port: Number(port), pid: rec ? rec.child.pid : null, spawned: true };
+}
+
+function ensurePort(raw) {
+  const text = raw == null || raw === '' ? String(KERNEL_PORT) : String(raw);
+  if (!/^\d+$/.test(text)) return { ok: false, status: 400, error: 'port must be an integer in [1024,65535]' };
+  const port = Number(text);
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+    return { ok: false, status: 400, error: 'port must be an integer in [1024,65535]' };
+  }
+  if (port === CONTROL_PORT) return { ok: false, status: 409, error: 'port is the manager control port' };
+  const loaded = loadSpecs(KERNELS_FILE, KERNEL_PORT, CONTROL_PORT);
+  if (loaded.specs.some((s) => Number(s.postalPort) === port)) {
+    return { ok: false, status: 409, error: 'port is reserved by a postal profile' };
+  }
+  const id = idForPort(port);
+  const dynamic = [...kernels.keys()].filter((k) => /^k\d+$/.test(k)).length;
+  if (!kernels.has(id) && /^k\d+$/.test(id) && dynamic >= MAX_DYNAMIC_KERNELS) {
+    return { ok: false, status: 429, error: `dynamic kernel limit (${MAX_DYNAMIC_KERNELS}) reached` };
+  }
+  return { ok: true, port };
 }
 
 // Pure storm-gate decision (time injected → unit-testable). `st` = {last, history}; decide whether to
@@ -410,11 +495,30 @@ function startTmuxServer() {
 }
 
 function startManager() {
+  managerControlToken = loadControlToken(true);
   startTmuxServer();
   const server = http.createServer((req, res) => {
     const url = new URL(req.url || '/', 'http://x');
     const kid = url.searchParams.get('kernel') || 'main';
-    const json = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+    const json = (code, obj, close) => {
+      const body = JSON.stringify(obj);
+      const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
+      if (close) headers.Connection = 'close';
+      res.writeHead(code, headers); res.end(body);
+      if (close) res.on('finish', () => req.destroy());
+    };
+    // Frame bodyless control requests before either provenance or bearer auth.  On every refusal the
+    // connection closes, so unread attacker bytes cannot become a second request on the keep-alive
+    // stream.  This is deliberately header-only: an unauthenticated body is never read or buffered.
+    if (req.method === 'POST') {
+      const rawLen = req.headers['content-length'];
+      if (req.headers['transfer-encoding']) {
+        return json(413, { ok: false, error: 'request body not accepted' }, true);
+      }
+      if (rawLen != null && (!/^\d+$/.test(String(rawLen)) || Number(rawLen) > MAX_CONTROL_BODY)) {
+        return json(413, { ok: false, error: 'request body too large' }, true);
+      }
+    }
     // CSRF / drive-by gate. Legit clients (the kernel's Restart proxy, the
     // `romp on` CLI) are server-side and send NO Origin header; a browser
     // cross-site fetch/form POST DOES send an Origin it cannot forge. So reject
@@ -424,7 +528,10 @@ function startManager() {
     if (origin) {
       let okOrigin = false;
       try { const ou = new URL(origin); okOrigin = ['127.0.0.1', 'localhost', '::1'].includes(ou.hostname); } catch { okOrigin = false; }
-      if (!okOrigin) return json(403, { ok: false, error: 'cross-site origin' });
+      if (!okOrigin) return json(403, { ok: false, error: 'cross-site origin' }, true);
+    }
+    if (!tokenOk(req.headers['x-romp-manager-token'])) {
+      return json(401, { ok: false, error: 'manager token required' }, true);
     }
     if (req.method === 'GET' && url.pathname === '/status') {
       return json(200, {
@@ -436,8 +543,9 @@ function startManager() {
     if (req.method === 'POST' && url.pathname === '/ensure') {
       // A front end configured for `port` asks us to guarantee a kernel there, then attaches. We own
       // it; the front end never spawns. Idempotent: spawned:false means one was already running.
-      const port = Number(url.searchParams.get('port')) || KERNEL_PORT;
-      return json(200, Object.assign({ ok: true }, ensureKernel(port)));
+      const checked = ensurePort(url.searchParams.get('port'));
+      if (!checked.ok) return json(checked.status, { ok: false, error: checked.error });
+      return json(200, Object.assign({ ok: true }, ensureKernel(checked.port)));
     }
     if (req.method === 'POST' && url.pathname === '/restart-all') {
       // Every restart request is logged WITH its source (the user 2026-07-31): a run of anonymous
@@ -482,7 +590,10 @@ function startManager() {
 
 // ── control client (romp on restart|status|down) ───────────────────────────
 function probeControl(cb) {
-  const req = http.get({ host: HOST, port: CONTROL_PORT, path: '/status', timeout: 1200 }, (res) => { res.resume(); cb(res.statusCode === 200); });
+  const token = loadControlToken(false);
+  const req = http.get({ host: HOST, port: CONTROL_PORT, path: '/status', timeout: 1200,
+                         headers: token ? { 'X-Romp-Manager-Token': token } : {} },
+    (res) => { res.resume(); cb(res.statusCode === 200 || res.statusCode === 401); });
   req.on('timeout', () => { req.destroy(); cb(false); });
   req.on('error', () => cb(false));
 }
@@ -491,7 +602,9 @@ function control(method, pathname, kernel, params) {
   const u = new URL(`http://${HOST}:${CONTROL_PORT}${pathname}`);
   if (kernel) u.searchParams.set('kernel', kernel);
   for (const [k, v] of Object.entries(params || {})) u.searchParams.set(k, v);
-  const req = http.request(u, { method, timeout: 4000 }, (res) => {
+  const token = loadControlToken(false);
+  const req = http.request(u, { method, timeout: 4000,
+                                headers: token ? { 'X-Romp-Manager-Token': token } : {} }, (res) => {
     let b = ''; res.on('data', (d) => (b += d));
     res.on('end', () => { try { process.stdout.write(JSON.stringify(JSON.parse(b), null, 2) + '\n'); } catch (e) { process.stdout.write(b + '\n'); } process.exit(res.statusCode < 400 ? 0 : 1); });
   });
@@ -515,7 +628,8 @@ function ensureUp() {
 // ── dispatch ────────────────────────────────────────────────────────────────
 // Exported for unit tests (restartGate = the pure storm-cap decision). The CLI dispatch runs only when this
 // file is executed directly, so require()-ing it from a test has no side effects.
-module.exports = { restartGate, quietGate, loadSpecs, specEnv, fileStamp };
+module.exports = { restartGate, quietGate, loadSpecs, specEnv, fileStamp, configuredPort, ensurePort,
+  validControlToken };
 if (require.main === module) {
   const cmd = process.argv[2];
   // `restart-all` (the `romp refresh` deploy path) defers to the next quiet window by default —

@@ -34,6 +34,7 @@ import { mediaSrc, kernelUrl } from "./media";
 import { initStrip, fmtReset } from "./strip";
 import { apiErrorReason } from "./api-error-reason";
 import { mathBlock, mathInline } from "./math";
+import { queuedCancelKey } from "./cancel-key";
 
 for (const [name, lang] of Object.entries({
   bash, sh: bash, shell: bash, python, py: python, javascript, js: javascript,
@@ -2698,7 +2699,8 @@ function restoreToComposer(text: string) {
   ta.setSelectionRange(ta.value.length, ta.value.length);
 }
 
-// The composer state around each ✕-click's optimistic restore, keyed `sid + " " + md`, so a FAILED
+// The composer state around each ✕-click's optimistic restore, keyed by the shared collision-safe
+// queuedCancelKey helper, so a FAILED
 // cancel (kernel cancelResult ok:false — the message had already reached the session) can put the
 // composer back exactly as it was IF the user hasn't touched it since (the user 2026-07-20: the
 // restored copy of an un-recallable message is a double-send waiting to happen). An edited draft is
@@ -8590,7 +8592,7 @@ window.addEventListener("message", (e: MessageEvent) => {
   // and UNDO the optimistic composer restore if the draft is untouched — leaving the copy there invited
   // re-sending a message that is already being answered. ok:true just drops the stash (restore stands).
   else if (m.type === "cancelResult" && typeof m.id === "string") {
-    const key = m.id + " " + (typeof m.md === "string" ? m.md : "");
+    const key = queuedCancelKey(m.id, typeof m.md === "string" ? m.md : "");
     const stash = pendingCancelRestores.get(key);
     pendingCancelRestores.delete(key);
     if (!m.ok) {
@@ -9441,7 +9443,7 @@ setupSettings();
         const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
         const before = ta ? ta.value : "";
         restoreToComposer(qmd);
-        pendingCancelRestores.set(activeId + " " + qmd, { before, after: ta ? ta.value : "" });
+        pendingCancelRestores.set(queuedCancelKey(activeId, qmd), { before, after: ta ? ta.value : "" });
       }
       // Optimistic; the next push rebuilds the queue without it. The GROUP is reflowed in the same breath —
       // the bubble alone leaves its "1 queued message" header behind, still counting what just went.

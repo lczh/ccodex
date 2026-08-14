@@ -191,7 +191,7 @@ class OpQueueParkOrDeliver(unittest.TestCase):
         self.assertEqual(km._pending_ops.get(SID),
                          [("compact",), ("send", "after the compact", "human"), ("model", "opus")])
 
-    def test_dead_session_queue_is_dropped_not_retried(self):
+    def test_backend_lookup_failure_keeps_the_queue_for_retry(self):
         km._pending_ops[SID] = [("send", "into the void", None)]
         km._compacting_now = lambda sid: False
 
@@ -199,7 +199,37 @@ class OpQueueParkOrDeliver(unittest.TestCase):
             raise RuntimeError("no such session")
         km.Sessions.backend_for = dead
         km._apply_pending_ops()                         # must not raise
-        self.assertNotIn(SID, km._pending_ops, "a dead session's queue is dropped, never retried forever")
+        self.assertEqual(km._pending_ops.get(SID), [("send", "into the void", None)],
+                         "a backend lookup failure is retryable and must never eat the user's message")
+
+    def test_backend_refusal_keeps_the_head_and_does_not_echo_it(self):
+        class Refusing(_FakeBackend):
+            def send(self, sid, text):
+                self.calls.append(("send", text))
+                return False
+
+        self.be = Refusing()
+        km._pending_ops[SID] = [("send", "please retry me", "human"),
+                                ("effort", "high")]
+        km.Sessions.backend_for = lambda sid: self.be
+        km._compacting_now = lambda sid: False
+        km._apply_pending_ops()
+        self.assertEqual(km._pending_ops.get(SID),
+                         [("send", "please retry me", "human"), ("effort", "high")])
+        self.assertEqual(self.echoes, [], "a refused send must not look delivered")
+
+    def test_immediate_refusal_is_parked_instead_of_echoed_and_lost(self):
+        class Refusing(_FakeBackend):
+            def send(self, sid, text):
+                self.calls.append(("send", text))
+                return False
+
+        self.be = Refusing()
+        km._compacting_now = lambda sid: False
+        km._working_now = lambda sid: False
+        km._send_or_park(self.be, SID, "please retry me", echo="human")
+        self.assertEqual(km._pending_ops.get(SID), [("send", "please retry me", "human")])
+        self.assertEqual(self.echoes, [])
 
     def test_producer_ticks_the_apply(self):
         import inspect

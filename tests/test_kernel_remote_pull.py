@@ -40,7 +40,7 @@ class FastPullGate(unittest.TestCase):
         km._remote_out_of_date = lambda r: ood
         km._behind_info = lambda sha: {"behind": behind, "ahead": ahead, "date": ""}
         try:
-            return km._is_fast_pull({"host": "TESTHOST", "kernel_sha": REMOTE})
+            return km._is_fast_pull({"host": "TESTHOST", "kernel_sha": REMOTE, "trust": "trusted"})
         finally:
             km._remote_out_of_date, km._behind_info = saved
 
@@ -54,6 +54,16 @@ class FastPullGate(unittest.TestCase):
         self.assertFalse(self._fp(behind=None, ahead=None), "an unknown build is unprovable — no")
         self.assertFalse(self._fp(behind=0, ahead=None), "half-known is still unproven")
 
+    def test_nontrusted_host_is_never_a_code_source(self):
+        saved = (km._remote_out_of_date, km._behind_info)
+        km._remote_out_of_date = lambda r: True
+        km._behind_info = lambda sha: {"behind": 0, "ahead": 3, "date": ""}
+        try:
+            self.assertFalse(km._is_fast_pull({"host": "TESTHOST", "kernel_sha": REMOTE,
+                                               "trust": "directed"}))
+        finally:
+            km._remote_out_of_date, km._behind_info = saved
+
 
 class PullRemote(unittest.TestCase):
     """_pull_remote drives git fetch + merge --ff-only via a dispatching subprocess mock."""
@@ -62,13 +72,16 @@ class PullRemote(unittest.TestCase):
         self._run, self._hc = km.subprocess.run, dict(km._HEAD_CACHE)
         km._HEAD_CACHE.update(ts=9e18, full=LOCAL, short=LOCAL[:8])
         km._remotes.clear()
+        km._remotes["TESTHOST"] = {"host": "TESTHOST", "trust": "trusted",
+                                    "kernel_sha": REMOTE}
 
     def tearDown(self):
         km.subprocess.run = self._run
         km._HEAD_CACHE.clear(); km._HEAD_CACHE.update(self._hc)
         km._remotes.clear()
 
-    def _wire(self, dirty="", rhead=REMOTE, ancestor_rc=0, merge_rc=0, count="3"):
+    def _wire(self, dirty="", rhead=REMOTE, fetched=REMOTE, resolved=REMOTE,
+              ancestor_rc=0, merge_rc=0, count="3"):
         calls = []
 
         def fake(argv, **kw):
@@ -84,6 +97,10 @@ class PullRemote(unittest.TestCase):
             if argv[0] == "git" and "merge" in argv:
                 return _R(rc=merge_rc, err="not a fast-forward" if merge_rc else "")
             if argv[0] == "git" and "rev-parse" in argv:
+                if "FETCH_HEAD" in argv:
+                    return _R(out=fetched)
+                if str(argv[-1]).endswith("^{commit}"):
+                    return _R(out=resolved)
                 return _R(out="bbbbbbb")
             cmd = argv[-1]                          # ssh: the clone discovery
             if "for d in" in cmd:
@@ -135,10 +152,85 @@ class PullRemote(unittest.TestCase):
         self.assertIn("diverged", detail)
 
     def test_already_up_to_date_short_circuits(self):
+        km._remotes["TESTHOST"]["kernel_sha"] = LOCAL
         self._wire(rhead=LOCAL)
         ok, detail = km._pull_remote("TESTHOST")
         self.assertTrue(ok)
         self.assertIn("already up to date", detail)
+
+    def test_expected_polled_sha_must_still_match_discovery(self):
+        calls = self._wire(rhead="c" * 40)
+        ok, detail = km._pull_remote("TESTHOST", expected_sha=REMOTE)
+        self.assertFalse(ok)
+        self.assertIn("changed build after it was polled", detail)
+        self.assertFalse(any(a[0] == "git" and "fetch" in a for a in calls),
+                         "a changed source is refused before fetching")
+
+    def test_fetch_head_must_equal_the_discovered_and_expected_sha(self):
+        calls = self._wire(rhead=REMOTE, fetched="c" * 40)
+        ok, detail = km._pull_remote("TESTHOST", expected_sha=REMOTE)
+        self.assertFalse(ok)
+        self.assertIn("changed HEAD during the pull", detail)
+        self.assertFalse(any(a[0] == "git" and "merge" in a for a in calls),
+                         "a moving remote HEAD is never merged")
+
+    def test_trust_is_unconditionally_required_before_touching_git_or_ssh(self):
+        km._remotes["TESTHOST"]["trust"] = "directed"
+        calls = self._wire()
+        ok, detail = km._pull_remote("TESTHOST", expected_sha=REMOTE)
+        self.assertFalse(ok)
+        self.assertIn("not trusted", detail)
+        self.assertEqual(calls, [])
+
+    def test_short_pin_resolves_to_exact_commit_before_discovery(self):
+        calls = self._wire()
+        ok, detail = km._pull_remote("TESTHOST", expected_sha=REMOTE[:7])
+        self.assertTrue(ok, detail)
+        resolve = next(a for a in calls if a[0] == "git" and str(a[-1]).endswith("^{commit}"))
+        self.assertEqual(resolve[-1], REMOTE[:7] + "^{commit}")
+
+    def test_same_prefix_but_different_full_commit_is_refused(self):
+        impostor = REMOTE[:7] + ("c" * 33)
+        calls = self._wire(rhead=impostor, resolved=REMOTE)
+        ok, detail = km._pull_remote("TESTHOST", expected_sha=REMOTE[:7])
+        self.assertFalse(ok)
+        self.assertIn("changed build after it was polled", detail)
+        self.assertFalse(any(a[0] == "git" and "fetch" in a for a in calls),
+                         "prefix agreement is not an executable-code pin")
+
+    def test_unresolvable_short_pin_is_refused_before_ssh(self):
+        calls = self._wire(resolved="")
+        ok, detail = km._pull_remote("TESTHOST", expected_sha=REMOTE[:7])
+        self.assertFalse(ok)
+        self.assertIn("exact, unambiguous", detail)
+        self.assertFalse(any(a[0] != "git" for a in calls), "no remote discovery before pin resolution")
+
+    def test_trust_downgrade_during_fetch_wins_before_merge(self):
+        calls = []
+
+        def fake(argv, **kw):
+            calls.append(argv)
+            if argv[0] == "git" and "status" in argv:
+                return _R()
+            if argv[0] == "git" and "fetch" in argv:
+                km._remotes["TESTHOST"]["trust"] = "directed"
+                return _R()
+            if argv[0] == "git" and "merge-base" in argv:
+                return _R()
+            if argv[0] == "git" and "rev-list" in argv:
+                return _R(out="1")
+            if argv[0] == "git" and "rev-parse" in argv:
+                return _R(out=REMOTE if "FETCH_HEAD" in argv else "bbbbbbb")
+            if "for d in" in argv[-1]:
+                return _R(out="DIR:/home/u/romp\nHEAD:%s\nDIRTY:" % REMOTE)
+            return _R()
+
+        km.subprocess.run = fake
+        ok, detail = km._pull_remote("TESTHOST", expected_sha=REMOTE)
+        self.assertFalse(ok)
+        self.assertIn("trust changed", detail)
+        self.assertFalse(any(a[0] == "git" and "merge" in a for a in calls),
+                         "a concurrent downgrade must win at the executable-code boundary")
 
 
 class AutoPullFiring(unittest.TestCase):
@@ -235,7 +327,8 @@ class AutoPullFiring(unittest.TestCase):
 
     def test_the_row_publishes_the_fast_pull_verdict(self):
         pub = km._remote_public({"host": "TESTHOST", "kernel_port": 29855, "local_port": 8801,
-                                 "token": "t", "status": "up", "sids": [], "kernel_sha": REMOTE})
+                                 "token": "t", "status": "up", "sids": [], "kernel_sha": REMOTE,
+                                 "trust": "trusted"})
         self.assertTrue(pub["fastPull"])
         self.assertFalse(pub["fastForward"])
 
