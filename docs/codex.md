@@ -36,10 +36,13 @@ Claude Code login. On a Codex-only machine, switch the judges to Codex instead
 
 ## Running the judges on Codex
 
-    echo codex > ~/.local/state/romp/judge-engine     # back to Claude: echo claude > …, or delete the file
+    romp engine codex        # back: romp engine claude — current posture: romp engine status
 
-then restart the kernel (the ↻ button, or `romp restart`). Every judge becomes
-a one-shot `codex exec` call — ephemeral (no session files), read-only sandbox,
+One switch, two knobs: the judges move to Codex, and new sessions (`romp new`,
+the kernel API) default to the Codex backend — the dashboard's + dialog keeps
+its own per-create toggle. No restart needed: judges read the setting on their
+next call, and running sessions are never touched. Every judge becomes a
+one-shot `codex exec` call — ephemeral (no session files), read-only sandbox,
 billing the machine's Codex login. Verified live: the real caption and gist
 judges answer correctly in ~5–6s per call.
 
@@ -47,7 +50,7 @@ Honest caveats while this is new:
 
 - **Quality**: the judge prompts were tuned on Claude models; on Codex they
   validate well but have less mileage. If cards read oddly, switch back —
-  it's one file.
+  it's one command.
 - **Cost/quota**: judges make many small calls (every turn gets captioned);
   on a ChatGPT plan they draw from the same usage pool as your Codex sessions.
 - **Accounting**: `codex exec` doesn't report token counts, so the analytics

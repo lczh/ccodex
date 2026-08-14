@@ -4632,6 +4632,18 @@ def _codex_ready():
         return False
 
 
+def _default_backend():
+    """The machine default for a NEW session when the caller names none — `romp engine` writes
+    STATE/default-backend ("sdk" | "codex"); absent/unknown → sdk, the long-standing default.
+    The dashboard's + dialog always names a backend (its own toggle), so this governs the
+    headless paths: `romp new` and POST /new."""
+    try:
+        v = (jd.STATE / "default-backend").read_text().strip()
+    except OSError:
+        return "sdk"
+    return v if v in ("sdk", "codex") else "sdk"
+
+
 # ── SDK problems → the dashboard's error center (the user 2026-07-28) ─────────────────────────────────────
 # The backend keeps a ring of everything that went wrong (SdkBackend._log, problem=True). Those used to
 # live only in the kernel log, so a stream that died or a model switch the CLI refused was invisible: the
@@ -22719,7 +22731,7 @@ class Handler(BaseHTTPRequestHandler):
                 if nm in live:
                     return self._send(200, json.dumps({"ok": True, "id": live[nm], "existing": True}),
                                       "application/json")
-                be_req = (b.get("backend") or "sdk")
+                be_req = (b.get("backend") or _default_backend())
                 if be_req == "codex":             # parity with the WS op: same gate, same loud refusal
                     if not _codex_ready():
                         cxbe = _codex()

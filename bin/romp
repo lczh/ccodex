@@ -658,6 +658,7 @@ EOF
     _romp_cmd "romp checkin <host>"        -            "Publish this machine to an attached hub (romp checkout withdraws)"
     _romp_cmd "romp default-dir [PATH]"    -            "Default working dir for new sessions (no arg prints; \"\" clears)"
     _romp_cmd "romp debug [on|off|status]" -            "Judge debug mode (rejection rows carry full input+reply)"
+    _romp_cmd "romp engine [claude|codex|status]" -     "One switch: which vendor runs the judges + what new sessions default to"
     exit 0
 fi
 
@@ -942,6 +943,49 @@ if [[ "${1:-}" == "debug" ]]; then
     exit 0
 fi
 
+# ── romp engine [claude|codex|status]: one switch for the machine's vendor posture ──────────────
+# Sets BOTH knobs together (docs/codex.md): which harness the JUDGES call (STATE/judge-engine —
+# read live per call, no restart) and which backend a NEW session defaults to
+# (STATE/default-backend — honored by `romp new` and the kernel's POST /new; the dashboard's
+# + dialog keeps its own per-create toggle). Running sessions are never touched.
+if [[ "${1:-}" == "engine" ]]; then
+    shift
+    _eng_state="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}"
+    case "${1:-status}" in
+        claude)
+            mkdir -p "$_eng_state"
+            printf 'claude\n' > "$_eng_state/judge-engine"
+            printf 'sdk\n'    > "$_eng_state/default-backend"
+            if ! command -v claude >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/claude" ]; then
+                echo "[romp] note: no claude binary found — install Claude Code and sign in, or judges + new sessions will fail loudly" >&2
+            fi
+            echo "[romp] engine CLAUDE — judges run on Claude; new sessions default to the Claude Agent SDK"
+            echo "[romp] running sessions are unaffected; judges pick this up on their next call" ;;
+        codex)
+            mkdir -p "$_eng_state"
+            printf 'codex\n' > "$_eng_state/judge-engine"
+            printf 'codex\n' > "$_eng_state/default-backend"
+            _cx="$(command -v codex 2>/dev/null || echo "$HOME/.local/bin/codex")"
+            if [ ! -x "$_cx" ]; then
+                echo "[romp] note: no codex binary found — run romp-codex-setup, then: codex login" >&2
+            elif ! "$_cx" login status 2>&1 | grep -qi '^logged in'; then   # the status goes to STDERR; "Not logged in" must not match
+                echo "[romp] note: codex isn't logged in — run: codex login (or codex login --device-auth)" >&2
+            fi
+            echo "[romp] engine CODEX — judges run on Codex; new sessions default to the Codex backend"
+            echo "[romp] running sessions are unaffected; judges pick this up on their next call" ;;
+        status)
+            # `|| true`: an absent file under set -euo pipefail otherwise kills the script
+            # mid-substitution, printing nothing at all
+            _je="$(cat "$_eng_state/judge-engine" 2>/dev/null | tr -d '[:space:]' || true)"
+            _db="$(cat "$_eng_state/default-backend" 2>/dev/null | tr -d '[:space:]' || true)"
+            echo "judges:               ${_je:-claude}"
+            echo "new-session default:  ${_db:-sdk}" ;;
+        *)
+            echo "usage: romp engine [claude|codex|status]" >&2; exit 2 ;;
+    esac
+    exit 0
+fi
+
 # Kernel-MANAGER commands. The manager (bin/romp-manager) is the thin, durable supervisor — normally
 # the login service runs it (romp-service; installed by install.sh), and front ends (VS Code, the web
 # dashboard, Obsidian) ATTACH rather than spawn. `romp up` is PURELY "run the manager, foreground" —
@@ -1142,7 +1186,11 @@ if [[ -n "$session_arg" ]] && ! $use_tmux && ! $resume; then
     _tok="$(_romp_token)"
     _kport="${ROMP_KERNEL_PORT:-29855}"
     _dir="${dir_arg:-$PWD}"
-    _be="sdk"; $use_codex && _be="codex"
+    # the machine default (romp engine → STATE/default-backend); an explicit --codex still wins.
+    # `|| true`: an absent file under set -euo pipefail otherwise kills the whole command here.
+    _be="$(cat "${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}/default-backend" 2>/dev/null | tr -d '[:space:]' || true)"
+    case "$_be" in sdk|codex) ;; *) _be="sdk" ;; esac
+    $use_codex && _be="codex"
     if [[ -z "$_tok" ]]; then
         echo "romp new: the kernel isn't running (no serve token). Start romp (the login service, or \`romp up\`), or use \`romp new -t $session_arg\` for a terminal session." >&2
         exit 1
@@ -1156,7 +1204,7 @@ if [[ -n "$session_arg" ]] && ! $use_tmux && ! $resume; then
         if [[ "$_resp" == *'"existing"'* ]]; then
             echo "romp new: \"$session_arg\" is already running; see the dashboard (romp)"
         else
-            _kind="SDK"; $use_codex && _kind="Codex"
+            _kind="SDK"; [ "$_be" = "codex" ] && _kind="Codex"
             echo "romp new: started \"$session_arg\" ($_kind session, working in $_dir)"
             echo "romp new: watch it on the dashboard: romp"
         fi
