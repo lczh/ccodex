@@ -91,6 +91,12 @@ class FakeClient:
     def thread_set_name(self, tid, name):
         self._rec("thread_set_name", tid, name)
 
+    def model_list(self, *a, **k):
+        self._rec("model_list")
+        return SimpleNamespace(data=[
+            SimpleNamespace(id="gpt-5-test", display_name="GPT-5 Test", hidden=False),
+            SimpleNamespace(id="gpt-5-hidden", display_name="Hidden", hidden=True)])
+
     def turn_start(self, tid, input_items, params=None):
         self._n += 1
         turn_id = "t-%d" % self._n
@@ -277,6 +283,16 @@ class Lifecycle(unittest.TestCase):
         self.assertFalse(be.rewind_files(sid, "u1"))
         self.assertTrue(be.set_model(sid, "gpt-5-codex"))
         self.assertEqual(be.live_sessions()[sid]["model"], "gpt-5-codex")
+        # a Claude alias would 400 the next turn — refused here so the kernel warns instead
+        self.assertFalse(be.set_model(sid, "sonnet"))
+        self.assertEqual(be.live_sessions()[sid]["model"], "gpt-5-codex")
+
+    def test_model_catalog_from_app_server(self):
+        be, fake, _ = build()
+        cat = be.model_catalog()
+        self.assertEqual(cat, [{"value": "gpt-5-test", "label": "GPT-5 Test"}])
+        be.model_catalog()
+        self.assertEqual(len(fake.called("model_list")), 1, "catalog is fetched once, then cached")
 
     def test_deliver_and_wake_reach_the_agent(self):
         be, fake, _ = build()

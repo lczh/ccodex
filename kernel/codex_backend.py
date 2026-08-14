@@ -151,6 +151,7 @@ class CodexBackend:
         self._client_factory = client_factory   # tests inject a fake; None → real CodexClient
         self._client = None
         self._client_err = None       # why the client can't be built/authed (str), or None
+        self._catalog = None          # model_catalog() cache — fetched once per process
         self._client_lock = threading.Lock()
         self._sessions = {}           # sid → _Session
         self._reg_lock = threading.Lock()
@@ -362,13 +363,37 @@ class CodexBackend:
 
     def set_model(self, sid, value):
         s = self._sessions.get(sid)
-        if not s or not value:
+        if not s or not value or not str(value).startswith("gpt"):
+            # a Claude alias (the other engine's vocabulary — a mis-aimed menu or script) would ride
+            # the next turn_start straight into a 400 that breaks the session's next turn; refusing
+            # here keeps the failure a loud kernel warn instead (2026-08-14 UI review)
             return False
         s.model = value                    # applied on the next turn_start; Codex persists it
         if s.norm:
             s.norm.model = value
         self._save_registry()
         return True
+
+    def model_catalog(self):
+        """[{value,label}] for the UI's model picker — the app-server's own model list (the ONE
+        authoritative source), fetched once per process and cached. [] when the client is
+        unavailable (the picker then shows nothing rather than another vendor's list). A plan
+        account may still refuse some listed models per turn — that failure surfaces loudly as
+        the turn's error card, and switching back is one click."""
+        if self._catalog is not None:
+            return self._catalog
+        c = self._get_client()
+        if c is None:
+            return []
+        try:
+            ms = c.model_list()
+            self._catalog = [{"value": m.id, "label": getattr(m, "display_name", None) or m.id}
+                             for m in (getattr(ms, "data", None) or [])
+                             if not getattr(m, "hidden", False)]
+        except Exception as e:
+            self.log("model_list failed: %s" % e)
+            return []
+        return self._catalog
 
     def set_mode(self, sid, mode):
         return False   # phase 1 pins approval never + workspace-write sandbox (plan doc); no live knob

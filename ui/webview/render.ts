@@ -7081,9 +7081,16 @@ type MetaKind = "mode" | "model" | "effort" | "fast";
 // keeps its reference; the session picker appends its own "Default" (use-the-CLI-default) sentinel — not a model.
 const MODEL_CHOICES: { label: string; value: string }[] = [];
 const EFFORT_CHOICES: { label: string; value: string }[] = [];
+// A CODEX session's pickers speak Codex's vocabulary (the payload's codex section — models from
+// the app-server's own list, efforts the four Codex accepts). Empty until the codex backend has
+// run: an empty model menu beats offering another vendor's models (docs/codex.md).
+const CODEX_MODEL_CHOICES: { label: string; value: string }[] = [];
+const CODEX_EFFORT_CHOICES: { label: string; value: string }[] = [];
 fetch(kernelUrl("/models"), { cache: "no-store" }).then((r) => r.json()).then((d) => {
   if (Array.isArray(d.models)) { MODEL_CHOICES.length = 0; MODEL_CHOICES.push(...d.models, { label: "Default", value: "default" }); }
   if (Array.isArray(d.efforts)) { EFFORT_CHOICES.length = 0; EFFORT_CHOICES.push(...d.efforts); }
+  if (d.codex && Array.isArray(d.codex.models)) { CODEX_MODEL_CHOICES.length = 0; CODEX_MODEL_CHOICES.push(...d.codex.models); }
+  if (d.codex && Array.isArray(d.codex.efforts)) { CODEX_EFFORT_CHOICES.length = 0; CODEX_EFFORT_CHOICES.push(...d.codex.efforts); }
 }).catch(() => { /* picker stays empty until it lands */ });
 // Permission mode: the shift+tab cycle (no slash command), so the picker offers the three cycle modes;
 // the host sets them by sending shift+tab the right number of times (the user 2026-06-16).
@@ -7137,12 +7144,24 @@ function prettyMode(m: string | undefined): string {
     case "auto": return "Auto";
     case "dontask": return "Don’t ask";
     case "bypasspermissions": return "Bypass";
+    case "sandboxed": return "Sandboxed";   // a Codex session's fixed posture (workspace-write)
     default: return "Normal";   // default / normal / unknown
   }
 }
 const META_CHOICES: Record<MetaKind, { label: string; value: string }[]> = {
   mode: MODE_CHOICES, model: MODEL_CHOICES, effort: EFFORT_CHOICES, fast: FAST_CHOICES,
 };
+// The choices a menu offers depend on the session's BACKEND: a Codex session speaks Codex's
+// vocabulary (its own model list, the four efforts it accepts) — never Claude's, whose aliases
+// the codex backend refuses (docs/codex.md). Mode/fast never reach here for codex (see the
+// toggleMetaMenu guard / the fast badge's report gate).
+function metaChoices(kind: MetaKind, st: Status): { label: string; value: string }[] {
+  if (st.backend === "codex") {
+    if (kind === "model") return CODEX_MODEL_CHOICES;
+    if (kind === "effort") return CODEX_EFFORT_CHOICES;
+  }
+  return META_CHOICES[kind];
+}
 // the live value of a meta kind for the active session
 function metaCurrent(kind: MetaKind, st: Status): string {
   return (kind === "model" ? st.model : kind === "effort" ? st.effort : kind === "fast" ? st.fast
@@ -7270,9 +7289,12 @@ function toggleMetaMenu(kind: MetaKind, btn: HTMLElement) {
   // a pending permission/picker prompt owns the pane's keyboard — injecting a
   // slash command there would answer the prompt instead (host guards this too)
   if (s.status.state === "awaiting") return;
+  // a Codex session's mode is fixed (sandboxed, plans/codex-backend.md phase 1) — the badge is
+  // informational, and opening Claude's permission-mode cycle under it would offer four no-ops
+  if (kind === "mode" && s.status.backend === "codex") return;
   const menu = el("div", "meta-menu");
   menu.dataset.kind = kind;
-  for (const c of META_CHOICES[kind]) {
+  for (const c of metaChoices(kind, s.status)) {
     const item = el("div", "meta-item" + (isCurrentMeta(kind, s.status, c.value) ? " current" : ""));
     item.textContent = c.label;
     item.addEventListener("click", (e) => {

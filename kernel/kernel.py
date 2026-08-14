@@ -22301,7 +22301,23 @@ class Handler(BaseHTTPRequestHandler):
                     "palettes": [{"name": k, "label": v["label"], "colors": v["bg"]}
                                  for k, v in pal.PALETTES.items()]}), "application/json", cache="no-cache")
             if p == "/models":                                # the ONE model + effort choice list — chat statusline, timeline lanes, AND judge settings all read it (the user 2026-07-02: no hardcoding in multiple places)
-                return self._send(200, json.dumps({"models": MODEL_CHOICES, "efforts": EFFORT_CHOICES}), "application/json", cache="no-cache")
+                # the codex section: what a CODEX session's pickers offer (docs/codex.md). Models
+                # come from the app-server's own list via the backend (the authoritative source;
+                # [] until the backend runs, so no picker ever shows another vendor's models);
+                # efforts are the four Codex accepts — max/ultracode are Claude-only.
+                cx = _codex()
+                cx_models = []
+                if cx:
+                    try:
+                        cx_models = cx.model_catalog()
+                    except Exception:
+                        pass
+                return self._send(200, json.dumps(
+                    {"models": MODEL_CHOICES, "efforts": EFFORT_CHOICES,
+                     "codex": {"models": cx_models,
+                               "efforts": [{"value": v, "label": v}
+                                           for v in ("low", "medium", "high", "xhigh")]}}),
+                    "application/json", cache="no-cache")
             if p == "/usage":                                 # the /usage rate-limit bars, re-read on demand: the rail's
                 # usage widget is click-to-refresh (the user 2026-06-30). Returns the freshest on-disk snapshot
                 # NOW, and (2026-07-02) also pokes one live SDK session for an exact get_usage snapshot — the
