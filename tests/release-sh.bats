@@ -3,8 +3,7 @@
 # scripts/release.sh — the release gate. What it exists to enforce:
 #   * VERSION is the ONE source of truth and the tag is DERIVED from it, so the two can
 #     never disagree — the script takes no tag argument at all (2026-07-29);
-#   * the tag is therefore always v-prefixed (bootstrap.sh's `git tag -l 'v*'` selector
-#     matches nothing otherwise, and the installer fails closed);
+#   * the tag is therefore always a stable vX.Y.Z tag, matching bootstrap.sh's selector;
 #   * every published tag is a cryptographically signed annotated tag and verifies locally;
 #   * the macOS CI run — dispatch-only, since macOS is billed even on public repos — must
 #     be GREEN before a version is tagged.
@@ -48,6 +47,10 @@ setup() {
 teardown() { rm -rf "$TEST_DIR"; }
 
 # STUB_CONCLUSION = what the stubbed `gh run view` reports (default success).
+# STUB_HEAD_SHA = the commit attached to that run (default: the fixture checkout's HEAD).
+# STUB_MOVE_REMOTE_SHA = move origin/main to this already-published commit while the run is viewed,
+# exercising the final remote-ref check without a network race.
+# STUB_DIRTY_ON_VIEW = mutate a tracked fixture file while the CI gate is viewed.
 # STUB_FLAKY_VIEWS = report nothing for the first N `run view` calls, as a transient API
 # error looks to the poll loop, then the real conclusion.
 # STUB_PR_STATE = what `gh pr view` reports (default MERGED).
@@ -63,7 +66,14 @@ case "\$1 \$2" in
   "run view")
       n=\$(( \$(cat "$TEST_DIR/views" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "$TEST_DIR/views"
       if [ "\$n" -le "\${STUB_FLAKY_VIEWS:-0}" ]; then exit 1; fi
-      echo "\${STUB_CONCLUSION:-success}" ;;
+      if [ -n "\${STUB_MOVE_REMOTE_SHA:-}" ]; then
+          git --git-dir="$TEST_DIR/origin.git" update-ref refs/heads/main "\$STUB_MOVE_REMOTE_SHA"
+      fi
+      if [ -n "\${STUB_DIRTY_ON_VIEW:-}" ]; then
+          printf 'changed-by-synthetic-gate\n' >> "$REPO/VERSION"
+      fi
+      head_sha="\${STUB_HEAD_SHA:-\$(git -C "$REPO" rev-parse HEAD)}"
+      printf '%s\t%s\n' "\${STUB_CONCLUSION:-success}" "\$head_sha" ;;
   # Auto-merge really lands the branch on origin/main, so the script's post-merge
   # fast-forward has something to pull and VERSION genuinely changes on main. Simulating
   # the merge as a no-op would let the bump path "pass" while proving nothing.
@@ -146,6 +156,7 @@ STUB
     _stub_gh
     echo "1.2.3" > "$REPO/VERSION"
     git -C "$REPO" commit -qam ver
+    git -C "$REPO" push -q origin main
     run "$REPO/scripts/release.sh" --skip-tests
     [ "$status" -eq 0 ]
     run git -C "$REPO" tag -l
@@ -206,6 +217,37 @@ STUB
     [ "$output" = "v0.1.0" ]
 }
 
+@test "release: refuses a clean feature branch even when VERSION already matches" {
+    _stub_gh
+    git -C "$REPO" switch -qc feature
+    echo synthetic > "$REPO/feature.txt"
+    git -C "$REPO" add feature.txt
+    git -C "$REPO" commit -qm feature
+
+    run "$REPO/scripts/release.sh" --skip-tests
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"does not match"*"origin/main"* ]]
+    [ ! -s "$GH_LOG" ]
+    run git -C "$REPO" tag -l
+    [ -z "$output" ]
+}
+
+@test "release: refuses a stale local release branch" {
+    _stub_gh
+    git clone -q --branch main "$TEST_DIR/origin.git" "$TEST_DIR/ahead"
+    git -C "$TEST_DIR/ahead" config user.email t@e.invalid
+    git -C "$TEST_DIR/ahead" config user.name t
+    git -C "$TEST_DIR/ahead" commit -q --allow-empty -m ahead
+    git -C "$TEST_DIR/ahead" push -q origin HEAD:main
+
+    run "$REPO/scripts/release.sh" --skip-tests
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"does not match"*"origin/main"* ]]
+    [ ! -s "$GH_LOG" ]
+    run git -C "$REPO" tag -l
+    [ -z "$output" ]
+}
+
 @test "release: a version PR that never merges does NOT tag" {
     _stub_gh
     STUB_PR_STATE=OPEN run "$REPO/scripts/release.sh" minor --skip-tests
@@ -231,6 +273,41 @@ STUB
     STUB_CONCLUSION=failure run "$REPO/scripts/release.sh" --skip-tests
     [ "$status" -ne 0 ]
     [[ "$output" == *"macOS run did not pass"* ]]
+    run git -C "$REPO" tag -l
+    [ -z "$output" ]
+}
+
+@test "release: refuses a green CI run for a different commit" {
+    _stub_gh
+    STUB_HEAD_SHA=0123456789012345678901234567890123456789 \
+        run "$REPO/scripts/release.sh" --skip-tests
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"different commit"* ]]
+    run git -C "$REPO" tag -l
+    [ -z "$output" ]
+}
+
+@test "release: refuses when the release branch moves after its green CI run" {
+    git clone -q "$TEST_DIR/origin.git" "$TEST_DIR/candidate"
+    git -C "$TEST_DIR/candidate" config user.email t@e.invalid
+    git -C "$TEST_DIR/candidate" config user.name t
+    git -C "$TEST_DIR/candidate" commit -q --allow-empty -m candidate
+    candidate_sha="$(git -C "$TEST_DIR/candidate" rev-parse HEAD)"
+    git -C "$TEST_DIR/candidate" push -q origin HEAD:refs/heads/candidate
+    _stub_gh
+
+    STUB_MOVE_REMOTE_SHA="$candidate_sha" run "$REPO/scripts/release.sh" --skip-tests
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"moved after validation"* ]]
+    run git -C "$REPO" tag -l
+    [ -z "$output" ]
+}
+
+@test "release: refuses when a release gate changes the working tree" {
+    _stub_gh
+    STUB_DIRTY_ON_VIEW=1 run "$REPO/scripts/release.sh" --skip-tests
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"working tree changed during the release gates"* ]]
     run git -C "$REPO" tag -l
     [ -z "$output" ]
 }
@@ -312,6 +389,21 @@ STUB
     [ ! -s "$GH_LOG" ]
 }
 
+@test "release: refuses a remote with multiple tag push destinations" {
+    _stub_gh
+    git init -q --bare "$TEST_DIR/extra.git"
+    git -C "$REPO" remote set-url --add --push origin "$TEST_DIR/origin.git"
+    git -C "$REPO" remote set-url --add --push origin "$TEST_DIR/extra.git"
+    run "$REPO/scripts/release.sh" --skip-tests
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"exactly one push URL"* ]]
+    [ ! -s "$GH_LOG" ]
+    run git -C "$TEST_DIR/origin.git" tag -l
+    [ -z "$output" ]
+    run git -C "$TEST_DIR/extra.git" tag -l
+    [ -z "$output" ]
+}
+
 @test "release: rejects repository identifiers with more than owner/repo" {
     _stub_gh
     ROMP_RELEASE_REPO=owner/repo/extra run "$REPO/scripts/release.sh" --skip-tests
@@ -336,12 +428,35 @@ STUB
     [ "$output" = "v0.2.0" ]
 }
 
+@test "release: reads the publishing default from its own repository, not the caller" {
+    _stub_gh
+    unset ROMP_RELEASE_REMOTE
+    git init -q --bare "$TEST_DIR/release.git"
+    git -C "$REPO" remote add release "$TEST_DIR/release.git"
+    git -C "$REPO" push -q release main
+    git -C "$REPO" config remote.pushDefault release
+
+    caller="$TEST_DIR/unrelated"
+    git init -q "$caller"
+    git -C "$caller" config remote.pushDefault planted
+    cd "$caller"
+    run "$REPO/scripts/release.sh" --skip-tests
+
+    [ "$status" -eq 0 ]
+    run git -C "$TEST_DIR/release.git" tag -l
+    [ "$output" = "v0.1.0" ]
+    run git -C "$TEST_DIR/origin.git" tag -l
+    [ -z "$output" ]
+}
+
 @test "release: notes start at the PREVIOUS tag, never at the one being cut" {
     _stub_gh
     git -C "$REPO" tag v0.0.9
+    git -C "$REPO" tag v9.0.0-rc.1
     run "$REPO/scripts/release.sh" --skip-tests
     [ "$status" -eq 0 ]
     grep -q -- "--notes-start-tag v0.0.9" "$GH_LOG"
+    ! grep -q -- "--notes-start-tag v9.0.0-rc.1" "$GH_LOG"
 }
 
 # ── the ordinary guards ───────────────────────────────────────────────
@@ -382,22 +497,23 @@ STUB
     [[ "$output" == *"is not X.Y.Z"* ]]
 }
 
-@test "release: a prerelease version tags as-is" {
+@test "release: refuses a prerelease VERSION" {
     _stub_gh
     echo "0.2.0-rc.1" > "$REPO/VERSION"
     git -C "$REPO" commit -qam ver
     run "$REPO/scripts/release.sh" --skip-tests
-    [ "$status" -eq 0 ]
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"stable releases only"* ]]
     run git -C "$REPO" tag -l
-    [ "$output" = "v0.2.0-rc.1" ]
+    [ -z "$output" ]
 }
 
-@test "release: a prerelease bumps from its release number" {
+@test "release: refuses an explicit prerelease target" {
     _stub_gh
-    echo "0.2.0-rc.1" > "$REPO/VERSION"
-    git -C "$REPO" commit -qam ver
-    run "$REPO/scripts/release.sh" minor --skip-tests --dry-run
-    [[ "$output" == *"0.2.0-rc.1 → 0.3.0"* ]]
+    run "$REPO/scripts/release.sh" 0.2.0-rc.1 --skip-tests --dry-run
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"stable releases only"* ]]
+    [ ! -s "$GH_LOG" ]
 }
 
 @test "release: --dry-run changes nothing at all" {
@@ -416,6 +532,7 @@ STUB
     mkdir -p "$REPO/tests"
     echo "raise SystemExit(1)" > "$REPO/tests/conftest.py"
     git -C "$REPO" add -A && git -C "$REPO" commit -qm suite
+    git -C "$REPO" push -q origin main
     run "$REPO/scripts/release.sh"
     [ "$status" -ne 0 ]
     [[ "$output" == *"Python suite failed"* ]]
@@ -452,6 +569,7 @@ EOF
     chmod +x "$TEST_DIR/gate-bin/python3" "$TEST_DIR/gate-bin/npm" "$TEST_DIR/gate-bin/npx"
     git -C "$REPO" add -A
     git -C "$REPO" commit -qm gate-fixture
+    git -C "$REPO" push -q origin main
     export RELEASE_GATE_LOG="$TEST_DIR/release-gate.log"
 
     PATH="$TEST_DIR/gate-bin:$PATH" run "$REPO/scripts/release.sh" --skip-macos
@@ -480,6 +598,7 @@ EOF
     chmod +x "$TEST_DIR/gate-bin/python3" "$TEST_DIR/gate-bin/npm"
     git -C "$REPO" add -A
     git -C "$REPO" commit -qm gate-fixture
+    git -C "$REPO" push -q origin main
 
     PATH="$TEST_DIR/gate-bin:$PATH" run "$REPO/scripts/release.sh" --skip-macos
     [ "$status" -ne 0 ]

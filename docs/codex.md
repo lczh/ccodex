@@ -112,7 +112,11 @@ servers from `~/.codex/config.toml`).
 ## Installing ccodex
 
 This repo is the distribution — the installer takes any repo and directory,
-cryptographically verifies the newest ccodex release tag, and checks it out:
+cryptographically verifies the newest stable ccodex release tag, and checks it out.
+There is currently no usable default release: the published tags are unsigned and the
+documentation does not yet identify an independently published maintainer key. Wait for
+both that trust root and a newer signed stable release, configure Git as described in
+[Release signature trust](install.md#release-signature-trust), and then run:
 
     curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | bash
 
@@ -142,8 +146,9 @@ configured signing key, verifies it locally, and publishes the matching release:
 
 The maintainer must configure `user.signingKey` (and `gpg.format ssh` plus an
 allowed-signers file when using SSH signing) before running the script, and upload the
-same public signing key to GitHub. The historical `v1.0.0` tag is unsigned; after this
-gate merges, cut a new signed release rather than weakening verification.
+same public signing key to GitHub and publish its fingerprint independently for installers.
+The historical `v1.0.0` and `v1.1.0` tags are unsigned; cut a new signed stable release
+rather than weakening verification.
 
 ccodex versions on its own line (v1.0.0 and up); upstream romp's tags stay
 behind it and are never pushed here, so the updater always resolves the

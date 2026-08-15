@@ -68,14 +68,22 @@ Needs Python 3.10+, Node.js 22+, git — and at least one agent vendor: an OpenA
 Codex sessions, and/or [Claude Code](https://claude.com/claude-code) (signed in) for
 Claude sessions.
 
+There is currently no usable default release. The published `v1.0.0` and `v1.1.0`
+tags are unsigned, and this repository does not yet identify an independently
+published maintainer key or fingerprint. Wait until both a maintainer key is published
+through an independent channel and a newer signed stable `vX.Y.Z` release exists, then
+configure Git to trust that key as described in
+[Release signature trust](docs/install.md#release-signature-trust).
+
+After those prerequisites are in place:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | bash
 ```
 
-This clones ccodex to `~/ccodex`, verifies the newest release tag with Git, installs it,
+This clones ccodex to `~/ccodex`, verifies the newest stable release tag with Git, installs it,
 and adds `bin/` to your shell rc. Release installs fail closed unless the tag has a valid
-signature from a signer trusted by your Git configuration; see
-[Release signature trust](docs/install.md#release-signature-trust). Installed machines then
+signature from a signer trusted by your Git configuration. Installed machines then
 learn about new releases on their own —
 the dashboard offers each update as a one-click banner (or installs it automatically;
 the gear's **Updates** setting decides). Then, in a new terminal:
@@ -87,9 +95,8 @@ ccodex engine codex    # optional — run EVERYTHING on the Codex login (skip if
 ccodex                 # opens the dashboard; start a session from there
 ```
 
-Migration note: `v1.0.0` predates this signature gate and is unsigned. After this change
-merges, a new signed release must be published before the default installer or updater can
-advance; the gate deliberately does not fall back to unsigned `main` or an older release.
+The gate deliberately does not fall back to unsigned `main`, a prerelease, or an older
+release.
 
 By default ccodex's own intelligence — the judges that caption work and route your
 attention — runs on Claude, so a machine without Claude Code should run

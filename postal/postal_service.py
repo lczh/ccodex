@@ -1083,7 +1083,11 @@ class Handler(BaseHTTPRequestHandler):
         pass   # keep stdout/stderr clean; the bus log is for real events only
 
     def _send(self, obj, code=200):
-        body = json.dumps(obj).encode()
+        body = json.dumps(obj).encode("utf-8")
+        if (urllib.parse.urlparse(self.path).path == "/peer-exchange"
+                and len(body) > PEER_EXCHANGE_MAX_BYTES):
+            body = json.dumps({"error": "exchange response exceeds the byte limit"}).encode()
+            code = 500
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -1091,7 +1095,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _body(self):
-        n = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError, OverflowError) as e:
+            raise PeerExchangeError("invalid content length") from e
+        if n < 0:
+            raise PeerExchangeError("invalid content length")
+        if (urllib.parse.urlparse(self.path).path == "/peer-exchange"
+                and n > PEER_EXCHANGE_MAX_BYTES):
+            raise PeerExchangeTooLarge("exchange request exceeds the byte limit")
         return json.loads(self.rfile.read(n)) if n else {}
 
     def _authorized(self):
@@ -1169,6 +1181,10 @@ class Handler(BaseHTTPRequestHandler):
                                "~/.local/state/romp/serve-token)"}, 403)
         try:
             data = self._body()
+        except PeerExchangeTooLarge:
+            return self._send({"error": "exchange request exceeds the byte limit"}, 413)
+        except PeerExchangeError:
+            return self._send({"error": "invalid request envelope"}, 400)
         except Exception:
             return self._send({"error": "bad json"}, 400)
         if u.path == "/peer":                      # the kernel's tunnel-transition notify (peer-bus mode)
@@ -1483,7 +1499,9 @@ def _peer_tier(value):
     PEER_STATE -> /peers -> the kernel's network panel.  Unknown values are omitted (the same behavior
     as an older peer that does not send the additive field), never reflected back to a browser.
     """
-    value = str(value or "").strip()
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
     return value if value in _TRUST_LEVELS else ""
 
 
@@ -1498,12 +1516,19 @@ def _peer_presence_rows(value):
     out = []
     if not isinstance(value, list):
         return out
-    for row in value[:2000]:
+    for row in value[:PEER_LIST_LIMITS["presence"]]:
         if not isinstance(row, dict):
             continue
-        name = " ".join(str(row.get("name") or "").split())[:128]
-        sid = str(row.get("id") or "")
-        via, via_bus = str(row.get("via") or ""), str(row.get("viaBus") or "")
+        raw_name, sid = row.get("name"), row.get("id")
+        via, via_bus = row.get("via"), row.get("viaBus")
+        if not isinstance(raw_name, str) or not isinstance(sid, str):
+            continue
+        if via is not None and not isinstance(via, str):
+            continue
+        if via_bus is not None and not isinstance(via_bus, str):
+            continue
+        name = " ".join(raw_name.split())[:128]
+        via, via_bus = via or "", via_bus or ""
         if not name or not _safe_id(sid):
             continue
         if via and not _safe_id(via):
@@ -1524,13 +1549,21 @@ def _peer_hold_rows(value):
     out = []
     if not isinstance(value, list):
         return out
-    for row in value[:100]:
+    for row in value[:PEER_LIST_LIMITS["holds"]]:
         if not isinstance(row, dict):
             continue
-        mid = str(row.get("mid") or "")
-        frm = " ".join(str(row.get("frm") or "?").split())[:128] or "?"
-        to = " ".join(str(row.get("to") or "?").split())[:128] or "?"
-        origin, via = str(row.get("origin") or ""), str(row.get("via") or "")
+        mid, origin, via = row.get("mid"), row.get("origin"), row.get("via")
+        if not isinstance(mid, str):
+            continue
+        if origin is not None and not isinstance(origin, str):
+            continue
+        if via is not None and not isinstance(via, str):
+            continue
+        raw_frm = row.get("frm") if isinstance(row.get("frm"), str) else "?"
+        raw_to = row.get("to") if isinstance(row.get("to"), str) else "?"
+        frm = " ".join(raw_frm.split())[:128] or "?"
+        to = " ".join(raw_to.split())[:128] or "?"
+        origin, via = origin or "", via or ""
         if not _safe_id(mid):
             continue
         if origin and not _safe_id(origin):
@@ -1539,10 +1572,11 @@ def _peer_hold_rows(value):
             continue
         try:
             at = max(0, int(row.get("at") or 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             at = 0
+        raw_gist = row.get("gist") if isinstance(row.get("gist"), str) else ""
         clean = {"mid": mid, "frm": frm, "to": to, "origin": origin, "at": at,
-                 "gist": " ".join(str(row.get("gist") or "").split())[:90]}
+                 "gist": " ".join(raw_gist.split())[:90]}
         if via:
             clean["via"] = via
         out.append(clean)
@@ -1709,6 +1743,84 @@ def peers_snapshot():
 # never for a dead session (live-only at delivery, loudly).
 
 PEER_PROTO = 1
+# An exchange can contain several 256 KiB messages plus bounded presence and receipt metadata.
+# Eight MiB keeps ordinary batching efficient while placing a hard ceiling before JSON allocation.
+PEER_EXCHANGE_MAX_BYTES = 8 * 1024 * 1024
+PEER_LIST_LIMITS = {
+    "presence": 2000,
+    "holds": 100,
+    "relays": 32,
+    "acks": 1024,
+    "bounces": 256,
+    "reads": 512,
+    "readAcks": 512,
+}
+PEER_RELAY_BYTE_BUDGET = 6 * 1024 * 1024
+PEER_REFUSAL_REASON = "the receiving machine refused delivery"
+
+
+class PeerExchangeError(ValueError):
+    """A peer exchange failed its bounded transport or envelope contract."""
+
+
+class PeerExchangeTooLarge(PeerExchangeError):
+    """A peer exchange exceeded the transport or list-cardinality ceiling."""
+
+
+def _peer_envelope_error(value):
+    """Return a bounded protocol error/status, or (None, 200) for a safe exchange root."""
+    if not isinstance(value, dict):
+        return "exchange body must be a JSON object", 400
+    for field, limit in PEER_LIST_LIMITS.items():
+        rows = value.get(field)
+        if rows is None:                              # absent fields remain compatible with older peers
+            continue
+        if not isinstance(rows, list):
+            return "exchange field '%s' must be a list" % field, 400
+        if len(rows) > limit:
+            return "exchange field '%s' has too many entries" % field, 413
+    return None, 200
+
+
+def _peer_payload_size(payload):
+    return len(json.dumps(payload).encode("utf-8"))
+
+
+def _fit_peer_exchange_payload(payload):
+    """Fit a locally built exchange without dropping terminal receipt state.
+
+    Relay/read records remain durable until acknowledged, while presence and holds are fresh snapshots.
+    Those four retryable/snapshot lists may therefore be prefix-batched. Acks, bounces, and readAcks
+    are intentionally retained; their field limits make their combined maximum comfortably bounded.
+    """
+    if _peer_payload_size(payload) <= PEER_EXCHANGE_MAX_BYTES:
+        return payload
+    for field in ("relays", "presence", "holds", "reads"):
+        rows = payload.get(field)
+        if not isinstance(rows, list) or not rows:
+            continue
+        original = rows
+        low, high = 0, len(original)
+        while low < high:
+            keep = (low + high + 1) // 2
+            payload[field] = original[:keep]
+            if _peer_payload_size(payload) <= PEER_EXCHANGE_MAX_BYTES:
+                low = keep
+            else:
+                high = keep - 1
+        payload[field] = original[:low]
+        if _peer_payload_size(payload) <= PEER_EXCHANGE_MAX_BYTES:
+            return payload
+    return payload
+
+
+def _peer_epoch(value):
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 BUS_EPOCH = int(time.time())               # this bus process's boot — peers key cached presence on it
 # This bus process's IDENTITY, carried on every exchange (additive, like `tier`; older peers omit it).
 # One machine reaches a fleet under TWO names — the alias its kernel dials (the ssh-config name) and
@@ -1960,17 +2072,28 @@ def outbox_put(host, msg):
     _atomic_json_put(d / (mid + ".json"), msg)
     _peer_wake(host).set()
 
-def outbox_list(host):
+def outbox_list(host, limit=None, byte_limit=None):
     if not _safe_id(host):
         return []
     try:
         out = []
+        used = 0
         for f in sorted((OUTBOX / host).glob("*.json")):
+            if limit is not None and len(out) >= limit:
+                break
             fingerprint = None
             try:
                 st = f.stat()
                 fingerprint = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
-                out.append(json.loads(f.read_text()))
+                row = json.loads(f.read_text())
+                size = len(json.dumps(row).encode("utf-8"))
+                if byte_limit is not None and used + size > byte_limit:
+                    if not out:
+                        _log("outbox: record %s exceeds one exchange's relay byte budget" % f.name)
+                        continue
+                    break
+                out.append(row)
+                used += size
             except Exception as e:
                 _quarantine_corrupt_json(f, "outbox", e, fingerprint)
         return out
@@ -2008,17 +2131,28 @@ def readbox_put(host, rec):
     _atomic_json_put(d / (mid + ".json"), rec)
     _peer_wake(host).set()
 
-def readbox_list(host):
+def readbox_list(host, limit=None, byte_limit=None):
     if not _safe_id(host):
         return []
     try:
         out = []
+        used = 0
         for f in sorted((READBOX / host).glob("*.json")):
+            if limit is not None and len(out) >= limit:
+                break
             fingerprint = None
             try:
                 st = f.stat()
                 fingerprint = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
-                out.append(json.loads(f.read_text()))
+                row = json.loads(f.read_text())
+                size = len(json.dumps(row).encode("utf-8"))
+                if byte_limit is not None and used + size > byte_limit:
+                    if not out:
+                        _log("readbox: record %s exceeds one exchange's byte budget" % f.name)
+                        continue
+                    break
+                out.append(row)
+                used += size
             except Exception as e:
                 _quarantine_corrupt_json(f, "readbox", e, fingerprint)
         return out
@@ -2028,6 +2162,8 @@ def readbox_list(host):
 def readbox_del(host, rec):
     """Clear one CONFIRMED receipt — only if the file still says what the peer confirmed (the unread
     flag matches), so an ack for a read never deletes the retraction that superseded it mid-flight."""
+    if not isinstance(rec, dict):
+        return
     mid = (rec or {}).get("mid") or ""
     if not (_safe_id(host) and _safe_id(mid)):   # host/mid are path components — block traversal
         return
@@ -2039,12 +2175,81 @@ def readbox_del(host, rec):
     except Exception:
         pass
 
+def _peer_ack_ids(value):
+    """Accept only bounded path-safe ack ids from an exchange list."""
+    if not isinstance(value, list):
+        return []
+    return [mid for mid in value[:PEER_LIST_LIMITS["acks"]]
+            if isinstance(mid, str) and _safe_id(mid)]
+
+
+def _peer_bounce_rows(value):
+    """Reduce bounces to terminal ids; peer-authored reasons are never executable mail text."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for row in value[:PEER_LIST_LIMITS["bounces"]]:
+        if not isinstance(row, dict):
+            continue
+        mid = row.get("mid")
+        if isinstance(mid, str) and _safe_id(mid):
+            out.append({"mid": mid, "why": PEER_REFUSAL_REASON})
+    return out
+
+
+def _peer_read_rows(value):
+    """Narrow receipt rows to routing ids, bounded timestamps, and the unread flag."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for row in value[:PEER_LIST_LIMITS["reads"]]:
+        if not isinstance(row, dict):
+            continue
+        mid = row.get("mid")
+        if not isinstance(mid, str) or not _safe_id(mid):
+            continue
+        clean = {"mid": mid}
+        origin = row.get("origin")
+        if origin:
+            if not isinstance(origin, str) or not _safe_id(origin):
+                continue
+            clean["origin"] = origin
+        dmid = row.get("dmid")
+        if dmid:
+            if not isinstance(dmid, str) or not _safe_id(dmid):
+                continue
+            clean["dmid"] = dmid
+        try:
+            clean["t"] = max(0, int(row.get("t") or 0))
+        except (TypeError, ValueError, OverflowError):
+            clean["t"] = 0
+        if row.get("unread"):
+            clean["unread"] = True
+        out.append(clean)
+    return out
+
+
+def _peer_read_ack_rows(value):
+    if not isinstance(value, list):
+        return []
+    out = []
+    for row in value[:PEER_LIST_LIMITS["readAcks"]]:
+        if not isinstance(row, dict):
+            continue
+        mid = row.get("mid")
+        if isinstance(mid, str) and _safe_id(mid):
+            out.append({"mid": mid, "unread": bool(row.get("unread"))})
+    return out
+
+
 def _read_arrived(host, r):
     """One read receipt from a peer: ours → log the exec (or its unexec retraction) into
     messages.jsonl, where _sent_receipts joins it to the cross-host sent event by the relay mid.
     Origin-stamped (the mail was forwarded through us) → re-queue one hop backward with the stamp
     stripped, so it can never loop — the same one-hop-max rule relays live by."""
-    mid = (r or {}).get("mid") or ""
+    if not isinstance(r, dict):
+        return
+    mid = r.get("mid") or ""
     if not _safe_id(mid):
         return
     origin = str((r or {}).get("origin") or "")
@@ -2067,12 +2272,15 @@ def _read_arrived(host, r):
 def _bounce_apply(host, b):
     """A peer refused one of our parked messages — return it to the SENDER as a bus-authored note,
     loudly, and drop it from the outbox. Parking never outlives a definitive refusal."""
-    mid = (b or {}).get("mid") or ""
+    rows = _peer_bounce_rows([b])
+    if not rows:
+        return
+    mid = rows[0]["mid"]
     msg = outbox_get(host, mid)
     if not msg:
         return
     note = ("undeliverable to '%s' on %s: %s\n\n(your message follows)\n%s"
-            % (msg.get("to") or "?", host, (b or {}).get("why") or "refused", msg.get("body") or ""))
+            % (msg.get("to") or "?", host, PEER_REFUSAL_REASON, msg.get("body") or ""))
     if msg.get("frm_id"):
         deliver(msg["frm_id"], "romp-postal", "", note, kind="coordinate")
     # The parked source is our retry record.  Retire it only after the return note was successfully
@@ -2080,7 +2288,7 @@ def _bounce_apply(host, b):
     outbox_del(host, mid)
     _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "bounced", "id": mid,
                                   "to": msg.get("to") or "?", "host": host,
-                                  "why": (b or {}).get("why") or "refused"})
+                                  "why": PEER_REFUSAL_REASON})
 
 def fleet_presence(exclude_host):
     """Presence for an exchange payload: local agents + ONE hop of gossip from our other peers, each
@@ -2206,8 +2414,9 @@ def _relay_in(host, m, token_proven=False):
     """One incoming relay: deliver locally, FORWARD one hop to a peer that owns the recipient, or
     bounce. Returns (verdict, bounce): 'ack' (delivered/held/deduped), 'hold' (forwarded — the
     END-TO-END ack comes back through us later; the sender keeps it parked meanwhile), 'bounce'
-    (definitive refusal), or 'drop' (unidentifiable: no mid to ack or bounce). Per-host trust gates the
-    local-delivery branch: trusted injects, directed holds for approval, isolated silently drops.
+    (definitive refusal), or 'drop' (unsafe/unidentifiable routing: no safe destination for a terminal
+    response). Per-host trust gates the local-delivery branch: trusted injects, directed holds for
+    approval, isolated silently drops.
 
     `token_proven` — True on the DIALED side (peer_exchange_handle): every request past the HTTP gate
     presented THIS machine's serve token, and token possession already means full control here (the
@@ -2220,41 +2429,74 @@ def _relay_in(host, m, token_proven=False):
     nothing: whatever answers the tunnel port never showed our token, so tiers gate it as before."""
     if not isinstance(m, dict):
         return "drop", None
-    # Relays cross an authenticated *machine* boundary, not a schema/trust boundary.  Narrow the
+    # Relays cross an authenticated *machine* boundary, not a schema/trust boundary. Narrow the
     # record before it can reach a mail header, quarantine JSON/browser metadata, or another peer's
-    # durable outbox.  In particular, origin is a claimed routing identity; only safe protocol ids
-    # may participate in trust lookup.  Display text stays literal (the browser uses text nodes), but
-    # control characters and unbounded values are refused rather than reflected or written to disk.
-    for key in ("mid", "to", "frm", "frm_id", "body", "kind", "origin"):
-        if key in m and m[key] is not None and not isinstance(m[key], str):
-            return "drop", None
-    mid = m.get("mid") or ""
-    if not _safe_id(mid):
+    # durable outbox. Unsafe routing fields drop silently: there is no safe identity to answer.
+    # Once mid + route are safe, a schema refusal BOUNCES with bounded constant text; dropping it
+    # would leave an honest sender retrying the same durable outbox item forever.
+    raw_mid = m.get("mid")
+    if not isinstance(raw_mid, str) or not _safe_id(raw_mid):
         return "drop", None
-    origin = m.get("origin") or ""
-    frm_id = m.get("frm_id") or ""
+    mid = raw_mid
+
+    def refuse(why):
+        return "bounce", {"mid": mid, "why": why}
+
+    raw_origin = m.get("origin")
+    raw_frm_id = m.get("frm_id")
+    origin = "" if raw_origin is None else raw_origin
+    frm_id = "" if raw_frm_id is None else raw_frm_id
+    if not isinstance(origin, str) or not isinstance(frm_id, str):
+        return "drop", None
     if (origin and not _safe_id(origin)) or (frm_id and not _safe_id(frm_id)):
         return "drop", None
-    raw_to, raw_frm = m.get("to") or "", m.get("frm") or "?"
-    if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_to + raw_frm):
+
+    raw_to = m.get("to")
+    raw_to = "" if raw_to is None else raw_to
+    if not isinstance(raw_to, str):
         return "drop", None
-    to = " ".join(raw_to.split())
-    frm = " ".join(raw_frm.split()) or "?"
-    if len(to) > 128 or len(frm) > 128:
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_to):
         return "drop", None
-    body = m.get("body") or ""
     try:
-        if len(body.encode("utf-8")) > 256 * 1024:
-            # BOUNCE, not drop: identity fields already validated, so the refusal is addressable —
-            # and a drop never acks, leaving the sender's outbox retrying the same oversized message
-            # on every exchange forever with nobody told (2026-08-14 review). Parking must never
-            # outlive a definitive refusal (_bounce_apply's own rule).
-            return "bounce", {"mid": mid, "why": "message too large (over 256KB) — not delivered"}
+        raw_to.encode("utf-8")
     except UnicodeError:
         return "drop", None
-    kind = m.get("kind") or ""
-    if kind not in ("", "delegate", "coordinate", "question"):
+    to = " ".join(raw_to.split())
+    if not to:
         return "drop", None
+
+    raw_frm = m.get("frm")
+    raw_frm = "?" if raw_frm is None or raw_frm == "" else raw_frm
+    if not isinstance(raw_frm, str):
+        return refuse("sender name must be text — not delivered")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_frm):
+        return refuse("sender name contains control characters — not delivered")
+    try:
+        raw_frm.encode("utf-8")
+    except UnicodeError:
+        return refuse("sender name is not valid UTF-8 — not delivered")
+    frm = " ".join(raw_frm.split()) or "?"
+    if len(to) > 128:
+        return refuse("recipient name exceeds 128 characters — not delivered")
+    if len(frm) > 128:
+        return refuse("sender name exceeds 128 characters — not delivered")
+
+    raw_body = m.get("body")
+    body = "" if raw_body is None else raw_body
+    if not isinstance(body, str):
+        return refuse("message body must be text — not delivered")
+    try:
+        if len(body.encode("utf-8")) > 256 * 1024:
+            return refuse("message too large (over 256KB) — not delivered")
+    except UnicodeError:
+        return refuse("message body is not valid UTF-8 — not delivered")
+
+    raw_kind = m.get("kind")
+    kind = "" if raw_kind is None else raw_kind
+    if not isinstance(kind, str):
+        return refuse("message kind must be text — not delivered")
+    if kind not in ("", "delegate", "coordinate", "question"):
+        return refuse("message kind is unsupported — not delivered")
     # Strip unknown peer-controlled keys before forwarding or persistence.
     m = {"mid": mid, "to": to, "frm": frm, "frm_id": frm_id, "body": body, "kind": kind}
     if origin:
@@ -2304,6 +2546,8 @@ def _relay_in(host, m, token_proven=False):
 def _ack_arrived(host, mid):
     """An end-to-end ack for outbox/<host>/<mid>: clear it. If we only FORWARDED it, relay the ack
     backward to the origin host; if it was ours, log the delivered receipt."""
+    if not isinstance(mid, str) or not _safe_id(mid):
+        return
     msg = outbox_get(host, mid)
     outbox_del(host, mid)
     if not msg:
@@ -2319,16 +2563,20 @@ def _ack_arrived(host, mid):
 def _bounce_arrived(host, b):
     """A bounce for outbox/<host>/<mid>: relay it backward if we only forwarded the message, else
     return it to our local sender."""
-    mid = (b or {}).get("mid") or ""
+    rows = _peer_bounce_rows([b])
+    if not rows:
+        return
+    bounce = rows[0]
+    mid = bounce["mid"]
     msg = outbox_get(host, mid)
     if msg and msg.get("origin"):
         p = _pending(msg["origin"])
         with _peer_lock:
-            p["bounces"].append(b)
+            p["bounces"].append(bounce)
         outbox_del(host, mid)                         # enqueue backward first; source remains on failure
         _peer_wake(msg["origin"]).set()
     else:
-        _bounce_apply(host, b)
+        _bounce_apply(host, bounce)
 
 def _pending(host):
     with _peer_lock:
@@ -2364,16 +2612,22 @@ def _drop_peer_name_dupes(host, bus_id):
 
 def peer_exchange_handle(data):
     """The DIALED side of one exchange. Returns (payload, status)."""
-    host = str((data or {}).get("host") or "").strip()
+    envelope_error, status = _peer_envelope_error(data)
+    if envelope_error:
+        return {"error": envelope_error}, status
+    raw_host = data.get("host")
+    if not isinstance(raw_host, str):
+        return {"error": "host must be text"}, 400
+    host = raw_host.strip()
     if not host:
         return {"error": "host required"}, 400
-    if (data or {}).get("proto") != PEER_PROTO:
-        return {"error": "peer protocol drift (theirs %r, ours %r) — update romp on one side"
-                % ((data or {}).get("proto"), PEER_PROTO), "proto": PEER_PROTO}, 409
+    if data.get("proto") != PEER_PROTO:
+        return {"error": "peer protocol drift — update romp on one side",
+                "proto": PEER_PROTO}, 409
     # Canonicalize BEFORE anything keys on the name: presence files under the alias (no duplicate
     # session rows), and the relays below are trust-judged under the alias the user actually tiered.
-    bus_id = str((data or {}).get("busId") or "")
-    if bus_id and not _safe_id(bus_id):
+    bus_id = data.get("busId") or ""
+    if not isinstance(bus_id, str) or (bus_id and not _safe_id(bus_id)):
         bus_id = ""                                      # identity metadata is bounded to protocol ids
     host = _canon_peer_name(host, bus_id)
     if not _safe_id(host):
@@ -2383,9 +2637,9 @@ def peer_exchange_handle(data):
         # logs the refusal) — unless the canonicalization above already folded the junk into a
         # checked-in alias, which is the existing self-heal and still works. Updated dialers never
         # declare such a name (self_host falls back); this guards against un-updated ones.
-        return {"error": "unsafe host name %r — this machine's hostname fails path-safety; fix its "
-                         "hostname (or set ROMP_POSTAL_HOST) and redial" % host}, 400
-    PEER_STATE[host] = {"presence": _peer_presence_rows(data.get("presence")), "epoch": data.get("epoch"),
+        return {"error": "unsafe host name — fix the peer hostname (or set ROMP_POSTAL_HOST) and redial"}, 400
+    PEER_STATE[host] = {"presence": _peer_presence_rows(data.get("presence")),
+                        "epoch": _peer_epoch(data.get("epoch")),
                         "holds": _peer_hold_rows(data.get("holds")), "seenAt": int(time.time())}
     if bus_id:
         PEER_STATE[host]["busId"] = bus_id
@@ -2393,13 +2647,13 @@ def peer_exchange_handle(data):
     tier = _peer_tier(data.get("tier"))
     if tier:                                         # the dialer's declared tier-of-us (additive; older peers omit it)
         PEER_STATE[host]["theirTier"] = tier
-    for mid in data.get("acks") or []:               # the dialer confirmed relays landed — end-to-end:
+    for mid in _peer_ack_ids(data.get("acks")):      # the dialer confirmed relays landed — end-to-end:
         _ack_arrived(host, mid)                      # a forwarded one relays its ack back to the origin
-    for b in data.get("bounces") or []:              # ...or refused them → backward, or to our sender
+    for b in _peer_bounce_rows(data.get("bounces")): # ...or refused them → backward, or to our sender
         _bounce_arrived(host, b)
-    for ra in data.get("readAcks") or []:            # the dialer confirmed response-carried receipts
+    for ra in _peer_read_ack_rows(data.get("readAcks")):  # the dialer confirmed response-carried receipts
         readbox_del(host, ra)
-    for r in data.get("reads") or []:                # read receipts flowing back — ours or one hop onward
+    for r in _peer_read_rows(data.get("reads")):     # read receipts flowing back — ours or one hop onward
         _read_arrived(host, r)
     acks, bounces = [], []
     for m in data.get("relays") or []:
@@ -2409,59 +2663,89 @@ def peer_exchange_handle(data):
         if verdict == "ack":
             acks.append(m.get("mid"))
         elif verdict == "bounce" and bounce:
-            bounces.append(bounce)                   # 'hold': forwarded — its ack comes back later
+            bounces.extend(_peer_bounce_rows([bounce]))  # 'hold': forwarded — its ack comes back later
 
     def _drain_backflow():                           # acks/bounces relayed BACK through us for this host
         p = _pending(host)
         with _peer_lock:
-            a2, b2 = p["acks"], p["bounces"]
-            p["acks"], p["bounces"] = [], []
+            raw_acks = p["acks"]
+            raw_bounces = p["bounces"]
+            pending_acks = _peer_ack_ids(raw_acks)
+            pending_bounces = _peer_bounce_rows(raw_bounces)
+            ack_room = max(0, PEER_LIST_LIMITS["acks"] - len(acks))
+            bounce_room = max(0, PEER_LIST_LIMITS["bounces"] - len(bounces))
+            a2, b2 = pending_acks[:ack_room], pending_bounces[:bounce_room]
+            p["acks"] = (pending_acks[ack_room:]
+                         + raw_acks[PEER_LIST_LIMITS["acks"]:])
+            p["bounces"] = (pending_bounces[bounce_room:]
+                             + raw_bounces[PEER_LIST_LIMITS["bounces"]:])
         return a2, b2
 
     a2, b2 = _drain_backflow()
     acks, bounces = acks + a2, bounces + b2
-    rel, reads = outbox_list(host), readbox_list(host)
+    rel = outbox_list(host, PEER_LIST_LIMITS["relays"], PEER_RELAY_BYTE_BUDGET)
+    reads = _peer_read_rows(readbox_list(host, PEER_LIST_LIMITS["reads"], 512 * 1024))
     if not rel and not reads and data.get("wait") and not acks and not bounces:
         # nothing to hand back → park on the wake so anything we accept mid-wait crosses instantly
         _peer_wake(host).clear()
         _peer_wake(host).wait(EXCHANGE_WAIT)
-        rel, reads = outbox_list(host), readbox_list(host)
+        rel = outbox_list(host, PEER_LIST_LIMITS["relays"], PEER_RELAY_BYTE_BUDGET)
+        reads = _peer_read_rows(readbox_list(host, PEER_LIST_LIMITS["reads"], 512 * 1024))
         a2, b2 = _drain_backflow()
         acks, bounces = acks + a2, bounces + b2
     # `reads` stay parked until the dialer's NEXT request readAcks them — a response can vanish
     # after we send it, so the dialed side never clears on send. Re-applying a duplicate is a no-op.
-    return {"host": self_host(), "epoch": BUS_EPOCH, "proto": PEER_PROTO, "busId": BUS_ID,
-            "presence": fleet_presence(host), "holds": holds_payload(host),
-            "tier": my_tier_of(host),                # how WE hold the dialer's mail (display/mirror, never the gate)
-            "relays": rel, "acks": acks, "bounces": bounces, "reads": reads}, 200
+    payload = {"host": self_host(), "epoch": BUS_EPOCH, "proto": PEER_PROTO, "busId": BUS_ID,
+               "presence": _peer_presence_rows(fleet_presence(host)),
+               "holds": _peer_hold_rows(holds_payload(host)),
+               "tier": my_tier_of(host),             # how WE hold the dialer's mail (display/mirror, never the gate)
+               "relays": rel, "acks": acks, "bounces": bounces, "reads": reads}
+    return _fit_peer_exchange_payload(payload), 200
 
 def build_exchange_request(host, wait=True):
     p = _pending(host)
     with _peer_lock:
-        acks, bounces, read_acks = list(p["acks"]), list(p["bounces"]), list(p.get("readAcks") or [])
-    return {"host": self_host(), "epoch": BUS_EPOCH, "proto": PEER_PROTO, "busId": BUS_ID,
-            "presence": fleet_presence(host), "holds": holds_payload(host),
-            "tier": my_tier_of(host),                # how WE hold the dialed host's mail
-            "relays": outbox_list(host),
-            "acks": acks, "bounces": bounces,
-            "reads": readbox_list(host), "readAcks": read_acks, "wait": bool(wait)}
+        acks = _peer_ack_ids(p["acks"])
+        bounces = _peer_bounce_rows(p["bounces"])
+        read_acks = _peer_read_ack_rows(p.get("readAcks") or [])
+    payload = {"host": self_host(), "epoch": BUS_EPOCH, "proto": PEER_PROTO, "busId": BUS_ID,
+               "presence": _peer_presence_rows(fleet_presence(host)),
+               "holds": _peer_hold_rows(holds_payload(host)),
+               "tier": my_tier_of(host),             # how WE hold the dialed host's mail
+               "relays": outbox_list(host, PEER_LIST_LIMITS["relays"], PEER_RELAY_BYTE_BUDGET),
+               "acks": acks, "bounces": bounces,
+               "reads": _peer_read_rows(readbox_list(
+                   host, PEER_LIST_LIMITS["reads"], 512 * 1024)),
+               "readAcks": read_acks, "wait": bool(wait)}
+    return _fit_peer_exchange_payload(payload)
 
 def peer_exchange_apply(host, req_sent, resp):
     """The DIALER's half: fold one exchange response in. `req_sent` is the request that produced it —
     its included acks/bounces/readAcks are now delivered and leave the pending queue (kept on send
     failure), and its reads leave the readbox: a response means the dialed side processed the whole
     request before answering, so request-carried receipts need no explicit ack."""
+    if not _safe_id(host) or not isinstance(req_sent, dict):
+        return False
+    request_error, _ = _peer_envelope_error(req_sent)
+    response_error, _ = _peer_envelope_error(resp)
+    if request_error or response_error:
+        return False
     p = _pending(host)
+    sent_acks = _peer_ack_ids(req_sent.get("acks"))
+    sent_bounces = {row["mid"] for row in _peer_bounce_rows(req_sent.get("bounces"))}
+    sent_read_acks = _peer_read_ack_rows(req_sent.get("readAcks"))
     with _peer_lock:
-        p["acks"] = [a for a in p["acks"] if a not in (req_sent.get("acks") or [])]
-        p["bounces"] = [b for b in p["bounces"] if b not in (req_sent.get("bounces") or [])]
-        p["readAcks"] = [a for a in p.get("readAcks") or [] if a not in (req_sent.get("readAcks") or [])]
-    for r in req_sent.get("reads") or []:
+        p["acks"] = [a for a in p["acks"] if a not in sent_acks]
+        p["bounces"] = [b for b in p["bounces"]
+                          if not isinstance(b, dict) or b.get("mid") not in sent_bounces]
+        p["readAcks"] = [a for a in p.get("readAcks") or [] if a not in sent_read_acks]
+    for r in _peer_read_rows(req_sent.get("reads")):
         readbox_del(host, r)
-    PEER_STATE[host] = {"presence": _peer_presence_rows(resp.get("presence")), "epoch": resp.get("epoch"),
+    PEER_STATE[host] = {"presence": _peer_presence_rows(resp.get("presence")),
+                        "epoch": _peer_epoch(resp.get("epoch")),
                         "holds": _peer_hold_rows(resp.get("holds")), "seenAt": int(time.time())}
-    bus_id = str(resp.get("busId") or "")
-    if bus_id and not _safe_id(bus_id):
+    bus_id = resp.get("busId") or ""
+    if not isinstance(bus_id, str) or (bus_id and not _safe_id(bus_id)):
         bus_id = ""
     if bus_id:                                       # the dialed alias is canonical for this bus: fold any
         PEER_STATE[host]["busId"] = bus_id           # row it left under its self-declared hostname
@@ -2469,11 +2753,11 @@ def peer_exchange_apply(host, req_sent, resp):
     tier = _peer_tier(resp.get("tier"))
     if tier:                                         # the dialed side's declared tier-of-us
         PEER_STATE[host]["theirTier"] = tier
-    for mid in resp.get("acks") or []:
+    for mid in _peer_ack_ids(resp.get("acks")):
         _ack_arrived(host, mid)
-    for b in resp.get("bounces") or []:
+    for b in _peer_bounce_rows(resp.get("bounces")):
         _bounce_arrived(host, b)
-    for r in resp.get("reads") or []:                # response-carried receipts: apply, ack on the NEXT dial
+    for r in _peer_read_rows(resp.get("reads")):     # response-carried receipts: apply, ack on the NEXT dial
         _read_arrived(host, r)
         with _peer_lock:
             p["readAcks"].append({"mid": r.get("mid"), "unread": bool(r.get("unread"))})
@@ -2485,7 +2769,8 @@ def peer_exchange_apply(host, req_sent, resp):
             if verdict == "ack":
                 p["acks"].append(m.get("mid"))
             elif verdict == "bounce" and bounce:
-                p["bounces"].append(bounce)          # 'hold': forwarded — its ack comes back later
+                p["bounces"].extend(_peer_bounce_rows([bounce]))  # 'hold': forwarded — ack returns later
+    return True
 
 def peer_route(to):
     """Where a non-local name lives: (host, agent) for exactly ONE peer match; (None, candidates) on
@@ -2521,16 +2806,55 @@ def peer_route(to):
         return hits[0]
     return None, hits
 
+def _peer_http_error_text(error):
+    """Read only a small diagnostic prefix from a peer-controlled HTTP error response."""
+    try:
+        return " ".join((error.read(2049) or b"").decode("utf-8", "replace").split())[:200]
+    except Exception:
+        return ""
+
+
 def _peer_http(port, payload, token=""):
     """Dial a peer bus through the kernel's -L forward. `token` is the PEER machine's serve token
     (?token= — the dialed bus validates against its own 0600 file); our X-Romp-Token would mean
     nothing over there."""
     path = "/peer-exchange" + (("?token=" + urllib.parse.quote(token)) if token else "")
+    envelope_error, status = _peer_envelope_error(payload)
+    if envelope_error:
+        error_type = PeerExchangeTooLarge if status == 413 else PeerExchangeError
+        raise error_type(envelope_error)
+    try:
+        wire = json.dumps(payload).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as e:
+        raise PeerExchangeError("exchange request is not encodable JSON") from e
+    if len(wire) > PEER_EXCHANGE_MAX_BYTES:
+        raise PeerExchangeTooLarge("exchange request exceeds the byte limit")
     req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path),
-                                 data=json.dumps(payload).encode(),
+                                 data=wire,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=EXCHANGE_WAIT + 10) as r:
-        return json.loads(r.read().decode() or "{}")
+        declared = r.headers.get("Content-Length")
+        if declared is not None:
+            try:
+                declared_size = int(declared)
+            except (TypeError, ValueError, OverflowError) as e:
+                raise PeerExchangeError("peer response has an invalid content length") from e
+            if declared_size < 0:
+                raise PeerExchangeError("peer response has an invalid content length")
+            if declared_size > PEER_EXCHANGE_MAX_BYTES:
+                raise PeerExchangeTooLarge("peer response exceeds the byte limit")
+        raw = r.read(PEER_EXCHANGE_MAX_BYTES + 1)
+        if len(raw) > PEER_EXCHANGE_MAX_BYTES:
+            raise PeerExchangeTooLarge("peer response exceeds the byte limit")
+        try:
+            response = json.loads(raw.decode("utf-8") or "{}")
+        except (UnicodeError, ValueError) as e:
+            raise PeerExchangeError("peer response is not valid JSON") from e
+        envelope_error, status = _peer_envelope_error(response)
+        if envelope_error:
+            error_type = PeerExchangeTooLarge if status == 413 else PeerExchangeError
+            raise error_type(envelope_error)
+        return response
 
 def _peer_loop(host):
     """One dialer per up peer: exchange, fold the response in, repeat — the dialed side's long-poll
@@ -2553,11 +2877,7 @@ def _peer_loop(host):
                 _peer_wake(host).clear()
                 _peer_wake(host).wait(60)
                 continue
-            body = ""
-            try:
-                body = " ".join((e.read() or b"").decode("utf-8", "replace").split())[:200]
-            except Exception:
-                pass
+            body = _peer_http_error_text(e)
             st = PEER_STATE.setdefault(host, {})
             if st.get("refused") != (e.code, body):      # each DISTINCT refusal once, not per retry —
                 st["refused"] = (e.code, body)           # a 4xx (e.g. the unsafe-host gate) otherwise

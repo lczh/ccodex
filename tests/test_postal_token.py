@@ -10,6 +10,7 @@ token, a token-less down notify keeps the last known one, and the dialer sends ?
 Synthetic only — hermetic temp state dir, placeholder names, no real session data.
 """
 import json
+import http.client
 import os
 import tempfile
 import threading
@@ -19,6 +20,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
@@ -78,6 +80,28 @@ class BusTokenGate(unittest.TestCase):
         self.assertEqual(_code(self.port, "/peers", headers={"X-Romp-Token": "wrong"}), 403)
         self.assertEqual(_code(self.port, "/peers?token=wrong"), 403)
 
+    def test_peer_exchange_rejects_an_oversize_declared_body_before_reading_it(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.putrequest("POST", "/peer-exchange?token=" + TOK)
+            conn.putheader("Content-Type", "application/json")
+            conn.putheader("Content-Length", str(ps.PEER_EXCHANGE_MAX_BYTES + 1))
+            conn.endheaders()
+            response = conn.getresponse()
+            self.assertEqual(response.status, 413)
+            self.assertLessEqual(len(response.read()), 256)
+        finally:
+            conn.close()
+
+    def test_peer_exchange_rejects_non_object_and_over_cardinality_envelopes(self):
+        headers = {"Content-Type": "application/json"}
+        self.assertEqual(_code(self.port, "/peer-exchange?token=" + TOK, headers=headers,
+                               method="POST", data=b"[]"), 400)
+        body = json.dumps({"host": "TESTHOST", "proto": ps.PEER_PROTO,
+                           "relays": [None] * (ps.PEER_LIST_LIMITS["relays"] + 1)}).encode()
+        self.assertEqual(_code(self.port, "/peer-exchange?token=" + TOK, headers=headers,
+                               method="POST", data=body), 413)
+
 
 class PeerTokenPlumbing(unittest.TestCase):
     def test_peer_update_stores_token_and_down_notify_keeps_it(self):
@@ -111,6 +135,68 @@ class PeerTokenPlumbing(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
         self.assertEqual(seen.get("path"), "/peer-exchange?token=peer-tok")
+
+    def test_peer_http_rejects_oversize_response_before_reading(self):
+        class DeclaredOversize:
+            headers = {"Content-Length": str(ps.PEER_EXCHANGE_MAX_BYTES + 1)}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, *args):
+                raise AssertionError("oversize response body must not be read")
+
+        with mock.patch.object(ps.urllib.request, "urlopen", return_value=DeclaredOversize()):
+            with self.assertRaises(ps.PeerExchangeError):
+                ps._peer_http(45001, {"host": "TESTHOST"})
+
+    def test_peer_http_rejects_non_object_and_over_cardinality_responses(self):
+        class Response:
+            def __init__(self, body):
+                self.body = body
+                self.headers = {"Content-Length": str(len(body))}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, *args):
+                return self.body
+
+        bodies = [b"[]", json.dumps({"relays": [None] *
+                                      (ps.PEER_LIST_LIMITS["relays"] + 1)}).encode()]
+        for body in bodies:
+            with self.subTest(body=body[:20]):
+                with mock.patch.object(ps.urllib.request, "urlopen", return_value=Response(body)):
+                    with self.assertRaises(ps.PeerExchangeError):
+                        ps._peer_http(45001, {"host": "TESTHOST"})
+
+    def test_peer_http_rejects_bad_outbound_envelopes_before_connecting(self):
+        payloads = [[], {"relays": [None] * (ps.PEER_LIST_LIMITS["relays"] + 1)}]
+        for payload in payloads:
+            with self.subTest(payload_type=type(payload).__name__):
+                with mock.patch.object(ps.urllib.request, "urlopen") as open_peer:
+                    with self.assertRaises(ps.PeerExchangeError):
+                        ps._peer_http(45001, payload)
+                    open_peer.assert_not_called()
+
+    def test_peer_http_error_diagnostic_uses_a_bounded_read(self):
+        class ErrorBody:
+            requested = None
+
+            def read(self, size):
+                self.requested = size
+                return b"synthetic peer error " * 200
+
+        error = ErrorBody()
+        text = ps._peer_http_error_text(error)
+        self.assertEqual(error.requested, 2049)
+        self.assertLessEqual(len(text), 200)
 
 
 if __name__ == "__main__":

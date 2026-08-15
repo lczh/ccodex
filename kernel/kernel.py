@@ -1874,43 +1874,6 @@ def _release_verify_argv(tag):
     return argv + ["verify-tag", tag]
 
 
-def _release_verify_enforced():
-    """Is a release trust root CONFIGURED on this install? Verification enforces only then —
-    mandatory-with-no-published-key bricked every install's updater from the first release (no key
-    was ever distributed for friends' machines to trust; 2026-08-14 review). Configured deployments
-    (the env var, an explicit opt-in, or the allowed-signers file bootstrap persists into the
-    clone's git config) keep the full fail-closed gate; everyone else verifies best-effort and the
-    update log says so loudly."""
-    if (os.environ.get("ROMP_RELEASE_ALLOWED_SIGNERS") or "").strip():
-        return True
-    if (os.environ.get("ROMP_VERIFY_RELEASES") or "").strip():
-        return True
-    # Read the clone's config FILE directly, no subprocess: this runs inside _run_update, where
-    # tests (and any caller) may have subprocess.Popen patched — a spawned `git config` there
-    # poisons the very capture that pins this function's behavior. bootstrap persists the
-    # allowed-signers path with `git config --local`, so the local config file is the store.
-    try:
-        gitp = ROOT / ".git"
-        if gitp.is_file():   # a worktree: `.git` is a pointer file; its config sits in the gitdir,
-            gd = ""          # with the shared half behind commondir
-            for line in gitp.read_text().splitlines():
-                if line.startswith("gitdir:"):
-                    gd = line.split(":", 1)[1].strip()
-            for cand in (Path(gd) / "config", Path(gd) / "commondir"):
-                try:
-                    if cand.name == "commondir":
-                        common = (Path(gd) / cand.read_text().strip()).resolve()
-                        cand = common / "config"
-                    if "allowedsignersfile" in cand.read_text().lower():
-                        return True
-                except OSError:
-                    continue
-            return False
-        return "allowedsignersfile" in (gitp / "config").read_text().lower()
-    except OSError:
-        return False
-
-
 def _run_update(tag):
     """Start the self-update: fetch the tag, fast-forward EXACTLY onto it, install, report (+ restart
     on success), in a DETACHED child. Returns True when the child was launched. The tree lands on the
@@ -1950,18 +1913,12 @@ def _run_update(tag):
                (q(sys.executable), q(manager_post), int(mport))) if mport.isdigit() \
         else "  : # no manager — the new code arms on the next romp start (the report says so)\n"
     ok_rep = {"ok": True, "tag": tag, "restarted": bool(mport.isdigit())}
-    verify_sh = " ".join(q(x) for x in verify_argv)
-    if not _release_verify_enforced():
-        # best-effort: the attempt and its outcome land in the log either way, but an unsigned tag
-        # does not dead-end the update on an install with no trust root to check against
-        verify_sh = ("{ %s || echo 'note: release tag not signature-verified "
-                     "(no trust root configured on this install)'; }" % verify_sh)
     script = (
         "cd %s || exit 1\n" % q(str(ROOT))
         + "{ echo; echo \"== romp self-update to %s ==\"; date; } >> %s 2>&1\n" % (tag, log)
         + "if git fetch origin refs/tags/%s:refs/tags/%s >> %s 2>&1 && %s >> %s 2>&1 "
           "&& git merge --ff-only %s >> %s 2>&1 && ./install.sh >> %s 2>&1; then\n"
-          % (tag, tag, log, verify_sh, log, tag, log, log)
+          % (tag, tag, log, " ".join(q(x) for x in verify_argv), log, tag, log, log)
         + "  printf '%%s' %s > %s\n" % (q(json.dumps(ok_rep)), rep)
         + restart
         + "else\n"
@@ -8864,7 +8821,9 @@ def _ask_peer_to_pull(host):
     if not j.get("ok"):
         return False, "%s refused: %s" % (host, j.get("detail") or j.get("error") or ("HTTP %s" % st))
     detail = str(j.get("detail") or "pulled this machine's commits")
-    rst, _rj = _peer_call(r, "POST", "/restart", {}, timeout=10)
+    # This call restarts only the peer we just updated. Broad restart scope is an independent,
+    # explicit operator action and must not spread through a peer's own attached machines.
+    rst, _rj = _peer_call(r, "POST", "/restart", {"fleet": False}, timeout=10)
     if rst != 200:
         return True, detail + "; it took the commits but did not ack the restart — restart romp on %s" % host
     return True, detail + "; restarting it"
@@ -20699,7 +20658,7 @@ window.__rompRestart=function(){
 var boot=document.getElementById('romp-boot');
 if(!boot){boot=document.createElement('div');boot.id='romp-boot';boot.innerHTML=__ROMP_LOADER__;document.body.appendChild(boot);}
 boot.classList.remove('gone');
-try{fetch('/restart',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).catch(function(){});}catch(e){}
+try{fetch('/restart',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"fleet":false}'}).catch(function(){});}catch(e){}
 var n=0;(function again(){setTimeout(function(){n++;
 fetch('/healthz',{cache:'no-store'}).then(function(r){var b=(r&&r.ok)?r.headers.get('X-Romp-Boot'):null;
 if(b&&b!==__ROMP_BOOT__)location.reload();else if(n<240)again();else location.reload();})
@@ -23016,20 +22975,20 @@ class Handler(BaseHTTPRequestHandler):
                 # button then polls /healthz and reloads). Standalone (no manager) → nothing to restart;
                 # the ack still returns.
                 #
-                # With remotes attached, Restart means EVERYTHING attached, not just this box (the
-                # user 2026-07-29) — remotes were being left on their old processes and old code with
-                # nothing saying so. The 2026-08-14 review sweep flipped this default to local-only
-                # (rationale: restart→sync-pull can import a trusted host's newer commits), but that
-                # concern is carried by the pull path's own trust + exact-commit-pin gates from the
-                # same sweep — and silently reversing a recorded product decision is not the review's
-                # call. `fleet:false` keeps the local-only behaviour. The remote half runs in a thread
-                # and writes its report to disk BEFORE restarting this kernel, because this process
-                # does not survive to report anything.
-                _fleet = True
+                # Remote-wide restart can import and execute a trusted host's newer commits, push this
+                # checkout to other hosts, and interrupt every attached machine. It therefore requires
+                # an explicit boolean opt-in; ordinary UI/API restart is local-only. Invalid request
+                # bodies are rejected instead of retaining a broader default after a parsing failure.
                 try:
-                    _fleet = json.loads(raw_body or b"{}").get("fleet", True) is not False
-                except Exception:
-                    pass
+                    _restart_body = json.loads(raw_body or b"{}")
+                except (TypeError, ValueError, UnicodeDecodeError):
+                    return self._send(400, "restart body must be valid JSON", "text/plain")
+                if not isinstance(_restart_body, dict):
+                    return self._send(400, "restart body must be a JSON object", "text/plain")
+                _remote_scope = _restart_body.get("fleet", False)
+                if not isinstance(_remote_scope, bool):
+                    return self._send(400, "restart field 'fleet' must be boolean", "text/plain")
+                _fleet = _remote_scope
                 # WHO ASKED, on the record (the user 2026-07-31): a restart blinks every dashboard, and
                 # a run of them traced to this route was unattributable — the CLI path audits itself
                 # (bin/romp → restart-audit.jsonl) but the HTTP door was silent. Same file, so one log

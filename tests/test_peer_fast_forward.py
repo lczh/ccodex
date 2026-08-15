@@ -116,6 +116,8 @@ class AskingThePeer(unittest.TestCase):
                          "a pull alone leaves the OLD kernel running and still reporting the old sha")
         self.assertEqual(calls[0][2], {"host": "hubname", "expectedSha": LOCAL},
                          "the peer is handed both the source name and the exact approved commit")
+        self.assertEqual(calls[1][2], {"fleet": False},
+                         "restarting one updated peer must not spread to its attached machines")
         self.assertIn("pulled 8 commits", detail)
         self.assertIn("restarting it", detail)
 

@@ -25,6 +25,7 @@ set_fast/set_mode/set_auth/stop_task/rewind_files → False, on_ask → False, c
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -79,8 +80,8 @@ _PERMANENT_RPC_TEXT = (
 )
 
 
-def _is_permanent_turn_rejection(error):
-    """Whether turn/start reached app-server and was rejected non-retryably.
+def _is_permanent_request_rejection(error):
+    """Whether an app-server request reached Codex and was rejected non-retryably.
 
     The pinned SDK gives request-shape/method/parameter failures distinct types. InternalRpcError,
     ServerBusyError and unknown numeric app codes can recover without changing the request, so they
@@ -97,9 +98,14 @@ def _is_permanent_turn_rejection(error):
     return any(pattern.search(message) for pattern in _PERMANENT_RPC_TEXT)
 
 
-class _PermanentTurnStartRejection(RuntimeError):
-    def __init__(self, cause, change_generation, client_generation):
+# Compatibility for focused probes written against the first durable-queue implementation.
+_is_permanent_turn_rejection = _is_permanent_request_rejection
+
+
+class _PermanentRequestRejection(RuntimeError):
+    def __init__(self, cause, operation, change_generation, client_generation):
         super().__init__(str(cause) or cause.__class__.__name__)
+        self.operation = operation
         self.change_generation = change_generation
         self.client_generation = client_generation
 
@@ -196,6 +202,7 @@ class _Session:
         self.state = "waiting"        # waiting | working (the two states this backend can know)
         self.since = time.time()
         self.queue = []               # pending sends (persisted); drained into the next turn
+        self.queue_ids = []           # stable durable identity parallel to queue (public API stays text-only)
         self.echoes = []              # optimistic user-atom echoes ahead of the materialized file
         self.turn_id = None           # the active turn (interrupt/steer target), else None
         self.loaded = False           # thread/resume done in THIS process
@@ -204,7 +211,7 @@ class _Session:
         self.worker = None
         self.kick = threading.Event() # wake the worker (new send / resume / shutdown)
         self.change_generation = 0    # explicit send/model/effort/resume changes that may fix a rejection
-        self.turn_rejection = None    # (change_generation, client_generation) parked until either changes
+        self.turn_rejection = None    # rejected request generations; parked until either one changes
         self.note = ""                # postal working-note
         self.lock = threading.RLock()  # queue/turn/worker/state fields; lifecycle calls can nest
         self.norm_lock = threading.Lock()  # the turn worker and global pump share one normalizer
@@ -248,6 +255,10 @@ class CodexBackend:
     def _reg_path(self):
         return self.root / "registry.json"
 
+    def _reg_lock_path(self):
+        # Persistent sidecar, never unlinked: unlinking can split contenders across two lock inodes.
+        return self.root / "registry.lock"
+
     def _load_registry(self):
         try:
             rows = json.loads(self._reg_path().read_text())
@@ -261,9 +272,9 @@ class CodexBackend:
                 s = _Session(sid, r["tid"], r.get("name", ""), r.get("cwd", ""),
                              r.get("model", ""), r.get("effort", ""), r.get("color", ""))
                 s.dead = bool(r.get("dead"))
-                raw_queue = r.get("queue")
-                s.queue = [t for t in raw_queue if isinstance(t, str) and t] \
-                    if isinstance(raw_queue, list) else []
+                queue_entries = self._registry_queue_entries(sid, r.get("queue"))
+                s.queue = [entry["text"] for entry in queue_entries]
+                s.queue_ids = [entry["id"] for entry in queue_entries]
                 s.note = r.get("note", "")
                 s.launch_error = r.get("launchError") if isinstance(r.get("launchError"), dict) else None
                 self._sessions[sid] = s
@@ -280,27 +291,161 @@ class CodexBackend:
         with self._sessions_lock:
             self._sessions[s.sid] = s
 
-    def _save_registry(self):
-        # serialized: a handler thread (send) and a worker (batch pop) save concurrently, and two
-        # unserialized writers shared one tmp path — the loser's os.replace found it already gone
-        with self._reg_lock:
-            rows = {}
-            for sid, s in self._session_items():
-                with s.lock:
-                    rows[sid] = {"tid": s.tid, "name": s.name, "cwd": s.cwd,
-                                 "model": s.model, "effort": s.effort, "dead": s.dead,
-                                 "queue": list(s.queue), "note": s.note, "color": s.color,
-                                 "launchError": s.launch_error}
-            tmp = self._reg_path().with_name(
-                "registry.tmp.%d.%s" % (os.getpid(), uuidlib.uuid4().hex[:8]))
+    @staticmethod
+    def _legacy_queue_id(sid, index, text, repair=""):
+        """A deterministic identity lets every overlapping loader agree on old string-only rows."""
+        seed = "%s\0%d\0%s\0%s" % (sid, index, text, repair)
+        return "legacy-%s" % uuidlib.uuid5(uuidlib.NAMESPACE_URL, seed).hex
+
+    @classmethod
+    def _registry_queue_entries(cls, sid, raw_queue):
+        """Canonical [{id,text}] entries, including lazy migration of the former [text] schema."""
+        if not isinstance(raw_queue, list):
+            return []
+        entries, used = [], set()
+        for index, raw in enumerate(raw_queue):
+            if isinstance(raw, str):
+                text = raw
+                entry_id = cls._legacy_queue_id(sid, index, text)
+            elif isinstance(raw, dict):
+                text, entry_id = raw.get("text"), raw.get("id")
+            else:
+                continue
+            if not isinstance(text, str) or not text:
+                continue
+            if not isinstance(entry_id, str) or not entry_id or entry_id in used:
+                # Repair malformed/duplicate ids deterministically so two processes still agree.
+                entry_id = cls._legacy_queue_id(sid, index, text, str(entry_id or "repair"))
+                salt = 0
+                while entry_id in used:
+                    salt += 1
+                    entry_id = cls._legacy_queue_id(sid, index, text, "repair-%d" % salt)
+            used.add(entry_id)
+            entries.append({"id": entry_id, "text": text})
+        return entries
+
+    @staticmethod
+    def _registry_snapshot(s):
+        with s.lock:
+            if len(s.queue_ids) != len(s.queue):
+                raise RuntimeError("Codex in-memory queue identity invariant failed for %s" % s.sid)
+            return {"tid": s.tid, "name": s.name, "cwd": s.cwd,
+                    "model": s.model, "effort": s.effort, "dead": s.dead,
+                    "queue": [{"id": entry_id, "text": text}
+                              for entry_id, text in zip(s.queue_ids, s.queue)],
+                    "note": s.note, "color": s.color,
+                    "launchError": s.launch_error}
+
+    def _registry_rows_for_update(self):
+        try:
+            rows = json.loads(self._reg_path().read_text())
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            # Never turn corruption into an empty registry and overwrite every durable queue.
+            raise RuntimeError("Codex registry is unreadable: %s" % e) from e
+        if not isinstance(rows, dict):
+            raise RuntimeError("Codex registry root is not an object")
+        return rows
+
+    def _write_registry_locked(self, rows):
+        """Atomic, durable write. Caller owns the persistent cross-process sidecar lock."""
+        tmp = self._reg_path().with_name(
+            "registry.tmp.%d.%s" % (os.getpid(), uuidlib.uuid4().hex[:8]))
+        try:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(rows, indent=1))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._reg_path())
             try:
-                tmp.write_text(json.dumps(rows, indent=1))
-                os.replace(tmp, self._reg_path())
+                dfd = os.open(str(self.root), os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass                       # some filesystems do not support directory fsync
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    def _save_registry(self, s, *, fields=(), create=False, queue_append=None, queue_ack=None):
+        """Apply ONE row transaction against the latest on-disk registry.
+
+        A former whole-memory snapshot let an overlapping old kernel erase a newer kernel's queued
+        sends during an unrelated rename/save. The thread lock serializes this backend; flock
+        serializes processes. Under both, reload the authoritative file and touch only the named
+        metadata fields. Queue mutations are operations over stable entry ids: append one newly
+        accepted send, or remove the exact ids whose turn/start was ACKed. Thus a concurrent append
+        survives an ACK even when its text repeats an earlier send. Every production mutator retains
+        its session RLock through this transaction, so same-process snapshots cannot commit out of
+        order. Snapshotting still happens before the registry lock, so no reverse lock edge exists.
+        """
+        allowed = {"tid", "name", "cwd", "model", "effort", "dead", "note", "color",
+                   "launchError"}
+        fields = set(fields)
+        unknown = fields - allowed
+        if unknown:
+            raise ValueError("unknown Codex registry fields: %s" % sorted(unknown))
+        snapshot = self._registry_snapshot(s)  # before registry locks: no reg-lock ↔ session-lock cycle
+        ack_mismatch = False
+        with self._reg_lock:
+            lock_fd = os.open(str(self._reg_lock_path()), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                os.fchmod(lock_fd, 0o600)
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                rows = self._registry_rows_for_update()
+                current = rows.get(s.sid)
+                reconstructed = not isinstance(current, dict) or not isinstance(current.get("tid"), str)
+                if create or reconstructed:
+                    row = dict(snapshot)
+                else:
+                    row = dict(current)
+                    for field in fields:
+                        row[field] = snapshot[field]
+
+                # Normalizing every touched row lazily migrates the former raw-string queue schema.
+                queue_now = self._registry_queue_entries(s.sid, row.get("queue"))
+                if queue_append is not None:
+                    if not (isinstance(queue_append, dict)
+                            and isinstance(queue_append.get("id"), str)
+                            and queue_append.get("id")
+                            and isinstance(queue_append.get("text"), str)
+                            and queue_append.get("text")):
+                        raise ValueError("Codex queue append requires a nonempty {id,text} entry")
+                    append_entry = {"id": queue_append["id"], "text": queue_append["text"]}
+                    prior = next((entry for entry in queue_now
+                                  if entry["id"] == append_entry["id"]), None)
+                    if prior is None:
+                        queue_now.append(append_entry)
+                    elif prior != append_entry:
+                        raise RuntimeError("Codex queue id collision for %s" % s.sid)
+                if queue_ack is not None:
+                    batch_ids = list(queue_ack)
+                    if not all(isinstance(entry_id, str) and entry_id for entry_id in batch_ids):
+                        raise ValueError("Codex queue ACK requires stable entry ids")
+                    if [entry["id"] for entry in queue_now[:len(batch_ids)]] == batch_ids:
+                        del queue_now[:len(batch_ids)]
+                        row["queue"] = queue_now
+                    elif queue_now:
+                        # Preserve at-least-once delivery on an overlap instead of deleting a queue
+                        # whose provenance we cannot prove. The mismatch is actionable and visible.
+                        ack_mismatch = True
+                row["queue"] = queue_now
+                rows[s.sid] = row
+                self._write_registry_locked(rows)
             finally:
                 try:
-                    tmp.unlink()
-                except OSError:
-                    pass
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+        # The ACK caller may deliberately retain s.lock through this transaction. Return the warning
+        # bit so it can invoke the arbitrary log callback only after every persistence lock is gone.
+        return ack_mismatch
 
     # ── client lifecycle ─────────────────────────────────────────────────────────────────────────
     def available(self):
@@ -532,9 +677,13 @@ class CodexBackend:
             if s.dead:
                 s.echoes = [e for e in s.echoes if e["text"] != text.strip()]
                 return False
+            entry_id = "q-%s" % uuidlib.uuid4().hex
             s.queue.append(text)
+            s.queue_ids.append(entry_id)
             s.change_generation += 1
-        self._save_registry()
+            # Keep append order identical in memory and on disk. _save_registry snapshots this RLock
+            # reentrantly before taking either registry lock; it never takes a session lock afterward.
+            self._save_registry(s, queue_append={"id": entry_id, "text": text})
         self._ensure_worker(s)
         s.kick.set()
         return True
@@ -568,10 +717,13 @@ class CodexBackend:
             s.model = value                # applied on the next turn_start; Codex persists it
             s.change_generation += 1
             queued = bool(s.queue) and not s.dead
+            self._save_registry(s, fields=("model",))
         with s.norm_lock:
             if s.norm:
-                s.norm.model = value
-        self._save_registry()
+                # A later set_model may have completed while this caller waited for norm_lock.
+                # Publish the current persisted value, never this caller's possibly-stale argument.
+                with s.lock:               # norm_lock → session lock matches _ensure_norm/_append
+                    s.norm.model = s.model
         if queued:
             self._ensure_worker(s)
             s.kick.set()
@@ -609,7 +761,7 @@ class CodexBackend:
             s.effort = value
             s.change_generation += 1
             queued = bool(s.queue) and not s.dead
-        self._save_registry()
+            self._save_registry(s, fields=("effort",))
         if queued:
             self._ensure_worker(s)
             s.kick.set()
@@ -642,8 +794,9 @@ class CodexBackend:
             s = _Session(sid, "pending-%s" % sid[:8], name, cwd)
             s.launch_error = {"text": self._client_err or SETUP_HINT, "at": time.time(),
                               "limit": False}
-            self._put_session(s)
-            self._save_registry()
+            with s.lock:
+                self._put_session(s)
+                self._save_registry(s, create=True)
             return sid
         try:
             resp = c.thread_start({"cwd": cwd, "approvalPolicy": APPROVAL_POLICY,
@@ -654,18 +807,20 @@ class CodexBackend:
             s = _Session(sid, "failed-%s" % sid[:8], name, cwd)
             s.launch_error = {"text": "codex thread/start failed: %s" % e, "at": time.time(),
                               "limit": False}
-            self._put_session(s)
-            self._save_registry()
+            with s.lock:
+                self._put_session(s)
+                self._save_registry(s, create=True)
             return sid
         s = _Session(sid, tid, name, cwd, model=model, color=bg)
         s.loaded = True
-        self._put_session(s)
+        with s.lock:
+            self._put_session(s)
+            self._save_registry(s, create=True)
         self._ensure_norm(s)
         # touch the materialized transcript NOW: discovery lists real files, and an empty jsonl
         # parses to an empty session — the tab opens immediately instead of waiting for turn one
         self.transcript_path(sid).touch()
         self._write_name(s, bg, fg)
-        self._save_registry()
         self.push()
         return sid
 
@@ -683,7 +838,7 @@ class CodexBackend:
             s.since = time.time()
             s.change_generation += 1
             queued = bool(s.queue)
-        self._save_registry()
+            self._save_registry(s, fields=("dead", "name", "cwd"))
         if queued:
             self._ensure_worker(s)
             s.kick.set()
@@ -693,9 +848,16 @@ class CodexBackend:
         s = self._session(sid)
         if not s:
             return False
+        save_error = None
         with s.lock:
             s.dead = True
             turn_id, tid, worker = s.turn_id, s.tid, s.worker
+            # Persist the lifecycle mutation before releasing the session lock. A concurrent resume
+            # must order after this write instead of being overwritten by a delayed kill snapshot.
+            try:
+                self._save_registry(s, fields=("dead",))
+            except Exception as e:
+                save_error = e
         c = self._client
         if turn_id and c is not None:
             try:
@@ -718,7 +880,8 @@ class CodexBackend:
             if drained:                    # notify OUTSIDE norm_lock (see _append)
                 self.poke()
                 self.push_session(s.sid)
-        self._save_registry()
+        if save_error is not None:
+            raise save_error
         return True
 
     def rename(self, sid, new_name):
@@ -728,8 +891,8 @@ class CodexBackend:
         with s.lock:
             s.name = new_name
             tid = s.tid
-        self._write_name(s)               # keep the shared identity file in sync (colours preserved)
-        self._save_registry()
+            self._write_name(s)           # keep the shared identity file in sync (colours preserved)
+            self._save_registry(s, fields=("name",))
         c = self._client
         if c is not None:
             try:
@@ -763,12 +926,12 @@ class CodexBackend:
                 s.tid = resp.thread.id
                 s.model = getattr(resp, "model", "") or s.model
                 s.loaded = True
+                self._save_registry(s, fields=("tid", "model"))
             with s.norm_lock:
                 s.norm = None
             self._ensure_norm(s)
             self.transcript_path(s.sid).touch()
             self._write_name(s)
-            self._save_registry()
             self.push()
             return True
         c.thread_resume(tid, {"cwd": cwd, **_execution_permissions(cwd, thread_start=True)})
@@ -805,32 +968,32 @@ class CodexBackend:
                                 s.turn_rejection = None
                     try:
                         progressed = self._run_turn(s)
-                    except _PermanentTurnStartRejection as e:
-                        self.log("turn rejected (%s): %s" % (s.name, e))
-                        with s.lock:
-                            s.launch_error = {"text": "codex turn rejected: %s" % e,
-                                              "at": time.time(), "limit": False}
-                            s.state = "waiting"
-                            s.turn_id = None
-                            # Record the generations of the REJECTED request, not whatever is
-                            # current after its RPC returned. A send/model change racing the RPC
-                            # must remain a fresh kick and immediately retry the new request.
-                            s.turn_rejection = (e.change_generation, e.client_generation)
+                    except _PermanentRequestRejection as e:
+                        self.log("%s rejected (%s): %s" % (e.operation, s.name, e))
                         try:
-                            self._save_registry()      # durable queue + visible rejection; no timed retry
+                            with s.lock:
+                                s.launch_error = {"text": "codex %s rejected: %s" % (e.operation, e),
+                                                  "at": time.time(), "limit": False}
+                                s.state = "waiting"
+                                s.turn_id = None
+                                # Record the generations of the REJECTED request, not whatever is
+                                # current after its RPC returned. A send/model change racing the RPC
+                                # must remain a fresh kick and immediately retry the new request.
+                                s.turn_rejection = (e.change_generation, e.client_generation)
+                                self._save_registry(s, fields=("launchError",))
                         except Exception:
                             self.log("turn rejection registry save: %s" % traceback.format_exc())
                         self.push_session(s.sid)
                         break
                     except Exception as e:
                         self.log("turn failed (%s): %s" % (s.name, traceback.format_exc()))
-                        with s.lock:
-                            s.launch_error = {"text": "codex turn failed: %s" % e,
-                                              "at": time.time(), "limit": False}
-                            s.state = "waiting"
-                            s.turn_id = None
                         try:
-                            self._save_registry()      # queue + visible failure survive another restart
+                            with s.lock:
+                                s.launch_error = {"text": "codex turn failed: %s" % e,
+                                                  "at": time.time(), "limit": False}
+                                s.state = "waiting"
+                                s.turn_id = None
+                                self._save_registry(s, fields=("launchError",))
                         except Exception:
                             self.log("turn failure registry save: %s" % traceback.format_exc())
                         self.push_session(s.sid)
@@ -856,20 +1019,38 @@ class CodexBackend:
     def _run_turn(self, s):
         c = self._get_client()
         if c is None:
-            with s.lock:
-                s.launch_error = {"text": self._client_err or SETUP_HINT, "at": time.time(),
-                                  "limit": False}
+            try:
+                with s.lock:
+                    s.launch_error = {"text": self._client_err or SETUP_HINT, "at": time.time(),
+                                      "limit": False}
+                    self._save_registry(s, fields=("launchError",))
+            except Exception:
+                self.log("client failure registry save: %s" % traceback.format_exc())
             self.push_session(s.sid)
             return False                   # queue stays parked; worker retries after the deadline
         with s.lock:
             loaded = s.loaded
-        if not loaded and not self._prepare_thread(s, c):
-            return True                    # killed while the resume/create RPC was in flight
+            prepare_change_generation = s.change_generation
+        if not loaded:
+            prepare_client_generation = self._client_generation_for(c)
+            try:
+                prepared = self._prepare_thread(s, c)
+            except Exception as e:
+                if _is_permanent_request_rejection(e):
+                    raise _PermanentRequestRejection(
+                        e, "thread preparation", prepare_change_generation,
+                        prepare_client_generation) from e
+                raise
+            if not prepared:
+                return True                # killed while the resume/create RPC was in flight
         norm = self._ensure_norm(s)
         with s.lock:
             if s.dead:
                 return True
             batch = list(s.queue)           # retain the durable prefix until turn/start ACKs
+            batch_ids = list(s.queue_ids)
+            if len(batch_ids) != len(batch):
+                raise RuntimeError("Codex in-memory queue identity invariant failed for %s" % s.sid)
             if not batch:
                 return True
             params = {"approvalPolicy": APPROVAL_POLICY, "cwd": s.cwd,
@@ -886,22 +1067,36 @@ class CodexBackend:
         try:
             started = c.turn_start(tid, [{"type": "text", "text": t} for t in batch], params)
         except Exception as e:
-            if _is_permanent_turn_rejection(e):
-                raise _PermanentTurnStartRejection(e, change_generation, client_generation) from e
+            if _is_permanent_request_rejection(e):
+                raise _PermanentRequestRejection(
+                    e, "turn", change_generation, client_generation) from e
             raise
-        with s.lock:
-            turn_id = started.turn.id
-            if s.queue[:len(batch)] != batch:
-                raise RuntimeError("Codex send queue prefix changed during turn/start")
-            del s.queue[:len(batch)]
-            s.turn_id = turn_id
-            s.state = "working"
-            s.since = time.time()
-            s.launch_error = None
-            s.turn_rejection = None
-            killed_during_start = s.dead
+        turn_id = started.turn.id
+        ack_persisted = False
         try:
-            self._save_registry()           # ACK first, then commit dequeue (at-least-once on crash)
+            with s.lock:
+                if s.queue[:len(batch)] != batch or s.queue_ids[:len(batch_ids)] != batch_ids:
+                    raise RuntimeError("Codex send queue prefix changed during turn/start")
+                del s.queue[:len(batch)]
+                del s.queue_ids[:len(batch_ids)]
+                s.turn_id = turn_id
+                s.state = "working"
+                s.since = time.time()
+                s.launch_error = None
+                s.turn_rejection = None
+                killed_during_start = s.dead
+                try:
+                    ack_mismatch = self._save_registry(
+                        s, fields=("launchError",), queue_ack=batch_ids)
+                except Exception:
+                    # turn/start already succeeded, but the durable ACK did not. Restore the exact
+                    # prefix before retrying so this process agrees with the still-queued disk row.
+                    s.queue[:0] = batch
+                    s.queue_ids[:0] = batch_ids
+                    raise
+                ack_persisted = True
+            if ack_mismatch:
+                self.log("registry queue ACK mismatch for %s; preserving durable queue" % s.sid)
             self.push_session(s.sid)
             if killed_during_start:
                 try:
@@ -922,6 +1117,15 @@ class CodexBackend:
                     self.push_session(s.sid)
                 if method == "turn/completed":
                     break
+        except Exception:
+            if not ack_persisted:
+                # The request is still durable, so prevent an untracked acknowledged turn from
+                # continuing alongside its retry. unregister in finally always releases routing.
+                try:
+                    c.turn_interrupt(tid, turn_id)
+                except Exception as e:
+                    self.log("unpersisted turn interrupt %s: %s" % (s.name, e))
+            raise
         finally:
             try:
                 c.unregister_turn_notifications(turn_id)
@@ -1009,7 +1213,7 @@ class CodexBackend:
         if s:
             with s.lock:
                 s.note = text or ""
-            self._save_registry()
+                self._save_registry(s, fields=("note",))
 
     def wake(self, sid):
         s = self._session(sid)

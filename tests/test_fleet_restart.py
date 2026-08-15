@@ -164,12 +164,10 @@ class ReportSurvivesTheRestart(unittest.TestCase):
         # It rides the block that owns the Restart button itself, so the two can never drift apart.
         js = km._LANDING_SETTINGS_JS
         self.assertIn("window.__rompRestart", js, "the report lives with the button that causes it")
-        # With remotes attached, Restart means everything attached (the user 2026-07-29) — the
-        # 2026-08-14 sweep's local-only reversal was reverted (the pull path's own trust +
-        # exact-commit-pin gates carry the code-import concern); fleet:false remains the opt-out.
-        self.assertNotIn("body:'{\"fleet\":false}'", js,
-                         "the Restart button must not silently opt OUT of the recorded fleet behavior")
-        self.assertIn('_fleet = True', src, "a bodyless/API restart keeps the recorded fleet default")
+        self.assertIn("body:'{\"fleet\":false}'", js,
+                      "the routine Restart button never opts into remote code import")
+        self.assertIn('.get("fleet", False)', src,
+                      "a bodyless/API restart is local-only")
         self.assertIn("fetch('/fleet-restart'", js)
         self.assertIn("romp:fleetSeen", js)
         self.assertIn("_fleetReport();", js, "and runs on load, after the restart brought the page back")

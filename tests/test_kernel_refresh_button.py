@@ -26,7 +26,7 @@ class RefreshButtonDecoupledTest(unittest.TestCase):
         # panes are open — always present, still POSTs /restart then polls /healthz and reloads.
         html = km._landing()
         self.assertIn("id=rail-refresh", html)
-        self.assertIn("body:'{}'", html)   # the default restarts everything attached (the user 2026-07-29)
+        self.assertIn("body:'{\"fleet\":false}'", html)   # routine refresh is explicitly local-only
         self.assertNotIn("id=rrefresh", _gear_src())   # gone from the feed gear
         # …and it draws a REAL browser-style reload icon (the user 2026-07-27: the ↻ TEXT glyph stopped
         # its arc short at 11 o'clock and never read as refresh, and its size rode the fallback font).

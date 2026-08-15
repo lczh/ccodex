@@ -10,6 +10,7 @@ Run:    python3 tests/test_codex_backend.py
 import json
 import os
 import queue
+import subprocess
 import sys
 import tempfile
 import threading
@@ -35,6 +36,16 @@ def until(fn, timeout=5.0, step=0.01):
             return True
         time.sleep(step)
     return False
+
+
+def registry_queue_entries(rows, sid):
+    """Canonical durable entries; tests that seed the legacy schema may still contain strings."""
+    return [entry if isinstance(entry, dict) else {"id": None, "text": entry}
+            for entry in rows[sid].get("queue", [])]
+
+
+def registry_queue_texts(rows, sid):
+    return [entry["text"] for entry in registry_queue_entries(rows, sid)]
 
 
 class _Payload:
@@ -174,13 +185,13 @@ class Conformance(unittest.TestCase):
             err.code, err.message = code, message
             return err
 
-        self.assertTrue(cb._is_permanent_turn_rejection(
+        self.assertTrue(cb._is_permanent_request_rejection(
             error_type("InvalidParamsError", -32602, "invalid model")))
-        self.assertTrue(cb._is_permanent_turn_rejection(
+        self.assertTrue(cb._is_permanent_request_rejection(
             error_type("CodexRpcError", -32000, "model gpt-x is not supported for this account")))
-        self.assertFalse(cb._is_permanent_turn_rejection(
+        self.assertFalse(cb._is_permanent_request_rejection(
             error_type("InternalRpcError", -32603, "internal error")))
-        self.assertFalse(cb._is_permanent_turn_rejection(
+        self.assertFalse(cb._is_permanent_request_rejection(
             error_type("CodexRpcError", -32001, "temporary backend failure")))
 
 
@@ -303,11 +314,55 @@ class Lifecycle(unittest.TestCase):
         self.assertTrue(fake.failed.wait(2))
         self.assertEqual(be.pending_queued(sid), ["first", "second"])
         rows = json.loads((Path(tmp) / "codex" / "registry.json").read_text())
-        self.assertEqual(rows[sid]["queue"], ["first", "second"])
+        self.assertEqual(registry_queue_texts(rows, sid), ["first", "second"])
         self.assertTrue(fake.retry_entered.wait(2))
         fake.allow_retry.set()
         self.assertTrue(until(lambda: not be.busy(sid) and not be.pending_queued(sid)))
         self.assertEqual(fake.attempts, [["first", "second"], ["first", "second"]])
+
+    def test_turn_ack_persistence_failure_cleans_up_and_retries_the_durable_batch(self):
+        class BlockingRetryClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.start_attempts = 0
+                self.retry_entered = threading.Event()
+                self.allow_retry = threading.Event()
+
+            def turn_start(self, tid, input_items, params=None):
+                self.start_attempts += 1
+                if self.start_attempts == 2:
+                    self.retry_entered.set()
+                    self.allow_retry.wait(5)
+                return super().turn_start(tid, input_items, params)
+
+        fake = BlockingRetryClient()
+        be, _, tmp = build(factory=lambda: fake)
+        sid = be.spawn("web", "/TESTDIR")
+        save = be._save_registry
+        failed = threading.Event()
+
+        def fail_first_ack(s, **kwargs):
+            if kwargs.get("queue_ack") is not None and not failed.is_set():
+                failed.set()
+                raise OSError("synthetic registry ACK failure")
+            return save(s, **kwargs)
+
+        be._save_registry = fail_first_ack
+        self.assertTrue(be.send(sid, "survive ACK failure"))
+        self.assertTrue(failed.wait(2))
+        self.assertTrue(fake.retry_entered.wait(2))
+        self.assertEqual(fake.called("unregister"), [("unregister", "t-1")])
+        self.assertEqual(fake.called("turn_interrupt")[0][2], "t-1")
+        self.assertEqual(be.pending_queued(sid), ["survive ACK failure"])
+        rows = json.loads((Path(tmp) / "codex" / "registry.json").read_text())
+        self.assertEqual(registry_queue_texts(rows, sid), ["survive ACK failure"])
+
+        fake.allow_retry.set()
+        self.assertTrue(until(lambda: not be.busy(sid) and not be.pending_queued(sid)))
+        self.assertEqual(fake.start_attempts, 2)
+        self.assertEqual([call[1] for call in fake.called("unregister")], ["t-1", "t-2"])
+        rows = json.loads((Path(tmp) / "codex" / "registry.json").read_text())
+        self.assertEqual(registry_queue_texts(rows, sid), [])
 
     def test_permanent_turn_rejection_parks_without_spin_until_explicit_change(self):
         class InvalidParamsError(RuntimeError):
@@ -342,6 +397,93 @@ class Lifecycle(unittest.TestCase):
         time.sleep(0.65)
         self.assertEqual(len(fake.attempts), 2, "the replacement request parks if it is rejected too")
         self.assertTrue(be.kill(sid))
+
+    def test_permanent_placeholder_prepare_parks_until_cwd_change(self):
+        class InvalidParamsError(RuntimeError):
+            code = -32602
+
+        class CwdRejectingClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.prepare_attempts = []
+
+            def thread_start(self, params=None):
+                self.prepare_attempts.append(dict(params or {}))
+                if (params or {}).get("cwd") != "/FIXED":
+                    raise InvalidParamsError("unknown permission profile for cwd")
+                return super().thread_start(params)
+
+        fake = CwdRejectingClient()
+        be, _, tmp = build(factory=lambda: fake)
+        sid = be.spawn("web", "/TESTDIR")       # visible failed-* placeholder
+        self.assertTrue(be.send(sid, "keep this durable"))
+        self.assertTrue(until(lambda: len(fake.prepare_attempts) == 2))
+        time.sleep(0.65)                          # exceeds the old automatic retry
+        self.assertEqual(len(fake.prepare_attempts), 2)
+        self.assertEqual(be.pending_queued(sid), ["keep this durable"])
+        rows = json.loads((Path(tmp) / "codex" / "registry.json").read_text())
+        self.assertEqual(registry_queue_texts(rows, sid), ["keep this durable"])
+        self.assertIn("thread preparation rejected", be.launch_error(sid)["text"])
+        self.assertTrue(be.wake(sid))
+        time.sleep(0.35)
+        self.assertEqual(len(fake.prepare_attempts), 2,
+                         "an ordinary wake must not repeat rejected thread preparation")
+        self.assertTrue(be.resume("web", sid, cwd="/FIXED"))
+        self.assertTrue(until(lambda: not be.busy(sid) and not be.pending_queued(sid)))
+        self.assertEqual(len(fake.prepare_attempts), 3)
+        self.assertEqual(fake.prepare_attempts[-1]["cwd"], "/FIXED")
+
+    def test_permanent_resume_prepare_retries_on_new_client_generation(self):
+        class InvalidRequestError(RuntimeError):
+            code = -32600
+
+        class ResumeRejectingClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.resume_attempts = 0
+
+            def thread_resume(self, tid, params=None):
+                self.resume_attempts += 1
+                raise InvalidRequestError("stored thread is unavailable on this server")
+
+        old, replacement = ResumeRejectingClient(), FakeClient()
+        clients = [old, replacement]
+        be, _, tmp = build(factory=lambda: clients.pop(0))
+        sid = be.spawn("web", "/TESTDIR")
+        self.assertTrue(be.resume("web", sid))
+        self.assertTrue(be.send(sid, "retry after replacement"))
+        self.assertTrue(until(lambda: old.resume_attempts == 1))
+        time.sleep(0.65)
+        self.assertEqual(old.resume_attempts, 1)
+        rows = json.loads((Path(tmp) / "codex" / "registry.json").read_text())
+        self.assertEqual(registry_queue_texts(rows, sid), ["retry after replacement"])
+        with be._client_lock:
+            be._record_client_failure_locked(RuntimeError("replace generation"), old)
+            be._client_retry_at = 0.0
+        self.assertTrue(be.available())
+        self.assertTrue(until(lambda: not be.busy(sid) and not be.pending_queued(sid)))
+        self.assertEqual(len(replacement.called("thread_resume")), 1)
+        self.assertEqual(len(replacement.called("turn_start")), 1)
+
+    def test_transient_thread_prepare_still_retries(self):
+        class ResumeFailsOnceClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.resume_attempts = 0
+
+            def thread_resume(self, tid, params=None):
+                self.resume_attempts += 1
+                if self.resume_attempts == 1:
+                    raise RuntimeError("synthetic transient resume failure")
+                return super().thread_resume(tid, params)
+
+        fake = ResumeFailsOnceClient()
+        be, _, _ = build(factory=lambda: fake)
+        sid = be.spawn("web", "/TESTDIR")
+        self.assertTrue(be.resume("web", sid))
+        self.assertTrue(be.send(sid, "retry transient prepare"))
+        self.assertTrue(until(lambda: not be.busy(sid) and not be.pending_queued(sid), timeout=3))
+        self.assertEqual(fake.resume_attempts, 2)
 
     def test_new_client_generation_retries_a_parked_permanent_rejection(self):
         class InvalidRequestError(RuntimeError):
@@ -404,6 +546,33 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(fake.called("turn_interrupt")[0][2], "t-1")
         self.assertTrue(until(lambda: not worker.is_alive()))
         self.assertFalse(be.owns(sid))
+
+    def test_kill_cleans_up_an_active_turn_when_dead_registry_write_fails(self):
+        be, fake, tmp = build()
+        fake.hold_open = True
+        fake.scripts = [[("item/completed",
+                          {"threadId": "T-1", "turnId": "t-1", "completedAtMs": 1781100000000,
+                           "item": {"type": "userMessage", "id": "u-1",
+                                    "content": [{"type": "text", "text": "keep running"}]}})]]
+        sid = be.spawn("web", "/TESTDIR")
+        self.assertTrue(be.send(sid, "keep running"))
+        self.assertTrue(until(lambda: be.live_sessions()[sid]["state"] == "working"))
+        worker = be._session(sid).worker
+        save = be._save_registry
+
+        def fail_dead_save(s, **kwargs):
+            if "dead" in kwargs.get("fields", ()):
+                raise OSError("synthetic dead-state persistence failure")
+            return save(s, **kwargs)
+
+        be._save_registry = fail_dead_save
+        with self.assertRaisesRegex(OSError, "synthetic dead-state persistence failure"):
+            be.kill(sid)
+        self.assertEqual(fake.called("turn_interrupt")[0][2], "t-1")
+        self.assertTrue(until(lambda: not worker.is_alive()))
+        self.assertFalse(be.owns(sid))
+        rows = json.loads((Path(tmp) / "codex" / "registry.json").read_text())
+        self.assertFalse(rows[sid]["dead"], "the failed durable mutation must not pretend it landed")
 
     def test_kill_can_mark_dead_while_turn_start_is_in_flight_then_interrupts_the_ack(self):
         class BlockingStartClient(FakeClient):
@@ -471,6 +640,186 @@ class Lifecycle(unittest.TestCase):
             self.assertEqual(r["parentUuid"], prev["uuid"],
                              "chain broke across the restart at %s" % r["uuid"])
         self.assertEqual(len({r["uuid"] for r in recs}), len(recs))
+
+    def test_stale_backend_metadata_save_cannot_erase_newer_durable_queue(self):
+        be, fake, tmp = build()
+        sid = be.spawn("web", "/TESTDIR")
+        stale = cb.CodexBackend(tmp, client_factory=lambda: fake)
+        ensure = be._ensure_worker
+        be._ensure_worker = lambda s: None
+        self.assertTrue(be.send(sid, "must survive stale save"))
+        be._ensure_worker = ensure
+        self.assertEqual(be.pending_queued(sid), ["must survive stale save"])
+        self.assertTrue(stale.rename(sid, "web-renamed"))
+        rows = json.loads((Path(tmp) / "codex" / "registry.json").read_text())
+        self.assertEqual(registry_queue_texts(rows, sid), ["must survive stale save"])
+        self.assertEqual(rows[sid]["name"], "web-renamed")
+
+    def test_same_process_metadata_mutations_commit_in_session_order(self):
+        be, _, tmp = build()
+        sid = be.spawn("web", "/TESTDIR")
+        snapshotted, release = threading.Event(), threading.Event()
+        snapshot = be._registry_snapshot
+
+        def gated_snapshot(s):
+            row = snapshot(s)
+            if row["model"] == "gpt-a" and not snapshotted.is_set():
+                snapshotted.set()
+                release.wait(5)
+            return row
+
+        be._registry_snapshot = gated_snapshot
+        first = threading.Thread(target=be.set_model, args=(sid, "gpt-a"))
+        second = threading.Thread(target=be.set_model, args=(sid, "gpt-b"))
+        first.start()
+        self.assertTrue(snapshotted.wait(2))
+        second.start()
+        time.sleep(0.05)
+        self.assertTrue(second.is_alive(), "the later mutation must wait through the first save")
+        release.set()
+        first.join(2)
+        second.join(2)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        rows = json.loads((Path(tmp) / "codex" / "registry.json").read_text())
+        self.assertEqual(be._session(sid).model, "gpt-b")
+        self.assertEqual(rows[sid]["model"], "gpt-b")
+
+    def test_delayed_ack_cannot_delete_a_new_identical_text_send(self):
+        be, fake, tmp = build()
+        sid = be.spawn("web", "/TESTDIR")
+        be._ensure_worker = lambda s: None
+        self.assertTrue(be.send(sid, "same text"))
+        self.assertTrue(be.kill(sid))          # let the stale backend load without consuming the queue
+        stale = cb.CodexBackend(tmp, client_factory=lambda: fake)
+
+        current = be._session(sid)
+        with current.lock:
+            old_id = current.queue_ids[0]
+            del current.queue[:1]
+            del current.queue_ids[:1]
+            self.assertFalse(be._save_registry(current, queue_ack=[old_id]))
+        self.assertTrue(be.resume("web", sid))
+        self.assertTrue(be.send(sid, "same text"))
+        with current.lock:
+            new_id = current.queue_ids[0]
+        self.assertNotEqual(new_id, old_id)
+
+        old = stale._session(sid)
+        with old.lock:
+            self.assertEqual(old.queue_ids, [old_id])
+            del old.queue[:1]
+            del old.queue_ids[:1]
+            mismatch = stale._save_registry(old, queue_ack=[old_id])
+        self.assertTrue(mismatch, "the delayed ACK must reject the newer entry id")
+        rows = json.loads((Path(tmp) / "codex" / "registry.json").read_text())
+        self.assertEqual(registry_queue_texts(rows, sid), ["same text"])
+        self.assertEqual([entry["id"] for entry in registry_queue_entries(rows, sid)], [new_id])
+
+        self.assertTrue(be.kill(sid))          # a dead restart leaves the surviving queue observable
+        restarted = cb.CodexBackend(tmp, client_factory=lambda: fake)
+        self.assertEqual(restarted.pending_queued(sid), ["same text"])
+        self.assertEqual(restarted._session(sid).queue_ids, [new_id])
+
+    def test_legacy_string_queue_migrates_with_stable_ids_across_restart(self):
+        tmp = tempfile.mkdtemp()
+        root = Path(tmp) / "codex"
+        root.mkdir(parents=True)
+        sid = "legacy-session"
+        (root / "registry.json").write_text(json.dumps({sid: {
+            "tid": "legacy-thread", "name": "old", "cwd": "/TESTDIR", "dead": True,
+            "queue": ["repeat", "repeat"],
+        }}))
+        first = cb.CodexBackend(tmp, client_factory=lambda: None)
+        overlap = cb.CodexBackend(tmp, client_factory=lambda: None)
+        self.assertEqual(first.pending_queued(sid), ["repeat", "repeat"])
+        ids = list(first._session(sid).queue_ids)
+        self.assertEqual(overlap._session(sid).queue_ids, ids)
+        self.assertEqual(len(set(ids)), 2)
+
+        self.assertTrue(first.rename(sid, "migrated"))  # any transaction lazily upgrades the row
+        rows = json.loads((root / "registry.json").read_text())
+        entries = registry_queue_entries(rows, sid)
+        self.assertTrue(all(entry["id"] and entry["text"] for entry in entries))
+        self.assertEqual([entry["id"] for entry in entries], ids)
+        restarted = cb.CodexBackend(tmp, client_factory=lambda: None)
+        self.assertEqual(restarted.pending_queued(sid), ["repeat", "repeat"])
+        self.assertEqual(restarted._session(sid).queue_ids, ids)
+
+    def test_other_backend_append_survives_exact_prefix_ack(self):
+        be, fake, tmp = build()
+        sid = be.spawn("web", "/TESTDIR")
+        other = cb.CodexBackend(tmp, client_factory=lambda: fake)  # stale before the queue changes
+        ensure = be._ensure_worker
+        be._ensure_worker = lambda s: None
+        self.assertTrue(be.send(sid, "accepted prefix"))
+        be._ensure_worker = ensure
+        other._save_registry(other._session(sid),
+                             queue_append={"id": "other-suffix", "text": "concurrent suffix"})
+        s = be._session(sid)
+        with s.lock:
+            self.assertEqual(s.queue, ["accepted prefix"])
+            prefix_id = s.queue_ids[0]
+            del s.queue[:1]                 # the same mutation made after turn/start ACK
+            del s.queue_ids[:1]
+            be._save_registry(s, fields=("launchError",), queue_ack=[prefix_id])
+        rows = json.loads((Path(tmp) / "codex" / "registry.json").read_text())
+        self.assertEqual(registry_queue_texts(rows, sid), ["concurrent suffix"])
+
+    def test_concurrent_local_sends_keep_memory_and_registry_order(self):
+        be, _, tmp = build()
+        sid = be.spawn("web", "/TESTDIR")
+        be._ensure_worker = lambda s: None
+        entered, release = threading.Event(), threading.Event()
+        save = be._save_registry
+
+        def gated_save(s, **kwargs):
+            if (kwargs.get("queue_append") or {}).get("text") == "first":
+                entered.set()
+                release.wait(5)
+            return save(s, **kwargs)
+
+        be._save_registry = gated_save
+        first = threading.Thread(target=be.send, args=(sid, "first"))
+        second = threading.Thread(target=be.send, args=(sid, "second"))
+        first.start()
+        self.assertTrue(entered.wait(2))
+        second.start()
+        time.sleep(0.05)
+        self.assertTrue(second.is_alive(), "the second append must wait behind the first transaction")
+        release.set()
+        first.join(2)
+        second.join(2)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        rows = json.loads((Path(tmp) / "codex" / "registry.json").read_text())
+        self.assertEqual(be.pending_queued(sid), ["first", "second"])
+        self.assertEqual(registry_queue_texts(rows, sid), ["first", "second"])
+
+    def test_registry_queue_appends_are_atomic_across_processes(self):
+        be, _, tmp = build()
+        sid = be.spawn("web", "/TESTDIR")
+        self.assertTrue(be.kill(sid))       # child backends load it without starting queue workers
+        code = r'''
+import sys
+from importlib.machinery import SourceFileLoader
+cb = SourceFileLoader("codex_child", sys.argv[1]).load_module()
+be = cb.CodexBackend(sys.argv[2], client_factory=lambda: None, log=lambda message: None)
+s = be._session(sys.argv[3])
+for i in range(20):
+    text = "%s:%d" % (sys.argv[4], i)
+    be._save_registry(s, queue_append={"id": "child-" + text, "text": text})
+'''
+        backend_path = str(Path(ROOT) / "kernel" / "codex_backend.py")
+        procs = [subprocess.Popen([sys.executable, "-c", code, backend_path, tmp, sid, str(n)])
+                 for n in range(4)]
+        for p in procs:
+            self.assertEqual(p.wait(timeout=15), 0)
+        rows = json.loads((Path(tmp) / "codex" / "registry.json").read_text())
+        entries = registry_queue_entries(rows, sid)
+        self.assertEqual(len(entries), 80)
+        self.assertEqual(len({entry["id"] for entry in entries}), 80)
+        self.assertEqual(len({entry["text"] for entry in entries}), 80)
 
     def test_backend_restart_rearms_a_persisted_queue_without_another_send(self):
         be, fake, tmp = build()

@@ -13,7 +13,7 @@
 # It runs the whole sequence, because the steps between "bump the number" and "users can
 # install it" were a chain of by-hand commands that were easy to half-finish. Leaving
 # VERSION merged but untagged is the worst of those states: main claims a version that
-# bootstrap.sh will not install, since bootstrap picks the newest v* TAG.
+# bootstrap.sh will not install, since bootstrap picks the newest exact stable vX.Y.Z tag.
 #
 #   1. resolve the target version (a bump level, an explicit number, or whatever VERSION
 #      already says) and refuse it if that tag already exists
@@ -27,10 +27,9 @@
 # Two rules it has always existed to enforce, both easy to get wrong by hand and expensive
 # to get wrong in public:
 #
-#   * The tag MUST be v-prefixed. bootstrap.sh picks the release with
-#     `git tag -l 'v*' --sort=-v:refname | head -n1`. A tag like "0.1.0" matches NOTHING, so
-#     the strict one-line installer reports that no release exists. Deriving the tag guarantees
-#     the prefix.
+#   * The tag MUST be v-prefixed and stable. bootstrap.sh considers only exact vX.Y.Z tags. A tag
+#     like "0.1.0" matches NOTHING, so the strict one-line installer reports that no release exists.
+#     Deriving and validating the tag guarantees the same contract here.
 #   * macOS CI does not run on pushes (it is billed even on public repos, ~10x, so it is
 #     workflow_dispatch-only). A macOS-only breakage can therefore sit undetected until a
 #     user hits it. Releasing is exactly when that matters, so this triggers the macOS run
@@ -43,10 +42,6 @@ set -euo pipefail
 GH="${ROMP_GH:-gh}"                       # overridable so tests can stub the GitHub CLI
 POLL="${ROMP_RELEASE_POLL:-5}"            # seconds between checks while the run starts
 REF="${ROMP_RELEASE_REF:-main}"
-# Default to the clone's own push target when one is configured (a dev clone whose origin is the
-# upstream repo but whose pushes go to a fork must never release AT upstream by default —
-# 2026-08-14 review); origin remains the fallback, which is right on a plain clone.
-RELEASE_REMOTE="${ROMP_RELEASE_REMOTE:-$(git config --get remote.pushDefault 2>/dev/null || echo origin)}"
 # Normally derived from RELEASE_REMOTE. The override is useful for local/non-GitHub remotes
 # (including the hermetic test fixture), but a GitHub remote and an explicit override must agree.
 RELEASE_REPO="${ROMP_RELEASE_REPO:-${ROMP_RELEASE_UPSTREAM:-}}"
@@ -114,6 +109,15 @@ verify_release_tag() {
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
+# Resolve the default only after entering THIS checkout. Otherwise an invocation from another Git
+# repository inherits that caller's remote.pushDefault and may publish through an unrelated,
+# coincidentally named remote. origin remains the fallback for a plain clone.
+RELEASE_REMOTE="${ROMP_RELEASE_REMOTE:-}"
+if [ -z "$RELEASE_REMOTE" ]; then
+    RELEASE_REMOTE="$(git config --get remote.pushDefault 2>/dev/null || true)"
+    [ -n "$RELEASE_REMOTE" ] || RELEASE_REMOTE=origin
+fi
+
 github_repo_from_url() {
     local url="$1" slug=""
     case "$url" in
@@ -133,7 +137,11 @@ github_repo_from_url() {
 # failed after the irreversible step while trying to publish the release in another repo.
 release_url="$(git remote get-url "$RELEASE_REMOTE" 2>/dev/null || true)"
 [ -n "$release_url" ] || die "release remote '$RELEASE_REMOTE' does not exist."
-release_push_url="$(git remote get-url --push "$RELEASE_REMOTE" 2>/dev/null || true)"
+release_push_urls="$(git remote get-url --push --all "$RELEASE_REMOTE" 2>/dev/null || true)"
+push_url_count="$(printf '%s\n' "$release_push_urls" | awk 'NF { n++ } END { print n + 0 }')"
+[ "$push_url_count" -eq 1 ] \
+    || die "release remote '$RELEASE_REMOTE' must have exactly one push URL (found $push_url_count)."
+release_push_url="$release_push_urls"
 fetch_repo="$(github_repo_from_url "$release_url")"
 push_repo="$(github_repo_from_url "$release_push_url")"
 if [ -n "$fetch_repo" ] && [ -n "$push_repo" ] && [ "$fetch_repo" != "$push_repo" ]; then
@@ -155,18 +163,47 @@ case "$RELEASE_REPO" in
 esac
 PROJECT="${RELEASE_REPO##*/}"
 
+git check-ref-format --branch "$REF" >/dev/null 2>&1 \
+    || die "release ref '$REF' is not a safe branch name."
+
+# Fetch from the exact repository that receives the tag, not from a possibly stale tracking ref.
+# The first call records the immutable release commit; later calls must see the same remote branch
+# and the same local HEAD.  This binds tests, dispatched CI, and the signed tag to one commit even
+# when VERSION already had the desired number before this script started.
+release_sha=""
+validate_release_head() {
+    local fetched_sha head_sha
+    if [ "$dry_run" -eq 1 ]; then
+        release_sha="$(git rev-parse --verify 'HEAD^{commit}')" \
+            || die "could not resolve the current commit."
+        say "[dry-run] would fetch $RELEASE_REMOTE/$REF and require it to remain at $release_sha."
+        return
+    fi
+    git fetch -q "$release_push_url" "refs/heads/$REF" \
+        || die "could not fetch $REF from the validated release remote '$RELEASE_REMOTE'."
+    fetched_sha="$(git rev-parse --verify 'FETCH_HEAD^{commit}' 2>/dev/null || true)"
+    [ -n "$fetched_sha" ] || die "could not resolve $RELEASE_REMOTE/$REF after fetching it."
+    head_sha="$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true)"
+    [ -n "$head_sha" ] || die "could not resolve the current commit."
+    if [ -n "$release_sha" ] && [ "$fetched_sha" != "$release_sha" ]; then
+        die "$RELEASE_REMOTE/$REF moved after validation ($release_sha -> $fetched_sha) — rerun so tests and CI cover the commit being tagged."
+    fi
+    [ "$head_sha" = "$fetched_sha" ] \
+        || die "local HEAD $head_sha does not match $RELEASE_REMOTE/$REF $fetched_sha — switch to that exact commit before releasing."
+    release_sha="$fetched_sha"
+}
+
 [ -f VERSION ] || die "no VERSION file at the repo root — it is the source of truth and must exist."
 current="$(tr -d '[:space:]' < VERSION)"
 
 # ── 1. resolve the target version ─────────────────────────────────────
-# The bump arithmetic works on the X.Y.Z core, so a prerelease suffix ("0.2.0-rc.1") bumps
-# from its release number rather than tripping the parser.
-core="${current%%-*}"
-if [[ ! "$core" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    die "VERSION ('$current') is not X.Y.Z — cannot compute a bump from it."
+# The updater selects stable releases. Refuse prerelease numbers here so a published release is
+# always eligible for the installation path this script exists to feed.
+if [[ ! "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    die "VERSION ('$current') is not X.Y.Z — stable releases only."
 fi
 IFS=. read -r cur_major cur_minor cur_patch <<EOF
-$core
+$current
 EOF
 
 case "$bump" in
@@ -177,8 +214,8 @@ case "$bump" in
     *)       target="$bump" ;;
 esac
 
-if [[ ! "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
-    die "'$target' is not semver (X.Y.Z, optionally with a prerelease suffix)."
+if [[ ! "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    die "'$target' is not semver X.Y.Z — stable releases only."
 fi
 tag="v$target"
 
@@ -254,6 +291,10 @@ if [ "$dry_run" -eq 0 ]; then
     [ "$have" = "$target" ] || die "VERSION says '$have' but we are releasing '$tag' — refusing to tag a mismatch."
 fi
 
+# VERSION matching is insufficient: a clean feature branch or stale local main can carry the same
+# number.  Bind the release to the freshly fetched branch before spending test or CI time.
+validate_release_head
+
 # ── 4. the tests ──────────────────────────────────────────────────────
 if [ "$skip_tests" -eq 1 ]; then
     echo "release: !! skipping the local suites at your explicit request (--skip-tests)."
@@ -303,9 +344,11 @@ if [ "$skip_macos" -eq 1 ]; then
 elif [ "$dry_run" -eq 1 ]; then
     say "[dry-run] would dispatch the macOS CI run and wait for it."
 else
-    say "triggering the macOS CI run on $REF (it is dispatch-only, so this is the check)..."
-    before="$("$GH" run list --workflow CI --event workflow_dispatch -L 1 --json databaseId -q '.[0].databaseId // ""' 2>/dev/null || true)"
-    "$GH" workflow run CI --ref "$REF" || die "could not dispatch the CI workflow."
+    say "triggering the macOS CI run on $REF at $release_sha (it is dispatch-only, so this is the check)..."
+    before="$("$GH" run list --repo "$RELEASE_REPO" --workflow CI --event workflow_dispatch \
+        -L 1 --json databaseId -q '.[0].databaseId // ""' 2>/dev/null || true)"
+    "$GH" workflow run CI --repo "$RELEASE_REPO" --ref "$REF" \
+        || die "could not dispatch the CI workflow."
 
     # Identify OUR run by waiting for the newest dispatch run to differ from the one that was
     # newest before we dispatched — `gh workflow run` prints no run id, and taking the newest
@@ -316,7 +359,8 @@ else
     run_id=""
     for _ in $(seq 1 60); do
         if [ "$POLL" != "0" ]; then sleep "$POLL"; fi
-        cur="$("$GH" run list --workflow CI --event workflow_dispatch -L 1 --json databaseId -q '.[0].databaseId // ""' 2>/dev/null || true)"
+        cur="$("$GH" run list --repo "$RELEASE_REPO" --workflow CI --event workflow_dispatch \
+            -L 1 --json databaseId -q '.[0].databaseId // ""' 2>/dev/null || true)"
         if [ -n "$cur" ] && [ "$cur" != "$before" ]; then run_id="$cur"; break; fi
         if [ "$POLL" = "0" ]; then break; fi     # test mode: never spin
     done
@@ -331,8 +375,20 @@ else
     # error just yields an empty conclusion and we poll again; only the run's own verdict
     # ends the wait.
     conclusion=""
+    run_head=""
     while :; do
-        conclusion="$("$GH" run view "$run_id" --json conclusion -q .conclusion 2>/dev/null || true)"
+        run_state="$("$GH" run view "$run_id" --repo "$RELEASE_REPO" --json conclusion,headSha \
+            -q '[.conclusion // "", .headSha // ""] | @tsv' 2>/dev/null || true)"
+        if [[ "$run_state" == *$'\t'* ]]; then
+            conclusion="${run_state%%$'\t'*}"
+            run_head="${run_state#*$'\t'}"
+        else
+            conclusion=""
+            run_head=""
+        fi
+        if [ -n "$run_head" ] && [ "$run_head" != "$release_sha" ]; then
+            die "the dispatched CI run covers a different commit ($run_head, expected $release_sha) — NOT tagging $tag."
+        fi
         if [ -n "$conclusion" ]; then break; fi
         if [ "$POLL" = "0" ]; then break; fi     # test mode: never spin
         sleep "$POLL"
@@ -341,19 +397,28 @@ else
         die "the macOS run did not pass (conclusion: ${conclusion:-none}) — NOT tagging $tag.
   Fix it, or re-run with --skip-macos if you have decided to ship anyway."
     fi
+    [ "$run_head" = "$release_sha" ] \
+        || die "the dispatched CI run did not report the validated commit $release_sha — NOT tagging $tag."
     say "macOS run green."
 fi
 
 # ── 6. tag, push, publish ─────────────────────────────────────────────
-# The previous release, for the notes range — computed BEFORE the new tag exists so it can
-# never pick itself.
-prev="$(git tag -l 'v*' --sort=-v:refname | head -n1 || true)"
+# The previous stable release, for the notes range — computed BEFORE the new tag exists so it can
+# never pick itself. Prerelease-looking tags are outside the updater/releaser contract and cannot
+# become the notes baseline.
+prev="$(git tag -l 'v*' --sort=-v:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }')"
+
+# Close the branch-move window after CI. The tag command below also names the recorded commit
+# explicitly, so neither an incidental checkout nor a moved remote can silently change its target.
+[ -z "$(git status --porcelain)" ] \
+    || die "working tree changed during the release gates — refusing to tag code other than the validated commit."
+validate_release_head
 
 if [ "$dry_run" -eq 1 ]; then
-    step git tag -s "$tag" -m "$PROJECT $tag"
+    step git tag -s "$tag" "$release_sha" -m "$PROJECT $tag"
     step git -c gpg.minTrustLevel=fully verify-tag "$tag"
 else
-    git tag -s "$tag" -m "$PROJECT $tag" \
+    git tag -s "$tag" "$release_sha" -m "$PROJECT $tag" \
         || die "could not create signed tag $tag. Configure Git signing (user.signingKey and, if needed, gpg.format) and retry."
     # A configured private key is not enough: prove the resulting tag is parseable and verifies
     # under the same Git trust configuration installers use before it leaves this machine.
@@ -366,7 +431,7 @@ say "created and verified signed tag $tag."
 
 # The tag goes to the validated release remote: a tag that exists only locally installs for
 # nobody, and publishing it in a different GitHub repository would leave a half-release.
-step git push -q "$RELEASE_REMOTE" "$tag" || die "could not push $tag to $RELEASE_REMOTE."
+step git push -q "$release_push_url" "$tag" || die "could not push $tag to $RELEASE_REMOTE."
 say "pushed $tag."
 
 if [ -n "$prev" ]; then

@@ -13,6 +13,7 @@ and one "sent" event no matter how many times the push defers.
 
 Synthetic only — placeholder UUIDs, hermetic temp state dir, no real session data.
 """
+import io
 import json
 import os
 import tempfile
@@ -49,6 +50,7 @@ class DeferredPushKeepsOneIdentity(unittest.TestCase):
         p = pm.TLDIR / "messages.jsonl"
         if p.exists():
             p.unlink()
+        pm._mark_pending(TO)
 
     def test_restore_puts_it_back_under_the_same_id(self):
         mid = pm.deliver(TO, "api", FROM, "the migration is on staging", kind="coordinate")
@@ -124,6 +126,31 @@ class DeferredPushKeepsOneIdentity(unittest.TestCase):
         self.assertTrue((pm.MAILROOT / TO / "new" / second).is_file())
         self.assertFalse((pm.MAILROOT / TO / "cur" / first).exists(),
                          "a failed batch cannot strand an earlier claim in cur/")
+
+    def test_one_unreadable_file_does_not_starve_later_mail(self):
+        mb = pm._mailbox(TO)
+        bad = mb / "new" / "100.bad"
+        good = mb / "new" / "200.good"
+        bad.write_text("From: api\nFrom-Id: %s\nDate: now\n\nunreadable\n" % FROM)
+        good.write_text("From: api\nFrom-Id: %s\nDate: now\n\nready\n" % FROM)
+        pm._mark_pending(TO)
+        real_read_text = pm.Path.read_text
+
+        def fail_bad(path, *args, **kwargs):
+            if path == bad:
+                raise OSError("synthetic unreadable file")
+            return real_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(pm.Path, "read_text", new=fail_bad), \
+             mock.patch.object(pm.sys, "stderr", new_callable=io.StringIO) as stderr:
+            claimed = pm.read_box(TO, consume=True)
+
+        self.assertEqual([m["id"] for m in claimed], [good.name])
+        self.assertTrue(bad.is_file(), "the unreadable message stays durable for recovery")
+        self.assertTrue((mb / "cur" / good.name).is_file(), "later readable mail is claimed")
+        self.assertTrue((pm.MAILPENDING / TO).is_file(), "the unread message keeps the pending marker")
+        self.assertIn(bad.name, stderr.getvalue())
+        self.assertIn("synthetic unreadable file", stderr.getvalue())
 
 
 class DeferredPushEndToEnd(unittest.TestCase):
