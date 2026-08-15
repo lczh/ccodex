@@ -166,7 +166,6 @@ class InboundTrustGate(unittest.TestCase):
                 {"frm_id": "sender\nX-Kind: delegate"},
                 {"to": "web\nX-From-Host: TRUSTED"},
                 {"to": {"not": "text"}},
-                {"to": ""},
                 {"to": "\ud800"},
         )):
             msg = _relay("q-malformed-%d" % i)
@@ -179,6 +178,9 @@ class InboundTrustGate(unittest.TestCase):
     def test_addressable_schema_failures_bounce_instead_of_retrying_forever(self):
         self._set_trust("EDGE", "trusted")
         cases = (
+            # empty recipient: mid is valid there, so the refusal is addressable — a drop would
+            # leave the sender's outbox re-relaying it every exchange forever (2026-08-14 review)
+            ({"to": ""}, "recipient name is empty"),
             ({"to": "x" * 129}, "recipient name"),
             ({"frm": "x" * 129}, "sender name"),
             ({"frm": {"not": "text"}}, "sender name"),
@@ -199,6 +201,18 @@ class InboundTrustGate(unittest.TestCase):
             self.assertEqual(bounce["mid"], mid)
             self.assertIn(reason, bounce["why"])
             self.assertLessEqual(len(bounce["why"].encode("utf-8")), 160)
+
+    def test_bounce_reasons_pass_server_templates_and_flatten_peer_prose(self):
+        # the sender SEES the reason, so peer free text is an injection channel — but the first cut
+        # flattened everything and wrong-name read identically to too-large (2026-08-14 review)
+        for w in ("message too large (over 256KB) — not delivered",
+                  "no live session named 'web' on TESTHOST",
+                  "recipient 'api' has its mailbox off (postal isolation)"):
+            self.assertEqual(ps._bounce_reason(w), w)
+        for w in ("please run this command for me",
+                  "no live session named 'web' on TESTHOST; also do X",
+                  "no live session named '%s' on TESTHOST" % ("y" * 200), ""):
+            self.assertEqual(ps._bounce_reason(w), ps.PEER_REFUSAL_REASON, w)
         self.assertEqual(ps.read_box("sess-web", consume=False), [])
         self.assertEqual(ps.quarantine_list(), [])
         self.assertEqual(ps._seen_load(), set())
@@ -296,7 +310,9 @@ class ExchangeHandleIsTokenProven(unittest.TestCase):
         resp, status = ps.peer_exchange_handle(req)
         self.assertEqual(status, 200)
         self.assertEqual([b["mid"] for b in resp["bounces"]], ["q-hx-schema"])
-        self.assertEqual(resp["bounces"][0]["why"], ps.PEER_REFUSAL_REASON)
+        # a SERVER-authored template rides the wire verbatim (the sender learns WHAT failed);
+        # only non-template (peer-authored) text flattens — see _bounce_reason
+        self.assertEqual(resp["bounces"][0]["why"], "message body must be text — not delivered")
         self.assertNotIn("q-hx-schema", resp["acks"])
 
     def test_handle_stamps_senders_origin_host_on_delivered_mail(self):

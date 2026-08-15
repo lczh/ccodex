@@ -262,7 +262,14 @@ class CodexBackend:
     def _load_registry(self):
         try:
             rows = json.loads(self._reg_path().read_text())
-        except Exception:
+        except FileNotFoundError:
+            rows = {}
+        except Exception as e:
+            # as LOUD at load as saves are: _save_registry refuses to overwrite an unreadable
+            # registry, but a silent {} here made every session vanish at boot and surface later
+            # as unrelated-looking spawn/send errors (2026-08-14 review)
+            self.log("codex registry unreadable at load — existing sessions will be missing "
+                     "until it is repaired: %s" % e)
             rows = {}
         with self._sessions_lock:
             for sid, r in rows.items():

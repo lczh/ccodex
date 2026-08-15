@@ -2183,8 +2183,40 @@ def _peer_ack_ids(value):
             if isinstance(mid, str) and _safe_id(mid)]
 
 
+_BOUNCE_EXACT = frozenset((
+    PEER_REFUSAL_REASON,
+    "sender name must be text — not delivered",
+    "sender name contains control characters — not delivered",
+    "sender name is not valid UTF-8 — not delivered",
+    "recipient name exceeds 128 characters — not delivered",
+    "recipient name is empty — not delivered",
+    "sender name exceeds 128 characters — not delivered",
+    "message body must be text — not delivered",
+    "message too large (over 256KB) — not delivered",
+    "message body is not valid UTF-8 — not delivered",
+    "message kind must be text — not delivered",
+    "message kind is unsupported — not delivered",
+))
+_BOUNCE_SHAPES = (
+    re.compile(r"^no live session named '[^'\n]{1,128}' on [A-Za-z0-9._:-]{1,64}$"),
+    re.compile(r"^recipient '[^'\n]{1,128}' has its mailbox off \(postal isolation\)$"),
+)
+
+
+def _bounce_reason(why):
+    """A bounce's `why` reaches the SENDING agent's chat, so peer-authored free text there is a
+    prompt-injection channel — but flattening EVERY reason to one constant (the first cut) threw the
+    sender's diagnostics away with it: wrong-name and too-large read identically (2026-08-14 review).
+    Reasons this service itself authors pass verbatim — the exact constant strings, plus the two
+    parameterized shapes anchored end-to-end with bounded charsets — and anything else flattens."""
+    w = " ".join(str(why or "").split())
+    if w in _BOUNCE_EXACT or any(rx.match(w) for rx in _BOUNCE_SHAPES):
+        return w
+    return PEER_REFUSAL_REASON
+
+
 def _peer_bounce_rows(value):
-    """Reduce bounces to terminal ids; peer-authored reasons are never executable mail text."""
+    """Reduce bounces to terminal ids + allowlisted reasons; peer free-text never rides through."""
     if not isinstance(value, list):
         return []
     out = []
@@ -2193,7 +2225,7 @@ def _peer_bounce_rows(value):
             continue
         mid = row.get("mid")
         if isinstance(mid, str) and _safe_id(mid):
-            out.append({"mid": mid, "why": PEER_REFUSAL_REASON})
+            out.append({"mid": mid, "why": _bounce_reason(row.get("why"))})
     return out
 
 
@@ -2279,16 +2311,16 @@ def _bounce_apply(host, b):
     msg = outbox_get(host, mid)
     if not msg:
         return
+    why = _bounce_reason(rows[0].get("why"))
     note = ("undeliverable to '%s' on %s: %s\n\n(your message follows)\n%s"
-            % (msg.get("to") or "?", host, PEER_REFUSAL_REASON, msg.get("body") or ""))
+            % (msg.get("to") or "?", host, why, msg.get("body") or ""))
     if msg.get("frm_id"):
         deliver(msg["frm_id"], "romp-postal", "", note, kind="coordinate")
     # The parked source is our retry record.  Retire it only after the return note was successfully
     # written; if delivery raises, the next exchange can retry the bounce instead of losing both.
     outbox_del(host, mid)
     _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "bounced", "id": mid,
-                                  "to": msg.get("to") or "?", "host": host,
-                                  "why": PEER_REFUSAL_REASON})
+                                  "to": msg.get("to") or "?", "host": host, "why": why})
 
 def fleet_presence(exclude_host):
     """Presence for an exchange payload: local agents + ONE hop of gossip from our other peers, each
@@ -2463,7 +2495,10 @@ def _relay_in(host, m, token_proven=False):
         return "drop", None
     to = " ".join(raw_to.split())
     if not to:
-        return "drop", None
+        # identity (mid) is already validated here, so the refusal is ADDRESSABLE — a drop never
+        # acks, and the sender's durable outbox would re-relay this record on every exchange
+        # forever with nobody told (the oversize-bounce rule, same reasoning)
+        return refuse("recipient name is empty — not delivered")
 
     raw_frm = m.get("frm")
     raw_frm = "?" if raw_frm is None or raw_frm == "" else raw_frm

@@ -323,7 +323,7 @@ class RunUpdate(Fresh):
                 self.assertFalse(km._run_update("v0.7.0"))
             self.assertIn("readable regular file", km._UPDATE_ERROR[0])
 
-    def _execute_captured_updater(self, verify_rc):
+    def _execute_captured_updater(self, verify_rc, enforce=False):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "repo"; root.mkdir()
             state = Path(td) / "state"; state.mkdir()
@@ -338,9 +338,13 @@ class RunUpdate(Fresh):
             install.chmod(0o755)
             spawned = []
             env = {k: v for k, v in km.os.environ.items()
-                   if k not in ("ROMP_MANAGER_PORT", "ROMP_RELEASE_ALLOWED_SIGNERS")}
+                   if k not in ("ROMP_MANAGER_PORT", "ROMP_RELEASE_ALLOWED_SIGNERS",
+                                "ROMP_VERIFY_RELEASES")}
             env.update(PATH=str(fakebin) + os.pathsep + env.get("PATH", ""),
                        GIT_CALLS=str(calls), VERIFY_RC=str(verify_rc))
+            if enforce:
+                # the opt-in trust-root flag: with it, verification is the fail-closed gate
+                env["ROMP_VERIFY_RELEASES"] = "1"
             with mock.patch.object(km, "ROOT", root), mock.patch.object(km.jd, "STATE", state), \
                  mock.patch.object(km.subprocess, "Popen", side_effect=lambda *a, **kw: spawned.append(a)), \
                  mock.patch.dict(km.os.environ, env, clear=True):
@@ -360,13 +364,27 @@ class RunUpdate(Fresh):
         self.assertTrue(report["ok"])
 
     def test_unsigned_or_bad_tag_stops_before_merge_install_and_restart(self):
-        rc, rows, report = self._execute_captured_updater(1)
+        # enforcement requires a CONFIGURED trust root (the env opt-in here; bootstrap's persisted
+        # allowed-signers config is the friend-install equivalent) — with one, the gate is exactly
+        # as strict as before
+        rc, rows, report = self._execute_captured_updater(1, enforce=True)
         self.assertEqual(rc, 0, "the detached reporter records a refusal rather than crashing")
         self.assertTrue(any("gpg.minTrustLevel=fully" in row and "verify-tag v0.7.0" in row for row in rows))
         self.assertFalse(any(row.startswith("merge ") for row in rows))
         self.assertNotIn("install", rows)
         self.assertFalse(report["ok"])
         self.assertIn("signature verification", report["why"])
+
+    def test_unsigned_without_trust_root_proceeds_with_a_note(self):
+        # no trust root anywhere → verification is best-effort: still attempted (and its refusal in
+        # the log), but the update proceeds. Mandatory-with-no-published-key bricked every install's
+        # updater from the first release, since no key was ever distributed (2026-08-14 review).
+        rc, rows, report = self._execute_captured_updater(1)
+        self.assertEqual(rc, 0)
+        self.assertTrue(any("verify-tag v0.7.0" in row for row in rows), "verification is still attempted")
+        self.assertTrue(any("merge --ff-only v0.7.0" in row for row in rows))
+        self.assertIn("install", rows)
+        self.assertTrue(report["ok"])
 
 
 class ReportConsumption(Fresh):
