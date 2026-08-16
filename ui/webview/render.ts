@@ -7950,7 +7950,7 @@ const META_CHOICES: Record<MetaKind, MetaChoice[]> = {
 // vocabulary (its own model list, the four efforts it accepts) — never Claude's, whose aliases
 // the codex backend refuses (docs/codex.md). Mode/fast never reach here for codex (see the
 // toggleMetaMenu guard / the fast badge's report gate).
-function metaChoices(kind: MetaKind, st: Status): { label: string; value: string }[] {
+function metaChoices(kind: MetaKind, st: Status): MetaChoice[] {
   if (st.backend === "codex") {
     if (kind === "model") return CODEX_MODEL_CHOICES;
     if (kind === "effort") return CODEX_EFFORT_CHOICES;
