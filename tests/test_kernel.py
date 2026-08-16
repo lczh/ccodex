@@ -4288,7 +4288,7 @@ class ViewBuilder(unittest.TestCase):
         landing = km._landing()
         self.assertIn("id=rail-gear", landing)
         self.assertIn("id=rail-refresh", landing)
-        self.assertIn("body:'{}'", landing)       # rail ↻ takes the default: everything attached (the user 2026-07-29)
+        self.assertIn("body:'{\"fleet\":false}'", landing)  # routine refresh is explicitly local-only
 
     def test_gear_polish_tooltips_colormap_bar_no_emoji(self):
         # the user 2026-06-23: descriptions become HOVER tooltips (decluttered), and the analytics button drops
@@ -6218,23 +6218,43 @@ class ServeSecurity(unittest.TestCase):
         No ROMP_MANAGER_PORT here → it acks without restarting anything."""
         import urllib.request, json as _json
         saved = os.environ.pop("ROMP_MANAGER_PORT", None)   # never trigger a real restart-all in a test
+        with km._remotes_lock:
+            saved_remotes = dict(km._remotes)
+            km._remotes.clear()
         try:
             req = urllib.request.Request("http://127.0.0.1:%d/restart?token=testtok" % self.port,
                                          method="POST", data=b"")
             with urllib.request.urlopen(req, timeout=5) as r:
                 self.assertEqual(r.status, 200)
                 # the ack also names WHICH kernel acked (boot id, 2026-07-27) — see RestartReloadRaceTest
-                # Ordinary/empty requests take the default: everything attached (the user 2026-07-29;
-                # with no remotes it restarts only this kernel anyway — see the _remotes gate).
                 self.assertEqual(_json.loads(r.read().decode()),
-                                 {"ok": True, "restarting": True, "boot": km._BOOT_ID, "fleet": True})
+                                 {"ok": True, "restarting": True, "boot": km._BOOT_ID, "fleet": False})
             req = urllib.request.Request("http://127.0.0.1:%d/restart?token=testtok" % self.port,
                                          method="POST", data=b'{"fleet":false}',
                                          headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=5) as r:
                 self.assertFalse(_json.loads(r.read().decode())["fleet"],
-                                 "local-only remains the explicit opt-out")
+                                 "local-only can also be stated explicitly")
+            req = urllib.request.Request("http://127.0.0.1:%d/restart?token=testtok" % self.port,
+                                         method="POST", data=b'{"fleet":true}',
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                self.assertTrue(_json.loads(r.read().decode())["fleet"],
+                                "remote-wide scope requires an explicit boolean opt-in")
+
+            import urllib.error
+            for bad in (b'{', b'\xff', b'null', b'[]', b'{"fleet":1}', b'{"fleet":"yes"}',
+                        b'{"fleet":null}'):
+                req = urllib.request.Request("http://127.0.0.1:%d/restart?token=testtok" % self.port,
+                                             method="POST", data=bad,
+                                             headers={"Content-Type": "application/json"})
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(req, timeout=5)
+                self.assertEqual(cm.exception.code, 400, bad)
         finally:
+            with km._remotes_lock:
+                km._remotes.clear()
+                km._remotes.update(saved_remotes)
             if saved is not None:
                 os.environ["ROMP_MANAGER_PORT"] = saved
 

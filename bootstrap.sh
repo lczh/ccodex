@@ -3,7 +3,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | bash
 #
 # Clones the repo, cryptographically verifies and checks out the requested release tag
-# (newest v* release by default), runs install.sh, and puts bin/ on your PATH. The clone IS
+# (newest stable vX.Y.Z release by default), runs install.sh, and puts bin/ on your PATH. The clone IS
 # the installation
 # (install.sh symlinks the hooks, MCP config and skills out of it, and bin/
 # links back into it), so this keeps the clone at a stable location rather
@@ -64,9 +64,9 @@ else
     git clone --quiet "$REPO" "$DIR"
 fi
 
-# Pick the ref. Releases are `v`-prefixed, so match on that rather than taking
-# the newest tag of any kind: the repo also carries non-release tags, and
-# installing one of those would silently pin somebody to an old baseline.
+# Pick the ref. Stable releases are exactly `vX.Y.Z`, so match that shape rather
+# than taking the newest tag of any kind: the repo also carries non-release and
+# prerelease tags, and the in-app updater intentionally ignores those too.
 ref="${ROMP_REF:-}"
 if [ -z "$ref" ]; then
     # Select only a tag the fetched origin actually advertises, and require the local tag object
@@ -78,6 +78,7 @@ if [ -z "$ref" ]; then
     fi
     while IFS= read -r candidate; do
         [ -n "$candidate" ] || continue
+        [[ "$candidate" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
         remote_tag_oid="$(printf '%s\n' "$remote_release_refs" | \
             awk -v wanted="refs/tags/$candidate" '$2 == wanted { print $1; exit }')"
         [ -n "$remote_tag_oid" ] || continue
@@ -90,7 +91,7 @@ if [ -z "$ref" ]; then
         break
     done < <(git -C "$DIR" tag -l 'v*' --sort=-v:refname)
     if [ -z "$ref" ]; then
-        echo "romp: no release tag is published; refusing to install an unverified branch." >&2
+        echo "romp: no stable vX.Y.Z release tag is published; refusing to install an unverified branch." >&2
         echo "  Wait for a signed release, or explicitly choose development code with ROMP_REF=main." >&2
         exit 1
     fi
@@ -123,21 +124,12 @@ if git -C "$DIR" show-ref --verify --quiet "refs/tags/$ref"; then
             -c "gpg.ssh.allowedSignersFile=$allowed_signers" \
             verify-tag "$ref" || signature_ok=0
     else
-        git -C "$DIR" -c gpg.minTrustLevel=fully verify-tag "$ref" 2>/dev/null || signature_ok=0
+        git -C "$DIR" -c gpg.minTrustLevel=fully verify-tag "$ref" || signature_ok=0
     fi
     if [ "$signature_ok" -ne 1 ]; then
-        # Verification ENFORCES only when a trust root was configured (ROMP_RELEASE_ALLOWED_SIGNERS,
-        # or ROMP_VERIFY_RELEASES=1 for GPG-trust users). Mandatory-with-no-published-key bricked
-        # every install: the repo's releases are not signed yet and no key is distributed anywhere,
-        # so there was nothing any installer could trust (2026-08-14 review). Configured deployments
-        # keep the full hard-fail; everyone else gets a loud, honest warning instead of a dead end.
-        if [ -n "$allowed_signers" ] || [ -n "${ROMP_VERIFY_RELEASES:-}" ]; then
-            echo "romp: release tag '$ref' does not have a valid signature trusted by git; refusing to install it." >&2
-            echo "  Import the maintainer's GPG key or configure Git's SSH allowed-signers file, then rerun." >&2
-            exit 1
-        fi
-        echo "==> Note: release tag '$ref' is not signature-verified (no trust root configured)." >&2
-        echo "    To enforce verification, set ROMP_RELEASE_ALLOWED_SIGNERS to an allowed-signers file." >&2
+        echo "romp: release tag '$ref' does not have a valid signature trusted by git; refusing to install it." >&2
+        echo "  Import the maintainer's GPG key or configure Git's SSH allowed-signers file, then rerun." >&2
+        exit 1
     fi
     if [ -n "$allowed_signers" ]; then
         # The kernel updater runs long after this bootstrap process and cannot inherit a one-shot
@@ -148,6 +140,10 @@ if git -C "$DIR" show-ref --verify --quiet "refs/tags/$ref"; then
             exit 1
         }
     fi
+fi
+
+if [ "$is_tag" -ne 1 ]; then
+    echo "romp: UNSAFE DEVELOPMENT OVERRIDE: ROMP_REF='$ref' is not a release tag; its code is not signature-verified." >&2
 fi
 
 if [ "$is_tag" -eq 1 ]; then

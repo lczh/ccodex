@@ -641,6 +641,36 @@ class Lifecycle(unittest.TestCase):
                              "chain broke across the restart at %s" % r["uuid"])
         self.assertEqual(len({r["uuid"] for r in recs}), len(recs))
 
+    def test_load_registry_logs_malformed_json_and_falls_back_empty(self):
+        tmp = tempfile.mkdtemp()
+        root = Path(tmp) / "codex"
+        root.mkdir(parents=True)
+        (root / "registry.json").write_text("{synthetic malformed json")
+        logs = []
+
+        be = cb.CodexBackend(tmp, client_factory=lambda: None, log=logs.append)
+
+        self.assertEqual(be._session_items(), [])
+        self.assertEqual(len(logs), 1)
+        self.assertIn("codex registry unreadable at load", logs[0])
+        self.assertIn("existing sessions will be missing until it is repaired", logs[0])
+
+    def test_load_registry_logs_valid_non_object_roots_and_falls_back_empty(self):
+        for value in ([], None, True, 7, "synthetic-root"):
+            with self.subTest(value=value):
+                tmp = tempfile.mkdtemp()
+                root = Path(tmp) / "codex"
+                root.mkdir(parents=True)
+                (root / "registry.json").write_text(json.dumps(value))
+                logs = []
+
+                be = cb.CodexBackend(tmp, client_factory=lambda: None, log=logs.append)
+
+                self.assertEqual(be._session_items(), [])
+                self.assertEqual(len(logs), 1)
+                self.assertIn("codex registry unreadable at load", logs[0])
+                self.assertIn("registry root is not an object", logs[0])
+
     def test_stale_backend_metadata_save_cannot_erase_newer_durable_queue(self):
         be, fake, tmp = build()
         sid = be.spawn("web", "/TESTDIR")

@@ -73,7 +73,7 @@ class LandingShell(unittest.TestCase):
         # …and it wears the SAME browser-style reload svg as the rail (the ↻ text glyph is gone, 2026-07-27)
         self.assertIn("data-act=restart data-keycmd=kernel.restart aria-label='Restart kernel' title='Restart kernel'>" + km._REFRESH_SVG + "</button>", html)
         self.assertIn("window.__rompRestart=function", km._LANDING_SETTINGS_JS)   # the shared restart path
-        self.assertIn("body:'{}'", km._LANDING_SETTINGS_JS)   # the default restarts everything attached (the user 2026-07-29)
+        self.assertIn("body:'{\"fleet\":false}'", km._LANDING_SETTINGS_JS)  # explicitly local-only
         self.assertIn("rf.onclick=function(){rf.style.pointerEvents='none';rf.style.opacity='0.5';window.__rompRestart();}", km._LANDING_SETTINGS_JS)
         self.assertIn("restart:function(){try{window.__rompRestart", km._LANDING_MOBILE_JS)   # the bar routes to it
 

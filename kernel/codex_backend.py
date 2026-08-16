@@ -262,6 +262,8 @@ class CodexBackend:
     def _load_registry(self):
         try:
             rows = json.loads(self._reg_path().read_text())
+            if not isinstance(rows, dict):
+                raise ValueError("registry root is not an object")
         except FileNotFoundError:
             rows = {}
         except Exception as e:

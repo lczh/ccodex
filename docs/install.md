@@ -13,6 +13,16 @@
 
 ## Install
 
+The historical `v1.0.0`, `v1.1.0`, and `v1.2.0` tags are unsigned and cannot
+pass release verification. Before running the default installer, make sure both
+of these prerequisites exist:
+
+1. The maintainer publishes a signing key and fingerprint through an independent
+   channel, and you configure Git to trust it as described below.
+2. A signed stable `vX.Y.Z` release newer than `v1.2.0` is published.
+
+After both prerequisites are in place:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | bash
 ```
@@ -23,12 +33,9 @@ Open a new terminal afterwards, so `~/ccodex/bin` is on your `PATH`, and type
 The same command updates ccodex later. To remove it, run `ccodex uninstall` (add
 `--purge` to delete recorded sessions too).
 
-This clones ccodex to `~/ccodex`, checks out the newest release tag, and installs it.
-When a release trust root is configured (next section), the tag is cryptographically
-verified first and a failure stops the install — never a silent fallback to `main`
-or an older tag. Without a configured trust root, verification is still attempted and
-its outcome noted, but does not block: releases are not yet signed, and a mandatory
-gate with no published key would refuse every install.
+This clones ccodex to `~/ccodex`, cryptographically verifies the newest stable release tag,
+and installs it. If the newest stable tag is unsigned, invalid, or signed by a key Git does not
+trust, installation stops; it never silently falls back to `main` or an older tag.
 [What it installs, in detail](architecture.md#what-the-installer-sets-up).
 
 ### Release signature trust
@@ -49,14 +56,20 @@ signer's public key before installation:
   successful verification, bootstrap saves that absolute path in the clone's local Git
   configuration so the long-lived in-app updater uses the identical trust root.
 
+  For a one-line install, place the environment assignment on the `bash` side of the
+  pipe so bootstrap receives it:
+
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | \
+    ROMP_RELEASE_ALLOWED_SIGNERS=/absolute/path/to/allowed-signers bash
+  ```
+
 The signer key or fingerprint must be distributed independently of the release tag being
 checked; trusting a key supplied only by an unverified tag would defeat the check. Custom
 `ROMP_REPO` installations work the same way, using that repository maintainer's trusted key.
 
-Releases are not signed yet, so the default install runs in the noted-not-enforced mode.
-Once releases are signed and the signing key is published, configuring the trust root
-(above, or `ROMP_VERIFY_RELEASES=1` with GPG trust) turns verification into a hard gate —
-recommended for any deployment that can distribute the key out of band.
+If either prerequisite is missing, the default install is intentionally unavailable. Do
+not disable verification or select an older tag to make it pass.
 
 ### Manual and custom installs
 
@@ -66,12 +79,15 @@ latest commit rather than the newest release:
 ```bash
 git clone https://github.com/lczh/ccodex.git ~/ccodex
 cd ~/ccodex
-tag="$(git tag -l 'v*' --sort=-v:refname | head -n1)"
-git verify-tag "$tag"                                           # must succeed
+tag="$(git tag -l 'v*' --sort=-v:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }')"
+git -c gpg.minTrustLevel=fully verify-tag "$tag"                # must succeed
 git checkout --detach "refs/tags/$tag"                          # newest verified release
-# or:   git checkout main                                        # the latest commit
+# DEVELOPMENT ONLY (unverified branch code): git checkout main
 ./install.sh
 ```
+
+The `main` alternative explicitly bypasses release-signature verification. Use it only
+when you intend to run development code and have reviewed that source yourself.
 
 Then add `bin/` to your `PATH` in your shell rc; `install.sh` prints the exact
 line for your clone.

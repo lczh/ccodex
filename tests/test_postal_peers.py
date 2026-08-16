@@ -305,7 +305,7 @@ class TwoBusExchange(unittest.TestCase):
         pm.deliver = lambda *a, **k: (_ for _ in ()).throw(OSError("synthetic maildir failure"))
         try:
             with self.assertRaises(OSError):
-                pm._bounce_apply("srv", {"mid": "bounce-retry", "why": "gone"})
+                pm._bounce_apply("srv", {"mid": "bounce-retry", "code": pm.PEER_REFUSAL_CODE})
         finally:
             pm.deliver = saved
         self.assertIsNotNone(pm.outbox_get("srv", "bounce-retry"),
@@ -388,6 +388,7 @@ class ThreeBusRelay(unittest.TestCase):
         resp, status = dialed.peer_exchange_handle(req)
         self.assertEqual(status, 200)
         dialer.peer_exchange_apply(alias, req, resp)
+        return req, resp
 
     def test_far_spoke_gossips_via_the_hub(self):
         self._xchg(pmc, pmb, "hub")                  # B learns carol
@@ -450,11 +451,18 @@ class ThreeBusRelay(unittest.TestCase):
         self._xchg(pm, pmb, "hub")                   # forwarded
         pmc.local_agents = lambda: []                # carol died before delivery
         self._xchg(pmc, pmb, "hub")                  # C receives the relay → bounces it
-        self._xchg(pmc, pmb, "hub")                  # C's bounce rides its next request → B routes backward
-        self._xchg(pm, pmb, "hub")                   # A picks the bounce up → sender gets the note
+        c_request, _ = self._xchg(pmc, pmb, "hub")   # C's bounce rides its next request → B routes backward
+        self.assertEqual(c_request["bounces"], [
+            {"mid": "r2", "code": "recipient-unavailable"},
+        ])
+        _, a_response = self._xchg(pm, pmb, "hub")   # A picks the bounce up → sender gets the note
+        self.assertTrue(a_response["bounces"])
+        self.assertTrue(all(row == {"mid": "r2", "code": "recipient-unavailable"}
+                            for row in a_response["bounces"]))
         back = pm.read_box("sid-a", consume=True)
         self.assertEqual(len(back), 1, "the far refusal came all the way back")
         self.assertIn("undeliverable to 'carol'", back[0]["body"])
+        self.assertIn(pm.PEER_BOUNCE_REASONS["recipient-unavailable"], back[0]["body"])
         self.assertEqual(pm.outbox_list("hub"), [], "nothing left parked after a definitive refusal")
 
     def test_a_hopped_message_never_hops_again(self):
@@ -463,7 +471,7 @@ class ThreeBusRelay(unittest.TestCase):
         pmb.PEER_STATE["hostc"] = {"presence": [{"name": "nobody-anywhere", "id": "sid-x"}], "seenAt": 1}
         verdict, bounce = pmb._relay_in("hosta", m)
         self.assertEqual(verdict, "bounce", "one hop max: an already-hopped message bounces, never re-forwards")
-        self.assertIn("no live session", bounce["why"])
+        self.assertEqual(bounce, {"mid": "r3", "code": "recipient-unavailable"})
 
 
 class RecallAndReceipts(unittest.TestCase):

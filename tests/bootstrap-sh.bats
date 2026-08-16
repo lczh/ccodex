@@ -46,13 +46,23 @@ setup() {
 
 teardown() { rm -rf "$TEST_DIR"; }
 
-@test "bootstrap.sh: clones, checks out the newest RELEASE tag, installs, sets PATH" {
+@test "bootstrap.sh: clones, checks out the newest stable release tag, installs, sets PATH" {
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -eq 0 ]
     [[ "$output" == *STUB_INSTALL_RAN* ]]
     # v0.2.0, not the newer untagged commit and not the non-release tag.
     [ "$(git -C "$HOME/romp" describe --tags)" = "v0.2.0" ]
     grep -qF "$HOME/romp/bin" "$HOME/.zshrc"
+}
+
+@test "bootstrap.sh: ignores a newer prerelease tag and installs the newest stable release" {
+    git -C "$ROMP_REPO" tag -s v9.0.0-rc.1 -m v9.0.0-rc.1
+
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Verifying release signature for v0.2.0"* ]]
+    [[ "$output" != *"Verifying release signature for v9.0.0-rc.1"* ]]
+    [ "$(git -C "$HOME/romp" describe --tags)" = "v0.2.0" ]
 }
 
 @test "bootstrap.sh: verifies with Git's configured trust when no allowed-signers env is set" {
@@ -63,6 +73,19 @@ teardown() { rm -rf "$TEST_DIR"; }
     [[ "$output" == *STUB_INSTALL_RAN* ]]
     [ "$(git -C "$HOME/romp" describe --tags)" = "v0.2.0" ]
     grep -q '"gpg.minTrustLevel=fully","verify-tag","v0.2.0"' "$TEST_DIR/git-trace"
+}
+
+@test "bootstrap.sh: a globally configured trust root rejects a different signer" {
+    ssh-keygen -q -t ed25519 -N '' -f "$TEST_DIR/untrusted-key"
+    git -C "$ROMP_REPO" -c user.signingKey="$TEST_DIR/untrusted-key" \
+        tag -s v0.3.0 -m untrusted
+    git config --global gpg.ssh.allowedSignersFile "$TEST_DIR/allowed-signers"
+    unset ROMP_RELEASE_ALLOWED_SIGNERS
+
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"does not have a valid signature"* ]]
+    [[ "$output" != *STUB_INSTALL_RAN* ]]
 }
 
 @test "bootstrap.sh: re-running updates in place and does not duplicate the PATH line" {
@@ -87,6 +110,8 @@ teardown() { rm -rf "$TEST_DIR"; }
 @test "bootstrap.sh: ROMP_REF pins a branch instead of the newest release" {
     ROMP_DIR="$HOME/romp" ROMP_REF=main run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -eq 0 ]
+    [[ "$output" == *"UNSAFE DEVELOPMENT OVERRIDE"* ]]
+    [[ "$output" == *"not signature-verified"* ]]
     [ "$(git -C "$HOME/romp" rev-parse --abbrev-ref HEAD)" = "main" ]
 }
 
@@ -118,7 +143,7 @@ teardown() { rm -rf "$TEST_DIR"; }
     git -C "$ROMP_REPO" tag -d v0.1.0 v0.2.0
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -ne 0 ]
-    [[ "$output" == *"no release tag is published"* ]]
+    [[ "$output" == *"no stable vX.Y.Z release tag is published"* ]]
     [[ "$output" == *"ROMP_REF=main"* ]]
     [[ "$output" != *STUB_INSTALL_RAN* ]]
 }
@@ -132,17 +157,13 @@ teardown() { rm -rf "$TEST_DIR"; }
     [ "$(git -C "$HOME/romp" rev-parse HEAD)" != "$(git -C "$ROMP_REPO" rev-parse v0.2.0^{})" ]
 }
 
-@test "bootstrap.sh: an unsigned release with NO trust root installs, with a loud note" {
-    # Enforcement requires a configured trust root (env / ROMP_VERIFY_RELEASES / persisted config).
-    # Mandatory-with-no-published-key bricked every friend install: releases were not signed and no
-    # key was distributed anywhere, so there was nothing to trust (2026-08-14 review).
+@test "bootstrap.sh: an unsigned release with no trust root still fails closed" {
     git -C "$ROMP_REPO" tag -a v0.3.0 -m unsigned
     unset ROMP_RELEASE_ALLOWED_SIGNERS
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"not signature-verified"* ]]
-    [[ "$output" == *STUB_INSTALL_RAN* ]]
-    [ "$(git -C "$HOME/romp" describe --tags)" = "v0.3.0" ]
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"does not have a valid signature"* ]]
+    [[ "$output" != *STUB_INSTALL_RAN* ]]
 }
 
 @test "bootstrap.sh: rejects a release signed by a key outside the allowed-signers trust root" {
@@ -173,7 +194,10 @@ teardown() { rm -rf "$TEST_DIR"; }
 
 @test "bootstrap.sh: ignores a higher local-only signed tag when choosing the origin release" {
     ROMP_DIR="$HOME/romp" bash "$REPO_ROOT/bootstrap.sh"
-    git -C "$HOME/romp" -c gpg.format=ssh -c user.signingKey="$TEST_DIR/release-key" \
+    # A clone does not inherit the fixture repository's user identity. Set a synthetic one here so
+    # this signed local-tag setup is hermetic on Linux runners without a global Git identity.
+    git -C "$HOME/romp" -c user.name=fixture -c user.email=fixture.invalid \
+        -c gpg.format=ssh -c user.signingKey="$TEST_DIR/release-key" \
         tag -s v999.0.0 -m local-only main
 
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
