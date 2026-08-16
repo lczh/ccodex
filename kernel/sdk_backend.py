@@ -3726,10 +3726,10 @@ class SdkBackend:
         picker-revive fix, the user 2026-07-05)."""
         reg = read_reg(self.state_dir, sid) or {}
         cwd = cwd or reg.get("cwd") or os.path.expanduser("~")
-        write_reg(self.state_dir, sid, {**reg, "sid": sid, "name": name, "cwd": cwd,
-                                        "mode": reg.get("mode", "acceptEdits"),
-                                        "effort": reg.get("effort", DEFAULT_EFFORT),
-                                        "lastSid": reg.get("lastSid") or sid, "alive": True})
+        self._update_reg(sid, name=name, cwd=cwd,              # locked RMW — a concurrent reg
+                         mode=reg.get("mode", "acceptEdits"),  # writer must not lose fields
+                         effort=reg.get("effort", DEFAULT_EFFORT),
+                         lastSid=reg.get("lastSid") or sid, alive=True)
         append_state(self.state_dir, sid, "waiting")
         self._poke()
         return True

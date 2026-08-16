@@ -133,7 +133,7 @@ class SdkResumePreservesLastSid(unittest.TestCase):
             def __init__(self):
                 self.state_dir = state
                 self._reg_lock = threading.RLock()
-            _mutate_reg = sb.SdkBackend._mutate_reg
+            _update_reg = sb.SdkBackend._update_reg
             def _poke(self):
                 pass
         sb.SdkBackend.resume(FakeBackend(), "testsess", SID)

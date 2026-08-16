@@ -91,9 +91,15 @@ class VersionDrift(unittest.TestCase):
         try:
             km.http.client.HTTPConnection = Conn
             self.assertEqual(km._poll_remote_version({"local_port": 1, "token": "t"}),
-                             {"sha": "def5678", "ver": ""})
+                             {"sha": "def5678", "ver": "", "autoNudge": None, "settings": None})
             Conn.payload = {"kernel_sha": '<img src=x onerror="pwned=1">', "kernel_ver": "v1.2.3"}
             self.assertIsNone(km._poll_remote_version({"local_port": 1, "token": "t"}))
+            # the settings-sync atoms ride the same poll and are type-narrowed at the same boundary:
+            # a remote that answers with attacker-shaped values yields None fields, never the values
+            Conn.payload = {"kernel_sha": "def5678", "kernel_ver": "v1.2.3",
+                            "autoNudge": "yes please", "settings": ["not", "a", "dict"]}
+            self.assertEqual(km._poll_remote_version({"local_port": 1, "token": "t"}),
+                             {"sha": "def5678", "ver": "v1.2.3", "autoNudge": None, "settings": None})
         finally:
             km.http.client.HTTPConnection = old
 

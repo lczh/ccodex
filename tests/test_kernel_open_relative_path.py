@@ -49,35 +49,40 @@ class ResolveOpenPath(unittest.TestCase):
         self.assertEqual(km._resolve_open_path("design/foo.md", "no-such-sid"), "design/foo.md")
 
     def test_handler_threads_the_session_id_into_the_resolver(self):
-        # the openFile handler passes the message's session id so relatives resolve against the right session
+        # the openFile handler passes the message's session id so relatives resolve against the right
+        # session, and a False return (no desktop to hand the file to) is SAID, never swallowed —
+        # the merged upstream contract (bool + host-named warn), same fail-loudly intent as before
         src = open(os.path.join(BIN, "romp-kernel")).read()
-        self.assertIn('_open_file(str(msg["path"]), sid=msg.get("id"))', src)
-        self.assertIn('_reply(client, {"type": "warn", "text": err})', src)
+        self.assertIn('if not _open_file(str(msg["path"]), sid=msg.get("id")):', src)
+        self.assertIn("has no desktop session to open it on", src)
 
     def test_linux_open_uses_xdg_open(self):
-        old_platform, old_which, old_popen, old_exists = (
-            km.sys.platform, km.shutil.which, km.subprocess.Popen, km.os.path.exists)
+        old_environ_get = km.os.environ.get
+        old_platform, old_which, old_popen = km.sys.platform, km.shutil.which, km.subprocess.Popen
         calls = []
         try:
             km.sys.platform = "linux"
+            km.os.environ = dict(km.os.environ, DISPLAY=":0")
             km.shutil.which = lambda name: "/usr/bin/xdg-open" if name == "xdg-open" else None
-            km.os.path.exists = lambda _path: True
             km.subprocess.Popen = lambda argv, **kwargs: calls.append(argv)
-            self.assertIsNone(km._open_file("design/foo.md", SID))
+            self.assertTrue(km._open_file("design/foo.md", SID))
             self.assertEqual(calls, [["xdg-open", os.path.join(BASE, "design/foo.md")]])
         finally:
-            km.sys.platform, km.shutil.which, km.subprocess.Popen, km.os.path.exists = (
-                old_platform, old_which, old_popen, old_exists)
+            km.sys.platform, km.shutil.which, km.subprocess.Popen = old_platform, old_which, old_popen
+            km.os.environ = os.environ
 
     def test_linux_open_reports_when_no_desktop_opener_exists(self):
-        old_platform, old_which, old_exists = km.sys.platform, km.shutil.which, km.os.path.exists
+        old_platform, old_which = km.sys.platform, km.shutil.which
+        old_env = km.os.environ
         try:
             km.sys.platform = "linux"
+            km.os.environ = {k: v for k, v in os.environ.items()
+                             if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
             km.shutil.which = lambda _name: None
-            km.os.path.exists = lambda _path: True
-            self.assertIn("install xdg-utils", km._open_file("design/foo.md", SID))
+            self.assertFalse(km._open_file("design/foo.md", SID),
+                             "no desktop → False, and the HANDLER says so to the user")
         finally:
-            km.sys.platform, km.shutil.which, km.os.path.exists = old_platform, old_which, old_exists
+            km.sys.platform, km.shutil.which, km.os.environ = old_platform, old_which, old_env
 
 
 if __name__ == "__main__":

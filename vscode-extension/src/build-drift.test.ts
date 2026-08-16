@@ -67,8 +67,8 @@ test("updateExtension rebuilds+reinstalls the VSIX, then offers a USER-gated rel
     "updateExtension must not read the repo root off /version");
   assert.ok(upd.includes("runInstall(script, extDir)") && upd.includes("target.script"),
     "runs the resolved install.sh (script now comes from update-target, not a joined /version path)");
-  assert.ok(upd.includes("packaged romp-chat-view\\.vsix") && upd.includes("install into:"),
-    "a clean exit is not enough — require the packaged + installed markers (install.sh skips gracefully)");
+  assert.ok(upd.includes("ROMP_EXT_INSTALL_RESULT installed=[1-9][0-9]* failed=[0-9]+"),
+    "a clean exit is not enough — require install.sh's machine-readable positive install count");
   // Reload is behind an explicit button click, never automatic (prefer-reload-banner-not-auto).
   assert.ok(upd.includes('"Reload window"') && upd.includes('choice === "Reload window"') &&
     upd.includes('executeCommand("workbench.action.reloadWindow")'),

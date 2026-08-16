@@ -2617,35 +2617,41 @@ def _relay_in(host, m, token_proven=False):
         m["origin"] = origin
     match = [a for a in local_agents() if a["name"] == to and not _postal_off(a["id"])]
     if match:
-        # Trust key = the true ORIGIN (the forwarding host stamps m["origin"]; else the direct peer).
-        # Unknown host (a race before the kernel's notify lands) defaults to directed — never auto-inject.
-        origin = m.get("origin") or host
-        prow = PEERS.get(origin)
-        trust = (prow or {}).get("trust") or "directed"
-        if prow is None and token_proven and not m.get("origin"):
-            trust = "trusted"                        # token-proven direct dialer, no explicit tier → deliver (see docstring)
-        if m.get("origin") and origin != host:
-            # A FORWARDED message can never outrank the host that forwarded it. m["origin"] is
-            # written BY the forwarder, so keying trust on the origin alone let any peer we dial
-            # stamp the name of a host tiered `trusted` and have its mail auto-injected into a
-            # session — precisely the attacker `directed` exists to hold for approval, and the
-            # names to guess are handed out by our own presence gossip. Cap at the forwarder's
-            # own tier so a directed relay stays directed however it labels its cargo.
-            hrow = PEERS.get(host)
-            htrust = (hrow or {}).get("trust") or "directed"
-            if hrow is None and token_proven:
-                htrust = "trusted"                   # token possession is already full control here (see docstring)
-            trust = least_trust(trust, htrust)
-        if trust == "trusted":
-            deliver(match[0]["id"], m.get("frm") or "?", m.get("frm_id") or "", m.get("body") or "",
-                    kind=m.get("kind") or "", from_host=origin,
-                    relay_mid=mid, relay_via=host)       # read-receipt route: back through the direct peer
-        elif trust == "directed":
-            _quarantine_put(origin, m, match[0]["id"], via=host)   # HELD for human approve/deny/edit; never injects
-        # else isolated → drop: ack so the sender stops resending, but deliver nothing (no communication).
-        # An isolated host normally never peers at all (the kernel forces its notify down), so this is a
-        # defensive backstop for the checkin-peer path where the mobile dials our /peer-exchange.
-        peer_seen_add(mid)
+        # Hold the idempotence claim across the effect and receipt publish.  Two exchange threads can
+        # carry the same mid concurrently; neither may pass a separate check before either appends.
+        with _seen_lock:
+            if mid in _seen_load():
+                return "ack", None                   # duplicate → re-ack, deliver nothing
+            # Trust key = the true ORIGIN (the forwarding host stamps m["origin"]; else the direct peer).
+            # Unknown host (a race before the kernel's notify lands) defaults to directed — never auto-inject.
+            origin = m.get("origin") or host
+            prow = PEERS.get(origin)
+            trust = (prow or {}).get("trust") or "directed"
+            if prow is None and token_proven and not m.get("origin"):
+                trust = "trusted"                    # token-proven direct dialer, no explicit tier → deliver (see docstring)
+            if m.get("origin") and origin != host:
+                # A FORWARDED message can never outrank the host that forwarded it. m["origin"] is
+                # written BY the forwarder, so keying trust on the origin alone let any peer we dial
+                # stamp the name of a host tiered `trusted` and have its mail auto-injected into a
+                # session — precisely the attacker `directed` exists to hold for approval, and the
+                # names to guess are handed out by our own presence gossip. Cap at the forwarder's
+                # own tier so a directed relay stays directed however it labels its cargo.
+                hrow = PEERS.get(host)
+                htrust = (hrow or {}).get("trust") or "directed"
+                if hrow is None and token_proven:
+                    htrust = "trusted"               # token possession is already full control here (see docstring)
+                trust = least_trust(trust, htrust)
+            if trust == "trusted":
+                deliver(match[0]["id"], m.get("frm") or "?", m.get("frm_id") or "", m.get("body") or "",
+                        kind=m.get("kind") or "", from_host=origin,
+                        relay_mid=mid, relay_via=host)   # read-receipt route: back through the direct peer
+            elif trust == "directed":
+                if not _quarantine_put(origin, m, match[0]["id"], via=host):
+                    return "drop", None              # no ack: retry after the local write failure
+            # else isolated → ack and remember, but deliver nothing (no communication).
+            # An isolated host normally never peers at all (the kernel forces its notify down), so this is
+            # a defensive backstop for the checkin-peer path where the mobile dials our /peer-exchange.
+            _peer_seen_add_locked(mid)
         return "ack", None
     if peer_seen_check(mid):
         return "ack", None                           # a duplicate whose recipient has since vanished

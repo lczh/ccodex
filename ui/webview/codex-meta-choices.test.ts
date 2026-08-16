@@ -23,7 +23,7 @@ test("the /models payload's codex section populates its own choice arrays (both 
 test("menu construction picks the choice list by the session's backend", () => {
   assert.match(RENDER, /function metaChoices\(kind: MetaKind, st: Status\)/);
   assert.match(RENDER, /st\.backend === "codex"/);
-  assert.match(RENDER, /for \(const c of metaChoices\(kind, s\.status\)\)/);
+  assert.match(RENDER, /for \(const c of metaChoices\(kind, s\.status\)\.filter\(/);
   assert.match(TIMELINE, /s\.backend === 'codex'/);
   assert.match(TIMELINE, /\? \(kind === 'model' \? CODEX_MODEL_CHOICES : CODEX_EFFORT_CHOICES\)/);
 });

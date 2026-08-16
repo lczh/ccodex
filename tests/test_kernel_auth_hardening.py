@@ -209,17 +209,22 @@ class CookieDoesNotBypassOrigin(unittest.TestCase):
                                     "Origin": "http://127.0.0.1:59999",
                                     "Host": "127.0.0.1:%d" % km.PORT})
         self.assertFalse(ok, "a cookie from another loopback port must not authorize")
-        self.assertEqual(why, "cross-site origin")
+        self.assertEqual(why, "browser provenance required for cookie authentication")
 
     def test_cookie_denied_from_an_offsite_origin(self):
         ok, _, why = _auth(headers={"Cookie": "romp_token=" + TOK, "Origin": "http://evil.example"})
         self.assertFalse(ok)
-        self.assertEqual(why, "cross-site origin")
+        self.assertEqual(why, "browser provenance required for cookie authentication")
 
-    def test_cookie_still_authorizes_absent_origin(self):
-        # a same-origin GET omits Origin; that path (and non-browser clients) is unchanged
-        ok, _, _ = _auth(headers={"Cookie": "romp_token=" + TOK})
-        self.assertTrue(ok, "a cookie with no Origin (same-origin nav / curl) still authorizes")
+    def test_cookie_without_provenance_is_denied_but_fetch_metadata_authorizes(self):
+        # a BARE cookie (no Origin, no fetch metadata) no longer authorizes: nothing proves the
+        # request isn't a cross-site document's, and native clients have the explicit token forms.
+        # Real browsers keep working — every same-origin nav/reload carries Sec-Fetch-Site.
+        ok, _, why = _auth(headers={"Cookie": "romp_token=" + TOK})
+        self.assertFalse(ok, "a cookie with no browser provenance must not authorize")
+        self.assertEqual(why, "browser provenance required for cookie authentication")
+        ok, _, _ = _auth(headers={"Cookie": "romp_token=" + TOK, "Sec-Fetch-Site": "none"})
+        self.assertTrue(ok, "a top-level navigation (Sec-Fetch-Site: none) still authorizes")
 
     def test_cookie_still_authorizes_the_dashboards_own_origin(self):
         ok, _, _ = _auth(headers={"Cookie": "romp_token=" + TOK,
