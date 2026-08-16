@@ -252,8 +252,17 @@ class CheckLoop(Fresh):
 class RunUpdate(Fresh):
     def test_detached_child_lands_on_the_tag_installs_reports_and_restarts_only_on_success(self):
         calls = []
-        with mock.patch.object(km.subprocess, "Popen", side_effect=lambda *a, **kw: calls.append((a, kw))), \
-             mock.patch.dict(km.os.environ, {"ROMP_MANAGER_PORT": "7777"}):
+        real_popen = subprocess.Popen
+        def _popen(*a, **kw):
+            argv = a[0] if a else kw.get("args")
+            if argv and argv[0] == "git":   # the enforcement config query runs for real (see harness)
+                return real_popen(*a, **kw)
+            calls.append((a, kw))
+            return mock.MagicMock()
+        with mock.patch.object(km.subprocess, "Popen", side_effect=_popen), \
+             mock.patch.dict(km.os.environ, {"ROMP_MANAGER_PORT": "7777",
+                                             "GIT_CONFIG_GLOBAL": "/dev/null",
+                                             "GIT_CONFIG_SYSTEM": "/dev/null"}):
             self.assertTrue(km._run_update("v0.7.0"))
         (a, kw), = calls
         self.assertEqual(a[0][:2], ["bash", "-c"])
@@ -330,8 +339,15 @@ class RunUpdate(Fresh):
             fakebin = Path(td) / "bin"; fakebin.mkdir()
             calls = Path(td) / "git-calls"
             git = fakebin / "git"
+            # `config` queries DELEGATE to the real git: _release_verify_enforced asks git for the
+            # EFFECTIVE gpg.ssh.allowedSignersFile (worktrees, [include]/[includeIf], global and
+            # system config resolve exactly as verification will see them), so the stub must let
+            # real resolution happen under the harness's controlled GIT_CONFIG_* env.
             git.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_CALLS\"\n"
-                           "case \" $* \" in *' verify-tag '*) exit \"$VERIFY_RC\";; esac\nexit 0\n")
+                           "case \" $* \" in\n"
+                           "  *' config '*) exec /usr/bin/git \"$@\";;\n"
+                           "  *' verify-tag '*) exit \"$VERIFY_RC\";;\n"
+                           "esac\nexit 0\n")
             git.chmod(0o755)
             install = root / "install.sh"
             install.write_text("#!/bin/sh\nprintf 'install\\n' >> \"$GIT_CALLS\"\n")
@@ -345,17 +361,30 @@ class RunUpdate(Fresh):
             # with global signers would otherwise flip the no-trust-root cases
             env.update(PATH=str(fakebin) + os.pathsep + env.get("PATH", ""),
                        GIT_CALLS=str(calls), VERIFY_RC=str(verify_rc),
-                       GIT_CONFIG_GLOBAL="/dev/null")
+                       GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
             if enforce == "global":
-                # the trust root lives ONLY in the global git config — must enforce like the rest
+                # the trust root lives ONLY in the global git config, and only behind an [include]
+                # — the exact resolution a raw file scan missed (the user's audit, 2026-08-16);
+                # git itself must surface it
+                inc = Path(td) / "included.cfg"
+                inc.write_text('[gpg "ssh"]\n\tallowedSignersFile = /tmp/signers\n')
                 gcfg = Path(td) / "gitconfig"
-                gcfg.write_text('[gpg "ssh"]\n\tallowedSignersFile = /tmp/signers\n')
+                gcfg.write_text('[include]\n\tpath = %s\n' % inc)
                 env["GIT_CONFIG_GLOBAL"] = str(gcfg)
             elif enforce:
                 # the opt-in trust-root flag: with it, verification is the fail-closed gate
                 env["ROMP_VERIFY_RELEASES"] = "1"
+            real_popen = subprocess.Popen
+            def _popen(*a, **kw):
+                argv = a[0] if a else kw.get("args")
+                if argv and argv[0] == "git":
+                    # the enforcement config query — let it RUN (it resolves via the stub → real
+                    # git under the controlled env); only the detached bash updater is captured
+                    return real_popen(*a, **kw)
+                spawned.append(a)
+                return mock.MagicMock()
             with mock.patch.object(km, "ROOT", root), mock.patch.object(km.jd, "STATE", state), \
-                 mock.patch.object(km.subprocess, "Popen", side_effect=lambda *a, **kw: spawned.append(a)), \
+                 mock.patch.object(km.subprocess, "Popen", side_effect=_popen), \
                  mock.patch.dict(km.os.environ, env, clear=True):
                 self.assertTrue(km._run_update("v0.7.0"))
             script = spawned[0][0][2]

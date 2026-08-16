@@ -1884,52 +1884,22 @@ def _release_verify_enforced():
     mandatory-with-no-published-key bricked every install's updater from the first release (no key
     was ever distributed for friends' machines to trust; 2026-08-14 review). Configured deployments
     keep the full fail-closed gate; everyone else verifies best-effort and the update log says so
-    loudly. A trust root counts from ANY of: the env vars, the clone-local config bootstrap
-    persists, or the user's GLOBAL git config — bootstrap enforces on global config, and the
-    updater disagreeing made a documented global-only setup silently weaker in exactly the
-    long-lived half (the user's audit, 2026-08-16). Config FILES are read directly, no subprocess:
-    this runs inside _run_update, where tests patch subprocess.Popen, and a spawned `git config`
-    there poisons the very capture that pins this function's behavior."""
+    loudly. A trust root counts from the env vars, or from git's EFFECTIVE
+    gpg.ssh.allowedSignersFile — asked of git itself, so worktrees, [include]/[includeIf], global
+    and system config all resolve exactly as verification will see them. Two earlier cuts each
+    fell short of that (the clone-local file only, then a raw scan of global files that missed
+    includes and system config — the user's audits, 2026-08-16); hand-resolving git config is a
+    losing game, so we don't."""
     if (os.environ.get("ROMP_RELEASE_ALLOWED_SIGNERS") or "").strip():
         return True
     if (os.environ.get("ROMP_VERIFY_RELEASES") or "").strip():
         return True
-
-    def _has_signers(path):
-        try:
-            return "allowedsignersfile" in path.read_text().lower()
-        except OSError:
-            return False
-
-    # the global config file(s), as git resolves them: GIT_CONFIG_GLOBAL replaces the defaults
-    # ($XDG_CONFIG_HOME/git/config, then ~/.gitconfig) when set
-    gcg = (os.environ.get("GIT_CONFIG_GLOBAL") or "").strip()
-    if gcg:
-        if _has_signers(Path(gcg)):
-            return True
-    else:
-        xdg = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
-        if _has_signers(xdg / "git" / "config") or _has_signers(Path.home() / ".gitconfig"):
-            return True
     try:
-        gitp = ROOT / ".git"
-        if gitp.is_file():   # a worktree: `.git` is a pointer file; its config sits in the gitdir,
-            gd = ""          # with the shared half behind commondir
-            for line in gitp.read_text().splitlines():
-                if line.startswith("gitdir:"):
-                    gd = line.split(":", 1)[1].strip()
-            for cand in (Path(gd) / "config", Path(gd) / "commondir"):
-                try:
-                    if cand.name == "commondir":
-                        common = (Path(gd) / cand.read_text().strip()).resolve()
-                        cand = common / "config"
-                    if "allowedsignersfile" in cand.read_text().lower():
-                        return True
-                except OSError:
-                    continue
-            return False
-        return _has_signers(gitp / "config")
-    except OSError:
+        r = subprocess.run(["git", "-C", str(ROOT), "config", "--get",
+                            "gpg.ssh.allowedSignersFile"],
+                           capture_output=True, text=True, timeout=10)
+        return bool(r.stdout.strip())
+    except Exception:
         return False
 
 
