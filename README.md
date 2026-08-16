@@ -68,10 +68,11 @@ Needs Python 3.10+, Node.js 22+, git — and at least one agent vendor: an OpenA
 Codex sessions, and/or [Claude Code](https://claude.com/claude-code) (signed in) for
 Claude sessions.
 
-The historical `v1.0.0`, `v1.1.0`, and `v1.2.0` tags are unsigned and cannot
-pass release verification. Before installing, independently obtain and pin the
-maintainer's signing key or fingerprint, then confirm that a signed stable release newer
-than `v1.2.0` exists. Configure Git to trust that key as described in
+There is currently no usable default release. The published `v1.0.0` and `v1.1.0`
+tags are unsigned, and this repository does not yet identify an independently
+published maintainer key or fingerprint. Wait until both a maintainer key is published
+through an independent channel and a newer signed stable `vX.Y.Z` release exists, then
+configure Git to trust that key as described in
 [Release signature trust](docs/install.md#release-signature-trust).
 
 After those prerequisites are in place:

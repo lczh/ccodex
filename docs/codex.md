@@ -111,14 +111,17 @@ servers from `~/.codex/config.toml`).
 
 ## Installing ccodex
 
-This repo is the distribution — the installer takes any repo and directory,
-cryptographically verifies the newest stable ccodex release tag, and checks it out.
-The historical `v1.0.0`, `v1.1.0`, and `v1.2.0` tags are unsigned and cannot pass
-release verification. Installation requires both an independently published maintainer
-key or fingerprint and a signed stable release newer than `v1.2.0`. Configure Git as
-described in [Release signature trust](install.md#release-signature-trust), and then run:
+This repo is the distribution — the installer takes any repo and directory, and
+checks out the newest ccodex release tag:
 
-    curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | bash
+    curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | \
+      ROMP_REPO=https://github.com/lczh/ccodex.git ROMP_DIR=$HOME/ccodex bash
+
+Releases are verified when a trust root is configured (a hard gate — see
+[Release signature trust](install.md#release-signature-trust)); without one,
+verification is attempted and its outcome noted, never a dead end — releases
+are not signed yet, and a mandatory gate with no published key would refuse
+every install.
 
 Then, in a new terminal, the two setup steps above (`ccodex-setup`,
 `codex login`) — and `ccodex engine codex` if the machine should run

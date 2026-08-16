@@ -193,10 +193,11 @@ through to `install.sh`:
   and must meet `gpg.minTrustLevel=fully`.
 - `ROMP_NO_PATH=1` leaves your shell rc alone.
 
-The `v1.0.0`, `v1.1.0`, and `v1.2.0` tags are unsigned historical releases and
-cannot pass release verification. The default installer accepts only a newer signed
-stable release and requires an independently published maintainer key or fingerprint;
-see [Release signature trust](install.md#release-signature-trust).
+Published releases are unsigned so far, so with no trust root configured the
+installer and updater verify best-effort and note the outcome. Configuring a
+trust root (`ROMP_RELEASE_ALLOWED_SIGNERS`, or `ROMP_VERIFY_RELEASES=1` with
+GPG trust) makes verification a hard gate — see
+[Release signature trust](install.md#release-signature-trust).
 
 ### Ports
 
