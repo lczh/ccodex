@@ -14,6 +14,13 @@ setup() {
     mkdir -p "$HOME"
     export SHELL=/bin/zsh
     export ROMP_REPO="$TEST_DIR/origin"
+    # Every git WRITE in this suite (fixture commits, the local-only signed tag crafted inside the
+    # bootstrapped clone) needs a committer identity. The scratch HOME has no gitconfig, and CI
+    # runners can't auto-detect one — "Committer identity unknown", exit 128 — while dev boxes
+    # usually can, which is exactly how this suite ran green locally and red on CI for three
+    # releases (2026-08-16). Env vars, so no fixture repo needs per-repo config.
+    export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid
+    export GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
 
     # Use a per-test SSH signing key and trust root. SSH-signed tags are understood by GitHub,
     # need no ambient GPG agent/keyring, and keep this suite completely hermetic.
