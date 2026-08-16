@@ -1138,16 +1138,29 @@ def read_sdk_defaults(state_dir: Path) -> dict:
         return {}
 
 
+_SDK_DEFAULTS_LOCK = threading.Lock()   # setters on separate handler threads merge one shared file
+
+
 def write_sdk_default(state_dir: Path, **fields) -> None:
     """Merge {model?, effort?} into the remembered defaults (atomic tmp+rename). Only non-None keys passed
-    are touched, so remembering a model never clobbers the remembered effort and vice-versa."""
-    d = read_sdk_defaults(state_dir)
-    d.update({k: v for k, v in fields.items() if v is not None})
-    p = _defaults_path(state_dir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(d))
-    os.replace(tmp, p)
+    are touched, so remembering a model never clobbers the remembered effort and vice-versa. The whole
+    read-merge-write is one serialized RMW: two setters on separate handler threads (a model pick and an
+    effort pick landing together) otherwise interleave and one field silently vanishes (pinned by
+    test_sdk_lifecycle_hardening; regressed in the 2026-08-16 upstream merge and caught by the pin)."""
+    with _SDK_DEFAULTS_LOCK:
+        d = read_sdk_defaults(state_dir)
+        d.update({k: v for k, v in fields.items() if v is not None})
+        p = _defaults_path(state_dir)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name("%s.%d.%s.tmp" % (p.name, os.getpid(), uuid.uuid4().hex[:8]))
+        try:
+            tmp.write_text(json.dumps(d))
+            os.replace(tmp, p)
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 _WORK_KEY: str | None = None   # process-lifetime stash; None = not yet claimed from the environment
@@ -4078,11 +4091,16 @@ class SdkBackend:
         return s._clearing
 
     def kill(self, sid: str) -> bool:
-        reg = read_reg(self.state_dir, sid)
-        if reg:
-            reg["alive"] = False
-            write_reg(self.state_dir, sid, reg)
-        s = self.sessions.pop(sid, None)
+        # Serialize with an in-flight _ensure (the same self._lock): once kill begins, no session
+        # can be installed behind it from an alive snapshot, and if ensure already began, kill
+        # waits it out and shuts the created instance down. The reg flip rides _update_reg — the
+        # locked RMW — never a bare read→mutate→write. (Both properties are pinned by
+        # test_sdk_lifecycle_hardening; both regressed in the 2026-08-16 upstream merge and the
+        # pins caught them.)
+        with self._lock:
+            if read_reg(self.state_dir, sid):
+                self._update_reg(sid, alive=False)
+            s = self.sessions.pop(sid, None)
         if s:
             s.shutdown()
         self._poke()
