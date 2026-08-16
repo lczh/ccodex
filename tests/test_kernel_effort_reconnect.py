@@ -45,13 +45,7 @@ class EffortReconnect(unittest.TestCase):
 
     def test_backend_set_effort_arms_the_pending_flag_and_reconnects(self):
         self.assertIn('s._effort_pending = value', BACKEND_SRC)
-<<<<<<< HEAD
-        # The flag shares the backend's serialized registry RMW; pin the atomic mutation rather
-        # than the old unlocked local-dict assignment spelling.
-        self.assertIn('row.update(effort=value, effortPending=True)', BACKEND_SRC)
-=======
         self.assertIn('self._update_reg(sid, effort=value, effortPending=True)', BACKEND_SRC)
->>>>>>> origin/main
         self.assertIn('s.request_reconnect()', BACKEND_SRC)
 
     def test_every_effort_pick_is_remembered_ultracode_included(self):
