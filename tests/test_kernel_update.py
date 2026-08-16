@@ -362,14 +362,19 @@ class RunUpdate(Fresh):
             # EFFECTIVE gpg.ssh.allowedSignersFile (worktrees, [include]/[includeIf], global and
             # system config resolve exactly as verification will see them), so the stub must let
             # real resolution happen under the harness's controlled GIT_CONFIG_* env.
-            git.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_CALLS\"\n"
+            # The calls log and verify rc are BAKED into the stubs, not read from the environment:
+            # the enforcement query is spawned by the kernel under test (its env is not the
+            # harness's to pass), and an inherited $GIT_CALLS proved flaky under the full suite —
+            # a fork occasionally saw it empty, crashing the stub before its exec and flipping
+            # enforcement off (2026-08-16, three hits in one instrumented run).
+            git.write_text("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> '%s'\n"
                            "case \" $* \" in\n"
                            "  *' config '*) exec /usr/bin/git \"$@\";;\n"
-                           "  *' verify-tag '*) exit \"$VERIFY_RC\";;\n"
-                           "esac\nexit 0\n")
+                           "  *' verify-tag '*) exit %d;;\n"
+                           "esac\nexit 0\n" % (calls, int(verify_rc)))
             git.chmod(0o755)
             install = root / "install.sh"
-            install.write_text("#!/bin/sh\nprintf 'install\\n' >> \"$GIT_CALLS\"\n")
+            install.write_text("#!/bin/sh\nprintf 'install\\n' >> '%s'\n" % calls)
             install.chmod(0o755)
             spawned = []
             env = {k: v for k, v in km.os.environ.items()
@@ -379,7 +384,6 @@ class RunUpdate(Fresh):
             # global git config (bootstrap enforces on it, so the updater must too) — a dev box
             # with global signers would otherwise flip the no-trust-root cases
             env.update(PATH=str(fakebin) + os.pathsep + env.get("PATH", ""),
-                       GIT_CALLS=str(calls), VERIFY_RC=str(verify_rc),
                        GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
             if enforce == "global":
                 # the trust root lives ONLY in the global git config, and only behind an [include]
