@@ -193,10 +193,12 @@ through to `install.sh`:
   and must meet `gpg.minTrustLevel=fully`.
 - `ROMP_NO_PATH=1` leaves your shell rc alone.
 
-Published releases are unsigned so far, so with no trust root configured the
-installer and updater verify best-effort and note the outcome. Configuring a
-trust root (`ROMP_RELEASE_ALLOWED_SIGNERS`, or `ROMP_VERIFY_RELEASES=1` with
-GPG trust) makes verification a hard gate — see
+Releases from v1.2.2 onward are SSH-signed (key: `docs/release-key.pub`).
+With no trust root configured, the installer and updater verify best-effort
+and note the outcome; configuring a trust root
+(`ROMP_RELEASE_ALLOWED_SIGNERS`, or `ROMP_VERIFY_RELEASES=1` with GPG trust)
+makes verification a hard gate, which accepts v1.2.2+ and rightly refuses the
+pre-signing tags — see
 [Release signature trust](install.md#release-signature-trust).
 
 ### Ports

@@ -124,6 +124,11 @@ if git -C "$DIR" show-ref --verify --quiet "refs/tags/$ref"; then
         }
         allowed_signers="$allowed_signers_dir/$(basename "$ROMP_RELEASE_ALLOWED_SIGNERS")"
     fi
+    # A trust root CONFIGURED IN GIT also enforces — a signers file persisted in this clone by an
+    # earlier bootstrap, or the user's global config. Without this, a re-run WITHOUT the one-shot
+    # env var silently downgraded an already-hardened install back to warn-and-proceed
+    # (the user's audit, 2026-08-16).
+    configured_signers="$(git -C "$DIR" config --get gpg.ssh.allowedSignersFile 2>/dev/null || true)"
     echo "==> Verifying release signature for $ref"
     signature_ok=1
     if [ -n "$allowed_signers" ]; then
@@ -139,7 +144,7 @@ if git -C "$DIR" show-ref --verify --quiet "refs/tags/$ref"; then
         # every install: the repo's releases are not signed yet and no key is distributed anywhere,
         # so there was nothing any installer could trust (2026-08-14 review). Configured deployments
         # keep the full hard-fail; everyone else gets a loud, honest warning instead of a dead end.
-        if [ -n "$allowed_signers" ] || [ -n "${ROMP_VERIFY_RELEASES:-}" ]; then
+        if [ -n "$allowed_signers" ] || [ -n "${ROMP_VERIFY_RELEASES:-}" ] || [ -n "$configured_signers" ]; then
             echo "romp: release tag '$ref' does not have a valid signature trusted by git; refusing to install it." >&2
             echo "  Import the maintainer's GPG key or configure Git's SSH allowed-signers file, then rerun." >&2
             exit 1

@@ -23,12 +23,13 @@ Open a new terminal afterwards, so `~/ccodex/bin` is on your `PATH`, and type
 The same command updates ccodex later. To remove it, run `ccodex uninstall` (add
 `--purge` to delete recorded sessions too).
 
-This clones ccodex to `~/ccodex`, checks out the newest release tag, and installs it.
-When a release trust root is configured (next section), the tag is cryptographically
+This clones ccodex to `~/ccodex`, checks out the newest stable release tag, and
+installs it. Releases from **v1.2.2** onward are SSH-signed. When a release trust
+root is configured (next section — recommended), the tag is cryptographically
 verified first and a failure stops the install — never a silent fallback to `main`
-or an older tag. Without a configured trust root, verification is still attempted and
-its outcome noted, but does not block: releases are not yet signed, and a mandatory
-gate with no published key would refuse every install.
+or an older tag. Without a configured trust root, verification is still attempted
+and its outcome noted, but does not block — the trade that keeps a machine with no
+pinned key installable; the pre-signing tags (≤v1.2.1) only install in this mode.
 [What it installs, in detail](architecture.md#what-the-installer-sets-up).
 
 ### Release signature trust
@@ -88,7 +89,9 @@ latest commit rather than the newest release:
 ```bash
 git clone https://github.com/lczh/ccodex.git ~/ccodex
 cd ~/ccodex
-tag="$(git tag -l 'v*' --sort=-v:refname | head -n1)"
+# stable releases only (vX.Y.Z) — the same shape bootstrap and the updater accept;
+# a bare 'v*' would let a prerelease-suffixed tag outrank every stable via version sort
+tag="$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)"
 git verify-tag "$tag"                                           # must succeed
 git checkout --detach "refs/tags/$tag"                          # newest verified release
 # or:   git checkout main                                        # the latest commit

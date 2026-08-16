@@ -23033,13 +23033,16 @@ class Handler(BaseHTTPRequestHandler):
                 # junk bodies, arrays, nulls and non-boolean values all got maximum scope + 200).
                 _fleet = True
                 if raw_body:
-                    _bad = ('{"ok": false, "error": "body must be a JSON object; '
-                            '\'fleet\' must be a boolean when present"}')
+                    _bad = ('{"ok": false, "error": "body must be a JSON object with at most a '
+                            'boolean \'fleet\' key"}')
                     try:
                         _b = json.loads(raw_body)
                     except Exception:
                         return self._send(400, _bad, "application/json")
-                    if not isinstance(_b, dict) or not isinstance(_b.get("fleet", True), bool):
+                    # unknown keys are a 400 too: a TYPO ({"fleat":false}) must never silently
+                    # become the broadest action via the untouched default (the user 2026-08-16)
+                    if (not isinstance(_b, dict) or set(_b) - {"fleet"}
+                            or not isinstance(_b.get("fleet", True), bool)):
                         return self._send(400, _bad, "application/json")
                     _fleet = _b.get("fleet", True)
                 # WHO ASKED, on the record (the user 2026-07-31): a restart blinks every dashboard, and

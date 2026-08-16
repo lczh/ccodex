@@ -117,11 +117,10 @@ checks out the newest ccodex release tag:
     curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | \
       ROMP_REPO=https://github.com/lczh/ccodex.git ROMP_DIR=$HOME/ccodex bash
 
-Releases are verified when a trust root is configured (a hard gate — see
-[Release signature trust](install.md#release-signature-trust)); without one,
-verification is attempted and its outcome noted, never a dead end — releases
-are not signed yet, and a mandatory gate with no published key would refuse
-every install.
+Releases from v1.2.2 onward are SSH-signed; with a trust root configured,
+verification is a hard gate (recommended — see
+[Release signature trust](install.md#release-signature-trust)). Without one,
+verification is attempted and its outcome noted, never a dead end.
 
 Then, in a new terminal, the two setup steps above (`ccodex-setup`,
 `codex login`) — and `ccodex engine codex` if the machine should run

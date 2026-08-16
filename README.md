@@ -68,25 +68,19 @@ Needs Python 3.10+, Node.js 22+, git — and at least one agent vendor: an OpenA
 Codex sessions, and/or [Claude Code](https://claude.com/claude-code) (signed in) for
 Claude sessions.
 
-There is currently no usable default release. The published `v1.0.0` and `v1.1.0`
-tags are unsigned, and this repository does not yet identify an independently
-published maintainer key or fingerprint. Wait until both a maintainer key is published
-through an independent channel and a newer signed stable `vX.Y.Z` release exists, then
-configure Git to trust that key as described in
-[Release signature trust](docs/install.md#release-signature-trust).
-
-After those prerequisites are in place:
-
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | \
+  ROMP_REPO=https://github.com/lczh/ccodex.git ROMP_DIR=$HOME/ccodex bash
 ```
 
-This clones ccodex to `~/ccodex`, verifies the newest stable release tag with Git, installs it,
-and adds `bin/` to your shell rc. Release installs fail closed unless the tag has a valid
-signature from a signer trusted by your Git configuration. Installed machines then
-learn about new releases on their own —
-the dashboard offers each update as a one-click banner (or installs it automatically;
-the gear's **Updates** setting decides). Then, in a new terminal:
+This clones ccodex to `~/ccodex`, checks out the newest stable release (signed from
+v1.2.2 onward), installs it, and adds `bin/` to your shell rc. With a release trust
+root configured, verification is a hard gate; without one, it is attempted and its
+outcome noted — pinning the published key is one documented step, recommended:
+[Release signature trust](docs/install.md#release-signature-trust). Installed
+machines then learn about new releases on their own — the dashboard offers each
+update as a one-click banner (or installs it automatically; the gear's **Updates**
+setting decides). Then, in a new terminal:
 
 ```bash
 ccodex-setup           # provision the Codex backend (a pinned venv; never your system Python)

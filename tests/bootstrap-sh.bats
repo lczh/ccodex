@@ -278,3 +278,16 @@ EOF
     [ "$(git -C "$HOME/romp" describe --tags)" = "v0.2.0" ]
     [[ "$output" == *"Checking out v0.2.0"* ]]
 }
+
+@test "bootstrap.sh: a persisted trust root keeps enforcing when the env var is gone" {
+    # the first run persists the signers path into the clone's git config; a later run without
+    # the one-shot env var must NOT silently downgrade to warn-and-proceed (the user 2026-08-16)
+    ROMP_DIR="$HOME/romp" bash "$REPO_ROOT/bootstrap.sh"
+    [ -n "$(git -C "$HOME/romp" config --local --get gpg.ssh.allowedSignersFile)" ]
+    git -C "$ROMP_REPO" tag -a v0.3.0 -m unsigned
+    unset ROMP_RELEASE_ALLOWED_SIGNERS
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"does not have a valid signature"* ]]
+    [[ "$output" != *STUB_INSTALL_RAN* ]]
+}

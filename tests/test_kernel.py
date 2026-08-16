@@ -6237,7 +6237,9 @@ class ServeSecurity(unittest.TestCase):
             # Malformed bodies are a 400, NEVER the broadest action by default-fallthrough (the
             # user 2026-08-16: junk, arrays, nulls, and non-boolean fleet all got maximum scope).
             for bad in (b"not json", b"[]", b"null", b'"fleet"', b'{"fleet": "no"}',
-                        b'{"fleet": 1}', b'{"fleet": null}'):
+                        b'{"fleet": 1}', b'{"fleet": null}',
+                        b'{"fleat": false}',               # the typo case — never silently broad
+                        b'{"fleet": false, "x": 1}'):      # unknown keys refuse too
                 req = urllib.request.Request("http://127.0.0.1:%d/restart?token=testtok" % self.port,
                                              method="POST", data=bad,
                                              headers={"Content-Type": "application/json"})
