@@ -104,7 +104,10 @@ class WiringPins(unittest.TestCase):
     KSRC = open(os.path.join(BIN, "romp-kernel")).read()
 
     def test_the_followup_planner_is_told_about_the_lifted_asks(self):
-        self.assertIn("optimistically cleared these earlier pending asks", self.SRC)
+        # the asks themselves ride a MARKED content section, so their judge-written whys are no longer
+        # inlined in the note's own instruction prose
+        self.assertIn('_sec("lifted-asks", lifted, mk)', self.SRC)
+        self.assertIn("optimistically cleared the earlier pending asks listed", self.SRC)
         self.assertIn("Never re-assert an ask the reply answered.", self.SRC)
         self.assertIn("lifted_blocks=[(i, a) for i, (_n, a) in sorted(lifted_by_num.items())]", self.SRC)
 

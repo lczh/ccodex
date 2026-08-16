@@ -54,12 +54,19 @@ class _Keyed(unittest.TestCase):
         self._env_before = os.environ.pop("ANTHROPIC_API_KEY", None)
         self._stash_before = sb._WORK_KEY
         sb._WORK_KEY = None                       # force a fresh claim from the env
+        # the key-account fast-mode probe is a real HTTPS GET — never from a test. Cases that
+        # exercise the policy arm their own answers (FastOrgPermissionFollowsBilling).
+        self._fetch_before = sb._fetch_key_fast_org
+        sb._fetch_key_fast_org = lambda key: None
+        sb._FAST_ORG_VERDICTS.clear()
         if self.KEY:
             os.environ["ANTHROPIC_API_KEY"] = self.KEY
         self.be = sb.SdkBackend(self.d, "/bin/true", lambda *a, **k: None)
 
     def tearDown(self):
         sb._WORK_KEY = self._stash_before
+        sb._fetch_key_fast_org = self._fetch_before
+        sb._FAST_ORG_VERDICTS.clear()
         os.environ.pop("ANTHROPIC_API_KEY", None)
         if self._env_before is not None:
             os.environ["ANTHROPIC_API_KEY"] = self._env_before
@@ -105,7 +112,9 @@ class EffectiveAuthKeyless(_Keyed):
                          "'key' with nothing to inject launches on the login — loudly, via _options")
 
 
-class OptionsInjection(_Keyed):
+class _OptionsHarness(_Keyed):
+    """Base for anything that calls _options directly."""
+
     def setUp(self):
         super().setUp()
         # ClaudeAgentOptions is a parameter (a dict stands in) and the in-function import only needs
@@ -128,6 +137,8 @@ class OptionsInjection(_Keyed):
     def _options_kw(self, sess):
         return self.be._options(sess, dict)
 
+
+class OptionsInjection(_OptionsHarness):
     def test_a_key_session_gets_the_key_and_a_login_session_a_clean_env(self):
         kw = self._options_kw(self._sess(1, auth="key"))
         self.assertEqual(kw["env"].get("ANTHROPIC_API_KEY"), FAKE_KEY)
@@ -146,7 +157,57 @@ class OptionsInjection(_Keyed):
     def test_a_key_pick_with_no_key_is_a_logged_problem_not_a_silent_fall(self):
         src = open(os.path.join(os.path.dirname(HERE), "kernel", "sdk_backend.py")).read()
         self.assertIn("session is set to the API key but the manager environment carries", src)
-        self.assertIn('kw["env"] = dict(kw["env"], ANTHROPIC_API_KEY=self.work_key)', src)
+        self.assertIn('ANTHROPIC_API_KEY=self.work_key', src)
+
+
+class FastOrgPermissionFollowsBilling(_OptionsHarness):
+    """Fast-mode permission follows BILLING (the user 2026-08-14): the CLI's availability probe asks
+    the saved claude.ai login whenever one exists, even on a session whose inference bills the
+    injected key — so _options asks the paying account itself (key_fast_org_env, fetch stubbed here)
+    and hands the CLI the switch matching the answer. Both directions matter: an enabled key account
+    skips the CLI's wrong-account probe, a disabled one forces fast mode off."""
+
+    def _env(self, answer, n=1):
+        sb._fetch_key_fast_org = lambda key: answer
+        return self._options_kw(self._sess(n, auth="key"))["env"]
+
+    def test_an_enabled_key_account_skips_the_clis_wrong_account_probe(self):
+        env = self._env(True)
+        self.assertEqual(env.get("CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK"), "1")
+        self.assertNotIn("CLAUDE_CODE_DISABLE_FAST_MODE", env)
+        self.assertEqual(env.get("ANTHROPIC_API_KEY"), FAKE_KEY,
+                         "the skip rides WITH the key — same connect, same account")
+
+    def test_a_disabled_key_account_forces_fast_mode_off(self):
+        env = self._env(False)
+        self.assertEqual(env.get("CLAUDE_CODE_DISABLE_FAST_MODE"), "1")
+        self.assertNotIn("CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK", env,
+                         "the wrong-account probe could say YES to a fast mode the payer turned off")
+
+    def test_no_answer_and_no_history_leaves_the_cli_default(self):
+        env = self._env(None)
+        self.assertNotIn("CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK", env)
+        self.assertNotIn("CLAUDE_CODE_DISABLE_FAST_MODE", env,
+                         "no answer is no licence to skip — the CLI's own check stands")
+
+    def test_a_failure_stands_on_the_last_definitive_answer(self):
+        self._env(True, n=1)
+        env = self._env(None, n=2)
+        self.assertEqual(env.get("CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK"), "1",
+                         "a transient network failure must not strip a verified permission")
+
+    def test_a_flip_is_adopted_not_cached_over(self):
+        self._env(True, n=1)
+        env = self._env(False, n=2)
+        self.assertEqual(env.get("CLAUDE_CODE_DISABLE_FAST_MODE"), "1")
+        self.assertNotIn("CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK", env)
+
+    def test_login_sessions_never_ask_the_key_account(self):
+        calls = []
+        sb._fetch_key_fast_org = lambda key: calls.append(key) or True
+        env = self._options_kw(self._sess(3, auth="login"))["env"]
+        self.assertEqual(calls, [], "a login session's probe already asks the account that pays")
+        self.assertNotIn("CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK", env)
 
 
 class InitMismatchIsLoud(_Keyed):
@@ -229,6 +290,27 @@ class SpendKeyedSplit(_Keyed):
         self.assertEqual(day["key"]["usd"], 1.0, "…but the key sub-count holds ONLY the key-billed turn")
         self.assertEqual(day["key"]["turns"], 1)
         self.assertEqual(day["key"]["tok"], 15)
+
+    def test_spend_windows_carry_a_rolling_hour(self):
+        # the hover's API-spend section leads with "1 hour" (the user 2026-08-15): the last hour by
+        # the same rolling bucket math as day, so a burst shows up without waiting for the day sum
+        self.be._record_spend(2.0, {"input_tokens": 10}, keyed=True)
+        real_state = km.jd.STATE
+        try:
+            km.jd.STATE = Path(self.d)
+            win = km._spend_windows()
+            # …and an old bucket (3h ago) stays out of the hour window while the day keeps it
+            import json as _json, time as _time
+            sp = _json.loads((Path(self.d) / "spend.json").read_text())
+            oldkey = _time.strftime("%Y-%m-%dT%H", _time.localtime(_time.time() - 3 * 3600))
+            sp.setdefault("hours", {})[oldkey] = {"usd": 7.0, "turns": 1, "tokIn": 5}
+            (Path(self.d) / "spend.json").write_text(_json.dumps(sp))
+            win2 = km._spend_windows()
+        finally:
+            km.jd.STATE = real_state
+        self.assertEqual(win["hour"]["usd"], 2.0)
+        self.assertEqual(win2["hour"]["usd"], 2.0, "a 3h-old bucket is outside the rolling hour")
+        self.assertEqual(win2["day"]["usd"], 9.0, "…but inside the rolling day")
 
     def test_spend_windows_keyed_only_reads_the_subcounts(self):
         self.be._record_spend(1.5, {"input_tokens": 10}, keyed=True)
@@ -414,7 +496,7 @@ class DrivePlumbing(unittest.TestCase):
 
     def test_create_paths_pass_the_pick_through(self):
         src = open(os.path.join(BIN, "romp-kernel")).read()
-        self.assertIn("def _create_sdk_session(nm, cwd, auth=\"\"):", src)
+        self.assertIn("def _create_sdk_session(nm, cwd, auth=\"\", prefs=None):", src)
         self.assertEqual(src.count('auth=(a if a in ("login", "key") else "")'), 2,
                          "the WS op and POST /new both pass it")
 

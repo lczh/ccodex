@@ -376,6 +376,12 @@ class ThreeBusRelay(unittest.TestCase):
         # whose origin is "hosta" (B stamps origin when it forwards). Trust itself: test_postal_quarantine.
         pmb.PEERS["hosta"] = {"port": 1, "up": True, "trust": "trusted"}
         pmc.PEERS["hosta"] = {"port": 1, "up": True, "trust": "trusted"}
+        # A forwarded message is ALSO capped at the forwarder's own tier (2026-08-05: a relay must
+        # not out-rank itself by stamping an origin — test_postal_quarantine owns that rule), so the
+        # hub C actually exchanges with needs a tier of its own. A real deployment always has one:
+        # the kernel notifies a row for every host you dial. Without it the hub reads as an unknown
+        # host, i.e. directed, and the relayed mail is HELD — correct, but the trust tests' business,
+        # not this one's, which is about relay mechanics and end-to-end acks.
         pmc.PEERS["hub"] = {"port": 1, "up": True, "trust": "trusted"}
 
     def tearDown(self):

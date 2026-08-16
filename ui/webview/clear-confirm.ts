@@ -29,3 +29,17 @@ export function clearConfirmDetail(titles: string[]): string | null {
     + shown
     + ". Undo clear on the feed restores the cards, but the agent will no longer remember the work behind them.";
 }
+
+// The END confirm's detail (the user 2026-08-15, who ended a session holding an open task and got no
+// warning before its card left the working surfaces): same open-top population as the /clear gate,
+// framed for ending — the cards aren't destroyed (the goal store keeps them; revive brings them back),
+// but they leave the board with the session, and that deserves naming before the click.
+export function endConfirmDetail(titles: string[], base: string): string {
+  if (!titles.length) return base;
+  const list = titles.join(", ");
+  const shown = list.length > 140 ? list.slice(0, 139) + "…" : list;
+  const n = titles.length;
+  return (n === 1 ? "1 card is still open on its board: " : n + " cards are still open on its board: ")
+    + shown + ". Ending takes them off the working surfaces with it. " + base;
+}
+

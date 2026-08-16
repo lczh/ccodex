@@ -1,7 +1,7 @@
 // Timeline AWAITING badge (the user 2026-07-01, working-state audit; recolored 2026-07-13): the lane
 // shows a distinct AWAITING badge for "waiting on dispatched/background work". Originally the badge wore
 // working-yellow; since the kernel's shared _session_chip split awaitingBg out of "working" (the user
-// 2026-07-13: "differentiate working from awaiting") it wears its OWN straw — the working gold's paler
+// 2026-07-13: "differentiate working from awaiting") it wears its OWN await-green — the working gold's paler
 // sibling — matching the chat chip and the tab/feed dots. The s.awaitingBg why-field stays the fallback
 // key for a remote host on an older kernel (state still 'working' there).
 import { test } from "node:test";
@@ -13,7 +13,7 @@ const TL = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "romp-timelin
 
 test("an awaitingBg lane renders an Awaiting badge in the romp brand green (the user 2026-07-22)", () => {
   // keyed on the chip state (the shared _session_chip split) OR the legacy why-field (older remote kernels)
-  assert.match(TL, /else if \(s\.state === 'awaitingBg' \|\| s\.awaitingBg\) m = \{ label: 'Awaiting', kind: 'awaitbg' \};/);
+  assert.match(TL, /else if \(s\.state === 'awaitingBg' \|\| s\.awaitingBg\) m = \{ label: 'Awaiting' \+ \(s\.awaitingKind \? ' ' \+ s\.awaitingKind : ''\), kind: 'awaitbg' \};/);
   // brand green, matching --st-awaitbg-bg in styles.css (this file loads standalone, so the hex is mirrored)
   assert.match(TL, /awaitbg: \{ bg: '#54B204', fg: '#0c1a00' \}/);
   // an awaitingBg lane still reads ACTIVE (full opacity / ongoing treatment), like working/compacting/clearing
@@ -29,8 +29,8 @@ test("precedence: blocked-on-you beats awaiting, awaiting beats Ready", () => {
   assert.ok(awaiting < ready, "awaiting is checked before the plain Ready fallback");
 });
 
-test("the legacy lane state 'awaiting' (blocked-on-you) still maps to Blocked, untouched", () => {
-  assert.match(TL, /s\.state === 'permission' \|\| s\.state === 'awaiting'\) m = \{ label: 'Blocked', kind: 'attention' \}/);
+test("needsInput maps to Blocked, and the legacy 'awaiting' name (an older remote kernel) still does too", () => {
+  assert.match(TL, /s\.state === 'permission' \|\| s\.state === 'needsInput' \|\| s\.state === 'awaiting'\) m = \{ label: 'Blocked', kind: 'attention' \}/);
 });
 
 test("an idle awaitingBg lane draws a full-thickness FADED stretch (0.4 alpha), not a thin dash (the user 2026-07-13)", () => {

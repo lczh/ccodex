@@ -45,7 +45,7 @@ test("the palette forks the ACTIVE session from the tip, via the chat pane", () 
 });
 
 test("kernel: forkSession is a session op; seeding precedes discoverability; the fsid is pinned to the sid", () => {
-  assert.match(KERNEL, /"forkSession"\)/);   // in ID_OPS — routed by session id like every session op
+  assert.match(KERNEL, /"mcpAction", "forkSession",/);   // in ID_OPS — routed by session id like every session op
   assert.match(KERNEL, /elif t == "forkSession" and msg\.get\("name"\):/);
   assert.match(KERNEL, /def _fork_session\(parent_sid, cut_msg_uuid, new_name, now=None\):/);
   // the cut means the same thing the edit/delete rewind means: just before the clicked user message
@@ -60,4 +60,35 @@ test("kernel: forkSession is a session op; seeding precedes discoverability; the
   assert.match(BACKEND, /self\.backend\._update_reg\(self\.sid, forkOf="", forkAt=""\)/);
   // …and the names/ entry is written LAST (it is the discoverability trigger)
   assert.match(BACKEND, /write_reg\(self\.state_dir, sid, reg\)[\s\S]{0,400}write_name\(self\.state_dir, sid, name, cwd, bg, fg\)[\s\S]{0,200}append_state\(self\.state_dir, sid, "waiting"\)/);
+});
+
+// ── branch lineage (the user 2026-08-13: branching must SHOW) ───────────────────────────────────
+
+test("a forked session renders its branch divider, deep-linked to the parent", () => {
+  assert.match(RENDER, /\| \{ kind: "branch"; fromSid\?: string; fromName\?: string; cut\?: string/);
+  assert.match(RENDER, /if \(ev\.kind === "branch"\) \{/);
+  assert.match(RENDER, /label\.dataset\.act = "branchjump"/);
+  assert.match(RENDER, /"Branched from " \+ \(ev\.fromName \|\| "another session"\)/);
+});
+
+test("the parent wears a chip where each branch departed, jumping to the child's divider", () => {
+  assert.match(RENDER, /function applyBranchChips\(sid: string, v: View\)/);
+  assert.match(RENDER, /chip\.dataset\.cut = "branch:" \+ k\.cut/);
+  assert.match(RENDER, /applyBranchChips\(sid, v\);\s+\/\/ same driver, same hooks/);
+  assert.match(RENDER, /branchjump: \(elx\) =>/);
+});
+
+test("kernel persists lineage durably and serves it on the session payload", () => {
+  // forkOf/forkAt are one-shot launch flags — forkedFrom is the durable record
+  assert.match(BACKEND, /reg\["forkedFrom"\] = \{"sid": parent_sid, "name": parent\.get\("name", ""\)/);
+  assert.match(BACKEND, /lineage_cut = cut_uuid or last_record_uuid\(/);
+  assert.match(BACKEND, /def fork_children\(self\)/);
+  assert.match(KERNEL, /"branch": branch, "branches": _kids,/);
+  assert.match(KERNEL, /"kind": "branch", "uuid": "branch:" \+ branch\["cut"\]/);
+});
+
+test("branch chrome wears the accent, like every highlight", () => {
+  const css = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "styles.css"), "utf8");
+  assert.match(css, /\.branch-divider::before, \.branch-divider::after \{[^}]*var\(--accent\)/s);
+  assert.match(css, /\.branch-chip \{[^}]*color: var\(--accent\)/s);
 });

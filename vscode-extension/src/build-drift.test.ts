@@ -38,24 +38,37 @@ test("the extension compares keepalive dv against the stamp and prompts once", (
     "latched (one prompt per window), guarded when the stamp is absent, and only NEWER dv fires");
 });
 
-test("the drift prompt is ACTIONABLE — an Update extension button, not a bare toast", () => {
+test("the drift prompt's buttons are resolved LOCALLY and never dead-end in an error toast", () => {
   const notice = slice("function maybeBuildNotice(dv: unknown)", "async function updateExtension");
-  assert.ok(notice.includes('"Update extension"'), "offers the Update extension action");
-  assert.ok(notice.includes("void updateExtension()"), "the action runs the self-update");
+  // The buttons come from a LOCAL resolution routed through driftNotice — never a fixed string, never
+  // off the wire — so a copy that can't rebuild is offered the copy-command action, not an Update
+  // button whose only outcome is an error toast.
+  assert.ok(notice.includes("resolveInstallScript(ctx?.extensionPath || \"\", process.env.ROMP_DIR"),
+    "resolves the target locally to decide the toast's buttons");
+  assert.ok(notice.includes("driftNotice("), "the message + actions come from driftNotice");
+  assert.ok(notice.includes("notice.message") && notice.includes("...notice.actions"),
+    "shows driftNotice's message and its actions, in order");
+  assert.ok(notice.includes("choice === UPDATE_ACTION") && notice.includes("void updateExtension()"),
+    "the Update action runs the self-update");
+  assert.ok(notice.includes("choice === COPY_ACTION") && notice.includes("clipboard.writeText(INSTALL_COMMAND)"),
+    "the Copy action puts the install command on the clipboard — a client-side action that cannot fail");
   // The notice itself must NOT reload — the drift toast never auto-anything (the reload is gated later).
   assert.ok(!notice.includes("reloadWindow"), "maybeBuildNotice must not reload the window");
 });
 
 test("updateExtension rebuilds+reinstalls the VSIX, then offers a USER-gated reload", () => {
   const upd = slice("async function updateExtension", "function runInstall");
-  assert.ok(upd.includes('fetchJson("/version")') && upd.includes("info.rompDir"),
-    "learns the repo root from the kernel's /version rompDir");
-  assert.ok(upd.includes('path.join(os.homedir(), reported.slice(1))'),
-    "$HOME-collapses rompDir back to a real path (same machine as the local kernel)");
-  assert.ok(upd.includes("runInstall(script, extDir)") && upd.includes('"install.sh"'),
-    "runs vscode-extension/install.sh");
-  assert.ok(upd.includes("ROMP_EXT_INSTALL_RESULT installed=[1-9][0-9]* failed=[0-9]+"),
-    "a clean exit is not enough — require install.sh's machine-readable positive install count");
+  // The install target is resolved LOCALLY — this VSIX's own path or ROMP_DIR from our own
+  // environment (update-target.ts) — never off the kernel's auth-exempt /version, where a rompDir
+  // off the wire would let whatever answers the port pick the directory a shell command runs from.
+  assert.ok(upd.includes("resolveInstallScript(ctx?.extensionPath || \"\", process.env.ROMP_DIR"),
+    "resolves the install dir from local knowledge, not a kernel response");
+  assert.ok(!/info\.rompDir|fetchJson\("\/version"\)/.test(upd),
+    "updateExtension must not read the repo root off /version");
+  assert.ok(upd.includes("runInstall(script, extDir)") && upd.includes("target.script"),
+    "runs the resolved install.sh (script now comes from update-target, not a joined /version path)");
+  assert.ok(upd.includes("packaged romp-chat-view\\.vsix") && upd.includes("install into:"),
+    "a clean exit is not enough — require the packaged + installed markers (install.sh skips gracefully)");
   // Reload is behind an explicit button click, never automatic (prefer-reload-banner-not-auto).
   assert.ok(upd.includes('"Reload window"') && upd.includes('choice === "Reload window"') &&
     upd.includes('executeCommand("workbench.action.reloadWindow")'),

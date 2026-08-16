@@ -62,7 +62,7 @@ class CourierDeferAbandon(unittest.TestCase):
         munged = re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(str(cdir)))
         (proj / munged).mkdir(parents=True)
         # recipient: a delivered peer (postal) message + a reply; its body carries the romp-msg-id marker
-        recip_recs = [uline(T0, "DELEGATE: wire up the export button\nromp-msg-id: %s" % MID, "u1"),
+        recip_recs = [uline(T0, "DELEGATE: wire up the export button\n<!-- romp-msg-id: %s -->" % MID, "u1"),
                       aline(T0 + 30, "On it.", "a1", "u1")]
         (proj / munged / (RECIP + ".jsonl")).write_text(
             "\n".join(json.dumps(r) for r in recip_recs) + "\n")

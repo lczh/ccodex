@@ -22,6 +22,10 @@ export const DEFAULT_CHORDS: Record<string, string> = {
   "session.jump": "Mod+O",
   "session.new": "Mod+Shift+O",
   "palette.toggle": "Mod+P",
+  // LITERAL Ctrl, not Mod: these mirror the user's own Obsidian nav bindings (their vault's
+  // hotkeys.json, verified 2026-08-14), where "Ctrl" is the Control key on every platform.
+  "chat.navBack": "Ctrl+M",
+  "chat.navForward": "Ctrl+,",
 };
 
 const commands = new Map<string, PaletteCommand>();

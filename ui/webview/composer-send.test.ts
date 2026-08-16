@@ -17,8 +17,8 @@ test("the composer markup includes a send button to the right of 📎", () => {
 });
 
 test("⏎ and the send button share ONE sendComposer() path", () => {
-  assert.match(RENDER, /const sendComposer = \(\) => \{/);
-  assert.match(RENDER, /vscodeApi\.postMessage\(\{ type: "sendMessage", id: activeId, text \}\)/);
+  assert.match(RENDER, /const sendComposer = \(opts\?: \{ pastShipGate\?: boolean \}\) => \{/);   // the opts are the ship gate's re-entry door (composer-ship-gate.test.ts)
+  assert.match(RENDER, /vscodeApi\.postMessage\(\{ type: "sendMessage", id: sid, text \}\)/);   // routeUserMessage — one routing owner since the staged flush (2026-08-15)
   // Enter calls it (desktop only — the mobile guard is asserted separately below)
   assert.match(RENDER, /if \(e\.key === "Enter" && !e\.shiftKey && !isCoarsePointer\(\)\) \{\s*e\.preventDefault\(\);\s*sendComposer\(\);/);
   // the button calls it (mousedown keeps textarea focus on desktop; on a phone it blurs so the keyboard
@@ -85,3 +85,27 @@ test("focusing a tab (after ⏎-send) draws NO white UA focus ring around its co
   // the dashed STATE outlines stay (higher specificity than the base .tab rule, so outline:none can't kill them)
   assert.match(CSS, /\.tab\.tab-awaiting, \.tab\.tab-blocked, \.tab\.tab-retrying \{ outline: 2px dashed/);
 });
+
+test("a staged chip clips IN BOUNDS with an ellipsis and expands on click (the user 2026-08-15)", () => {
+  const STYLES = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "styles.css"), "utf8");
+  // the flex label could never shrink (no min-width:0), so long texts ran off the pane edge with no
+  // ellipsis; expanded, the same label wraps to the full text — the context-fold idiom
+  assert.match(STYLES, /\.staged-chip \.composer-chip-label \{ flex: 1 1 auto; max-width: 100%; min-width: 0; \}/);
+  assert.match(STYLES, /\.staged-chip\.open \.staged-row \.composer-chip-label \{ white-space: pre-wrap; overflow: visible; \}/);
+  // the affordance is visibly CHROME, not message text: dim, parenthesized, at the line's end
+  assert.match(STYLES, /\.staged-expand \{ flex: 0 0 auto; color: var\(--dim\); font-size: 0\.85em; \}/);
+  assert.match(RENDER, /hint\.textContent = open \? "\(collapse\)" : "\(expand\)";/);
+  // expansion survives the strip re-render (keyed set), and the discard ✕ does not toggle the fold
+  assert.match(RENDER, /const stagedOpen = new Set<string>\(\);/);
+  assert.match(RENDER, /x\.addEventListener\("click", \(ev\) => \{ ev\.stopPropagation\(\);/);
+  // each staged reply carries its CONTEXT inside the dotted box: one chip per quote, independently
+  // expandable (its click never toggles the reply's own fold), keyed sid:i:j
+  assert.match(RENDER, /const quotes = \(s\.cites as Citation\[\]\)\.filter\(\(c\) => c && c\.quote\);/);
+  assert.match(RENDER, /const ck = id \+ ":" \+ i \+ ":" \+ j;/);
+  // the context keeps the composer's blue citation-pill look inside the staged box
+  assert.match(RENDER, /el\("div", "composer-chip staged-cite"/);
+  assert.match(STYLES, /\.staged-cite \{ min-width: 0; max-width: 100%; cursor: pointer; \}/);
+  assert.match(RENDER, /cite\.addEventListener\("click", \(ev\) => \{\s*\n\s*ev\.stopPropagation\(\);/);
+  assert.match(STYLES, /\.staged-cite\.open \.composer-chip-label \{ white-space: pre-wrap; overflow: visible; \}/);
+});
+

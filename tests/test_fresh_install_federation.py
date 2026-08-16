@@ -79,7 +79,7 @@ class SpawnedSessionPath(unittest.TestCase):
 
     def test_options_pass_the_overlay(self):
         src = Path(os.path.join(os.path.dirname(HERE), "kernel", "sdk_backend.py")).read_text()
-        self.assertIn("env=_bin_on_path_env(os.environ)", src,
+        self.assertIn('env={**_bin_on_path_env(os.environ), "ROMP_SID": str(sess.sid),', src,
                       "_options wires the overlay through the SDK's designed env field")
 
 

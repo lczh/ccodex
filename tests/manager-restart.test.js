@@ -75,3 +75,46 @@ test('the backstop cap applies even while busy — a deploy can never starve', (
 test('just under the cap still waits', () => {
   assert.equal(quietGate({ since: 1000 }, 5, 999 + QOPTS.maxDeferMs, QOPTS).action, 'wait');
 });
+
+// quietTick — the CHAIN around quietGate (the 2026-08-14 incident: a queued refresh logged its backstop
+// and then silently never applied; the old loop re-armed the next tick only inside the busy-probe
+// callback, so a probe whose callback never fired killed the pending refresh with zero further log
+// lines). Dependency-injected: these tests drive the exact seams that failed.
+const { quietTick } = require(path.join(__dirname, '..', 'bin', 'romp-manager'));
+
+test('quietTick: a probe whose callback never fires cannot kill the chain (schedule-first)', () => {
+  let scheduled = 0;
+  quietTick({ pending: () => ({ since: 0 }), fetchBusy: () => {}, now: () => 1000,
+              opts: QOPTS, log: () => {}, schedule: () => { scheduled++; }, apply: () => {} });
+  assert.equal(scheduled, 1);
+});
+
+test('quietTick: a double-fired probe callback evaluates once (http timeout + error both fire)', () => {
+  let applied = 0; let cb;
+  quietTick({ pending: () => ({ since: 0 }), fetchBusy: (c) => { cb = c; }, now: () => 1000,
+              opts: QOPTS, log: () => {}, schedule: () => {}, apply: () => { applied++; } });
+  cb(0); cb(0);
+  assert.equal(applied, 1);
+});
+
+test('quietTick: a throwing evaluation is LOUD and leaves the refresh queued', () => {
+  let logged = ''; let applied = 0;
+  quietTick({ pending: () => ({ since: 0 }), fetchBusy: (c) => c(0), now: () => { throw new Error('boom'); },
+              opts: QOPTS, log: (m) => { logged = m; }, schedule: () => {}, apply: () => { applied++; } });
+  assert.match(logged, /stays queued/);
+  assert.equal(applied, 0);
+});
+
+test('quietTick: a satisfied pending (an immediate restart won) neither probes nor re-arms', () => {
+  let scheduled = 0;
+  quietTick({ pending: () => null, fetchBusy: () => { throw new Error('must not probe'); },
+              now: () => 0, opts: QOPTS, log: () => {}, schedule: () => { scheduled++; }, apply: () => {} });
+  assert.equal(scheduled, 0);
+});
+
+test('quietTick: a quiet fleet applies through the injected apply', () => {
+  let applied = null;
+  quietTick({ pending: () => ({ since: 0 }), fetchBusy: (c) => c(0), now: () => 1000,
+              opts: QOPTS, log: () => {}, schedule: () => {}, apply: (g) => { applied = g; } });
+  assert.equal(applied && applied.reason, 'quiet');
+});

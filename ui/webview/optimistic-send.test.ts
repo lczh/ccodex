@@ -23,8 +23,9 @@ const RENDER = fs.readFileSync(
   path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
 
 test("the plain send registers an optimistic bubble; follow-up/quote sends keep their own kernel echo", () => {
-  // only the PLAIN sendMessage branch registers — a citation follow-up/quote has its own kernel-side echo
-  assert.match(RENDER, /else \{ vscodeApi\.postMessage\(\{ type: "sendMessage", id: activeId, text \}\); registerOptimistic\(activeId, text\); \}/);
+  // only the PLAIN sendMessage branch registers — a citation follow-up/quote has its own kernel-side
+  // echo (the branch lives in routeUserMessage since the staged flush, 2026-08-15)
+  assert.match(RENDER, /else \{ vscodeApi\.postMessage\(\{ type: "sendMessage", id: sid, text \}\); registerOptimistic\(sid, text\); \}/);
   // registerOptimistic shows it NOW (before any push) via reconcile + appendActive
   assert.match(RENDER, /function registerOptimistic\(id: string, text: string\): void/);
   assert.match(RENDER, /if \(v\) v\.stale = true;\s*\n\s*if \(id === activeId\) \{\s*\n\s*appendActive\(\);/);

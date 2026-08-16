@@ -195,6 +195,72 @@ class PostBodyGate(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertFalse(h.rfile.called)
         self.assertTrue(h.close_connection)
+class CookieDoesNotBypassOrigin(unittest.TestCase):
+    """The cookie is the one credential the browser attaches for you, so it is the one that must
+    NOT bypass the Origin gate. Cookies are host- not port-scoped (RFC 6265 §8.5), so every
+    http://127.0.0.1:<port> page is same-site with the dashboard and rides this cookie — SameSite
+    included. Without the Origin check, any page served by anything else on loopback (a dev server
+    in a repo an agent cloned) reached /ws, which streams every session and accepts sendMessage."""
+
+    def test_cookie_denied_from_a_foreign_loopback_origin(self):
+        # the drive-by case: a page on another loopback PORT is same-site, so the browser attaches
+        # the cookie, but its Origin is not ours → the cookie must not authorize
+        ok, _, why = _auth(headers={"Cookie": "romp_token=" + TOK,
+                                    "Origin": "http://127.0.0.1:59999",
+                                    "Host": "127.0.0.1:%d" % km.PORT})
+        self.assertFalse(ok, "a cookie from another loopback port must not authorize")
+        self.assertEqual(why, "cross-site origin")
+
+    def test_cookie_denied_from_an_offsite_origin(self):
+        ok, _, why = _auth(headers={"Cookie": "romp_token=" + TOK, "Origin": "http://evil.example"})
+        self.assertFalse(ok)
+        self.assertEqual(why, "cross-site origin")
+
+    def test_cookie_still_authorizes_absent_origin(self):
+        # a same-origin GET omits Origin; that path (and non-browser clients) is unchanged
+        ok, _, _ = _auth(headers={"Cookie": "romp_token=" + TOK})
+        self.assertTrue(ok, "a cookie with no Origin (same-origin nav / curl) still authorizes")
+
+    def test_cookie_still_authorizes_the_dashboards_own_origin(self):
+        ok, _, _ = _auth(headers={"Cookie": "romp_token=" + TOK,
+                                  "Origin": "http://127.0.0.1:%d" % km.PORT,
+                                  "Host": "127.0.0.1:%d" % km.PORT})
+        self.assertTrue(ok)
+
+    def test_cookie_still_authorizes_the_vscode_webview(self):
+        ok, _, _ = _auth(headers={"Cookie": "romp_token=" + TOK,
+                                  "Origin": "vscode-webview://0p9m1abc"})
+        self.assertTrue(ok, "the VS Code webview origin is allowed by _origin_ok")
+
+    def test_explicit_token_still_bypasses_origin_for_federation(self):
+        # the escape hatch a cross-site page cannot use: only an EXPLICIT token bypasses origin,
+        # and a drive-by page can't obtain one (it rides only the cookie)
+        ok, _, _ = _auth(headers={"Origin": "http://evil.example"}, token=TOK)
+        self.assertTrue(ok)
+
+
+class ResponseHardeningHeaders(unittest.TestCase):
+    """Every response declares its type as final (nosniff) and refuses cross-origin framing
+    (clickjacking). Source-pinned: the header set lives in _send, exercised on every route."""
+
+    def test_send_sets_nosniff_and_frame_guards(self):
+        import inspect
+        src = inspect.getsource(km.Handler._send)
+        self.assertIn('"X-Content-Type-Options", "nosniff"', src)
+        self.assertIn('"X-Frame-Options", "SAMEORIGIN"', src)
+        self.assertIn("frame-ancestors 'self'", src)
+
+    def test_remote_relay_derives_its_own_mime_and_discards_the_remotes(self):
+        # the /remote/<host>/file relay must decide the Content-Type from the requested extension
+        # (_PREVIEW_MIME) and never mirror the remote's — a remote answering text/html for a .pdf
+        # the lightbox opens in a same-origin iframe would be script on the dashboard's origin
+        import inspect
+        src = inspect.getsource(km.Handler._remote_file)
+        self.assertIn("_PREVIEW_MIME.get(os.path.splitext", src)
+        self.assertIn("status, ctype = resp.status, mime", src)
+        # the type must not be READ from the remote (a comment may still name it as "never this")
+        self.assertNotIn("ctype = resp.getheader", src)
+        self.assertNotIn('resp.status, resp.getheader("Content-Type")', src)
 
 
 if __name__ == "__main__":

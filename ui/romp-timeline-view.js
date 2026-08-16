@@ -307,13 +307,16 @@ function badgeFor(s) {
   // chip vocabulary below; the legacy raw names stay accepted for the cold-skeleton fallback.
   else if (s.state === 'blocked') m = { label: 'API error', kind: 'attention' };  // same red the chat chip shows
   else if (s.state === 'interrupting') m = { label: 'Interrupting', kind: 'working' };  // stop in flight
-  else if (s.state === 'permission' || s.state === 'awaiting') m = { label: 'Blocked', kind: 'attention' };
+  else if (s.state === 'permission' || s.state === 'needsInput' || s.state === 'awaiting') m = { label: 'Blocked', kind: 'attention' };   // 'awaiting' = the legacy name, an older remote kernel
   // AWAITING dispatched/background work: its OWN chip state now ('awaitingBg', the kernel's shared
-  // _session_chip split, the user 2026-07-13 — no longer folded into working) in STRAW, the working gold's
-  // paler sibling: same family, visibly held rather than producing. The s.awaitingBg why-field key stays as
+  // _session_chip split, the user 2026-07-13 — no longer folded into working) in the romp brand GREEN
+  // (recolored from the original straw, the user 2026-07-22): visibly held rather than producing. The
+  // s.awaitingBg why-field key stays as
   // the fallback (a remote host on an older kernel still reports state 'working' + the field).
   // (The LEGACY lane state 'awaiting' above means blocked-on-you — this name dodges that.)
-  else if (s.state === 'awaitingBg' || s.awaitingBg) m = { label: 'Awaiting', kind: 'awaitbg' };
+  // The KIND rides the label ('Awaiting job', the user 2026-08-15) — the enum values ARE the words;
+  // an older kernel ships no awaitingKind and the badge reads plain 'Awaiting' as before.
+  else if (s.state === 'awaitingBg' || s.awaitingBg) m = { label: 'Awaiting' + (s.awaitingKind ? ' ' + s.awaitingKind : ''), kind: 'awaitbg' };
   else if (s.state === 'ready' || s.state === 'waiting' || s.state === 'idle') m = { label: 'Ready', kind: 'ready' };
   if (!m) return null;
   return { label: m.label, bg: BADGE[m.kind].bg, fg: BADGE[m.kind].fg };
@@ -526,6 +529,11 @@ class TimelinePanel {
     // so draw() paints the romp swirl loader there. Set true the instant applyBars runs (or a full one-shot
     // data object arrives through update()), and the loader is gone on the next draw. CLAUDE.md loader rule.
     this._barsLoaded = false;
+    // per-LANE bars evidence (the user 2026-08-15: after a restart, a live WORKING lane vanished from
+    // the active-only view, then reappeared bar-less): every with_bars build writes a turns entry for
+    // EVERY lane it covered (empty for a quiet one), so a lane's key appearing is the exact "its
+    // evidence arrived" event — until then the active filter must not judge it.
+    this._barsSeen = new Set();
     this._loaderBackstop = null;   // timer id: force the loader done if a warming build never brings content
     this.M = { left: 130, right: 16, top: 8, bottom: 22 };   // axis labels live in the bottom margin
     this._mc = document.createElement('canvas').getContext('2d');
@@ -1379,6 +1387,7 @@ class TimelinePanel {
     // already present → no loader. The two-message path leaves turns empty here; the loader shows until
     // applyBars lands. Read the RAW turns BEFORE the prev-carry below back-fills them.
     if (data.turns && Object.keys(data.turns).length) this._barsLoaded = true;
+    if (data.turns) for (const k of Object.keys(data.turns)) this._barsSeen.add(k);
     const prev = this.data;
     if (prev && (!data.turns || !Object.keys(data.turns).length)) {
       data.turns = prev.turns || {}; data.judging = prev.judging || [];
@@ -1453,6 +1462,7 @@ class TimelinePanel {
   applyBars(m) {
     if (!m || !this.data || !this.data.sessions) return;
     this.data.turns = m.turns || {};
+    for (const k of Object.keys(this.data.turns)) this._barsSeen.add(k);
     this.data.judging = m.judging || [];
     this.data.messages = m.messages || [];
     // (nudges array retired 2026-07-07 payload audit: auto-nudges render from the bar's nudgeAuto)
@@ -2214,7 +2224,7 @@ class TimelinePanel {
     const reopen = this._metaMenu && this._metaMenu._kind === kind && this._metaMenu._sid === s.id;
     this._closeMetaMenu();
     if (reopen) return;
-    if (s.state === 'awaiting' || s.state === 'permission') return;
+    if (s.state === 'needsInput' || s.state === 'awaiting' || s.state === 'permission') return;
     // Styled inline (NOT via a CSS class): injectStyles() guards on an existing <style> id, so a CSS
     // rule added later never lands after a plugin reload — only a full restart. Inline always applies.
     // MENU_STYLE/etc = the one shared menu vocabulary (CLAUDE.md rule, the user 2026-08-09) — the chat
@@ -2366,8 +2376,9 @@ class TimelinePanel {
   }
 
   // Clear a DEAD lane's leftover row from the timeline (the Clear pill on a struck-through lane). The kernel
-  // holds the dismissal IN MEMORY only, so it does NOT survive a `romp refresh` (the user 2026-07-02) —
-  // a mistakenly-cleared lane comes back on restart. Web-shell only (no Obsidian/Node path: nothing to persist).
+  // PERSISTS the dismissal since 2026-08-14 (timeline-dismissed.json) — it survives romp refresh and
+  // reconnects (the user 2026-08-14: cleared state must be remembered); only a sid coming back LIVE
+  // resurfaces the lane, shedding its record. Web-shell only (no Obsidian/Node path: nothing to post to).
   _dismissLane(id) {
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineDismiss === 'function') {
@@ -2490,7 +2501,15 @@ class TimelinePanel {
     const hasWork = (s) =>
       turnsOf(s.id).some((t) => overlaps(t.start, barEndT(t, nowS, data.now))) ||
       data.messages.some((m) => (m.fromId === s.id || m.toId === s.id) && overlaps(Math.min(m.sent, m.exec), Math.max(m.sent, m.exec)));
-    const active = (s) => (s.live && !this._activeOnly) || hasWork(s);
+    // …and a LIVE lane whose bars have never arrived is PRESUMED active (the user 2026-08-15: on a
+    // cold connect — this kernel restarting, or a remote host's bars not yet merged — the filter
+    // judged a working lane by evidence that didn't exist yet and dropped it entirely). Evidence =
+    // the lane's turns key having landed in ANY bars payload (every with_bars build writes one per
+    // lane, empty for a quiet one) or being present in the current data (the one-shot/full path);
+    // that key landing is the event that hands judgment back to hasWork.
+    const barsKnown = (s) => this._barsSeen.has(s.id)
+      || !!(data.turns && Object.prototype.hasOwnProperty.call(data.turns, s.id));
+    const active = (s) => (s.live && !this._activeOnly) || hasWork(s) || (s.live && !barsKnown(s));
     let vis = data.sessions.filter(active);
     // …but never hide EVERYONE: with every lane idle in this window the filter would blank the whole
     // band — which reads as broken (the loading rule), and leaves no row space to grab-drag back out
@@ -2670,7 +2689,7 @@ class TimelinePanel {
         const bh = lit ? eh : BAR_H;
         const bar = el('rect', { x: bx, y: y - bh / 2, width: bw, height: bh, rx: bh / 2, fill: s.color, opacity: lit ? 1 : 0.9 });
         svg.appendChild(bar);
-        const act = s.state === 'working' || s.state === 'permission' || s.state === 'awaiting' || s.state === 'awaitingBg' || s.state === 'compacting' || s.state === 'clearing';
+        const act = s.state === 'working' || s.state === 'permission' || s.state === 'needsInput' || s.state === 'awaiting' || s.state === 'awaitingBg' || s.state === 'compacting' || s.state === 'clearing';
         const ongoing = s.live && act && t.end > t.start && (data.now - t.end) <= 5;
         const hit = el('rect', { x: bx, y: y - 7, width: bw, height: 14, fill: 'transparent' }); hit.style.cursor = 'pointer';
         const html = () => '<div class="r"><span class="chip" style="background:' + s.color + '"></span><span class="who" style="color:' + s.color + '">' + esc(s.name) + '</span><span class="t">' + clock(t.start) + '–' + clock(t.end) + '</span></div>' + this.barBody(t, ongoing);
@@ -2689,7 +2708,7 @@ class TimelinePanel {
       // segment (BAR_H, the work-bar reference) in the lane color from the last work period's end to the
       // live edge, but FADED to 0.4 alpha — "something is pending here", a faded continuation of the work
       // bar rather than active work (which stays the solid ~0.9 bar). Its own hover lists the task(s),
-      // consistent with the feed's "Waiting on task" pill. Event-gated on the SAME live signal the lane
+      // consistent with the feed's "Awaiting task" pill. Event-gated on the SAME live signal the lane
       // badge reads (s.awaitingBg — kernel _session_awaiting, non-null only while the turn is CLOSED), so
       // it appears with the wait and vanishes the moment the tasks settle or a new turn opens.
       if (s.live && s.awaitingBg) {
@@ -2703,7 +2722,7 @@ class TimelinePanel {
           const rows = ((s.awaitingTasks && s.awaitingTasks.length) ? s.awaitingTasks : [s.awaitingBg])
             .map((d) => '<div class="b" style="opacity:.85">' + esc(d) + '</div>').join('');
           const tip = '<div class="r"><span class="chip" style="background:' + s.color + '"></span><span class="who" style="color:' + s.color + '">' + esc(s.name)
-            + '</span><span class="t">' + clock(anchor) + '– waiting…</span></div>' + rows;
+            + '</span><span class="t">' + clock(anchor) + '– awaiting…</span></div>' + rows;
           const wh = el('rect', { x: lx1, y: y - 7, width: lx2 - lx1, height: 14, fill: 'transparent' }); wh.style.cursor = 'grab';
           wh.addEventListener('mouseenter', (e) => { ln.setAttribute('stroke-width', String(BAR_H + 2)); ln.setAttribute('opacity', '0.6'); this.showTip(tip, e); });
           wh.addEventListener('mousemove', (e) => this.moveTip(e));
@@ -2721,7 +2740,7 @@ class TimelinePanel {
       // input (historical, from the state-transition log), plus the current open one. The
       // dashed white overlay reads as a distinct texture vs a solid "still working" bar.
       const aw = (s.awaiting && s.awaiting.length) ? s.awaiting
-                 : ((s.live && (s.state === 'permission' || s.state === 'awaiting') && s.since != null) ? [[s.since, t1]] : []);
+                 : ((s.live && (s.state === 'permission' || s.state === 'needsInput' || s.state === 'awaiting') && s.since != null) ? [[s.since, t1]] : []);
       for (const span of aw) {
         const a0 = span[0], b0 = span[1];
         const sa = Math.max(a0, t0), sb = Math.min(b0, t1); if (sb <= sa) continue;
@@ -2912,7 +2931,7 @@ class TimelinePanel {
         chit.style.cursor = 'pointer'; chit.setAttribute('aria-label', 'clear this ended session from the timeline');
         chit.addEventListener('mouseenter', (e) => {
           box.setAttribute('fill', CL_RED); box.setAttribute('stroke', CL_RED); box.setAttribute('stroke-opacity', '1'); ctx.setAttribute('fill', '#ffffff');
-          this.showTip("Clear this ended session from the timeline<div style='opacity:.65;margin-top:2px'>a kernel restart (romp refresh) brings it back</div>", e);
+          this.showTip("Clear this ended session from the timeline<div style='opacity:.65;margin-top:2px'>stays cleared across restarts; starting the session again brings it back</div>", e);
         });
         chit.addEventListener('mousemove', (e) => this.moveTip(e));
         chit.addEventListener('mouseleave', () => {
@@ -2922,7 +2941,8 @@ class TimelinePanel {
           e.stopPropagation(); this.hideTip();
           // optimistic: drop it from the current frame so it vanishes at once, and hold it in _dismissed so
           // a stale or federation-merged push can't put it back before the kernel confirms (_reconcileDismissed).
-          // A restart — forgetting it kernel-side — still brings it back, as designed.
+          // The kernel persists the dismissal (2026-08-14), so restarts and reconnects keep it cleared;
+          // only the session coming back live resurfaces the lane.
           this._dismissed.add(s.id);
           if (this.data && this.data.sessions) this.data.sessions = this.data.sessions.filter((x) => x.id !== s.id);
           this._dismissLane(s.id); this.draw();
@@ -3056,6 +3076,33 @@ class TimelinePanel {
     this._reapCompactBars(compactSeen);   // drop overlay scan-bars for lanes no longer compacting / off-screen
     this._reapWorkLabels(workSeen);        // drop overlay WORKING labels for lanes no longer working / off-screen
     this._reapMetaDots(metaSeen);          // drop switching-dots overlays for lanes whose /model pick has landed / off-screen
+
+    // ── branch connectors (the user 2026-08-14): a fork drawn like a git graph — one thick
+    // perpendicular bar, work-bar weight (BAR_H), from the parent's lane to the child's at the fork
+    // moment, in the CHILD's color: the branch is the child's beginning, and the child's own bars
+    // start here (the kernel clips its copied history while the parent's lane is in the build).
+    // Click → the child's chat at its branch divider; drawn before the message connectors so the
+    // thin lines and their dots stay on top.
+    vis.forEach((s) => {
+      const br = s.branch;
+      if (!br || vidx[br.fromId] == null || vidx[s.id] == null || !inWin(br.t)) return;
+      const bx = x(br.t), y1 = laneY(vidx[br.fromId]), y2 = laneY(vidx[s.id]);
+      if (y1 === y2) return;
+      const bTop = Math.min(y1, y2), bH = Math.abs(y2 - y1);
+      const bbar = el('rect', { x: bx - BAR_H / 2, y: bTop, width: BAR_H, height: bH, rx: BAR_H / 2, fill: s.color, opacity: 0.85 });
+      svg.appendChild(bbar);
+      const bhit = el('rect', { x: bx - 9, y: bTop - 4, width: 18, height: bH + 8, fill: 'transparent' });
+      bhit.style.cursor = 'pointer';
+      const pname = (data.sessions.find((p) => p.id === br.fromId) || {}).name || '';
+      const bHtml = () => '<div class="r"><span class="chip" style="background:' + s.color + '"></span><span class="who" style="color:' + s.color + '">' + esc(s.name) + '</span><span class="t">' + clock(br.t) + '</span></div>' + this.body('branched from ' + pname + ' here');
+      const bEnter = (e) => { bbar.setAttribute('opacity', '1'); this.showTip(bHtml(), e); };
+      bhit.__tlHoverIn = bEnter;
+      bhit.addEventListener('mouseenter', bEnter);
+      bhit.addEventListener('mousemove', (e) => this.moveTip(e));
+      bhit.addEventListener('mouseleave', () => { bbar.setAttribute('opacity', '0.85'); this.hideTip(); });
+      bhit.addEventListener('click', () => { this._select(s.id); this.openChat(s.id, br.cut ? 'branch:' + br.cut : '', false, false, br.t); });
+      svg.appendChild(bhit);
+    });
 
     // obstacles for routing — at each event's process-start (a pending event rides `now` via execAt/startAt)
     const obstacles = [];
@@ -3205,6 +3252,32 @@ class TimelinePanel {
           const sz = DOT_R * 1.9;
           svg.appendChild(el('image', { x: dx - sz / 2, y: y - sz / 2, width: sz, height: sz, href: mediaUrl('romp-swirl-glyph.svg'), 'pointer-events': 'none' }));
         }
+      });
+    });
+
+    // ── comment squares (the user 2026-08-14): a comment thread never becomes a lane — a SQUARE
+    // (against the round message/prompt dots) sits on the lane at the commented message, in the
+    // SESSION's own color with the same white border and footprint as a message dot (the user
+    // 2026-08-15 — the shape alone says "comment"), dimmed once resolved. Click → the chat at that
+    // message, where the yellow highlight opens the thread.
+    vis.forEach((s, i) => {
+      const y = laneY(i);
+      (s.comments || []).forEach((c) => {
+        if (!c.t || !inWin(c.t)) return;
+        const side = DOT_R * 2 - 1, cx = x(c.t);
+        const sq = el('rect', { x: cx - side / 2, y: y - side / 2, width: side, height: side, rx: 1.5,
+          fill: s.color, stroke: '#e8eef5', 'stroke-width': 0.75,
+          opacity: c.status === 'resolved' ? 0.45 : 0.95 });
+        sq.style.cursor = 'pointer';
+        const qHtml = () => '<div class="r"><span class="chip" style="background:' + s.color + '"></span><span class="who" style="color:' + s.color + '">' + esc(s.name) + '</span><span class="t">' + clock(c.t) + '</span></div>' + this.body(c.status === 'resolved' ? 'a resolved comment on this message' : 'a comment on this message — click to open it there');
+        const qGrow = (g) => { sq.setAttribute('width', side + g); sq.setAttribute('height', side + g); sq.setAttribute('x', cx - (side + g) / 2); sq.setAttribute('y', y - (side + g) / 2); };
+        const qEnter = (e) => { qGrow(3); this.showTip(qHtml(), e); };
+        sq.__tlHoverIn = qEnter;
+        sq.addEventListener('mouseenter', qEnter);
+        sq.addEventListener('mousemove', (e) => this.moveTip(e));
+        sq.addEventListener('mouseleave', () => { qGrow(0); this.hideTip(); });
+        sq.addEventListener('click', () => { this._select(s.id); this.openChat(s.id, c.uuid, false, false, c.t); });
+        svg.appendChild(sq);
       });
     });
 

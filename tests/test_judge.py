@@ -2219,7 +2219,7 @@ class DistillDoneGate(unittest.TestCase):
 class Courier(unittest.TestCase):
     def test_seg_peer_extracts_sender_and_msgid(self):
         seg = {"trigger": "u1", "atoms": [{"uuid": "u1", "type": "user", "author": {"peer": "SENDERSID"},
-               "message": {"content": [{"type": "text", "text": "ASK: do X\nromp-msg-id: abc.123"}]}}]}
+               "message": {"content": [{"type": "text", "text": "ASK: do X\n<!-- romp-msg-id: abc.123 -->"}]}}]}
         self.assertEqual(jd._seg_peer(seg), ("SENDERSID", "abc.123"))
         human = {"trigger": "u2", "atoms": [{"uuid": "u2", "type": "user", "author": "human",
                  "message": {"content": [{"type": "text", "text": "hi"}]}}]}
@@ -2283,7 +2283,7 @@ class PostalDelegation(unittest.TestCase):
         """A delivered POSTAL message line (the peer-segment trigger): the body carries the romp-msg-id
         marker, so the event model authors it {"peer": ...} and _seg_peer flags it."""
         return {"type": "user", "timestamp": iso(t), "uuid": uuid, "parentUuid": parent,
-                "message": {"role": "user", "content": "%s\nromp-msg-id: %s" % (text, mid)}}
+                "message": {"role": "user", "content": "%s\n<!-- romp-msg-id: %s -->" % (text, mid)}}
 
     def _run(self, recs, courier, work, passes=1, complete_g=False, view_cleared=False):
         """Write recs, find the peer seg, pre-seed the recipient store with `courier` (a goal label →
@@ -2296,7 +2296,19 @@ class PostalDelegation(unittest.TestCase):
             tpath.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
             saved = (jd.GOALDIR, jd.PCACHE, jd.MESSAGES, jd.plan_llm, jd.opener_llm, jd._group_store, jd._view_cleared)
             jd.GOALDIR, jd.PCACHE = td / "goals", td / "pcache"
-            jd.MESSAGES = td / "messages.jsonl"           # hermetic: empty postal index (no live data, peer=None)
+            jd.MESSAGES = td / "messages.jsonl"           # hermetic postal index in which every delivered mid
+            #                                               RESOLVES to a sender — the courier only plants for a
+            #                                               known sender, and a sender-less delivery yields no
+            #                                               '#d' at all (test_judge_senderless_delegation)
+            mids = set()
+            for r in recs:
+                c = (r.get("message") or {}).get("content")
+                if isinstance(c, str):
+                    for part in c.split("<!-- romp-msg-id:")[1:]:
+                        mids.add(part.split("-->")[0].strip())
+            jd.MESSAGES.write_text("".join(
+                json.dumps({"ev": "sent", "id": m, "from_id": "11111111-2222-3333-4444-00000000cccc"}) + "\n"
+                for m in sorted(mids)))
             jd.plan_llm, jd.opener_llm = work, (lambda *a, **k: "")
             jd._group_store = lambda *a, **k: None
             try:
@@ -3547,7 +3559,7 @@ class SweepTurn(unittest.TestCase):
         seg_by_id = {seg0["id"]: seg0, seg1["id"]: seg1}
         captured = {}
 
-        def spy(tt, mt, gh=""):
+        def spy(tt, mt, gh="", lw=""):
             captured["gh"] = gh
             return '{"done": [{"goal": 1, "why": "done"}]}'
         jd.closer_llm = spy
@@ -3560,7 +3572,7 @@ class SweepTurn(unittest.TestCase):
         store["placements"][self.seg["id"]] = g1["id"]
         captured = {}
 
-        def spy(tt, mt, gh=""):
+        def spy(tt, mt, gh="", lw=""):
             captured["gh"] = gh
             return '{"done": [{"goal": 1, "why": "done"}]}'
         jd.closer_llm = spy
@@ -3593,7 +3605,7 @@ class StatusReportMenu(unittest.TestCase):
     def _spy(self, reply):
         captured = {}
 
-        def spy(tt, mt, gh=""):
+        def spy(tt, mt, gh="", lw=""):
             captured["mt"] = mt
             return reply
         jd.closer_llm = spy
@@ -3857,7 +3869,7 @@ class ModelTiers(unittest.TestCase):
         self.assertEqual(jd.TRIAGE_MODEL, "sonnet", "triage tier defaults to the sonnet alias (→ latest Sonnet)")
         self.assertNotEqual(jd.INDEX_MODEL, jd.TRIAGE_MODEL)
         calls, saved = [], jd._judge_run
-        jd._judge_run = lambda model, sysp, user, effort=None, judge=None, tier="triage": (calls.append((model, sysp, tier)) or "")
+        jd._judge_run = lambda model, sysp, user, effort=None, judge=None, tier="triage", mark=None: (calls.append((model, sysp, tier)) or "")
         try:
             jd.caption_llm("x"); jd.archive_llm("x"); jd.plan_llm("x", "y")
             jd.courier_llm("x", "y"); jd.closer_llm("x", "y")
@@ -3873,7 +3885,7 @@ class ModelTiers(unittest.TestCase):
     def test_plan_llm_model_and_effort_override(self):
         """plan_llm takes model + effort overrides (for the classification A/B); default is the triage model."""
         seen, saved = {}, jd._judge_run
-        jd._judge_run = lambda model, sysp, user, effort=None, judge=None, tier="triage": (seen.update(model=model, effort=effort) or "")
+        jd._judge_run = lambda model, sysp, user, effort=None, judge=None, tier="triage", mark=None: (seen.update(model=model, effort=effort) or "")
         try:
             jd.plan_llm("seg", "menu")
             self.assertEqual((seen["model"], seen["effort"]), ("sonnet", None), "default: triage alias, no explicit effort")
@@ -4416,8 +4428,10 @@ class DeltaScopedDistill(unittest.TestCase):
         from unittest import mock
         with mock.patch.object(jd, "_judge_run", return_value="x") as m:
             jd.distill_llm("g", "w", "dw", prior_summary="old take")
-            user = m.call_args.args[2]
-        self.assertIn("<prior-summary>\nold take\n</prior-summary>", user)
+            user, mk = m.call_args.args[2], m.call_args.kwargs["mark"]
+        # content sections carry the call's own mark now (the trust boundary), so the section is
+        # asserted as the judge really sees it
+        self.assertIn(jd._sec("prior-summary", "old take", mk), user)
         self.assertIn("never a recap", user)
         with mock.patch.object(jd, "_judge_run", return_value="x") as m:
             jd.distill_llm("g", "w", "dw")
@@ -4791,93 +4805,6 @@ class KnownTargetContext(unittest.TestCase):
                         "the WORK-run retitled the follow-up target")
         subs = [nd for nd in store2["nodes"].values() if nd["parentId"] == gid]
         self.assertEqual(len(subs), 1, "the new work still filed as a step under it")
-
-
-class DistillArtifacts(unittest.TestCase):
-    """The distiller's ARTIFACTS line (the user 2026-07-08): a completed goal that PRODUCED files (a
-    plot, a PDF report) lists their paths on one trailing labeled line; _split_artifacts peels it off
-    the reply so the summary stays prose, and the parsed paths land in node["artifacts"] for the feed
-    card ("N artifacts" + modal previews). The kernel existence-filters at build time, so the judge
-    stores the transcription as-is."""
-
-    def setUp(self):
-        self._saved_distill = jd.distill_llm
-
-    def tearDown(self):
-        jd.distill_llm = self._saved_distill
-
-    def test_split_artifacts_parses_a_trailing_line(self):
-        body, arts = jd._split_artifacts("TAKEAWAY: The plot is ready.\nARTIFACTS: /tmp/a.png, /tmp/b.pdf")
-        self.assertEqual(body, "TAKEAWAY: The plot is ready.")
-        self.assertEqual(arts, ["/tmp/a.png", "/tmp/b.pdf"])
-
-    def test_absent_line_returns_body_unchanged(self):
-        body, arts = jd._split_artifacts("TAKEAWAY: Done, no files.")
-        self.assertEqual(body, "TAKEAWAY: Done, no files.")
-        self.assertEqual(arts, [])
-
-    def test_a_mid_reply_mention_is_not_the_line(self):
-        # anchored to the END of the body — prose that mentions the word is never mistaken for it
-        text = "TAKEAWAY: ARTIFACTS: was discussed but nothing shipped.\nMore prose."
-        body, arts = jd._split_artifacts(text)
-        self.assertEqual(body, text)
-        self.assertEqual(arts, [])
-
-    def test_caps_at_five_and_drops_empties(self):
-        line = "ARTIFACTS: " + ", ".join("/tmp/f%d.png" % i for i in range(8)) + ", , "
-        _, arts = jd._split_artifacts("TAKEAWAY: Done.\n" + line)
-        self.assertEqual(arts, ["/tmp/f%d.png" % i for i in range(5)])
-
-    def test_distill_sys_teaches_the_line(self):
-        self.assertIn("ARTIFACTS:", jd.DISTILL_SYS)
-        self.assertIn("never source code", jd.DISTILL_SYS, "deliverable outputs only, not edited files")
-        self.assertIn("omit the line entirely", jd.DISTILL_SYS, "most goals produce none")
-        self.assertNotIn("ARTIFACTS:", jd.BLOCK_BRIEF_SYS, "the block brief isn't taught the line")
-
-    def test_distill_session_stores_artifacts(self):
-        d = Distiller("test_distills_completed_top_from_its_discontinuous_trail")
-        records = [uline(T0, "plot the results", "u1", ps="typed"),
-                   aline(T0 + 10, "Saved the plot to /tmp/out/plot.png with all four series rendered, "
-                                  "styled, and labeled the way the earlier drafts settled on.", "a1", "u1",
-                         stop="end_turn")]
-        path = d._setup(records)
-        try:
-            now = T0 + 5000
-            s1 = em.segments(jd.parsed_session(SID, [path], now)["turns"][0])[0]["id"]
-            gid = SID + ":g1"
-            jd.save_goals(SID, {"rompUuid": SID, "seq": 1, "placementsV": jd.PLACEMENTS_V, "status": {gid: "completed"}, "placements": {},
-                                "nodes": {gid: {"id": gid, "text": "Plot the results", "parentId": None,
-                                                "nodeComplete": True, "blocked": False, "cleared": False,
-                                                "trail": [s1], "t": T0, "mt": T0 + 10}}})
-            jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None: ("BACKGROUND: You asked for a results plot.\n"
-                                                  "TAKEAWAY: The plot is saved and ready.\n"
-                                                  "ARTIFACTS: /tmp/out/plot.png\nSOURCE: m1")
-            self.assertEqual(jd.run_distill(now=now), 1)
-            nd = jd.load_goals(SID)["nodes"][gid]
-            self.assertEqual(nd["summary"], "The plot is saved and ready.", "the line is peeled off the prose")
-            self.assertEqual(nd["artifacts"], ["/tmp/out/plot.png"])
-            self.assertEqual(nd["summaryAnchor"], "a1", "SOURCE still resolves with ARTIFACTS between")
-        finally:
-            d.tearDown()
-
-    def test_no_line_stores_none(self):
-        d = Distiller("test_distills_completed_top_from_its_discontinuous_trail")
-        records = [uline(T0, "do it", "u1", ps="typed"),
-                   aline(T0 + 10, "did it", "a1", "u1", stop="end_turn")]
-        path = d._setup(records)
-        try:
-            now = T0 + 5000
-            s1 = em.segments(jd.parsed_session(SID, [path], now)["turns"][0])[0]["id"]
-            gid = SID + ":g1"
-            jd.save_goals(SID, {"rompUuid": SID, "seq": 1, "placementsV": jd.PLACEMENTS_V, "status": {gid: "completed"}, "placements": {},
-                                "nodes": {gid: {"id": gid, "text": "Do it", "parentId": None,
-                                                "nodeComplete": True, "blocked": False, "cleared": False,
-                                                "trail": [s1], "t": T0, "mt": T0 + 10}}})
-            jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None: "TAKEAWAY: Delivered."
-            self.assertEqual(jd.run_distill(now=now), 1)
-            self.assertIsNone(jd.load_goals(SID)["nodes"][gid]["artifacts"])
-        finally:
-            d.tearDown()
 
 
 class DistillSections(unittest.TestCase):
@@ -5737,15 +5664,16 @@ class Distiller(unittest.TestCase):
         # a LIST of (sub-goal, why) pairs → a numbered <owed> block, one line per pair, so the prompt can map
         # each to its own takeaway paragraph. A plain string (single block) is passed through unchanged.
         seen, saved = {}, jd._judge_run
-        jd._judge_run = lambda model, sysp, user, effort=None, judge=None: (seen.update(user=user) or "a brief")
+        jd._judge_run = lambda model, sysp, user, effort=None, judge=None, tier="triage", mark=None: (
+            seen.update(user=user) or "a brief")
         try:
             jd.brief_llm("the goal", "the work",
                          [("record the screencast", "you record it"),
                           ("consolidate Internals", "merge or leave")])
-            self.assertIn("<owed>\n1. record the screencast: you record it\n"
-                          "2. consolidate Internals: merge or leave\n</owed>", seen["user"])
+            self.assertIn("\n1. record the screencast: you record it\n"
+                          "2. consolidate Internals: merge or leave\n</owed ", seen["user"])
             jd.brief_llm("g", "w", "just one thing")
-            self.assertIn("<owed>\njust one thing\n</owed>", seen["user"], "a lone string renders as before")
+            self.assertIn("\njust one thing\n</owed ", seen["user"], "a lone string renders as before")
         finally:
             jd._judge_run = saved
 
@@ -5857,7 +5785,7 @@ class GistLlm(unittest.TestCase):
     def test_uses_index_model_and_gist_sys_and_cleans_the_phrase(self):
         seen = {}
 
-        def fake(model, sys_prompt, user, effort=None, judge=None, tier="triage"):
+        def fake(model, sys_prompt, user, effort=None, judge=None, tier="triage", mark=None):
             seen.update(model=model, sys=sys_prompt, user=user, judge=judge, tier=tier)
             return "  a dark-mode toggle for settings.  "       # stray padding + trailing dot
         jd._judge_run = fake
@@ -5882,7 +5810,8 @@ class BlockBriefJudgeLabel(unittest.TestCase):
 
     def test_brief_llm_logs_as_the_briefer(self):
         seen, saved = {}, jd._judge_run
-        jd._judge_run = lambda model, sysp, user, effort=None, judge=None: (seen.update(judge=judge) or "a brief")
+        jd._judge_run = lambda model, sysp, user, effort=None, judge=None, tier="triage", mark=None: (
+            seen.update(judge=judge) or "a brief")
         try:
             jd.brief_llm("the goal", "the work", "owed a decision")
         finally:
@@ -7312,19 +7241,82 @@ class AwaitingVerdict(unittest.TestCase):
     def test_parse_collects_awaiting_and_resolutions_win(self):
         self.assertEqual(
             jd._parse_close('{"done": [], "block": [], "awaiting": [{"goal": 2, "why": "a test run; merges when green"}]}', 3),
-            {"done": {}, "block": {}, "awaiting": {2: "a test run; merges when green"}})
+            {"done": {}, "block": {}, "awaiting": {2: {"why": "a test run; merges when green", "kind": None}}})
         self.assertEqual(
             jd._parse_close('{"done": [{"goal": 1, "why": "shipped"}], "block": [{"goal": 2, "why": "?"}],'
                             ' "awaiting": [{"goal": 1, "why": "w"}, {"goal": 2, "why": "w"}, {"goal": 3, "why": "w"}]}', 3),
-            {"done": {1: "shipped"}, "block": {2: "?"}, "awaiting": {3: "w"}},
+            {"done": {1: "shipped"}, "block": {2: "?"}, "awaiting": {3: {"why": "w", "kind": None}}},
             "a goal resolved done/blocked never also carries the annotation")
         self.assertIsNone(jd._parse_close('{"done": [], "awaiting": [{"goal": 0, "why": "x"}]}', 3),
                           "a zero index in the awaiting list poisons the whole reply, same as the others")
 
+    def test_parse_extracts_a_valid_kind_and_drops_garbage(self):
+        # the kind enum is AWAIT_KINDS; anything else (or absent) parses to None — the kindless
+        # legacy shape every rule treats exactly as before the enum existed
+        got = jd._parse_close('{"done": [], "block": [], "awaiting": ['
+                              '{"goal": 1, "why": "slurm 4821", "kind": "job"},'
+                              '{"goal": 2, "why": "w", "kind": " PEER "},'
+                              '{"goal": 3, "why": "w", "kind": "banana"}]}', 3)
+        self.assertEqual(got["awaiting"][1], {"why": "slurm 4821", "kind": "job"})
+        self.assertEqual(got["awaiting"][2]["kind"], "peer", "kind normalizes case/whitespace")
+        self.assertIsNone(got["awaiting"][3]["kind"], "an off-enum kind degrades to kindless, never poisons")
+
+    def test_apply_files_the_kind_and_a_kind_gain_lands_at_the_original_anchor(self):
+        s = _store()
+        g = _mknode(s, "G1")
+        jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: {"why": "the sweep", "kind": None}}},
+                       t=T0 + 50, touched=1)
+        self.assertNotIn("awaitingKind", g, "a kindless stamp carries no kind field at all")
+        # the closer re-files the SAME why now carrying a kind: the classification catches up, but the
+        # stamp's anchor may NOT move — the wake's patience and the supersede ordering key on it
+        jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: {"why": "the sweep", "kind": "job"}}},
+                       t=T0 + 500, touched=1)
+        self.assertEqual(g["awaitingKind"], "job")
+        self.assertEqual(g["awaitingAt"], T0 + 50, "a kind gain is not a new wait — the anchor stays")
+        rows = [e for e in g["log"] if e["kind"] == "awaiting"]
+        self.assertEqual([e.get("awaitKind") for e in rows], [None, "job"])
+        # …an identical (why, kind) re-assert coalesces as before…
+        jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: {"why": "the sweep", "kind": "job"}}},
+                       t=T0 + 900, touched=1)
+        self.assertEqual(len([e for e in g["log"] if e["kind"] == "awaiting"]), 2)
+        # …and a same-why RELABEL (job↔task flip-flop) is swallowed too: an LLM changing its mind about
+        # the label is not new information, and landing it would re-anchor + chew LOG_CAP every audit
+        jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: {"why": "the sweep", "kind": "task"}}},
+                       t=T0 + 1300, touched=1)
+        self.assertEqual(g["awaitingKind"], "job")
+        self.assertEqual(len([e for e in g["log"] if e["kind"] == "awaiting"]), 2)
+
+    def test_a_kindful_reply_with_no_why_files_nothing_on_an_unstamped_goal(self):
+        # the old None != None skip must survive the kind clause: a malformed {kind, empty why} item
+        # on a goal with NO standing stamp appends no diary row, however often the model repeats it
+        s = _store()
+        g = _mknode(s, "G1")
+        jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: {"why": "", "kind": "job"}}},
+                       t=T0 + 50, touched=1)
+        self.assertEqual([e for e in g.get("log", []) if e["kind"] == "awaiting"], [])
+
+    def test_a_kindless_reassert_keeps_the_kind_only_while_the_why_stands(self):
+        # SAME why, kindless re-assert → the standing classification holds; a kindless assert of a
+        # DIFFERENT why is a different wait — inheriting the neighbor's label would ship an
+        # affirmatively wrong kind (review 2026-08-15)
+        s = _store()
+        g = _mknode(s, "G1")
+        jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: {"why": "the sweep", "kind": "job"}}},
+                       t=T0 + 50, touched=1)
+        jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: {"why": "the second pass", "kind": None}}},
+                       t=T0 + 500, touched=1)
+        self.assertEqual(g["awaitingWhy"], "the second pass")
+        self.assertNotIn("awaitingKind", g, "a new wait does not inherit the old wait's kind")
+
+    def test_awaiting_kind_is_diary_owned(self):
+        nd = jd.GuardedNode({"id": "n", "text": "G"})
+        with self.assertRaises(TypeError):
+            nd["awaitingKind"] = "job"
+
     def test_apply_stamps_the_annotation_without_resolving(self):
         s = _store()
         g = _mknode(s, "G1")
-        newly = jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: "a fleet test run; merges when green"}},
+        newly = jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: {"why": "a fleet test run; merges when green", "kind": None}}},
                                t=T0 + 50, touched=1)
         self.assertEqual(newly, [], "awaiting is an annotation, never a completion")
         self.assertEqual(g["awaitingWhy"], "a fleet test run; merges when green")
@@ -7337,19 +7329,19 @@ class AwaitingVerdict(unittest.TestCase):
         # a long poll loop re-asserts every audited turn; identical whys never chew through LOG_CAP
         s = _store()
         g = _mknode(s, "G1")
-        jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: "the campaign timer"}}, t=T0 + 50, touched=1)
-        jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: "the campaign timer"}}, t=T0 + 500, touched=1)
+        jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: {"why": "the campaign timer", "kind": None}}}, t=T0 + 50, touched=1)
+        jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: {"why": "the campaign timer", "kind": None}}}, t=T0 + 500, touched=1)
         rows = [e for e in g["log"] if e["kind"] == "awaiting"]
         self.assertEqual(len(rows), 1, "an identical re-assert is skipped, not re-appended")
         self.assertEqual(g["awaitingAt"], T0 + 50, "the stamp keeps its original since-time")
-        jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: "the deploy it kicked off"}}, t=T0 + 900, touched=1)
+        jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: {"why": "the deploy it kicked off", "kind": None}}}, t=T0 + 900, touched=1)
         self.assertEqual(g["awaitingWhy"], "the deploy it kicked off", "a changed why is a real event -> new row")
         self.assertEqual(g["awaitingAt"], T0 + 900)
 
     def test_the_next_audited_turn_without_reassert_lifts_the_stamp(self):
         s = _store()
         g = _mknode(s, "G1")
-        jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: "the watcher"}}, t=T0 + 50, touched=1)
+        jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: {"why": "the watcher", "kind": None}}}, t=T0 + 50, touched=1)
         self.assertTrue(g.get("awaitingWhy"))
         jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {}}, t=T0 + 500, touched=1)
         self.assertNotIn("awaitingWhy", g, "the goal's own next audited turn is the exact clearing event")
@@ -7361,7 +7353,7 @@ class AwaitingVerdict(unittest.TestCase):
         # from the awaiting list says nothing about their wait -> the `touched` bound excludes them
         s = _store()
         g1, g2 = _mknode(s, "touched"), _mknode(s, "candidate")
-        jd.apply_close(s, [g1, g2], {"done": {}, "block": {}, "awaiting": {2: "its own async job"}}, t=T0 + 50, touched=2)
+        jd.apply_close(s, [g1, g2], {"done": {}, "block": {}, "awaiting": {2: {"why": "its own async job", "kind": None}}}, t=T0 + 50, touched=2)
         jd.apply_close(s, [g1, g2], {"done": {}, "block": {}, "awaiting": {}}, t=T0 + 500, touched=1)
         self.assertEqual(g2.get("awaitingWhy"), "its own async job",
                          "the candidate (index 2 > touched 1) keeps its stamp; only real turns lift")
@@ -7371,7 +7363,7 @@ class AwaitingVerdict(unittest.TestCase):
                                ("block", {"done": {}, "block": {1: "Approve?"}, "awaiting": {}})):
             s = _store()
             g = _mknode(s, "G1")
-            jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: "the test run"}}, t=T0 + 50, touched=1)
+            jd.apply_close(s, [g], {"done": {}, "block": {}, "awaiting": {1: {"why": "the test run", "kind": None}}}, t=T0 + 50, touched=1)
             jd.apply_close(s, [g], verdicts, t=T0 + 500, touched=1)
             self.assertNotIn("awaitingWhy", g, "a landed %s outranks and ends the annotation" % kind)
 
@@ -7417,6 +7409,24 @@ class AwaitingVerdict(unittest.TestCase):
             nd["awaitingWhy"] = "hand-written"
         with self.assertRaises(TypeError):
             nd["awaitingAt"] = 123
+
+    def test_closer_prompt_names_the_watcher_turn_as_canonical_awaiting(self):
+        # live repro 2026-08-15 (exp session, monitor over a slurm job): with the false block lifted,
+        # the closer STILL omitted on a monitor-event turn — "job still running, nothing new" read as
+        # unsure, and unsure omits. The watcher shape is never unsure: the live watcher is the work in
+        # flight and the wake-on-events arrangement is the intent to act.
+        for phrase in ("One shape is never unsure: a WATCHER", "ended with the watch still armed",
+                       "file it even when the turn " + "reports nothing new"):
+            self.assertIn(phrase, jd.CLOSER_SYS)
+
+    def test_closer_prompt_forbids_filing_a_handoff_wait_as_a_block(self):
+        # live case 2026-08-15: "Engage the new session when ready: it is launched... and will present
+        # results" was filed as a BLOCK — a peer-wait wearing needs-you clothing. The blocked rollup
+        # then suppressed the goal's awaiting entirely (blocked outranks awaiting by design), so a
+        # session genuinely watching an external job read as needing the user.
+        for phrase in ("The mirror image is NOT blocked", "will report back on its own",
+                       "never blocked; filing it blocked parks a card on the user"):
+            self.assertIn(phrase, jd.CLOSER_SYS)
 
     def test_closer_prompt_offers_awaiting_with_the_tight_rule(self):
         # the user 2026-07-21: ONLY when it plans to take action again pending something running

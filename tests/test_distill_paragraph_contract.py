@@ -118,24 +118,21 @@ class ParagraphContract(unittest.TestCase):
 
 class ParserKeepsTheParagraphs(unittest.TestCase):
     """The reply parser is what has to survive the new shape: a takeaway is now MULTI-paragraph, the
-    trailing ARTIFACTS/SOURCE lines still peel off around it, and a decorated label still parses."""
+    trailing SOURCE line still peels off around it, and a decorated label still parses."""
 
     REPLY = ("BACKGROUND: You asked for the retry detail to reach the UI.\n"
              "TAKEAWAY: The rebuilt bundle carries the real request id and backoff.\n\n"
              "Running install.sh is the one step left to install it.\n"
-             "ARTIFACTS: /tmp/plot.png\n"
              "SOURCE: m4")
 
     def _parse(self, reply):
         body, src = jd._split_source(reply)
-        body, arts = jd._split_artifacts(body)
         bg, take = jd._split_sections(body)
-        return bg, take, arts, src
+        return bg, take, src
 
-    def test_source_and_artifacts_peel_off_a_multi_paragraph_takeaway(self):
-        bg, take, arts, src = self._parse(self.REPLY)
+    def test_source_peels_off_a_multi_paragraph_takeaway(self):
+        bg, take, src = self._parse(self.REPLY)
         self.assertEqual(src, "m4")
-        self.assertEqual(arts, ["/tmp/plot.png"])
         self.assertEqual(bg, "You asked for the retry detail to reach the UI.")
         self.assertEqual(take.split("\n\n"),
                          ["The rebuilt bundle carries the real request id and backoff.",
@@ -145,7 +142,7 @@ class ParserKeepsTheParagraphs(unittest.TestCase):
     def test_the_blank_line_survives_storage_untouched(self):
         """node['summary'] is stored verbatim and the card renders it with white-space: pre-wrap, so the
         paragraph break IS the blank line. Anything that collapsed it would silently re-weld the leftover."""
-        _, take, _, _ = self._parse(self.REPLY)
+        _, take, _ = self._parse(self.REPLY)
         self.assertIn("\n\n", take)
         self.assertEqual(take, take.strip(), "trimmed at the ends only")
 

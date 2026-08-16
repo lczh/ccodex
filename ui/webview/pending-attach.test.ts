@@ -39,8 +39,9 @@ test("the strip renders pending chips (name + pulsing dots) and shows even with 
 });
 
 test("the droppedPath ack retires the chip it answers, then attaches the thumbnail", () => {
-  assert.match(RENDER, /retirePendingShip\(m\.path\);/);
-  assert.match(RENDER, /retirePendingShip\(m\.path\);[\s\S]{0,200}addComposerFile\(activeId, m\.path\)/);
+  assert.match(RENDER, /const owner = retirePendingShip\(m\.path\) \|\| activeId;/);
+  assert.match(RENDER, /retirePendingShip\(m\.path\)[\s\S]{0,300}addComposerFile\(owner, m\.path\)/,
+    "the ack attaches to the composer that SHIPPED the file (the 2026-08-16 wrong-tab attach)");
 });
 
 test("ack↔chip matching mirrors the kernel's saved-name sanitizer, FIFO as the fallback", () => {
@@ -56,7 +57,7 @@ test("a failed kernel save is NACKED and surfaces loudly — never a silent stuc
   assert.match(KERNEL, /_reply\(client, \{"type": "dropSaveFailed", "name": str\(msg\["name"\]\)\}\)/);
   // client: the nack retires the chip and says so in a toast
   assert.match(RENDER, /m\.type === "dropSaveFailed" && typeof m\.name === "string"/);
-  assert.match(RENDER, /retirePendingShip\(m\.name\);\s*\n\s*warnToast\(m\.name \+ " couldn't be saved on the kernel/);
+  assert.match(RENDER, /retirePendingShip\(m\.name\) \|\| activeId;[\s\S]{0,300}warnToast\(m\.name \+ " couldn't be saved on the kernel/);
   // a FileReader failure retires it too — an unreadable file must not pulse forever
   assert.match(RENDER, /reader\.onerror = \(\) => retirePendingShip\(name\);/);
 });

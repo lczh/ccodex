@@ -186,6 +186,19 @@ stretch after your follow-up, so the takeaway is the update, never a recap.
 May cite a `SOURCE: mN` line, parsed into the summary's deep link; a cite
 that misses logs and chips the card instead of failing.
 
+**Distiller notes.** Every judge that writes prose you read — distiller,
+briefer, staller, captioner, gister, archiver — also carries your standing
+style notes, when you keep any: `~/.config/romp/distiller-notes.md` is read
+at call time (no restart needed) and appended to the prompt, notes winning
+over prompt defaults on conflict. Plain language, e.g. "never cite PR or
+commit numbers; say what the change does". Delete the file and the next
+call runs bare. The placement judges and the courier never see it: those
+emit verdicts and agent-directed copy, not prose for you. The path is a
+plain read that follows symlinks, so the durable setup is the content in
+your dotfiles with a symlink here — one edit then reaches every machine's
+judges through your normal dotfiles sync (the user 2026-08-15), instead
+of each kernel keeping its own hand-seeded copy.
+
 **briefer.** When a top card blocks (and live for the focused picker or
 permission goal): a decision brief that leads with exactly what you must
 decide or provide, then options and tradeoffs. Same `SOURCE:` contract as
@@ -307,8 +320,12 @@ permission/API-error floors: one interrupt at a time, the present event first.
 - **auto-nudge**: a kernel trigger, not an LLM. Detects a genuinely stalled
   session and injects one nudge prompt; the planner's nudge phase does the
   judging, and a failed nudge records the block.
-- **awaiting**: event-derived, never a verdict. Only real subagents make an
-  idle session awaiting.
+- **awaiting**: layered. The LIVE sources are event-derived — subagents,
+  the pending background-task set, the delegation graph — and the CLOSER files a
+  durable awaiting verdict (the goal store's ⏳ stamp) carrying a KIND naming
+  what the wait is on: agents, task, job (an external computation), peer, timer.
+  The kind scopes the rules: a peer's answer supersedes only peer waits, and a
+  job stamp survives its watcher dying (the wake is its backstop).
 
 ## Where responsibilities overlap
 

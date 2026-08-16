@@ -31,9 +31,14 @@ setup() {
    "dir": "/tmp/notes-api", "bg": "#54B204", "fg": "black", "backend": "tmux", "working": ""}
 ]}
 JSON
+    export CURL_STDIN="$TEST_DIR/curl.stdin"
+    # Record argv AND stdin: the serve token travels on stdin now (curl --config -), so a mock that
+    # only watched argv could not tell a working auth header from no header at all. Read stdin
+    # BEFORE writing the response, or the config never lands.
     cat > "$MOCK/curl" <<'MOCK'
 #!/usr/bin/env bash
 echo "$*" >> "$CURL_LOG"
+cat >> "$CURL_STDIN" 2>/dev/null
 [ -n "${CURL_FAIL:-}" ] && exit 22
 cat "$FLEET_JSON"
 MOCK
@@ -72,7 +77,10 @@ teardown() { rm -rf "$TEST_DIR"; }
     run "$ROMP_SCRIPT" sessions
     [ "$status" -eq 0 ]
     grep -q "127.0.0.1:29855/sessions" "$CURL_LOG"
-    grep -q "TESTTOKEN123" "$CURL_LOG"
+    # The token goes in on stdin, never argv: /proc/<pid>/cmdline is world-readable, so a token in
+    # argv hands full control of every session to any other account on the machine.
+    grep -q "X-Romp-Token: TESTTOKEN123" "$CURL_STDIN"
+    ! grep -q "TESTTOKEN123" "$CURL_LOG"
 }
 
 @test "romp sessions: a dead kernel fails LOUDLY, never an empty list read as no sessions" {

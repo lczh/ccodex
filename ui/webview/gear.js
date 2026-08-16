@@ -38,6 +38,11 @@ var SHORTCUT_ROWS =
   '<span class=rs-key-desc>view, record and rebind every dashboard shortcut</span></div>' +
   '<div class=rs-key id=rs-keys-vsc hidden><span class=rs-key-desc>Shortcuts are VS Code keybindings here — search "rompChat" in Keyboard Shortcuts.</span></div>';
 
+// Auto Nudge's hover description lives in a var because fillAutoNudge() appends to it when the attached
+// machines disagree — the row then has to say WHICH ones, and this is the one level down from the label.
+var AUTONUDGE_SUB = "When a session goes idle but its goal still shows working (not blocked, not awaiting agents or a job "
+  + "you), automatically nudge it once for a status update. Applies to every connected machine's kernel.";
+
 // The modal markup — ported verbatim from the kernel's _gear_html; the model/
 // effort selects start empty and are filled from /models (see fill()).
 var GEAR_HTML =
@@ -53,11 +58,11 @@ var GEAR_HTML =
   "<button id=rs-defaultdir-browse type=button style='flex:0 0 auto;cursor:pointer;background:#2a2a2a;color:#ccc;border:1px solid #3a3a3a;border-radius:5px;padding:3px 8px'>Browse…</button>" +
   '</div></span></div>' +
   "<label class='rs-row rs-sep'><input type=checkbox id=rs-autonudge>" +
-  '<span><b>Auto Nudge</b>' +
-  '<span class=rs-sub>When a session goes idle but its goal still shows working (not blocked, not awaiting you), automatically nudge it once for a status update.</span>' +
+  '<span><b>Auto Nudge</b><span class=rs-mixed id=rs-autonudge-split hidden></span>' +
+  '<span class=rs-sub id=rs-autonudge-sub>' + AUTONUDGE_SUB + '</span>' +
   '</span></label>' +
-  "<div class='rs-row' style='cursor:default'><span style='flex:1 1 auto'><b>Automatic updates</b>" +
-  '<span class=rs-sub>romp checks its repo for a new tagged release at start-up and every 6 hours (ordinary commits never trigger it; updating lands exactly on the release). Check and ask (the default) offers it as a banner with an Update button; Install automatically fetches, installs and restarts by itself; Off never checks. Kernel-side setting.</span>' +
+  "<div class='rs-row' style='cursor:default'><span style='flex:1 1 auto'><b>Automatic updates <span class=rs-mixed hidden></span></b>" +
+  '<span class=rs-sub>romp watches for new tagged releases (every 6 hours) AND new commits on main (origin polled every few minutes, plus a restart offer when updated code sits on disk unbooted) — one banner covers both, and acting on it converges every attached machine. Check and ask (the default) offers the banner with an Update button; Install automatically converges by itself, restarting at the next quiet moment; Off never checks. Kernel-side setting.</span>' +
   "<select id=rs-updates style='margin-top:5px;width:100%;background:#1e1e1e;color:#ccc;" +
   "border:1px solid #3a3a3a;border-radius:5px;padding:3px 4px;cursor:pointer'>" +
   '<option value=ask>Check and ask</option><option value=auto>Install automatically</option><option value=off>Off</option>' +
@@ -69,10 +74,12 @@ var GEAR_HTML =
   '<option value=sdk>SDK</option><option value=tmux>tmux (terminal)</option><option value=codex>Codex</option>' +
   '</select></span></div>' +
   '<div class=rs-sec>Judges</div>' +
-  "<div class='rs-row rs-jrow'><b>Triage model</b><span class=rs-sub>The model the triage judges use — planner, grouper, closer, distiller, courier (the judgment-heavy tier). Applies on the judges' next pass; no restart. A pick here follows to every connected machine's kernel.</span><select id=rs-judgemodel></select></div>" +
-  "<div class='rs-row rs-jrow'><b>Triage effort</b><span class=rs-sub>Thinking effort for the triage judges. Default = no effort flag (the judges' standard behavior). Not every model accepts every level. Follows to every connected machine's kernel.</span><select id=rs-judgeeffort></select></div>" +
-  "<div class='rs-row rs-jrow'><b>Indexing model</b><span class=rs-sub>The model the indexing judges use — captioner + archiver (high-volume, low-stakes summarization). Haiku by default for cost. Follows to every connected machine's kernel.</span><select id=rs-indexmodel></select></div>" +
-  "<div class='rs-row rs-jrow'><b>Indexing effort</b><span class=rs-sub>Thinking effort for the indexing judges. Default = none (indexing runs with thinking disabled as a cost lever; leave Default unless you know you want it). Follows to every connected machine's kernel.</span><select id=rs-indexeffort></select></div>" +
+  "<div class='rs-row rs-jrow'><b>Triage model <span class=rs-mixed hidden></span></b><span class=rs-sub>The model the triage judges use — planner, grouper, closer, courier (the judgment-heavy tier). Applies on the judges' next pass; no restart. A pick here follows to every connected machine's kernel.</span><select id=rs-judgemodel></select></div>" +
+  "<div class='rs-row rs-jrow'><b>Triage effort <span class=rs-mixed hidden></span></b><span class=rs-sub>Thinking effort for the triage judges. Default = no effort flag (the judges' standard behavior). Not every model accepts every level. Follows to every connected machine's kernel.</span><select id=rs-judgeeffort></select></div>" +
+  "<div class='rs-row rs-jrow'><b>Distilling model <span class=rs-mixed hidden></span></b><span class=rs-sub>The model for the judges that write the prose you read on cards — distiller, briefer, staller. Follow triage (the default) keeps them on the triage pick; pinning a model here lets the copy you read run richer than the placement judges. Follows to every connected machine's kernel.</span><select id=rs-distillmodel></select></div>" +
+  "<div class='rs-row rs-jrow'><b>Distilling effort <span class=rs-mixed hidden></span></b><span class=rs-sub>Thinking effort for the distilling judges. Follow triage (the default) rides the triage effort; Default pins no effort flag. Follows to every connected machine's kernel.</span><select id=rs-distilleffort></select></div>" +
+  "<div class='rs-row rs-jrow'><b>Indexing model <span class=rs-mixed hidden></span></b><span class=rs-sub>The model the indexing judges use — captioner + archiver (high-volume, low-stakes summarization). Haiku by default for cost. Follows to every connected machine's kernel.</span><select id=rs-indexmodel></select></div>" +
+  "<div class='rs-row rs-jrow'><b>Indexing effort <span class=rs-mixed hidden></span></b><span class=rs-sub>Thinking effort for the indexing judges. Default = none (indexing runs with thinking disabled as a cost lever; leave Default unless you know you want it). Follows to every connected machine's kernel.</span><select id=rs-indexeffort></select></div>" +
   '<div class=rs-sec>Keyboard shortcuts</div>' + SHORTCUT_ROWS +
   '<div class=rs-sec>Chat</div>' +
   '<label class=rs-row><input type=checkbox id=rs-compact>' +
@@ -156,7 +163,9 @@ function initGear(post) {
     cg = document.getElementById('rs-collapsegaps'), ao = document.getElementById('rs-activeonly'),
     jm = document.getElementById('rs-judgemodel'),
     im = document.getElementById('rs-indexmodel'), je = document.getElementById('rs-judgeeffort'),
-    ie = document.getElementById('rs-indexeffort'), upm = document.getElementById('rs-updates');
+    ie = document.getElementById('rs-indexeffort'), upm = document.getElementById('rs-updates'),
+    dm = document.getElementById('rs-distillmodel'), de = document.getElementById('rs-distilleffort'),
+    ans = document.getElementById('rs-autonudge-split'), asub = document.getElementById('rs-autonudge-sub');
   function load() { try { return Object.assign({ compact: true, colormap: 'aurora', subgoals: true, debug: false, backend: 'sdk', defaultDir: '', showBranch: false, tabCtx: 'over50', collapseGaps: true, activeOnly: true }, JSON.parse(localStorage.getItem('romp:settings') || 'null')); } catch (e) { return { compact: true, colormap: 'aurora', subgoals: true, debug: false, backend: 'sdk', defaultDir: '', showBranch: false, tabCtx: 'over50', collapseGaps: true, activeOnly: true }; } }
   // mirrors settings.ts tabCtxMode (this file can't import the TS module): the gauge shipped for a
   // few hours as a boolean toggle — false was an explicit hide, true the default nobody chose.
@@ -183,12 +192,20 @@ function initGear(post) {
   if (ao) ao.addEventListener('change', function () { var s = load(); s.activeOnly = ao.checked; save(s); });
   // Auto Nudge / judge tiers are SERVER-SIDE (the kernel runs them): post the
   // change; the controls re-initialize from /version on every open (fill()).
-  if (an) an.addEventListener('change', function () { post({ type: 'setAutoNudge', enabled: an.checked }); });
+  // Each attached kernel keeps its own copy, so the post goes to all of them
+  // (federation.ts KERNEL_SETTING) — which is also what resolves a split box:
+  // the click picks one answer and every machine takes it.
+  if (an) an.addEventListener('change', function () {
+    clearAutoNudgeSplit();
+    post({ type: 'setAutoNudge', enabled: an.checked });
+  });
   if (upm) upm.addEventListener('change', function () { post({ type: 'setUpdateMode', mode: upm.value }); });
   if (jm) jm.addEventListener('change', function () { post({ type: 'setJudgeModel', model: jm.value }); });
   if (im) im.addEventListener('change', function () { post({ type: 'setIndexModel', model: im.value }); });
   if (je) je.addEventListener('change', function () { post({ type: 'setJudgeEffort', effort: je.value }); });
   if (ie) ie.addEventListener('change', function () { post({ type: 'setIndexEffort', effort: ie.value }); });
+  if (dm) dm.addEventListener('change', function () { post({ type: 'setDistillModel', model: dm.value }); });
+  if (de) de.addEventListener('change', function () { post({ type: 'setDistillEffort', effort: de.value }); });
   // feed-colormap preview bar: a horizontal gradient of the SELECTED map's stops (mirrors render.ts COLORMAPS).
   var CMAPS = { aurora: [[84, 178, 4], [0, 180, 115], [35, 175, 156], [66, 169, 176], [25, 168, 201], [14, 164, 227], [74, 155, 241], [113, 145, 244], [144, 136, 240]],
     hawaii: [[140, 2, 115], [146, 46, 85], [151, 78, 62], [155, 111, 40], [156, 150, 28], [137, 189, 74], [107, 212, 142], [103, 233, 213], [179, 242, 253]],
@@ -247,21 +264,92 @@ function initGear(post) {
     return fetch(ku('/models'), { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (d) {
       choices = d || { models: [], efforts: [] };
       var mo = (choices.models || []).map(function (m) { return '<option value="' + m.value + '">' + m.label + '</option>'; }).join('');
-      var eo = '<option value="">Default</option>' + (choices.efforts || []).map(function (m) { return '<option value="' + m.value + '">' + m.label + '</option>'; }).join('');
+      var eff = (choices.efforts || []).map(function (m) { return '<option value="' + m.value + '">' + m.label + '</option>'; }).join('');
+      var eo = '<option value="">Default</option>' + eff;
       if (jm) jm.innerHTML = mo; if (im) im.innerHTML = mo;
       if (je) je.innerHTML = eo; if (ie) ie.innerHTML = eo;
+      // the distilling pair leads with the follow-triage sentinel — its default, so a fresh kernel
+      // shows "Follow triage" rather than a model nobody picked. Its Default (no effort flag) is the
+      // stored sentinel "none", never "" — an empty state file reads back as the default ("follow").
+      if (dm) dm.innerHTML = '<option value="triage">Follow triage</option>' + mo;
+      if (de) de.innerHTML = '<option value="triage">Follow triage</option><option value="none">Default</option>' + eff;
       return choices;
     }).catch(function () { return null; });
   }
   function lv() { var t = document.querySelector('script[src*="feed.js"]');
     var m = t && t.getAttribute('src').match(/[?&]v=(\d+)/); return m ? +m[1] : 0; }
+  function clearAutoNudgeSplit() {
+    if (an) an.indeterminate = false;
+    if (ans) { ans.hidden = true; ans.textContent = ''; }
+    if (asub) asub.textContent = AUTONUDGE_SUB;
+  }
+  // Auto Nudge is one switch for every connected machine, but each kernel keeps its own copy — and
+  // /version answers for THIS one alone. So the box takes the local kernel's setting, then checks the
+  // others: a connected host that disagrees puts the box in the mixed state (a tri-state checkbox plus
+  // the word beside the label — glanceable) and is NAMED in the hover line, one level down. Before this
+  // the box quietly spoke for machines it could not see, and the other kernel went on nudging for days
+  // behind an unchecked box (the user 2026-08-14). Clicking a mixed box picks one answer for everyone,
+  // since the post goes to every kernel.
+  //
+  // A host that never reported a setting — an older kernel, a row that has not polled — is left OUT
+  // rather than read as off: guessing would invent a disagreement and invite a click that changes a
+  // machine nobody asked about. Same for a host that is not `up`, whose row is a memory (see
+  // _remote_public's stale note). A /tunnels that fails leaves the local answer standing.
+  function fillAutoNudge(mine, rows) {
+    if (!an) return;
+    an.checked = !!mine;
+    clearAutoNudgeSplit();
+    var split = (rows || []).filter(function (t) {
+      return t && t.status === 'up' && typeof t.autoNudge === 'boolean' && t.autoNudge !== !!mine;
+    }).map(function (t) { return t.host; });
+    if (!split.length) return;
+    an.indeterminate = true;
+    if (ans) { ans.textContent = 'mixed'; ans.hidden = false; }
+    if (asub) asub.textContent = AUTONUDGE_SUB
+      + (mine ? ' Right now these have it off: ' : ' Right now these still have it on: ')
+      + split.join(', ') + '. Clicking sets them all the same way.';
+  }
+  // The autoNudge rule, generalized to EVERY kernel-side select (the user 2026-08-14): the control keeps
+  // showing the LOCAL kernel's value, and a small "mixed" mark appears when a connected, up, REPORTING
+  // machine disagrees — hover names the hosts. A machine that never reported (older kernel, unpolled row)
+  // is unknown, never a disagreement: guessing would invite a click that changes a machine nobody asked
+  // about. One pick posts to every kernel (KERNEL_SETTING) and the next fill clears the mark — the local
+  // value is the default ANSWER to confirm, never a silent overwrite of a remote's deliberate setting.
+  function fillMixedMarks(v, rows) {
+    var mine = (v && v.settings) || null;
+    [['updateMode', upm], ['judgeModel', jm], ['judgeEffort', je], ['indexModel', im],
+     ['indexEffort', ie], ['distillModel', dm], ['distillEffort', de]].forEach(function (pair) {
+      var key = pair[0], el = pair[1];
+      if (!el) return;
+      var row = el.closest ? el.closest('.rs-row') : null;
+      var mark = row ? row.querySelector('.rs-mixed') : null;
+      if (mark) { mark.hidden = true; mark.textContent = ''; mark.removeAttribute('title'); }
+      if (!mine || typeof mine[key] === 'undefined' || !mark) return;
+      var split = (rows || []).filter(function (t) {
+        return t && t.status === 'up' && t.settings && typeof t.settings[key] !== 'undefined'
+          && String(t.settings[key]) !== String(mine[key]);
+      }).map(function (t) { return t.host; });
+      if (!split.length) return;
+      mark.textContent = 'mixed';
+      mark.title = 'differs on: ' + split.join(', ') + ' — picking here sets every machine the same way';
+      mark.hidden = false;
+    });
+  }
   function fill() { fillChoices().then(function () { return fetch(ku('/version'), { cache: 'no-store' }); }).then(function (r) { return r.json(); }).then(function (v) {
-    if (an) an.checked = !!v.autoNudge;
+    // ONE /tunnels fetch feeds every cross-machine comparison: the autoNudge box and the select marks.
+    // A failed /tunnels leaves the local answers standing, unmarked — same fallback as before.
+    fetch(ku('/tunnels'), { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (d) {
+      var rows = (d && d.tunnels) || [];
+      fillAutoNudge(v.autoNudge, rows);
+      fillMixedMarks(v, rows);
+    }).catch(function () { fillAutoNudge(v.autoNudge, []); fillMixedMarks(v, []); });
     if (upm && typeof v.updateMode === 'string') upm.value = v.updateMode;   // the kernel's persisted mode is authoritative
     if (jm && typeof v.judgeModel === 'string') jm.value = v.judgeModel;   // the judge's ACTUAL current model/effort per tier is authoritative
     if (im && typeof v.indexModel === 'string') im.value = v.indexModel;
     if (je && typeof v.judgeEffort === 'string') je.value = v.judgeEffort;
     if (ie && typeof v.indexEffort === 'string') ie.value = v.indexEffort;
+    if (dm && typeof v.distillModel === 'string') dm.value = v.distillModel;   // RAW: "triage" selects the Follow-triage option
+    if (de && typeof v.distillEffort === 'string') de.value = v.distillEffort;
     if (dd && typeof v.defaultDir === 'string') dd.value = v.defaultDir;   // the kernel's persisted default is authoritative
     // Browse… draws on the KERNEL's screen, and a kernel with no desktop has none — the click used to
     // vanish into a macOS-only dialog. Drop the button rather than offer one that cannot work; the

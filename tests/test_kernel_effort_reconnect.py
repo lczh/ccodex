@@ -45,10 +45,48 @@ class EffortReconnect(unittest.TestCase):
 
     def test_backend_set_effort_arms_the_pending_flag_and_reconnects(self):
         self.assertIn('s._effort_pending = value', BACKEND_SRC)
+<<<<<<< HEAD
         # The flag shares the backend's serialized registry RMW; pin the atomic mutation rather
         # than the old unlocked local-dict assignment spelling.
         self.assertIn('row.update(effort=value, effortPending=True)', BACKEND_SRC)
+=======
+        self.assertIn('self._update_reg(sid, effort=value, effortPending=True)', BACKEND_SRC)
+>>>>>>> origin/main
         self.assertIn('s.request_reconnect()', BACKEND_SRC)
+
+    def test_every_effort_pick_is_remembered_ultracode_included(self):
+        # the user 2026-08-14: they pick ultracode and expect NEW sessions to follow. The old guard
+        # (`if value != "ultracode"`) deliberately never remembered it, so the seed sat on their one
+        # historical max pick and every new session opened at max — reading as a downgrade. spawn
+        # still hands each new session its own per-session launch shape (--effort xhigh + the
+        # ultracode settings key), so the CLI's session-scoping is preserved.
+        self.assertNotIn('if value != "ultracode"', BACKEND_SRC)
+        self.assertIn("write_sdk_default(self.state_dir, effort=value)", BACKEND_SRC)
+        # …and the seed round-trips through the defaults store (behavioral, hermetic state dir)
+        import tempfile as _tf
+        from importlib.machinery import SourceFileLoader as _SFL
+        sb = _SFL("romp_sdk_backend_efr", os.path.join(BIN, "romp_sdk_backend.py")).load_module()
+        td = _tf.mkdtemp()
+        sb.write_sdk_default(td, effort="ultracode")
+        d = sb.read_sdk_defaults(td)
+        self.assertEqual(d.get("effort"), "ultracode")
+        self.assertIn("ultracode", sb.EFFORT_LEVELS,
+                      "spawn's seed filter (in EFFORT_LEVELS) must accept the remembered ultracode")
+
+    def test_setters_write_the_reg_through_the_locked_rmw(self):
+        # the bare read→mutate→write raced the loop threads' own locked RMWs (queue/echo mirrors,
+        # liveCtx) and could silently drop the just-picked field: the label looked right, then the
+        # value reverted at the next respawn when __init__ re-read the reg (the user 2026-08-14,
+        # whose ultracode sessions seemed to downgrade at random). The whole setter family goes
+        # through _update_reg now.
+        for pin in ('self._update_reg(sid, effort=value, effortPending=True)',
+                    'self._update_reg(sid, auth=value, authPending=True)',
+                    'self._update_reg(sid, mode=mode)',
+                    'self._update_reg(sid, fast=(value == "on"), liveFast=value)',
+                    'self._update_reg(sid, name=new_name)',
+                    'self._update_reg(sid, model=value, modelPending=bool(s._model_pending))',
+                    'self._update_reg(sid, model=value, liveModel=_alias_label(value), modelPending=False)'):
+            self.assertIn(pin, BACKEND_SRC)
 
     def test_backend_clears_the_pending_flag_when_the_reconnect_lands(self):
         # cleared the instant the new client connects (reconnect loop) — event-based, mirrors _model_pending

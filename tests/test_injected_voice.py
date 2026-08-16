@@ -126,6 +126,10 @@ class InjectedBodiesSpeakAsTheUser(unittest.TestCase):
             # index, so it shipped saying "goal" twice and announcing "(Automated re-check…)" until
             # 2026-08-11 — exactly the drift this index exists to catch
             "awaiting backstop": km.AWAITING_BACKSTOP_TEXT,
+            # a comment thread's opening message (the user 2026-08-13): the highlight + comment are
+            # the user's own words; the quoting frame around them is romp-authored and scanned here
+            "comment thread opener": km._comment_first_message(
+                "Cap the retry delay at two minutes.", "Why two minutes and not five?"),
         }
         # every repeat-nudge variant wears the same voice as the first fire (the user 2026-08-11): the
         # rotation exists so a re-ask doesn't read canned, so a variant that broke the voice rule would
@@ -173,10 +177,11 @@ class InjectedBodiesSpeakAsTheUser(unittest.TestCase):
         for name, body in self._bodies().items():
             # the wrap-up is a stop order, not a status ask; a TYPED follow-up carries the user's OWN
             # words as its body, so there is no romp-authored ask in it to check; the DEBT reminder
-            # asks for a reply to a PEER, not a progress report to the user
+            # asks for a reply to a PEER, not a progress report to the user; a comment thread's
+            # opener is the user's own comment on a quoted passage — a conversation, never a nudge
             if name in ("clear wrap-up", "clear wrap-up (batch)", "typed follow-up on a summary",
                         "debt reminder (question)", "debt reminder (handoff)",
-                        "debt reminder (several)"):
+                        "debt reminder (several)", "comment thread opener"):
                 continue
             text = prose(body).lower()
             with self.subTest(message=name):

@@ -382,7 +382,7 @@ class Authorship(unittest.TestCase):
     def test_opener_authors_human_sdk_peer(self):
         out = run_scenario("author_kinds")
         self.assertEqual([_trigger_author(t) for t in out["turns"]],
-                         ["human", "sdk", {"peer": PEER}])
+                         ["human", "sdk", {"peer": PEER, "mid": MID, "kind": ""}])
 
     def test_romp_auto_marker_flags_rompAuto_but_a_button_nudge_does_not(self):
         # An AUTO-nudge (kernel _auto_nudge_tick) carries romp-injected AND romp-auto → its trigger atom is
@@ -415,7 +415,7 @@ class Authorship(unittest.TestCase):
 
     def test_peer_rompuuid_resolved_from_messages_log(self):
         out = run_scenario("author_kinds")
-        self.assertEqual(_trigger_author(out["turns"][2]), {"peer": PEER})
+        self.assertEqual(_trigger_author(out["turns"][2]).get("peer"), PEER)
 
     def test_peer_null_when_id_absent_from_log(self):
         # same postal marker, but the message id is not in the log -> peer rompUuid null
@@ -426,7 +426,7 @@ class Authorship(unittest.TestCase):
             p.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
             out = em.parse_session(str(p), rompuuid=SID, dir="/TESTDIR", candidate_files=[str(p)],
                                    postal_log=[], now=NOW)
-        self.assertEqual(_trigger_author(out["turns"][0]), {"peer": None})
+        self.assertEqual(_trigger_author(out["turns"][0]).get("peer"), None)
 
 
 class RompInjectedAuthor(unittest.TestCase):
@@ -462,7 +462,7 @@ class RompInjectedAuthor(unittest.TestCase):
 
     def test_postal_marker_still_wins_for_a_peer_message(self):
         b = self._blocks("DELEGATE: do a thing\n\n<!-- romp-msg-id: m1 -->")
-        self.assertEqual(em.author_of(b, "typed", {"m1": PEER}), {"peer": PEER},
+        self.assertEqual(em.author_of(b, "typed", {"m1": PEER}).get("peer"), PEER,
                          "a real peer message stays a peer card, not a romp injection")
 
 

@@ -60,6 +60,27 @@ PY
     grep -q "^/end$" <(head -1 "$TEST_DIR/req")
 }
 
+@test "romp end self resolves through ROMP_SID and defers to idle by default" {
+    # a session closing ITSELF after its work (the user 2026-08-15): self = the spawn-frozen sid,
+    # and the kernel kills at the turn's settle so the goodbye lands first
+    start_fake_kernel '{"ok": true}'
+    ROMP_SID="11111111-2222-3333-4444-555555555555" run "$ROMP_SCRIPT" end self
+    [ "$status" -eq 0 ]
+    grep -q "^/end$" <(head -1 "$TEST_DIR/req")
+    grep -q '"id": "11111111-2222-3333-4444-555555555555"' "$TEST_DIR/req"
+    grep -q '"when": "idle"' "$TEST_DIR/req"
+}
+
+@test "romp end self --now skips the deferral; self outside a session fails loudly" {
+    start_fake_kernel '{"ok": true}'
+    ROMP_SID="11111111-2222-3333-4444-555555555555" run "$ROMP_SCRIPT" end self --now
+    [ "$status" -eq 0 ]
+    ! grep -q '"when"' "$TEST_DIR/req"
+    ROMP_SID="" run "$ROMP_SCRIPT" end self
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"only works from inside a romp SDK session"* ]]
+}
+
 @test "the dashed spellings are silent aliases: --send works and says nothing about it" {
     # Agent-facing text delivered before 2026-07-25 (postal reply footers, skill
     # docs in old transcripts) names the dashed forms; they must keep working
@@ -82,6 +103,25 @@ import json, sys
 body = open(sys.argv[1]).read().split("\n", 1)[1]
 assert json.loads(body) == {"name": "helper", "text": 'fix the "thing" \\ and this'}, body
 PY
+}
+
+@test "romp send --tag appends the render-hint marker; bad labels and missing text exit 2" {
+    start_fake_kernel '{"ok": true}'
+    run "$ROMP_SCRIPT" send helper --tag kickoff 'boot brief for the run'
+    [ "$status" -eq 0 ]
+    python3 - "$TEST_DIR/req" <<'PY'
+import json, sys
+body = open(sys.argv[1]).read().split("\n", 1)[1]
+d = json.loads(body)
+assert d["name"] == "helper", d
+assert d["text"] == "boot brief for the run\n\n<!-- romp-tag: kickoff -->", d
+PY
+    run "$ROMP_SCRIPT" send helper --tag 'two words' 'text'
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--tag must be one word"* ]]
+    run "$ROMP_SCRIPT" send helper --tag kickoff
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"usage: romp send"* ]]
 }
 
 @test "a kernel refusal is loud: non-zero exit + the kernel's answer" {

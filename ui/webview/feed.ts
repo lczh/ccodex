@@ -7,9 +7,9 @@
 // pushes and updated in place — never torn down — so hovering one doesn't flicker
 // when the fleet streams new deliverables in.
 import { distillText, distillInputs, applyDistillLine, distillPending } from "./distiller-line";
-import { spinFor } from "./spin-caption";
+import { spinFor, KIND_WORD } from "./spin-caption";
 import { onlyTag, matchesOnly } from "./only-filter";
-import { hostNameNodes, hostPartsNodes, hostIsDown, hostDownNote } from "./host-prefix";
+import { hostNameNodes, hostPartsNodes, hostIsDown, hostDownNote, hostOf } from "./host-prefix";
 import { extHoverMatches } from "./card-key";
 import { provenanceRows, provenanceGroupRows, rootStart, type ProvFmt, type ProvRow } from "./provenance";
 import { ageColorReadable } from "./age-color";
@@ -17,7 +17,6 @@ import { badgeNotices, clearBoundaryNotices, sdkProblemNotices, syncNotices,
   type ClearNoticeRow, type SdkNoticeRow, type SyncNoticeRow } from "./badge-mirror";
 import { initStrip } from "./strip";
 import { installSettingsSync } from "./settings";
-import { previewThumb, previewKind } from "./preview";
 import { VIEW_STATE_KEY, parseViewState, serializeViewState, pruneViewState, capViewState, type FeedViewState } from "./feed-view-state";
 
 // (The standalone-deliverable "FeedItem" subsystem was REMOVED 2026-07-07: the kernel had emitted
@@ -86,7 +85,6 @@ interface AskItem {
               mid?: string; frm?: string; to?: string; origin?: string; body?: string; gist?: string };   // quarantine (held peer mail) adds these; gist = the bus's 90-char collapse for the compact card line
   summary?: string | null;                         // distiller's key takeaway for a COMPLETED goal → the done card's one auto-written line (kernel asks.append); null until produced
   distillState?: "completed" | "blocked" | null;   // the GENUINE resolution state the distiller line keys on, so the brief/takeaway rides the real block instead of the transient `column` (which recheck/rejudging flicker to working) — the user 2026-07-21; absent from older/remote payloads → fall back to column
-  artifacts?: string[] | null;                     // files the work PRODUCED (distiller ARTIFACTS line, kernel existence-filtered at build): "N artifacts" under the summary; previewed in the modal (the user 2026-07-08)
   blockSummary?: string | null;                    // block-distiller's decision brief for a BLOCKED goal → the blocked card's one auto-written line (kernel 466393c); null until produced
   briefParts?: { id?: string; since: number }[] | null;   // MULTI-item brief: one {id, since} per paragraph IN ORDER (judge briefParts) → per-paragraph "Nm ago" stamps; null/absent = single ask, the card header's age is the stamp (the user 2026-07-24)
   summaryParts?: { id?: string; since: number }[] | null;   // the DONE twin: per-paragraph done-event stamps for a takeaway the distiller split by <completed-items> (the user 2026-07-24)
@@ -97,7 +95,7 @@ interface AskItem {
   warnRows?: { t: number; judge: string; err: string; note?: string; debug?: { input?: string; reply?: string } }[] | null;   // DEBUG MODE only (romp debug on): every judge failure touching this card (kernel _card_warn_rows) → "Warnings (debug)" modal section; rows captured in debug carry the failing call's input + reply (the user 2026-07-09)
   origin?: { peer: string; peerSid: string; peerHost?: string; color: { bg: string; fg: string } | null } | null;  // courier handoff: planted by a peer's message → "↪ from <peer>"; peerHost = a FEDERATED sender's host, rendered as the quiet "host:" prefix (absent on older payloads / local senders)
   waitingOn?: { peerSid: string; name: string; color: { bg: string; fg: string } | null; inCycle: boolean; kind?: string } | null;  // unanswered msg out to a live peer → "Awaiting <peer>" chip, or "Handed off to <peer>" when kind is "delegate" (peer name in native colour, no emoji; kernel _wait_for_graph; the user 2026-06-22 / 2026-07-25)
-  awaiting?: { why?: string | null; tasks?: string[] | null } | null;   // AWAITING flavor: held in Working, ⏳ awaiting badge — waiting on dispatched/delegated work (agents/subagents/a build), NOT on you (kernel build_feed; the user 2026-06-22). The peer case rides waitingOn; this carries the generic "why". `tasks` = live bg-task descriptions (the user 2026-07-13): present → the compact "Waiting on task" pill (expands the list, like Sub-goals) replaces the boxed why.
+  awaiting?: { why?: string | null; kind?: string | null; tasks?: string[] | null } | null;   // AWAITING flavor: held in Working, ⏳ awaiting badge — waiting on dispatched/delegated work (agents/subagents/a build), NOT on you (kernel build_feed; the user 2026-06-22). The peer case rides waitingOn; this carries the generic "why". `tasks` = live bg-task descriptions (the user 2026-07-13): present → the compact "Awaiting task" pill (expands the list, like Sub-goals) replaces the boxed why.
   groupTitle?: string;                             // host: this ask shares a typed turn with siblings → the group's title
   groupN?: number;                                 // host: sibling count for that turn (>1 ⇒ fold into one group card)
   provisional?: boolean;                           // a LIVE-PROMPT placeholder (kernel _provisional_card): the session is working an in-progress turn the planner hasn't classified yet. No goal node (empty tree) — dim, non-interactive, no clear/nudge/modal; replaced by the real card once the planner places the segment.
@@ -193,7 +191,11 @@ function dropDismissed(ids: string[]): void {
 // possibly know about it yet. MOVE_ACK_MS is now only a backstop for an answer that never arrives.
 const MOVE_ACK_MS = 15000;
 const pendingFollowMove = new Map<string, number>();   // card itemId → backstop timer id; KEY = still predicting
-const pendingMoveAck = new Map<string, number>();      // card itemId → the buildId the kernel acked it with
+// card itemId → the ack's buildId AND the kernel whose counter it is on. Every kernel numbers feed
+// builds independently, so an ack is only comparable against the SAME host's frame of a merged payload
+// (the user 2026-08-15: the local kernel's buildId, large after days of uptime, "outranked" a remote
+// ack's small post-restart buildId on the first merged emission — see reconcileFollowMove).
+const pendingMoveAck = new Map<string, { host: string; buildId: number }>();
 // What KIND of reply put each prediction in flight (the user 2026-07-20: EVERY context-carrying reply flips
 // its card to Working instantly, not just the feed composer's own follow-up):
 //  - "followup": a message rides along → the prediction wears the re-check styling ("Followed up" chip),
@@ -284,7 +286,7 @@ function optimisticFollowMove(itemId: string, kind: MoveKind = "followup") {
 // went out. ok=true records the buildId the prediction must outlive and re-arms the window SILENTLY: the
 // kernel has spoken, so nothing from here on is worth a toast, but a prediction must never outlive the
 // answer either, so the backstop stays armed in case a payload goes missing.
-function ackFollowMove(itemId: string, ok: boolean, buildId: number) {
+function ackFollowMove(itemId: string, ok: boolean, buildId: number, host: string) {
   if (!pendingFollowMove.has(itemId)) return;
   if (!ok) {
     clearFollowMove(itemId, "ack-fail");
@@ -292,7 +294,7 @@ function ackFollowMove(itemId: string, ok: boolean, buildId: number) {
     render();
     return;
   }
-  pendingMoveAck.set(itemId, buildId);
+  pendingMoveAck.set(itemId, { host, buildId });
   const prev = pendingFollowMove.get(itemId); if (prev) clearTimeout(prev);
   pendingFollowMove.set(itemId, window.setTimeout(() => {
     if (!pendingFollowMove.has(itemId)) return;
@@ -305,7 +307,7 @@ function ackFollowMove(itemId: string, ok: boolean, buildId: number) {
 // right after retiring the picker (answerAsk → _mark_views_dirty), so a payload that still shows the card out
 // of Working is post-answer truth — a real remaining/renewed block (e.g. the next permission prompt of a
 // burst). Holding the prediction there would MASK a genuine "needs you"; dropping it re-shows the ⏸ card.
-function reconcileFollowMove(incoming: AskItem[], buildId: number) {
+function reconcileFollowMove(incoming: AskItem[], buildId: number, buildIds?: Record<string, number>) {
   for (const id of Array.from(pendingFollowMove.keys())) {
     const a = incoming.find((x) => x.itemId === id);
     if (!a || a.column === "working" || pendingMoveKind.get(id) === "answer") {
@@ -317,8 +319,22 @@ function reconcileFollowMove(incoming: AskItem[], buildId: number) {
     // reopen, and taking it as the answer is exactly the bounce back to Completed this replaced. A NEWER one
     // is the kernel's own state, so yield to it silently — the reply landed, the card simply moved on (the
     // work finished, a fresh block arrived), which is honest to show and never a failed move.
+    //
+    // "After" only means anything on ONE counter (the user 2026-08-15, whose reply to a remote card
+    // bounced Working → Completed → Working): every kernel numbers its own feed builds, and the merged
+    // payload's top-level buildId is the LOCAL kernel's — days of uptime vs a just-restarted remote made
+    // it "outrank" every remote ack instantly, dropping the prediction while the cached remote frame
+    // still predated the reopen. So compare the ack against the CARD's own kernel: its host's entry in
+    // the per-host buildIds map (mergeHostFeeds). A single-kernel payload has no map — there the
+    // top-level buildId IS the card's kernel's counter, for local (un-acked-host "") cards. A payload
+    // that can't be placed on the ack's counter simply doesn't outrank: the prediction waits for
+    // confirmation by content, with the MOVE_ACK_MS backstop unchanged behind it.
     const acked = pendingMoveAck.get(id);
-    if (acked !== undefined && buildId > acked) clearFollowMove(id, "outranked");
+    if (acked === undefined) continue;
+    const cardHost = hostOf(a.sid);
+    if (cardHost !== acked.host) continue;   // an ack from some other kernel says nothing about this card
+    const mark = buildIds ? buildIds[cardHost] : (cardHost === "" ? buildId : undefined);
+    if (typeof mark === "number" && mark > acked.buildId) clearFollowMove(id, "outranked");
   }
 }
 // Render-time: keep each still-unconfirmed predicted card in Working, styled like the kernel's own re-checked
@@ -491,11 +507,24 @@ const openBgSvc = new Set<string>();   // sids with the chip's process list expa
 // arrive collapsed too, and a card's column is not knowable when you fold the thread. Persisted across
 // reloads with the rest of the disclosure state, and deliberately NOT pruned when the cards go away.
 const collapsedThreads = new Set<string>();
-// names of sessions idle-but-AWAITING background work (the user 2026-07-13): the same dot in straw —
+// names of sessions idle-but-AWAITING background work (the user 2026-07-13): the same dot in await-green —
 // matching the chat chip's Awaiting color — so a held session reads differently from a working one.
 let awaitingSet = new Set<string>();
-type DotState = "" | "work" | "await";
-const dotFor = (name: string): DotState => workingSet.has(name) ? "work" : awaitingSet.has(name) ? "await" : "";
+// Sessions the kernel LISTS but whose live state it could not read. These draw a gray ring, which
+// is what lets a BLANK pip mean "alive and quiet" and nothing else — before it, an unreadable state
+// and an idle one were the same nothing, so a rendering hole was indistinguishable from health.
+let unknownSet = new Set<string>();
+type DotState = "" | "work" | "await" | "unknown";
+const dotFor = (name: string): DotState =>
+  workingSet.has(name) ? "work" : awaitingSet.has(name) ? "await"
+  : unknownSet.has(name) ? "unknown" : "";
+// The pip explains itself on hover (the user 2026-07-22: learn the states from tooltips, not the
+// CLI). It encodes TURN state — is anything running? — not attention; attention lives in the card.
+const DOT_TIP: Record<Exclude<DotState, "">, string> = {
+  work: "working — a turn is running right now",
+  await: "awaiting — idle, but background work it dispatched is still running",
+  unknown: "state unknown — romp couldn't read this session's live state",
+};
 // Ensure a `.fwork-dot` sits immediately before `nameEl` iff `state` is non-empty (idempotent on
 // re-render; an existing dot RETINTS in place when the state flips). The name's text/color are untouched.
 function setWorkDot(nameEl: HTMLElement | null, state: DotState | boolean) {
@@ -503,10 +532,14 @@ function setWorkDot(nameEl: HTMLElement | null, state: DotState | boolean) {
   const st: DotState = state === true ? "work" : state === false ? "" : state;
   const prev = nameEl.previousElementSibling;
   const has = !!prev && prev.classList.contains("fwork-dot");
+  const paint = (d: Element) => {          // one kind class at a time; "work" is the bare base class
+    for (const k of ["await", "unknown"]) d.classList.toggle(k, st === k);
+    (d as HTMLElement).title = st ? DOT_TIP[st] : "";
+  };
   if (st && !has) {
-    const d = el("span", "fwork-dot"); d.classList.toggle("await", st === "await");
+    const d = el("span", "fwork-dot"); paint(d);
     nameEl.parentElement?.insertBefore(d, nameEl);
-  } else if (st && has) prev!.classList.toggle("await", st === "await");
+  } else if (st && has) paint(prev!);
   else if (!st && has) prev!.remove();
 }
 
@@ -956,18 +989,14 @@ function makeAskCard(it: AskItem): HTMLElement {
   // point is that something is wrong. Filled in applySections.
   const stallBtn = el("button", "fask-secbtn fask-stallbtn"); stallBtn.textContent = "Stalled"; stallBtn.style.display = "none";
   const stallBody = el("div", "fask-stall-body");
-  // "Waiting on task" — the FOURTH mutually-exclusive section (the user 2026-07-13): a compact pill (with
+  // "Awaiting task" — the FOURTH mutually-exclusive section (the user 2026-07-13): a compact pill (with
   // the mini spinning swirl inside) that replaces the old boxed awaiting caption when live bg TASKS exist;
   // click expands the task list in the checklist spot, same interaction as Sub-goals. Filled in applySections.
   const taskBtn = el("button", "fask-secbtn fask-taskbtn"); taskBtn.style.display = "none";
   const taskGlyph = el("span", "fask-awaiting-swirl"); taskGlyph.setAttribute("aria-hidden", "true");
   const taskLbl = el("span", "fask-taskbtn-lbl");
   taskBtn.append(taskGlyph, taskLbl);
-  // "N artifacts" (the user 2026-07-08): when the distiller listed PRODUCED files (and the kernel verified
-  // they exist), a small nav line at the BOTTOM of the summary body — click opens the modal, where the
-  // artifacts render as previews. Filled in applySections; shows only with the summary section.
-  const artline = el("div", "fask-artline nav"); artline.style.display = "none";
-  secs.append(bgBody, distill, stallBody, artline);   // the BODIES only; the toggles ride row3 (below), one body shows at a time
+  secs.append(bgBody, distill, stallBody);   // the BODIES only; the toggles ride row3 (below), one body shows at a time
   // now that the toggles exist, populate row3: Background · Summary · Sub-goals · Waiting-on-task — GROUPED
   // left, wrapping together as a block (the user 2026-07-08). Retry/Revive (rare) trail on the right (actions).
   row3.append(bgBtn, takeBtn, stallBtn, subBtn, taskBtn, actions);
@@ -1112,7 +1141,7 @@ function makeAskCard(it: AskItem): HTMLElement {
   a._qApprove = qApprove; a._qDeny = qDeny; a._qBody = qbody;
   a._delegations = delegations;
   a._checklist = checklist;
-  a._distill = distill; a._artline = artline;
+  a._distill = distill;
   a._secs = secs; a._bgBtn = bgBtn; a._bgBody = bgBody; a._takeBtn = takeBtn; a._subBtn = subBtn;
   a._stallBtn = stallBtn; a._stallBody = stallBody;
   a._taskBtn = taskBtn; a._taskLbl = taskLbl;
@@ -1227,7 +1256,7 @@ function applySections(a: any, it: AskItem, distillShown: boolean): void {
   }
   const hasSubs = subCount > 0;
   // live background tasks (the user 2026-07-13): when the card is AWAITING on tasks, the compact
-  // "Waiting on task" pill joins the section toggles and expands this list (the old boxed caption is gone)
+  // "Awaiting task" pill joins the section toggles and expands this list (the old boxed caption is gone)
   const taskList = ((it.awaiting && it.awaiting.tasks) || []).filter(Boolean);
   const hasTasks = taskList.length > 0;
   // resolve the selection (default = summary open), falling back to "none" if the chosen section is empty
@@ -1270,18 +1299,6 @@ function applySections(a: any, it: AskItem, distillShown: boolean): void {
   a._stallBody.style.display = choice === "stall" ? "" : "none";
   if (choice === "stall") a._stallBody.textContent = stallText(stall);
   a._stallBtn.onclick = pick("stall");
-  // "N artifacts" under the summary (the user 2026-07-08): the kernel already existence-filtered the
-  // distiller's list, so a count here is always openable. Click → the modal, where they render as previews.
-  const artline = a._artline as HTMLElement;
-  const arts = it.artifacts || [];
-  if (choice === "summary" && arts.length) {
-    artline.textContent = arts.length === 1 ? "1 artifact" : arts.length + " artifacts";
-    artline.title = "files this work produced — click to preview\n" + arts.join("\n");
-    artline.style.display = "";
-    artline.onclick = (ev: Event) => { ev.stopPropagation(); fullscreenAskId = it.itemId; renderModal(); };
-  } else {
-    artline.style.display = "none";
-  }
   // Sub-goals toggle — visible only when the goal HAS sub-goals; pressed when the tree is showing
   const subBtn = a._subBtn as HTMLElement;
   subBtn.style.display = hasSubs ? "" : "none";
@@ -1290,11 +1307,18 @@ function applySections(a: any, it: AskItem, distillShown: boolean): void {
   subBtn.setAttribute("aria-pressed", choice === "subgoals" ? "true" : "false");
   subBtn.title = choice === "subgoals" ? "hide the sub-goals" : "show the sub-goals";
   subBtn.onclick = pick("subgoals");
-  // "Waiting on task" pill (the user 2026-07-13) — visible only while live bg tasks exist; the mini swirl
+  // "Awaiting task" pill (the user 2026-07-13) — visible only while live bg tasks exist; the mini swirl
   // inside keeps the "in flight" cue; pressed when the task list is showing. No preachy tooltip.
+  // "Awaiting", not "Waiting on": the chat chip and timeline badge already label this exact state
+  // Awaiting, and two words for one state read as two states (the user 2026-08-13).
   const taskBtn = a._taskBtn as HTMLElement;
   taskBtn.style.display = hasTasks ? "" : "none";
-  (a._taskLbl as HTMLElement).textContent = taskList.length === 1 ? "Waiting on task" : "Waiting on " + taskList.length + " tasks";
+  // the KIND words the pill (the user 2026-08-15): "Awaiting job", "Awaiting 3 agents" — the wait's
+  // class in the visible label (tooltips are dead on the touch PWA); kindless keeps the classic "task"
+  const kw = KIND_WORD[(it.awaiting && it.awaiting.kind) || ""] || "task";
+  const one = kw === "agents" ? "agent" : kw;   // singular form: "Awaiting agent", plural "N agents"
+  (a._taskLbl as HTMLElement).textContent =
+    taskList.length === 1 ? "Awaiting " + one : "Awaiting " + taskList.length + " " + (one === kw ? kw + "s" : kw);
   taskBtn.classList.toggle("on", choice === "tasks");
   taskBtn.setAttribute("aria-pressed", choice === "tasks" ? "true" : "false");
   taskBtn.title = choice === "tasks" ? "hide the tasks" : "show the tasks";
@@ -1543,8 +1567,11 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
                        dCompleted, Date.now() / 1000);
   const spinCaption = spin.caption, spinTip = spin.tip, awaitingBg = spin.awaitingBg;
   a._awaitSpin.style.display = spinCaption ? "" : "none";
-  // The AWAITING case gets a rounded box (its distinct read); the swirl spins in every case now.
+  // The AWAITING case gets a rounded box (its distinct read); the swirl spins in every case now —
+  // except the at-rest floor (`still`): quiet/unknown keep the glyph as the state anchor, stilled,
+  // because spin reads as in-flight and nothing is (the user 2026-08-14).
   a._awaitSpin.classList.toggle("await-paused", awaitingBg);
+  a._awaitSpin.classList.toggle("await-still", !!spin.still);
   if (spinCaption) { a._awaitWhy.textContent = spinCaption; a._awaitSpin.title = spinTip || spinCaption; }
   // The swirl's "Analyzing…" caption + tooltip REPLACES the separate "↩ re-judging" chip (the user
   // 2026-06-29: don't show both) — drop the chip the recheck branch set above when the swirl is saying it.
@@ -2213,52 +2240,8 @@ function renderTreeBody(host: HTMLElement, it: AskItem, skipRoot = false) {
   host.appendChild(box);
 }
 
-// The modal's ARTIFACTS strip (the user 2026-07-08): the files this work produced (distiller ARTIFACTS
-// line, kernel existence-filtered), rendered below the tree as click-to-expand previews — an image
-// thumb / PDF chip opening the lightbox on the web dashboard, a plain open-the-file chip in the VS Code
-// webview (its sandbox can't load the kernel's /file URL). Sig-guarded on the path list so a kernel
-// repush doesn't re-fetch every thumb; renderTreeBody wipes the host when the TREE changes, so the
-// strip is (re)appended after it on every modal render.
-function applyModalArtifacts(host: HTMLElement, it: AskItem): void {
-  const arts = it.artifacts || [];
-  let strip = host.querySelector(":scope > .fmodal-arts") as HTMLElement | null;
-  if (!arts.length) { strip?.remove(); return; }
-  const sig = arts.join("\n");
-  if (strip && (strip as any)._sig === sig) return;
-  strip?.remove();
-  strip = el("div", "fmodal-arts");
-  (strip as any)._sig = sig;
-  const head = el("div", "fmodal-arts-head");
-  head.textContent = arts.length === 1 ? "Artifact" : "Artifacts";
-  strip.appendChild(head);
-  const row = el("div", "fmodal-arts-row");
-  for (const p of arts) {
-    const cell = el("div", "fmodal-art");
-    const name = p.slice(p.lastIndexOf("/") + 1) || p;
-    const th = previewThumb(p, it.sid);   // null off the web dashboard (or an unpreviewable type) → chip
-    if (th) {
-      cell.appendChild(th);
-      if (previewKind(p) === "img") {     // a PDF chip already carries its filename; only pixels need a caption
-        const cap = el("div", "fmodal-art-name");
-        cap.textContent = name;
-        cap.title = p;
-        cell.appendChild(cap);
-      }
-    } else {
-      const chip = el("button", "fmodal-art-chip");
-      chip.textContent = name;
-      chip.title = "open " + p;
-      chip.onclick = (ev: Event) => { ev.stopPropagation(); vscodeApi?.postMessage({ type: "openFile", path: p, id: it.sid }); };
-      cell.appendChild(chip);
-    }
-    row.appendChild(cell);
-  }
-  strip.appendChild(row);
-  host.appendChild(strip);
-}
-
 // Debug-mode judge warnings (the user 2026-07-09): every judge failure touching this card, appended
-// below the tree/artifacts. The kernel only emits warnRows while `romp debug on`, so the section
+// below the tree. The kernel only emits warnRows while `romp debug on`, so the section
 // simply never exists in normal mode. One line per failure (time · judge · kind — evidence); a row
 // captured in debug mode expands (native <details>) to the failing call's full input + reply, so a
 // rejection is inspectable the moment it happens, without reproducing it.
@@ -2849,7 +2832,6 @@ function renderModal() {
     // toggling the button reveals the composer.
     wireFollowUp(fupEl, fuboxEl, fuinEl, fusendEl, (txt) => postFollowUp(txt, it.itemId, it.sid));
     renderTreeBody(body, it, false);   // root goal IS the first list line; sub-goals render beneath it
-    applyModalArtifacts(body, it);     // produced-file previews below the tree (the user 2026-07-08)
     applyModalWarnings(body, it);      // debug mode: this card's judge failures, input+reply expandable (the user 2026-07-09)
   }
   // The bottom bar always shows (every modal has an age + Clear); the Follow-up button inside it hides
@@ -3707,7 +3689,11 @@ window.addEventListener("message", (e: MessageEvent) => {
     // an acked prediction early, leaving the backstop to retire it.
     lastFeedEvent = "payload";                         // tripwire: this render's inputs are the fresh payload
     lastPayloadBuildId = typeof m.buildId === "number" ? m.buildId : 0;
-    reconcileFollowMove(incomingAsks, lastPayloadBuildId);
+    // per-host counters when this is a merged multi-kernel payload (mergeHostFeeds.buildIds);
+    // absent on a single-kernel payload, where the top-level buildId is the one counter there is
+    const perHostBuildIds = m.buildIds && typeof m.buildIds === "object" && !Array.isArray(m.buildIds)
+      ? m.buildIds as Record<string, number> : undefined;
+    reconcileFollowMove(incomingAsks, lastPayloadBuildId, perHostBuildIds);
     reconcilePendingDone(incomingAsks);   // retire an optimistic tick once the real tree carries it
     // An optimistic Undo clear is CONFIRMED once the kernel's payload carries the id again → stop forcing it.
     // Until then, keep the cached card in `asks` so the replace above can't drop the just-restored card (flicker).
@@ -3727,7 +3713,8 @@ window.addEventListener("message", (e: MessageEvent) => {
       const c = a.sid ? a.sid.indexOf(":") : -1;             // remote sid → also index the bare name under its host
       if (c > 0 && !a.name.includes(":")) sessionColors.set(a.sid.slice(0, c) + ":" + a.name, a.color.bg);
     }
-    awaitingSet = new Set(Array.isArray(m.awaiting) ? m.awaiting : []);   // straw awaiting dots (the user 2026-07-13)
+    awaitingSet = new Set(Array.isArray(m.awaiting) ? m.awaiting : []);   // await-green awaiting dots (the user 2026-07-13)
+    unknownSet = new Set(Array.isArray(m.stateUnknown) ? m.stateUnknown : []);   // listed-but-unreadable → gray ring, never a blank
     bgServicesMap = m.bgServices && typeof m.bgServices === "object" ? m.bgServices : {};   // session name -> judge-classified service descs → the session-header chip (2026-07-24)
     if (Array.isArray(m.order)) sessionOrder = m.order.filter((x: any) => typeof x === "string");   // grouped-mode session rank (tab/lane order)
     if (Array.isArray(m.sessions)) {
@@ -3824,9 +3811,12 @@ window.addEventListener("message", (e: MessageEvent) => {
     // — the kernel may name a SUB-goal that a visible top card carries — and an id this view never predicted
     // is a no-op, so the ack is safe to broadcast to every feed pane.
     const bid = typeof m.buildId === "number" ? m.buildId : 0;
+    // which kernel's counter `bid` is on: federation stamps a remote ack with its host (prefixInbound);
+    // an unstamped ack came from the local kernel — host "", the same value hostOf gives local cards
+    const ackHost = typeof m.host === "string" ? m.host : "";
     for (const raw of m.ids.map(String)) {
       const top = asks.find((a) => a.itemId === raw) ?? asks.find((a) => a.tree?.some((n) => n.id === raw));
-      ackFollowMove(top ? top.itemId : raw, !!m.ok, bid);
+      ackFollowMove(top ? top.itemId : raw, !!m.ok, bid, ackHost);
     }
   }
 });

@@ -11,8 +11,9 @@ import * as path from "node:path";
 const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
 
 test("drafts are persisted to and reloaded from the webview's saved state", () => {
-  // persist: mirror the Map into setState, alongside (not replacing) whatever else is saved — plus citations
-  assert.match(RENDER, /function persistDrafts\(\): void \{[\s\S]*setState\?\.\(\{ \.\.\.\(vscodeApi\.getState\?\.\(\) \|\| \{\}\), drafts: Object\.fromEntries\(drafts\),[\s\S]*citations: Object\.fromEntries\(composerCitations\),[\s\S]*files: Object\.fromEntries\(composerFiles\) \}\)/);
+  // persist: mirror the Map into setState, alongside (not replacing) whatever else is saved — plus
+  // citations, files, and the staged stack (2026-08-15)
+  assert.match(RENDER, /function persistDrafts\(\): void \{[\s\S]*setState\?\.\(\{ \.\.\.\(vscodeApi\.getState\?\.\(\) \|\| \{\}\), drafts: Object\.fromEntries\(drafts\),[\s\S]*citations: Object\.fromEntries\(composerCitations\),[\s\S]*files: Object\.fromEntries\(composerFiles\),[\s\S]*staged: stagedMsgs\.entries\(\) \}\)/);
   // reload: hydrate the Map from saved state at startup (string values only)
   assert.match(RENDER, /const saved = \(\(vscodeApi\?\.getState\?\.\(\) \|\| \{\}\) as any\)\.drafts;/);
   assert.match(RENDER, /for \(const \[k, v\] of Object\.entries\(saved\)\) if \(typeof v === "string"\) drafts\.set\(k, v\);/);

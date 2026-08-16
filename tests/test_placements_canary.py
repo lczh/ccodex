@@ -119,7 +119,11 @@ class PlacementIdentityCanary(unittest.TestCase):
         # v8 (2026-08-13, the shape-B twin drop): this fixture carries no command wrappers, so every
         # pinned id is UNCHANGED — the bump seals transcripts that DO carry shape-B commands, whose
         # phantom twin atom drops out of the set.
-        self.assertEqual(jd.PLACEMENTS_V, 8, "EXPECTED_SEG_IDS was pinned under PLACEMENTS_V=8 — "
+        # v9 (2026-08-14, the resume-fork stitch): this fixture records no resumeFork lineage, so
+        # every pinned id is UNCHANGED — the bump seals sessions whose machine-cut resumes forked
+        # fresh-headed transcripts, whose previously-dropped pre-cut atoms rejoin the set
+        # (tests/test_kernel_resume_fork_lineage.py covers the stitch itself).
+        self.assertEqual(jd.PLACEMENTS_V, 9, "EXPECTED_SEG_IDS was pinned under PLACEMENTS_V=9 — "
                          "re-pin the ids and this version together, in the same commit")
 
 

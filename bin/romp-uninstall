@@ -154,19 +154,26 @@ rm -f  "$ROMP_DIR/vscode-extension"/*.vsix "$ROMP_DIR/vscode-extension/package.j
 echo "==> SDK venv"
 rm -rf "$STATE/sdkvenv"
 
-# ── 4b. the judge scratch, which lives OUTSIDE the state dir ───────────
-# romp runs its judges as `claude` processes rooted at /tmp/romp-judge (kernel/judge.py's
-# JUDGE_SCRATCH), so Claude Code writes their transcripts into a project dir keyed on that
-# path — outside $STATE, and therefore untouched by --purge. A purged, reinstalled romp kept
-# showing judge records from the PREVIOUS install because of it (the user 2026-07-27, who
-# rightly read that as an incomplete teardown).
+# ── 4b. the judge scratch's Claude Code project dir, which lives OUTSIDE the state dir ───────────
+# romp runs its judges as `claude` processes rooted at JUDGE_SCRATCH (kernel/judge.py), so Claude
+# Code writes their transcripts into a project dir keyed on that path — outside $STATE, and
+# therefore untouched by --purge. A purged, reinstalled romp kept showing judge records from the
+# PREVIOUS install because of it (the user 2026-07-27, who rightly read that as an incomplete
+# teardown).
+#
+# The scratch moved from /tmp/romp-judge to "$STATE/judge-scratch": a world-writable /tmp with a
+# guessable name let another local account create the path first and hand romp's judges — and this
+# teardown — a directory they control. The scratch itself is inside $STATE now, so --purge takes it
+# either way; but the DERIVED project dir is still keyed on the path, so this default has to move
+# with it or the 07-27 symptom comes back under a new name.
 #
 # These are romp's own droppings: every transcript here is a judge call romp made, never a
 # session anyone started, so removing them completes the teardown rather than deleting user
 # data. Scoped to exactly that one derived directory — YOUR project dirs are never touched.
-# Claude Code names a project dir after its cwd with '/' → '-', so /tmp/romp-judge maps to
-# '-tmp-romp-judge'; derived, not hardcoded, so it follows JUDGE_SCRATCH if that ever moves.
-JUDGE_SCRATCH="${ROMP_JUDGE_SCRATCH:-/tmp/romp-judge}"
+# Claude Code names a project dir after its cwd with '/' → '-', so ~/.local/state/romp/judge-scratch
+# maps to '-home-<you>-local-state-romp-judge-scratch'; derived, not hardcoded, so it follows
+# JUDGE_SCRATCH if that ever moves again.
+JUDGE_SCRATCH="${ROMP_JUDGE_SCRATCH:-$STATE/judge-scratch}"
 echo "==> judge scratch"
 
 # Validate BEFORE removing anything. Both paths below are derived from a variable, and an
@@ -175,27 +182,84 @@ echo "==> judge scratch"
 # guard test caught it, and only GNU rm's --preserve-root stopped it.) So require a path
 # that could only be romp's own scratch: absolute, at least two components deep, not $HOME
 # or any ancestor of it, and named for romp. Anything else is skipped loudly, never guessed at.
-_judge_ok=1
-_scratch_slug="${JUDGE_SCRATCH//\//-}"
-case "$JUDGE_SCRATCH" in
-    /*/?*) ;;                                    # absolute AND at least two components
-    *)     _judge_ok="" ;;
-esac
-[[ "$JUDGE_SCRATCH" == *romp* ]]            || _judge_ok=""   # it is romp's scratch or it is not ours
-[[ "$JUDGE_SCRATCH" != "$HOME" ]]           || _judge_ok=""
-[[ "$HOME" != "$JUDGE_SCRATCH"/* ]]         || _judge_ok=""   # never an ancestor of $HOME
-[[ "$JUDGE_SCRATCH" != *".."* ]]            || _judge_ok=""
+#
+# Every one of those checks compares STRINGS, and one directory has many spellings: "$HOME/",
+# "$HOME/.", "$STATE//x", a value with a trailing newline, a case variant on a case-insensitive
+# filesystem. Each is a different string for the same directory, so the string checks miss it
+# and the `rm -rf` below does not — a trailing slash alone is enough to walk $HOME past both
+# the equality check and the ancestor pattern. A trailing slash also switches OFF a symlink
+# refusal, because `[[ -L "$p/" ]]` resolves the link instead of lstat'ing it.
+#
+# So canonicalise ONCE, and run every check against the canonical path, so the path that is
+# validated is the path that gets deleted. It happens in python3 (already required above)
+# rather than a shell suffix-trimmer: a trimmer only closes the spellings that sit at the END
+# of the string, and it never sees a trailing newline at all, because $(...) strips that after
+# the trimmer has already run.
+#
+# The same call emits the Claude Code project slug, because that has to be derived from the very
+# same path: Claude Code names a project dir after its cwd by replacing EVERY non-alphanumeric
+# character with '-', over the REALPATH — kernel/judge.py's _proj_dir implements exactly that. A
+# shell `${p//\//-}` replaces only the slashes, which agreed by luck while the scratch was
+# /tmp/romp-judge (no other non-alnum char in it) and stopped agreeing the moment it moved under
+# ~/.local/state: the dot in `.local` survives, so the two spell the same path differently and the
+# transcripts are left behind.
+_judge_lines="$(python3 - "$JUDGE_SCRATCH" "$STATE" "$HOME" <<'PYEOF'
+import os, re, sys
 
-if [[ -z "$_judge_ok" ]]; then
+raw, state, home = sys.argv[1], sys.argv[2], sys.argv[3]
+
+
+def canon(p):
+    """One spelling per directory. Surrounding whitespace goes first (a trailing newline is a
+    different string for the same dir), then a doubled leading slash — which normpath is
+    required to preserve — then normpath collapses '//', '/./' and any trailing slash."""
+    p = re.sub(r"^//+", "/", p.strip())
+    return os.path.normpath(p) if p else ""
+
+
+cp, chome, cstate = canon(raw), canon(home), canon(state)
+ok = (
+    ".." not in raw                     # never resolved away: '..' through a symlink is not lexical
+    and cp.startswith("/")              # absolute...
+    and cp.count("/") >= 2              # ...and at least two components deep
+    # It is romp's scratch or it is not ours: named for romp, OR sitting inside romp's own state
+    # root — the default is "$STATE/judge-scratch", and a custom ROMP_STATE_DIR with no "romp" in
+    # it (say /data/agents) would otherwise fail this and silently skip the teardown.
+    and ("romp" in cp or cp.startswith(cstate + "/"))
+    and cp != chome                     # $HOME itself...
+    and not chome.startswith(cp + "/")  # ...or any ancestor of it
+    and cp != cstate                    # the state root: only --purge removes that, confirmed
+    and not os.path.islink(cp)          # a symlinked scratch is somebody else's directory
+)
+for danger in (chome, cstate):
+    # The last word whenever the path exists. A symlinked or case-variant spelling of $HOME or
+    # the state dir is a different string for the same inode, and no comparison above sees it.
+    try:
+        if ok and os.path.samefile(cp, danger):
+            ok = False
+    except OSError:
+        pass
+# Line 1 the canonical path the rm gets, line 2 the project slug — both off the same `cp`, so the
+# string that was validated and the directory removed below are one and the same.
+sys.stdout.write("%s\n%s\n" % (cp, re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(cp))) if ok else "")
+PYEOF
+)"
+_judge_scratch="$(printf '%s\n' "$_judge_lines" | sed -n 1p)"
+_scratch_slug="$(printf '%s\n' "$_judge_lines" | sed -n 2p)"
+
+if [[ -z "$_judge_scratch" ]]; then
     echo "    skipped: '$JUDGE_SCRATCH' doesn't look like romp's judge scratch — remove it yourself" >&2
 else
+    JUDGE_SCRATCH="$_judge_scratch"
     rm -rf "$JUDGE_SCRATCH"
     # The transcripts Claude Code wrote for those judge runs. It names a project dir after the
-    # cwd with '/' → '-', so /tmp/romp-judge maps to '-tmp-romp-judge'. Derived, not hardcoded,
-    # so it follows JUDGE_SCRATCH if that ever moves — and gated on the same slug carrying
-    # "romp", so this can never resolve to the projects dir itself or to one of YOUR sessions.
+    # cwd, every non-alphanumeric character to '-', over the realpath. Derived, not hardcoded, so
+    # it follows JUDGE_SCRATCH if that ever moves — and derived from the SAME canonical path the
+    # rm above deleted, so the string that was validated and the target removed here are one
+    # directory. Gated on the same validation above, so this can never resolve to the projects
+    # dir itself or to one of YOUR sessions.
     _judge_proj="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$_scratch_slug"
-    if [[ -d "$_judge_proj" && "$_scratch_slug" == *romp* ]]; then
+    if [[ -d "$_judge_proj" && -n "$_scratch_slug" && "$_judge_proj" != */projects ]]; then
         rm -rf "$_judge_proj"
         echo "    removed romp's judge transcripts ($_judge_proj)"
     fi

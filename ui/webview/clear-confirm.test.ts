@@ -7,7 +7,7 @@ import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { isClearCmd, openTopTitles, clearConfirmDetail } from "./clear-confirm";
+import { isClearCmd, openTopTitles, clearConfirmDetail, endConfirmDetail } from "./clear-confirm";
 
 const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
 const FEED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.ts"), "utf8");
@@ -42,6 +42,16 @@ test("the confirm detail: null with nothing open; singular/plural; long lists ca
   const long = clearConfirmDetail(Array.from({ length: 30 }, (_, i) => "card number " + i))!;
   assert.ok(long.length < 400, "the titles list is capped so the modal stays readable");
   assert.match(long, /…/);
+});
+
+test("endConfirmDetail names the open cards before an End, and stays quiet with none", () => {
+  const base = "The session shuts down.";
+  assert.equal(endConfirmDetail([], base), base, "nothing open -> the short static line");
+  const one = endConfirmDetail(["ship the exporter"], base);
+  assert.ok(one.startsWith("1 card is still open on its board: ship the exporter."));
+  assert.ok(one.endsWith(base));
+  const two = endConfirmDetail(["a", "b"], base);
+  assert.ok(two.startsWith("2 cards are still open on its board: a, b."));
 });
 
 test("sendComposer gates a /clear behind showConfirm — Cancel first (safe default), send only on confirm", () => {

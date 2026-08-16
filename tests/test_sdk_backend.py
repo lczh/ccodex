@@ -1181,6 +1181,31 @@ class SetModelModePure(unittest.TestCase):
         self.assertTrue(self.be.set_mode(sid, "plan"))
         self.assertEqual(sb.read_reg(self.d, sid)["mode"], "plan")
 
+    def test_bypass_applies_to_THIS_session_and_is_never_remembered(self):
+        # The picker offers Bypass on SDK sessions (the user 2026-08-15). Every other mode is a
+        # preference worth inheriting, so it seeds the next new session — but spawn() reads that seed
+        # with nothing in the create UI showing it, so remembering BYPASS would hand every session you
+        # started afterwards an unprompted agent, off one click on one tab. It stays where you set it.
+        sid = self.be.spawn("m", self.d)
+        self.assertTrue(self.be.set_mode(sid, "plan"))
+        self.assertEqual(sb.read_sdk_defaults(self.d).get("mode"), "plan", "an ordinary mode is remembered")
+
+        self.assertTrue(self.be.set_mode(sid, "bypassPermissions"))
+        self.assertEqual(sb.read_reg(self.d, sid)["mode"], "bypassPermissions",
+                         "it DOES apply to the session you set it on")
+        self.assertEqual(sb.read_sdk_defaults(self.d).get("mode"), "plan",
+                         "…and leaves the remembered default alone, rather than clobbering it")
+        self.assertEqual(sb.read_reg(self.d, self.be.spawn("m2", self.d))["mode"], "plan",
+                         "so the NEXT new session comes up prompting, not bypassing")
+
+    def test_bypass_is_not_remembered_even_as_the_first_mode_ever_picked(self):
+        # The guard cannot be "keep the previous default" alone: with no default written yet there is
+        # nothing to keep, and spawn()'s own fallback has to be what a new session lands on.
+        sid = self.be.spawn("m", self.d)
+        self.assertTrue(self.be.set_mode(sid, "bypassPermissions"))
+        self.assertNotEqual(sb.read_sdk_defaults(self.d).get("mode"), "bypassPermissions")
+        self.assertNotEqual(sb.read_reg(self.d, self.be.spawn("m2", self.d))["mode"], "bypassPermissions")
+
     def test_chosen_model_read_from_reg_on_construct(self):
         sess = sb.SdkSession(self.be, {"sid": "x", "name": "n", "cwd": self.d, "model": "sonnet"})
         self.assertEqual(sess.chosen_model, "sonnet")
@@ -1250,13 +1275,23 @@ class RememberedDefaults(unittest.TestCase):
 
     def test_set_mode_is_remembered_and_seeds_the_next_session(self):
         # the bug (the user 2026-06-27): mode wasn't remembered like model/effort, so every new SDK session
-        # came up acceptEdits regardless of the user's preferred (e.g. bypassPermissions/auto-accept) mode.
+        # came up acceptEdits regardless of the user's preferred mode. (This used to demonstrate the point
+        # with bypassPermissions, which is now the ONE mode deliberately left out of the memory — see
+        # SetModelModePure.test_bypass_applies_to_THIS_session_and_is_never_remembered. Any other mode
+        # still seeds, which is what this covers.)
         s1 = self.be.spawn("a", self.d)
-        self.assertTrue(self.be.set_mode(s1, "bypassPermissions"))
-        self.assertEqual(sb.read_sdk_defaults(self.d).get("mode"), "bypassPermissions", "remembered globally")
+        self.assertTrue(self.be.set_mode(s1, "auto"))
+        self.assertEqual(sb.read_sdk_defaults(self.d).get("mode"), "auto", "remembered globally")
         s2 = self.be.spawn("b", self.d)                                  # a NEW session, created AFTER the pick
-        self.assertEqual(sb.read_reg(self.d, s2)["mode"], "bypassPermissions", "new session seeds the mode")
-        self.assertEqual(self.be.live_sessions()[s2]["mode"], "bypassPermissions", "and the badge shows it")
+        self.assertEqual(sb.read_reg(self.d, s2)["mode"], "auto", "new session seeds the mode")
+        self.assertEqual(self.be.live_sessions()[s2]["mode"], "auto", "and the badge shows it")
+
+    def test_a_hand_written_bypass_default_is_still_honoured(self):
+        # The carve-out lives in set_mode, NOT in spawn: romp declines to remember bypass off a click,
+        # but it does not overrule someone who wrote the default themselves. The escape hatch stays open
+        # for anyone who genuinely wants every new session unprompted.
+        sb.write_sdk_default(self.d, mode="bypassPermissions")
+        self.assertEqual(sb.read_reg(self.d, self.be.spawn("a", self.d))["mode"], "bypassPermissions")
 
     def test_remembering_mode_does_not_clobber_model_or_effort(self):
         s1 = self.be.spawn("a", self.d)

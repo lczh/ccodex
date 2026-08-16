@@ -226,6 +226,53 @@ class InboundTrustGate(unittest.TestCase):
             self.assertEqual(clean["code"], ps.PEER_REFUSAL_CODE)
             self.assertEqual(ps._bounce_reason(clean), ps.PEER_REFUSAL_REASON)
             self.assertNotIn("perform-a-synthetic-action", json.dumps(clean))
+    def test_a_forwarder_cannot_outrank_itself_by_stamping_a_trusted_origin(self):
+        """The origin stamp is written BY the forwarder, so trust keyed on it alone is a claim the
+        claimant makes about itself. A peer you tiered `directed` — one you attached but do not let
+        drive your sessions — answers one exchange with origin set to a host you DID tier trusted,
+        and its mail is auto-injected: pasted into a live session and entered. The names to guess
+        are not secret either; presence gossip hands them out. A forwarded message is now capped at
+        the forwarder's own tier, so a directed relay stays directed however it labels its cargo."""
+        self._set_trust("EDGE", "directed")       # the peer we actually received from
+        self._set_trust("ORIGIN", "trusted")      # the name it claims to be speaking for
+        verdict, _ = ps._relay_in("EDGE", _relay("q-forge-1", origin="ORIGIN"))
+        self.assertEqual(verdict, "ack")
+        self.assertEqual(len(ps.quarantine_list()), 1,
+                         "a directed forwarder's mail must hold, whatever origin it stamps")
+        self.assertEqual(len(list((ps.MAILROOT / "sess-web" / "new").glob("*"))), 0,
+                         "nothing may reach the session's mailbox")
+
+    def test_an_isolated_forwarder_stays_dropped_however_it_labels_its_mail(self):
+        # isolated is the strongest refusal the user can express: no communication at all. It must
+        # not become a hold (visible, approvable) by stamping a trusted origin.
+        self._set_trust("EDGE", "isolated")
+        self._set_trust("ORIGIN", "trusted")
+        verdict, _ = ps._relay_in("EDGE", _relay("q-forge-2", origin="ORIGIN"))
+        self.assertEqual(verdict, "ack")
+        self.assertEqual(len(ps.quarantine_list()), 0, "isolated drops; it never even holds")
+        self.assertEqual(len(list((ps.MAILROOT / "sess-web" / "new").glob("*"))), 0)
+
+    def test_the_cap_never_promotes_a_forwarders_mail(self):
+        # The cap is a floor-lowering, not a lookup swap: a trusted forwarder relaying a DIRECTED
+        # origin's mail must still hold it (the origin's own tier still applies).
+        self._set_trust("EDGE", "trusted")
+        self._set_trust("ORIGIN", "directed")
+        verdict, _ = ps._relay_in("EDGE", _relay("q-forge-3", origin="ORIGIN"))
+        self.assertEqual(verdict, "ack")
+        self.assertEqual(len(ps.quarantine_list()), 1)
+
+
+class LeastTrust(unittest.TestCase):
+    def test_the_more_restrictive_tier_wins_either_way_round(self):
+        self.assertEqual(ps.least_trust("trusted", "directed"), "directed")
+        self.assertEqual(ps.least_trust("directed", "trusted"), "directed")
+        self.assertEqual(ps.least_trust("isolated", "trusted"), "isolated")
+        self.assertEqual(ps.least_trust("trusted", "trusted"), "trusted")
+
+    def test_an_unrecognised_tier_is_treated_as_directed_not_trusted(self):
+        # A tier this build does not know must never read as permission.
+        self.assertEqual(ps.least_trust("nonsense", "trusted"), "nonsense")
+        self.assertEqual(ps.least_trust("isolated", "nonsense"), "isolated")
 
 
 class TokenProvenDialerGate(InboundTrustGate):

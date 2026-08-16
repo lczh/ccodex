@@ -16,7 +16,7 @@ test("the section BODIES live in .fask-secs; the toggles moved to the time row (
   assert.match(FEED, /const secs = el\("div", "fask-secs"\); secs\.style\.display = "none";/);
   assert.match(FEED, /bgBtn\.textContent = "Background"/, "capitalized like Clear");
   assert.match(FEED, /takeBtn\.textContent = "Summary"/);
-  assert.match(FEED, /secs\.append\(bgBody, distill, stallBody, artline\)/, "secs holds the BODIES only (incl. the stall body + the artifacts line) — the toggles ride row3 now");
+  assert.match(FEED, /secs\.append\(bgBody, distill, stallBody\)/, "secs holds the BODIES only (incl. the stall body) — the toggles ride row3 now");
   assert.match(FEED, /a\._secs = secs; a\._bgBtn = bgBtn; a\._bgBody = bgBody; a\._takeBtn = takeBtn;/);
   assert.match(FEED, /background\?: string \| null;/, "the AskItem carries the kernel's background field");
   // just a body container now (a plain block; one full-width body shows at a time)
@@ -50,7 +50,7 @@ test("hovering the SELECTED (.on) toggle gives it a reverse highlight — the ac
 
 test("state: a single mutually-exclusive secChoice (bg | summary | subgoals | tasks | none); default follows Collapsed", () => {
   // Sub-goals joined Background/Summary as the THIRD mutually-exclusive section (the user 2026-07-08);
-  // the "Waiting on task" list is the FOURTH (the user 2026-07-13)
+  // the "Awaiting task" list is the FOURTH (the user 2026-07-13)
   assert.match(FEED, /const secChoice = new Map<string, "bg" \| "summary" \| "subgoals" \| "tasks" \| "stall" \| "none">\(\);/);
   // absent from the map → the DEFAULT, set by the footer "Collapsed" toggle (off → summary, on → none)
   assert.match(FEED, /return secChoice\.get\(id\) \?\? \(feedPrefs\(\)\.collapsed \? "none" : "summary"\);/);

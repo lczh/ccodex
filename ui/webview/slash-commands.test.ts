@@ -129,8 +129,9 @@ test("the expanded view lists a multi-group arg hint one bracketed group per lin
 });
 
 test("the composer placeholder hints that / opens commands (the user 2026-06-30)", () => {
-  // the resting placeholder now comes from composerRestingPlaceholder(); its DESKTOP form keeps the "type /
-  // for commands" hint (mobile drops the ⏎/⇧⏎ part — see the composer-send mobile test)
+  // the resting placeholder now comes from composerRestingPlaceholder(); its DESKTOP form carries the
+  // full hint row — send, newline, stage, and the bare "/ for commands" (the user 2026-08-15: "type"
+  // was filler) — while mobile keeps just the core prompt (see the composer-send mobile test)
   assert.match(RENDER, /composer\.placeholder = closed \? "Session closed — read-only" : composerRestingPlaceholder\(\);/);
-  assert.match(RENDER, /"Message this session…  \(⏎ send · ⇧⏎ newline · type \/ for commands\)"/);
+  assert.match(RENDER, /"Message this session…  \(⏎ send · ⇧⏎ newline · ⌘⏎ stage · \/ for commands\)"/);
 });

@@ -67,7 +67,9 @@ teardown() { rm -rf "$TEST_DIR"; }
     [ "$status" -eq 0 ]
     local unit="$ROMP_SYSTEMD_DIR/romp-manager.service"
     grep -q "ExecStart=$ROMP_MANAGER_BIN up" "$unit"
-    ! grep -q "romp-node-launch" "$unit"
+    # `run` + status, NOT a bare `! grep`: `!` is exempt from set -e, so mid-test it asserts nothing.
+    run grep -q "romp-node-launch" "$unit"
+    [ "$status" -ne 0 ]
     [ ! -e "$XDG_STATE_HOME/romp/romp-node" ]
 }
 
@@ -265,7 +267,8 @@ EOF2
     ROMP_OS_OVERRIDE=Linux run "$SVC" install
     [ "$status" -eq 0 ]
     local unit="$ROMP_SYSTEMD_DIR/romp-manager.service"
-    ! grep -q "ROMP_SERVE_PORT\|ROMP_KERNEL_PORT\|ROMP_POSTAL_PORT\|ROMP_MANAGER_PORT\|ROMP_STATE_DIR\|CLAUDE_CONFIG_DIR\|ROMP_TMUX_SOCKET" "$unit"
+    run grep -q "ROMP_SERVE_PORT\|ROMP_KERNEL_PORT\|ROMP_POSTAL_PORT\|ROMP_MANAGER_PORT\|ROMP_STATE_DIR\|CLAUDE_CONFIG_DIR\|ROMP_TMUX_SOCKET" "$unit"
+    [ "$status" -ne 0 ]
     # ...and the file is still well-formed around the seam: the always-present
     # (optional, dash-prefixed) EnvironmentFile line, a blank line, then [Install].
     grep -q "^Environment=ROMP_SUPERVISED=1$" "$unit"

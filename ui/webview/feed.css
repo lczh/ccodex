@@ -344,6 +344,11 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
   -webkit-line-clamp: 2; line-clamp: 2; }
 @keyframes fask-swirl-spin { to { transform: rotate(-360deg); } }
 @media (prefers-reduced-motion: reduce) { .fask-awaiting-swirl { animation: none; } }
+/* The at-rest floor (the user 2026-08-14): a working-column card with nothing in motion (session quiet
+   between turns, or a machine reporting nothing) still shows the glyph as its state anchor — STILLED,
+   because spin reads as in-flight — with the line dimmed to match its at-rest weight. */
+.fask-awaiting.await-still .fask-awaiting-swirl { animation-play-state: paused; opacity: 0.5; }
+.fask-awaiting.await-still .fask-awaiting-why { opacity: 0.75; }
 /* awaiting-background-agents: a rounded outline box so the "held, waiting on dispatched work" state reads as
    distinct. The romp swirl SPINS here like everywhere else (the user 2026-07-04, for whom a spin reads as in flight,
    not stalled — which is the awaiting state; the box already sets it apart from the working cases). The box
@@ -440,6 +445,11 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 /* idle-but-awaiting background work → the same dot in the romp brand green, matching the chat chip's
    Awaiting color (--st-awaitbg-bg in styles.css; hex here because the feed page loads only this file) */
 .fwork-dot.await { background: #54B204; }
+/* state UNKNOWN (listed, but the live state could not be read) → an explicit gray ring, the same
+   "can't see it" gray the network strip's down-host dot uses (strip.ts). Hollow = not a running
+   state; the point is that no-information renders as itself instead of as an empty spot, which is
+   what lets a blank pip mean "alive and quiet". Hex here because this sheet loads standalone. */
+.fwork-dot.unknown { background: transparent; box-shadow: inset 0 0 0 1.5px #8a8a8a; }
 .ftree-meta { flex: 0 0 auto; margin-left: 6px; color: var(--dim); font-size: 0.9em; font-weight: 400;
   white-space: nowrap; }   /* same size as the card checklist lines it corresponds to, never bold (the user 2026-07-02) */
 /* the DISTILLER's per-node line in the modal (restored 2026-06-29): a done node's takeaway / a blocked node's
@@ -1003,26 +1013,8 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 }
 .feed-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
-/* ── artifact previews (the user 2026-07-08): files the work PRODUCED, distiller ARTIFACTS line,
-   kernel existence-filtered. On the card: an "N artifacts" nav line at the bottom of the summary.
-   In the modal: a strip of click-to-expand previews below the tree. .path-thumb / the lightbox are
-   SHARED with the chat (preview.ts) and defined in BOTH sheets — each page loads only its own css
-   (the .romp-acted precedent). ── */
-.fask-artline { font-size: 0.86em; color: var(--dim); cursor: pointer; margin: 2px 0 1px; }
-.fask-artline:hover { color: var(--fg); text-decoration: underline; text-underline-offset: 2px; }
-.fmodal-arts { margin-top: 12px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.08); }
-.fmodal-arts-head { font-size: 0.72em; text-transform: uppercase; letter-spacing: 0.06em; color: var(--dim); margin-bottom: 6px; }
-.fmodal-arts-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; }
-.fmodal-art { display: flex; flex-direction: column; gap: 3px; max-width: 240px; min-width: 0; }
-.fmodal-art-name { font-size: 0.72em; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.fmodal-art-chip { font: inherit; font-size: 0.72em; cursor: pointer; padding: 4px 9px; border-radius: 6px;
-  background: var(--vscode-input-background, #3c3c3c); color: var(--fg);
-  border: 1px solid rgba(255, 255, 255, 0.14); max-width: 240px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.fmodal-art-chip:hover { border-color: var(--accent); }
-
 /* debug-mode judge warnings (the user 2026-07-09): the card modal's failure-inspection section.
-   Sizes reuse the artifact strip's (labels match labels): 0.72em heads, 0.82em body rows. */
+   0.72em heads, 0.82em body rows (labels match labels). */
 .fmodal-warns { margin-top: 12px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.08); }
 .fmodal-warns-head { font-size: 0.72em; text-transform: uppercase; letter-spacing: 0.06em; color: #e0b341; margin-bottom: 6px; }
 .fmodal-warn-row { margin-bottom: 6px; }
@@ -1033,43 +1025,6 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 .fmodal-warn-pre { font-size: 0.82em; margin: 2px 0; padding: 6px 8px; border-radius: 6px;
   background: rgba(0, 0, 0, 0.25); border: 1px solid rgba(255, 255, 255, 0.08);
   white-space: pre-wrap; overflow-wrap: anywhere; max-height: 300px; overflow-y: auto; }
-
-/* a renderable file mentioned by path → a click-to-expand thumbnail (preview.ts previewThumb) */
-.path-thumb { display: inline-flex; align-items: center; gap: 6px; cursor: zoom-in; border-radius: 7px;
-  border: 1px solid rgba(255, 255, 255, 0.14); overflow: hidden; background: rgba(0, 0, 0, 0.25); }
-.path-thumb:hover { border-color: var(--accent); }
-.path-thumb-img { display: block; max-width: 220px; max-height: 140px; object-fit: contain; }
-
-/* the preview's LOADING cue (the user 2026-07-31): the mini romp swirl holds a mentioned image's spot
-   until its load event lands (preview.ts withLoadCue) — a remote file rides the ssh tunnel, and the
-   picture used to pop in with nothing saying it was on the way. First load of a URL only, so re-renders
-   never re-flash it. Both sheets carry it (each page loads only its own — the .romp-acted precedent). */
-.path-load-spin { display: block; width: 20px; height: 20px; margin: 8px 10px;
-  animation: path-load-spin 2.4s linear infinite; }   /* the calm mini-swirl spin, same as the awaiting glyphs */
-@keyframes path-load-spin { to { transform: rotate(-360deg); } }
-.path-img-loading { display: none; }   /* the <img> takes the spot the instant it has pixels */
-@media (prefers-reduced-motion: reduce) { .path-load-spin { animation: none; } }
-.path-thumb.pdf { padding: 5px 9px; cursor: pointer; }
-.path-thumb-tag { font-size: 0.72em; font-weight: 700; letter-spacing: 0.04em; color: var(--accent); flex: 0 0 auto; }
-.path-thumb-name { font-size: 0.72em; color: var(--fg); overflow: hidden; text-overflow: ellipsis;
-  white-space: nowrap; max-width: 200px; }
-
-/* full-view lightbox (preview.ts openLightbox): image at natural-but-capped size, or the PDF in the
-   browser's native viewer. Above every modal/loader layer. Backdrop click / Esc / ✕ closes. */
-#romp-lightbox { position: fixed; inset: 0; z-index: 1300; background: rgba(0, 0, 0, 0.72);
-  display: flex; align-items: center; justify-content: center; }
-.romp-lightbox-inner { display: flex; flex-direction: column; gap: 8px; max-width: 92vw; max-height: 90vh; }
-.romp-lightbox-img { max-width: 92vw; max-height: 82vh; object-fit: contain; border-radius: 8px;
-  box-shadow: 0 12px 44px rgba(0, 0, 0, 0.6); }
-.romp-lightbox-inner.pdf { width: 88vw; height: 88vh; }
-.romp-lightbox-frame { flex: 1 1 auto; width: 100%; border: 0; border-radius: 8px; background: #fff; }
-.romp-lightbox-bar { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.romp-lightbox-name { flex: 1 1 auto; font-size: 0.86em; color: var(--fg); opacity: 0.85;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.romp-lightbox-close { font: inherit; font-size: 0.86em; cursor: pointer; flex: 0 0 auto;
-  padding: 2px 9px; border-radius: 6px; background: rgba(255, 255, 255, 0.1); color: var(--fg);
-  border: 1px solid rgba(255, 255, 255, 0.18); }
-.romp-lightbox-close:hover { border-color: var(--accent); }
 
 /* the "host:" prefix on a federated session's name — see styles.css (one treatment, two sheets) */
 .host-prefix { color: var(--dim); font-weight: 400; font-style: italic; font-size: 0.88em; }

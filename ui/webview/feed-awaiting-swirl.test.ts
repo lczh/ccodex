@@ -21,7 +21,7 @@ test("the swirl element is built in the body, right after the distiller line, an
 });
 
 test("the swirl is driven by spinFor's caption — shown when there is one, else hidden", () => {
-  assert.match(FEED, /import \{ spinFor \} from "\.\/spin-caption";/);
+  assert.match(FEED, /import \{ spinFor, KIND_WORD \} from "\.\/spin-caption";/);
   assert.match(FEED, /const spin = spinFor\(it, distillPending\(dCompleted, dBlocked, it\.summary, it\.blockSummary, !!it\.blocked\),/);
   assert.match(FEED, /const spinCaption = spin\.caption, spinTip = spin\.tip, awaitingBg = spin\.awaitingBg;/);
   assert.match(FEED, /import \{ distillText, distillInputs, applyDistillLine, distillPending \} from "\.\/distiller-line";/);
@@ -29,11 +29,14 @@ test("the swirl is driven by spinFor's caption — shown when there is one, else
   assert.match(FEED, /a\._awaitWhy\.textContent = spinCaption; a\._awaitSpin\.title = spinTip \|\| spinCaption;/);
 });
 
-test("a bg-task wait wears the compact 'Waiting on task' pill that expands the task list (the user 2026-07-13)", () => {
+test("a bg-task wait wears the compact 'Awaiting task' pill that expands the task list (the user 2026-07-13)", () => {
   // the pill joins the mutually-exclusive card sections (bg / summary / subgoals / tasks), swirl inside
   assert.match(FEED, /const taskBtn = el\("button", "fask-secbtn fask-taskbtn"\)/);
   assert.match(FEED, /"bg" \| "summary" \| "subgoals" \| "tasks" \| "stall" \| "none"/);
-  assert.match(FEED, /taskList\.length === 1 \? "Waiting on task" : "Waiting on " \+ taskList\.length \+ " tasks"/);
+  // "Awaiting task", never "Waiting on task": one word per state across every surface — the chat chip
+  // and timeline badge already say Awaiting for this exact state (the user 2026-08-13)
+  assert.match(FEED, /taskList\.length === 1 \? "Awaiting " \+ one : "Awaiting " \+ taskList\.length \+ " "/);
+  assert.doesNotMatch(FEED, /"Waiting on task"/);
   assert.match(FEED, /taskBtn\.onclick = pick\("tasks"\);/);
   // expanded rows render in the checklist spot, same view as Sub-goals, the swirl as each row's mark
   assert.match(FEED, /if \(choice === "tasks"\) \{[\s\S]*?el\("div", "fcheck ftask"\)[\s\S]*?ftask-swirl/);

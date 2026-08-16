@@ -26,7 +26,9 @@ test("build_session gates the API-error (chip 'blocked') on NOT busy — mirrors
 
 test("build_session computes open_now + the awaiting signal BEFORE the gate consumes them", () => {
   const onow = KERNEL.indexOf('open_now = _session_working(session["turns"])');
-  const awaiting = KERNEL.indexOf('awaiting_why = _session_awaiting(sid, sess["path"], not open_now, stamp=True)');
+  const awaiting = KERNEL.indexOf('_aw = _session_awaiting(sid, sess["path"], not open_now, stamp=True)');
+  const unpack = KERNEL.indexOf('awaiting_why = _aw["why"] if _aw else None');
+  assert.ok(unpack !== -1 && awaiting < unpack, "the {kind, why} unpack follows the one call");
   const gate = KERNEL.indexOf('aerr = _api_error(sess["path"]) if not (open_now or awaiting_why) else None');
   assert.ok(onow !== -1 && awaiting !== -1 && gate !== -1, "open_now, awaiting_why, and the gate must all be present");
   assert.ok(onow < gate && awaiting < gate, "open_now + awaiting_why must be defined before the gate (else NameError)");
@@ -35,7 +37,7 @@ test("build_session computes open_now + the awaiting signal BEFORE the gate cons
 test("the chip reads 'working' for an open turn, 'awaitingBg' for a held one — never 'ready'/'blocked'", () => {
   // the formula lives in the SHARED _session_chip now (the user 2026-07-03) — one derivation for the
   // chat chip AND the timeline lane, so the two surfaces can never disagree. Since 2026-07-13 the
-  // awaiting-background case is its OWN state (straw Awaiting), no longer folded into working.
+  // awaiting-background case is its OWN state (await-green Awaiting), no longer folded into working.
   assert.match(KERNEL, /"working" if open_now else\n/);
   assert.match(KERNEL, /"awaitingBg" if awaiting_why else "ready"\)/);
   assert.match(KERNEL, /chip = _session_chip\(sid, sess\["path"\], session, tm, now\)/);

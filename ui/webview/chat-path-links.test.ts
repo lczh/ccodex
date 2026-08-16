@@ -16,6 +16,7 @@ import * as path from "node:path";
 
 const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
 const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
+const VIEW = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "file-view.ts"), "utf8");
 
 test("the chat event carries the kernel's pathLinks verdict on user and assistant turns", () => {
   assert.match(RENDER, /kind: "user";[^\n]*pathLinks\?: Record<string, string>/);
@@ -35,7 +36,8 @@ test("membership in pathLinks gates the link, and the map's value is the OPEN ta
   // the fixed target is what opens (and openPathLink titles it, so hover shows where a fix points);
   // with NO pathLinks key on the event (old kernel, cached payload) the token opens as written
   assert.match(RENDER, /const open = isUri \? fileUriToPath\(tok\) : \(fixed \?\? tok\);/);
-  assert.match(RENDER, /frag\.appendChild\(isUri \? fileUriLink\(tok\) : openPathLink\(tok, open, true\)\);/);
+  assert.match(RENDER, /const link = isUri \? fileUriLink\(tok\) : openPathLink\(tok, open, true\);/);
+  assert.match(RENDER, /frag\.appendChild\(link\);/);
   assert.match(RENDER, /a\.title = "Open " \+ open;/);
 });
 
@@ -58,6 +60,14 @@ test("the kernel resolves in three tiers over the session repo's real file list"
   // one repo listing per build pass, built lazily, never keyed on .git/index mtime
   assert.ok(KERNEL.includes("_pl_memo = {}"), "per-build memo");
   assert.ok(KERNEL.includes("_REPO_LIST_MAX"), "a runaway listing skips tiers 2/3");
+});
+
+test("the /file error bodies name the resolved path, and the viewer doesn't repeat it", () => {
+  assert.ok(KERNEL.includes('"not found: %s" % _tilde(fp)'));
+  assert.ok(KERNEL.includes('"too large to show: %s (%s, limit %s)"'));
+  assert.ok(KERNEL.includes('"not a text file: %s" % _tilde(fp)'));
+  // the viewer's hint line exists for errors that DON'T name the path (network, old kernel)
+  assert.match(VIEW, /if \(!msg\.includes\(path\)\) \{/);
 });
 
 // executed: the Python tokenizer (_path_tokens) and CLICKABLE_PATH_RE must agree on what a token IS —

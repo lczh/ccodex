@@ -39,7 +39,7 @@ class DisconnectBanner(unittest.TestCase):
         # (test_pane_loader_reconnect.py owns that half)
         # …and ARMS the retire (freshPending) so the prompt clears itself when the resync frame lands
         # (the user 2026-08-01) — see test_the_connection_prompt_retires_when_the_resync_lands
-        self.assertIn('if(wasReconn){armStale();freshPending=true;'
+        self.assertIn('if(wasReconn){armStale("reconnect");freshPending=true;'
                       'try{window.dispatchEvent(new Event("romp:wsup"));}catch(e){}}', js)
         self.assertNotIn("if(everConnected){location.reload();return;}", js,
                          "the silent auto-reload-on-reconnect is replaced by a reload PROMPT")
@@ -56,7 +56,34 @@ class DisconnectBanner(unittest.TestCase):
         # after the throttled 5s watchdog), and forces a reconnect to resync — which disarms it again if the
         # resync lands inside the arming window (the user 2026-08-01).
         self.assertIn('document.addEventListener("visibilitychange"', js)
-        self.assertIn("Date.now()-lastRecv>STALE_MS){armStale();freshPending=true;", js)
+        self.assertIn('Date.now()-lastRecv>STALE_MS){armStale("foreground");freshPending=true;', js)
+
+    def test_a_hidden_pane_never_raises_the_stale_banner(self):
+        # the user 2026-08-15, on the phone: the mobile shell shows ONE pane, hiding the rest with
+        # display:none; iOS throttles the hidden iframes' JS, so each hidden pane's watchdog kept
+        # force-closing its own healthy socket and re-raising the banner every ~45s over a dashboard
+        # that was visibly working. A display:none iframe has a ZERO viewport — raiseStale checks that
+        # at raise time (no event exists for a CSS display flip) and stays silent while hidden; a pane
+        # shown while genuinely stale re-raises within one watchdog tick, now visible.
+        js = km._shim("feed")
+        self.assertIn("function paneHidden(){try{return window.parent!==window"
+                      "&&(window.innerWidth===0||window.innerHeight===0);}", js)
+        self.assertIn('function raiseStale(why){if(paneHidden()){staleDiag("stale-suppressed-hidden",why);return;}', js,
+                      "the visibility gate is at RAISE time, so hidden panes reconnect silently")
+
+    def test_every_stale_raise_leaves_a_breadcrumb_naming_pane_and_path(self):
+        # the user 2026-08-15: the flapping-banner repro was Chrome-on-Android after an iOS-shaped
+        # diagnosis — the next report must carry recorded evidence. Every raise (and every hidden-pane
+        # suppression, and every watchdog force-close) posts a clientDiag with the pane, the arming
+        # path (reconnect/foreground), the socket state and the quiet gap; send() queues while the
+        # socket is down, so the breadcrumb survives the drop it describes.
+        js = km._shim("feed")
+        self.assertIn('send({type:"clientDiag",surface:"pane-shim",what:what,', js)
+        self.assertIn('staleDiag("stale-raise",why);', js)
+        self.assertIn('staleDiag("stale-suppressed-hidden",why);', js)
+        self.assertIn('staleDiag("watchdog-close","quiet");', js)
+        self.assertIn('armStale("reconnect");', js)
+        self.assertIn('armStale("foreground");', js)
 
     def test_shim_reconnect_loop_cannot_die(self):
         # The retry chain used to hang entirely off onclose, and the watchdog only ever closed OPEN
@@ -68,7 +95,7 @@ class DisconnectBanner(unittest.TestCase):
         self.assertIn("function connect(){if(ws&&(ws.readyState===0||ws.readyState===1))return;", js)
         self.assertIn("connT=Date.now();", js)
         # the watchdog handles EVERY socket state: half-open OPEN, stuck CONNECTING, and lost-timer CLOSED
-        self.assertIn("if(ws.readyState===1){if(everConnected&&Date.now()-lastRecv>STALE_MS){try{ws.close();}catch(e){}}return;}", js)
+        self.assertIn('if(ws.readyState===1){if(everConnected&&Date.now()-lastRecv>STALE_MS){staleDiag("watchdog-close","quiet");try{ws.close();}catch(e){}}return;}', js)
         self.assertIn("if(ws.readyState===0&&Date.now()-connT>15000){try{ws.close();}catch(e){}return;}", js)
         self.assertIn("if(ws.readyState===3&&Date.now()-connT>8000){connect();}", js)
         # the foregrounding fast-path tears down a stuck CONNECTING socket too, and re-dials a closed one
@@ -111,9 +138,9 @@ class DisconnectBanner(unittest.TestCase):
         self.assertIn("freshPending=true", js, "a reconnect arms the retire")
         # …and the prompt is ARMED, not shown (the user 2026-08-01): raising it at once made it flash up
         # and straight back down on nearly every dashboard open, since the resync lands within a beat.
-        self.assertIn("staleTimer=setTimeout(function(){staleTimer=0;raiseStale();},1000)", js,
+        self.assertIn("staleTimer=setTimeout(function(){staleTimer=0;raiseStale(why);},1000)", js,
                       "a one-second arming window, not an immediate raise")
-        self.assertIn("if(wasReconn){armStale();", js, "the reconnect ARMS it")
+        self.assertIn('if(wasReconn){armStale("reconnect");', js, "the reconnect ARMS it")
         self.assertNotIn("if(wasReconn){raiseStale();", js, "…and never raises it outright")
         self.assertIn("if(staleTimer){clearTimeout(staleTimer);staleTimer=0;}", js,
                       "a resync inside the window disarms it, so it never appears at all")
@@ -133,7 +160,7 @@ class DisconnectBanner(unittest.TestCase):
         # a tab foregrounded onto a dead socket forces a reconnect and used to prompt immediately; that
         # reconnect resyncs like any other, so it arms the same window and disarms on the same frame
         js = km._shim("chat", 7777)
-        self.assertIn("Date.now()-lastRecv>STALE_MS){armStale();freshPending=true;", js)
+        self.assertIn('Date.now()-lastRecv>STALE_MS){armStale("foreground");freshPending=true;', js)
         self.assertNotIn("STALE_MS){raiseStale();", js)
 
     def test_a_standalone_page_retires_only_its_connection_bar(self):

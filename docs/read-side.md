@@ -210,7 +210,7 @@ Completed card. No read-time DAG rebuild, no status derivation, no handoff repai
 - **Lanes**: one per session; each **segment** is a bar `[t, end]` (segments are
   exactly "what the timeline draws as a bar" in the event model), a dot at the
   trigger, idle atoms as the not-working gaps, caption on hover.
-- **Stripes**: awaiting / compacting, from the state read.
+- **Stripes**: needs-input (a live permission/picker prompt) / compacting, from the state read.
 - **Connectors**: postal messages between lanes, from courier records / the message
   log.
 - **Overlays**: focus / hover from the feed and chat (UI ephemera, one WS channel).

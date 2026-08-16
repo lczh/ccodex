@@ -59,6 +59,10 @@ body.rs-lifted.rs-pane-gone::before { display: none; }
   margin-top: 2px; color: #cdd3da; font-size: .92em; line-height: 1.35; background: #1b1b1c; border: 1px solid #3a3a3a;
   border-radius: 6px; padding: 6px 9px; box-shadow: 0 4px 14px #000000aa; pointer-events: none; }
 #rsettings .rs-sub code { background: #0d0d0d; border-radius: 3px; padding: 0 3px; }
+/* A setting whose value differs between the connected machines: the checkbox goes tri-state, and this
+   says so in words beside the label, because an indeterminate box alone is easy to read straight past.
+   Label size, section grey — the hover line names which machines. */
+#rsettings .rs-mixed { color: #6f747c; margin-left: 6px; }
 /* judge model/effort rows are one-liners (the user 2026-07-12): label left, picker right */
 #rsettings .rs-jrow { align-items: center; cursor: default; }
 #rsettings .rs-jrow b { flex: 1 1 auto; }

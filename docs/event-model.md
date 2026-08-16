@@ -244,8 +244,13 @@ third is real new information:
 So authorship collapses to **`author` on the user atom** plus derivation:
 
 ```
-author: "human" | "sdk" | "system" | { peer: <rompUuid> }
+author: "human" | "sdk" | "system"
+      | { peer: <rompUuid>, mid: <msgId>, kind: "delegate"|"coordinate"|"question"|"" }
 ```
+
+A peer author carries the marker it resolved, not just the sender: one delivery can
+hold several messages, so a later reader must be told WHICH one this author came
+from rather than re-scanning the text and landing on a different one.
 
 | author | derived from | opener? |
 |---|---|---|

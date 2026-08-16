@@ -177,7 +177,9 @@ STUB
     # half-finished release this script exists to prevent.
     grep -q "pr merge 4242 " "$GH_LOG"
     grep -q "pr view 4242 " "$GH_LOG"
-    ! grep -qE "pr (merge|view) release-" "$GH_LOG"
+    # `run` + status, NOT a bare `! grep`: `!` is exempt from set -e, so mid-test it asserts nothing.
+    run grep -qE "pr (merge|view) release-" "$GH_LOG"
+    [ "$status" -ne 0 ]
     run git -C "$REPO" tag -l
     [ "$output" = "v0.2.0" ]
 }
@@ -212,7 +214,8 @@ STUB
     run "$REPO/scripts/release.sh" 0.1.0 --skip-tests
     [ "$status" -eq 0 ]
     [[ "$output" == *"no bump PR needed"* ]]
-    ! grep -q "pr create" "$GH_LOG"
+    run grep -q "pr create" "$GH_LOG"
+    [ "$status" -ne 0 ]
     run git -C "$REPO" tag -l
     [ "$output" = "v0.1.0" ]
 }
@@ -338,7 +341,8 @@ STUB
     run "$REPO/scripts/release.sh" --skip-macos --skip-tests
     [ "$status" -eq 0 ]
     [[ "$output" == *"SKIPPING the macOS check"* ]]
-    ! grep -q "workflow run CI" "$GH_LOG"     # no CI was dispatched
+    run grep -q "workflow run CI" "$GH_LOG"   # no CI was dispatched
+    [ "$status" -ne 0 ]
     run git -C "$REPO" tag -l
     [ "$output" = "v0.1.0" ]
 }

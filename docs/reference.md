@@ -45,7 +45,9 @@ These are for scripting and for agents rather than daily use:
 Two things to know before building on `romp sessions --json`. **`waiting` means
 at rest**, the ordinary state of a session that has finished its turn, so
 matching it as an alert badges the whole idle fleet as needing you; the states
-that want a person are `awaiting`, a permission prompt, and `blocked`. And
+that want a person are `permission` and `picker` (a live prompt) and `blocked`.
+(`romp sessions` emits the RAW backend states — the dashboard's chip states,
+`needsInput`/`awaitingBg`, never appear here.) And
 **`id` is the durable key**, not `lastSid`: everything Romp files per session is
 keyed by `id`, while `lastSid` is the live transcript's id and forks on
 `/clear`.

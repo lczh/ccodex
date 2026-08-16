@@ -89,7 +89,16 @@ The trust unit is the **machine**, not a session on it: any process on a remote
 box can write to that box's bus, so trust is set per host. Identity is provided
 by the ssh tunnel the message arrives on — no separate signing. The gate is
 enforced at the receiving bus's delivery point, so it holds regardless of which
-host originated the message (a forwarded message is judged by its true origin).
+host originated the message.
+
+A **forwarded** message is judged by the more restrictive of two tiers: the
+origin's and the forwarding host's. The origin stamp is written by the forwarder
+and nothing signs it, so trusting it alone would let any peer claim to speak for
+a host you tiered `trusted` and have its mail auto-injected — a `directed` host
+could promote itself simply by labelling its cargo. Capping at the forwarder's
+own tier means a directed relay stays directed whatever name it stamps, at the
+cost that mail from a trusted origin relayed through a directed hub is held for
+approval rather than delivered.
 
 **Check-in / “Share my sessions there” is trusted-only administrative
 delegation.** The machine that checks in opens a reverse ssh tunnel and hands

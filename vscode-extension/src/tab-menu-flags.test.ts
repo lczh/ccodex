@@ -36,7 +36,7 @@ test("each toggle item carries an icon (slashed when off) and a sub-description"
 });
 
 test("the menu adds the notification bell toggle — inverted polarity: `notify` true is the ENABLED state (the user 2026-07-28)", () => {
-  assert.match(SRC, /notify\?: boolean; \}/);                       // rides Session like the other two flags
+  assert.match(SRC, /notify\?: boolean;/);                          // rides Session like the other two flags
   assert.match(SRC, /notify: \("notify" in msg\) \? !!msg\.notify/);  // absorbed + carried across pushes
   assert.match(SRC, /const onBell = !!\(s && s\.notify\);/);
   // the icon slashes on !onBell (bell OFF), while feed/mail slash on their own off-flags being TRUE

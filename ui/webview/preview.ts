@@ -1,5 +1,5 @@
-// File-preview helpers shared by the chat (render.ts path thumbnails) and the feed (feed.ts artifact
-// strips) — the user 2026-07-08: when an agent produces a plot/PDF/screenshot, show the thing, not just
+// File-preview helpers for the chat (render.ts path thumbnails and full-size renders) — the user
+// 2026-07-08: when an agent produces a plot/PDF/screenshot, show the thing, not just
 // its path. The bytes come from the kernel's `/file?path=…&sid=…` endpoint (extension-allowlisted,
 // existence-checked, behind the same auth as every route), so a preview is only ever what the kernel
 // can actually read RIGHT NOW — a deleted/hallucinated path 404s and the <img> onerror hides the thumb
@@ -36,6 +36,50 @@ export function canPreview(): boolean {
 // per URL for this page life: chat re-renders rebuild these elements constantly, and re-flashing a
 // spinner over bytes the browser just painted would itself be flicker — only a URL's FIRST load spins.
 const loadedOnce = new Set<string>();
+
+// A manual retry's swirl stays up at least this long before a failure may swap the chip back in —
+// an instant connection reset otherwise flashes it for one frame and the tap looks ignored (the
+// user 2026-08-16). Presentation smoothing only: the failed state is already decided, this paces
+// nothing but the paint.
+const MIN_RETRY_SPIN_MS = 400;
+
+// Blob types for the resumable retry's assembled bytes (an <img> renders a typed blob everywhere;
+// untyped leans on sniffing). Keyed by extension, mirroring IMG_EXT.
+const IMG_MIME: Record<string, string> = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+  webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml",
+};
+
+// Fully-fetched previews for this page life: original URL → object URL. The chat re-renders its
+// messages constantly, and a resumable fetch bypasses the HTTP cache (no-store) — without this memo
+// every re-render would re-pull the whole image over the very link that struggled to deliver it
+// once. Bounded; the evicted entry's blob is released.
+const resolvedUrls = new Map<string, string>();
+function rememberResolved(url: string, objUrl: string): void {
+  resolvedUrls.set(url, objUrl);
+  if (resolvedUrls.size > 24) {
+    const oldest = resolvedUrls.entries().next().value as [string, string];
+    resolvedUrls.delete(oldest[0]);
+    URL.revokeObjectURL(oldest[1]);
+  }
+}
+
+function fmtBytes(got: number, total: number): string {
+  const h = (n: number) => (n >= 1e6 ? (n / 1e6).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1e3)) + " KB");
+  return total ? h(got) + " of " + h(total) : h(got);
+}
+
+// The fixed-footprint wait box shared by the retrying swirl AND the failure chip, so retry churn
+// never shifts the layout under the reader (the user 2026-08-16: the chat scroll thrashed by about
+// a line as the states swapped heights).
+function mkWait(box: HTMLElement): HTMLElement {
+  box.textContent = "";
+  const wait = document.createElement("span");
+  wait.className = "path-full-wait";
+  box.appendChild(wait);
+  return wait;
+}
+
 function withLoadCue(box: HTMLElement, img: HTMLImageElement, url: string): void {
   if (loadedOnce.has(url)) return;
   const spin = document.createElement("img");
@@ -111,52 +155,23 @@ export function openLightbox(path: string, sid?: string | null): void {
   document.body.appendChild(wrap);
 }
 
-// A thumbnail element for `path`: an <img> that REMOVES ITSELF if the kernel can't serve the file
-// (404/413 → onerror), so a mentioned-but-missing path costs nothing. Click opens the lightbox.
-// PDFs get a labeled doc-chip instead of pixels (no server-side rendering); same click behavior.
-export function previewThumb(path: string, sid?: string | null): HTMLElement | null {
-  const kind = previewKind(path);
-  if (!kind || !canPreview()) return null;
-  const box = document.createElement("span");
-  box.className = "path-thumb";
-  box.title = "click to preview " + path;
-  if (kind === "pdf") {
-    box.classList.add("pdf");
-    const tag = document.createElement("span");
-    tag.className = "path-thumb-tag";
-    tag.textContent = "PDF";
-    const nm = document.createElement("span");
-    nm.className = "path-thumb-name";
-    nm.textContent = path.slice(path.lastIndexOf("/") + 1);
-    box.append(tag, nm);
-    // a chip can't self-verify like an <img> — probe so a missing PDF never shows a dead chip
-    fetch(fileUrl(path, sid), { method: "HEAD" }).then((r) => { if (!r.ok) box.remove(); }).catch(() => box.remove());
-  } else {
-    const img = document.createElement("img");
-    img.className = "path-thumb-img";
-    const url = fileUrl(path, sid);
-    img.src = url;
-    img.alt = path;
-    img.loading = "lazy";
-    img.onerror = () => box.remove();
-    withLoadCue(box, img, url);   // mini swirl holds the spot until the load event (first load only)
-    box.appendChild(img);
-  }
-  box.onclick = (ev) => { ev.stopPropagation(); openLightbox(path, sid); };
-  return box;
-}
-
 // FULL-SIZE inline render for a mentioned image in the CHAT (the user 2026-07-20, who wanted not even a
-// thumbnail but a rendered image, like the user messages). Same self-verification as previewThumb —
+// thumbnail but a rendered image, like the user messages). Self-verifying —
 // a path the kernel can't serve removes itself — and an image click still opens the lightbox. Images
 // render at the user-image scale (.path-full-img mirrors .user-img's 320px cap, one size per
 // information type). A PDF is a labeled CARD, not an auto-loading inline viewer (click → lightbox):
 // the first cut embedded an <iframe> per mentioned PDF, and a browser set to "Download PDFs" (or one
 // that declines to render inline) saved a FRESH COPY on every chat re-render — the user's Downloads
 // folder silently filled with datasheet copies (2026-07-20). A fetch must be user-initiated, once.
-// Web only — callers gate on canPreview and fall back per surface. The feed's artifact strips
-// deliberately KEEP previewThumb: cards stay glanceable, the chat is where the full render lives.
-export function previewFull(path: string, sid?: string | null): HTMLElement | null {
+// Web only — callers gate on canPreview and fall back per surface.
+// `verified`: the KERNEL already stat'd this path (spacePaths / a pathLinks verdict), so a load
+// error is TRANSIENT — the kernel restarting mid-fetch, a tunnel blip — not a dead path. Removing
+// the box then erases the preview silently until some later re-render (the user 2026-08-15, who sat
+// through exactly that: verified path pills, no images, no cue). A verified path's failure therefore
+// stays VISIBLE — a "preview unavailable — tap to retry" chip in the figure's spot — per the
+// fail-loudly rule. Only an UNVERIFIED path (old kernel, no pathLinks key) keeps self-removal:
+// there the error really does mean "no such file".
+export function previewFull(path: string, sid?: string | null, verified = false): HTMLElement | null {
   const kind = previewKind(path);
   if (!kind || !canPreview()) return null;
   const box = document.createElement("span");
@@ -175,19 +190,183 @@ export function previewFull(path: string, sid?: string | null): HTMLElement | nu
     box.title = "click to view " + path;
     box.onclick = (ev) => { ev.stopPropagation(); openLightbox(path, sid); };
     // a chip can't self-verify like an <img> — HEAD-probe (headers only, no body — never a download)
-    // so a missing PDF never shows a dead card
-    fetch(fileUrl(path, sid), { method: "HEAD" }).then((r) => { if (!r.ok) box.remove(); }).catch(() => box.remove());
+    // so a missing PDF never shows a dead card. A kernel-VERIFIED card skips the probe: the kernel
+    // said the file exists, and a transient probe failure must not erase the card.
+    if (!verified) fetch(fileUrl(path, sid), { method: "HEAD" }).then((r) => { if (!r.ok) box.remove(); }).catch(() => box.remove());
   } else {
-    const img = document.createElement("img");
-    img.className = "path-full-img";
     const url = fileUrl(path, sid);
-    img.src = url;
-    img.alt = path;
-    img.loading = "lazy";
-    img.onerror = () => box.remove();
-    img.onclick = (ev) => { ev.stopPropagation(); openLightbox(path, sid); };
-    withLoadCue(box, img, url);   // mini swirl holds the spot until the load event (first load only)
-    box.appendChild(img);
+    // A verified preview whose fetch died usually died because the KERNEL was away (a restart mid-
+    // deploy — the 2026-08-15 report hit exactly the converge-restart window), and delta-send never
+    // rebuilds an old turn's DOM, so the chip would otherwise sit until a human tapped it. Bounded so
+    // a genuinely-dead file settles on the tap chip instead of re-fetching on every push forever —
+    // but an attempt that MADE PROGRESS refills the budget (see the resumable retry below): forward
+    // motion is the event proving the link works sometimes, and only truly dead attempts spend it.
+    let autoRetries = 3;
+    let fails = 0;                                   // total failed attempts — the chip's copy escalates
+    // RESUMABLE RETRY STATE (the user 2026-08-16, on flaky wifi: every retry restarted the transfer
+    // from byte 0, so a large figure never finished arriving — and the swirl gave no idea how far it
+    // got). The happy path below stays a plain <img> (the browser cache makes the chat's constant
+    // re-renders free); once a load has FAILED, retries switch to a managed fetch that keeps every
+    // byte received so far and asks the kernel for the REST (Range: bytes=N-, honored by /file and
+    // across the federation relay). A dropping link then finishes the picture ACROSS attempts, with
+    // the swirl narrating real progress ("1.2 of 3.4 MB" — content-length makes it knowable). No
+    // artificial deadline anywhere: only a real network error ends an attempt.
+    let parts: Uint8Array[] = [];
+    let got = 0;
+    let total = 0;
+    let fetching = false;                            // one managed attempt at a time (a tap mid-fetch no-ops)
+    const showChip = () => {
+      if (!box.isConnected) return;                  // the turn re-rendered; a fresh box owns this spot now
+      // ONE continuous narrative while the machinery is still going (the user 2026-08-16, third
+      // report: the box flipped between "trying" and "unavailable" on every auto-retry cycle even
+      // though it eventually loaded — the state bounced, so the UI read as impatient). While bounded
+      // auto-retries remain, the wait box KEEPS its loading persona — swirl + a note carrying the
+      // failure and the plan ("dropped at 1.2 MB of 3.4 MB — retrying · tap to retry now"), the
+      // whole box tappable — and the ⚠ chip appears only when the budget is genuinely spent. A
+      // repeat failure must still READ as a response to a tap: the note re-pulses on swap-in.
+      if (autoRetries > 0) {
+        autoRetries--;
+        failedPreviews.set(box, () => build(true));
+        const wait = mkWait(box);
+        wait.title = path + " — tap to retry now";
+        wait.style.cursor = "pointer";
+        wait.onclick = (ev) => { ev.stopPropagation(); build(true); };
+        const spin = document.createElement("img");
+        spin.className = "path-load-spin";
+        spin.src = "/media/romp-swirl-glyph.svg";
+        spin.alt = "loading preview…";
+        const note = document.createElement("span");
+        note.className = "path-load-note";
+        note.textContent = (got > 0 ? "connection dropped at " + fmtBytes(got, total)
+                                    : "connection dropped")
+                           + " — retrying · tap to retry now";
+        wait.append(spin, note);
+        if (fails > 1) {
+          note.classList.add("path-retry-flash");
+          note.addEventListener("animationend", () => note.classList.remove("path-retry-flash"), { once: true });
+        }
+        return;
+      }
+      const wait = mkWait(box);
+      const chip = document.createElement("span");
+      chip.className = "path-full-retry";
+      // the budget is spent: three attempts gained nothing (progress refills it), so say so plainly
+      chip.textContent =
+        (got > 0 ? "⚠ connection dropped at " + fmtBytes(got, total)
+                 : (fails > 1 ? "⚠ still unavailable" : "⚠ preview unavailable"))
+        + " — tap to retry";
+      chip.title = path;
+      chip.onclick = (ev) => { ev.stopPropagation(); build(true); };
+      wait.appendChild(chip);
+      if (fails > 1) {
+        chip.classList.add("path-retry-flash");
+        chip.addEventListener("animationend", () => chip.classList.remove("path-retry-flash"), { once: true });
+      }
+    };
+    const failAfterBeat = (started: number) => {
+      fails++;
+      // A retry that dies instantly (a dead tunnel resets the connection in milliseconds) would
+      // flash the swirl for one frame and put back an identical chip — an ignored-looking tap.
+      // Hold the swirl to a perceivable beat before swapping. Presentation smoothing only: the
+      // attempt has already failed, and the auto-heal registration rides the same swap.
+      const left = MIN_RETRY_SPIN_MS - (Date.now() - started);
+      if (left > 0) setTimeout(showChip, left); else showChip();
+    };
+    const mkImg = (src: string) => {
+      const img = document.createElement("img");
+      img.className = "path-full-img";
+      img.src = src;
+      img.alt = path;
+      img.loading = "lazy";
+      img.onclick = (ev) => { ev.stopPropagation(); openLightbox(path, sid); };
+      return img;
+    };
+    const resumeFetch = async (note: HTMLElement) => {
+      const gotBefore = got;
+      const r = await fetch(url, { cache: "no-store",
+                                   headers: got > 0 ? { Range: "bytes=" + got + "-" } : {} });
+      if (r.status === 206) {
+        // the kernel continues our partial — the entity size rides Content-Range's "/<size>" tail
+        total = parseInt((r.headers.get("Content-Range") || "").split("/")[1] || "0", 10) || total;
+      } else if (r.ok) {
+        parts = []; got = 0;                         // full body (no range asked, or the server restarted us)
+        total = parseInt(r.headers.get("Content-Length") || "0", 10) || 0;
+      } else {
+        throw new Error("http " + r.status);
+      }
+      const reader = r.body!.getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          parts.push(value);
+          got += value.byteLength;
+          note.textContent = "fetching… " + fmtBytes(got, total);
+        }
+      } finally {
+        if (got > gotBefore) autoRetries = 3;        // progress refills the budget — the link works sometimes
+      }
+      if (total && got < total) throw new Error("cut at " + got);   // stream ended early → resume next attempt
+      const blob = new Blob(parts as BlobPart[], { type: IMG_MIME[path.slice(path.lastIndexOf(".") + 1).toLowerCase()] || "" });
+      return URL.createObjectURL(blob);
+    };
+    const build = (bust: boolean) => {
+      const done = resolvedUrls.get(url);
+      if (done) {                                    // already fully fetched this page-life → instant
+        box.textContent = "";
+        box.appendChild(mkImg(done));
+        return;
+      }
+      if (!bust) {                                   // first attempt: the plain <img> happy path
+        box.textContent = "";
+        const img = mkImg(url);
+        img.onerror = () => {
+          if (!verified) { box.remove(); return; }
+          failAfterBeat(0);                          // no beat on the first attempt — the cue was already up
+        };
+        withLoadCue(box, img, url);   // mini swirl holds the spot until the load event (memo on the un-busted url)
+        box.appendChild(img);
+        return;
+      }
+      if (fetching) return;
+      fetching = true;
+      const started = Date.now();
+      const wait = mkWait(box);
+      const spin = document.createElement("img");
+      spin.className = "path-load-spin";
+      spin.src = "/media/romp-swirl-glyph.svg";
+      spin.alt = "loading preview…";
+      const note = document.createElement("span");
+      note.className = "path-load-note";
+      note.textContent = got > 0 ? "resuming… " + fmtBytes(got, total) : "fetching…";
+      wait.append(spin, note);
+      resumeFetch(note).then((objUrl) => {
+        fetching = false;
+        rememberResolved(url, objUrl);
+        loadedOnce.add(url);                         // re-renders skip the cue — the bytes are in hand
+        if (!box.isConnected) return;
+        box.textContent = "";
+        box.appendChild(mkImg(objUrl));
+      }).catch(() => {
+        fetching = false;
+        if (!verified) { box.remove(); return; }
+        failAfterBeat(started);
+      });
+    };
+    build(false);
   }
   return box;
+}
+
+// Failed VERIFIED previews awaiting recovery. A kernel push arriving IS the kernel-is-back event —
+// no pushes arrive while it's down, so retrying on push can't spam — and render.ts calls this on
+// every incoming kernel message, healing the chips without a tap (event-based; the tap chip stays
+// as the manual path and the backstop once a box's bounded auto-retries are spent).
+const failedPreviews = new Map<HTMLElement, () => void>();
+export function retryFailedPreviews(): void {
+  if (!failedPreviews.size) return;
+  for (const [box, rebuild] of Array.from(failedPreviews.entries())) {
+    failedPreviews.delete(box);                      // one attempt per registration; re-registers on error
+    if (box.isConnected) rebuild();                  // a re-rendered turn made a fresh box — let the old go
+  }
 }

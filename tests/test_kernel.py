@@ -747,7 +747,7 @@ class ViewBuilder(unittest.TestCase):
             self.assertEqual(calls[0], 0, "no incoming postal card → the whole-fleet scan is skipped")
             self.assertEqual(out, plain, "non-postal events pass through unchanged")
             # an incoming postal marker → the scan runs ONCE and its caption lands on the card
-            inc = [{"kind": "user", "md": "romp-msg-id: m9", "ts": T0, "uuid": "u2"}]
+            inc = [{"kind": "user", "md": "<!-- romp-msg-id: m9 -->", "ts": T0, "uuid": "u2"}]
             idx = {"m9": {"from": "peer", "fromId": None, "body": "the full body", "id": "m9",
                           "t": T0, "park": None}}
             cards = km._hydrate_postal(inc, idx)
@@ -763,7 +763,7 @@ class ViewBuilder(unittest.TestCase):
         saved = km._msg_summaries
         km._msg_summaries = lambda: {}
         try:
-            inc = [{"kind": "user", "md": "romp-msg-id: m10", "ts": T0, "uuid": "u3"}]
+            inc = [{"kind": "user", "md": "<!-- romp-msg-id: m10 -->", "ts": T0, "uuid": "u3"}]
             fid = "abcdef00-1234-0000-0000-000000000000"
             idx = {"m10": {"from": "unknown", "fromId": fid, "fromHost": "TESTHOST2",
                            "body": "the sensors are live", "id": "m10", "t": T0, "park": None}}
@@ -1196,7 +1196,7 @@ class ViewBuilder(unittest.TestCase):
             "nodes": {top: gn(top, "research the API", None, why="user asked for the research")},
             "placements": {}, "status": {top: "working"}}))
         saved = km._session_awaiting
-        km._session_awaiting = lambda sid, path, idle, stamp=False: "Waiting on the 3 research agents it dispatched."
+        km._session_awaiting = lambda sid, path, idle, stamp=False: {"kind": "agents", "why": "Waiting on the 3 research agents it dispatched."}
         try:
             card = next(a for a in km.build_feed(NOW)["asks"] if a["itemId"] == top)
         finally:
@@ -1443,7 +1443,8 @@ class ViewBuilder(unittest.TestCase):
         self.assertTrue(km._states_awaiting_overlay(SID).get("awaiting"),
                         "awaiting:true with no later work turn stays awaiting")
         self.assertEqual(km._session_awaiting(SID, str(self.tpath), True),
-                         "Waiting on 2 background jobs it launched.", "the genuine awaiting badge still shows")
+                         {"kind": None, "why": "Waiting on 2 background jobs it launched."},
+                         "the genuine awaiting badge still shows")
 
     def test_blocked_rolls_up_the_card_tree_so_a_buried_block_is_visible(self):
         # nimbus (the user 2026-07-11): the card sat in Needs-you off a block BURIED two levels down,
@@ -1532,18 +1533,22 @@ class ViewBuilder(unittest.TestCase):
             # source 0: real subagents in flight — the snapshot carries the live LIST (a {"type","since"}
             # per agent); the why counts via len() (the pre-fix code %d-formatted the list itself)
             km._tmux_sessions = lambda: {SID: {"subagents": [{"type": "", "since": T0}, {"type": "", "since": T0}]}}
-            self.assertEqual(km._session_awaiting(SID, str(p), True), "2 background agents still working",
+            self.assertEqual(km._session_awaiting(SID, str(p), True),
+                             {"kind": "agents", "why": "2 background agents still working"},
                              "a live subagent DOES leave an idle session awaiting (a working flavor)")
             # source 0.5: the live bg-task set — one task shows its description verbatim
             km._tmux_sessions = lambda: {SID: {"bgTasks": [timer]}}
             self.assertEqual(km._session_awaiting(SID, str(p), True),
-                             "waiting on a background task: 20-minute timer for campaign-start check")
+                             {"kind": "task",
+                              "why": "waiting on a background task: 20-minute timer for campaign-start check"})
             km._tmux_sessions = lambda: {SID: {"bgTasks": [timer, dict(timer, desc="power watcher")]}}
             self.assertEqual(km._session_awaiting(SID, str(p), True),
-                             "waiting on 2 background tasks — 20-minute timer for campaign-start check, …")
+                             {"kind": "task",
+                              "why": "waiting on 2 background tasks — 20-minute timer for campaign-start check, …"})
             # subagents outrank bg tasks when both run (they're the bigger dispatch)
             km._tmux_sessions = lambda: {SID: {"subagents": [{"type": "", "since": T0}], "bgTasks": [timer]}}
-            self.assertEqual(km._session_awaiting(SID, str(p), True), "1 background agent still working")
+            self.assertEqual(km._session_awaiting(SID, str(p), True),
+                             {"kind": "agents", "why": "1 background agent still working"})
         finally:
             km._tmux_sessions = saved
 
@@ -1557,7 +1562,8 @@ class ViewBuilder(unittest.TestCase):
             {"t": T0 + 1, "awaiting": True, "why": "3 agents in flight"},
             {"t": T0 + 2, "state": "idle"},
         ]) + "\n")
-        self.assertEqual(km._session_awaiting(SID, "/nonexistent", True), "3 agents in flight",
+        self.assertEqual(km._session_awaiting(SID, "/nonexistent", True),
+                         {"kind": None, "why": "3 agents in flight"},
                          "the latest awaiting overlay (interleaved with state records) drives the badge")
         self.assertIsNone(km._session_awaiting(SID, "/nonexistent", False),
                           "a WORKING session is not 'awaiting' (idle=False short-circuits)")
@@ -1919,7 +1925,7 @@ class ViewBuilder(unittest.TestCase):
         km._tmux_sessions = lambda: {SID: {"state": "waiting", "since": NOW - 100, "model": "",
                                            "effort": "", "context": None, "compactPct": None, "color": None,
                                            "subagents": [{"type": "", "since": 1}, {"type": "", "since": 2}]}}
-        self.assertIn("2 background agents", km._session_awaiting(SID, str(self.tpath), True) or "",
+        self.assertIn("2 background agents", (km._session_awaiting(SID, str(self.tpath), True) or {}).get("why", ""),
                       "the live SubagentStart/Stop count restores the truth over the superseded overlay")
 
     def test_card_carries_the_auto_nudge_history(self):
@@ -1966,6 +1972,26 @@ class ViewBuilder(unittest.TestCase):
         cards = {a["itemId"]: a for a in km.build_feed(NOW)["asks"]}
         self.assertFalse(cards[g1]["nudgeFailed"],
                          "a closer verdict + user reopen after the failed nudge is the story moving on")
+
+    def test_stalled_chip_retires_on_the_unblockers_ruling(self):
+        # the user 2026-08-14: the unblocker ruled a nudge's block answered in passing (a fresh request
+        # arrived and the session resumed the thread) and the card moved back to Working — but the chip,
+        # whose claim IS that block, survived for hours because "unblocker" was missing from the
+        # story-moved actor set: a red "waiting on you" on a card the judges had just un-waited.
+        g1 = SID + ":g1"
+        self._goal_store(
+            {g1: {"id": g1, "text": "audit the pipeline", "parentId": None, "nodeComplete": False,
+                  "blocked": False, "cleared": False, "trail": [], "t": T0,
+                  "log": [{"ev_t": NOW - 500, "src": "nudge", "kind": "block", "at": NOW - 500},
+                          {"ev_t": NOW - 100, "src": "unblocker", "kind": "unblock", "at": NOW - 100,
+                           "why": "answered in passing: a new request arrived and the session resumed"}]}},
+            {g1: "working"}, last=g1)
+        (jd.STATE / "auto-nudge.json").write_text(json.dumps(
+            {"enabled": True, "nudged": {g1: {"count": 1, "lastTurnId": SID + ":1:aa", "failed": True}}}))
+        km._autonudge_cache.clear()
+        cards = {a["itemId"]: a for a in km.build_feed(NOW)["asks"]}
+        self.assertFalse(cards[g1]["nudgeFailed"],
+                         "the unblocker's ruling IS the story moving on — the chip's claim was just overruled")
 
     def test_debug_mode_joins_warn_rows_onto_the_card(self):
         # the user 2026-07-09: with `romp --debug on`, every judge failure touching a card rides it to the
@@ -2185,7 +2211,8 @@ class ViewBuilder(unittest.TestCase):
         self.assertEqual(km._awaiting_task_descs("00000000-0000-0000-0000-000000000000", "/nonexistent"), [])
         # build_feed attaches the list on awaiting cards, beside the why (source pin)
         src = Path(BIN, "romp-kernel").read_text()
-        self.assertIn('"awaiting": ({"why": await_why, "tasks": _awaiting_task_descs(fsid, s["path"])}', src)
+        self.assertIn('"awaiting": ({"why": await_why, "kind": await_kind,', src)
+        self.assertIn('"tasks": _awaiting_task_descs(fsid, s["path"])} if col == "awaiting" else None)', src)
 
     def test_provisional_card_shows_the_message_caption_once_it_lands(self):
         # The user 2026-06-19: the card reads the captioner's persisted MESSAGE caption ('<segid>#p') — the
@@ -3080,7 +3107,7 @@ class ViewBuilder(unittest.TestCase):
         self._orphaned_goal(idle=True)
         km._set_auto_nudge(True)
         saved = km._session_awaiting
-        km._session_awaiting = lambda sid, path, idle, stamp=False: "Waiting on its background agents."
+        km._session_awaiting = lambda sid, path, idle, stamp=False: {"kind": "agents", "why": "Waiting on its background agents."}
         sent, restore = self._stub_nudge()
         try:
             km._auto_nudge_tick(NOW, km._tmux_sessions())
@@ -4421,7 +4448,7 @@ class ViewBuilder(unittest.TestCase):
         self.assertEqual(card["column"], "needs_input", "a picker-floored card files under BLOCKED directly")
         self.assertIn("input", card["blocked"]["what"], "picker wording reflects a question, not an approval")
         # the session chip (build_session payload) also reads "awaiting" on a picker, like a permission
-        self.assertEqual(km.build_session(SID, NOW)["status"]["state"], "awaiting",
+        self.assertEqual(km.build_session(SID, NOW)["status"]["state"], "needsInput",
                          "the session chip reads awaiting on a live picker")
 
     def test_feed_permission_does_not_floor_a_completed_focus(self):
@@ -5155,6 +5182,26 @@ class ViewBuilder(unittest.TestCase):
                       "after cycling, the kernel records the new mode so the chat label updates")
         self.assertIn(["__push_all__"], calls, "and re-renders so the label flips immediately")
 
+    def test_tmux_set_mode_refuses_a_mode_the_cycle_cannot_reach(self):
+        # The picker gained Bypass for SDK sessions (the user 2026-08-15). shift+tab is the only handle
+        # the TUI gives us, so a tmux session cannot reach bypassPermissions/dontAsk at all — and
+        # set_mode used to return True regardless, telling the caller a permission mode had been set
+        # when _cycle_mode had already declined it. Refuse, so the kernel can say so.
+        saved_tmux, saved_cycle = km._tmux_sessions, km._cycle_mode
+        cycled = []
+        km._tmux_sessions = lambda: {SID: {"mode": "auto"}}
+        km._cycle_mode = lambda name, sid, target: cycled.append(target)
+        try:
+            be = km.TmuxBackend()
+            self.assertFalse(be.set_mode(SID, "bypassPermissions"), "no keystroke reaches it → say no")
+            self.assertFalse(be.set_mode(SID, "dontAsk"), "same for the other flag-only mode")
+            self.assertEqual(cycled, [], "and don't pretend to cycle")
+            for m in km._MODE_CYCLE:
+                self.assertTrue(be.set_mode(SID, m), "every cycle mode still goes through: %s" % m)
+            self.assertEqual(cycled, list(km._MODE_CYCLE))
+        finally:
+            km._tmux_sessions, km._cycle_mode = saved_tmux, saved_cycle
+
     def test_recency_colormap_chooser(self):
         # the colormap chooser (the user 2026-06-16): several perceptually-uniform maps + a persisted pick.
         for name in ("hawaii", "viridis", "magma", "inferno", "plasma", "cividis"):
@@ -5687,7 +5734,7 @@ class ViewBuilder(unittest.TestCase):
         # background work it dispatched is no longer folded into "working" — the shared _session_chip
         # emits `awaitingBg`, so the chat chip (straw "Awaiting") and the timeline lane split together.
         saved = km._session_awaiting
-        km._session_awaiting = lambda sid, path, idle, stamp=False: "bg agents" if idle else None
+        km._session_awaiting = lambda sid, path, idle, stamp=False: {"kind": "agents", "why": "bg agents"} if idle else None
         try:
             chip = km.build_session(SID, NOW)["status"]["state"]
             lane = next(s for s in km.build_timeline(NOW)["sessions"] if s["id"] == SID)["state"]
@@ -5700,7 +5747,7 @@ class ViewBuilder(unittest.TestCase):
         # working beats the awaiting flavor: while the main thread is actually producing, the chip says
         # Working — awaitingBg only covers the idle-but-held stretch.
         saved_aw, saved_w = km._session_awaiting, km._session_working
-        km._session_awaiting = lambda sid, path, idle, stamp=False: "bg agents"
+        km._session_awaiting = lambda sid, path, idle, stamp=False: {"kind": "agents", "why": "bg agents"}
         km._session_working = lambda turns: True
         try:
             chip = km.build_session(SID, NOW)["status"]["state"]
@@ -5712,7 +5759,7 @@ class ViewBuilder(unittest.TestCase):
         # the straw dots (feed cards/headers + chat tabs) key on feed["awaiting"] exactly as the yellow
         # dots key on feed["working"] — same names, same federation prefixing (ARRAY_ID).
         saved = km._session_awaiting
-        km._session_awaiting = lambda sid, path, idle, stamp=False: "bg agents" if idle else None
+        km._session_awaiting = lambda sid, path, idle, stamp=False: {"kind": "agents", "why": "bg agents"} if idle else None
         try:
             feed = km.build_feed(NOW)
         finally:
@@ -5890,7 +5937,7 @@ class ViewBuilder(unittest.TestCase):
         km._tmux_sessions = lambda: {SID: {"state": "permission", "since": NOW - 5, "model": "Opus 4.8",
                                            "effort": "max", "context": 20, "compactPct": None, "color": None}}
         st = km.build_session(SID, NOW)["status"]
-        self.assertEqual(st["state"], "awaiting", "permission -> awaiting chip")
+        self.assertEqual(st["state"], "needsInput", "permission -> the needs-input chip (renamed 2026-08-15)")
         self.assertEqual(st["model"], "Opus 4.8")
         self.assertEqual(st["ctx"], "20")
 
@@ -7432,15 +7479,36 @@ class WaitGraphDelegatesAndStampSupersede(unittest.TestCase):
         return {"ev": "sent", "id": "m%d" % ts, "from_id": f, "to_id": t, "t": ts,
                 "from": "x", "body": body, "kind": kind}
 
-    def test_delegate_creates_a_wait_edge_and_any_reply_clears_it(self):
-        self._log(self._msg(self.A, self.B, NOW - 300, "delegate"))
+    def test_a_cross_host_reply_addressed_to_the_relay_still_answers_the_ask(self):
+        # obsidian↔lab_manager (2026-08-15): a cross-host reply is logged to_id "peer:<host>" (the
+        # relay), not the recipient's sid — the (from,to) pair never closed and the asker wore
+        # "Awaiting <peer>" forever after the answer landed. The row's toName resolves through the
+        # alias map every remote sender's rows build (from_host + from -> from_id).
+        self._log(
+            # the remote asker's question, stamped with its host+name (this row TEACHES the alias)
+            dict(self._msg(self.A, self.B, NOW - 300, "question"),
+                 **{"from": "web", "from_host": "TESTHOST"}),
+            # the local session's reply, addressed to the relay — the observed cross-host shape
+            dict(self._msg(self.B, "peer:TESTHOST", NOW - 200, "coordinate"),
+                 toName="TESTHOST:web"))
         g = km._wait_for_graph(NOW, {self.A, self.B})
-        self.assertEqual((g[self.A]["peerSid"], g[self.A]["kind"], g[self.A]["since"]),
-                         (self.B, "delegate", NOW - 300),
-                         "a handoff is a reply-expecting ask: it creates the edge, labeled delegate")
-        # ANY later message back — even a coordinate — answers the handoff; the edge clears on that event
-        self._log(self._msg(self.B, self.A, NOW - 100, "coordinate", body="done, merged"))
-        self.assertEqual(km._wait_for_graph(NOW, {self.A, self.B}), {})
+        self.assertNotIn(self.A, g, "the relay-addressed reply answers the ask once toName resolves")
+
+    def test_an_unresolvable_relay_row_behaves_as_before(self):
+        self._log(self._msg(self.A, self.B, NOW - 300, "question"),
+                  dict(self._msg(self.B, "peer:TESTHOST", NOW - 200, "coordinate"),
+                       toName="TESTHOST:never-seen"))
+        g = km._wait_for_graph(NOW, {self.A, self.B})
+        self.assertIn(self.A, g, "no alias for the name -> the raw relay id keeps today's behavior")
+
+    def test_a_delegate_transfers_ownership_and_sets_no_edge(self):
+        # the user 2026-08-15 (reversing 2026-07-25): a handoff whose body said "no reply needed" still
+        # parked its sender as awaiting-peer, and a sender with many outstanding handoffs read as
+        # permanently stalled. Ownership transferred is not a dependency — only a QUESTION edges; real
+        # handoff visibility rides the courier goal graph with the peer's completion as the exact end.
+        self._log(self._msg(self.A, self.B, NOW - 300, "delegate"))
+        self.assertEqual(km._wait_for_graph(NOW, {self.A, self.B}), {},
+                         "the delegator is free the moment the handoff sends")
 
     def test_coordinate_makes_no_edge_and_question_keeps_its_kind(self):
         self._log(self._msg(self.A, self.B, NOW - 300, "coordinate"))
@@ -7450,7 +7518,7 @@ class WaitGraphDelegatesAndStampSupersede(unittest.TestCase):
 
     def test_peer_answered_at_tracks_only_answered_pairs(self):
         self.assertEqual(km._peer_answered_at(self.A), 0, "no traffic → nothing answered")
-        self._log(self._msg(self.A, self.B, NOW - 300, "delegate"))
+        self._log(self._msg(self.A, self.B, NOW - 300, "question"))
         self.assertEqual(km._peer_answered_at(self.A), 0, "outstanding ask → not answered")
         self._log(self._msg(self.B, self.A, NOW - 200, "coordinate"))
         self.assertEqual(km._peer_answered_at(self.A), NOW - 200, "the reply time, once it lands")
@@ -7480,14 +7548,14 @@ class WaitGraphDelegatesAndStampSupersede(unittest.TestCase):
                           "awaitingWhy": "sent to a peer to build the flag parser",
                           "awaitingAt": NOW - 500}},
             "placements": {}, "status": {g: "working"}}))
-        self._log(self._msg(self.A, self.B, NOW - 600, "delegate"))
+        self._log(self._msg(self.A, self.B, NOW - 600, "question"))
         full, tops, _deleg = km._session_stamp_read(self.A)   # 3rd slot = delegated-peer sids (2026-08-08)
         self.assertEqual(full[2], "sent to a peer to build the flag parser")
         self.assertEqual(tops, frozenset({g}))
         # the peer's reply lands (also busts the postal-key on the stamp cache) → the stamp view lifts
         self._log(self._msg(self.B, self.A, NOW - 100, "coordinate", body="built and merged"))
         full, tops, _deleg = km._session_stamp_read(self.A)
-        self.assertEqual(full, (None, None, None), "the answered handoff supersedes the older stamp")
+        self.assertEqual(full, (None, None, None, None), "the answered handoff supersedes the older stamp")
         self.assertEqual(tops, frozenset())
 
 

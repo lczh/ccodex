@@ -42,9 +42,19 @@ test("recheck/rejudging spin the same whether or not a brief exists", () => {
 // --- the rest of the ladder, in precedence order ---------------------------------------------------
 test("AWAITING outranks everything and wears the box", () => {
   const s = spinFor({ awaiting: { why: "" }, recheck: true, judging: true, column: "working" }, true, false);
-  assert.equal(s.caption, "Awaiting background agents");
+  assert.equal(s.caption, "Awaiting agents");
   assert.equal(s.awaitingBg, true, "the awaiting case gets the rounded box (.await-paused)");
   assert.match(s.tip, /Not on you|not on you/);
+});
+
+test("the kind words the box: 'Awaiting job' for an external computation, per KIND_WORD", () => {
+  // the wait's CLASS in the visible label (the user 2026-08-15) — tooltips are dead on the touch PWA
+  assert.equal(spinFor({ awaiting: { why: "", kind: "job" }, column: "working" }, false, false).caption,
+               "Awaiting job");
+  assert.equal(spinFor({ awaiting: { why: "", kind: "timer" }, column: "working" }, false, false).caption,
+               "Awaiting timer");
+  assert.equal(spinFor({ awaiting: { why: "", kind: "banana" }, column: "working" }, false, false).caption,
+               "Awaiting agents", "an unknown kind falls back to the box's historic default word");
 });
 
 test("AWAITING uses the kernel's why verbatim (capitalized) when it reads 'waiting on …'", () => {
@@ -54,7 +64,7 @@ test("AWAITING uses the kernel's why verbatim (capitalized) when it reads 'waiti
 });
 
 test("a peer wait (waitingOn chip) and a bg-TASK wait (pill) both defer — no generic awaiting box", () => {
-  // the "Awaiting <peer>" chip / the "Waiting on task" pill already carry these; the box would double up
+  // the "Awaiting <peer>" chip / the "Awaiting task" pill already carry these; the box would double up
   assert.equal(spinFor({ awaiting: { why: "x" }, waitingOn: "peer" }, false, false).caption, null);
   assert.equal(spinFor({ awaiting: { why: "x", tasks: ["t1"] } }, false, false).caption, null);
 });
@@ -69,7 +79,7 @@ test("a PROVISIONAL working card tells the truth about its phase", () => {
 test("a provisional AWAITING placeholder never reads a false 'Working…'", () => {
   // provisional + awaiting (a bg-task wait with no goal to floor) → the awaiting branch owns it
   const s = spinFor({ provisional: true, column: "working", awaiting: { why: "" } }, false, false);
-  assert.equal(s.caption, "Awaiting background agents");
+  assert.equal(s.caption, "Awaiting agents");
 });
 
 test("the SETTLE GAP (turn done, verdict pending) spins on a working card", () => {
@@ -94,8 +104,14 @@ test("DISTILLING names which line is being written", () => {
   assert.equal(spinFor({}, true, true).caption, "Distilling…");
 });
 
-test("an ordinary working card with its turn open shows no spin at all", () => {
-  assert.deepEqual(spinFor({ column: "working" }, false, false), { caption: null, tip: "", awaitingBg: false });
+test("a working card carrying NO signal at all reads as unknown, never as silence", () => {
+  // this pin once asserted the mute card ({caption: null}) as the ordinary case — twice updated,
+  // twice wrong: first the narration (2026-08-13) gave the open turn a voice, then the floor
+  // (2026-08-14) gave every remaining working-column shape one. The empty payload is the floor's
+  // last resort: unknown, stilled glyph, said out loud.
+  const s = spinFor({ column: "working" }, false, false);
+  assert.match(s.caption || "", /unknown/);
+  assert.equal(s.still, true);
 });
 
 test("recheck/rejudging outrank the settle gap and the distiller", () => {
@@ -126,7 +142,7 @@ test("a settled card displaced to Working loses its line but never its caption",
 const FEED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.ts"), "utf8");
 
 test("feed.ts routes the card's swirl through spinFor and keeps no inline copy of the ladder", () => {
-  assert.match(FEED, /import \{ spinFor \} from "\.\/spin-caption";/);
+  assert.match(FEED, /import \{ spinFor, KIND_WORD \} from "\.\/spin-caption";/);
   assert.match(FEED, /const spin = spinFor\(it, distillPending\(/);
   assert.match(FEED, /const spinCaption = spin\.caption, spinTip = spin\.tip, awaitingBg = spin\.awaitingBg;/);
   // the inline ladder is gone — no second, drifting copy of the rule
@@ -168,14 +184,42 @@ test("the narration is the FLOOR — every richer story still wins", () => {
   assert.equal(spinFor({ column: "working", working: w, recheck: true }, false, false, 2000).caption,
                "Analyzing…", "re-check outranks narration");
   assert.equal(spinFor({ column: "working", working: w, awaiting: { why: null } }, false, false, 2000).caption,
-               "Awaiting background agents", "awaiting outranks narration");
+               "Awaiting agents", "awaiting outranks narration");
   assert.equal(spinFor({ column: "working", working: w }, true, false, 2000).caption,
                "Distilling…", "a pending distill outranks narration");
 });
 
-test("no narration off the working column or without the payload", () => {
+test("no spin off the working column — briefs/takeaways/chips carry those cards", () => {
   assert.equal(spinFor({ column: "needs_input", working: { since: 1, toolUses: 2 } }, false, false, 100).caption,
                null);
-  assert.equal(spinFor({ column: "working" }, false, false, 100).caption, null,
-               "a cache-cold card paints plain until the payload snaps in");
+});
+
+test("THE FLOOR IS TOTAL — a working-column card can never be mute (the user 2026-08-14)", () => {
+  // Two cards sat in Working with nothing on them — a session quietly between turns — and the old
+  // contract here BLESSED it ("a cache-cold card paints plain"). Every working-column shape now
+  // yields a caption; when nothing is in motion the glyph stills instead of lying with a spin.
+  const open = spinFor({ column: "working", sessState: "open" }, false, false, 100);
+  assert.equal(open.caption, "Working…");
+  assert.ok(!open.still, "an open turn spins — it IS in flight");
+  const quiet = spinFor({ column: "working", sessState: "quiet" }, false, false, 100);
+  assert.match(quiet.caption || "", /^Paused — resumes/);
+  assert.equal(quiet.still, true, "nothing in motion → the glyph stills (a spin would lie)");
+  const unk = spinFor({ column: "working", sessState: "unknown" }, false, false, 100);
+  assert.match(unk.caption || "", /unknown — this machine isn't reporting/);
+  assert.equal(unk.still, true);
+  assert.match(spinFor({ column: "working" }, false, false, 100).caption || "",
+               /unknown/, "even a payload with NO floor field reads as unknown, never as silence");
+  // the totality sweep: every combination of the ladder's inputs with column=working → a caption
+  const bools: (true | undefined)[] = [undefined, true];
+  for (const judging of bools) for (const recheck of bools) for (const rejudging of bools)
+    for (const provisional of bools) for (const dp of [false, true])
+      for (const working of [undefined, { since: 50, toolUses: 2 }])
+        for (const sessState of [undefined, "open", "quiet", "unknown"])
+          for (const awaiting of [undefined, { why: "" }]) {
+            const s = spinFor({ column: "working", judging, recheck, rejudging, provisional,
+                                working, sessState, awaiting }, dp, false, 100);
+            assert.notEqual(s.caption, null,
+              "mute working card: " + JSON.stringify({ judging, recheck, rejudging, provisional, dp,
+                                                       working: !!working, sessState, awaiting: !!awaiting }));
+          }
 });

@@ -89,8 +89,8 @@ class CourierKindDemoteOnly(unittest.TestCase):
         self.td.cleanup()
 
     def _deliver(self, kind):
-        kind_line = ("\nromp-msg-kind: %s" % kind) if kind else ""
-        recs = [uline(T0, "what subnet is the new box on?\nromp-msg-id: %s%s" % (MID, kind_line), "u1"),
+        kind_line = ("\n<!-- romp-msg-kind: %s -->" % kind) if kind else ""
+        recs = [uline(T0, "what subnet is the new box on?\n<!-- romp-msg-id: %s -->%s" % (MID, kind_line), "u1"),
                 aline(T0 + 30, "It's on the flat /24.", "a1", "u1")]
         (self.proj_dir / (RECIP + ".jsonl")).write_text(
             "\n".join(json.dumps(r) for r in recs) + "\n")

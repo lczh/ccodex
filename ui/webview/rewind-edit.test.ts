@@ -27,10 +27,14 @@ test("the edit affordance renders only on bubbles the backend can address", () =
 test("sending in edit mode posts rewindSend and never a plain sendMessage", () => {
   assert.match(RENDER, /vscodeApi\?\.postMessage\(\{ type: "rewindSend", id: activeId, uuid: editing\.uuid, text: typed \}\);/);
   assert.match(RENDER, /pendingRewind\.set\(activeId, \{ uuid: editing\.uuid, text: typed, ts: Date\.now\(\) \}\);/);
-  // the edit branch returns BEFORE the sendMessage path (and registers no tail-appended optimistic bubble)
+  // the edit branch returns BEFORE any send path runs — since the staged flush (2026-08-15) the first
+  // thing deliver does is release the staged stack, so preceding THAT is what proves an edit can never
+  // fall through into a plain send (the routing itself now lives in routeUserMessage, defined earlier
+  // in the file, so a source-index race against it would be meaningless)
   const editBranch = RENDER.indexOf('type: "rewindSend"');
-  const plainSend = RENDER.indexOf('else { vscodeApi.postMessage({ type: "sendMessage", id: activeId, text });');
-  assert.ok(editBranch > 0 && editBranch < plainSend, "edit branch precedes the plain send");
+  const stagedFlush = RENDER.indexOf("flushStaged(sid);");
+  assert.ok(editBranch > 0 && stagedFlush > 0 && editBranch < stagedFlush,
+    "edit branch precedes deliver's first send action");
 });
 
 test("the composer edit chip cancels via its x and via Escape", () => {

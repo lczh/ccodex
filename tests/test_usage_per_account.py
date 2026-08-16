@@ -196,7 +196,10 @@ class RailRendering(unittest.TestCase):
         # and the spend rows are numbers only — no track span
         self.assertIn("function winDet(u,det)", self.js)
         self.assertIn("winDet(r.usage,det);spendDet(r.usage,det);", self.js)
-        self.assertIn("<span>API spend</span>", self.js)
+        # spend is ONE fleet-level section now (the user 2026-08-13): one shared key, one number,
+        # "· N machines" when several — never a per-host repeat
+        self.assertIn("function fleetSpendHTML(sets)", self.js)
+        self.assertIn("API spend'+(hosts>1?' · '+hosts+' machines':'')", self.js)
         self.assertIn("' tok · '+(v.turns||0)+' turns</span>", self.js)
 
     def test_the_account_wide_notices_read_off_THIS_machine(self):

@@ -183,7 +183,11 @@ class CloserRulesTheCandidate(unittest.TestCase):
         self.assertTrue(top["nodeComplete"])
         self.assertEqual([e for e in top["log"] if e.get("kind") == "done"][0].get("src"), "closer",
                          "the completion has an author and a diary row")
-        self.assertTrue(top["trail"], "DONE-ANCHOR: the ruling turn's recap segment lands on the trail")
+        self.assertEqual(top["trail"], [],
+                         "DONE-ANCHOR is turn-menu-only (the user 2026-08-14): a candidate is ruled "
+                         "from goal history, so the ruling turn's recap holds none of its work — "
+                         "appending it aimed the card's deep-links at unrelated prose. The umbrella "
+                         "keeps its organic trail (none here); its children's tails carry the links.")
         self.assertIn("Run long soak experiment", seen["mt"])
         self.assertIn("is finished", seen["mt"], "the steps-finished note rides the menu")
         self.assertGreaterEqual(s["nodes"][SID + ":g1"].get("closerLookT") or 0, T1,

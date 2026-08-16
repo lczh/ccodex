@@ -55,6 +55,16 @@ class PayloadPins(unittest.TestCase):
         self.assertIn('sess_progress = _open_turn_progress(ps["turns"]) if (ps and who_working) else None', src)
         self.assertIn('"working": (sess_progress if column == "working" else None)', src)
 
+    def test_working_cards_carry_the_mute_proof_floor(self):
+        # the user 2026-08-14: a working card ALWAYS says its state. The kernel grades each session's
+        # disposition — "open" (turn running), "quiet" (parsed, between turns), "unknown" (no parse to
+        # read: a cold cache or a machine reporting nothing) — and every working card carries it, so
+        # the feed's spin floor can speak even when the narration payload cannot ride.
+        import inspect
+        src = inspect.getsource(km.build_feed)
+        self.assertIn('sess_state = "open" if who_working else ("quiet" if ps else "unknown")', src)
+        self.assertIn('"sessState": (sess_state if column == "working" else None)', src)
+
 
 if __name__ == "__main__":
     unittest.main()

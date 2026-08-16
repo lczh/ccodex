@@ -41,8 +41,8 @@ test("linkifyFileUris whole-links a verified span's entire inline-code content",
   // exact-match against the kernel's verified set, then the whole content becomes one open link
   assert.match(RENDER, /const tok = \(code\.textContent \|\| ""\)\.trim\(\);\s*\n\s*if \(!verified\.has\(tok\)\) continue;/);
   assert.match(RENDER, /code\.replaceChildren\(link\);/);
-  // a verified image/PDF joins the same full-size preview strip the token links feed
-  assert.match(RENDER, /if \(previewKind\(tok\) && !previewable\.includes\(tok\) && !\(skipThumbs && skipThumbs\.includes\(tok\)\)\) previewable\.push\(tok\);/);
+  // a verified image/PDF joins the same full-size previews the token links feed (figure at its mention)
+  assert.match(RENDER, /if \(previewKind\(tok\) && !previewable\.includes\(tok\) && !\(skipThumbs && skipThumbs\.includes\(tok\)\)\) \{\s*\n\s*previewable\.push\(tok\);\s*\n\s*mentionAt\.set\(tok, code\);/);
 });
 
 test("the whole-span pass runs BEFORE the token walk, so the new link is skipped by it", () => {

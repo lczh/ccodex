@@ -43,10 +43,14 @@ class SendEcho(unittest.TestCase):
                       "…and the self-correction path while recall still works")
         self.assertEqual(self.posts[0][1], "/send", "the message itself still went out")
 
-    def test_a_handoff_reads_its_wait_back(self):
+    def test_a_handoff_reads_the_ownership_transfer_back(self):
+        # the user 2026-08-15 (reversing 2026-07-25): a delegate transfers ownership — the sender is
+        # NOT recorded as waiting; a sender needing the report before proceeding asks with question
         out = self._send("delegate")
         self.assertIn("as a handoff", out)
-        self.assertIn("waiting on them to report back", out)
+        self.assertIn("they own it now", out)
+        self.assertIn("NOT recorded as waiting", out)
+        self.assertIn("send a question", out)
 
     def test_a_coordinate_stays_the_plain_delivery_line(self):
         self.assertEqual(self._send("coordinate"), "Delivered to 'api'.")

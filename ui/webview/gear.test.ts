@@ -45,8 +45,48 @@ test("every gear fetch routes through the kernel base + token (VS Code's webview
 test("the gear posts kernel ops through ONE shared channel (never re-acquires the VS Code API)", () => {
   assert.ok(!GEAR.includes("acquireVsCodeApi"), "a second acquire throws in a real webview");
   for (const op of ["setAutoNudge", "setJudgeModel", "setIndexModel", "setJudgeEffort", "setIndexEffort",
-    "setColormap", "setPalette", "setDefaultDir", "browseDir"])
+    "setDistillModel", "setDistillEffort", "setColormap", "setPalette", "setDefaultDir", "browseDir"])
     assert.ok(GEAR.includes(`'${op}'`), `gear must post ${op}`);
+});
+
+test("the distilling tier is its own gear pair, defaulting to follow-triage", () => {
+  // The user 2026-08-14: the card-prose judges (distiller, briefer, staller) split out of triage so
+  // what you READ can run a richer model than the placement judges. The stored sentinel "triage"
+  // means follow the triage pick live — today's behavior until the user pins — so the selects must
+  // lead with that option and fill from the RAW /version value, never the resolved model.
+  for (const id of ["rs-distillmodel", "rs-distilleffort"])
+    assert.ok(GEAR.includes(id), `the gear must render ${id}`);
+  assert.ok(GEAR.includes('"triage">Follow triage'), "the follow-triage option leads both selects");
+  assert.ok(GEAR.includes('"none">Default'), "the effort's no-flag pin is the stored sentinel, never ''");
+  assert.ok(GEAR.includes("v.distillModel"), "fill() reads the RAW distill model value");
+  assert.ok(GEAR.includes("v.distillEffort"), "fill() reads the RAW distill effort value");
+});
+
+test("every kernel-side select says so when connected machines disagree (the autoNudge rule generalized)", () => {
+  // The user 2026-08-14: everything stays in sync; on disagreement the gear ASKS by showing the local
+  // value with a mixed mark beside it — hover names the hosts, one pick sets every machine — and a
+  // machine that never reported (an older kernel) is unknown, never a disagreement to click away.
+  assert.ok(GEAR.includes("fillMixedMarks"), "the generalized reconcile must exist and be called");
+  assert.ok(/t\.settings && typeof t\.settings\[key\] !== 'undefined'/.test(GEAR),
+    "non-reporting rows are excluded, not read as disagreeing");
+  assert.ok(GEAR.includes("differs on: "), "the hover names the disagreeing hosts");
+  const mixedSpans = GEAR.match(/class=rs-mixed hidden/g) || [];
+  assert.ok(mixedSpans.length >= 7, `every kernel-side select carries a marker span (got ${mixedSpans.length})`);
+});
+
+test("the Auto Nudge box speaks for every attached machine, and says so when they disagree", () => {
+  // /version answers for the kernel serving this page only, so the box used to show one machine's
+  // setting as everyone's — the user 2026-08-14 unchecked it and the other machine kept nudging with
+  // nothing on screen to say so. The reconcile reads each attached row's own setting off /tunnels.
+  assert.ok(GEAR.includes("fetch(ku('/tunnels')"), "the box must check the OTHER kernels, not just /version");
+  assert.ok(GEAR.includes("an.indeterminate = true"), "hosts that disagree put the box in the mixed state");
+  assert.ok(GEAR.includes("rs-autonudge-split"), "…said in words too — a tri-state box alone reads past");
+  assert.ok(GEAR_CSS.includes(".rs-mixed"), "…and that marker needs its styling, or it inherits nothing");
+  assert.ok(/t\.status === 'up'/.test(GEAR) && /typeof t\.autoNudge === 'boolean'/.test(GEAR),
+    "only a CONNECTED host that actually reported a setting counts — never guess for a silent one");
+  // The description is the one level down: it names the machines, so it cannot be a frozen literal.
+  assert.ok(/asub\.textContent = AUTONUDGE_SUB\s*\n?\s*\+/.test(GEAR) && GEAR.includes("split.join("),
+    "the hover line must name who differs");
 });
 
 test("the gear owns its browseResult (the reply lands in the FEED document, not the chat's)", () => {

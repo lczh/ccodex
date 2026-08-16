@@ -21,7 +21,7 @@ test("Stalled is a real section button, in the toggle row, with its own class", 
   assert.match(FEED, /const stallBtn = el\("button", "fask-secbtn fask-stallbtn"\); stallBtn\.textContent = "Stalled";/);
   assert.match(FEED, /row3\.append\(bgBtn, takeBtn, stallBtn, subBtn, taskBtn, actions\)/,
     "it rides the same row as the other toggles");
-  assert.match(FEED, /secs\.append\(bgBody, distill, stallBody, artline\)/,
+  assert.match(FEED, /secs\.append\(bgBody, distill, stallBody\)/,
     "and its body rides the same body container");
 });
 

@@ -73,8 +73,8 @@ test("scrollToAnchor restores a keep-offset instead of landing on it", () => {
     "the row comes back at its captured offset");
   assert.ok(!/landOn\(/.test(branch), "a restore must NOT top-align + flash the row like a jump");
   // …and the ordinary path still does land properly.
-  assert.match(body, /landTrail\.push\("pointer-exact"\);\s*\n\s*landOn\(target\);/,
-    "a genuine deep-link still lands via landOn");
+  assert.match(body, /landTrail\.push\("pointer-exact"\);\s*\n\s*landOn\(target, uuid\);/,
+    "a genuine deep-link still lands via landOn (uuid = the one-flash-per-navigation key)");
 });
 
 test("a keep-offset restore that misses does not toast the reader 'couldn't locate'", () => {

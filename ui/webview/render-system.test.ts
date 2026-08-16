@@ -35,9 +35,10 @@ test("the card is a bordered box with a ⚙ header + one-line summary + caret, c
 });
 
 test("each CLAUDE.md doc renders as a raw, scrollable SUB-box with a scope badge + path", () => {
-  assert.match(RENDER, /for \(const doc of ev\.claudemd \|\| \[\]\)/);
+  assert.match(RENDER, /\(ev\.claudemd \|\| \[\]\)\.forEach\(\(doc, i\) =>/);   // indexed — each doc's scroll key needs its position
   assert.match(RENDER, /el\("span", "sys-doc-scope " \+ \(doc\.scope === "global" \? "global" : "project"\)\)/);
-  assert.match(RENDER, /sec\.appendChild\(preEl\(doc\.text\)\)/, "raw text in a .fold-pre box, not markdown-rendered");
+  assert.match(RENDER, /sec\.appendChild\(preEl\(doc\.text, key \? key \+ ":doc" \+ i : undefined\)\)/,
+    "raw text in a .fold-pre box, not markdown-rendered — scroll keyed per doc (fold-scroll.test.ts)");
 });
 
 test("the card never claims to be the verbatim harness prompt — it says the base prompt isn't recorded", () => {

@@ -364,7 +364,8 @@ class StalledGoals(Base):
         # stalled_facts (judge side) and build_feed's routing key on the SAME jd.WHY_IN_FLIGHT tuple,
         # so the two stall surfaces can never disagree about which reasons wear the chip.
         self.assertEqual(set(jd.WHY_IN_FLIGHT),
-                         {jd.WHY_JUDGING, jd._WHY_JUDGING_LEGACY, jd.WHY_TURN_IN_FLIGHT})
+                         {jd.WHY_JUDGING, jd._WHY_JUDGING_LEGACY, jd.WHY_TURN_IN_FLIGHT,
+                          jd.WHY_UNBLOCK_UNSETTLED})   # the repeat-unblock hold is in-flight too
         self.assertNotIn("the agent's to-do sync is due", jd.WHY_IN_FLIGHT,
                          "store-backed reasons wear the chip — they are genuine stalls to read")
 

@@ -6,7 +6,18 @@ import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { usageColor, fmtAgo, fmtReset, fmtUsd, usageWindows, apiCell, STRIP_PANES } from "./strip";
+import { usageColor, fmtAgo, fmtReset, fmtUsd, fmtTok, usageWindows, apiCell, STRIP_PANES } from "./strip";
+
+test("fmtTok: 3 significant figures at every magnitude (the user 2026-08-13)", () => {
+  assert.equal(fmtTok(1_318_619_909), "1.32B");
+  assert.equal(fmtTok(13_200_000_000), "13.2B");
+  assert.equal(fmtTok(132_000_000_000), "132B");
+  assert.equal(fmtTok(1_300_000_000), "1.30B");   // trailing zero KEPT — the precision is the point
+  assert.equal(fmtTok(433_181_617), "433M");
+  assert.equal(fmtTok(4_330_000), "4.33M");
+  assert.equal(fmtTok(9_990), "9.99k");
+  assert.equal(fmtTok(999), "999");               // below 1k the raw count already carries 3 figures
+});
 
 test("usageColor mirrors the rail's green/amber/red ramp", () => {
   assert.equal(usageColor(0), "#54B204");
@@ -179,8 +190,8 @@ test("apiCell arms on the spend windows' presence and carries 1 day + 1 month", 
     "the collapsed cell shows 1 day + 1 month only — 1 week lives in the hover");
   assert.deepEqual(cell!.segs.map((s) => fmtUsd(s.usd)), ["$12", "$88"], "whole dollars, no cents");
   assert.match(cell!.title, /^API-key spend\n/);
-  assert.match(cell!.title, /1 week — \$40 · 9M tok · 21 turns/, "the hover keeps the full breakdown");
-  assert.match(cell!.title, /1 day — \$12 · 3\.5M tok · 5 turns/);
+  assert.match(cell!.title, /1 week — \$40 · 9\.00M tok · 21 turns/, "the hover keeps the full breakdown");
+  assert.match(cell!.title, /1 day — \$12 · 3\.46M tok · 5 turns/);   // 3 sig figs (the user 2026-08-13)
 });
 
 test("an older kernel's fiveHour window still arms the cell (version skew)", () => {

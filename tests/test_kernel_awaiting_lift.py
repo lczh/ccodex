@@ -59,6 +59,14 @@ def _notification(tid, t):
             "message": {"role": "user", "content": body}}
 
 
+def _monitor(tid, t, timeout_ms=300000):
+    """A non-persistent Monitor launch — the watcher shape; expires at t + timeout + grace with no
+    terminal record when its CLI dies mid-watch (em._bg_expired)."""
+    return {"type": "assistant", "timestamp": _iso(t), "uuid": "m" + tid, "parentUuid": None,
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": tid, "name": "Monitor", "input": {"timeout_ms": timeout_ms}}]}}
+
+
 class AwaitingLift(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
@@ -90,13 +98,15 @@ class AwaitingLift(unittest.TestCase):
         km._bgall_cache.clear(); km._bgtasks_cache.clear()
 
     def _seed(self, why="waiting on two dispatched investigations; will act when they return",
-              born=BORN, anchor=STAMP, written=None):
+              born=BORN, anchor=STAMP, written=None, kind=None):
         """`anchor` is awaitingAt (the audited turn's TRIGGER time); `written` is when the closer actually
         wrote the verdict (its `at`), which defaults to the anchor for the pre-2026-07-27 fixture shape."""
         nd = {"id": self.gid, "text": "a goal", "parentId": None, "nodeComplete": False,
               "blocked": False, "cleared": False, "trail": [], "t": born, "mt": born,
               "awaitingWhy": why, "awaitingAt": anchor,
+              **({"awaitingKind": kind} if kind else {}),
               "log": [{"ev_t": anchor, "src": "closer", "kind": "awaiting", "why": why,
+                       **({"awaitKind": kind} if kind else {}),
                        "at": anchor if written is None else written}]}
         (km.jd.GOALDIR / (SID + ".json")).write_text(json.dumps(
             {"rompUuid": SID, "seq": 1, "placements": {}, "status": {}, "nodes": {self.gid: nd}}))
@@ -123,6 +133,31 @@ class AwaitingLift(unittest.TestCase):
         self._seed()
         self._tick()
         self.assertIsNotNone(self._stamp(), "one dispatch is still out → still genuinely awaiting")
+
+    # ---- kind=job: the watcher is the CARRIER, not the wait (the user 2026-08-15) ----
+    def test_a_job_stamps_expired_watcher_does_not_lift_it(self):
+        # the observed slurm shape: a watcher armed over an external job dies with a restart (no
+        # terminal record, expires past its deadline) — the JOB may still be running, so the stamp
+        # stands; the 6h wake is the backstop, per the lift's own design note
+        self._transcript([_monitor("t1", LAUNCH)])   # deadline LAUNCH+300s; no terminal record
+        self._seed(why="slurm 4821 regenerating the parts; verifies when done", kind="job")
+        self._tick(now=LAUNCH + 1000)                # well past deadline + grace → expired
+        self.assertIsNotNone(self._stamp(), "a dead watcher is not the external job returning")
+
+    def test_the_same_expired_watcher_lifts_a_kindless_stamp_as_before(self):
+        # the legacy trade stands for untyped stamps: expiry counts as returned (the pre-enum rule,
+        # 'the awaiting-stamp lift must not wait forever on a dead monitor')
+        self._transcript([_monitor("t1", LAUNCH)])
+        self._seed(why="watching the long sweep")
+        self._tick(now=LAUNCH + 1000)
+        self.assertIsNone(self._stamp(), "kindless keeps the pre-enum expiry behavior")
+
+    def test_a_job_stamps_real_terminal_record_still_lifts(self):
+        # the watcher genuinely returned and reported — that IS the deciding event, job kind or not
+        self._transcript([_launch("t1", LAUNCH), _notification("t1", BACK)])
+        self._seed(why="slurm 4821 regenerating the parts", kind="job")
+        self._tick()
+        self.assertIsNone(self._stamp(), "a real terminal record ends the wait for every kind")
 
     # ---- self-scoping: the other awaiting flavors are untouched ----
     def test_a_wait_with_no_dispatches_of_its_own_is_untouched(self):
@@ -323,6 +358,46 @@ class AwaitingLift(unittest.TestCase):
         every = km._scan_bg_tasks(self.path, want_all=True)
         self.assertEqual(sorted(t["id"] for t in every), ["t1", "t2"])
         self.assertEqual({t["id"]: t["status"] for t in every}["t1"], "completed")
+
+    # ---- a return the stamping judge already saw cannot end the wait (2026-08-16) ----
+    def test_scan_records_when_the_result_landed(self):
+        # the substrate: endT is the notification record's transcript time, the lift's evidence
+        self._transcript([_launch("t1", LAUNCH), _notification("t1", BACK)])
+        every = km._scan_bg_tasks(self.path, want_all=True)
+        self.assertEqual(int(every[0].get("endT") or 0), BACK)
+
+    def test_returns_the_stamp_already_knew_do_not_lift_it(self):
+        # the incident: a stamp about EXTERNAL work (cluster captures due hours later) was written
+        # while the goal's only local dispatch had returned HOURS earlier, in a turn the stamping
+        # judge had long since audited — the all-returned test was instantly true and the stamp
+        # lifted the same minute it was written, whereupon the lift row mooted the nudge-failure
+        # evaluation and the card idled in Working with no reviver left. A return that predates the
+        # stamp's ANCHOR (the audited turn's trigger) is evidence the judge stamped WITH; only a
+        # return past the anchor can be the event the stamp waited on. (Mid-turn and audit-lag
+        # returns — after the anchor, before the write — keep lifting, per the tests above.)
+        self._transcript([_launch("t1", LAUNCH), _notification("t1", BACK)])
+        self._seed(why="waiting on the four cluster captures landing overnight",
+                   anchor=BACK + 80, written=BACK + 100)   # stamped well after the return landed
+        self._tick(now=BACK + 500)
+        self.assertIsNotNone(self._stamp(),
+                             "a pre-anchor return can't end the wait — the 6h wake owns this one")
+
+    def test_a_lift_drops_the_goals_spent_nudge_record(self):
+        # the lift is NEW INFORMATION for the escalation ladder: an idle session never produces the
+        # genuine turn the ledger's arm-key dedup waits for, so a latched (failed/moot) record would
+        # otherwise silence nudges on this goal forever — erase it with the stamp (2026-08-16)
+        self._transcript([_launch("t1", LAUNCH), _notification("t1", BACK)])
+        self._seed()
+        km._mark_auto_nudged(self.gid, "SOME-ARM-TURN", 3, at=BACK - 50)
+        d = dict(km._auto_nudge_data())
+        n = dict(d.get("nudged", {}))
+        n[self.gid] = dict(n[self.gid], moot=True)      # the latch the incident carried
+        d["nudged"] = n
+        km._write_auto_nudge(d)
+        self._tick()
+        self.assertIsNone(self._stamp(), "precondition: this lift lands")
+        self.assertNotIn(self.gid, km._auto_nudge_data().get("nudged", {}),
+                         "the lift erases the spent record so the ladder can re-engage")
 
 
 if __name__ == "__main__":

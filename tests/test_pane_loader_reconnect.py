@@ -69,7 +69,7 @@ class PaneLoaderReconnect(unittest.TestCase):
         """A first connect must NOT fire it: the loader is legitimately up during a cold load and has to
         stay there until real content lands (an 8s timer that hid it early was the 2026-07-03 bug)."""
         shim = km._shim("chat")
-        self.assertIn('if(wasReconn){armStale();freshPending=true;'
+        self.assertIn('if(wasReconn){armStale("reconnect");freshPending=true;'
                       'try{window.dispatchEvent(new Event("romp:wsup"));}catch(e){}}',
                       shim, "wsup rides the same wasReconn gate as the reload prompt (which now also arms "
                             "its own retire — the user 2026-08-01)")

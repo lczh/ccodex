@@ -32,11 +32,44 @@ km = SourceFileLoader("romp_kernel_judgesync", os.path.join(BIN, "romp-kernel"))
 
 class ApplySettings(unittest.TestCase):
     def setUp(self):
-        for f in ("judge-model", "index-model", "judge-effort", "index-effort"):
+        for f in ("judge-model", "index-model", "judge-effort", "index-effort",
+                  "distill-model", "distill-effort"):
             try:
                 (km.jd.STATE / f).unlink()
             except OSError:
                 pass
+
+    def test_distill_pair_applies_pins_and_reports_raw(self):
+        # the ack answers the RAW stored value ("triage" = following the triage pick), matching
+        # /version, so the gear shows the user's CHOICE — never its resolution
+        res = km._apply_judge_settings({})
+        self.assertEqual((res["distillModel"], res["distillEffort"]), ("triage", "triage"))
+        res = km._apply_judge_settings({"distillModel": "haiku", "distillEffort": "none"})
+        self.assertEqual((km.jd.STATE / "distill-model").read_text(), "haiku")
+        self.assertEqual((km.jd.STATE / "distill-effort").read_text(), "none",
+                         '"none" PINS no-flag; "" is unstorable (folds into the follow default) and ignored')
+        self.assertEqual((res["distillModel"], res["distillEffort"]), ("haiku", "none"))
+        res = km._apply_judge_settings({"distillEffort": ""})
+        self.assertEqual(res["distillEffort"], "none", "an empty distill effort is invalid, not a clear")
+
+    def test_distill_sentinel_returns_the_pair_to_follow_mode(self):
+        km._apply_judge_settings({"distillModel": "haiku", "distillEffort": "high"})
+        res = km._apply_judge_settings({"distillModel": "triage", "distillEffort": "triage"})
+        self.assertEqual((res["distillModel"], res["distillEffort"]), ("triage", "triage"))
+
+    def test_distill_garbage_is_ignored_like_every_other_tier(self):
+        km._apply_judge_settings({"distillModel": "haiku"})
+        res = km._apply_judge_settings({"distillModel": "gpt-99"})
+        self.assertEqual(res["distillModel"], "haiku", "garbage never reaches `claude --model`")
+
+    def test_version_and_tunnels_carry_the_settings_dict(self):
+        # source pins in the sync file's own style: /version publishes ONE settings dict a peer
+        # kernel lifts onto its /tunnels row, and the row serializer forwards it (None = older kernel)
+        import inspect
+        src = inspect.getsource(km)
+        self.assertIn('"settings": {"autoNudge": _auto_nudge_on(), "updateMode": _update_mode()', src)
+        self.assertIn('"settings": r.get("settings") if isinstance(r.get("settings"), dict) else None', src)
+        self.assertIn('r["settings"] = (rver or {}).get("settings")', src)
 
     def test_valid_fields_land_and_the_ack_reports_them(self):
         res = km._apply_judge_settings({"judgeModel": "fable", "indexEffort": "low"})

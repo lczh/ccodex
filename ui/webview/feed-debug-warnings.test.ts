@@ -12,11 +12,10 @@ const FEED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", 
 const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.css"), "utf8");
 const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "bin", "romp-kernel"), "utf8");
 
-test("the card payload carries warnRows and the modal renders them after the artifacts", () => {
+test("the card payload carries warnRows and the modal renders them below the tree", () => {
   assert.match(FEED, /warnRows\?: \{ t: number; judge: string; err: string; note\?: string; debug\?: \{ input\?: string; reply\?: string \} \}\[\] \| null;/);
   assert.match(FEED, /function applyModalWarnings\(host: HTMLElement, it: AskItem\): void/);
-  assert.match(FEED, /applyModalArtifacts\(body, it\);.*\n\s*applyModalWarnings\(body, it\);/,
-    "the section sits below the tree + artifact previews");
+  assert.match(FEED, /applyModalWarnings\(body, it\);/, "wired in the single-ask modal branch");
 });
 
 test("rows render newest first, with the capture behind a native details fold", () => {

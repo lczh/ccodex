@@ -58,8 +58,9 @@ class CreateSessionAckFast(unittest.TestCase):
             setattr(km, n, v)
 
     def test_create_reveals_first_and_never_builds_inline(self):
-        sid = km._create_sdk_session("newsesh", "/tmp")
+        sid, extra = km._create_sdk_session("newsesh", "/tmp")   # (sid, applied-prefs echo) since 2026-08-16
         self.assertEqual(sid, "11111111-2222-3333-4444-555555555555")
+        self.assertEqual(extra, {}, "no prefs asked for -> nothing applied, nothing echoed")
         self.assertEqual(self.fake.calls[0][0], "spawn")
         self.assertEqual(self.fake.calls[1], ("connect", sid), "eager-connect still runs (model lists immediately)")
         kinds = [e[0] for e in self.events]

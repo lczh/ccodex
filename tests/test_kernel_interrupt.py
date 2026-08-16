@@ -311,7 +311,7 @@ class InterruptRecordEndsTurn(unittest.TestCase):
         # requirement (the user 2026-07-05 via ui): suppressed until the USER's next message — a peer
         # postal turn (author {"peer": …} via the romp-msg-id marker) ending in between must not re-arm
         recs = self._interrupted() + [
-            uline(T0 + 200, "QUESTION: which port?\nromp-msg-id: 1111.2_3.TESTHOST", "u3", "u2"),
+            uline(T0 + 200, "QUESTION: which port?\n<!-- romp-msg-id: 1111.2_3.TESTHOST -->", "u3", "u2"),
             aline(T0 + 220, "answered the peer", "a2", "u3", "end_turn")]
         self.assertTrue(km._interrupt_suppresses_nudge(self._turns(recs)),
                         "a peer's postal message is not the user speaking — still suppressed")
@@ -490,7 +490,7 @@ class AutoNudgeInterruptGate(unittest.TestCase):
         # peer postal exchange ending after the interrupt used to make the latest turn read 'genuine' and
         # re-arm the nudge.
         self._transcript(interrupted=True)
-        self._append([uline(T0 + 200, "COORDINATE: heads-up\nromp-msg-id: 1111.2_3.TESTHOST", "u4", "u3"),
+        self._append([uline(T0 + 200, "COORDINATE: heads-up\n<!-- romp-msg-id: 1111.2_3.TESTHOST -->", "u4", "u3"),
                       aline(T0 + 220, "acknowledged", "a4", "u4", "end_turn")])
         self._goal()
         sent, restore = self._stub()

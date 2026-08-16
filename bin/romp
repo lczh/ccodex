@@ -4,6 +4,7 @@
 # Usage (see `romp help`):
 #   romp                     # open the dashboard in your browser
 #   romp new api             # start a session named "api" (SDK; lives in the kernel)
+#   romp new -m "fix X" api  # ...and deliver the first prompt in the same command
 #   romp new -t api          # ...as a terminal (tmux) session, attached
 #   romp resume              # resume a past conversation (full-screen picker)
 #   romp send api "text"     # scripts/agents: message a session (also: interrupt, end)
@@ -632,6 +633,9 @@ EOF
     _romp_cmd "romp new --codex <name>"    -            "Start it as an OpenAI Codex session (docs/codex.md)"
     _romp_cmd "romp new -t <name>"         -            "Start it as a terminal (tmux) session and attach (--detach: don't attach)"
     _romp_cmd "romp new -d <dir> <name>"   -            "Working directory for the new session (default: the current folder)"
+    _romp_cmd "romp new -m <text> <name>"  -            "Start it AND deliver <text> as its first prompt (one command, idea to working)"
+    _romp_cmd "romp new --model <id> <name>" -          "Model for the SDK session, as a FULL id (e.g. claude-fable-5); re-asserted if <name> already runs"
+    _romp_cmd "romp new --effort <level> <name>" -      "Reasoning effort for the SDK session (e.g. high, ultracode); re-asserted if <name> already runs"
     _romp_cmd "romp resume [<id>]"         -            "Resume a past conversation (full-screen picker; or an exact UUID)"
     _romp_cmd "romp status"                romp-manager "Show manager + kernel status"
     _romp_cmd "romp refresh"               romp-manager "Restart the postal bus + all romp kernels (picks up new code — run after an update)"
@@ -711,6 +715,19 @@ _romp_token() {
     cat "${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}/serve-token" 2>/dev/null || true
 }
 
+# The auth header as a curl CONFIG on stdin, for `curl --config -`. Never `-H "X-Romp-Token: $tok"`:
+# argv is world-readable through /proc/<pid>/cmdline, so every other account on the machine can read
+# the token off a running curl — and the token is full control of every session. These curls are
+# short-lived, which makes reading one a race rather than a certainty; that is not a boundary.
+# curl's config syntax is quoted, so a token carrying " or \ (only possible via ROMP_SERVE_TOKEN —
+# the minted one is base64url) is escaped rather than silently truncating the header.
+_romp_token_cfg() {
+    local _t _e
+    _t="$(_romp_token)"
+    _e="${_t//\\/\\\\}"; _e="${_e//\"/\\\"}"
+    printf 'header = "X-Romp-Token: %s"\n' "$_e"
+}
+
 # `romp url` — print the tokened dashboard URL, nothing else (scripting/piping; bare `romp` is the
 # human entry point). The first open seeds a year-long cookie; after that the bare URL works.
 # `--url` stays as a silent alias (agent-facing text names it).
@@ -741,8 +758,9 @@ fi
 #   * `waiting` is AT REST, not attention-needed. It is the ordinary state of a session sitting
 #     there having finished its turn, and it is what most of the fleet reads most of the time.
 #     Substring-matching /wait/ into an alert paints a "needs you" badge on every idle session,
-#     which is worse than the blank it replaced. The states that DO want the user are `awaiting`
-#     (a permission prompt) and `blocked`.
+#     which is worse than the blank it replaced. The states that DO want the user are `permission`
+#     and `picker` (a live prompt) and `blocked`. (These are the RAW backend states; the dashboard's
+#     chip vocabulary — needsInput, awaitingBg — never rides this command.)
 #   * `id` is the durable key, NOT `lastSid`. Every per-session store romp keeps (states/,
 #     captions/, goals/, episodes/) is filed under `id`. `lastSid` is the live Claude Code
 #     transcript's fsid, which FORKS on /clear — it is what the old tmux @romp-session-id
@@ -760,7 +778,7 @@ if [[ "${1:-}" == "sessions" ]]; then
         *)      echo "usage: romp sessions [--json]" >&2; exit 2 ;;
     esac
     _kport="${ROMP_KERNEL_PORT:-29855}"
-    _resp="$(curl -sf -m 10 "http://127.0.0.1:$_kport/sessions" -H "X-Romp-Token: $(_romp_token)")" \
+    _resp="$(_romp_token_cfg | curl -sf -m 10 --config - "http://127.0.0.1:$_kport/sessions")" \
         || { echo "romp sessions: kernel not reachable on :$_kport (is romp running?)" >&2; exit 1; }
     if $_json; then
         printf '%s\n' "$_resp"
@@ -845,8 +863,7 @@ if [[ "${1:-}" =~ ^(checkin|checkout)$ ]]; then
     if [[ -z "$_host" ]]; then echo "usage: romp $_verb <host>" >&2; exit 2; fi
     _kport="${ROMP_KERNEL_PORT:-29855}"
     _on="false"; [[ "$_verb" == "checkin" ]] && _on="true"
-    _resp="$(curl -sf -m 10 -X POST "http://127.0.0.1:$_kport/tunnels/checkin" \
-                  -H "X-Romp-Token: $(_romp_token)" \
+    _resp="$(_romp_token_cfg | curl -sf -m 10 --config - -X POST "http://127.0.0.1:$_kport/tunnels/checkin" \
                   -H 'Content-Type: application/json' -d "{\"host\": \"$_host\", \"on\": $_on}")" \
         || { echo "romp $_verb: kernel not reachable on :$_kport (is romp running?)" >&2; exit 1; }
     if [[ "$_resp" == *'"ok": true'* || "$_resp" == *'"ok":true'* ]]; then
@@ -868,16 +885,56 @@ if [[ "${1:-}" =~ ^(--)?(send|interrupt|end)$ ]]; then
     _who="${1:-}"
     if [[ -z "$_who" ]]; then echo "usage: romp $_verb <session> $([[ "$_verb" == send ]] && echo '<text>')" >&2; exit 2; fi
     shift
+    # `romp end self [--now]` — a session closing ITSELF after finishing its work (the user
+    # 2026-08-15: telling a session "close yourself when done" never worked; an agent could only
+    # kill its own process, which read as a crash). `self` resolves through ROMP_SID (spawn-frozen
+    # by the SDK backend, inherited by every Bash the agent runs). Default is when=idle: the kernel
+    # kills at the turn's SETTLE, so the goodbye lands and the judges file the outcome before the
+    # clean × death. --now skips the deferral (for any target).
+    _when="";
+    if [[ "$_verb" == "end" ]]; then
+        [[ "$_who" == "self" ]] && _when="idle"
+        for _a in "$@"; do
+            [[ "$_a" == "--now" ]] && _when=""
+            [[ "$_a" == "--when-idle" ]] && _when="idle"
+        done
+    fi
     _kport="${ROMP_KERNEL_PORT:-29855}"
     if [[ "$_verb" == "send" ]]; then
+        # `--tag <label>` — a RENDER HINT for auto-generated text (a kickoff template, a scripted
+        # brief): the chat shows a tagged message as machine-sent under that label instead of posing
+        # it as the user's typed words (the user 2026-08-15). Sugar for appending the marker comment
+        # `<!-- romp-tag: <label> -->` yourself; the label is one word, letters/digits/dashes.
+        _tag=""
+        if [[ "${1:-}" == "--tag" ]]; then
+            _tag="${2:-}"
+            shift 2 || { echo "usage: romp send <session> [--tag <label>] <text>" >&2; exit 2; }
+        fi
         _text="$*"
-        if [[ -z "$_text" ]]; then echo "usage: romp send <session> <text>" >&2; exit 2; fi
+        if [[ -z "$_text" ]]; then echo "usage: romp send <session> [--tag <label>] <text>" >&2; exit 2; fi
+        if [[ -n "$_tag" ]]; then
+            [[ "$_tag" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,23}$ ]] \
+                || { echo "romp send: --tag must be one word (letters/digits/dashes, <=24 chars)" >&2; exit 2; }
+            _text="$_text"$'\n\n'"<!-- romp-tag: $_tag -->"
+        fi
         _payload="$(python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "text": sys.argv[2]}))' "$_who" "$_text")"
+    elif [[ "$_verb" == "end" && "$_who" == "self" ]]; then
+        if [[ -z "${ROMP_SID:-}" ]]; then
+            echo "romp end self: ROMP_SID is not set — 'self' only works from inside a romp SDK session" >&2
+            exit 2
+        fi
+        _payload="$(python3 -c 'import json,sys; d={"id": sys.argv[1]};
+import os
+w=sys.argv[2]
+if w: d["when"]=w
+print(json.dumps(d))' "$ROMP_SID" "$_when")"
     else
-        _payload="$(python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1]}))' "$_who")"
+        _payload="$(python3 -c 'import json,sys; d={"name": sys.argv[1]};
+w=sys.argv[2] if len(sys.argv)>2 else ""
+if w: d["when"]=w
+print(json.dumps(d))' "$_who" "$_when")"
     fi
-    _resp="$(curl -sf -m 10 -X POST "http://127.0.0.1:$_kport/$_verb" \
-                  -H "X-Romp-Token: $(_romp_token)" \
+    _resp="$(_romp_token_cfg | curl -sf -m 10 --config - -X POST "http://127.0.0.1:$_kport/$_verb" \
                   -H 'Content-Type: application/json' -d "$_payload")" \
         || { echo "romp $_verb: kernel not reachable on :$_kport (is romp running?)" >&2; exit 1; }
     if [[ "$_resp" == *'"ok": true'* || "$_resp" == *'"ok":true'* ]]; then
@@ -1089,8 +1146,11 @@ resume=false
 resume_id=""
 detach=false
 dir_arg=""
+model_arg=""
+effort_arg=""
 use_tmux=false
 use_codex=false
+msg_arg=""
 
 case "${1:-}" in
     new)
@@ -1102,21 +1162,61 @@ case "${1:-}" in
                 --detach)  detach=true; shift ;;
                 -d)        shift
                            if [[ $# -eq 0 || "$1" == -* ]]; then
-                               echo "usage: romp new [-t|--codex] [-d <dir>] <name>" >&2; exit 2
+                               echo "usage: romp new [-t|--codex] [-d <dir>] [-m <text>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
                            fi
                            dir_arg="$1"; shift ;;
+                -m|--message) shift
+                           # spawn WITH the first prompt — one command from idea to a working
+                           # session (the user 2026-08-14: `romp new` then `romp send` was the
+                           # last two-step on the idea-to-working path). Empty text is a usage
+                           # error, not a silent no-op.
+                           if [[ $# -eq 0 || -z "$1" ]]; then
+                               echo "usage: romp new [-t] [-d <dir>] [-m <text>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
+                           fi
+                           msg_arg="$1"; shift ;;
+                --model)   shift
+                           # per-spawn model, riding POST /new (the user 2026-08-14: the nightly
+                           # optimizer must always run fable, and a headless script has no WS).
+                           # FULL id as the picker sends it (claude-fable-5) — the alias table
+                           # stops at opus/sonnet/haiku and quietly resolved "fable" to Opus 5.
+                           if [[ $# -eq 0 || -z "$1" || "$1" == -* ]]; then
+                               echo "usage: romp new [-t] [-d <dir>] [-m <text>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
+                           fi
+                           model_arg="$1"; shift ;;
+                --effort)  shift
+                           # per-spawn effort (e.g. high, ultracode) — ultracode is per-session
+                           # by design, never a machine default, so /new is its sanctioned door.
+                           if [[ $# -eq 0 || -z "$1" || "$1" == -* ]]; then
+                               echo "usage: romp new [-t] [-d <dir>] [-m <text>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
+                           fi
+                           effort_arg="$1"; shift ;;
                 -*)        echo "romp new: unknown option: $1" >&2; exit 2 ;;
                 *)         if [[ -n "$session_arg" ]]; then
-                               echo "usage: romp new [-t|--codex] [-d <dir>] <name>" >&2; exit 2
+                               echo "usage: romp new [-t|--codex] [-d <dir>] [-m <text>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
                            fi
                            session_arg="$1"; shift ;;
             esac
         done
         if [[ -z "$session_arg" ]]; then
-            echo "usage: romp new [-t|--codex] [-d <dir>] <name>" >&2; exit 2
+            echo "usage: romp new [-t|--codex] [-d <dir>] [-m <text>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
         fi
         if $use_tmux && $use_codex; then
             echo "romp new: --codex and -t are different session kinds — pick one" >&2; exit 2
+        fi
+        if [[ -n "$model_arg$effort_arg" ]] && $use_codex; then
+            # per-spawn model/effort ride /new for SDK sessions only; the codex spawn takes the
+            # account default and the pickers change it after. Refuse loudly (no silent drop).
+            echo "romp new: --model/--effort need the default (SDK) session — set them from the dashboard for a Codex session" >&2; exit 2
+        fi
+        if [[ -n "$msg_arg" ]] && $use_tmux; then
+            # the tmux variant attaches a terminal you type into yourself; delivering a first
+            # prompt is the SDK path's job. Refuse loudly rather than dropping the text.
+            echo "romp new: -m needs the default (SDK) session — with -t you type into the terminal yourself" >&2; exit 2
+        fi
+        if [[ -n "$model_arg$effort_arg" ]] && $use_tmux; then
+            # per-spawn model/effort ride the kernel's /new (SDK); a terminal session picks them
+            # inside Claude itself. Refuse loudly rather than dropping the flags (no silent divergence).
+            echo "romp new: --model/--effort need the default (SDK) session — with -t, pick them inside Claude itself" >&2; exit 2
         fi
         ;;
     resume|--resume)
@@ -1200,9 +1300,8 @@ if [[ -n "$session_arg" ]] && ! $use_tmux && ! $resume; then
         echo "romp new: the kernel isn't running (no serve token). Start romp (the login service, or \`romp up\`), or use \`romp new -t $session_arg\` for a terminal session." >&2
         exit 1
     fi
-    _payload="$(python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "dir": sys.argv[2], "backend": sys.argv[3]}))' "$session_arg" "$_dir" "$_be")"
-    _resp="$(curl -sf -m 15 -X POST "http://127.0.0.1:$_kport/new" \
-                  -H "X-Romp-Token: $_tok" \
+    _payload="$(python3 -c 'import json,sys; d={"name": sys.argv[1], "dir": sys.argv[2], "backend": sys.argv[3]}; sys.argv[4] and d.update(model=sys.argv[4]); sys.argv[5] and d.update(effort=sys.argv[5]); print(json.dumps(d))' "$session_arg" "$_dir" "$_be" "$model_arg" "$effort_arg")"
+    _resp="$(_romp_token_cfg | curl -sf -m 15 --config - -X POST "http://127.0.0.1:$_kport/new" \
                   -H 'Content-Type: application/json' -d "$_payload")" \
         || { echo "romp new: kernel not reachable on :$_kport (is romp running?). \`romp new -t $session_arg\` starts a terminal session without it." >&2; exit 1; }
     if [[ "$_resp" == *'"ok": true'* || "$_resp" == *'"ok":true'* ]]; then
@@ -1212,6 +1311,34 @@ if [[ -n "$session_arg" ]] && ! $use_tmux && ! $resume; then
             _kind="SDK"; [ "$_be" = "codex" ] && _kind="Codex"
             echo "romp new: started \"$session_arg\" ($_kind session, working in $_dir)"
             echo "romp new: watch it on the dashboard: romp"
+        fi
+        # --model/--effort: report what the kernel APPLIED — it echoes them back (the same park-aware
+        # setters as the dashboard pickers, re-asserted even on an already-running session). An ack
+        # WITHOUT the echo means an older kernel dropped the ask — say so loudly instead of letting
+        # this machine and the session quietly diverge.
+        if [[ -n "$model_arg$effort_arg" ]]; then
+            _applied="$(python3 -c 'import json,sys; r=json.loads(sys.argv[1]); print(", ".join("%s %s" % (k, r[k]) for k in ("model","effort") if r.get(k)))' "$_resp" 2>/dev/null || true)"
+            if [[ -n "$_applied" ]]; then
+                echo "romp new: applied $_applied"
+            else
+                echo "romp new: WARNING — the kernel did not acknowledge --model/--effort (older kernel?); set them from the dashboard" >&2
+            fi
+        fi
+        # -m: deliver the first prompt through the same kernel route `romp send` uses, so one
+        # command goes from idea to a working session. Per-leg reporting, never silent: the
+        # session EXISTS by now (the /new above acked), so a failed send names the exact
+        # retry command instead of pretending the spawn failed.
+        if [[ -n "$msg_arg" ]]; then
+            _mpayload="$(python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "text": sys.argv[2]}))' "$session_arg" "$msg_arg")"
+            _mresp="$(_romp_token_cfg | curl -sf -m 10 --config - -X POST "http://127.0.0.1:$_kport/send" \
+                          -H 'Content-Type: application/json' -d "$_mpayload")" \
+                || { echo "romp new: session is up but the message did NOT land (kernel send failed). Retry: romp send $session_arg '<text>'" >&2; exit 1; }
+            if [[ "$_mresp" == *'"ok": true'* || "$_mresp" == *'"ok":true'* ]]; then
+                echo "romp new: first prompt delivered"
+            else
+                echo "romp new: session is up but the kernel refused the message: $_mresp. Retry: romp send $session_arg '<text>'" >&2
+                exit 1
+            fi
         fi
         exit 0
     fi
@@ -1370,6 +1497,14 @@ else
     sid="$(_romp_uuid)"
     claude_cmd="claude --name \"$display\" --session-id $sid"
 fi
+
+# The session's romp identity rides its ENVIRONMENT on both backends (the user 2026-08-16):
+# ROMP_SID (the stable id — what `romp end self` resolves through) and ROMP_SESSION_NAME (the
+# human name at spawn — env-first author attribution for external tools, which talk to romp only
+# through the API and this var, never tmux). Mirrors the SDK backend's spawn env (sdk_backend
+# _options); both values are already sanitized above (sid: hex+hyphens, name: [A-Za-z0-9_-]),
+# so the interpolation into the respawn-pane exec line is injection-safe.
+claude_cmd="ROMP_SID=$sid ROMP_SESSION_NAME=\"$display\" $claude_cmd"
 
 # Load the Romp Postal Service MCP server (tool-native messaging) into romp
 # sessions only (scoped via --mcp-config), when installed.

@@ -58,7 +58,7 @@ test("kernel: the feed payload carries the build id, claimed BEFORE the read it 
 });
 
 test("client: ok=false is the only thing that interrupts the user, and it says what actually happened", () => {
-  assert.match(FEED, /function ackFollowMove\(itemId: string, ok: boolean, buildId: number\)/);
+  assert.match(FEED, /function ackFollowMove\(itemId: string, ok: boolean, buildId: number, host: string\)/);
   assert.match(FEED, /m\.type === "cardMoveAck" && Array\.isArray\(m\.ids\)/);
   // a follow-up's MESSAGE still went out even when the card is gone — say so rather than implying it vanished
   assert.match(FEED, /Your reply was sent, but that card isn’t on the board any more to move to Working\./);
@@ -71,15 +71,30 @@ test("client: an ACKED prediction yields only to a payload built AFTER the gestu
   // the exact race the old timer papered over: a build already in flight when the click landed cannot know
   // about the reopen, and taking it as the answer is the bounce back to Completed this replaced
   assert.match(FEED, /const acked = pendingMoveAck\.get\(id\);/);
-  assert.match(FEED, /if \(acked !== undefined && buildId > acked\) clearFollowMove\(id, "outranked"\);/);
-  assert.match(FEED, /function reconcileFollowMove\(incoming: AskItem\[\], buildId: number\)/);
+  assert.match(FEED, /if \(typeof mark === "number" && mark > acked\.buildId\) clearFollowMove\(id, "outranked"\);/);
+  assert.match(FEED, /function reconcileFollowMove\(incoming: AskItem\[\], buildId: number, buildIds\?: Record<string, number>\)/);
+});
+
+test("client: 'after' is judged on the CARD's kernel's counter, never another kernel's (2026-08-15)", () => {
+  // the federated bounce: the merged payload's top-level buildId is the LOCAL kernel's counter (days of
+  // uptime → large), the ack's is the card's home kernel's (just restarted → small), so every merged
+  // emission instantly "outranked" the ack and dropped the prediction while the cached remote frame
+  // still predated the reopen — Working → Completed (a beat) → Working on every reply to a remote card.
+  assert.match(FEED, /const cardHost = hostOf\(a\.sid\);/);
+  assert.match(FEED, /if \(cardHost !== acked\.host\) continue;/, "an ack from some other kernel says nothing about this card");
+  // per-host counters from mergeHostFeeds when merged; single-kernel payloads keep the top-level buildId
+  // for local cards only — a payload that can't be placed on the ack's counter never outranks
+  assert.match(FEED, /const mark = buildIds \? buildIds\[cardHost\] : \(cardHost === "" \? buildId : undefined\);/);
+  // the ack records whose counter its buildId is on; unstamped = the local kernel (hostOf's "" for local)
+  assert.match(FEED, /const ackHost = typeof m\.host === "string" \? m\.host : "";/);
+  assert.match(FEED, /pendingMoveAck\.set\(itemId, \{ host, buildId \}\);/);
 });
 
 test("client: an ack silences the toast but never lets a prediction wedge", () => {
   // ok=true re-arms the window SILENTLY: the kernel has spoken, so nothing after that is worth a toast, but
   // a prediction must not outlive the answer either if a payload goes missing
   const ack = FEED.slice(FEED.indexOf("function ackFollowMove("), FEED.indexOf("// On a fresh authoritative payload"));
-  assert.match(ack, /pendingMoveAck\.set\(itemId, buildId\);/);
+  assert.match(ack, /pendingMoveAck\.set\(itemId, \{ host, buildId \}\);/);
   assert.match(ack, /clearFollowMove\(itemId, "backstop-noconfirm"\); render\(\);\s*\/\/ silent wedge guard/);
   assert.ok(!/feedToast/.test(ack.slice(ack.indexOf("pendingMoveAck.set"))),
     "no toast on any path after the kernel confirmed the move");

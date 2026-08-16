@@ -39,7 +39,7 @@ test("a name+dot header entry opens each session's run; only runs that exist get
   assert.match(FEED, /key = "s:" \+ listEl\.id \+ ":" \+ e\.sid;/);
   // the header carries the identity: colored name, host prefix treatment, the yellow working dot
   assert.match(FEED, /nm\.replaceChildren\(\.\.\.hostNameNodes\(e\.name, e\.sid\)\);/);
-  assert.match(FEED, /setWorkDot\(nm, dotFor\(e\.name\)\);/);   // work OR awaiting dot — straw when idle-but-awaiting (the user 2026-07-13)
+  assert.match(FEED, /setWorkDot\(nm, dotFor\(e\.name\)\);/);   // work OR awaiting dot — await-green when idle-but-awaiting (the user 2026-07-13)
   // headers aren't cards — but a FOLDED one stands in for its run, so the chip counts what it hides;
   // the column must report the board, not what the reader happens to have open (2026-07-31)
   assert.match(FEED, /const nCards = \(es: Entry\[\]\) => es\.reduce\(\(n, e\) => n \+ \(e\.kind === "sess" \? e\.folded : 1\), 0\);/);

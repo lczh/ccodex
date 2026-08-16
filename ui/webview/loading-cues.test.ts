@@ -23,18 +23,16 @@ test("previews: the mini swirl holds the spot until the load EVENT; first load o
   assert.match(PREVIEW, /spin\.src = mediaSrc\("romp-swirl-glyph\.svg"\);/, "mediaSrc — resolves on BOTH surfaces");
   assert.match(PREVIEW, /img\.addEventListener\("load", \(\) => \{\s*\n\s*loadedOnce\.add\(url\);\s*\n\s*spin\.remove\(\);/,
                "the cue clears on the load event, never a timer");
-  // both builders wear it — the chat's full-size render and the feed modal's thumb
+  // one builder wears it — the chat's full-size render (the feed's thumb strip is gone, 2026-08-14)
   const cues = PREVIEW.match(/withLoadCue\(box, img, url\);/g) || [];
-  assert.equal(cues.length, 2, "previewThumb AND previewFull");
+  assert.equal(cues.length, 1, "previewFull");
 });
 
-test("previews: the cue CSS lives in BOTH sheets (each page loads only its own — the .romp-acted precedent)", () => {
-  for (const css of [FEED_CSS, CHAT_CSS]) {
-    assert.match(css, /\.path-load-spin \{ display: block; width: 20px; height: 20px;/);
-    assert.match(css, /@keyframes path-load-spin \{ to \{ transform: rotate\(-360deg\); \} \}/, "the reverse romp spin");
-    assert.match(css, /\.path-img-loading \{ display: none; \}/, "the <img> takes the spot the instant it has pixels");
-    assert.match(css, /prefers-reduced-motion: reduce\) \{ \.path-load-spin \{ animation: none; \} \}/);
-  }
+test("previews: the cue CSS lives in the chat sheet (the one preview surface since 2026-08-14)", () => {
+  assert.match(CHAT_CSS, /\.path-load-spin \{ display: block; width: 20px; height: 20px;/);
+  assert.match(CHAT_CSS, /@keyframes path-load-spin \{ to \{ transform: rotate\(-360deg\); \} \}/, "the reverse romp spin");
+  assert.match(CHAT_CSS, /\.path-img-loading \{ display: none; \}/, "the <img> takes the spot the instant it has pixels");
+  assert.match(CHAT_CSS, /prefers-reduced-motion: reduce\) \{ \.path-load-spin \{ animation: none; \} \}/);
 });
 
 test("undo clear: the round-trip branch arms a busy cue that never disables the button", () => {

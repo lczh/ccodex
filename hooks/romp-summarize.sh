@@ -10,8 +10,9 @@
 #
 # Design constraints (all per the user's ask):
 #   - CANNOT take action — the summarizer model runs with `--tools ""` (zero
-#     tools) + MCP disabled, so it can only emit text; it structurally cannot
-#     edit/run/fetch anything, regardless of how it reads the transcript.
+#     tools), MCP disabled, `--safe-mode` (no discovered memory/skills/hooks)
+#     and a cwd only we can write, so it can only emit text; it structurally
+#     cannot edit/run/fetch anything, regardless of how it reads the transcript.
 #   - NEVER blocks — every expensive step runs in a detached subshell, so the
 #     hook returns instantly (critical for UserPromptSubmit, which gates the
 #     prompt) and the phrase lands a poll later. Emits NOTHING on stdout.
@@ -277,14 +278,36 @@ Reply with ONLY the <=8-word past-tense phrase describing what the ASSISTANT acc
   #                          reads the input (and it's cheaper — no tool
   #                          schemas in the prompt).
   #   --strict-mcp-config + empty --mcp-config → no MCP tools either.
-  # Plus: own existing auth (no API key), /tmp cwd so it skips the project
-  # CLAUDE.md, TMUX unset for the recursion guard, portable 45s timeout
-  # (macOS has no `timeout`).
+  #   --safe-mode          → drops auto-discovered CLAUDE.md/memory, skills AND
+  #                          HOOKS — the hole the two flags above leave open,
+  #                          since they gate tools and MCP but nothing stops a
+  #                          discovered settings.json from running commands.
+  #                          Mirrors the judges' isolation (kernel/judge.py
+  #                          _judge_cmd); it keeps auth + model, so subscription
+  #                          billing is unchanged (NOT --bare, which drops the
+  #                          login too).
+  # Plus: own existing auth (no API key), TMUX unset for the recursion guard,
+  # portable 45s timeout (macOS has no `timeout`).
+  #
+  # The cwd is a private directory we own, NOT /tmp — which is what it was, on
+  # the stated grounds that /tmp skips the project CLAUDE.md. That had the risk
+  # backwards: /tmp is world-writable, so on a shared machine any other local
+  # user can plant /tmp/.claude/settings.json and have its hook commands run as
+  # us — once per prompt and once per stop, for anyone who has opted this hook
+  # in at all (the gates at the top keep that off by default).
+  # Dropping the project CLAUDE.md is --safe-mode's job; the cwd's only job is
+  # to be a directory nobody else can write into. mkdir is idempotent, so the
+  # first summarize on a fresh install creates it.
+  work_dir="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}/summarize"
+  mkdir -p "$work_dir" 2>/dev/null && chmod 700 "$work_dir" 2>/dev/null
+  # Unwritable state root (full disk, bad perms): $HOME is still ours and still
+  # not plantable by anyone else. Never fall back to a world-writable dir.
+  [[ -d "$work_dir" ]] || work_dir="$HOME"
   summary=""
   for _attempt in 1 2; do
-    summary=$(printf '%s' "$prompt" | (cd /tmp 2>/dev/null && \
+    summary=$(printf '%s' "$prompt" | (cd "$work_dir" 2>/dev/null && \
       env -u TMUX -u TMUX_PANE ROMP_SUMMARIZING=1 perl -e 'alarm 45; exec @ARGV' \
-        claude -p --model "$ANNOUNCER_MODEL" --tools "" \
+        claude -p --safe-mode --model "$ANNOUNCER_MODEL" --tools "" \
           --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
           --append-system-prompt "$sys" 2>/dev/null) | tr '\n' ' ')
     summary="$(printf '%s' "$summary" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"

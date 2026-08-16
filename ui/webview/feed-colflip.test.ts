@@ -69,6 +69,6 @@ test("feed: every prediction drop names WHY, so a bounce's trigger is in the tra
   }
   // a fresh payload marks itself as the next render's input, before reconcile can re-tag
   const payload = FEED.slice(FEED.indexOf('lastFeedEvent = "payload"'));
-  assert.ok(payload.indexOf("reconcileFollowMove(incomingAsks, lastPayloadBuildId)") > 0,
+  assert.ok(payload.indexOf("reconcileFollowMove(incomingAsks, lastPayloadBuildId, perHostBuildIds)") > 0,
     "payload tag set before reconcile runs");
 });

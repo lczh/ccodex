@@ -111,6 +111,18 @@ type SessionRow = { id: string; name: string; dir: string; bg: string };
     id: "settings.open", title: "Open settings",
     run: () => { try { pane("f-feed")!.contentWindow!.postMessage({ romp: "openSettings" }, "*"); } catch (e) { /* feed not loaded */ } },
   });
+  // Chat history back/forward (the user 2026-08-14; their own Obsidian nav keys — Ctrl+M / Ctrl+,
+  // per their vault's hotkeys.json). The chat pane owns the trail (it knows the tabs + scroll spots);
+  // these run when focus is in the SHELL — with focus inside the chat, its own capture handler
+  // (render.ts) reads the same bindings store, so a rebind moves both at once.
+  registerCommand({
+    id: "chat.navBack", title: "Navigate back in the chat",
+    run: () => { try { pane("f-chat")!.contentWindow!.postMessage({ romp: "chatNav", dir: -1 }, "*"); } catch (e) { /* chat not loaded */ } },
+  });
+  registerCommand({
+    id: "chat.navForward", title: "Navigate forward in the chat",
+    run: () => { try { pane("f-chat")!.contentWindow!.postMessage({ romp: "chatNav", dir: 1 }, "*"); } catch (e) { /* chat not loaded */ } },
+  });
   registerCommand({ id: "log.open", title: "Open the log", run: () => { if (w.__rompOpenErrs) w.__rompOpenErrs(); } });
   registerCommand({ id: "net.open", title: "Remote kernels", run: () => { if (w.__rompOpenNet) w.__rompOpenNet(); } });
   registerCommand({ id: "usage.open", title: "Token usage", run: () => { if (w.__rompUsagePanel) w.__rompUsagePanel(); } });

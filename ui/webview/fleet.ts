@@ -144,6 +144,24 @@ function paintFoldButtons() {
 
 function el(tag: string, cls?: string): HTMLElement { const e = document.createElement(tag); if (cls) e.className = cls; return e; }
 
+// The status pip before a session name — the same language the feed's .fwork-dot speaks: gold =
+// working, await-green = awaiting dispatched background work, gray ring = the live state could not be
+// read. A healthy idle session gets NO pip, so a blank means "alive and quiet" and nothing else.
+// That only holds if every OTHER state renders, which is why the awaiting dot belongs here too: the
+// feed has shown it since 2026-07-13, but this pane did not, so an awaiting session was blank here
+// and read as idle. States with their own designed treatments elsewhere (blocked / retrying /
+// compacting / closed) keep their undotted look.
+function statusDot(s: FleetSession): HTMLElement | null {
+  const st = s.status?.state;
+  const kind = st === "working" ? "" : st === "awaitingBg" ? "await" : st ? null : "unknown";
+  if (kind === null) return null;                 // a known state with its own treatment: no pip
+  const d = el("span", "fl-workdot" + (kind ? " " + kind : ""));
+  d.title = kind === "" ? "working — a turn is running right now"
+    : kind === "await" ? "awaiting — idle, but background work it dispatched is still running"
+    : "state unknown — romp couldn't read this session's live state";
+  return d;
+}
+
 // Hover-highlight a GROUP of zones together (parity with the ledger box's linkHover, render.ts): the
 // checkbox + time light as one unit when either is hovered, each keeping its own shape via .lz-hl, so a
 // clickable row shows which parts go together (the user 2026-06-24).
@@ -310,7 +328,7 @@ function renderFleetNode(ctx: SessCtx, n: LedgerNode, depth: number, container: 
   // It's a label, not its own action — a click bubbles to the row's data-act="open" and jumps into the session.
   if (flat && depth === 0) {
     const tag = el("span", "fl-sesslabel");
-    if (s.status?.state === "working") tag.appendChild(el("span", "fl-workdot"));
+    const sd = statusDot(s); if (sd) tag.appendChild(sd);   // working / awaiting / unreadable
     const tnm = el("span", "fl-sesslabel-name"); nameInto(tnm, s.name, s.sid, curSearch);
     if (s.color?.bg) tnm.style.color = s.color.bg;
     tag.appendChild(tnm);
@@ -470,7 +488,7 @@ function render() {
       caret.style.cssText = "flex:0 0 auto;cursor:pointer;color:var(--vscode-descriptionForeground,#9a9a9a);"
         + "font-size:9px;width:13px;text-align:center;user-select:none";
       head.appendChild(caret);
-      if (s.status?.state === "working") head.appendChild(el("span", "fl-workdot"));
+      const hd = statusDot(s); if (hd) head.appendChild(hd);   // working / awaiting / unreadable
       const nm = el("span", "fl-name");
       nameInto(nm, s.name, s.sid, curSearch);   // highlight a name match (remote "host:" stays quiet metadata)
       if (s.color?.bg) nm.style.color = s.color.bg;

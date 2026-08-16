@@ -36,7 +36,21 @@ setup() {
 
     "$POSTAL" serve >/dev/null 2>&1 &
     BUS_PID=$!
-    for _ in $(seq 1 50); do curl -s "127.0.0.1:$ROMP_POSTAL_PORT/ping" >/dev/null 2>&1 && break; sleep 0.1; done
+    # Readiness is load-bearing: every test assumes the bus is up, and proceeding without it surfaces as a
+    # confusing DOWNSTREAM failure (a 2026-08-14 CI runner lost this race: "remote --force" probed a port
+    # the bus hadn't bound yet and failed three asserts later, reading like a tunnel bug). Fail HERE,
+    # naming the real problem. A dead bus process is the early exit; the doubled bound is only a backstop.
+    local up=0 _
+    for _ in $(seq 1 100); do
+        curl -s "127.0.0.1:$ROMP_POSTAL_PORT/ping" >/dev/null 2>&1 && { up=1; break; }
+        kill -0 "$BUS_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if [ "$up" != 1 ]; then
+        local alive=no; kill -0 "$BUS_PID" 2>/dev/null && alive=yes
+        echo "# setup: postal bus never came up on 127.0.0.1:$ROMP_POSTAL_PORT (pid $BUS_PID, alive=$alive)" >&2
+        return 1
+    fi
 }
 
 teardown() {

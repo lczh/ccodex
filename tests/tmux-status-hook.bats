@@ -368,7 +368,9 @@ run_hook() {
     export XDG_STATE_HOME="$TEST_DIR/state"
     run run_hook '{"hook_event_name":"SessionStart","source":"clear","session_id":"fork-new","cwd":"/tmp"}'
     [ "$status" -eq 0 ]
-    ! grep -q 'set -t test @romp-session-id' "$MOCK_LOG"
+    # `run` + status, NOT a bare `! grep`: `!` is exempt from set -e, so mid-test it asserts nothing.
+    run grep -q 'set -t test @romp-session-id' "$MOCK_LOG"
+    [ "$status" -ne 0 ]
     [ ! -e "$TEST_DIR/state/romp/names/fork-new" ]
 }
 

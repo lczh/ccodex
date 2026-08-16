@@ -84,10 +84,16 @@ export function usageWindows(usage: any, nowS: number): UsageWindow[] {
   return out;
 }
 
+// 3 significant figures at every magnitude (the user 2026-08-13: a bare "1B tok" hides a third of a
+// billion tokens) — 1.32B / 13.2B / 132B, trailing zeros kept so the precision reads as meant.
+// Twin of the kernel rail's fmtTok; the two must stay in step (rail-spend pins).
+function fmtSig3(v: number): string {
+  return v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2);
+}
 export function fmtTok(n: number): string {
-  if (n >= 1e9) return (n / 1e9).toFixed(1).replace(/\.0$/, "") + "B";
-  if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
-  if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "k";
+  if (n >= 1e9) return fmtSig3(n / 1e9) + "B";
+  if (n >= 1e6) return fmtSig3(n / 1e6) + "M";
+  if (n >= 1e3) return fmtSig3(n / 1e3) + "k";
   return String(n);
 }
 

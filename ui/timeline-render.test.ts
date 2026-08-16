@@ -233,6 +233,25 @@ test("an idle live lane thins out under active-only, and returns when the toggle
   assert.equal(panel._vis.length, 2, "zoomed out over its past work, the lane returns");
 });
 
+test("a live lane with NO bars evidence yet is presumed active — never dropped cold (the user 2026-08-15)", () => {
+  // after a kernel restart, the active-only filter judged a WORKING lane by bars that had not arrived
+  // yet (its own kernel still warming, or a remote host's bars unmerged) and dropped the lane entirely;
+  // it then reappeared bar-less as data trickled in. A live lane without a turns key is unjudged, not
+  // inactive; its key landing (every with_bars build writes one per covered lane) hands judgment back.
+  const panel: any = new TimelinePanel(makeNode("div"));
+  const data: any = synthData();
+  delete data.turns.S2;             // S2's evidence has not arrived (cold connect / unmerged host)
+  panel._collapseGaps = false;
+  panel.data = data;
+  panel.draw();
+  assert.deepEqual(panel._vis.map((s: any) => s.id).sort(), ["S1", "S2"],
+    "the evidence-less live lane stands beside the working one");
+  panel._barsSeen.add("S2");        // its bars payload lands (even empty) → judgment passes to hasWork
+  panel.draw();
+  assert.deepEqual(panel._vis.map((s: any) => s.id), ["S1"],
+    "once its bars arrive empty, the same lane is genuinely quiet and thins out");
+});
+
 test("an ALL-quiet window falls back to the live lanes — never a blank, un-grabbable band", () => {
   // Panning into a stretch where nothing happened must not empty the timeline: a blank band reads as
   // broken, and the per-lane row space is the only mouse-drag pan surface, so an empty _vis would

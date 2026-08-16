@@ -16,9 +16,9 @@ const RENDER = fs.readFileSync(
 
 test("linkifyFileUris takes skipThumbs and excludes those paths from the thumbnail strip", () => {
   assert.match(RENDER, /function linkifyFileUris\(root: HTMLElement, skipThumbs\?: string\[\], spacePaths\?: string\[\],\s*\n\s*pathLinks\?: Record<string, string>\): void/);
-  // the previewable push gates on skipThumbs — the path stays a LINK, it just doesn't thumb
+  // the previewable push gates on skipThumbs — the path stays a LINK, it just doesn't render a figure
   assert.match(RENDER,
-    /if \(previewKind\(open\) && !previewable\.includes\(open\) && !\(skipThumbs && skipThumbs\.includes\(open\)\)\) previewable\.push\(open\);/);
+    /if \(previewKind\(open\) && !previewable\.includes\(open\) && !\(skipThumbs && skipThumbs\.includes\(open\)\)\) \{\s*\n\s*previewable\.push\(open\);\s*\n\s*mentionAt\.set\(open, link\);/);
 });
 
 test("the user bubble passes its ev.images paths (caption path AND path:-src) as skipThumbs", () => {

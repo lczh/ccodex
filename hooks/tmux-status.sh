@@ -65,7 +65,7 @@ esac
 
 # Status emoji for the ghostty tab dot (tmux.conf set-titles-string reads
 # @romp-emoji). Mirrors the dashboard's state→color: 🔵 ready (waiting/
-# idle), 🟡 working, 🔴 awaiting (permission). Updated here on every event
+# idle), 🟡 working, 🔴 needs input (permission). Updated here on every event
 # so the dot tracks Claude's live status. (A fourth dot, ⚪ inactive, is set
 # NOT here but by scripts/romp-idle-dots once a ready session sits idle > 1h —
 # the tab analog of the dashboard/timeline fade; the next event resets it here.)

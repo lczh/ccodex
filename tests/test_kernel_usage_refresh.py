@@ -67,13 +67,17 @@ class UsageRefreshWiring(unittest.TestCase):
 
     def test_rail_usage_widget_is_click_to_refresh(self):
         html = km._landing()
-        # the widget is a clickable, discoverable affordance — the click hint lives in the rich tip's
-        # footer, never a native title (the user 2026-08-08: the browser's flat box fought the tip)
+        # the widget is a clickable affordance, but it no longer ADVERTISES the click: refresh is
+        # automatic (the 60s pull + the timeline's live forward), and a click-me line misread on a
+        # hover surface (the user 2026-08-14) — no hint anywhere, and never a native title
+        # (the user 2026-08-08: the browser's flat box fought the tip)
         self.assertIn("id=rail-usage", html)
         self.assertIn("el.style.cursor='pointer'", html)
-        self.assertIn("click to refresh", html)
+        self.assertNotIn("click to refresh", html)
         self.assertNotIn("click the bars", html)   # tightened 2026-08-08 — the reader is already on the bars
         self.assertNotIn("Click to refresh usage", html)
+        # an OPEN hover tip follows every data landing instead of asking for the click
+        self.assertIn("if(tip.style.display==='block'&&!tip.classList.contains('ru-modal'))", html)
         # a click fetches the on-demand endpoint and re-renders through the normal render() path.
         # (2026-07-30: /usage/fleet — /usage plus one row per OTHER Claude account signed in across the
         # fleet. It collapses to the single local row whenever every machine is on the same login.)

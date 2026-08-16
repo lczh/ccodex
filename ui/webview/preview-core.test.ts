@@ -1,0 +1,61 @@
+// File-preview core (the user 2026-07-08, re-homed from feed-artifacts.test.ts when the feed's
+// artifact strips were removed 2026-08-14 — the chat is the one preview surface now): a path
+// mentioned in the CHAT gets an inline render, bytes ride the kernel's /file endpoint. Source pins
+// over preview.ts / render.ts / styles.css / the kernel (render.ts has import-time DOM side effects,
+// so no test imports it as a module — see distill-background.test.ts precedent).
+import { test } from "node:test";
+import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+const UI = path.resolve(process.cwd(), "..", "ui", "webview");
+const RENDER = fs.readFileSync(path.join(UI, "render.ts"), "utf8");
+const PREVIEW = fs.readFileSync(path.join(UI, "preview.ts"), "utf8");
+const CHAT_CSS = fs.readFileSync(path.join(UI, "styles.css"), "utf8");
+const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "bin", "romp-kernel"), "utf8");
+
+test("preview.ts: kind classification, kernel /file URL, and self-removing renders", () => {
+  // the client's renderable-extension list must stay in step with the kernel's _PREVIEW_MIME
+  assert.match(PREVIEW, /IMG_EXT = new Set\(\["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"\]\)/);
+  assert.match(KERNEL, /_PREVIEW_MIME = dict\(_IMG_MIME, \*\*\{"\.pdf": "application\/pdf"\}\)/,
+               "kernel allowlist = image mimes + pdf; the client mirrors it");
+  assert.match(PREVIEW, /if \(ext === "pdf"\) return "pdf";/);
+  // bytes come from the kernel's /file endpoint, path percent-encoded, sid for cwd-relative
+  // resolution — routed through the /remote/<host>/file relay when the sid wears a host prefix
+  // (a federated session's file lives on the remote disk; behavior pinned in preview-remote.test.ts)
+  assert.match(PREVIEW, /base \+ "\?path=" \+ encodeURIComponent\(path\) \+ \(bare \? "&sid=" \+ encodeURIComponent\(bare\) : ""\)/);
+  assert.match(PREVIEW, /"\/remote\/" \+ encodeURIComponent\(host\) \+ "\/file"/);
+  // web dashboard only: the VS Code webview can't reach the kernel origin from an <img>
+  assert.match(PREVIEW, /location\.protocol === "http:" \|\| location\.protocol === "https:"/);
+  // an UNVERIFIED render the kernel can't serve REMOVES ITSELF (no dead chips): img onerror, pdf HEAD
+  // probe. Kernel-VERIFIED paths keep a visible retry chip instead — chat-inline-preview.test.ts pins that.
+  assert.match(PREVIEW, /if \(!verified\) \{ box\.remove\(\); return; \}/);
+  assert.match(PREVIEW, /if \(!verified\) fetch\(fileUrl\(path, sid\), \{ method: "HEAD" \}\)\.then\(\(r\) => \{ if \(!r\.ok\) box\.remove\(\); \}\)\.catch\(\(\) => box\.remove\(\)\)/);
+  assert.match(KERNEL, /if p == "\/file":/, "the preview bytes endpoint exists");
+  assert.match(KERNEL, /def do_HEAD\(self\):/, "HEAD probe for chips that can't self-verify like an <img>");
+});
+
+test("preview.ts: lightbox is a singleton overlay — img or native-viewer iframe, Esc/backdrop closes", () => {
+  assert.match(PREVIEW, /document\.getElementById\("romp-lightbox"\)\?\.remove\(\);/, "reopening replaces, never stacks");
+  assert.match(PREVIEW, /frame\.src = fileUrl\(path, sid\);/, "pdf → iframe → the browser's own viewer");
+  assert.match(PREVIEW, /if \(ev\.key === "Escape"\)/);
+  assert.match(PREVIEW, /wrap\.onclick = \(ev\) => \{ if \(ev\.target === wrap\) dismiss\(\); \};/, "backdrop closes; content clicks don't");
+});
+
+test("chat: a mentioned image/PDF grows a FULL render at its mention, deduped and capped", () => {
+  // (the user 2026-07-20: full renders replaced the 2026-07-08 thumbnails in the chat; the user
+  // 2026-08-15: figures moved from a tail strip to the mentioning block —
+  // chat-inline-preview.test.ts pins the placement shape)
+  assert.match(RENDER, /import \{ previewKind, previewFull, canPreview, fileUrl, retryFailedPreviews \} from "\.\/preview";/);
+  assert.match(RENDER, /if \(previewKind\(open\) && !previewable\.includes\(open\) && !\(skipThumbs && skipThumbs\.includes\(open\)\)\) \{/, "collected while linkifying — same detection, no second regex pass; an in-bubble image never re-renders");
+  assert.match(RENDER, /if \(previewable\.length\) \{/, "both surfaces now — VS Code images ride the host data-URL flow");
+  assert.match(RENDER, /previewable\.slice\(0, 4\)/, "capped so a directory listing doesn't wallpaper the chat");
+  assert.match(RENDER, /previewFull\(p, activeId, kernelVerified\.has\(p\)\)/, "relative paths resolve against the ACTIVE session's cwd, as openPathLink; verified paths fail loudly");
+});
+
+test("the chat sheet carries the lightbox + preview styles (the feed no longer previews)", () => {
+  assert.match(CHAT_CSS, /#romp-lightbox \{ position: fixed; inset: 0; z-index: 1300;/);
+  assert.match(CHAT_CSS, /\.path-thumb-tag \{ font-size: 0\.74em;/, "the PDF card's label (previewFull)");
+  assert.match(CHAT_CSS, /\.path-full-img \{ display: block; max-width: 100%;/, "the full render's image scale");
+  assert.match(CHAT_CSS, /\.path-thumbs \{ display: flex; flex-wrap: wrap;/, "the chat strip container");
+});

@@ -48,7 +48,7 @@ test("the kernel is authoritative: a confirming push clears the prediction, an u
   // reconcile runs against the authoritative incoming payload on every feed push, carrying that payload's
   // buildId so an ACKED prediction can tell a pre-click payload from the kernel's answer (feed-move-ack)
   assert.match(FEED, /lastPayloadBuildId = typeof m\.buildId === "number" \? m\.buildId : 0;/);
-  assert.match(FEED, /reconcileFollowMove\(incomingAsks, lastPayloadBuildId\);/);
+  assert.match(FEED, /reconcileFollowMove\(incomingAsks, lastPayloadBuildId, perHostBuildIds\);/);
   // CONFIRMED = the kernel now lists the card as working, OR no longer lists it (cleared/absorbed).
   // (An ANSWER-kind prediction additionally yields to the first payload either way — feed-card-predict.)
   assert.match(FEED, /if \(!a \|\| a\.column === "working" \|\| pendingMoveKind\.get\(id\) === "answer"\) \{/);

@@ -103,8 +103,11 @@ teardown() {
     for i in $(seq 1 50); do [ -s "$envdump" ] && break; sleep 0.1; done
     mcurl -fsS -X POST "http://127.0.0.1:7581/stop" >/dev/null 2>&1 || true
     [ -s "$envdump" ]
-    ! grep -q '^TMUX=' "$envdump"
-    ! grep -q '^TMUX_PANE=' "$envdump"
+    # `run` + status, NOT a bare `! grep`: `!` is exempt from set -e, so mid-test it asserts nothing.
+    run grep -q '^TMUX=' "$envdump"
+    [ "$status" -ne 0 ]
+    run grep -q '^TMUX_PANE=' "$envdump"
+    [ "$status" -ne 0 ]
     grep -q '^ROMP_SERVE_BIN=' "$envdump"   # the dump is real: other env DID flow through
 }
 
