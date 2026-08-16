@@ -131,11 +131,11 @@ Codex-only. `ccodex` opens the dashboard.
 Installed machines learn about new releases on their own: the kernel checks
 this repo's tags at boot and every few hours, and the dashboard offers the
 update as a banner — one click fetches the release, reinstalls, and restarts.
-Both bootstrap and the in-app updater require `git verify-tag` at Git's **full**
-trust level to succeed; a bad or unknown signature stops before install or
-restart and never falls back. Git must already trust the maintainer's OpenPGP
-key or SSH allowed-signers entry; see
-[Release signature trust](install.md#release-signature-trust).
+Updates follow the same rule as installs: with a trust root configured,
+`git verify-tag` at Git's **full** trust level is a hard gate — a bad or
+unknown signature stops before any code moves, never falling back — and
+without one, verification is attempted and its outcome noted in the update
+log; see [Release signature trust](install.md#release-signature-trust).
 The gear's **Updates** setting picks the behavior: *Check and ask* (default),
 *Install automatically*, or *Off*.
 

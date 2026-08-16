@@ -58,3 +58,10 @@ test("gear.css carries the modal styling for every pane that hosts it", () => {
     assert.ok(GEAR_CSS.includes(sel), `gear.css must style ${sel}`);
   assert.ok(KERNEL.includes("/dist/gear.css"), "the kernel feed page must link the extracted stylesheet");
 });
+
+test("the gear's dormant web-rail restart sends the default scope like every other surface", () => {
+  // AGENTS.md decision 2: every restart surface sends the same default; the missing body pin is
+  // how gear.js silently disagreed with the dashboard for two releases (the user's audit, 2026-08-16)
+  assert.ok(GEAR.includes("body: '{}'"), "gear restart body is the default scope");
+  assert.ok(!GEAR.includes('"fleet":false'), "no local-only opt-out hardcoded in gear");
+});

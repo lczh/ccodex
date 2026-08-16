@@ -1843,6 +1843,11 @@ def _latest_release_tag():
         if len(parts) != 2 or parts[1].endswith("^{}"):   # ^{} = peeled duplicate of an annotated tag
             continue
         tag = parts[1].rsplit("/", 1)[-1]
+        # releases are v-PREFIXED, exactly as bootstrap and the manual recipe select them: _semver
+        # tolerates a bare X.Y.Z (it also parses the VERSION file), so without this check the
+        # updater accepted tag shapes the installers refuse (the user's audit, 2026-08-16)
+        if not tag.startswith("v"):
+            continue
         v = _semver(tag)
         if v and (best_v is None or v > best_v):
             best, best_v = tag, v
@@ -1856,7 +1861,7 @@ def _release_verify_argv(tag):
     ROMP_RELEASE_ALLOWED_SIGNERS is set, resolve it now and refuse anything except a readable regular
     file rather than passing a typo to the child and hoping another trust store applies.
     """
-    if not _semver(tag):
+    if not (str(tag).startswith("v") and _semver(tag)):   # v-prefixed, like every installer surface
         raise ValueError("release tag is not a plain semantic version")
     # `git verify-tag` verifies cryptographic validity but, for OpenPGP, otherwise accepts an
     # imported key whose ownertrust is undefined.  Code installation requires a fully trusted
@@ -1878,17 +1883,34 @@ def _release_verify_enforced():
     """Is a release trust root CONFIGURED on this install? Verification enforces only then —
     mandatory-with-no-published-key bricked every install's updater from the first release (no key
     was ever distributed for friends' machines to trust; 2026-08-14 review). Configured deployments
-    (the env var, an explicit opt-in, or the allowed-signers file bootstrap persists into the
-    clone's git config) keep the full fail-closed gate; everyone else verifies best-effort and the
-    update log says so loudly."""
+    keep the full fail-closed gate; everyone else verifies best-effort and the update log says so
+    loudly. A trust root counts from ANY of: the env vars, the clone-local config bootstrap
+    persists, or the user's GLOBAL git config — bootstrap enforces on global config, and the
+    updater disagreeing made a documented global-only setup silently weaker in exactly the
+    long-lived half (the user's audit, 2026-08-16). Config FILES are read directly, no subprocess:
+    this runs inside _run_update, where tests patch subprocess.Popen, and a spawned `git config`
+    there poisons the very capture that pins this function's behavior."""
     if (os.environ.get("ROMP_RELEASE_ALLOWED_SIGNERS") or "").strip():
         return True
     if (os.environ.get("ROMP_VERIFY_RELEASES") or "").strip():
         return True
-    # Read the clone's config FILE directly, no subprocess: this runs inside _run_update, where
-    # tests (and any caller) may have subprocess.Popen patched — a spawned `git config` there
-    # poisons the very capture that pins this function's behavior. bootstrap persists the
-    # allowed-signers path with `git config --local`, so the local config file is the store.
+
+    def _has_signers(path):
+        try:
+            return "allowedsignersfile" in path.read_text().lower()
+        except OSError:
+            return False
+
+    # the global config file(s), as git resolves them: GIT_CONFIG_GLOBAL replaces the defaults
+    # ($XDG_CONFIG_HOME/git/config, then ~/.gitconfig) when set
+    gcg = (os.environ.get("GIT_CONFIG_GLOBAL") or "").strip()
+    if gcg:
+        if _has_signers(Path(gcg)):
+            return True
+    else:
+        xdg = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+        if _has_signers(xdg / "git" / "config") or _has_signers(Path.home() / ".gitconfig"):
+            return True
     try:
         gitp = ROOT / ".git"
         if gitp.is_file():   # a worktree: `.git` is a pointer file; its config sits in the gitdir,
@@ -1906,7 +1928,7 @@ def _release_verify_enforced():
                 except OSError:
                     continue
             return False
-        return "allowedsignersfile" in (gitp / "config").read_text().lower()
+        return _has_signers(gitp / "config")
     except OSError:
         return False
 

@@ -63,6 +63,12 @@ test("no usage → no windows (the strip stays quiet, never fakes bars)", () => 
 test("the strip carries the rail's controls: refresh, network popover, pane quick-opens", () => {
   const src = fs.readFileSync(path.join(path.resolve(process.cwd(), ".."), "ui", "webview", "strip.ts"), "utf8");
   assert.ok(src.includes('"/restart"') || src.includes("/restart`"), "the refresh button restarts the kernel");
+  // the request BODY is the default scope — every restart surface sends the same thing
+  // (AGENTS.md decision 2); this pin is what was missing when strip silently disagreed
+  // with the dashboard (the user's audit, 2026-08-16)
+  assert.ok(src.includes('body: "{}"'), "strip restart sends the default scope, no local-only opt-out");
+  assert.ok(!src.includes("fleet: false") && !src.includes('"fleet":false'),
+    "no surface hardcodes the local-only opt-out");
   for (const ep of ["/ssh-hosts", "/tunnels", "/tunnels/detach", "/tunnels/update", "/tunnels/start"])
     assert.ok(src.includes(ep), `the network popover must drive ${ep} (the rail twin)`);
   assert.ok(src.includes('{ type: "openPane", pane: p.key }'), "quick-opens post openPane to the host");

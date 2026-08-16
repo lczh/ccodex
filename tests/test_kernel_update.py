@@ -339,10 +339,19 @@ class RunUpdate(Fresh):
             spawned = []
             env = {k: v for k, v in km.os.environ.items()
                    if k not in ("ROMP_MANAGER_PORT", "ROMP_RELEASE_ALLOWED_SIGNERS",
-                                "ROMP_VERIFY_RELEASES")}
+                                "ROMP_VERIFY_RELEASES", "GIT_CONFIG_GLOBAL")}
+            # hermetic global-config dimension: _release_verify_enforced also reads the USER'S
+            # global git config (bootstrap enforces on it, so the updater must too) — a dev box
+            # with global signers would otherwise flip the no-trust-root cases
             env.update(PATH=str(fakebin) + os.pathsep + env.get("PATH", ""),
-                       GIT_CALLS=str(calls), VERIFY_RC=str(verify_rc))
-            if enforce:
+                       GIT_CALLS=str(calls), VERIFY_RC=str(verify_rc),
+                       GIT_CONFIG_GLOBAL="/dev/null")
+            if enforce == "global":
+                # the trust root lives ONLY in the global git config — must enforce like the rest
+                gcfg = Path(td) / "gitconfig"
+                gcfg.write_text('[gpg "ssh"]\n\tallowedSignersFile = /tmp/signers\n')
+                env["GIT_CONFIG_GLOBAL"] = str(gcfg)
+            elif enforce:
                 # the opt-in trust-root flag: with it, verification is the fail-closed gate
                 env["ROMP_VERIFY_RELEASES"] = "1"
             with mock.patch.object(km, "ROOT", root), mock.patch.object(km.jd, "STATE", state), \
@@ -374,6 +383,29 @@ class RunUpdate(Fresh):
         self.assertNotIn("install", rows)
         self.assertFalse(report["ok"])
         self.assertIn("signature verification", report["why"])
+
+    def test_global_git_config_trust_root_enforces_in_the_updater(self):
+        # bootstrap enforces when the GLOBAL git config carries the signers file; the updater
+        # checking only env + clone-local config made a documented global-only setup silently
+        # weaker in the long-lived half (the user's audit, 2026-08-16)
+        rc, rows, report = self._execute_captured_updater(1, enforce="global")
+        self.assertEqual(rc, 0)
+        self.assertFalse(any(row.startswith("merge ") for row in rows))
+        self.assertNotIn("install", rows)
+        self.assertFalse(report["ok"])
+
+    def test_bare_semver_tags_are_not_releases(self):
+        # bootstrap and the manual recipe select v-prefixed tags only; _semver alone also parses
+        # the VERSION file's bare X.Y.Z, so the tag sites must require the prefix explicitly
+        fake = subprocess.CompletedProcess([], 0, stdout=(
+            "aaaa\trefs/tags/1.9.9\n"
+            "bbbb\trefs/tags/v0.7.0\n"
+            "cccc\trefs/tags/v0.7.0^{}\n"), stderr="")
+        with mock.patch.object(km.subprocess, "run", return_value=fake):
+            self.assertEqual(km._latest_release_tag(), "v0.7.0",
+                             "a bare X.Y.Z tag must never outrank or be selected")
+        with self.assertRaises(ValueError):
+            km._release_verify_argv("1.2.3")
 
     def test_unsigned_without_trust_root_proceeds_with_a_note(self):
         # no trust root anywhere → verification is best-effort: still attempted (and its refusal in

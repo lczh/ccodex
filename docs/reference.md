@@ -186,8 +186,9 @@ through to `install.sh`:
 
 - `ROMP_DIR=<path>` where to clone; default `~/ccodex`.
 - `ROMP_REF=<tag|branch>` install a specific ref; default is the newest stable
-  `vX.Y.Z` release tag. Tags must pass `git verify-tag`; no release or a failed signature stops
-  installation instead of falling back. `ROMP_REF=main` is an explicit development-code opt-in.
+  `vX.Y.Z` release tag. Tags are verified with `git verify-tag` — a hard stop on failure when a
+  trust root is configured, a loud note otherwise (see below); no published release always stops.
+  `ROMP_REF=main` is an explicit development-code opt-in.
 - `ROMP_RELEASE_ALLOWED_SIGNERS=<absolute-path>` supplies Git's SSH allowed-signers file
   to bootstrap and the in-app updater. OpenPGP signatures use Git's configured GPG keyring
   and must meet `gpg.minTrustLevel=fully`.
