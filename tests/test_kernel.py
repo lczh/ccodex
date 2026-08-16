@@ -6234,6 +6234,16 @@ class ServeSecurity(unittest.TestCase):
             with urllib.request.urlopen(req, timeout=5) as r:
                 self.assertFalse(_json.loads(r.read().decode())["fleet"],
                                  "local-only remains the explicit opt-out")
+            # Malformed bodies are a 400, NEVER the broadest action by default-fallthrough (the
+            # user 2026-08-16: junk, arrays, nulls, and non-boolean fleet all got maximum scope).
+            for bad in (b"not json", b"[]", b"null", b'"fleet"', b'{"fleet": "no"}',
+                        b'{"fleet": 1}', b'{"fleet": null}'):
+                req = urllib.request.Request("http://127.0.0.1:%d/restart?token=testtok" % self.port,
+                                             method="POST", data=bad,
+                                             headers={"Content-Type": "application/json"})
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(req, timeout=5)
+                self.assertEqual(ctx.exception.code, 400, bad)
         finally:
             if saved is not None:
                 os.environ["ROMP_MANAGER_PORT"] = saved

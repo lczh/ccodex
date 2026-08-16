@@ -78,6 +78,14 @@ if [ -z "$ref" ]; then
     fi
     while IFS= read -r candidate; do
         [ -n "$candidate" ] || continue
+        # Stable releases ONLY — the exact vX.Y.Z shape the kernel updater's _semver accepts. The
+        # version sort otherwise ranks a prerelease-suffixed tag (v9.9.9-rc.1) above every stable,
+        # so a fresh install would take a prerelease the UPDATER then refuses to move past — the
+        # two pickers must agree on what a release is (the user 2026-08-16).
+        case "$candidate" in
+            v[0-9]*.[0-9]*.[0-9]*) printf '%s' "${candidate#v}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || continue ;;
+            *) continue ;;
+        esac
         remote_tag_oid="$(printf '%s\n' "$remote_release_refs" | \
             awk -v wanted="refs/tags/$candidate" '$2 == wanted { print $1; exit }')"
         [ -n "$remote_tag_oid" ] || continue

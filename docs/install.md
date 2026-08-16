@@ -33,8 +33,29 @@ gate with no published key would refuse every install.
 
 ### Release signature trust
 
-The installer and in-app updater use `git verify-tag`. Git therefore needs the release
-signer's public key before installation:
+Releases **from v1.2.2 onward are SSH-signed** with the ccodex release key, published
+in this repo at [`docs/release-key.pub`](release-key.pub) and fingerprinted here for
+out-of-band comparison:
+
+    SHA256:RaeDsaGzhN2OuP6NowcmkENJgFvk6Ma+ebKHC1OWqDo (ED25519)
+
+The earlier `v1.0.0`–`v1.2.1` tags predate signing and stay unsigned; a configured
+trust root therefore accepts v1.2.2+ and refuses the older tags, which is correct.
+To enforce verification (recommended once you've compared the fingerprint through a
+second channel):
+
+    mkdir -p ~/.config/ccodex
+    printf 'ccodex-release %s\n' "$(curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/docs/release-key.pub)" \
+      > ~/.config/ccodex/allowed-signers
+    # then install with the trust root pinned (bootstrap persists it for the updater):
+    curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | \
+      ROMP_REPO=https://github.com/lczh/ccodex.git ROMP_DIR=$HOME/ccodex \
+      ROMP_RELEASE_ALLOWED_SIGNERS=$HOME/.config/ccodex/allowed-signers bash
+
+Note the bootstrapping caveat: the key file travels in the same repo as the code, so
+its value comes from comparing the fingerprint above through an independent channel
+(the maintainer directly, this page at a different time/network). For `git verify-tag`
+mechanics, Git needs the signer's key configured before installation:
 
 - For an OpenPGP signature, import the maintainer's published public key into the GPG
   keyring Git uses, confirm its fingerprint through a trusted channel, and certify that key
@@ -53,9 +74,10 @@ The signer key or fingerprint must be distributed independently of the release t
 checked; trusting a key supplied only by an unverified tag would defeat the check. Custom
 `ROMP_REPO` installations work the same way, using that repository maintainer's trusted key.
 
-Releases are not signed yet, so the default install runs in the noted-not-enforced mode.
-Once releases are signed and the signing key is published, configuring the trust root
-(above, or `ROMP_VERIFY_RELEASES=1` with GPG trust) turns verification into a hard gate —
+Without a configured trust root the default install runs in the noted-not-enforced
+mode — verification is attempted and its outcome printed, and the install proceeds.
+Configuring the trust root (above, or `ROMP_VERIFY_RELEASES=1` with GPG trust) turns
+verification into a hard gate —
 recommended for any deployment that can distribute the key out of band.
 
 ### Manual and custom installs

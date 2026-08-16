@@ -160,7 +160,9 @@ export function initStrip(openSettings: () => void, post?: (m: Record<string, un
     e.stopPropagation();
     refresh.disabled = true;
     fetch(kernelUrl("/restart"), { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fleet: false }) }).catch(() => { /* the reconnect machinery reports */ });
+      // default scope — everything attached (AGENTS.md decision 2); this surface must not
+      // silently disagree with the dashboard's Restart (the user 2026-08-16)
+      body: "{}" }).catch(() => { /* the reconnect machinery reports */ });
     setTimeout(() => { refresh.disabled = false; }, 8000);   // pure failsafe re-arm; the reload normally lands first
   });
   // Remote kernels — the rail's #rail-net twin (same endpoints; the shell keeps

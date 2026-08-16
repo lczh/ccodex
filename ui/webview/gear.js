@@ -325,7 +325,9 @@ function initGear(post) {
   p.addEventListener('click', function (e) { if (e.target === p) closeSettings(); });   // click the dimmed backdrop (not the card) → close
   document.addEventListener('click', function (e) { if (!p.hidden && e.target !== g && !p.contains(e.target)) closeSettings(); });
   var rf = document.getElementById('rrefresh');   // ↻ (web shell rail only): POST /restart, poll /healthz, reload
-  if (rf) rf.onclick = function () { rf.disabled = true; try { fetch(ku('/restart'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"fleet":false}' }).catch(function () {}); } catch (e) {}
+  // body '{}' = the default scope, everything attached (AGENTS.md decision 2) — this button must
+  // not silently disagree with the dashboard rail's Restart (the user 2026-08-16)
+  if (rf) rf.onclick = function () { rf.disabled = true; try { fetch(ku('/restart'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).catch(function () {}); } catch (e) {}
     var n = 0; (function again() { setTimeout(function () { n++; fetch(ku('/healthz'), { cache: 'no-store' }).then(function (r) { if (r && r.ok) location.reload(); else if (n < 40) again(); }).catch(function () { if (n < 40) again(); }); }, 500); })(); };
   // ── token-usage analytics modal: a sessions-vs-judges bar chart over a selectable window ──
   var raBack = document.getElementById('ranalytics-back'), raOpen = document.getElementById('ra-open'),

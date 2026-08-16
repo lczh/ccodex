@@ -23027,11 +23027,21 @@ class Handler(BaseHTTPRequestHandler):
                 # call. `fleet:false` keeps the local-only behaviour. The remote half runs in a thread
                 # and writes its report to disk BEFORE restarting this kernel, because this process
                 # does not survive to report anything.
+                # Scope rides an OPTIONAL boolean `fleet` in a JSON-object body. A body that does
+                # not parse to exactly that shape is a 400 — malformed input must never select the
+                # BROADEST action by falling into the default (the user 2026-08-16, verifying that
+                # junk bodies, arrays, nulls and non-boolean values all got maximum scope + 200).
                 _fleet = True
-                try:
-                    _fleet = json.loads(raw_body or b"{}").get("fleet", True) is not False
-                except Exception:
-                    pass
+                if raw_body:
+                    _bad = ('{"ok": false, "error": "body must be a JSON object; '
+                            '\'fleet\' must be a boolean when present"}')
+                    try:
+                        _b = json.loads(raw_body)
+                    except Exception:
+                        return self._send(400, _bad, "application/json")
+                    if not isinstance(_b, dict) or not isinstance(_b.get("fleet", True), bool):
+                        return self._send(400, _bad, "application/json")
+                    _fleet = _b.get("fleet", True)
                 # WHO ASKED, on the record (the user 2026-07-31): a restart blinks every dashboard, and
                 # a run of them traced to this route was unattributable — the CLI path audits itself
                 # (bin/romp → restart-audit.jsonl) but the HTTP door was silent. Same file, so one log

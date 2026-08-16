@@ -266,3 +266,15 @@ EOF
     [ -z "$(git -C "$HOME/romp" config --get remote.pushDefault || true)" ]
     [[ "$output" != *"Publishing remote"* ]]
 }
+
+@test "bootstrap.sh: a prerelease-suffixed tag never outranks the newest stable release" {
+    # version sort ranks v9.9.9-rc.1 above every stable, and the kernel updater's _semver refuses
+    # prerelease shapes — installing one would strand the machine on a release the updater can't
+    # move past (the user 2026-08-16). Both pickers speak exactly vX.Y.Z.
+    git -C "$ROMP_REPO" -c gpg.format=ssh -c user.signingKey="$TEST_DIR/release-key" \
+        tag -s v9.9.9-rc.1 -m prerelease
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -eq 0 ]
+    [ "$(git -C "$HOME/romp" describe --tags)" = "v0.2.0" ]
+    [[ "$output" == *"Checking out v0.2.0"* ]]
+}
