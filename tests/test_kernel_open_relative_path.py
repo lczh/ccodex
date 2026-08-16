@@ -57,19 +57,23 @@ class ResolveOpenPath(unittest.TestCase):
         self.assertIn("has no desktop session to open it on", src)
 
     def test_linux_open_uses_xdg_open(self):
-        old_environ_get = km.os.environ.get
+        # km.os IS the singleton os module: save the REAL environ object and restore THAT.
+        # Restoring `os.environ` re-reads the already-rebound attribute (a no-op), leaving a plain
+        # dict installed process-wide — every later putenv is then lost to subprocess children
+        # (froze the updater harness's env in the full suite, 2026-08-16).
+        old_env = km.os.environ
         old_platform, old_which, old_popen = km.sys.platform, km.shutil.which, km.subprocess.Popen
         calls = []
         try:
             km.sys.platform = "linux"
-            km.os.environ = dict(km.os.environ, DISPLAY=":0")
+            km.os.environ = dict(old_env, DISPLAY=":0")
             km.shutil.which = lambda name: "/usr/bin/xdg-open" if name == "xdg-open" else None
             km.subprocess.Popen = lambda argv, **kwargs: calls.append(argv)
             self.assertTrue(km._open_file("design/foo.md", SID))
             self.assertEqual(calls, [["xdg-open", os.path.join(BASE, "design/foo.md")]])
         finally:
             km.sys.platform, km.shutil.which, km.subprocess.Popen = old_platform, old_which, old_popen
-            km.os.environ = os.environ
+            km.os.environ = old_env
 
     def test_linux_open_reports_when_no_desktop_opener_exists(self):
         old_platform, old_which = km.sys.platform, km.shutil.which
