@@ -167,7 +167,11 @@ Reply with ONLY the <=8-word phrase capturing what they asked for. Nothing else.
       #   (nothing)        → the turn produced no text and used no tools; skip.
       #   VERBATIM\n<text> → short, tool-less reply (a direct answer): show as-is.
       #   MODEL\n<turn>    → real work: summarize with the model.
-      excerpt=$(python3 - "$transcript" <<'PY' 2>/dev/null || true
+      # Heredoc in a FUNCTION, never inline in the $(): macOS bash 3.2's naive $() scan
+      # trips over quotes in the body (same landmine as bin/romp-uninstall, 2026-08-16;
+      # pinned by tests/test_shell_bash32_portability.py).
+      _turn_excerpt() {
+        python3 - "$transcript" <<'PY' 2>/dev/null || true
 import sys, json
 lu = ""
 texts = []   # assistant text blocks in the latest turn (reset on each human prompt)
@@ -236,7 +240,8 @@ if tools:
             seen.append(t)
     print("TOOLS USED: " + ", ".join(seen[:12]))
 PY
-      )
+      }
+      excerpt=$(_turn_excerpt)
       [[ -n "${excerpt//[[:space:]]/}" ]] || exit 0
       mode="${excerpt%%$'\n'*}"
       payload="${excerpt#*$'\n'}"
