@@ -75,3 +75,28 @@ EOF
     [ "$status" -eq 2 ]
     [[ "$output" == *"usage: romp engine"* ]]
 }
+
+@test "romp new: --model/--effort refuse UP FRONT when the engine default makes the spawn codex" {
+    # validating against the --codex flag alone let these sail through on an engine-codex
+    # machine: the codex session got created and the preference silently dropped, warned only
+    # afterward (the user's audit, 2026-08-17). The refusal must come at parse time — exit 2,
+    # BEFORE any kernel/token probing (exit 1 would mean it got past validation).
+    run "$ROMP_SCRIPT" engine codex
+    [ "$status" -eq 0 ]
+    run "$ROMP_SCRIPT" new --model some-model mysess
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"romp engine codex"* ]]
+    run "$ROMP_SCRIPT" new --effort high mysess
+    [ "$status" -eq 2 ]
+
+    # the explicit flag still refuses, naming the flag
+    run "$ROMP_SCRIPT" engine claude
+    run "$ROMP_SCRIPT" new --codex --model some-model mysess
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--codex"* ]]
+
+    # and an SDK spawn keeps taking them past validation (fails later only on the dead kernel)
+    run "$ROMP_SCRIPT" new --model some-model mysess
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"kernel"* ]]
+}

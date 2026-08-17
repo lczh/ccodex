@@ -23,4 +23,3 @@ test("the apiError chip + Retry still show (they key on blocked.state, not the c
   // billing limit) — the user 2026-07-14; the spend-cap wiring is pinned in apierror-spend-limit.test.ts.
   assert.match(FEED, /a\._apiRetry\.style\.display = \(isApiErr && !spendLimit && !modelLimit\) \? "" : "none";/);
 });
-

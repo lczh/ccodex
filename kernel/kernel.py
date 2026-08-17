@@ -1916,13 +1916,20 @@ def _release_verify_enforced():
         return True
     if (os.environ.get("ROMP_VERIFY_RELEASES") or "").strip():
         return True
+    # Fail CLOSED on anything but git's clean "key absent" answer (rc 1, silent). A query error,
+    # timeout, or noise proves nothing about the trust root, and "couldn't tell" must never
+    # downgrade a configured install to best-effort (the user's audit, 2026-08-17). rc 0 with an
+    # EMPTY value is likewise enforced: someone configured the key; verification then fails loudly
+    # against the misconfiguration instead of quietly skipping the gate.
     try:
         r = subprocess.run(["git", "-C", str(ROOT), "config", "--get",
                             "gpg.ssh.allowedSignersFile"],
                            capture_output=True, text=True, timeout=10)
-        return bool(r.stdout.strip())
     except Exception:
-        return False
+        return True
+    if r.returncode == 0:
+        return True
+    return not (r.returncode == 1 and not r.stdout.strip() and not r.stderr.strip())
 
 
 def _run_update(tag):
@@ -2088,11 +2095,12 @@ _MAIN_DRIFT = ["", ""]                 # [origin sha a notice fired for, checkou
 
 
 def _origin_main_sha():
-    """origin/main's commit (short), '' when unreachable — offline is a normal state, never a crash."""
+    """origin/main's commit (FULL sha — the pull step binds its checkout to exactly this; display
+    shortens it), '' when unreachable — offline is a normal state, never a crash."""
     try:
         out = subprocess.run(["git", "ls-remote", "origin", "refs/heads/main"],
                              cwd=str(ROOT), capture_output=True, text=True, timeout=15)
-        return (out.stdout.split() or [""])[0][:8]
+        return (out.stdout.split() or [""])[0]
     except Exception:
         return ""
 
@@ -2108,13 +2116,13 @@ def _checkout_sha():
 
 
 def _main_drift_verdict(origin, checkout, running):
-    """(kind, target) — the pure decision. kind: "pull" (origin ahead of the checkout: fetch + advance
+    """(kind, target) — the pure decision. kind: "pull" (origin moved off the checkout: fetch + advance
     + restart), "restart" (the checkout is ahead of the running kernel: restart alone), or "" (in sync
     or unknowable). A sha that could not be read ('' anywhere) is unknown → no verdict: guessing would
-    invent a notice. Comparison is by INEQUALITY, not ancestry — the checkout only ever moves by
-    fast-forwarding to origin/main here, so a differing sha IS new information, and a wrongly-diverged
-    checkout surfaces in the pull step's own fast-forward refusal rather than being guessed at."""
-    if origin and checkout and origin != checkout:
+    invent a notice. Comparison is by INEQUALITY (prefix-matched: origin is full, checkout short) —
+    a differing sha is the NOTICE trigger only; the pull step itself re-fetches, requires the fetched
+    tip to still be this target, and refuses anything that is not a fast-forward of the checkout."""
+    if origin and checkout and not origin.startswith(checkout):
         return ("pull", origin)
     if checkout and running and checkout != running:
         return ("restart", checkout)
@@ -2124,10 +2132,20 @@ def _main_drift_verdict(origin, checkout, running):
 def _main_drift_check():
     """One origin/checkout/running comparison pass; fires the SAME banner as the release check (the
     shell's offer() renders the main-drift wording off kind:"main"). Re-fires only when the target sha
-    CHANGES — new information, never a re-nag of the sha already offered or dismissed."""
+    CHANGES — new information, never a re-nag of the sha already offered or dismissed.
+
+    A CONFIGURED RELEASE TRUST ROOT ends the PULL half here: that install has said its code moves
+    only through signed, verified release tags (bootstrap.sh sets exactly that up), and converging
+    on a bare origin/main tip would swap in code nothing ever signed — bypassing the entire
+    verification chain the tag updater enforces (the user's audit, 2026-08-17). Dev clones (no
+    trust root) keep the main-tracking flow. The RESTART half still fires everywhere: it moves no
+    code, it only offers to run what is already on disk."""
     if _update_mode() == "off":
         return
-    kind, target = _main_drift_verdict(_origin_main_sha(), _checkout_sha(), _kernel_sha())
+    # Enforced installs never even probe origin/main (no ls-remote): with origin unknown the
+    # verdict cannot say "pull", and the restart half needs no network.
+    origin = "" if _release_verify_enforced() else _origin_main_sha()
+    kind, target = _main_drift_verdict(origin, _checkout_sha(), _kernel_sha())
     if not kind:
         _MAIN_DRIFT[0] = _MAIN_DRIFT[1] = ""          # in sync: a future drift is new information again
         return
@@ -2146,19 +2164,35 @@ def _main_drift_check():
             _MAIN_DRIFT[slot] = ""
             return
         _LAST_AUTO_CONVERGE[0] = time.time()
-        _run_main_update(kind)
+        _run_main_update(kind, target=target)
     else:
         _send_to_app("shell", {"type": "updateAvail", "kind": "main", "drift": kind,
-                               "cur": _kernel_sha() or "", "tag": target, "boot": _BOOT_ID})
+                               "cur": _kernel_sha() or "", "tag": target[:8], "boot": _BOOT_ID})
 
 
-def _run_main_update(kind, immediate=False):
-    """Converge on newest main: advance the checkout (fast-forward only; a DIRTY shared tree refuses
-    LOUDLY — peer sessions' uncommitted work is never discarded) and bounce every kernel through the
-    manager. `kind` "restart" skips the pull (the checkout is already ahead). Unattended (auto mode)
-    the bounce rides the quiet window; a banner CLICK is the user's own deliberate cut → immediate."""
+def _run_main_update(kind, immediate=False, target=""):
+    """Converge on newest main: advance the checkout and bounce every kernel through the manager.
+    `kind` "restart" skips the pull (the checkout is already ahead). Unattended (auto mode) the
+    bounce rides the quiet window; a banner CLICK is the user's own deliberate cut → immediate.
+
+    The pull step moves the checkout ONLY when every one of these holds, and says why not otherwise
+    (the user's audit, 2026-08-17 — the first cut checked none of them):
+      * no release trust root is configured — that install converges on nothing unsigned, ever
+      * the shared tree is clean — peer sessions' uncommitted work is never discarded
+      * the fetch SUCCEEDED — a quiet fetch failure otherwise re-checks-out the stale local ref,
+        which can move the tree BACKWARD
+      * the fetched tip IS the sha the verdict advertised (`target`) — the move is bound to the
+        offer; a main that moved again since is new information for the next pass, not a licence
+        to check out whatever is there now
+      * the tip fast-forwards from HEAD — a diverged or rewound origin/main is refused, named
+      * install.sh succeeds — new code with stale deps/build is not an update"""
     if kind == "pull":
         try:
+            if _release_verify_enforced():
+                _sync_notice("this install updates only through signed release tags — "
+                             "not converging on origin/main.", ok=False)
+                _MAIN_DRIFT[0] = ""
+                return
             dirty = subprocess.run(["git", "status", "--porcelain"], cwd=str(ROOT),
                                    capture_output=True, text=True, timeout=10).stdout.strip()
             if dirty:
@@ -2166,14 +2200,40 @@ def _run_main_update(kind, immediate=False):
                              "not touching it. Commit or stash it, then Update again.", ok=False)
                 _MAIN_DRIFT[0] = ""                   # let the notice re-fire once the tree is clean
                 return
-            subprocess.run(["git", "fetch", "origin", "main"], cwd=str(ROOT),
-                           capture_output=True, text=True, timeout=60)
-            r = subprocess.run(["git", "checkout", "--detach", "origin/main"], cwd=str(ROOT),
+            f = subprocess.run(["git", "fetch", "origin", "main"], cwd=str(ROOT),
+                               capture_output=True, text=True, timeout=60)
+            if f.returncode != 0:
+                _sync_notice("main moved at origin, but fetching it failed: %s"
+                             % (f.stderr or f.stdout or "").strip()[-200:], ok=False)
+                _MAIN_DRIFT[0] = ""
+                return
+            tip = subprocess.run(["git", "rev-parse", "origin/main"], cwd=str(ROOT),
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+            if not tip or (target and tip != target):
+                _sync_notice("main moved again while updating — offering the newer commit instead.",
+                             ok=False)
+                _MAIN_DRIFT[0] = ""                   # the next pass advertises the fresh tip
+                return
+            ff = subprocess.run(["git", "merge-base", "--is-ancestor", "HEAD", tip],
+                                cwd=str(ROOT), capture_output=True, text=True, timeout=10)
+            if ff.returncode != 0:
+                _sync_notice("origin/main is not a fast-forward of this checkout (diverged or "
+                             "rewound) — not moving. Reconcile the clone yourself.", ok=False)
+                _MAIN_DRIFT[0] = ""
+                return
+            r = subprocess.run(["git", "checkout", "--detach", tip], cwd=str(ROOT),
                                capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
                 _sync_notice("main moved at origin, but advancing the checkout failed: %s"
                              % (r.stderr or r.stdout or "").strip()[-200:], ok=False)
                 _MAIN_DRIFT[0] = ""
+                return
+            inst = subprocess.run(["bash", str(ROOT / "install.sh")], cwd=str(ROOT),
+                                  capture_output=True, text=True, timeout=600)
+            if inst.returncode != 0:
+                _sync_notice("the checkout advanced to %s but install.sh failed: %s — fix it, "
+                             "then: romp refresh" % (tip[:8],
+                             (inst.stderr or inst.stdout or "").strip()[-200:]), ok=False)
                 return
         except Exception as e:
             _sync_notice("main moved at origin, but the pull step failed: %s" % e, ok=False)
@@ -2183,7 +2243,9 @@ def _run_main_update(kind, immediate=False):
         import urllib.request
         req = urllib.request.Request("http://127.0.0.1:%d/restart-all%s"
                                      % (int(os.environ.get("ROMP_MANAGER_PORT") or 7432),
-                                        "" if immediate else "?when=quiet"), method="POST")
+                                        "" if immediate else "?when=quiet"), method="POST",
+                                     headers={"X-Romp-Manager-Token":
+                                              os.environ.get("ROMP_MANAGER_TOKEN", "")})
         urllib.request.urlopen(req, timeout=5).read()
     except Exception as e:
         _sync_notice("romp is updated on disk but the restart request failed (%s) — "
@@ -9528,6 +9590,11 @@ def _update_remote(host):
         'LOGDIR="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}"; mkdir -p "$LOGDIR"; R=%s; '
         'if ! git -C "$R" merge-base --is-ancestor HEAD %s 2>/dev/null; then '
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIVERGED; exit 0; fi; '
+        # Re-check dirtiness HERE, in the same shell as the reset — the discover-step probe ran an
+        # ssh round-trip ago, and an edit landing in that window would be destroyed by reset --hard
+        # on the strength of a stale answer (the user's audit, 2026-08-17).
+        'if [ -n "$(git -C "$R" status --porcelain 2>/dev/null | head -c 1)" ]; then '
+        'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYNOW; exit 0; fi; '
         'git -C "$R" reset --hard %s >/dev/null 2>&1 || { git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; }; '
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; '
         'NEW="$(git -C "$R" rev-parse --short HEAD)"; '
@@ -9553,7 +9620,7 @@ def _update_remote(host):
         'UP=0; for i in 1 2 3 4 5 6 7 8; do sleep 1; if bash -c "exec 3<>/dev/tcp/127.0.0.1/%d" 2>/dev/null; then UP=1; break; fi; done; '
         'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null &  sleep 1; fi; '
         'echo "SYNCED:$NEW"'
-    ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
+    ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -9588,6 +9655,9 @@ def _update_remote(host):
                        "git push --force %s:<remote-romp-dir> HEAD:refs/heads/%s "
                        "then, on %s: git reset --hard %s && git update-ref -d refs/heads/%s"
                        % (host, host, host, _P2P_REF, host, _P2P_REF, _P2P_REF))
+    if tag == "DIRTYNOW":
+        return False, ("pushed, but %s picked up uncommitted work between the check and the apply — "
+                       "not clobbering it. Commit or stash there, then push again." % host)
     if tag == "RESETFAIL":
         return False, "pushed, but the remote couldn't check out the new code"
     if tag == "NOLAUNCH":
@@ -24827,9 +24897,17 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, json.dumps({"ok": True, "state": _UPDATE_STATE[0]}), "application/json")
                 kind = "pull" if _MAIN_DRIFT[0] else ("restart" if _MAIN_DRIFT[1] else "")
                 if kind:
-                    _audit_restart_request("main-converge", tag=_MAIN_DRIFT[0] or _MAIN_DRIFT[1],
+                    if kind == "pull" and _release_verify_enforced():
+                        # The banner never fires under a trust root, but the route must not trust
+                        # the banner: this install moves only via signed release tags.
+                        return self._send(409, json.dumps({"ok": False, "error":
+                                          "this install updates only through signed release tags"}),
+                                          "application/json")
+                    converge_target = _MAIN_DRIFT[0] or _MAIN_DRIFT[1]
+                    _audit_restart_request("main-converge", tag=converge_target,
                                            addr=str(self.client_address[0]))
-                    threading.Thread(target=_run_main_update, args=(kind, True), daemon=True).start()
+                    threading.Thread(target=_run_main_update, args=(kind, True, converge_target),
+                                     daemon=True).start()
                     _send_to_app("shell", {"type": "updateAvail", "state": "running", "boot": _BOOT_ID})
                     return self._send(200, json.dumps({"ok": True, "state": "converging"}), "application/json")
                 return self._send(409, "no newer release or main commit known to this kernel", "text/plain")

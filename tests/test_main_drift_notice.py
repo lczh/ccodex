@@ -24,25 +24,30 @@ SourceFileLoader("romp_judge", os.path.join(BIN, "romp-judge")).load_module()
 km = SourceFileLoader("romp_kernel_drift", os.path.join(BIN, "romp-kernel")).load_module()
 
 
+OA = "aaaa1111" + "e" * 32          # origin/main FULL sha (the verdict binds the pull to all 40)
+OB = "bbbb2222" + "e" * 32
+
+
 class DriftVerdict(unittest.TestCase):
-    def test_origin_ahead_of_the_checkout_wants_a_pull(self):
-        self.assertEqual(km._main_drift_verdict("aaaa1111", "bbbb2222", "bbbb2222"), ("pull", "aaaa1111"))
+    def test_origin_ahead_of_the_checkout_wants_a_pull_bound_to_the_full_sha(self):
+        self.assertEqual(km._main_drift_verdict(OA, "bbbb2222", "bbbb2222"), ("pull", OA))
 
     def test_checkout_ahead_of_the_running_kernel_wants_a_restart(self):
         # the hand-advanced case: updated code sits on disk, nothing booted it
-        self.assertEqual(km._main_drift_verdict("aaaa1111", "aaaa1111", "cccc3333"), ("restart", "aaaa1111"))
+        self.assertEqual(km._main_drift_verdict(OA, "aaaa1111", "cccc3333"), ("restart", "aaaa1111"))
 
     def test_pull_outranks_restart_when_both_hold(self):
         # origin ahead AND the running build stale: one pull converges both in a single bounce
-        self.assertEqual(km._main_drift_verdict("aaaa1111", "bbbb2222", "cccc3333")[0], "pull")
+        self.assertEqual(km._main_drift_verdict(OA, "bbbb2222", "cccc3333")[0], "pull")
 
     def test_in_sync_is_quiet(self):
-        self.assertEqual(km._main_drift_verdict("aaaa1111", "aaaa1111", "aaaa1111"), ("", ""))
+        # origin is full, the checkout short: same commit must read as agreement, not drift
+        self.assertEqual(km._main_drift_verdict(OA, "aaaa1111", "aaaa1111"), ("", ""))
 
     def test_unknown_shas_never_invent_a_notice(self):
         # offline ls-remote, unreadable checkout, missing running sha: unknown, not a disagreement
         self.assertEqual(km._main_drift_verdict("", "bbbb2222", "bbbb2222"), ("", ""))
-        self.assertEqual(km._main_drift_verdict("aaaa1111", "", "bbbb2222"), ("", ""))
+        self.assertEqual(km._main_drift_verdict(OA, "", "bbbb2222"), ("", ""))
         self.assertEqual(km._main_drift_verdict("", "", ""), ("", ""))
 
 
@@ -51,22 +56,63 @@ class DriftWiring(unittest.TestCase):
         src = inspect.getsource(km._main_drift_check)
         self.assertIn('if _update_mode() == "off":', src)
         self.assertIn('if _update_mode() == "auto":', src)
-        self.assertIn("_run_main_update(kind)", src)
+        self.assertIn("_run_main_update(kind, target=target)", src,
+                      "even unattended, the converge is bound to the sha this pass advertised")
         self.assertIn('"kind": "main"', src, "ask mode fires the shared banner with the drift variant")
 
-    def test_a_dirty_shared_tree_refuses_loudly_and_rearms(self):
+    def test_a_release_trusting_install_never_probes_or_pulls_main(self):
+        # a configured trust root means code moves ONLY via signed release tags: the check must not
+        # even ls-remote origin (no probe → no pull verdict → no banner, no auto converge), and the
+        # pull step itself refuses as defence in depth (the user's audit, 2026-08-17)
+        src = inspect.getsource(km._main_drift_check)
+        self.assertIn('"" if _release_verify_enforced() else _origin_main_sha()', src)
+        self.assertIn("signed release tags", inspect.getsource(km._run_main_update))
+
+    def test_the_restart_half_still_fires_under_a_trust_root(self):
+        # restart-drift moves no code — it runs what is already on disk (a landed tag update whose
+        # bounce died). Functional: enforced, checkout ahead of the running build → restart verdict.
+        ran = []
+        saved = (km._update_mode, km._release_verify_enforced, km._checkout_sha, km._kernel_sha,
+                 km._run_main_update, km._LAST_AUTO_CONVERGE[0], km._MAIN_DRIFT[0], km._MAIN_DRIFT[1])
+        km._update_mode = lambda: "auto"
+        km._release_verify_enforced = lambda: True
+        km._checkout_sha = lambda: "bbbb2222"
+        km._kernel_sha = lambda: "cccc3333"
+        km._run_main_update = lambda kind, immediate=False, target="": ran.append((kind, target))
+        try:
+            km._MAIN_DRIFT[0] = km._MAIN_DRIFT[1] = ""
+            km._LAST_AUTO_CONVERGE[0] = 0.0
+            km._main_drift_check()
+            self.assertEqual(ran, [("restart", "bbbb2222")])
+        finally:
+            (km._update_mode, km._release_verify_enforced, km._checkout_sha, km._kernel_sha,
+             km._run_main_update) = saved[:5]
+            km._LAST_AUTO_CONVERGE[0] = saved[5]
+            km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = saved[6], saved[7]
+
+    def test_the_pull_step_verifies_every_precondition_and_says_why_not(self):
+        # the first cut checked none of these (the user's audit, 2026-08-17): a quiet fetch failure
+        # re-checked-out the stale ref, any differing sha was "an update" (older/diverged included),
+        # the checkout was never bound to the advertised sha, install.sh never ran, and the restart
+        # POST carried no manager token (every converge ended 401 with the processes still stale)
         src = inspect.getsource(km._run_main_update)
         self.assertIn('"status", "--porcelain"', src)
         self.assertIn("uncommitted work", src, "the refusal names the real problem")
-        self.assertIn('_MAIN_DRIFT[0] = ""', src, "the notice re-fires once the tree is clean")
-        self.assertIn('"checkout", "--detach", "origin/main"', src, "advance is the repo's own convention")
+        self.assertIn("if f.returncode != 0:", src, "a failed fetch aborts loudly, never re-checks-out stale refs")
+        self.assertIn("tip != target", src, "the move is bound to the sha the verdict advertised")
+        self.assertIn('"merge-base", "--is-ancestor", "HEAD", tip', src,
+                      "a diverged or rewound origin/main is refused, named")
+        self.assertIn('"checkout", "--detach", tip', src, "the checkout lands on the BOUND sha, not a ref")
+        self.assertIn('install.sh', src, "new code with stale deps/build is not an update")
+        self.assertIn('"X-Romp-Manager-Token"', src, "the restart request authenticates to the manager")
+        self.assertIn('_MAIN_DRIFT[0] = ""', src, "every refusal re-arms the notice")
 
     def test_the_click_converges_immediately_and_auto_rides_the_quiet_window(self):
         src = inspect.getsource(km._run_main_update)
         self.assertIn('"" if immediate else "?when=quiet"', src)
         route = inspect.getsource(km)
-        self.assertIn('threading.Thread(target=_run_main_update, args=(kind, True), daemon=True)', route,
-                      "the banner click is the user's own deliberate cut")
+        self.assertIn('threading.Thread(target=_run_main_update, args=(kind, True, converge_target)',
+                      route, "the banner click is the user's own deliberate cut, bound to the offer")
 
     def test_auto_converges_batch_behind_the_cool_down(self):
         # the user 2026-08-15, after flipping auto: main took a merge every few minutes and auto mode
@@ -74,11 +120,13 @@ class DriftWiring(unittest.TestCase):
         # cool-down, N merges inside the window become ONE restart to the LATEST sha.
         ran = []
         saved = (km._update_mode, km._origin_main_sha, km._checkout_sha, km._kernel_sha,
-                 km._run_main_update, km._LAST_AUTO_CONVERGE[0], km._MAIN_DRIFT[0], km._MAIN_DRIFT[1])
+                 km._run_main_update, km._LAST_AUTO_CONVERGE[0], km._MAIN_DRIFT[0], km._MAIN_DRIFT[1],
+                 km._release_verify_enforced)
         km._update_mode = lambda: "auto"
+        km._release_verify_enforced = lambda: False   # dev-box posture; the machine's own config must not leak in
         km._checkout_sha = lambda: "aaa"
         km._kernel_sha = lambda: "aaa"
-        km._run_main_update = lambda kind, immediate=False: ran.append(kind)
+        km._run_main_update = lambda kind, immediate=False, target="": ran.append(kind)
         try:
             km._MAIN_DRIFT[0] = km._MAIN_DRIFT[1] = ""
             km._LAST_AUTO_CONVERGE[0] = 0.0
@@ -97,6 +145,7 @@ class DriftWiring(unittest.TestCase):
              km._run_main_update) = saved[:5]
             km._LAST_AUTO_CONVERGE[0] = saved[5]
             km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = saved[6], saved[7]
+            km._release_verify_enforced = saved[8]
 
     def test_the_shell_banner_carries_the_drift_variants(self):
         src = inspect.getsource(km)

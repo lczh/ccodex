@@ -1203,10 +1203,21 @@ case "${1:-}" in
         if $use_tmux && $use_codex; then
             echo "romp new: --codex and -t are different session kinds — pick one" >&2; exit 2
         fi
-        if [[ -n "$model_arg$effort_arg" ]] && $use_codex; then
+        # The EFFECTIVE backend decides flag validity — the machine default (`romp engine`,
+        # STATE/default-backend) counts exactly like an explicit --codex. Resolved HERE, before
+        # any flag guard: validating against the flag alone let `romp new --model …` on an
+        # engine-codex machine sail past, create the Codex session, silently ignore the
+        # preference and warn only afterward (the user's audit, 2026-08-17).
+        # `|| true`: an absent file under set -euo pipefail otherwise kills the whole command.
+        _be="$(cat "${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}/default-backend" 2>/dev/null | tr -d '[:space:]' || true)"
+        case "$_be" in sdk|codex) ;; *) _be="sdk" ;; esac
+        $use_codex && _be="codex"
+        if [[ -n "$model_arg$effort_arg" && "$_be" == "codex" ]] && ! $use_tmux; then
             # per-spawn model/effort ride /new for SDK sessions only; the codex spawn takes the
-            # account default and the pickers change it after. Refuse loudly (no silent drop).
-            echo "romp new: --model/--effort need the default (SDK) session — set them from the dashboard for a Codex session" >&2; exit 2
+            # account default and the pickers change it after. Refuse loudly (no silent drop),
+            # naming which door made this spawn Codex.
+            _why="--codex"; $use_codex || _why="this machine's \`romp engine codex\` default"
+            echo "romp new: --model/--effort need an SDK session, and $_why makes this a Codex one — set them from the dashboard instead" >&2; exit 2
         fi
         if [[ -n "$msg_arg" ]] && $use_tmux; then
             # the tmux variant attaches a terminal you type into yourself; delivering a first
@@ -1291,11 +1302,8 @@ if [[ -n "$session_arg" ]] && ! $use_tmux && ! $resume; then
     _tok="$(_romp_token)"
     _kport="${ROMP_KERNEL_PORT:-29855}"
     _dir="${dir_arg:-$PWD}"
-    # the machine default (romp engine → STATE/default-backend); an explicit --codex still wins.
-    # `|| true`: an absent file under set -euo pipefail otherwise kills the whole command here.
-    _be="$(cat "${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}/default-backend" 2>/dev/null | tr -d '[:space:]' || true)"
-    case "$_be" in sdk|codex) ;; *) _be="sdk" ;; esac
-    $use_codex && _be="codex"
+    # $_be — the effective backend — was resolved at parse time (the `new` case), where the
+    # model/effort guards needed it; an explicit --codex already won there.
     if [[ -z "$_tok" ]]; then
         echo "romp new: the kernel isn't running (no serve token). Start romp (the login service, or \`romp up\`), or use \`romp new -t $session_arg\` for a terminal session." >&2
         exit 1

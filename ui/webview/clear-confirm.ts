@@ -42,4 +42,3 @@ export function endConfirmDetail(titles: string[], base: string): string {
   return (n === 1 ? "1 card is still open on its board: " : n + " cards are still open on its board: ")
     + shown + ". Ending takes them off the working surfaces with it. " + base;
 }
-

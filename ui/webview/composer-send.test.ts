@@ -108,4 +108,3 @@ test("a staged chip clips IN BOUNDS with an ellipsis and expands on click (the u
   assert.match(RENDER, /cite\.addEventListener\("click", \(ev\) => \{\s*\n\s*ev\.stopPropagation\(\);/);
   assert.match(STYLES, /\.staged-cite\.open \.composer-chip-label \{ white-space: pre-wrap; overflow: visible; \}/);
 });
-

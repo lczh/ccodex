@@ -117,6 +117,40 @@ class ModeStore(Fresh):
         self.assertEqual(km._update_mode(), "ask", "an unknown stored mode reads as the default")
 
 
+class VerifyEnforcedFailsClosed(unittest.TestCase):
+    """The trust-root probe downgrades to best-effort ONLY on git's clean "key absent" answer
+    (rc 1, silent). A query error, timeout, or noise proves nothing about the trust root, and
+    "couldn't tell" must never un-enforce a configured install; an EMPTY configured value is a
+    misconfiguration for verification to fail loudly against, not an absence (the user's audit,
+    2026-08-17)."""
+
+    def _probe(self, result=None, exc=None):
+        clean_env = {k: v for k, v in km.os.environ.items()
+                     if k not in ("ROMP_RELEASE_ALLOWED_SIGNERS", "ROMP_VERIFY_RELEASES")}
+        kw = {"side_effect": exc} if exc else {"return_value": result}
+        with mock.patch.dict(km.os.environ, clean_env, clear=True), \
+             mock.patch.object(km.subprocess, "run", **kw):
+            return km._release_verify_enforced()
+
+    def _cp(self, rc, out="", err=""):
+        return subprocess.CompletedProcess([], rc, stdout=out, stderr=err)
+
+    def test_configured_value_enforces(self):
+        self.assertTrue(self._probe(self._cp(0, out="/etc/signers\n")))
+
+    def test_configured_EMPTY_value_still_enforces(self):
+        self.assertTrue(self._probe(self._cp(0, out="\n")))
+
+    def test_cleanly_absent_key_is_the_only_downgrade(self):
+        self.assertFalse(self._probe(self._cp(1)))
+
+    def test_config_errors_timeouts_and_noise_enforce(self):
+        self.assertTrue(self._probe(self._cp(128, err="fatal: bad config line 3\n")))
+        self.assertTrue(self._probe(self._cp(1, err="warning: something odd\n")))
+        self.assertTrue(self._probe(exc=km.subprocess.TimeoutExpired("git", 10)))
+        self.assertTrue(self._probe(exc=OSError("fork failed")))
+
+
 class LatestReleaseTag(unittest.TestCase):
     def _ls(self, stdout, rc=0, stderr=""):
         return mock.patch.object(km.subprocess, "run", return_value=subprocess.CompletedProcess(
@@ -570,10 +604,12 @@ class Routes(Fresh):
         # a test (2026-08-14: this exact route, exercised unstubbed while real drift existed, restart-
         # stormed the machine running the suite — each run bounced every kernel on the box)
         km._UPDATE_AVAIL[0] = ""
-        km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = "aaaa1111", ""
+        km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = "a" * 40, ""
         ran = []
-        with mock.patch.object(km, "_run_main_update",
-                               side_effect=lambda kind, immediate=False: ran.append((kind, immediate))):
+        with mock.patch.object(km, "_release_verify_enforced", return_value=False), \
+             mock.patch.object(km, "_run_main_update",
+                               side_effect=lambda kind, immediate=False, target="":
+                               ran.append((kind, immediate, target))):
             code, body = self._post("/update")
             self.assertEqual(code, 200)
             self.assertIn("converging", body)
@@ -581,8 +617,24 @@ class Routes(Fresh):
                 if ran:
                     break
                 time.sleep(0.01)
-        self.assertEqual(ran, [("pull", True)], "the banner click is the user's own deliberate cut")
+        self.assertEqual(ran, [("pull", True, "a" * 40)],
+                         "the click is the user's own cut, BOUND to the sha the kernel offered")
         km._MAIN_DRIFT[0] = ""
+
+    def test_post_update_refuses_main_convergence_on_a_release_trusting_install(self):
+        # a configured trust root means code moves only via signed release tags; the banner never
+        # fires there, but the route itself must not trust the banner (the user's audit, 2026-08-17)
+        km._UPDATE_AVAIL[0] = ""
+        km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = "a" * 40, ""
+        try:
+            with mock.patch.object(km, "_release_verify_enforced", return_value=True), \
+                 mock.patch.object(km, "_run_main_update",
+                                   side_effect=AssertionError("must not converge")):
+                code, body = self._post("/update")
+            self.assertEqual(code, 409)
+            self.assertIn("signed release tags", body)
+        finally:
+            km._MAIN_DRIFT[0] = ""
 
 
 class Wiring(unittest.TestCase):

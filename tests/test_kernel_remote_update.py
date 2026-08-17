@@ -191,6 +191,21 @@ class UpdateRemote(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("diverged", detail)
 
+    def test_the_apply_recheck_catches_an_edit_landing_after_the_probe(self):
+        # the discover-step dirty probe is an ssh round-trip old by apply time; an edit landing in
+        # that window must be re-caught IN THE SAME SHELL as the reset, or reset --hard destroys it
+        # on the strength of a stale answer (the user's audit, 2026-08-17)
+        calls = self._wire(apply_out="DIRTYNOW")
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("uncommitted work between the check and the apply", detail)
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        pre, _, post = apply.partition("reset --hard")
+        self.assertIn("status --porcelain", pre,
+                      "the recheck sits between the ancestry gate and the reset, same shell")
+        self.assertIn("DIRTYNOW", pre)
+        self.assertNotIn("status --porcelain", post, "and never after the reset, where it is moot")
+
     def test_no_romp_clone_fails_loudly(self):
         self._wire(disc_out="NOROMP")
         ok, detail = km._update_remote("TESTHOST")
