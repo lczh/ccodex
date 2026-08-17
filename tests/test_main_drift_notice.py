@@ -9,6 +9,7 @@ import os
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
+from unittest import mock
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
@@ -66,7 +67,7 @@ class DriftWiring(unittest.TestCase):
         # pull step itself refuses as defence in depth (the user's audit, 2026-08-17)
         src = inspect.getsource(km._main_drift_check)
         self.assertIn('"" if _release_verify_enforced() else _origin_main_sha()', src)
-        self.assertIn("signed release tags", inspect.getsource(km._run_main_update))
+        self.assertIn("signed release tags", inspect.getsource(km._run_main_update_locked))
 
     def test_the_restart_half_still_fires_under_a_trust_root(self):
         # restart-drift moves no code — it runs what is already on disk (a landed tag update whose
@@ -94,8 +95,10 @@ class DriftWiring(unittest.TestCase):
         # the first cut checked none of these (the user's audit, 2026-08-17): a quiet fetch failure
         # re-checked-out the stale ref, any differing sha was "an update" (older/diverged included),
         # the checkout was never bound to the advertised sha, install.sh never ran, and the restart
-        # POST carried no manager token (every converge ended 401 with the processes still stale)
-        src = inspect.getsource(km._run_main_update)
+        # POST carried no manager token (every converge ended 401 with the processes still stale).
+        # ConvergeFunctional below DRIVES these; the pins here just keep the spellings honest.
+        src = (inspect.getsource(km._run_main_update) + inspect.getsource(km._run_main_update_locked)
+               + inspect.getsource(km._converge_install))
         self.assertIn('"status", "--porcelain"', src)
         self.assertIn("uncommitted work", src, "the refusal names the real problem")
         self.assertIn("if f.returncode != 0:", src, "a failed fetch aborts loudly, never re-checks-out stale refs")
@@ -108,7 +111,7 @@ class DriftWiring(unittest.TestCase):
         self.assertIn('_MAIN_DRIFT[0] = ""', src, "every refusal re-arms the notice")
 
     def test_the_click_converges_immediately_and_auto_rides_the_quiet_window(self):
-        src = inspect.getsource(km._run_main_update)
+        src = inspect.getsource(km._run_main_update_locked)
         self.assertIn('"" if immediate else "?when=quiet"', src)
         route = inspect.getsource(km)
         self.assertIn('threading.Thread(target=_run_main_update, args=(kind, True, converge_target)',
@@ -155,8 +158,113 @@ class DriftWiring(unittest.TestCase):
 
     def test_the_route_acts_only_on_what_the_kernel_itself_found(self):
         src = inspect.getsource(km)
-        self.assertIn('kind = "pull" if _MAIN_DRIFT[0] else ("restart" if _MAIN_DRIFT[1] else "")', src,
+        self.assertIn('d0, d1 = _MAIN_DRIFT[0], _MAIN_DRIFT[1]', src,
+                      "one snapshot: a re-read could pair a pull with an emptied target")
+        self.assertIn('kind = "pull" if d0 else ("restart" if d1 else "")', src,
                       "no version or kind is ever taken from the client")
+
+
+class ConvergeFunctional(unittest.TestCase):
+    """The pull step, DRIVEN, not source-matched (the adversarial review, 2026-08-17: the wiring
+    pins above stay green if a guard loses its `return` or the steps reorder). A scripted
+    subprocess fake records every call; each refusal must stop the sequence where it claims to,
+    and the happy path must run the steps in order and check out the BOUND sha."""
+
+    FULL = "f" * 40
+    OTHER = "0" * 40
+
+    def setUp(self):
+        self._saved = (km._MAIN_DRIFT[0], km._MAIN_DRIFT[1],
+                       km._CONVERGE_STATE[0], km._CONVERGE_INSTALL_FAILED[0])
+        km._MAIN_DRIFT[0] = km._MAIN_DRIFT[1] = ""
+        km._CONVERGE_STATE[0] = km._CONVERGE_INSTALL_FAILED[0] = ""
+        self.notices = []
+        self.requests = []
+
+    def tearDown(self):
+        (km._MAIN_DRIFT[0], km._MAIN_DRIFT[1],
+         km._CONVERGE_STATE[0], km._CONVERGE_INSTALL_FAILED[0]) = self._saved
+
+    def _run(self, kind="pull", target=None, fail=(), tip=None, enforced=False):
+        """Drive _run_main_update with every subprocess scripted. `fail` names steps that exit 1."""
+        import subprocess as sp
+        import urllib.request
+        target = self.FULL if target is None else target
+        tip = self.FULL if tip is None else tip
+        calls = []
+
+        def fake_run(argv, **kw):
+            step = ("install" if any("install.sh" in str(a) for a in argv) else
+                    "status" if "status" in argv else "fetch" if "fetch" in argv else
+                    "rev-parse" if "rev-parse" in argv else
+                    "merge-base" if "merge-base" in argv else
+                    "checkout" if "checkout" in argv else "other")
+            calls.append((step, list(argv)))
+            rc = 1 if step in fail else 0
+            out = tip + "\n" if step == "rev-parse" else ""
+            if step == "status" and step in fail:
+                rc, out = 0, "M peer-session-edit.py\n"   # "failing" status = a DIRTY tree answer
+            return sp.CompletedProcess(argv, rc, stdout=out, stderr="boom" if rc else "")
+
+        env = dict(km.os.environ, ROMP_MANAGER_TOKEN="tok-abc12", ROMP_MANAGER_PORT="1")
+        with mock.patch.object(km.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(km, "_release_verify_enforced", return_value=enforced), \
+             mock.patch.object(km, "_sync_notice",
+                               side_effect=lambda m, ok=True: self.notices.append(m)), \
+             mock.patch.dict(km.os.environ, env, clear=True), \
+             mock.patch.object(urllib.request, "urlopen",
+                               side_effect=lambda req, timeout=0: self.requests.append(req) or
+                               mock.MagicMock()):
+            km._run_main_update(kind, target=target)
+        return [s for s, _ in calls], calls
+
+    def test_happy_path_runs_in_order_and_checks_out_the_bound_sha(self):
+        steps, calls = self._run()
+        self.assertEqual(steps, ["status", "fetch", "rev-parse", "merge-base", "checkout", "install"])
+        checkout_argv = next(a for s, a in calls if s == "checkout")
+        self.assertIn(self.FULL, checkout_argv, "the checkout lands on the resolved+bound sha")
+        self.assertNotIn("origin/main", checkout_argv, "never the ref — it can move under us")
+        self.assertEqual(len(self.requests), 1)
+        self.assertIn("tok-abc12", str(self.requests[0].header_items()),
+                      "the restart authenticates to the manager")
+
+    def test_each_refusal_stops_the_sequence_and_restarts_nothing(self):
+        for fail_step, last_expected in (("status", "status"), ("fetch", "fetch"),
+                                         ("merge-base", "merge-base"), ("checkout", "checkout")):
+            self.setUp()
+            steps, _ = self._run(fail=(fail_step,))
+            self.assertEqual(steps[-1], last_expected, fail_step)
+            self.assertNotIn("install", steps, fail_step)
+            self.assertEqual(self.requests, [], "%s: a refused pull must restart nothing" % fail_step)
+
+    def test_a_moved_or_unbound_tip_never_reaches_checkout(self):
+        steps, _ = self._run(tip=self.OTHER)          # main moved between verdict and fetch
+        self.assertNotIn("checkout", steps)
+        self.setUp()
+        steps, _ = self._run(target="")               # binding is mandatory, not optional-by-default
+        self.assertNotIn("checkout", steps)
+        self.assertEqual(self.requests, [])
+
+    def test_enforcement_stops_the_pull_before_any_subprocess(self):
+        steps, _ = self._run(enforced=True)
+        self.assertEqual(steps, [])
+        self.assertTrue(any("signed release tags" in n for n in self.notices))
+
+    def test_a_failed_install_latches_and_the_restart_half_heals_it(self):
+        steps, _ = self._run(fail=("install",))
+        self.assertEqual(steps[-1], "install")
+        self.assertEqual(self.requests, [], "no restart onto a build whose install failed")
+        self.assertEqual(km._CONVERGE_INSTALL_FAILED[0], "f" * 8)
+        with mock.patch.object(km, "_checkout_sha", return_value="f" * 8):
+            steps, _ = self._run(kind="restart")
+        self.assertEqual(steps, ["install"], "the restart half retries the install first")
+        self.assertEqual(km._CONVERGE_INSTALL_FAILED[0], "", "a passing install spends the latch")
+        self.assertEqual(len(self.requests), 1, "and only then does the restart go out")
+
+    def test_one_converge_at_a_time(self):
+        km._CONVERGE_STATE[0] = "running"
+        steps, _ = self._run()
+        self.assertEqual(steps, [], "a second converge while one runs is a no-op")
 
 
 if __name__ == "__main__":
