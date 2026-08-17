@@ -231,6 +231,25 @@ class UpdateCheck(Fresh):
         self.assertEqual(ran, ["v0.7.0"], "one automatic attempt per version")
         self.assertTrue(any(not n["ok"] and "v0.7.0" in n["text"] for n in self.notices()))
 
+    def test_a_refused_auto_launch_is_not_an_attempt(self):
+        # writing the once-only marker BEFORE the launch consumed the automatic retry forever when
+        # the launch was refused — e.g. another update holding the interprocess lock (the user's
+        # audit, 2026-08-17). A refusal writes no marker and says why; a later pass retries.
+        ran = []
+        with mock.patch.object(km, "_kernel_ver", return_value="v0.6.0"), \
+             mock.patch.object(km, "_latest_release_tag", return_value="v0.7.0"), \
+             mock.patch.object(km, "_run_update", side_effect=lambda tag: ran.append(tag) and False), \
+             mock.patch.object(km, "_send_to_app"):
+            km._set_update_mode("auto")
+            km._UPDATE_ERROR[0] = "another update is already running on this checkout"
+            km._update_check()
+            self.assertEqual(ran, ["v0.7.0"], "the launch was tried")
+            self.assertFalse((jd.STATE / "update-attempted.json").exists(),
+                             "a refusal is not an attempt — the marker must not burn the retry")
+            self.assertEqual(km._UPDATE_AVAIL[0], "", "the discovery re-arms for the next pass")
+        self.assertTrue(any("did not start" in n["text"] for n in self.notices()))
+        km._UPDATE_ERROR[0] = ""
+
     def test_rediscovering_the_same_release_mid_run_stays_quiet(self):
         # the 6h re-check re-finds a version for weeks — only a CHANGED discovery is new information
         sent = []
@@ -385,7 +404,7 @@ class RunUpdate(Fresh):
                 self.assertFalse(km._run_update("v0.7.0"))
             self.assertIn("readable regular file", km._UPDATE_ERROR[0])
 
-    def _execute_captured_updater(self, verify_rc, enforce=False):
+    def _execute_captured_updater(self, verify_rc, enforce=False, install_rc=0):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "repo"; root.mkdir()
             (root / ".git").mkdir()                   # the interprocess update flock lives here
@@ -406,10 +425,12 @@ class RunUpdate(Fresh):
                            "case \" $* \" in\n"
                            "  *' config '*) exec /usr/bin/git \"$@\";;\n"
                            "  *' verify-tag '*) exit %d;;\n"
+                           "  *' rev-parse '*) echo deadbee1;;\n"
                            "esac\nexit 0\n" % (calls, int(verify_rc)))
             git.chmod(0o755)
             install = root / "install.sh"
-            install.write_text("#!/bin/sh\nprintf 'install\\n' >> '%s'\n" % calls)
+            install.write_text("#!/bin/sh\nprintf 'install\\n' >> '%s'\nexit %d\n"
+                               % (calls, int(install_rc)))
             install.chmod(0o755)
             spawned = []
             env = {k: v for k, v in km.os.environ.items()
@@ -449,6 +470,8 @@ class RunUpdate(Fresh):
             ran = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
             rows = calls.read_text().splitlines()
             report = json.loads((state / "update-report.json").read_text())
+            latch = state / "converge-install-failed"
+            self._latch = latch.read_text().strip() if latch.exists() else None
             return ran.returncode, rows, report
 
     def test_good_signature_verifier_allows_merge_and_install(self):
@@ -458,6 +481,21 @@ class RunUpdate(Fresh):
         self.assertIn("merge --ff-only v0.7.0", rows)
         self.assertIn("install", rows)
         self.assertTrue(report["ok"])
+        # the install-intent latch is armed BEFORE the merge moves HEAD (a crash between the two
+        # otherwise boots half-installed code with no record — the user's audit, 2026-08-17)...
+        rev = next(i for i, row in enumerate(rows) if "rev-parse" in row)
+        mrg = next(i for i, row in enumerate(rows) if row.startswith("merge "))
+        self.assertLess(rev, mrg, "the latch's sha resolves before the move")
+        self.assertIsNone(self._latch, "...and a completed install spends it")
+
+    def test_a_failed_install_after_the_merge_leaves_the_intent_latch_armed(self):
+        rc, rows, report = self._execute_captured_updater(0, install_rc=1)
+        self.assertEqual(rc, 0)
+        self.assertIn("merge --ff-only v0.7.0", rows, "HEAD moved")
+        self.assertIn("install", rows, "install ran and failed")
+        self.assertFalse(report["ok"])
+        self.assertEqual(self._latch, "deadbee1",
+                         "the durable latch names the moved-to commit for the boot heal")
 
     def test_unsigned_or_bad_tag_stops_before_merge_install_and_restart(self):
         # enforcement requires a CONFIGURED trust root (the env opt-in here; bootstrap's persisted
@@ -567,6 +605,16 @@ class Routes(Fresh):
         self.assertEqual((status, d["tag"], d["mode"], d["state"]), (200, "v0.7.0", "ask", ""))
         self.assertEqual(d["boot"], km._BOOT_ID, "the banner detects the NEW kernel by this flipping")
 
+    def test_update_check_reports_a_running_converge_as_in_flight(self):
+        # a page loading mid-converge must get the wait treatment, not a fresh offer — converge
+        # errors already ride `failed`; the running state rides `state` (the user's audit, 2026-08-17)
+        km._CONVERGE_STATE[0] = "running"
+        try:
+            _, body = _serve_get("/update-check", headers={"X-Romp-Token": km.TOKEN})
+            self.assertEqual(json.loads(body)["state"], "running")
+        finally:
+            km._CONVERGE_STATE[0] = ""
+
     def test_update_check_surfaces_converge_refusals_so_the_banner_unsticks(self):
         # a refused converge left the banner's spinner polling /update-check forever: the route
         # reported nothing, because converge errors lived only in the notice ring (the user's
@@ -657,8 +705,8 @@ class Routes(Fresh):
         km._UPDATE_AVAIL[0] = ""
         km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = "a" * 40, ""
         try:
-            (jd.STATE / "update-channel").unlink(missing_ok=True)   # the default posture
-            with mock.patch.object(km, "_run_main_update",
+            with mock.patch.object(km, "_update_channel", return_value="stable"), \
+                 mock.patch.object(km, "_run_main_update",
                                    side_effect=AssertionError("must not converge")):
                 code, body = self._post("/update")
             self.assertEqual(code, 409)

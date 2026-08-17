@@ -313,16 +313,26 @@ EOF
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -eq 0 ]
     [[ "$output" == *"Update channel: stable"* ]]
-    [ "$(cat "$HOME/.local/state/romp/update-channel")" = "stable" ]
+    [ "$(git -C "$HOME/romp" config --get romp.updateChannel)" = "stable" ]
 }
 
 @test "bootstrap.sh: ROMP_REF=main is the explicit dev opt-in, and a tag re-run flips back" {
     ROMP_DIR="$HOME/romp" ROMP_REF=main run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -eq 0 ]
-    [ "$(cat "$HOME/.local/state/romp/update-channel")" = "dev" ]
+    [ "$(git -C "$HOME/romp" config --get romp.updateChannel)" = "dev" ]
     # re-bootstrapping onto a release moves the install back to stable — the channel follows
     # the last explicit choice, never a sticky accident
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -eq 0 ]
-    [ "$(cat "$HOME/.local/state/romp/update-channel")" = "stable" ]
+    [ "$(git -C "$HOME/romp" config --get romp.updateChannel)" = "stable" ]
+}
+
+@test "bootstrap.sh: a feature branch or pinned ref is NOT the dev channel" {
+    # dev means exactly the ROMP_REF=main opt-in: a branch or pinned-commit install is a
+    # deliberate NON-main checkout, and recording it as dev would authorize converging it onto a
+    # main it never asked to follow (the user's audit, 2026-08-17)
+    git -C "$ROMP_REPO" branch feature-x
+    ROMP_DIR="$HOME/romp" ROMP_REF=feature-x run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -eq 0 ]
+    [ "$(git -C "$HOME/romp" config --get romp.updateChannel)" = "stable" ]
 }

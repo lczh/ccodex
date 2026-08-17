@@ -191,6 +191,24 @@ class UpdateRemote(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("diverged", detail)
 
+    def test_a_failed_status_reads_as_unknown_never_clean(self):
+        # a status command that ERRORS used to read as a clean tree — green-lighting a reset of
+        # code it could not actually see (the user's audit, 2026-08-17); both the discover probe
+        # and the apply-step recheck must refuse on it, named
+        self._wire(dirty="STATERR")
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("state is unknown", detail)
+        calls = self._wire(apply_out="STATERR")
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("state is unknown", detail)
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        self.assertIn("STATERR", apply.partition("reset --hard")[0],
+                      "the rc check sits before the reset, same shell")
+        disc = next(a[-1] for a in calls if isinstance(a[-1], str) and "for d in" in a[-1])
+        self.assertIn("STATERR", disc, "the discover probe distinguishes error from clean too")
+
     def test_the_apply_recheck_catches_an_edit_landing_after_the_probe(self):
         # the discover-step dirty probe is an ssh round-trip old by apply time; an edit landing in
         # that window must be re-caught IN THE SAME SHELL as the reset, or reset --hard destroys it

@@ -62,17 +62,27 @@ class DriftWiring(unittest.TestCase):
         self.assertIn('"kind": "main"', src, "ask mode fires the shared banner with the drift variant")
 
     def test_the_default_channel_is_stable_and_only_dev_reads_as_dev(self):
-        # the CHANNEL is persisted separately from signature policy: keying convergence off the
-        # trust root left default no-trust-root installs silently tracking unsigned main (the
-        # user's audit, 2026-08-17). Absent, unreadable, or garbage all read STABLE.
-        ch = km.jd.STATE / "update-channel"
-        ch.unlink(missing_ok=True)
-        self.assertEqual(km._update_channel(), "stable", "absent file → stable, never dev")
-        ch.write_text("banana\n")
-        self.assertEqual(km._update_channel(), "stable", "garbage → stable")
-        ch.write_text("dev\n")
-        self.assertEqual(km._update_channel(), "dev")
-        ch.unlink(missing_ok=True)
+        # the CHANNEL is persisted separately from signature policy — and PER CHECKOUT, in the
+        # clone's git config, so kernels sharing one checkout can never disagree about it (the
+        # user's audits, 2026-08-17). Absent, garbage, or a failed query all read STABLE.
+        import subprocess as sp
+
+        def probe(rc, out="", exc=None):
+            kw = ({"side_effect": exc} if exc else
+                  {"return_value": sp.CompletedProcess([], rc, stdout=out, stderr="")})
+            with mock.patch.object(km.subprocess, "run", **kw) as run:
+                got = km._update_channel()
+            if not exc:
+                self.assertIn("romp.updateChannel", run.call_args[0][0],
+                              "the channel is git config's answer, never a state-dir copy")
+            return got
+
+        self.assertEqual(probe(1), "stable", "absent key → stable, never dev")
+        self.assertEqual(probe(0, "banana\n"), "stable", "garbage → stable")
+        self.assertEqual(probe(0, "dev\n"), "dev")
+        self.assertEqual(probe(0, "stable\n"), "stable")
+        self.assertEqual(probe(128), "stable", "a query error → stable (fail closed)")
+        self.assertEqual(probe(0, exc=OSError("no git")), "stable")
 
     def test_a_stable_install_never_probes_or_pulls_main(self):
         # stable means code moves ONLY via signed release tags: the check must not even ls-remote
@@ -90,8 +100,8 @@ class DriftWiring(unittest.TestCase):
         km._kernel_sha = lambda: "bbbb2222"
         try:
             km._MAIN_DRIFT[0] = km._MAIN_DRIFT[1] = ""
-            (km.jd.STATE / "update-channel").unlink(missing_ok=True)   # default = stable
-            km._main_drift_check()
+            with mock.patch.object(km, "_update_channel", return_value="stable"):
+                km._main_drift_check()
             self.assertEqual(probes, [], "a stable install never dials origin")
             self.assertEqual(km._MAIN_DRIFT[0], "", "and no pull offer is ever latched")
         finally:
@@ -111,8 +121,8 @@ class DriftWiring(unittest.TestCase):
         try:
             km._MAIN_DRIFT[0] = km._MAIN_DRIFT[1] = ""
             km._LAST_AUTO_CONVERGE[0] = 0.0
-            (km.jd.STATE / "update-channel").unlink(missing_ok=True)   # default = stable
-            km._main_drift_check()
+            with mock.patch.object(km, "_update_channel", return_value="stable"):
+                km._main_drift_check()
             self.assertEqual(ran, [("restart", "bbbb2222")])
         finally:
             (km._update_mode, km._checkout_sha, km._kernel_sha,
@@ -154,8 +164,9 @@ class DriftWiring(unittest.TestCase):
         saved = (km._update_mode, km._origin_main_sha, km._checkout_sha, km._kernel_sha,
                  km._run_main_update, km._LAST_AUTO_CONVERGE[0], km._MAIN_DRIFT[0], km._MAIN_DRIFT[1])
         km._update_mode = lambda: "auto"
-        (km.jd.STATE / "update-channel").write_text("dev\n")   # only the dev channel pulls main
-        self.addCleanup(lambda: (km.jd.STATE / "update-channel").unlink(missing_ok=True))
+        p = mock.patch.object(km, "_update_channel", return_value="dev")   # only dev pulls main
+        p.start()
+        self.addCleanup(p.stop)
         km._checkout_sha = lambda: "aaa"
         km._kernel_sha = lambda: "aaa"
         km._run_main_update = lambda kind, immediate=False, target="": ran.append(kind)
@@ -202,20 +213,20 @@ class ConvergeFunctional(unittest.TestCase):
     OTHER = "0" * 40
 
     def setUp(self):
-        self._saved = (km._MAIN_DRIFT[0], km._MAIN_DRIFT[1], km._CONVERGE_STATE[0])
+        self._saved = (km._MAIN_DRIFT[0], km._MAIN_DRIFT[1], km._CONVERGE_STATE[0],
+                       km._LAST_AUTO_CONVERGE[0])
         km._MAIN_DRIFT[0] = km._MAIN_DRIFT[1] = ""
         km._CONVERGE_STATE[0] = ""
         km._set_install_failed("")
-        (km.jd.STATE / "update-channel").write_text("dev\n")   # only dev converges; per-test default
         self.notices = []
         self.requests = []
 
     def tearDown(self):
-        (km._MAIN_DRIFT[0], km._MAIN_DRIFT[1], km._CONVERGE_STATE[0]) = self._saved
+        (km._MAIN_DRIFT[0], km._MAIN_DRIFT[1], km._CONVERGE_STATE[0],
+         km._LAST_AUTO_CONVERGE[0]) = self._saved
         km._set_install_failed("")
-        (km.jd.STATE / "update-channel").unlink(missing_ok=True)
 
-    def _run(self, kind="pull", target=None, fail=(), tip=None, channel=None):
+    def _run(self, kind="pull", target=None, fail=(), tip=None, channel=None, restart_fails=False):
         """Drive _run_main_update with every subprocess scripted. `fail` names steps that exit 1."""
         import subprocess as sp
         target = self.FULL if target is None else target
@@ -247,17 +258,16 @@ class ConvergeFunctional(unittest.TestCase):
 
             def getresponse(self):
                 r = mock.MagicMock()
-                r.status = 200
+                r.status = 500 if restart_fails else 200
                 return r
 
             def close(self):
                 pass
 
-        if channel is not None:
-            (km.jd.STATE / "update-channel").write_text(channel + "\n")
         env = dict(km.os.environ, ROMP_MANAGER_TOKEN="tok-abc12", ROMP_MANAGER_PORT="1",
                    HTTP_PROXY="http://127.0.0.1:9")   # a proxy that must NEVER be consulted
-        with mock.patch.object(km.subprocess, "run", side_effect=fake_run), \
+        with mock.patch.object(km, "_update_channel", return_value=channel or "dev"), \
+             mock.patch.object(km.subprocess, "run", side_effect=fake_run), \
              mock.patch.object(km, "_sync_notice",
                                side_effect=lambda m, ok=True: self.notices.append(m)), \
              mock.patch.dict(km.os.environ, env, clear=True), \
@@ -340,11 +350,107 @@ class ConvergeFunctional(unittest.TestCase):
         fd = km._update_flock()
         self.assertIsNotNone(fd, "the lock is free at rest")
         try:
+            km._MAIN_DRIFT[0] = self.FULL           # as the check-pass leaves it before converging
+            km._LAST_AUTO_CONVERGE[0] = 12345.0
             steps, _ = self._run()
             self.assertEqual(steps, [], "a held lock stops the pull before any subprocess")
             self.assertTrue(any("another update is already running" in n for n in self.notices))
+            # contention is NOT an attempt: nothing moved, nothing restarted — the offer slot and
+            # the cool-down must be re-armed or the automatic retry is suppressed forever
+            self.assertEqual(km._MAIN_DRIFT[0], "", "the offer slot re-arms for the next pass")
+            self.assertEqual(km._LAST_AUTO_CONVERGE[0], 0.0, "no restart happened; no cool-down burned")
         finally:
             km.os.close(fd)
+
+    def test_the_intent_latch_is_armed_BEFORE_the_checkout_moves(self):
+        # latching only after install RETURNS failure left a crash between the checkout and that
+        # write booting half-installed code with no record (the user's audit, 2026-08-17). The
+        # latch must already name the target while the checkout subprocess runs.
+        seen_at_checkout = []
+        # capture the latch value at the moment the checkout step executes
+        import subprocess as sp
+        calls = []
+
+        def fake_run(argv, **kw):
+            step = ("install" if any("install.sh" in str(a) for a in argv) else
+                    "checkout" if "checkout" in argv else
+                    "rev-parse" if "rev-parse" in argv else "other")
+            if step == "checkout":
+                seen_at_checkout.append(km._install_failed_sha())
+            calls.append(step)
+            out = self.FULL + "\n" if step == "rev-parse" else ""
+            return sp.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+        class Conn:
+            def __init__(self, *a, **k): pass
+            def request(self, *a, **k): pass
+            def getresponse(self):
+                r = mock.MagicMock(); r.status = 200; return r
+            def close(self): pass
+
+        with mock.patch.object(km, "_update_channel", return_value="dev"), \
+             mock.patch.object(km.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(km, "_sync_notice", side_effect=lambda m, ok=True: None), \
+             mock.patch.object(km.http.client, "HTTPConnection", Conn):
+            km._run_main_update("pull", target=self.FULL)
+        self.assertEqual(seen_at_checkout, ["f" * 8],
+                         "the intent is durable before HEAD can move — a crash finds it at boot")
+        self.assertEqual(km._install_failed_sha(), "", "a completed install spends the intent")
+
+    def test_a_failed_checkout_disarms_the_intent(self):
+        steps, _ = self._run(fail=("checkout",))
+        self.assertEqual(steps[-1], "checkout")
+        self.assertEqual(km._install_failed_sha(), "", "HEAD did not move; nothing to heal")
+
+    def test_a_failed_restart_request_rearms_the_drift_offer(self):
+        steps, _ = self._run(restart_fails=True)
+        self.assertEqual(steps[-1], "install", "the pull itself completed")
+        self.assertTrue(any("restart request failed" in n for n in self.notices))
+        self.assertEqual((km._MAIN_DRIFT[0], km._MAIN_DRIFT[1]), ("", ""),
+                         "the restart never happened — the next pass must re-offer, not latch stale")
+
+
+class BootHeal(unittest.TestCase):
+    """A kernel that BOOTED a latched (half-installed) checkout heals synchronously at boot,
+    before the subsystems start, and under the interprocess lock — an unlocked late retry ran
+    install.sh concurrently across kernels sharing the checkout (the user's audit, 2026-08-17)."""
+
+    def tearDown(self):
+        km._set_install_failed("")
+
+    def test_heals_a_matching_latch_under_the_lock(self):
+        km._set_install_failed("f" * 8)
+        ran = []
+        with mock.patch.object(km, "_checkout_sha", return_value="f" * 8), \
+             mock.patch.object(km, "_converge_install", side_effect=lambda s: ran.append(s) or True):
+            km._boot_heal()
+        self.assertEqual(ran, ["f" * 8])
+
+    def test_a_mismatched_latch_is_cleared_as_moot(self):
+        km._set_install_failed("00000000")           # the move it recorded never landed
+        with mock.patch.object(km, "_checkout_sha", return_value="f" * 8), \
+             mock.patch.object(km, "_converge_install",
+                               side_effect=AssertionError("nothing to heal")):
+            km._boot_heal()
+        self.assertEqual(km._install_failed_sha(), "")
+
+    def test_a_held_lock_skips_the_heal_for_the_holder(self):
+        km._set_install_failed("f" * 8)
+        fd = km._update_flock()
+        self.assertIsNotNone(fd)
+        try:
+            with mock.patch.object(km, "_checkout_sha", return_value="f" * 8), \
+                 mock.patch.object(km, "_converge_install",
+                                   side_effect=AssertionError("the lock holder heals, not us")):
+                km._boot_heal()
+        finally:
+            km.os.close(fd)
+        self.assertEqual(km._install_failed_sha(), "f" * 8, "left for the lock holder to spend")
+
+    def test_boot_runs_the_heal_before_the_subsystems(self):
+        src = inspect.getsource(km)
+        self.assertLess(src.index("    _boot_heal()"), src.index("    _boot_warm()"),
+                        "the heal precedes every subsystem start — half-installed code must not serve")
 
 
 if __name__ == "__main__":

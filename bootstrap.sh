@@ -132,9 +132,9 @@ if git -C "$DIR" show-ref --verify --quiet "refs/tags/$ref"; then
     # configured-but-EMPTY value is a misconfiguration for verification to fail loudly against,
     # never a downgrade to warning-only (the user's audit, 2026-08-17).
     configured_signers_rc=0
-    git -C "$DIR" config --get gpg.ssh.allowedSignersFile >/dev/null 2>&1 || configured_signers_rc=$?
+    probe_err="$(git -C "$DIR" config --get gpg.ssh.allowedSignersFile 2>&1 >/dev/null)" || configured_signers_rc=$?
     trust_root_in_git=1
-    [ "$configured_signers_rc" -eq 1 ] && trust_root_in_git=0
+    [ "$configured_signers_rc" -eq 1 ] && [ -z "$probe_err" ] && trust_root_in_git=0
     echo "==> Verifying release signature for $ref"
     signature_ok=1
     if [ -n "$allowed_signers" ]; then
@@ -195,17 +195,17 @@ else
         echo "romp: ref '$ref' was not found after fetching origin." >&2; exit 1; }
 fi
 
-# Persist the UPDATE CHANNEL this install chose — a release tag is stable, anything else
-# (ROMP_REF=main, a branch, a bare sha) is an explicit development opt-in. The kernel's
-# main-convergence updater follows origin/main ONLY on the dev channel; keying that off the
-# trust root instead left default no-trust-root installs silently tracking unsigned main
-# (the user's audit, 2026-08-17). Re-running bootstrap onto a tag moves the install back
-# to stable — the channel follows the last explicit choice.
-state_dir="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}"
-channel="dev"
-[ "$is_tag" -eq 1 ] && channel="stable"
-mkdir -p "$state_dir" && printf '%s\n' "$channel" > "$state_dir/update-channel" || {
-    echo "romp: could not record the update channel in $state_dir." >&2; exit 1; }
+# Persist the UPDATE CHANNEL this install chose, in the CHECKOUT's own git config — the channel
+# describes the checkout, and a per-state-dir copy let kernels sharing one checkout disagree
+# about it (the user's audits, 2026-08-17). The kernel's main-convergence updater follows
+# origin/main ONLY on `dev`, and `dev` means exactly the documented ROMP_REF=main opt-in: a
+# feature branch or a pinned commit is a deliberate NON-main install, and recording it as dev
+# would authorize converging it onto a main it never asked to follow. Everything else — tags
+# included — is stable; re-running bootstrap follows the last explicit choice.
+channel="stable"
+[ "$ref" = "main" ] && channel="dev"
+git -C "$DIR" config --local romp.updateChannel "$channel" || {
+    echo "romp: could not record the update channel in the clone's git config." >&2; exit 1; }
 echo "==> Update channel: $channel"
 
 echo "==> Running install.sh"

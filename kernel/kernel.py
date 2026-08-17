@@ -1846,18 +1846,21 @@ def _set_update_mode(mode):
 
 
 def _update_channel():
-    """"stable" or "dev" — WHICH code this install follows, persisted in STATE/update-channel and
-    fully separate from signature-enforcement policy (the user's audit, 2026-08-17: the first cut
-    keyed main-convergence off the trust root, so a default install with NO trust root configured —
-    a supported state, not a declared dev checkout — silently tracked unsigned origin/main).
-    Stable follows signed release tags only; dev opts into tracking main. ABSENT or unreadable or
-    garbage reads STABLE: nobody lands on the unsigned channel by default or by accident —
-    bootstrap.sh writes "dev" only for an explicit non-release ROMP_REF install."""
+    """"stable" or "dev" — WHICH code this install follows, fully separate from signature
+    enforcement (the user's audit, 2026-08-17: keying main-convergence off the trust root left
+    default no-trust-root installs silently tracking unsigned origin/main). Stable follows signed
+    release tags only; dev opts into tracking main. Persisted as `romp.updateChannel` in the
+    CHECKOUT's own git config — the channel describes the checkout, and a state-dir copy let
+    kernels sharing one checkout disagree about it (same audit, next round). Anything but git's
+    exact `dev` answer — absent, garbage, a query error — reads STABLE: nobody lands on the
+    unsigned channel by default or by accident. bootstrap.sh writes `dev` only for the documented
+    ROMP_REF=main opt-in."""
     try:
-        c = (jd.STATE / "update-channel").read_text().strip()
-        return c if c in ("stable", "dev") else "stable"
-    except OSError:
+        r = subprocess.run(["git", "-C", str(ROOT), "config", "--get", "romp.updateChannel"],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
         return "stable"
+    return "dev" if r.returncode == 0 and r.stdout.strip() == "dev" else "stable"
 
 
 def _semver(tag):
@@ -1993,12 +1996,26 @@ def _run_update(tag):
         # does not dead-end the update on an install with no trust root to check against
         verify_sh = ("{ %s || echo 'note: release tag not signature-verified "
                      "(no trust root configured on this install)'; }" % verify_sh)
+    # The install-intent latch is ARMED before the merge moves HEAD and cleared only after
+    # install.sh returns 0: a crash, kill, or reboot anywhere between the two otherwise boots
+    # partially installed code with no record for the boot heal to act on (the user's audit,
+    # 2026-08-17). The latch names the TAG's commit, resolved before the move; a failed merge
+    # leaves a latch that mismatches HEAD, which the boot heal clears as moot.
+    latch = q(str(jd.STATE / "converge-install-failed"))
     script = (
         "cd %s || exit 1\n" % q(str(ROOT))
         + "{ echo; echo \"== romp self-update to %s ==\"; date; } >> %s 2>&1\n" % (tag, log)
-        + "if git fetch origin refs/tags/%s:refs/tags/%s >> %s 2>&1 && %s >> %s 2>&1 "
-          "&& git merge --ff-only %s >> %s 2>&1 && ./install.sh >> %s 2>&1; then\n"
-          % (tag, tag, log, verify_sh, log, tag, log, log)
+        + "OK=0\n"
+        + "if git fetch origin refs/tags/%s:refs/tags/%s >> %s 2>&1 && %s >> %s 2>&1; then\n"
+          % (tag, tag, log, verify_sh, log)
+        + "  git rev-parse --short=8 'refs/tags/%s^{commit}' > %s 2>> %s\n" % (tag, latch, log)
+        + "  if git merge --ff-only %s >> %s 2>&1 && ./install.sh >> %s 2>&1; then\n"
+          % (tag, log, log)
+        + "    rm -f %s\n" % latch
+        + "    OK=1\n"
+        + "  fi\n"
+        + "fi\n"
+        + "if [ \"$OK\" = 1 ]; then\n"
         + "  printf '%%s' %s > %s\n" % (q(json.dumps(ok_rep)), rep)
         + restart
         + "else\n"
@@ -2094,8 +2111,16 @@ def _update_check():
             _send_to_app("shell", {"type": "updateAvail", "cur": _kernel_ver() or "", "tag": latest,
                                    "boot": _BOOT_ID})
             return
+        if not _run_update(latest):
+            # a REFUSAL (policy, or another update holding the interprocess lock) is not an
+            # attempt: nothing launched. Writing the once-only marker before the launch consumed
+            # the automatic retry on a busy lock forever (the user's audit, 2026-08-17). Say why,
+            # leave _UPDATE_AVAIL discovered — the next pass with new info can offer again.
+            _sync_notice("the automatic update to %s did not start: %s" %
+                         (latest, _UPDATE_ERROR[0] or "the launch was refused"), ok=False)
+            _UPDATE_AVAIL[0] = ""
+            return
         _atomic_write(jd.STATE / "update-attempted.json", json.dumps({"tag": latest, "t": int(time.time())}))
-        _run_update(latest)
     else:
         _send_to_app("shell", {"type": "updateAvail", "cur": _kernel_ver() or "", "tag": latest,
                                "boot": _BOOT_ID})
@@ -2314,6 +2339,11 @@ def _run_main_update(kind, immediate=False, target=""):
         lock_fd = _update_flock()
         if lock_fd is None:
             _converge_note("another update is already running on this checkout — not starting a second.")
+            # Contention is NOT an attempt: nothing moved, nothing restarted. Consuming the offer
+            # slot or the cool-down here permanently suppressed the automatic retry (the user's
+            # audit, 2026-08-17) — re-arm both so the next pass re-offers/re-tries.
+            _MAIN_DRIFT[0 if kind == "pull" else 1] = ""
+            _LAST_AUTO_CONVERGE[0] = 0.0
             return
         _CONVERGE_ERROR[0] = ""                       # a fresh converge owns the error slot
         _run_main_update_locked(kind, immediate, target)
@@ -2380,9 +2410,15 @@ def _run_main_update_locked(kind, immediate, target):
                                "rewound) — not moving. Reconcile the clone yourself.")
                 _MAIN_DRIFT[0] = ""
                 return
+            # INTENT, armed BEFORE HEAD moves: latching only after install RETURNS failure left a
+            # crash/kill/reboot between the checkout and that write booting half-installed code
+            # with no record (the user's audit, 2026-08-17). A crash anywhere past this line finds
+            # the latch matching the new HEAD at boot and heals; a failed checkout disarms it.
+            _set_install_failed(tip[:8])
             r = subprocess.run(["git", "checkout", "--detach", tip], cwd=str(ROOT),
                                capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
+                _set_install_failed("")               # HEAD did not move; nothing to heal
                 _converge_note("main moved at origin, but advancing the checkout failed: %s"
                                % (r.stderr or r.stdout or "").strip()[-200:])
                 _MAIN_DRIFT[0] = ""
@@ -2419,6 +2455,10 @@ def _run_main_update_locked(kind, immediate, target):
     except Exception as e:
         _converge_note("romp is updated on disk but the restart request failed (%s) — "
                        "restart it yourself: romp refresh" % e)
+        # The restart never happened, so the drift is still real: clearing the acted-on slots
+        # lets the next pass re-derive and RE-OFFER it instead of latching a stale "already
+        # offered" that never completes (the user's audit, 2026-08-17).
+        _MAIN_DRIFT[0] = _MAIN_DRIFT[1] = ""
 
 
 def _converge_install(sha8):
@@ -2447,15 +2487,35 @@ def _converge_install(sha8):
     return True
 
 
+def _boot_heal():
+    """This kernel may have BOOTED a checkout whose install.sh never finished (an external restart
+    — romp refresh, a reboot — ignores the latch by nature; and the intent latch is armed BEFORE
+    HEAD moves, so a crash mid-update lands here too). Heal SYNCHRONOUSLY at boot, before the
+    subsystems start on possibly half-installed code, and UNDER the interprocess lock — several
+    kernels share a checkout, and an unlocked retry ran install.sh concurrently (the user's audit,
+    2026-08-17). Lock contention means another process is already updating/healing: skip. A latch
+    that no longer matches HEAD is moot (the move it recorded never landed) and is cleared."""
+    failed = _install_failed_sha()
+    if not failed:
+        return
+    if failed != _sha8(_checkout_sha()):
+        _set_install_failed("")
+        return
+    fd = _update_flock()
+    if fd is None:
+        return
+    try:
+        _converge_install(failed)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def _update_check_loop():
     """The daemon thread: one pass at boot, then one per cadence, forever. The cheap main-drift probe
     runs every pass; the release-tag check keeps its six-hour stride."""
-    failed = _install_failed_sha()
-    if failed and failed == _sha8(_checkout_sha()):
-        # This kernel BOOTED a checkout whose install.sh never finished (an external restart —
-        # romp refresh, a reboot — ignores the latch by nature). Heal at boot: re-run the install
-        # (idempotent); the latch clears on a pass and the notice re-fires on another failure.
-        _converge_install(failed)
     last_release = 0.0
     while True:
         try:
@@ -9755,7 +9815,10 @@ def _discover_remote_clone(host):
         'if [ -d "$d/.git" ]; then R="$d"; break; fi; done; fi; '
         'if [ -z "$R" ]; then echo NOROMP; exit 0; fi; '
         'echo "DIR:$R"; echo "HEAD:$(git -C "$R" rev-parse HEAD 2>/dev/null)"; '
-        'echo "DIRTY:$(git -C "$R" status --porcelain 2>/dev/null | head -c 1)"')
+        # a FAILED status must never read as a clean tree — that answer green-lights a reset of
+        # code the command could not actually see (the user's audit, 2026-08-17)
+        'if ds=$(git -C "$R" status --porcelain 2>/dev/null); then '
+        'echo "DIRTY:$(printf %s "$ds" | head -c 1)"; else echo "DIRTY:STATERR"; fi')
     try:
         d = subprocess.run([SSH_BIN] + _SSH_OPTS + ["--", host, disc], capture_output=True, text=True, timeout=25)
     except Exception as e:
@@ -9808,6 +9871,9 @@ def _update_remote(host):
     rdir, rhead, rdirty, derr = _discover_remote_clone(host)
     if derr:
         return False, derr
+    if rdirty == "STATERR":
+        return False, ("reading the tree state on %s failed — not resetting a checkout whose "
+                       "state is unknown" % host)
     if rdirty:
         return False, "remote %s has uncommitted changes — commit or discard them there first (won't clobber)" % host
     if rhead and rhead == lfull:
@@ -9830,8 +9896,11 @@ def _update_remote(host):
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIVERGED; exit 0; fi; '
         # Re-check dirtiness HERE, in the same shell as the reset — the discover-step probe ran an
         # ssh round-trip ago, and an edit landing in that window would be destroyed by reset --hard
-        # on the strength of a stale answer (the user's audit, 2026-08-17).
-        'if [ -n "$(git -C "$R" status --porcelain 2>/dev/null | head -c 1)" ]; then '
+        # on the strength of a stale answer (the user's audit, 2026-08-17). A status that FAILS is
+        # its own refusal: a command error must never read as a clean tree (same audit, next round).
+        'if ! as=$(git -C "$R" status --porcelain 2>/dev/null); then '
+        'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERR; exit 0; fi; '
+        'if [ -n "$(printf %%s "$as" | head -c 1)" ]; then '
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYNOW; exit 0; fi; '
         'git -C "$R" reset --hard %s >/dev/null 2>&1 || { git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; }; '
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; '
@@ -9858,7 +9927,7 @@ def _update_remote(host):
         'UP=0; for i in 1 2 3 4 5 6 7 8; do sleep 1; if bash -c "exec 3<>/dev/tcp/127.0.0.1/%d" 2>/dev/null; then UP=1; break; fi; done; '
         'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null &  sleep 1; fi; '
         'echo "SYNCED:$NEW"'
-    ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
+    ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -9893,6 +9962,9 @@ def _update_remote(host):
                        "git push --force %s:<remote-romp-dir> HEAD:refs/heads/%s "
                        "then, on %s: git reset --hard %s && git update-ref -d refs/heads/%s"
                        % (host, host, host, _P2P_REF, host, _P2P_REF, _P2P_REF))
+    if tag == "STATERR":
+        return False, ("pushed, but reading the tree state on %s failed at the apply step — "
+                       "not resetting a checkout whose state is unknown" % host)
     if tag == "DIRTYNOW":
         return False, ("pushed, but %s picked up uncommitted work between the check and the apply — "
                        "not clobbering it. Commit or stash there, then push again." % host)
@@ -25177,7 +25249,9 @@ class Handler(BaseHTTPRequestHandler):
                             updated = str(rep.get("tag") or "")
                 return self._send(200, json.dumps({
                     "cur": _kernel_ver() or "", "tag": _UPDATE_AVAIL[0], "mode": _update_mode(),
-                    "state": _UPDATE_STATE[0], "failed": failed, "updated": updated,
+                    # a running CONVERGE is as in-flight as a running tag update: a page loading
+                    # mid-converge shows the same wait treatment instead of a fresh offer
+                    "state": _UPDATE_STATE[0] or _CONVERGE_STATE[0], "failed": failed, "updated": updated,
                     # the pending MAIN-DRIFT offer (2026-08-15): a page loaded after the push can
                     # re-derive it, and a stale page can revalidate before acting
                     "drift": ("pull" if _MAIN_DRIFT[0] else ("restart" if _MAIN_DRIFT[1] else "")),
@@ -26908,6 +26982,8 @@ def main():
             sys.stderr.write("romp-kernel: pruned %d judge scratch transcript(s)\n" % _n)
     except Exception:
         sys.stderr.write("judge scratch prune: %s\n" % traceback.format_exc())
+    _boot_heal()                                              # a latched half-installed checkout heals BEFORE
+    #                                                           the subsystems start on it (locked, skip-if-held)
     _write_palette_mirror()                                   # keep bin/romp's palette-colors mirror current across code updates
     _boot_warm()                                              # pre-parse the live fleet during the reconnect gap (fast first paint)
     threading.Thread(target=_sdk, daemon=True).start()        # construct the SDK backend NOW so its boot
