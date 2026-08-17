@@ -470,7 +470,7 @@ class RunUpdate(Fresh):
             ran = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
             rows = calls.read_text().splitlines()
             report = json.loads((state / "update-report.json").read_text())
-            latch = state / "converge-install-failed"
+            latch = root / ".git" / "romp-install-failed"   # checkout-scoped, beside the update lock
             self._latch = latch.read_text().strip() if latch.exists() else None
             return ran.returncode, rows, report
 

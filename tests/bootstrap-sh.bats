@@ -336,3 +336,27 @@ EOF
     [ "$status" -eq 0 ]
     [ "$(git -C "$HOME/romp" config --get romp.updateChannel)" = "stable" ]
 }
+
+@test "bootstrap.sh: a NOISY rc-1 trust probe enforces — only git's quiet 'absent' downgrades" {
+    # rc 1 with stderr noise proves nothing about the trust root; reading it as 'absent'
+    # downgraded verification to warn-only (the adversarial review, 2026-08-17). A git wrapper
+    # injects noise into exactly the probe; everything else delegates to the real git.
+    ROMP_DIR="$HOME/romp" bash "$REPO_ROOT/bootstrap.sh"
+    git -C "$HOME/romp" config --local --unset gpg.ssh.allowedSignersFile
+    git -C "$ROMP_REPO" tag -a v0.3.0 -m unsigned
+    unset ROMP_RELEASE_ALLOWED_SIGNERS
+    REAL_GIT="$(command -v git)"
+    mkdir -p "$TEST_DIR/bin"
+    cat > "$TEST_DIR/bin/git" <<WRAP
+#!/bin/sh
+case " \$* " in
+  *' config --get gpg.ssh.allowedSignersFile '*|*' config --get gpg.ssh.allowedSignersFile') echo 'warning: config oddity' >&2; exit 1;;
+esac
+exec "$REAL_GIT" "\$@"
+WRAP
+    chmod +x "$TEST_DIR/bin/git"
+    PATH="$TEST_DIR/bin:$PATH" ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"does not have a valid signature"* ]]
+    [[ "$output" != *STUB_INSTALL_RAN* ]]
+}

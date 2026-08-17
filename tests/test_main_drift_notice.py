@@ -317,8 +317,10 @@ class ConvergeFunctional(unittest.TestCase):
         self.assertEqual(steps[-1], "install")
         self.assertEqual(self.requests, [], "no restart onto a build whose install failed")
         self.assertEqual(km._install_failed_sha(), "f" * 8)
-        self.assertEqual((km.jd.STATE / "converge-install-failed").read_text().strip(), "f" * 8,
-                         "the latch survives a process death — it lives in STATE, not memory")
+        self.assertEqual(km._install_latch_path().read_text().strip(), "f" * 8,
+                         "the latch survives a process death AND is CHECKOUT-scoped (the git dir), "
+                         "so sibling kernels sharing the clone see it — a state-dir copy left them "
+                         "blind (the adversarial review, 2026-08-17)")
         with mock.patch.object(km, "_checkout_sha", return_value="f" * 8):
             steps, _ = self._run(kind="restart")
         self.assertEqual(steps, ["install"], "the restart half retries the install first")
@@ -403,6 +405,9 @@ class ConvergeFunctional(unittest.TestCase):
         self.assertEqual(km._install_failed_sha(), "", "HEAD did not move; nothing to heal")
 
     def test_a_failed_restart_request_rearms_the_drift_offer(self):
+        # the slots are NON-EMPTY going in, as the check pass leaves them — asserting emptiness
+        # from an already-empty start proved nothing (the adversarial review, 2026-08-17)
+        km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = self.FULL, "f" * 8
         steps, _ = self._run(restart_fails=True)
         self.assertEqual(steps[-1], "install", "the pull itself completed")
         self.assertTrue(any("restart request failed" in n for n in self.notices))
@@ -418,38 +423,55 @@ class BootHeal(unittest.TestCase):
     def tearDown(self):
         km._set_install_failed("")
 
-    def test_heals_a_matching_latch_under_the_lock(self):
+    def test_heals_a_matching_latch_under_the_lock_and_hands_the_fd_to_install(self):
         km._set_install_failed("f" * 8)
         ran = []
         with mock.patch.object(km, "_checkout_sha", return_value="f" * 8), \
-             mock.patch.object(km, "_converge_install", side_effect=lambda s: ran.append(s) or True):
+             mock.patch.object(km, "_converge_install",
+                               side_effect=lambda s, fd=None: ran.append((s, fd is not None)) or True):
             km._boot_heal()
-        self.assertEqual(ran, ["f" * 8])
+        self.assertEqual(ran, [("f" * 8, True)],
+                         "the lock fd rides into install.sh so an orphaned installer keeps holding it")
 
-    def test_a_mismatched_latch_is_cleared_as_moot(self):
+    def test_a_mismatched_latch_is_cleared_as_moot_UNDER_the_lock(self):
+        # an unlocked moot-clear raced a live detached tag updater and erased ITS armed latch
+        # between its rev-parse and its merge (the adversarial review, 2026-08-17)
         km._set_install_failed("00000000")           # the move it recorded never landed
+        src = inspect.getsource(km._boot_heal)
+        self.assertLess(src.index("_update_flock()"), src.index('_set_install_failed("")'),
+                        "the moot-check happens only while holding the lock")
         with mock.patch.object(km, "_checkout_sha", return_value="f" * 8), \
              mock.patch.object(km, "_converge_install",
                                side_effect=AssertionError("nothing to heal")):
             km._boot_heal()
         self.assertEqual(km._install_failed_sha(), "")
 
-    def test_a_held_lock_skips_the_heal_for_the_holder(self):
+    def test_a_held_lock_skips_loudly_and_the_check_loop_retries(self):
         km._set_install_failed("f" * 8)
         fd = km._update_flock()
         self.assertIsNotNone(fd)
+        notes = []
         try:
             with mock.patch.object(km, "_checkout_sha", return_value="f" * 8), \
+                 mock.patch.object(km, "_sync_notice",
+                                   side_effect=lambda m, ok=True: notes.append(m)), \
                  mock.patch.object(km, "_converge_install",
                                    side_effect=AssertionError("the lock holder heals, not us")):
                 km._boot_heal()
         finally:
             km.os.close(fd)
         self.assertEqual(km._install_failed_sha(), "f" * 8, "left for the lock holder to spend")
+        self.assertTrue(any("half-finished install" in n for n in notes),
+                        "the skip is LOUD — a silent skip ran half-installed code forever")
+        self.assertIn("_boot_heal()", inspect.getsource(km._update_check_loop),
+                      "the check loop is the retry path after a contended boot")
 
-    def test_boot_runs_the_heal_before_the_subsystems(self):
+    def test_boot_runs_the_heal_before_the_bundle_build_and_subsystems(self):
         src = inspect.getsource(km)
-        self.assertLess(src.index("    _boot_heal()"), src.index("    _boot_warm()"),
+        heal = src.index("    _boot_heal()")
+        self.assertLess(heal, src.index("    _ensure_bundles()"),
+                        "_ensure_bundles npm-builds ON the checkout — it must not run before the heal")
+        self.assertLess(heal, src.index("    _boot_warm()"),
                         "the heal precedes every subsystem start — half-installed code must not serve")
 
 

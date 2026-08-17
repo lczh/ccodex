@@ -209,6 +209,45 @@ class UpdateRemote(unittest.TestCase):
         disc = next(a[-1] for a in calls if isinstance(a[-1], str) and "for d in" in a[-1])
         self.assertIn("STATERR", disc, "the discover probe distinguishes error from clean too")
 
+    def test_the_generated_shell_actually_emits_STATERR_when_status_dies(self):
+        # the string-level pins above never EXECUTE the shell: replanting the audited bug (a dead
+        # status reading as clean) passed all of them (the adversarial review, 2026-08-17). Run
+        # the real generated scripts against a fixture checkout whose git can't report status.
+        import tempfile
+        from pathlib import Path
+        calls = self._wire(apply_out="SYNCED:abcdef0")
+        km._update_remote("TESTHOST")
+        disc = next(a[-1] for a in calls if isinstance(a[-1], str) and "for d in" in a[-1])
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            fix = home / "romp"
+            (fix / ".git").mkdir(parents=True)
+            fakebin = Path(td) / "bin"
+            fakebin.mkdir()
+            log = Path(td) / "ops"
+            (fakebin / "git").write_text(
+                "#!/bin/sh\necho \"$*\" >> '%s'\ncase \" $* \" in\n"
+                "  *' status '*) echo 'fatal: index corrupt' >&2; exit 128;;\n"
+                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "esac\nexit 0\n" % log)
+            (fakebin / "git").chmod(0o755)
+            env = dict(os.environ, HOME=str(home),
+                       PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
+            # km.subprocess IS this module's subprocess (one singleton), so _wire's fake is still
+            # installed — the REAL runner was saved by setUp exactly for this
+            d = self._run(["sh", "-c", disc], env=env, capture_output=True, text=True, timeout=30)
+            self.assertIn("DIRTY:STATERR", d.stdout,
+                          "the DISCOVER probe, executed, reports the dead status as an error")
+            # the apply script embeds its own $R; point it at the fixture and run it
+            apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix).replace(
+                "R=/home/u/romp ", "R=%s " % fix)
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=30)
+            self.assertIn("STATERR", a.stdout,
+                          "the APPLY recheck, executed, refuses on a dead status")
+            ops = log.read_text() if log.exists() else ""
+            self.assertNotIn("reset --hard", ops, "and the reset never ran")
+
     def test_the_apply_recheck_catches_an_edit_landing_after_the_probe(self):
         # the discover-step dirty probe is an ssh round-trip old by apply time; an edit landing in
         # that window must be re-caught IN THE SAME SHELL as the reset, or reset --hard destroys it

@@ -1829,6 +1829,7 @@ def _set_auto_nudge(enabled):
 _UPDATE_AVAIL = [""]     # newest remote release tag when newer than ours ("" = none/unknown)
 _UPDATE_STATE = [""]     # "" | "running" — one update at a time; the banner reads this
 _UPDATE_ERROR = [""]     # synchronous policy refusal (for /update + /update-check), cleared on a valid launch
+_UPDATE_REFUSED = ["", ""]   # the (tag, reason) the auto path last noticed a refusal for — fire once per CHANGE, not per pass
 _UPDATE_MODES = ("ask", "auto", "off")
 
 
@@ -2000,17 +2001,26 @@ def _run_update(tag):
     # install.sh returns 0: a crash, kill, or reboot anywhere between the two otherwise boots
     # partially installed code with no record for the boot heal to act on (the user's audit,
     # 2026-08-17). The latch names the TAG's commit, resolved before the move; a failed merge
-    # leaves a latch that mismatches HEAD, which the boot heal clears as moot.
-    latch = q(str(jd.STATE / "converge-install-failed"))
+    # leaves a latch that mismatches HEAD, which the boot heal clears as moot. It lives in the
+    # checkout's GIT DIR (checkout-scoped, like the lock), and its write is PART OF THE && CHAIN:
+    # an unchecked write that failed (unwritable dir, disk full) used to leave an empty latch and
+    # still run the merge — the audit hole silently reopened (the adversarial review, 2026-08-17).
+    latch_path = _install_latch_path()
+    if latch_path is None:
+        _UPDATE_ERROR[0] = "cannot resolve the checkout's git dir for the install latch"
+        _UPDATE_STATE[0] = ""
+        return False
+    latch = q(str(latch_path))
     script = (
         "cd %s || exit 1\n" % q(str(ROOT))
         + "{ echo; echo \"== romp self-update to %s ==\"; date; } >> %s 2>&1\n" % (tag, log)
         + "OK=0\n"
         + "if git fetch origin refs/tags/%s:refs/tags/%s >> %s 2>&1 && %s >> %s 2>&1; then\n"
           % (tag, tag, log, verify_sh, log)
-        + "  git rev-parse --short=8 'refs/tags/%s^{commit}' > %s 2>> %s\n" % (tag, latch, log)
-        + "  if git merge --ff-only %s >> %s 2>&1 && ./install.sh >> %s 2>&1; then\n"
-          % (tag, log, log)
+        + "  if git rev-parse --short=8 'refs/tags/%s^{commit}' > %s 2>> %s "
+          "&& [ -s %s ] "
+          "&& git merge --ff-only %s >> %s 2>&1 && ./install.sh >> %s 2>&1; then\n"
+          % (tag, latch, log, latch, tag, log, log)
         + "    rm -f %s\n" % latch
         + "    OK=1\n"
         + "  fi\n"
@@ -2037,6 +2047,13 @@ def _run_update(tag):
         subprocess.Popen(["bash", "-c", script], start_new_session=True, cwd=str(ROOT),
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, pass_fds=(lock_fd,))
+    except Exception as e:
+        # a spawn that RAISES after the in-flight latch was set wedged _UPDATE_STATE at "running"
+        # for the kernel's life — eternal banner spinner, every future update refused (the
+        # adversarial review, 2026-08-17)
+        _UPDATE_ERROR[0] = "could not launch the updater: %s" % str(e)[:160]
+        _UPDATE_STATE[0] = ""
+        return False
     finally:
         try:
             os.close(lock_fd)                         # the child's inherited copy holds the flock
@@ -2114,12 +2131,17 @@ def _update_check():
         if not _run_update(latest):
             # a REFUSAL (policy, or another update holding the interprocess lock) is not an
             # attempt: nothing launched. Writing the once-only marker before the launch consumed
-            # the automatic retry on a busy lock forever (the user's audit, 2026-08-17). Say why,
-            # leave _UPDATE_AVAIL discovered — the next pass with new info can offer again.
-            _sync_notice("the automatic update to %s did not start: %s" %
-                         (latest, _UPDATE_ERROR[0] or "the launch was refused"), ok=False)
+            # the automatic retry on a busy lock forever (the user's audit, 2026-08-17). Clearing
+            # the discovery lets the next pass RETRY the launch — but the notice fires only when
+            # the (tag, reason) pair CHANGES, not once per 6h pass forever (the adversarial
+            # review, same day).
+            refusal = (latest, _UPDATE_ERROR[0] or "the launch was refused")
+            if refusal != tuple(_UPDATE_REFUSED):
+                _UPDATE_REFUSED[:] = refusal
+                _sync_notice("the automatic update to %s did not start: %s" % refusal, ok=False)
             _UPDATE_AVAIL[0] = ""
             return
+        _UPDATE_REFUSED[:] = ["", ""]
         _atomic_write(jd.STATE / "update-attempted.json", json.dumps({"tag": latest, "t": int(time.time())}))
     else:
         _send_to_app("shell", {"type": "updateAvail", "cur": _kernel_ver() or "", "tag": latest,
@@ -2158,23 +2180,42 @@ _CONVERGE_ERROR = [""]                 # the last converge refusal, surfaced via
 #                                        — an in-memory latch forgot the broken build on any restart
 
 
+def _install_latch_path():
+    """The latch lives in the CHECKOUT's git dir, beside romp-update.lock: it describes the
+    checkout, and a per-state-dir copy left sibling kernels sharing the clone blind to it — they
+    neither healed nor honored it and restarted everyone onto the half-installed build (the
+    adversarial review, 2026-08-17; the same bug class the channel fix closed). None when the git
+    dir is unresolvable."""
+    gd = _update_git_dir()
+    return (gd / "romp-install-failed") if gd is not None else None
+
+
 def _install_failed_sha():
-    """The _sha8 of a checkout whose install.sh failed, or "". DURABLE (STATE file): the checkout
-    moves before install runs, so a kernel/manager/machine restart between the two must not forget
-    that the code on disk never finished installing (the user's audit, 2026-08-17 — the in-memory
-    latch died with the process, and its own failure message recommended the restart that kills it)."""
-    try:
-        return (jd.STATE / "converge-install-failed").read_text().strip()[:8]
-    except OSError:
-        return ""
+    """The _sha8 of a checkout whose install.sh never finished, or "". DURABLE and CHECKOUT-scoped:
+    the checkout moves before install runs, so any process on this clone must see the record
+    across restarts (the user's audit + the adversarial review, 2026-08-17). Reads the pre-v1.3.3
+    STATE-dir spelling as a fallback so an armed latch survives the location move."""
+    p = _install_latch_path()
+    for cand in ([p] if p is not None else []) + [jd.STATE / "converge-install-failed"]:
+        try:
+            v = cand.read_text().strip()[:8]
+        except OSError:
+            continue
+        if v:
+            return v
+    return ""
 
 
 def _set_install_failed(sha8):
+    p = _install_latch_path()
     try:
         if sha8:
-            _atomic_write(jd.STATE / "converge-install-failed", sha8)
+            if p is None:
+                raise OSError("no resolvable git dir for the checkout")
+            _atomic_write(p, sha8)
         else:
-            (jd.STATE / "converge-install-failed").unlink(missing_ok=True)
+            for cand in ([p] if p is not None else []) + [jd.STATE / "converge-install-failed"]:
+                cand.unlink(missing_ok=True)
     except OSError as e:
         _sync_notice("could not persist the install-failed latch (%s) — a restart may boot the "
                      "half-installed checkout" % e, ok=False)
@@ -2346,7 +2387,7 @@ def _run_main_update(kind, immediate=False, target=""):
             _LAST_AUTO_CONVERGE[0] = 0.0
             return
         _CONVERGE_ERROR[0] = ""                       # a fresh converge owns the error slot
-        _run_main_update_locked(kind, immediate, target)
+        _run_main_update_locked(kind, immediate, target, lock_fd)
     finally:
         _CONVERGE_STATE[0] = ""
         if lock_fd is not None:
@@ -2364,7 +2405,7 @@ def _converge_note(msg):
     _sync_notice(msg, ok=False)
 
 
-def _run_main_update_locked(kind, immediate, target):
+def _run_main_update_locked(kind, immediate, target, lock_fd=None):
     if kind == "pull":
         tip = ""
         try:
@@ -2427,7 +2468,7 @@ def _run_main_update_locked(kind, immediate, target):
             _converge_note("main moved at origin, but the pull step failed: %s" % e)
             _MAIN_DRIFT[0] = ""
             return
-        if not _converge_install(tip[:8]):
+        if not _converge_install(tip[:8], lock_fd):
             return
     if kind == "restart":
         failed = _install_failed_sha()
@@ -2435,7 +2476,7 @@ def _run_main_update_locked(kind, immediate, target):
             # the checkout sitting on disk is one whose install failed — booting it is exactly the
             # stale-deps update the pull path refused; retry the install and restart only on a pass
             if failed == _sha8(_checkout_sha()):
-                if not _converge_install(failed):
+                if not _converge_install(failed, lock_fd):
                     return
             else:
                 _set_install_failed("")               # a different sha landed since; latch is moot
@@ -2461,16 +2502,23 @@ def _run_main_update_locked(kind, immediate, target):
         _MAIN_DRIFT[0] = _MAIN_DRIFT[1] = ""
 
 
-def _converge_install(sha8):
+def _converge_install(sha8, lock_fd=None):
     """Run install.sh for a converge; True means EXIT 0 — nothing else does (an rc!=0 with empty
     output counted as success in the first cut; the user's audit, 2026-08-17). A failure or timeout
     latches the sha durably (_set_install_failed) — the checkout has already moved, and the report
     must say so rather than pretend nothing happened. The advice is 'Update again', deliberately
     NOT 'romp refresh': a refresh is precisely the restart-onto-the-broken-build the latch exists
-    to stop (same audit)."""
+    to stop (same audit).
+
+    The caller's interprocess-lock fd RIDES INTO install.sh (pass_fds, like the tag path's
+    detached child): the kernel can die mid-install (romp refresh, a manager death) leaving the
+    installer orphaned but ALIVE — with the flock held only by the dead kernel, the replacement's
+    boot heal acquired the freed lock and ran a SECOND install.sh over the orphan, the exact
+    interleaving the lock exists to prevent (the adversarial review, 2026-08-17)."""
     try:
         inst = subprocess.run(["bash", str(ROOT / "install.sh")], cwd=str(ROOT),
-                              capture_output=True, text=True, timeout=600)
+                              capture_output=True, text=True, timeout=600,
+                              pass_fds=(lock_fd,) if lock_fd is not None else ())
         ok = inst.returncode == 0
         why = "" if ok else ((inst.stderr or inst.stdout or "").strip()[-200:]
                              or "exit %d with no output" % inst.returncode)
@@ -2487,25 +2535,62 @@ def _converge_install(sha8):
     return True
 
 
+def _migrate_channel():
+    """One-time move of the v1.3.2 STATE-file channel into the checkout's git config — without it,
+    a v1.3.2 ROMP_REF=main install silently flipped to stable on upgrade (safe direction, wrong
+    silently; the adversarial review, 2026-08-17). Migrates ONLY 'dev' (stable is the default
+    everywhere), only when git config has no answer yet, and consumes the old file either way."""
+    old = jd.STATE / "update-channel"
+    try:
+        v = old.read_text().strip()
+    except OSError:
+        return
+    try:
+        if v == "dev":
+            have = subprocess.run(["git", "-C", str(ROOT), "config", "--get", "romp.updateChannel"],
+                                  capture_output=True, text=True, timeout=10)
+            if have.returncode == 1 and not have.stdout.strip():
+                w = subprocess.run(["git", "-C", str(ROOT), "config", "--local",
+                                    "romp.updateChannel", "dev"],
+                                   capture_output=True, text=True, timeout=10)
+                if w.returncode != 0:
+                    _sync_notice("could not migrate this install's dev update channel into the "
+                                 "clone's git config — it now reads STABLE; re-run bootstrap with "
+                                 "ROMP_REF=main to re-opt-in.", ok=False)
+                    return                            # keep the old file: retry next boot
+        old.unlink(missing_ok=True)
+    except Exception as e:
+        _sync_notice("update-channel migration failed (%s) — a dev install may read STABLE until "
+                     "bootstrap re-runs." % e, ok=False)
+
+
 def _boot_heal():
     """This kernel may have BOOTED a checkout whose install.sh never finished (an external restart
     — romp refresh, a reboot — ignores the latch by nature; and the intent latch is armed BEFORE
     HEAD moves, so a crash mid-update lands here too). Heal SYNCHRONOUSLY at boot, before the
     subsystems start on possibly half-installed code, and UNDER the interprocess lock — several
     kernels share a checkout, and an unlocked retry ran install.sh concurrently (the user's audit,
-    2026-08-17). Lock contention means another process is already updating/healing: skip. A latch
-    that no longer matches HEAD is moot (the move it recorded never landed) and is cleared."""
-    failed = _install_failed_sha()
-    if not failed:
-        return
-    if failed != _sha8(_checkout_sha()):
-        _set_install_failed("")
+    2026-08-17). Everything, the moot-check included, happens under the lock: an unlocked
+    moot-clear raced a live detached tag updater and erased ITS armed latch between its rev-parse
+    and its merge (the adversarial review, 2026-08-17). Contention is a LOUD skip, and the update
+    check loop calls back here every pass — a held lock at boot (that very orphaned installer
+    keeping the flock alive through the kernel's death) is retried, never a forever-unhealed hole."""
+    if not _install_failed_sha():
         return
     fd = _update_flock()
     if fd is None:
+        _converge_note("this checkout has a half-finished install and another process holds the "
+                       "update lock — waiting for it; this kernel may be running a half-installed "
+                       "build until then.")
         return
     try:
-        _converge_install(failed)
+        failed = _install_failed_sha()                # re-read under the lock; a holder may have spent it
+        if not failed:
+            return
+        if failed != _sha8(_checkout_sha()):
+            _set_install_failed("")                   # the move it recorded never landed; moot
+            return
+        _converge_install(failed, fd)
     finally:
         try:
             os.close(fd)
@@ -2528,6 +2613,10 @@ def _update_check_loop():
             _main_drift_check()
         except Exception:
             sys.stderr.write("main drift pass: %s\n" % traceback.format_exc())
+        try:
+            _boot_heal()                              # the retry path for a boot-time lock-contention
+        except Exception:                             # skip; returns immediately when no latch is armed
+            sys.stderr.write("heal pass: %s\n" % traceback.format_exc())
         time.sleep(_MAIN_CHECK_EVERY_S)
 
 
@@ -9902,7 +9991,23 @@ def _update_remote(host):
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERR; exit 0; fi; '
         'if [ -n "$(printf %%s "$as" | head -c 1)" ]; then '
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYNOW; exit 0; fi; '
-        'git -C "$R" reset --hard %s >/dev/null 2>&1 || { git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; }; '
+        # The reset holds the REMOTE checkout's own update lock (the same romp-update.lock its
+        # kernel's tag/converge updaters hold): without it, this reset could move HEAD under a
+        # mid-flight updater on the remote (the adversarial review, 2026-08-17). python3 because
+        # flock(1) does not exist on macOS; the lock releases with the process, exactly spanning
+        # the reset. A held lock is its own verdict (UPDATERUNNING), not a clobber.
+        'GD="$(git -C "$R" rev-parse --absolute-git-dir 2>/dev/null)"; '
+        '[ -n "$GD" ] || { git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; }; '
+        "python3 -c 'import fcntl,os,subprocess,sys\n"
+        "fd=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT,0o644)\n"
+        "try:\n"
+        "    fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
+        "except OSError:\n"
+        "    sys.exit(3)\n"
+        'sys.exit(subprocess.run(["git","-C",sys.argv[2],"reset","--hard",sys.argv[3]]).returncode)\' '
+        '"$GD/romp-update.lock" "$R" %s >/dev/null 2>&1; RRC=$?; '
+        'if [ "$RRC" = 3 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo UPDATERUNNING; exit 0; fi; '
+        'if [ "$RRC" != 0 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; fi; '
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; '
         'NEW="$(git -C "$R" rev-parse --short HEAD)"; '
         # RESTART the kernel THROUGH THE MANAGER (the user 2026-07-04: the manager is romp's durable supervisor —
@@ -9927,7 +10032,8 @@ def _update_remote(host):
         'UP=0; for i in 1 2 3 4 5 6 7 8; do sleep 1; if bash -c "exec 3<>/dev/tcp/127.0.0.1/%d" 2>/dev/null; then UP=1; break; fi; done; '
         'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null &  sleep 1; fi; '
         'echo "SYNCED:$NEW"'
-    ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
+    ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
+         _P2P_REF, _P2P_REF, _P2P_REF, kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -9965,6 +10071,9 @@ def _update_remote(host):
     if tag == "STATERR":
         return False, ("pushed, but reading the tree state on %s failed at the apply step — "
                        "not resetting a checkout whose state is unknown" % host)
+    if tag == "UPDATERUNNING":
+        return False, ("pushed, but %s is mid-update (its own updater holds the checkout's "
+                       "update lock) — try again when it finishes" % host)
     if tag == "DIRTYNOW":
         return False, ("pushed, but %s picked up uncommitted work between the check and the apply — "
                        "not clobbering it. Commit or stash there, then push again." % host)
@@ -26968,6 +27077,9 @@ def main():
     # (a federated host) has no ~/.local/bin on PATH — bare `claude` exec-failed silently there.
     os.environ.setdefault("ROMP_CLAUDE_BIN", _claude_bin())
     signal.signal(signal.SIGTERM, _graceful_term)             # drain, don't die mid-flight (see _graceful_term)
+    _migrate_channel()                                        # one-time: a v1.3.2 STATE-file channel moves into git config
+    _boot_heal()                                              # a latched half-installed checkout heals FIRST — before
+    #                                                           _ensure_bundles builds on it, before any subsystem
     _ensure_bundles()
     try:                                                      # the diary boot sweep (2026-07-07): migrate every
         _death_boot_pass()                                    # deaths no kernel was up to see: stamp them
@@ -26982,8 +27094,6 @@ def main():
             sys.stderr.write("romp-kernel: pruned %d judge scratch transcript(s)\n" % _n)
     except Exception:
         sys.stderr.write("judge scratch prune: %s\n" % traceback.format_exc())
-    _boot_heal()                                              # a latched half-installed checkout heals BEFORE
-    #                                                           the subsystems start on it (locked, skip-if-held)
     _write_palette_mirror()                                   # keep bin/romp's palette-colors mirror current across code updates
     _boot_warm()                                              # pre-parse the live fleet during the reconnect gap (fast first paint)
     threading.Thread(target=_sdk, daemon=True).start()        # construct the SDK backend NOW so its boot
