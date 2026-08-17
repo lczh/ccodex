@@ -204,8 +204,14 @@ fi
 # included — is stable; re-running bootstrap follows the last explicit choice.
 channel="stable"
 [ "$ref" = "main" ] && channel="dev"
-git -C "$DIR" config --local romp.updateChannel "$channel" || {
-    echo "romp: could not record the update channel in the clone's git config." >&2; exit 1; }
+# The marker lives in the WORKTREE's own git dir: `git config --local` is repository-scoped, so a
+# dev worktree could flip a sibling release worktree's channel via the shared config (the
+# user's audit, 2026-08-17). The legacy key is unset so it can never shadow the marker.
+gd="$(git -C "$DIR" rev-parse --absolute-git-dir)" || {
+    echo "romp: could not resolve the clone's git dir for the update channel." >&2; exit 1; }
+printf '%s\n' "$channel" > "$gd/romp-update-channel" || {
+    echo "romp: could not record the update channel in $gd." >&2; exit 1; }
+git -C "$DIR" config --unset romp.updateChannel 2>/dev/null || true
 echo "==> Update channel: $channel"
 
 echo "==> Running install.sh"

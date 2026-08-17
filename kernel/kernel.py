@@ -1850,12 +1850,26 @@ def _update_channel():
     """"stable" or "dev" — WHICH code this install follows, fully separate from signature
     enforcement (the user's audit, 2026-08-17: keying main-convergence off the trust root left
     default no-trust-root installs silently tracking unsigned origin/main). Stable follows signed
-    release tags only; dev opts into tracking main. Persisted as `romp.updateChannel` in the
-    CHECKOUT's own git config — the channel describes the checkout, and a state-dir copy let
-    kernels sharing one checkout disagree about it (same audit, next round). Anything but git's
+    release tags only; dev opts into tracking main. Persisted as `romp-update-channel` in the
+    WORKTREE's own git dir — the channel describes one checkout exactly: a state-dir copy let
+    kernels sharing a checkout disagree, and the v1.3.3 git-config key was repository-scoped, so
+    a dev worktree could flip a sibling release worktree (same audit, two more rounds). Anything but git's
     exact `dev` answer — absent, garbage, a query error — reads STABLE: nobody lands on the
     unsigned channel by default or by accident. bootstrap.sh writes `dev` only for the documented
     ROMP_REF=main opt-in."""
+    gd = _update_git_dir()
+    if gd is not None:
+        try:
+            v = (gd / "romp-update-channel").read_text().strip()
+        except OSError:
+            v = ""
+        if v:
+            return "dev" if v == "dev" else "stable"
+    # Legacy fallback (v1.3.3 wrote git config --local): that key is REPOSITORY-scoped, and a dev
+    # worktree could flip a release worktree's channel through it (the user's audit, 2026-08-17)
+    # — so it counts ONLY for the MAIN checkout (.git a directory), never a linked worktree.
+    if not (ROOT / ".git").is_dir():
+        return "stable"
     try:
         r = subprocess.run(["git", "-C", str(ROOT), "config", "--get", "romp.updateChannel"],
                            capture_output=True, text=True, timeout=10)
@@ -2207,6 +2221,11 @@ def _install_failed_sha():
 
 
 def _set_install_failed(sha8):
+    """Persist (or clear) the latch; returns True only when the write/clear actually LANDED. The
+    return is LOAD-BEARING for arming: the intent must exist durably before HEAD moves, so a
+    caller about to move the checkout refuses when this fails — noticing-but-proceeding let a
+    full/unwritable git dir move HEAD with no recovery record (the user's audit, 2026-08-17).
+    A failed CLEAR is the safe direction (the heal re-runs install and retries the clear)."""
     p = _install_latch_path()
     try:
         if sha8:
@@ -2216,9 +2235,11 @@ def _set_install_failed(sha8):
         else:
             for cand in ([p] if p is not None else []) + [jd.STATE / "converge-install-failed"]:
                 cand.unlink(missing_ok=True)
+        return True
     except OSError as e:
         _sync_notice("could not persist the install-failed latch (%s) — a restart may boot the "
                      "half-installed checkout" % e, ok=False)
+        return False
 
 
 def _update_git_dir():
@@ -2455,7 +2476,12 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
             # crash/kill/reboot between the checkout and that write booting half-installed code
             # with no record (the user's audit, 2026-08-17). A crash anywhere past this line finds
             # the latch matching the new HEAD at boot and heals; a failed checkout disarms it.
-            _set_install_failed(tip[:8])
+            if not _set_install_failed(tip[:8]):
+                # an intent that cannot PERSIST blocks the move outright — an unwritable git dir
+                # must never mean "proceed unrecorded" (the user's audit, 2026-08-17)
+                _converge_note("could not record the install intent — not moving HEAD.")
+                _MAIN_DRIFT[0] = ""
+                return
             r = subprocess.run(["git", "checkout", "--detach", tip], cwd=str(ROOT),
                                capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
@@ -2536,29 +2562,32 @@ def _converge_install(sha8, lock_fd=None):
 
 
 def _migrate_channel():
-    """One-time move of the v1.3.2 STATE-file channel into the checkout's git config — without it,
-    a v1.3.2 ROMP_REF=main install silently flipped to stable on upgrade (safe direction, wrong
-    silently; the adversarial review, 2026-08-17). Migrates ONLY 'dev' (stable is the default
-    everywhere), only when git config has no answer yet, and consumes the old file either way."""
-    old = jd.STATE / "update-channel"
-    try:
-        v = old.read_text().strip()
-    except OSError:
+    """One-time move of the older channel spellings into the WORKTREE's marker file: v1.3.2 wrote
+    a STATE file (kernels sharing a checkout disagreed), v1.3.3 wrote git config --local (linked
+    worktrees SHARED it — a dev worktree could flip a release sibling; the user's audits,
+    2026-08-17). Migrates ONLY 'dev' (stable is the default everywhere), consumes the old
+    spellings, and takes config-dev only on the MAIN checkout — a linked worktree never
+    legitimately owned that shared key."""
+    gd = _update_git_dir()
+    if gd is None:
         return
+    marker = gd / "romp-update-channel"
     try:
-        if v == "dev":
-            have = subprocess.run(["git", "-C", str(ROOT), "config", "--get", "romp.updateChannel"],
-                                  capture_output=True, text=True, timeout=10)
-            if have.returncode == 1 and not have.stdout.strip():
-                w = subprocess.run(["git", "-C", str(ROOT), "config", "--local",
-                                    "romp.updateChannel", "dev"],
-                                   capture_output=True, text=True, timeout=10)
-                if w.returncode != 0:
-                    _sync_notice("could not migrate this install's dev update channel into the "
-                                 "clone's git config — it now reads STABLE; re-run bootstrap with "
-                                 "ROMP_REF=main to re-opt-in.", ok=False)
-                    return                            # keep the old file: retry next boot
+        old = jd.STATE / "update-channel"
+        try:
+            v_state = old.read_text().strip()
+        except OSError:
+            v_state = ""
+        have = subprocess.run(["git", "-C", str(ROOT), "config", "--get", "romp.updateChannel"],
+                              capture_output=True, text=True, timeout=10)
+        v_cfg = have.stdout.strip() if have.returncode == 0 else ""
+        wants_dev = v_state == "dev" or (v_cfg == "dev" and (ROOT / ".git").is_dir())
+        if wants_dev and not marker.exists():
+            _atomic_write(marker, "dev")
         old.unlink(missing_ok=True)
+        if v_cfg and (ROOT / ".git").is_dir():
+            subprocess.run(["git", "-C", str(ROOT), "config", "--unset", "romp.updateChannel"],
+                           capture_output=True, text=True, timeout=10)
     except Exception as e:
         _sync_notice("update-channel migration failed (%s) — a dev install may read STABLE until "
                      "bootstrap re-runs." % e, ok=False)
@@ -9991,22 +10020,39 @@ def _update_remote(host):
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERR; exit 0; fi; '
         'if [ -n "$(printf %%s "$as" | head -c 1)" ]; then '
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYNOW; exit 0; fi; '
-        # The reset holds the REMOTE checkout's own update lock (the same romp-update.lock its
-        # kernel's tag/converge updaters hold): without it, this reset could move HEAD under a
-        # mid-flight updater on the remote (the adversarial review, 2026-08-17). python3 because
-        # flock(1) does not exist on macOS; the lock releases with the process, exactly spanning
-        # the reset. A held lock is its own verdict (UPDATERUNNING), not a clobber.
+        # The reset and the install are ONE transaction under the REMOTE checkout's own update
+        # lock (the same romp-update.lock its kernel's tag/converge updaters hold), with the
+        # install latch armed before HEAD moves and spent only by a passing install.sh — this
+        # path used to lock the reset alone and never install at all (the user's audits,
+        # 2026-08-17). python3 because flock(1) does not exist on macOS; the lock releases with
+        # the process, exactly spanning the transaction. Exits: 3 = lock held (UPDATERUNNING),
+        # 4 = install failed with the latch armed (INSTALLFAIL — the remote's boot heal retries),
+        # 5 = could not arm the latch (nothing moved), else the reset's own rc.
         'GD="$(git -C "$R" rev-parse --absolute-git-dir 2>/dev/null)"; '
         '[ -n "$GD" ] || { git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; }; '
         "python3 -c 'import fcntl,os,subprocess,sys\n"
-        "fd=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT,0o644)\n"
+        "lock,r,target=sys.argv[1],sys.argv[2],sys.argv[3]\n"
+        "fd=os.open(lock,os.O_RDWR|os.O_CREAT,0o644)\n"
         "try:\n"
         "    fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
         "except OSError:\n"
         "    sys.exit(3)\n"
-        'sys.exit(subprocess.run(["git","-C",sys.argv[2],"reset","--hard",sys.argv[3]]).returncode)\' '
+        'res=subprocess.run(["git","-C",r,"rev-parse","--short=8",target],capture_output=True,text=True)\n'
+        'sha8=(res.stdout or "").strip()[:8]\n'
+        "if res.returncode or not sha8:\n"
+        "    sys.exit(5)\n"
+        'lp=os.path.join(os.path.dirname(lock),"romp-install-failed")\n'
+        'tmp=lp+".tmp"\n'
+        'open(tmp,"w").write(sha8)\n'
+        "os.replace(tmp,lp)\n"
+        'if subprocess.run(["git","-C",r,"reset","--hard",target]).returncode:\n'
+        "    sys.exit(6)\n"
+        'if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r).returncode:\n'
+        "    sys.exit(4)\n"
+        "os.remove(lp)' "
         '"$GD/romp-update.lock" "$R" %s >/dev/null 2>&1; RRC=$?; '
         'if [ "$RRC" = 3 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo UPDATERUNNING; exit 0; fi; '
+        'if [ "$RRC" = 4 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo INSTALLFAIL; exit 0; fi; '
         'if [ "$RRC" != 0 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; fi; '
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; '
         'NEW="$(git -C "$R" rev-parse --short HEAD)"; '
@@ -10033,7 +10079,7 @@ def _update_remote(host):
         'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null &  sleep 1; fi; '
         'echo "SYNCED:$NEW"'
     ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
-         _P2P_REF, _P2P_REF, _P2P_REF, kport)
+         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -10074,6 +10120,10 @@ def _update_remote(host):
     if tag == "UPDATERUNNING":
         return False, ("pushed, but %s is mid-update (its own updater holds the checkout's "
                        "update lock) — try again when it finishes" % host)
+    if tag == "INSTALLFAIL":
+        return False, ("pushed and reset %s, but its install.sh failed — the latch is armed, so "
+                       "nothing restarts onto it until install passes there (its boot heal "
+                       "retries)" % host)
     if tag == "DIRTYNOW":
         return False, ("pushed, but %s picked up uncommitted work between the check and the apply — "
                        "not clobbering it. Commit or stash there, then push again." % host)
@@ -10139,6 +10189,10 @@ def _pull_remote(host, expected_sha=None):
                             capture_output=True, text=True, timeout=10)
     except Exception as e:
         return False, str(e)[:200]
+    if st.returncode != 0:
+        # a failed status is NOT a clean tree — proceeding here fast-forwarded over state the
+        # command never saw (the user's audit, 2026-08-17)
+        return False, "reading this machine's tree state failed — not moving a checkout whose state is unknown"
     if (st.stdout or "").strip():
         return False, "this machine's tree has uncommitted changes — commit or stash them first (won't clobber)"
     expected = _exact_commit_pin(expected_sha or ((_rr or {}).get("kernel_sha") or ""))
@@ -10192,12 +10246,33 @@ def _pull_remote(host, expected_sha=None):
                                  and current.get("trust") == "trusted")
         if not still_trusted:
             return False, ("%s trust changed during the pull — nothing merged" % host)
-        m = subprocess.run(["git", "-C", str(ROOT), "merge", "--ff-only", "FETCH_HEAD"],
-                           capture_output=True, text=True, timeout=30)
+        # The MOVE is a full update transaction like every other path (the user's audit,
+        # 2026-08-17: this one changed HEAD with no lock, no intent, no install): the checkout's
+        # interprocess lock spans merge + install, the latch is armed before HEAD moves and only
+        # a passing install.sh spends it.
+        lock_fd = _update_flock()
+        if lock_fd is None:
+            return False, "another update is already running on this checkout — try again when it finishes"
+        try:
+            if not _set_install_failed(_sha8(fetched_sha)):
+                return False, "could not record the install intent — not moving HEAD"
+            m = subprocess.run(["git", "-C", str(ROOT), "merge", "--ff-only", "FETCH_HEAD"],
+                               capture_output=True, text=True, timeout=30)
+            if m.returncode != 0:
+                _set_install_failed("")    # HEAD did not move; nothing to heal
+                return False, ("fast-forward failed: %s"
+                               % ((m.stderr or m.stdout or "").strip()[:160] or "unknown"))
+            installed = _converge_install(_sha8(fetched_sha), lock_fd)
+        finally:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
     except Exception as e:
         return False, str(e)[:200]
-    if m.returncode != 0:
-        return False, "fast-forward failed: %s" % ((m.stderr or m.stdout or "").strip()[:160] or "unknown")
+    if not installed:
+        return False, ("pulled from %s but install.sh failed — nothing restarts onto it until "
+                       "install passes (the notice has the story)" % host)
     _HEAD_CACHE.update(ts=0.0)             # HEAD moved; the next poll re-reads it and the drift clears
     short = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
                            capture_output=True, text=True, timeout=5).stdout.strip()
@@ -27077,9 +27152,18 @@ def main():
     # (a federated host) has no ~/.local/bin on PATH — bare `claude` exec-failed silently there.
     os.environ.setdefault("ROMP_CLAUDE_BIN", _claude_bin())
     signal.signal(signal.SIGTERM, _graceful_term)             # drain, don't die mid-flight (see _graceful_term)
-    _migrate_channel()                                        # one-time: a v1.3.2 STATE-file channel moves into git config
+    _migrate_channel()                                        # one-time: older channel spellings move into the worktree marker
     _boot_heal()                                              # a latched half-installed checkout heals FIRST — before
     #                                                           _ensure_bundles builds on it, before any subsystem
+    _armed = _install_failed_sha()
+    if _armed and _armed == _sha8(_checkout_sha()):
+        # The heal could not spend the latch (install failed again, or another process holds the
+        # lock). SERVING is not an option: subsystems on a half-installed build are the audit's
+        # exact scenario. Abort; the manager's backoff respawn — and romp-serve's own pre-exec
+        # gate — are the retry (the user's audit, 2026-08-17).
+        sys.stderr.write("romp-kernel: this checkout's install never finished and could not be "
+                         "healed at boot — refusing to serve a half-installed build.\n")
+        sys.exit(70)
     _ensure_bundles()
     try:                                                      # the diary boot sweep (2026-07-07): migrate every
         _death_boot_pass()                                    # deaths no kernel was up to see: stamp them

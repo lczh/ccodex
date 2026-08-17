@@ -79,15 +79,19 @@ class PullRemote(unittest.TestCase):
         km.subprocess.run = self._run
         km._HEAD_CACHE.clear(); km._HEAD_CACHE.update(self._hc)
         km._remotes.clear()
+        km._set_install_failed("")
 
     def _wire(self, dirty="", rhead=REMOTE, fetched=REMOTE, resolved=REMOTE,
-              ancestor_rc=0, merge_rc=0, count="3"):
+              ancestor_rc=0, merge_rc=0, count="3", status_rc=0, install_rc=0):
         calls = []
+        latch_at_merge = self.latch_at_merge = []
 
         def fake(argv, **kw):
             calls.append(argv)
+            if any("install.sh" in str(a) for a in argv):
+                return _R(rc=install_rc, err="boom" if install_rc else "")
             if argv[0] == "git" and "status" in argv:
-                return _R(out=dirty)
+                return _R(out=dirty, rc=status_rc)
             if argv[0] == "git" and "fetch" in argv:
                 return _R()
             if argv[0] == "git" and "merge-base" in argv:
@@ -95,6 +99,7 @@ class PullRemote(unittest.TestCase):
             if argv[0] == "git" and "rev-list" in argv:
                 return _R(out=count)
             if argv[0] == "git" and "merge" in argv:
+                latch_at_merge.append(km._install_failed_sha())
                 return _R(rc=merge_rc, err="not a fast-forward" if merge_rc else "")
             if argv[0] == "git" and "rev-parse" in argv:
                 if "FETCH_HEAD" in argv:
@@ -144,6 +149,56 @@ class PullRemote(unittest.TestCase):
         self.assertIn("TESTHOST:/home/u/romp", fetch, "fetches from the discovered clone over our own ssh")
         merge = next(a for a in calls if a[0] == "git" and "merge" in a)
         self.assertIn("--ff-only", merge, "never a merge or rebase on the user's behalf")
+
+    def test_a_failed_status_is_unknown_never_clean(self):
+        # a status that ERRORS with empty stdout used to read as a clean tree and the pull
+        # fast-forwarded over state the command never saw (the user's audit, 2026-08-17)
+        self._wire(status_rc=128)
+        ok, detail = km._pull_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("state is unknown", detail)
+
+    def test_the_pull_is_a_full_update_transaction(self):
+        # this path used to change HEAD with no lock, no intent, and no install.sh (the user's
+        # audit, 2026-08-17) — now: the latch is armed BEFORE the merge, install.sh runs as part
+        # of the pull, and a passing install spends the latch
+        calls = self._wire()
+        ok, detail = km._pull_remote("TESTHOST")
+        self.assertTrue(ok, detail)
+        self.assertEqual(self.latch_at_merge, [km._sha8(REMOTE)],
+                         "the intent is durable before HEAD can move")
+        self.assertTrue(any("install.sh" in str(a) for c in calls for a in c),
+                        "install.sh is part of the transaction, not an afterthought")
+        self.assertEqual(km._install_failed_sha(), "", "a passing install spends the latch")
+
+    def test_a_failed_install_after_the_pull_keeps_the_latch_and_says_so(self):
+        self._wire(install_rc=1)
+        ok, detail = km._pull_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("install.sh failed", detail)
+        self.assertEqual(km._install_failed_sha(), km._sha8(REMOTE),
+                         "armed — nothing restarts onto it until install passes")
+
+    def test_a_held_update_lock_refuses_the_pull(self):
+        self._wire()
+        fd = km._update_flock()
+        self.assertIsNotNone(fd)
+        try:
+            ok, detail = km._pull_remote("TESTHOST")
+        finally:
+            km.os.close(fd)
+        self.assertFalse(ok)
+        self.assertIn("another update is already running", detail)
+
+    def test_an_unpersistable_intent_blocks_the_merge(self):
+        calls = self._wire()
+        from unittest import mock
+        with mock.patch.object(km, "_set_install_failed", return_value=False):
+            ok, detail = km._pull_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("install intent", detail)
+        self.assertFalse(any(a[0] == "git" and "merge" in a and "merge-base" not in a
+                             for a in calls), "HEAD never moved")
 
     def test_divergence_is_refused_loudly(self):
         self._wire(ancestor_rc=1)

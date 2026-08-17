@@ -320,18 +320,18 @@ EOF
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -eq 0 ]
     [[ "$output" == *"Update channel: stable"* ]]
-    [ "$(git -C "$HOME/romp" config --get romp.updateChannel)" = "stable" ]
+    [ "$(cat "$(git -C "$HOME/romp" rev-parse --absolute-git-dir)/romp-update-channel")" = "stable" ]
 }
 
 @test "bootstrap.sh: ROMP_REF=main is the explicit dev opt-in, and a tag re-run flips back" {
     ROMP_DIR="$HOME/romp" ROMP_REF=main run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -eq 0 ]
-    [ "$(git -C "$HOME/romp" config --get romp.updateChannel)" = "dev" ]
+    [ "$(cat "$(git -C "$HOME/romp" rev-parse --absolute-git-dir)/romp-update-channel")" = "dev" ]
     # re-bootstrapping onto a release moves the install back to stable — the channel follows
     # the last explicit choice, never a sticky accident
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -eq 0 ]
-    [ "$(git -C "$HOME/romp" config --get romp.updateChannel)" = "stable" ]
+    [ "$(cat "$(git -C "$HOME/romp" rev-parse --absolute-git-dir)/romp-update-channel")" = "stable" ]
 }
 
 @test "bootstrap.sh: a feature branch or pinned ref is NOT the dev channel" {
@@ -341,7 +341,7 @@ EOF
     git -C "$ROMP_REPO" branch feature-x
     ROMP_DIR="$HOME/romp" ROMP_REF=feature-x run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -eq 0 ]
-    [ "$(git -C "$HOME/romp" config --get romp.updateChannel)" = "stable" ]
+    [ "$(cat "$(git -C "$HOME/romp" rev-parse --absolute-git-dir)/romp-update-channel")" = "stable" ]
 }
 
 @test "bootstrap.sh: a NOISY rc-1 trust probe enforces — only git's quiet 'absent' downgrades" {

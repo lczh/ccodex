@@ -209,6 +209,22 @@ class UpdateRemote(unittest.TestCase):
         disc = next(a[-1] for a in calls if isinstance(a[-1], str) and "for d in" in a[-1])
         self.assertIn("STATERR", disc, "the discover probe distinguishes error from clean too")
 
+    def test_an_install_failure_on_the_remote_is_its_own_verdict(self):
+        # the apply used to lock the reset alone and never install at all (the user's audit,
+        # 2026-08-17); a failed install now leaves the remote's latch armed and says so
+        self._wire(apply_out="INSTALLFAIL")
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("install.sh failed", detail)
+        self.assertIn("boot heal", detail)
+        calls = self._wire(apply_out="SYNCED:abcdef0")
+        km._update_remote("TESTHOST")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        self.assertIn("install.sh", apply, "the apply transaction installs")
+        self.assertIn("romp-install-failed", apply, "and arms the remote's latch before the reset")
+        self.assertLess(apply.index("romp-install-failed"), apply.index("reset"),
+                        "intent before the move, on the remote exactly as locally")
+
     def test_the_generated_shell_actually_emits_STATERR_when_status_dies(self):
         # the string-level pins above never EXECUTE the shell: replanting the audited bug (a dead
         # status reading as clean) passed all of them (the adversarial review, 2026-08-17). Run

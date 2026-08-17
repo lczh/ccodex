@@ -62,27 +62,44 @@ class DriftWiring(unittest.TestCase):
         self.assertIn('"kind": "main"', src, "ask mode fires the shared banner with the drift variant")
 
     def test_the_default_channel_is_stable_and_only_dev_reads_as_dev(self):
-        # the CHANNEL is persisted separately from signature policy — and PER CHECKOUT, in the
-        # clone's git config, so kernels sharing one checkout can never disagree about it (the
-        # user's audits, 2026-08-17). Absent, garbage, or a failed query all read STABLE.
+        # the CHANNEL is a marker in the WORKTREE's own git dir — the v1.3.3 git-config key was
+        # repository-scoped, so a dev worktree could flip a sibling release worktree (the user's
+        # audits, 2026-08-17). Absent, garbage, or a failed query all read STABLE; the legacy
+        # config key counts ONLY on the main checkout.
         import subprocess as sp
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td) / "gitdir"; gd.mkdir()
+            marker = gd / "romp-update-channel"
+            with mock.patch.object(km, "_update_git_dir", return_value=gd):
+                with mock.patch.object(km.subprocess, "run",
+                                       side_effect=AssertionError("the marker answers alone")):
+                    marker.write_text("dev\n")
+                    self.assertEqual(km._update_channel(), "dev")
+                    marker.write_text("banana\n")
+                    self.assertEqual(km._update_channel(), "stable", "garbage → stable")
+                    marker.write_text("stable\n")
+                    self.assertEqual(km._update_channel(), "stable")
+                marker.unlink()
+                # absent marker, LINKED worktree (.git is a file): never the shared legacy key
+                wt = Path(td) / "wt"; wt.mkdir(); (wt / ".git").write_text("gitdir: /elsewhere\n")
+                with mock.patch.object(km, "ROOT", wt), \
+                     mock.patch.object(km.subprocess, "run",
+                                       side_effect=AssertionError("worktrees never read the shared key")):
+                    self.assertEqual(km._update_channel(), "stable")
+                # absent marker, MAIN checkout (.git a dir): legacy config fallback, exact dev only
+                mn = Path(td) / "main"; (mn / ".git").mkdir(parents=True)
 
-        def probe(rc, out="", exc=None):
-            kw = ({"side_effect": exc} if exc else
-                  {"return_value": sp.CompletedProcess([], rc, stdout=out, stderr="")})
-            with mock.patch.object(km.subprocess, "run", **kw) as run:
-                got = km._update_channel()
-            if not exc:
-                self.assertIn("romp.updateChannel", run.call_args[0][0],
-                              "the channel is git config's answer, never a state-dir copy")
-            return got
+                def probe(rc, out=""):
+                    with mock.patch.object(km, "ROOT", mn), \
+                         mock.patch.object(km.subprocess, "run",
+                                           return_value=sp.CompletedProcess([], rc, stdout=out, stderr="")):
+                        return km._update_channel()
 
-        self.assertEqual(probe(1), "stable", "absent key → stable, never dev")
-        self.assertEqual(probe(0, "banana\n"), "stable", "garbage → stable")
-        self.assertEqual(probe(0, "dev\n"), "dev")
-        self.assertEqual(probe(0, "stable\n"), "stable")
-        self.assertEqual(probe(128), "stable", "a query error → stable (fail closed)")
-        self.assertEqual(probe(0, exc=OSError("no git")), "stable")
+                self.assertEqual(probe(1), "stable", "absent key → stable, never dev")
+                self.assertEqual(probe(0, "dev\n"), "dev")
+                self.assertEqual(probe(0, "banana\n"), "stable")
+                self.assertEqual(probe(128), "stable", "a query error → stable (fail closed)")
 
     def test_a_stable_install_never_probes_or_pulls_main(self):
         # stable means code moves ONLY via signed release tags: the check must not even ls-remote
@@ -399,6 +416,14 @@ class ConvergeFunctional(unittest.TestCase):
                          "the intent is durable before HEAD can move — a crash finds it at boot")
         self.assertEqual(km._install_failed_sha(), "", "a completed install spends the intent")
 
+    def test_an_unpersistable_intent_blocks_the_checkout(self):
+        # noticing-but-proceeding let a full/unwritable git dir move HEAD with no recovery record
+        # (the user's audit, 2026-08-17): the arm's return is load-bearing
+        with mock.patch.object(km, "_set_install_failed", return_value=False):
+            steps, _ = self._run()
+        self.assertNotIn("checkout", steps, "no durable intent, no move")
+        self.assertTrue(any("install intent" in n for n in self.notices))
+
     def test_a_failed_checkout_disarms_the_intent(self):
         steps, _ = self._run(fail=("checkout",))
         self.assertEqual(steps[-1], "checkout")
@@ -473,6 +498,17 @@ class BootHeal(unittest.TestCase):
                         "_ensure_bundles npm-builds ON the checkout — it must not run before the heal")
         self.assertLess(heal, src.index("    _boot_warm()"),
                         "the heal precedes every subsystem start — half-installed code must not serve")
+
+    def test_boot_ABORTS_when_the_latch_survives_the_heal(self):
+        # returning after a failed/contended heal started every subsystem on the half-installed
+        # checkout anyway (the user's audit, 2026-08-17): serving is not an option; the manager's
+        # backoff respawn — and romp-serve's pre-exec gate — are the retry
+        src = inspect.getsource(km)
+        gate = src.index("_armed = _install_failed_sha()")
+        self.assertLess(src.index("    _boot_heal()"), gate)
+        self.assertLess(gate, src.index("    _ensure_bundles()"))
+        self.assertIn("sys.exit(70)", src[gate:gate + 800],
+                      "still latched for the running HEAD → refuse to serve")
 
 
 if __name__ == "__main__":

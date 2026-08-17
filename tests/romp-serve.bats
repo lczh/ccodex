@@ -176,3 +176,55 @@ extract_pick() { sed -n '/^pick_python()/,/^}/p' "$1"; }
     diff <(sed -n '/^pick_python()/,/^}/p' "$ROMP_SERVE") \
          <(sed -n '/^pick_python()/,/^}/p' "$BIN/romp-sdk-setup")
 }
+
+# ── the install-latch gate (the user's audit, 2026-08-17) ────────────────────────────────────────
+# An armed latch naming the current HEAD means the last update moved the code but install.sh never
+# finished. The gate runs BEFORE the kernel execs (module imports otherwise happen on the
+# half-installed checkout): heal under the checkout's lock, refuse to start unless install passes.
+# The fixture is a copy of romp-serve inside its own tiny git repo, because the script resolves its
+# repo from its own location.
+
+_latch_fixture() {
+    FIX="$TEST_DIR/fix"
+    mkdir -p "$FIX/bin"
+    cp "$ROMP_SERVE" "$FIX/bin/romp-serve"
+    git -C "$FIX" init -q -b main
+    git -C "$FIX" -c user.email=t@t -c user.name=t commit -q --allow-empty -m x
+    GD="$(git -C "$FIX" rev-parse --absolute-git-dir)"
+    CUR="$(git -C "$FIX" rev-parse --short=8 HEAD | head -c 8)"
+    printf '#!/usr/bin/env bash\necho KERNEL_RAN\n' > "$FIX/bin/romp-kernel"
+    chmod +x "$FIX/bin/romp-kernel"
+    export ROMP_KERNEL_BIN="$FIX/bin/romp-kernel"   # outrank the suite-wide stub from setup()
+}
+
+@test "romp-serve: an armed latch with a FAILING install refuses to start the kernel (exit 70)" {
+    _latch_fixture
+    printf '#!/bin/sh\nexit 1\n' > "$FIX/install.sh"; chmod +x "$FIX/install.sh"
+    printf '%s' "$CUR" > "$GD/romp-install-failed"
+    run "$FIX/bin/romp-serve"
+    [ "$status" -eq 70 ]
+    [[ "$output" != *KERNEL_RAN* ]]
+    [[ "$output" == *"half-installed"* ]]
+    [ -s "$GD/romp-install-failed" ]
+}
+
+@test "romp-serve: an armed latch heals (install passes), spends the latch, and starts the kernel" {
+    _latch_fixture
+    printf '#!/bin/sh\nexit 0\n' > "$FIX/install.sh"; chmod +x "$FIX/install.sh"
+    printf '%s' "$CUR" > "$GD/romp-install-failed"
+    run "$FIX/bin/romp-serve"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *KERNEL_RAN* ]]
+    [ ! -e "$GD/romp-install-failed" ]
+}
+
+@test "romp-serve: a latch naming some OTHER commit is moot — cleared, kernel starts, no install" {
+    _latch_fixture
+    printf '#!/bin/sh\necho INSTALL_RAN; exit 1\n' > "$FIX/install.sh"; chmod +x "$FIX/install.sh"
+    printf '%s' "00000000" > "$GD/romp-install-failed"
+    run "$FIX/bin/romp-serve"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *KERNEL_RAN* ]]
+    [[ "$output" != *INSTALL_RAN* ]]
+    [ ! -e "$GD/romp-install-failed" ]
+}

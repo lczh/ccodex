@@ -89,6 +89,40 @@ pick_python() {
 }
 PY="$(pick_python)"
 
+# GATE ON THE INSTALL LATCH before the kernel ever execs (the user's audit, 2026-08-17: module
+# imports and subsystems otherwise start on a half-installed checkout before any in-kernel heal
+# can run). An armed latch naming THIS HEAD means the last update moved the code but install.sh
+# never finished: run it here, under the checkout's own update lock, and refuse to start the
+# kernel unless it passes -- the manager's backoff respawn is the retry. A latch naming some
+# OTHER commit is moot (that move never landed) and is cleared.
+GD="$(git -C "$ROMP_DIR" rev-parse --absolute-git-dir 2>/dev/null || true)"
+LATCH="${GD:+$GD/romp-install-failed}"
+if [[ -n "$GD" && -s "$LATCH" ]]; then
+    _want="$(head -c 8 "$LATCH" 2>/dev/null || true)"
+    _cur="$(git -C "$ROMP_DIR" rev-parse --short=8 HEAD 2>/dev/null | head -c 8 || true)"
+    if [[ -n "$_want" && "$_want" != "$_cur" ]]; then
+        rm -f "$LATCH"
+    elif [[ -n "$_want" ]]; then
+        echo "romp-serve: this checkout's last install never finished -- running install.sh before the kernel starts" >&2
+        if python3 - "$GD/romp-update.lock" "$ROMP_DIR" <<'LOCKPY'
+import fcntl, os, subprocess, sys
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(3)
+sys.exit(subprocess.run(["bash", os.path.join(sys.argv[2], "install.sh")], cwd=sys.argv[2]).returncode)
+LOCKPY
+        then
+            rm -f "$LATCH"
+        else
+            echo "romp-serve: install.sh did not pass (or another update holds this checkout's lock) --" >&2
+            echo "  refusing to start a kernel on a half-installed build; the manager retries with backoff." >&2
+            exit 70
+        fi
+    fi
+fi
+
 # Map onto the kernel's env, then exec it (preserving the PID for the manager).
 # ROMP_MANAGER_PID (parent-death watchdog) and ROMP_SERVE_TOKEN (auto-loaded from the
 # persisted token file if unset) flow through untouched. ROMP_KERNEL_NO_OPEN keeps a
