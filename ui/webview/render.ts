@@ -82,8 +82,8 @@ type TaskOutputs = Record<string, { command: string; output: string }>;
 type ChatEvent = (
   // mid/mids: postal message ids the kernel could NOT resolve into cards, carried on the raw turn so a
   // timeline arc into it still lands (see _hydrate_postal's unresolved path)
-  | { kind: "user"; md: string; uuid?: string; ts?: string; reminders?: string[]; taskOutputs?: TaskOutputs; human?: boolean; romp?: boolean; rompAuto?: boolean; rompSystem?: boolean; followUp?: boolean; goal?: string; fuCtx?: string; canned?: string; tag?: string; mid?: string; mids?: string[]; images?: { src: string; path?: string }[]; undelivered?: boolean; echoT?: number; spacePaths?: string[]; pathLinks?: Record<string, string> }
-  | { kind: "assistant"; md: string; uuid?: string; ts?: string; spacePaths?: string[]; pathLinks?: Record<string, string> }   // spacePaths: backticked filenames WITH spaces the kernel verified exist (build_session _space_paths) → whole-span links. pathLinks: path-shaped tokens the kernel verified against the filesystem, token → real open target (build_session _path_links) — the linkifier's gate
+  | { kind: "user"; md: string; uuid?: string; ts?: string; reminders?: string[]; taskOutputs?: TaskOutputs; human?: boolean; romp?: boolean; rompAuto?: boolean; rompSystem?: boolean; followUp?: boolean; goal?: string; fuCtx?: string; canned?: string; tag?: string; mid?: string; mids?: string[]; images?: { src: string; path?: string }[]; undelivered?: boolean; echoT?: number; spacePaths?: string[]; pathLinks?: Record<string, string>; pathPins?: Record<string, string> }
+  | { kind: "assistant"; md: string; uuid?: string; ts?: string; spacePaths?: string[]; pathLinks?: Record<string, string>; pathPins?: Record<string, string> }   // spacePaths: backticked filenames WITH spaces the kernel verified exist (build_session _space_paths) → whole-span links. pathLinks: path-shaped tokens the kernel verified against the filesystem, token → real open target (build_session _path_links) — the linkifier's gate
   | { kind: "thinking"; text: string; encrypted: boolean; uuid?: string; ts?: string }
   | {
       kind: "tool";
@@ -1031,7 +1031,24 @@ const CLICKABLE_PATH_RE = /file:\/\/\/?[^\s<>"'`)]+|[~.\w\-]*\/[~.\w\-/]*[\w\-]|
 // kernel, a cached payload) keeps today's shape-only linking rather than unlinking history.
 // file:// URIs are explicit absolute paths — never gated on the map.
 function linkifyFileUris(root: HTMLElement, skipThumbs?: string[], spacePaths?: string[],
-                         pathLinks?: Record<string, string>): void {
+    pathLinks?: Record<string, string>, pathPins?: Record<string, string>): void {
+  // A whole-backtick http(s) URL becomes a TAPPABLE link that still looks like code (the user
+  // 2026-08-16, on mobile, wanting to tap through to a dashboard link a session sent). Bare URLs
+  // and [text](url) already link via marked's gfm autolink + the global anchor click delegate;
+  // the code-span form was the one dead shape. Inline spans only (never inside <pre> blocks or an
+  // existing anchor), and only when the span's ENTIRE text is one URL — a URL quoted inside prose
+  // code stays code. The scheme is validated here, so the anchor is as safe as md()'s sanitized ones.
+  for (const code of Array.from(root.querySelectorAll("code"))) {
+    const t = (code.textContent || "").trim();
+    if (!/^https?:\/\/\S+$/.test(t)) continue;
+    if (code.closest("pre") || code.closest("a")) continue;
+    const a = document.createElement("a");
+    a.href = t;
+    a.className = "url-code-link";
+    a.title = t + " — opens in a new tab";
+    code.replaceWith(a);
+    a.appendChild(code);
+  }
   const previewable: string[] = [];   // renderable paths found in this message → full renders at their mentions
   const mentionAt = new Map<string, HTMLElement>();   // path → its FIRST mention's element (figure anchor)
   const kernelVerified = new Set<string>();           // paths the kernel stat'd — their previews fail loudly, never silently
@@ -1108,7 +1125,7 @@ function linkifyFileUris(root: HTMLElement, skipThumbs?: string[], spacePaths?: 
     const BLOCK_SEL = "p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th";
     const strips = new Map<HTMLElement, HTMLElement>();   // figure anchor → its strip (same block shares one)
     for (const p of previewable.slice(0, 4)) {
-      const full = canPreview() ? previewFull(p, activeId, kernelVerified.has(p))
+      const full = canPreview() ? previewFull(p, activeId, kernelVerified.has(p), (pathPins || {})[p])
         : previewKind(p) === "img" ? buildPathImg(p) : null;
       if (!full) continue;
       const block = mentionAt.get(p)?.closest(BLOCK_SEL) as HTMLElement | null;
@@ -1843,7 +1860,7 @@ function renderEventInner(ev: ChatEvent): HTMLElement {
         if (more) {
           const full = el("div", "nudge-full md");
           full.innerHTML = md(raw);
-          linkifyFileUris(full, imgPaths, ev.spacePaths, ev.pathLinks);
+          linkifyFileUris(full, imgPaths, ev.spacePaths, ev.pathLinks, ev.pathPins);
           bubble.appendChild(full);
           bubble.classList.add("nudge-collapsible");
           // toggle rides the stable document.body delegate (data-act), NOT a per-render listener —
@@ -1856,7 +1873,7 @@ function renderEventInner(ev: ChatEvent): HTMLElement {
         }
       } else if (ev.md) {
         bubble.innerHTML = md(ev.md);
-        linkifyFileUris(bubble, imgPaths, ev.spacePaths, ev.pathLinks);   // bare file:// URLs in a message → clickable (open in the host's default app)
+        linkifyFileUris(bubble, imgPaths, ev.spacePaths, ev.pathLinks, ev.pathPins);   // bare file:// URLs in a message → clickable (open in the host's default app)
       }
       // images, IN the bubble (part of his message): thumbnail + open/copy caption;
       // a literal path in the typed text becomes the same open-link inline.
@@ -2005,7 +2022,7 @@ function renderEventInner(ev: ChatEvent): HTMLElement {
     const body = el("div", "assistant md");
     body.innerHTML = md(ev.md);
     highlight(body);
-    linkifyFileUris(body, undefined, ev.spacePaths, ev.pathLinks);   // bare file:// URLs + verified spaced filenames → clickable
+    linkifyFileUris(body, undefined, ev.spacePaths, ev.pathLinks, ev.pathPins);   // bare file:// URLs + verified spaced filenames → clickable
     turn.appendChild(body);
     return turn;
   }
@@ -8567,7 +8584,7 @@ function renderStagedStrip(id: string | null): void {
     const open = stagedOpen.has(id + ":" + i);
     if (open) chip.classList.add("open");
     const hint = el("span", "staged-expand");
-    hint.textContent = open ? "(collapse)" : "(expand)";
+    hint.textContent = open ? "(collapse)" : "(click to expand)";
     const toggle = () => {
       const k = id + ":" + i;
       if (stagedOpen.has(k)) stagedOpen.delete(k); else stagedOpen.add(k);
@@ -9928,8 +9945,11 @@ function setupComposer() {
       // it (the user 2026-07-30) — silently accepting it would clear the composer and deliver nothing.
       if (hostIsDown(sid)) {
         const host = String(sid).slice(0, String(sid).indexOf(":"));
+        // the refusal itself is DEMAND: ask the kernel to re-dial that host's tunnel right now,
+        // so "romp is re-dialing" below is literally true at the moment it is read (2026-08-16)
+        vscodeApi?.postMessage({ type: "redial", host });
         warnToast(host + " is disconnected, so this wasn't sent. It's still in the box — romp is "
-          + "reconnecting, and you can send it then.");
+          + "re-dialing the link now; send again when it's back.");
         return;
       }
       if (isProvisionalId(sid)) {
@@ -9943,6 +9963,7 @@ function setupComposer() {
         provisionalQueue.push(text);
         registerOptimistic(sid, text);
         sendOnShip.delete(sid);                       // a send happened — any held one is superseded
+        histWalk.delete(sid);                         // …and the history walk starts fresh
         if (attached.length) { composerFiles.delete(sid); if (sid === activeId) renderComposerFiles(sid); }
         drafts.delete(sid); draftStartedAt.delete(sid); persistDrafts();
         ta.value = ""; composerManualH = null; ta.style.height = "";
@@ -9971,6 +9992,7 @@ function setupComposer() {
       // (a citation follow-up/quote has its own kernel-side echo path; the optimistic bubble covers the plain send)
       if (cites) { composerCitations.delete(activeId); renderComposerChips(activeId); }   // consumed on send
       sendOnShip.delete(sid);                       // a send happened — any held one is superseded
+      histWalk.delete(sid);                         // …and the history walk starts fresh
       if (attached.length) { composerFiles.delete(sid); if (sid === activeId) renderComposerFiles(sid); }   // the strip emptied into this message
       drafts.delete(activeId); draftStartedAt.delete(activeId); persistDrafts();   // sent — no draft to restore on a later switch-back
       ta.value = "";
@@ -10210,8 +10232,55 @@ function setupComposer() {
   ta.addEventListener("blur", () => window.setTimeout(closeSlash, 120));   // close when leaving (a row's mousedown keeps focus, so it fires only on a real leave)
   window.addEventListener("resize", positionSlash);
 
+  // ── PROMPT HISTORY (the user 2026-08-16): ↑ with the caret on the box's FIRST line recalls the
+  // session's previously SENT prompts, shell-style; ↓ on the last line walks forward again, and
+  // walking past the newest restores the draft you were typing (stashed on the first ↑). History is
+  // the session payload's own human-sent messages — authoritative, survives reloads — with romp's
+  // injected turns excluded and adjacent repeats collapsed. The walk drops on send.
+  const histWalk = new Map<string, { idx: number; stash: string }>();   // sid → walk position + stashed draft
+  const composerHistory = (sid: string): string[] => {
+    const out: string[] = [];
+    for (const ev of sessions.get(sid)?.events || []) {
+      if (ev.kind !== "user" || !ev.human || ev.romp || ev.rompAuto) continue;
+      const t = (ev.md || "").trim();
+      if (t && out[out.length - 1] !== t) out.push(t);
+    }
+    return out;                                        // oldest → newest
+  };
   ta.addEventListener("keydown", (e) => {
     if (slashKey(e)) return;   // the slash menu owns ↑/↓/⏎/Tab/Esc while it's open
+    // ↑/↓ recall history ONLY from the boundary lines with a collapsed caret and no modifiers —
+    // mid-text arrows keep their native caret movement, so multi-line editing is never hijacked.
+    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && activeId
+        && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey
+        && ta.selectionStart === ta.selectionEnd) {
+      const onFirst = !ta.value.slice(0, ta.selectionStart).includes("\n");
+      const onLast = !ta.value.slice(ta.selectionStart).includes("\n");
+      const w = histWalk.get(activeId);
+      if (e.key === "ArrowUp" ? onFirst : (onLast && w)) {
+        const hist = composerHistory(activeId);
+        if (e.key === "ArrowUp") {
+          const idx = w ? w.idx - 1 : hist.length - 1;
+          if (idx >= 0 && hist.length) {
+            e.preventDefault();
+            histWalk.set(activeId, { idx, stash: w ? w.stash : ta.value });
+            ta.value = hist[idx];
+            ta.setSelectionRange(ta.value.length, ta.value.length);
+            growComposer(ta);
+            ta.dispatchEvent(new Event("input"));      // draft/slash/ask-mode bookkeeping stays true
+          }
+          return;                                      // nothing older → native caret-to-start is fine
+        }
+        e.preventDefault();
+        const idx = w!.idx + 1;
+        if (idx >= hist.length) { ta.value = w!.stash; histWalk.delete(activeId); }
+        else { w!.idx = idx; ta.value = hist[idx]; }
+        ta.setSelectionRange(ta.value.length, ta.value.length);
+        growComposer(ta);
+        ta.dispatchEvent(new Event("input"));
+        return;
+      }
+    }
     // Backspace at the very START of the box deletes the citation chip "like a character" (the user
     // 2026-07-01) — the chip sits just before the caret, so this is the natural way to remove it by keyboard.
     if (e.key === "Backspace" && !e.metaKey && !e.ctrlKey && ta.selectionStart === 0 && ta.selectionEnd === 0

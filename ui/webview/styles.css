@@ -66,7 +66,8 @@ html, body {
   background: var(--bg); color: var(--fg);
   font-family: var(--sans); font-size: var(--fs); line-height: 1.6;
 }
-body { display: flex; flex-direction: column; }
+body { display: flex; flex-direction: column; overflow-x: hidden; }   /* the chat pane NEVER scrolls
+   sideways (the user 2026-08-16) — a wide child is a layout bug to fix, not a scroll to offer */
 /* a 2px NEUTRAL frame around the WHOLE pane — drawn as a fixed overlay ON TOP so the tab bar /
    composer backgrounds can't paint over it. pointer-events:none so it never blocks clicks. The
    session's identity color now lives on the conversation RAIL instead (the user 2026-06-15). */
@@ -565,6 +566,11 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
    the queued idiom (queued = sent, awaiting injection; these are unsent by choice). Same chip anatomy
    as citations, its own read: a dashed accent edge instead of the pill, no hourglass; the head wears
    the queued-head size (labels match labels). */
+/* the three composer strips are wrapped flex ITEMS of #composer: without flex-basis 100% +
+   min-width 0 their min-content width is a nowrap child's full intrinsic width, so one long staged
+   line refused to shrink, blew the strip past the pane and dragged a horizontal scroll with it (the
+   user 2026-08-16, screenshot) — the ellipsis never got the chance to engage */
+#composer-files, #composer-staged, #composer-chips { flex: 1 1 100%; min-width: 0; max-width: 100%; }
 #composer-staged { flex-direction: column; gap: 3px; padding: 5px 8px 0; }
 .staged-head { display: flex; align-items: center; gap: 8px; font-size: 0.78em; color: var(--dim); letter-spacing: 0.02em; }
 .staged-head .staged-go { margin-left: auto; background: none; border: 1px solid var(--accent); color: var(--accent);
@@ -2295,6 +2301,10 @@ body.picker-lifted > #picker.kb-tight { align-items: flex-start; padding: 12px 1
 .path-full-pdfcard { display: inline-flex; align-items: center; gap: 7px; padding: 7px 11px;
   border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.14); background: rgba(0, 0, 0, 0.25); }
 .path-full-pdfcard:hover { border-color: var(--accent); }
+/* a whole-backtick URL, tappable but still dressed as code (render.ts linkifyFileUris) */
+.url-code-link { text-decoration: none; cursor: pointer; }
+.url-code-link code { text-decoration: underline dotted; text-underline-offset: 2px; }
+.url-code-link:hover code { color: var(--accent); }
 /* a kernel-VERIFIED preview whose bytes failed to arrive (restart, tunnel blip) — visible, retryable,
    never silently removed (preview.ts previewFull) */
 .path-full-retry { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 8px;

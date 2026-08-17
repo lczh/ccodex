@@ -65,6 +65,10 @@ test("it clears itself the moment the host is back", () => {
 test("a send into a disconnected session is refused, and the text is KEPT", () => {
   assert.match(RENDER, /if \(hostIsDown\(sid\)\) \{/);
   assert.match(RENDER, /is disconnected, so this wasn't sent\. It's still in the box/);
+  // the refusal itself is DEMAND (the user 2026-08-16, on flaky wifi): it asks the kernel to
+  // re-dial the host's tunnel NOW, so the toast's "re-dialing the link now" is literally true
+  assert.match(RENDER, /vscodeApi\?\.postMessage\(\{ type: "redial", host \}\);/);
+  assert.match(RENDER, /re-dialing the link now; send again when it's back\./);
   // the refusal must come BEFORE the box is cleared, or the message is gone
   const deliver = RENDER.slice(RENDER.indexOf("const deliver = () =>"));
   const guard = deliver.indexOf("if (hostIsDown(sid)) {");

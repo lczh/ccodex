@@ -28,6 +28,11 @@ export interface FeedViewState {
   // alone. Keyed by SESSION, not by card, because the point is that cards which do not exist yet inherit
   // it — see the prune exemption below.
   threads: string[];
+  // Stacked-layout COLUMN state (the user 2026-08-16): collapsed column keys ("asks"/"needsInput"/
+  // "completed") and the user's dragged column order. Both describe the LAYOUT, not any card, so both
+  // are prune-EXEMPT like `threads` and bounded by their three known keys instead.
+  cols: string[];
+  order: string[];
 }
 
 export const VIEW_STATE_KEY = "romp:feedview";
@@ -36,7 +41,7 @@ export const VIEW_STATE_KEY = "romp:feedview";
 export const VIEW_STATE_CAP = 4000;
 
 export function emptyViewState(): FeedViewState {
-  return { v: 1, sec: {}, tree: [], nodes: [], logs: [], asks: [], threads: [] };
+  return { v: 1, sec: {}, tree: [], nodes: [], logs: [], asks: [], threads: [], cols: [], order: [] };
 }
 
 /** Parse a stored blob. ANY malformed/foreign/old-version value reads as empty rather than throwing — a
@@ -53,8 +58,10 @@ export function parseViewState(raw: string | null | undefined): FeedViewState {
     }
     // `threads` post-dates v1 blobs, so a stored entry without it reads as "nothing collapsed" rather
     // than as corrupt — no version bump, and yesterday's saved sections survive the upgrade.
+    const col = (x: unknown): string[] =>
+      arr(x).filter((k) => k === "asks" || k === "needsInput" || k === "completed");
     return { v: 1, sec, tree: arr(o.tree), nodes: arr(o.nodes), logs: arr(o.logs), asks: arr(o.asks),
-             threads: arr(o.threads) };
+             threads: arr(o.threads), cols: col(o.cols), order: col(o.order) };
   } catch {
     return emptyViewState();
   }
@@ -102,7 +109,7 @@ export function pruneViewState(s: FeedViewState, liveIds: Set<string>): FeedView
   for (const [k, v] of Object.entries(s.sec)) if (keyIsLive(k, liveIds)) sec[k] = v;
   const keep = (xs: string[]) => xs.filter((k) => keyIsLive(k, liveIds));
   return capViewState({ v: 1, sec, tree: keep(s.tree), nodes: keep(s.nodes), logs: keep(s.logs),
-                        asks: keep(s.asks), threads: s.threads });
+                        asks: keep(s.asks), threads: s.threads, cols: s.cols, order: s.order });
 }
 
 export function viewStateSize(s: FeedViewState): number {

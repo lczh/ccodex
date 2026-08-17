@@ -6562,13 +6562,17 @@ def _consolidate_tops(store, cap=20):
     """The session's COMPLETED top-level goals, oldest-first, capped — the consolidator's candidate forest.
     A candidate is a top (parentId None) that is currently `completed` in the rolled-up status, is NOT itself
     an umbrella (don't re-group already-grouped trees into umbrella-of-umbrellas), and is neither node-cleared
-    nor view-cleared (the user crossed it off — never resurrect it under a fresh umbrella)."""
+    nor view-cleared (the user crossed it off — never resurrect it under a fresh umbrella). A top carrying
+    courier ORIGIN provenance is excluded too (the user 2026-08-16): build_feed reads origin from the TOP
+    node only, so umbrella absorption would erase the "↪ from <peer>" badge — the one visible record that
+    this card's work was a delegation and that its clear rides the cross-session link."""
     nodes = store["nodes"]
     status = store.get("status", {})
     vc = _view_cleared()
     tops = [nd for nd in nodes.values()
             if nd.get("parentId") is None and not nd.get("umbrella")
             and not nd.get("cleared") and nd["id"] not in vc
+            and not (isinstance(nd.get("origin"), dict) and nd["origin"].get("peer"))
             and status.get(nd["id"]) == "completed"]
     tops.sort(key=lambda nd: nd.get("t", 0))
     return tops[-cap:] if len(tops) > cap else tops

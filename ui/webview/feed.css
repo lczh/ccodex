@@ -142,15 +142,34 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 
 /* responsive: stack the three columns when the panel is too narrow for them to
    sit side by side — prevents thin columns that break words mid-word ("Shippe/d") */
+/* the stacked layout's header furniture (the user 2026-08-16) exists ONLY there — hidden by default,
+   revealed inside the container query below. The fold caret wears the .feed-sess-fold treatment (dim,
+   thumb-padded); the category CHIP is itself the drag surface (no separate handle — the grab cursor
+   it wears in the stacked layout is the affordance). */
+.fcol-fold { display: none; }
+.feed-col.col-collapsed .feed-col-list { display: none; }   /* folded: the header (chip + count) stands in */
+
 @container (max-width: 540px) {
   .feed-cols { flex-direction: column; }
-  /* stacked, the columns read TOP-DOWN as Completed → Blocked (needs you) → Working (the user 2026-07-30,
-     moving Completed up from the middle; supersedes the 2026-07-08 Blocked-first order): what finished
-     first, then what needs you, then what's still running. DOM order stays Working/Blocked/Completed
-     (unchanged for the side-by-side layout); `order` only re-sequences the stacked case. */
-  .feed-col.col-completed  { order: 1; }
-  .feed-col.col-needsInput { order: 2; }
-  .feed-col.col-asks       { order: 3; }
+  /* stacked, the columns read TOP-DOWN as Completed → Blocked (needs you) → Working by default (the
+     user 2026-07-30, moving Completed up from the middle; supersedes the 2026-07-08 Blocked-first
+     order): what finished first, then what needs you, then what's still running. DOM order stays
+     Working/Blocked/Completed (unchanged for the side-by-side layout); `order` only re-sequences the
+     stacked case — and a dragged section (feed.ts applyColStack) overrides via --stack-order, so the
+     user's arrangement wins and survives reloads with the rest of the view state. */
+  .feed-col.col-completed  { order: var(--stack-order, 1); }
+  .feed-col.col-needsInput { order: var(--stack-order, 2); }
+  .feed-col.col-asks       { order: var(--stack-order, 3); }
+  /* the SAME caret the session headers wear (.feed-sess-fold): same glyphs, same side (right of
+     the label), same rendered size — the header's 0.72em is compensated explicitly so the glyph
+     paints at the feed's base size instead of shrinking with the label (the user 2026-08-16) */
+  .fcol-fold { display: inline-block; flex: none; padding: 0 5px; margin-left: -2px; color: var(--dim);
+    background: transparent; border: 0; font: inherit; font-size: 1.389em; font-weight: 400;
+    line-height: 1; cursor: pointer; transition: color 0.12s ease; }
+  .fcol-fold:hover, .fcol-fold:focus-visible { color: var(--fg); }
+  .feed-col-head .fcol-chip { cursor: grab; touch-action: none; user-select: none; }
+  .feed-col.col-dragging { position: relative; z-index: 5; opacity: 0.9; }   /* lifted over its siblings while it follows the pointer */
+  .feed-col.col-dragging .fcol-chip { cursor: grabbing; }
 }
 
 /* ---------- ask card (the inbox unit): three rows (the user 2026-06-14) ---------- */
@@ -280,6 +299,7 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 .fask-origin { flex: 0 0 auto; font-size: 0.8em; cursor: pointer; white-space: nowrap; }
 .fask-origin-pre { color: var(--dim); }
 .fask-origin-peer { font-weight: 600; }
+.fask-origin-absorbed { opacity: 0.55; }   /* provenance of a finished handoff — history, not an active link */
 /* the DISTILLER's one line on a card (restored 2026-06-29): completed → takeaway, blocked → decision brief.
    No why-rationale line; hidden until the distiller produces. pre-wrap keeps a copy-pasteable artifact intact. */
 .fask-distill { font-size: 0.86em; line-height: 1.4; margin: 1px 0 2px; color: var(--fg); opacity: 0.82; white-space: pre-wrap; overflow-wrap: anywhere; }

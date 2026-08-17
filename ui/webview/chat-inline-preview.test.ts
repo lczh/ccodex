@@ -19,7 +19,7 @@ const FEED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", 
 const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
 
 test("previewFull renders the image itself; a PDF is a click-to-view CARD, never an auto-loading frame", () => {
-  assert.match(PREVIEW, /export function previewFull\(path: string, sid\?: string \| null, verified = false\): HTMLElement \| null/);
+  assert.match(PREVIEW, /export function previewFull\(path: string, sid\?: string \| null, verified = false, pin\?: string\): HTMLElement \| null/);
   assert.match(PREVIEW, /img\.className = "path-full-img";/);
   // NO inline <iframe> for PDFs (2026-07-20): a browser set to "Download PDFs" saved a fresh copy on
   // EVERY chat re-render — the Downloads folder silently filled. The fetch must be user-initiated.
@@ -37,7 +37,7 @@ test("a kernel-VERIFIED preview fails LOUDLY: a retry chip holds the figure's sp
   // unverified (old kernel, no pathLinks verdict) keeps self-removal — there the error means "no such file"
   assert.match(pf, /if \(!verified\) \{ box\.remove\(\); return; \}/);
   assert.match(pf, /chip\.className = "path-full-retry";/);
-  assert.match(pf, /chip\.onclick = \(ev\) => \{ ev\.stopPropagation\(\); build\(true\); \};/, "tap to retry rebuilds the img");
+  assert.match(pf, /chip\.onclick = \(ev\) => \{ ev\.stopPropagation\(\); autoRetries = 3; build\(true\); \};/, "a tap re-arms persistence, then retries");
   assert.match(pf, /headers: got > 0 \? \{ Range: "bytes=" \+ got \+ "-" \} : \{\}/,
     "a retry RESUMES from the bytes already received (kernel /file honors the suffix range)");
   // the render layer feeds the verdict: spacePaths and pathLinks hits are kernel-stat'd paths
@@ -57,8 +57,8 @@ test("the failure chip narrates what happens next, escalates on repeat, and a re
   // "trying" and "unavailable" on every retry cycle read as impatient even when it eventually loaded)
   assert.match(pf, /if \(autoRetries > 0\) \{\s*\n\s*autoRetries--;\s*\n\s*failedPreviews\.set\(box, \(\) => build\(true\)\);/);
   assert.match(pf, /\+ " — retrying · tap to retry now";/);
-  assert.match(pf, /wait\.onclick = \(ev\) => \{ ev\.stopPropagation\(\); build\(true\); \};/,
-    "the whole retrying box is the tap target");
+  assert.match(pf, /wait\.onclick = \(ev\) => \{ ev\.stopPropagation\(\); autoRetries = 3; build\(true\); \};/,
+    "the whole retrying box is the tap target — and a tap re-arms persistence");
   assert.match(pf, /"⚠ preview unavailable"\)\)\s*\n\s*\+ " — tap to retry";/,
     "the chip exists only once the budget is spent, so it carries no retrying-automatically claim");
   // a repeat failure pulses the chip on swap-in — the acknowledge-every-click rule
@@ -86,7 +86,7 @@ test("a failed preview heals on the next kernel push — the kernel-is-back even
 });
 
 test("the chat uses the FULL render on web, and the host data-URL flow for images in VS Code", () => {
-  assert.match(RENDER, /const full = canPreview\(\) \? previewFull\(p, activeId, kernelVerified\.has\(p\)\)\s*\n\s*: previewKind\(p\) === "img" \? buildPathImg\(p\) : null;/);
+  assert.match(RENDER, /const full = canPreview\(\) \? previewFull\(p, activeId, kernelVerified\.has\(p\), \(pathPins \|\| \{\}\)\[p\]\)\s*\n\s*: previewKind\(p\) === "img" \? buildPathImg\(p\) : null;/);
   assert.doesNotMatch(RENDER, /previewThumb/, "the chat no longer renders mention thumbnails — full renders now");
 });
 
@@ -154,4 +154,20 @@ test("a flaky link finishes the picture ACROSS retries: resume, narrate progress
   assert.match(KERNEL, /self\.send_header\("Content-Range", "bytes %d-%d\/%d" % \(rng, size - 1, size\)\)/);
   assert.match(KERNEL, /hdrs\["Range"\] = _rng/, "the relay forwards the browser's range to the remote");
   assert.match(KERNEL, /re\.match\(r"\^bytes \\d\+-\\d\+\/\\d\+\$", crange\)/, "and mirrors only byte arithmetic back");
+});
+
+test("an instant server failure names its reason, and a tap genuinely re-arms", () => {
+  // the user 2026-08-16 (fourth report, live on a broken tunnel): retries "failed immediately" with
+  // no reason — the image was fine, the LINK to its host was down, and the kernel's 502 body said so
+  // ("tunnel to <host> is not answering") while the UI showed a generic "unavailable". And after the
+  // budget spent, each tap bought exactly ONE feeble attempt — "a click makes it seemingly not try
+  // so hard". The error body's first line now rides the note and the chip verbatim, and a tap
+  // refills the auto-retry budget (a human gesture is new information; the kernel-push auto-heal
+  // path deliberately does NOT refill, or the bound would be infinite).
+  const pf = PREVIEW.slice(PREVIEW.indexOf("export function previewFull"));
+  assert.match(pf, /why = \(\(await r\.text\(\)\) \|\| ""\)\.split\("\\n"\)\[0\]\.slice\(0, 120\);/);
+  assert.match(pf, /throw new Error\(why \|\| "http " \+ r\.status\);/);
+  assert.match(pf, /: lastErr \|\| "connection dropped"\)/, "the retrying note carries the server's reason");
+  assert.match(pf, /: lastErr \? "⚠ " \+ lastErr/, "so does the give-up chip");
+  assert.match(pf, /if \(lastErr\.startsWith\("cut at "\)\) lastErr = "";/, "mid-stream cuts narrate via byte progress instead");
 });

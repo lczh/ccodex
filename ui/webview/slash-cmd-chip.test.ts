@@ -16,7 +16,7 @@ test("a leading slash command in a human bubble becomes a .slash-cmd-chip, args 
   assert.match(RENDER, /const chip = el\("span", "slash-cmd-chip"\); chip\.textContent = m\[1\];/);
   assert.match(RENDER, /const args = el\("span", "slash-cmd-args"\); args\.textContent = rest;/);
   // the non-command path still renders markdown as before (now also linkifies bare file:// URLs)
-  assert.match(RENDER, /\} else if \(ev\.md\) \{\s*\n\s*bubble\.innerHTML = md\(ev\.md\);\s*\n\s*linkifyFileUris\(bubble, imgPaths, ev\.spacePaths, ev\.pathLinks\);[^\n]*\n\s*\}/);
+  assert.match(RENDER, /\} else if \(ev\.md\) \{\s*\n\s*bubble\.innerHTML = md\(ev\.md\);\s*\n\s*linkifyFileUris\(bubble, imgPaths, ev\.spacePaths, ev\.pathLinks, ev\.pathPins\);[^\n]*\n\s*\}/);
 });
 
 test("the chip is a monospace, outlined keyword pill that reads on the blue bubble", () => {

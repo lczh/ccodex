@@ -21,6 +21,7 @@ function sample(): FeedViewState {
     logs: ["card-b:n4"],
     asks: ["card-a"],
     threads: [],   // the card-prune tests below assert on CARD state; the thread exemption has its own
+    cols: ["completed"], order: ["asks", "completed", "needsInput"],
   };
 }
 
@@ -61,7 +62,7 @@ test("an itemId containing a colon is not mis-attributed by the prune", () => {
   // its FIRST colon would read this card as "blocked" and prune state that is very much live.
   const s: FeedViewState = {
     v: 1, sec: { "blocked:sess-7": "bg" }, tree: ["blocked:sess-7:n1"], nodes: [], logs: [], asks: [],
-    threads: [],
+    threads: [], cols: [], order: [],
   };
   const pruned = pruneViewState(s, new Set(["blocked:sess-7"]));
   assert.deepEqual(pruned.sec, { "blocked:sess-7": "bg" }, "the colon-bearing id survives");
@@ -92,7 +93,7 @@ test("the cap is a backstop that trims cheap state first and section choices las
     nodes: Array.from({ length: 10 }, (_, i) => `a:n${i}`),
     logs: Array.from({ length: 10 }, (_, i) => `a:l${i}`),
     asks: ["a"],
-    threads: ["sid-1"],
+    threads: ["sid-1"], cols: [], order: [],
   };
   const capped = capViewState(big, 20);
   assert.equal(viewStateSize(capped), 20);
@@ -107,7 +108,7 @@ test("a folded thread SURVIVES the card prune — that is the whole point of it"
   // describes a SESSION: it has to hold while that session has no cards on the board, or clearing the last
   // card would silently re-expand the thread and the next card would arrive unfolded.
   const s: FeedViewState = {
-    v: 1, sec: { "card-a": "bg" }, tree: [], nodes: [], logs: [], asks: [], threads: ["sid-quiet"],
+    v: 1, sec: { "card-a": "bg" }, tree: [], nodes: [], logs: [], asks: [], threads: ["sid-quiet"], cols: [], order: [],
   };
   const pruned = pruneViewState(s, new Set<string>());   // no live cards at all
   assert.deepEqual(pruned.threads, ["sid-quiet"]);
@@ -175,4 +176,19 @@ test("blocked/quota-limited storage never breaks the feed", () => {
 test("the storage key is namespaced alongside the feed's existing settings key", () => {
   assert.equal(VIEW_STATE_KEY, "romp:feedview");
   assert.ok(VIEW_STATE_KEY.startsWith("romp:"));
+});
+
+test("stacked-column state persists, tolerates old blobs, and gates on the three known keys", () => {
+  // the user 2026-08-16: fold + drag order are LAYOUT state — prune-exempt like threads, and a
+  // pre-upgrade blob (no cols/order) reads as nothing-folded, default order — never as corrupt
+  const old = parseViewState(JSON.stringify({ v: 1, sec: {}, tree: [], nodes: [], logs: [], asks: [], threads: [] }));
+  assert.deepEqual(old.cols, []);
+  assert.deepEqual(old.order, []);
+  const junk = parseViewState(JSON.stringify({ v: 1, sec: {}, tree: [], nodes: [], logs: [], asks: [],
+                                               threads: [], cols: ["asks", "evil", 5], order: ["completed", "x"] }));
+  assert.deepEqual(junk.cols, ["asks"], "unknown keys are dropped at the parse gate");
+  assert.deepEqual(junk.order, ["completed"]);
+  const pruned = pruneViewState(sample(), new Set<string>([]));
+  assert.deepEqual(pruned.cols, ["completed"], "layout state survives a full card prune");
+  assert.deepEqual(pruned.order, ["asks", "completed", "needsInput"]);
 });

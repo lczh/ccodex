@@ -4908,8 +4908,8 @@ class ViewBuilder(unittest.TestCase):
             "placements": {}, "status": {g: "working"}}))
         card = next(a for a in km.build_feed(NOW)["asks"] if a["itemId"] == g)
         self.assertEqual(card["origin"], {"peer": "sendersess", "peerHost": "", "peerSid": sender,
-                                          "color": {"bg": "#ff8800", "fg": "#ffffff"}},
-                         "origin.peer (a sid) resolves to the sender's name + color")
+                                          "color": {"bg": "#ff8800", "fg": "#ffffff"}, "live": True},
+                         "origin.peer (a sid) resolves to the sender's name + color; the link is live")
 
     def test_feed_handoff_origin_falls_back_to_short_sid_when_unnamed(self):
         """If the sender isn't in the names registry, fall back to a short sid (never crash / show blank)."""
@@ -4962,9 +4962,12 @@ class ViewBuilder(unittest.TestCase):
         self.assertEqual(card["origin"]["peer"], "renamedsess")
         self.assertEqual(card["origin"]["peerHost"], "")
 
-    def test_feed_handoff_origin_hidden_when_fully_absorbed(self):
-        """Once the sender's linked goal is done/cleared/gone (or there was no link), the handoff is fully
-        absorbed → origin=None, so the badge hides and the card reads as the recipient's native goal."""
+    def test_feed_handoff_origin_persists_absorbed_with_live_false(self):
+        """PROVENANCE IS HISTORY (the user 2026-08-16): the "↪ from <peer>" badge used to vanish the
+        moment the sender's linked goal closed — which run_propagate makes the exact moment THIS card
+        completes — so a completed card never showed where its work came from, and a propagated clear
+        read as one card mysteriously taking another. The badge now stays for the card's life with
+        live=False once absorbed; only the AFFORDANCE changes (dimmed, historical)."""
         sender = "11112222-3333-4444-5555-666677778888"
         (jd.NAMES / sender).write_text("sendersess\t/elsewhere\t#ff8800\n")
         self._sender_goal(sender, sender + ":g1", nodeComplete=True)   # sender finished its piece
@@ -4978,13 +4981,60 @@ class ViewBuilder(unittest.TestCase):
                 "placements": {}, "status": {g: "working"}}))
         write_origin(sender + ":g1", "m-y.2")
         card = next(a for a in km.build_feed(NOW)["asks"] if a["itemId"] == g)
-        self.assertIsNone(card["origin"], "sender's linked goal is done → fully absorbed → no badge")
+        self.assertEqual(card["origin"]["peer"], "sendersess", "the badge survives absorption")
+        self.assertFalse(card["origin"]["live"], "sender's linked goal is done → absorbed → live False")
         write_origin(None, "m-y.3")                              # no link at all
         card = next(a for a in km.build_feed(NOW)["asks"] if a["itemId"] == g)
-        self.assertIsNone(card["origin"], "no link (goalId null) → absorbed → no badge")
+        self.assertFalse(card["origin"]["live"], "no link (goalId null) → absorbed")
         write_origin(sender + ":gGONE", "m-y.4")                 # link to a goal that no longer exists
         card = next(a for a in km.build_feed(NOW)["asks"] if a["itemId"] == g)
-        self.assertIsNone(card["origin"], "link to a missing goal → absorbed → no badge")
+        self.assertFalse(card["origin"]["live"], "link to a missing goal → absorbed")
+
+    def test_feed_tree_ships_the_handoff_kind_with_the_recipients_identity(self):
+        """The sender's "↪ delegated to <peer>" tracking node ships kind "handoff" + the RECIPIENT's
+        identity (from the courier-recorded handoff.peer — exact, never inferred), so the feed's
+        long-dormant delegations section finally populates and the checklist stops showing a bare
+        text row with no visible cross-card link (the user 2026-08-16)."""
+        recip = "99998888-7777-6666-5555-444433332222"
+        (jd.NAMES / recip).write_text("recipsess\t/elsewhere\t#22cc88\n")
+        top, leaf, own = "%s:g20" % SID, "%s:g21" % SID, "%s:g22" % SID
+        # the top keeps ONE ordinary leaf of its own — a pure-delegation top (every leaf a handoff)
+        # is suppressed from the feed entirely, by design
+        (jd.GOALDIR / (SID + ".json")).write_text(json.dumps({
+            "rompUuid": SID, "seq": 22, "lastNode": None,
+            "nodes": {top: {"id": top, "text": "Broader goal", "parentId": None, "nodeComplete": False,
+                            "blocked": False, "cleared": False, "trail": [], "t": NOW - 80},
+                      leaf: {"id": leaf, "text": "↪ delegated to recipsess: run the sweep", "parentId": top,
+                             "nodeComplete": False, "blocked": False, "cleared": False, "trail": [],
+                             "t": NOW - 70, "handoff": {"peer": recip, "msgId": "m-h.1"}},
+                      own: {"id": own, "text": "Own remaining step", "parentId": top,
+                            "nodeComplete": False, "blocked": False, "cleared": False, "trail": [],
+                            "t": NOW - 65}},
+            "placements": {}, "status": {top: "working"}}))
+        card = next(a for a in km.build_feed(NOW)["asks"] if a["itemId"] == top)
+        row = next(n for n in card["tree"] if n["id"] == leaf)
+        self.assertEqual(row["kind"], "handoff")
+        self.assertEqual(row["who"], "recipsess", "the row wears the RECIPIENT's identity")
+        self.assertEqual(row["whoSid"], recip)
+        plain = next(n for n in card["tree"] if n["id"] == top)
+        self.assertEqual(plain["kind"], "ask", "ordinary nodes are untouched")
+
+    def test_consolidator_never_absorbs_an_origin_top(self):
+        """Umbrella absorption makes a top a non-top, and build_feed reads origin from the TOP only —
+        so consolidating an origin-carrying completed card would erase the "↪ from <peer>" provenance
+        from the board entirely (the user 2026-08-16). Excluded from the candidate forest."""
+        sender = "11112222-3333-4444-5555-666677778888"
+        g1, g2 = "%s:g30" % SID, "%s:g31" % SID
+        store = {"rompUuid": SID, "seq": 31, "lastNode": None,
+                 "nodes": {g1: {"id": g1, "text": "Native done goal", "parentId": None, "nodeComplete": True,
+                                "blocked": False, "cleared": False, "trail": [], "t": NOW - 60},
+                           g2: {"id": g2, "text": "Delegated done goal", "parentId": None, "nodeComplete": True,
+                                "blocked": False, "cleared": False, "trail": [], "t": NOW - 50,
+                                "origin": {"peer": sender, "goalId": sender + ":g1", "msgId": "m-c.1"}}},
+                 "placements": {}, "status": {g1: "completed", g2: "completed"}}
+        cands = [nd["id"] for nd in jd._consolidate_tops(store)]
+        self.assertIn(g1, cands)
+        self.assertNotIn(g2, cands, "provenance stays on the board — its card keeps its own face")
 
     def test_feed_clear_and_undo(self):
         g1 = "%s:g1" % SID

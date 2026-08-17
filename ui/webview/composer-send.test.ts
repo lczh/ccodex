@@ -94,7 +94,7 @@ test("a staged chip clips IN BOUNDS with an ellipsis and expands on click (the u
   assert.match(STYLES, /\.staged-chip\.open \.staged-row \.composer-chip-label \{ white-space: pre-wrap; overflow: visible; \}/);
   // the affordance is visibly CHROME, not message text: dim, parenthesized, at the line's end
   assert.match(STYLES, /\.staged-expand \{ flex: 0 0 auto; color: var\(--dim\); font-size: 0\.85em; \}/);
-  assert.match(RENDER, /hint\.textContent = open \? "\(collapse\)" : "\(expand\)";/);
+  assert.match(RENDER, /hint\.textContent = open \? "\(collapse\)" : "\(click to expand\)";/);   // the tail names the gesture (the user 2026-08-16)
   // expansion survives the strip re-render (keyed set), and the discard ✕ does not toggle the fold
   assert.match(RENDER, /const stagedOpen = new Set<string>\(\);/);
   assert.match(RENDER, /x\.addEventListener\("click", \(ev\) => \{ ev\.stopPropagation\(\);/);

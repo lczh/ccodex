@@ -1,6 +1,8 @@
 // The staged stack (the user 2026-08-15): every rule executed.
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { StagedStack } from "./staged-messages";
 
 test("stage order is release order, and a flush is one-shot", () => {
@@ -42,4 +44,20 @@ test("the persistence round-trip keeps text, context and order — and drops jun
   r.restore({ b: [{ text: "" }, { nope: 1 }, "junk"], c: "junk" });   // a hand-edited/old store
   assert.equal(r.count("b"), 0, "junk hydrates to nothing, never a crash");
   assert.equal(r.count("c"), 0);
+});
+
+test("a staged line stays inside the pane: shrinkable strips, ellipsis, click-to-expand tail", () => {
+  // the user 2026-08-16 (screenshot): one long staged message refused to shrink — the composer's
+  // strips are wrapped flex ITEMS, and without flex-basis 100% + min-width 0 their min-content
+  // width is the nowrap label's full intrinsic width, so the line blew past the pane and dragged a
+  // horizontal scroll with it. The pane must NEVER scroll sideways.
+  const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "styles.css"), "utf8");
+  const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
+  assert.match(CSS, /#composer-files, #composer-staged, #composer-chips \{ flex: 1 1 100%; min-width: 0; max-width: 100%; \}/);
+  assert.match(CSS, /body \{ display: flex; flex-direction: column; overflow-x: hidden; \}/,
+    "the hard guarantee: a wide child is a layout bug, never a sideways scroll");
+  assert.match(CSS, /\.composer-chip-label \{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap;/,
+    "the one-line ellipsis that the shrinkable strip finally lets engage");
+  assert.match(RENDER, /hint\.textContent = open \? "\(collapse\)" : "\(click to expand\)";/,
+    "the tail names the gesture");
 });

@@ -1272,6 +1272,9 @@ class Handler(BaseHTTPRequestHandler):
                 if PEERS.get(phost, {}).get("up"):
                     return self._send({"ok": True, "id": mid,
                                        "note": "relaying to '%s' on %s" % (hit.get("name") or to, phost)})
+                _kernel_post("/redial", {"host": phost})   # parking IS demand: ask the kernel to
+                #                                             re-dial the host's tunnel now instead of
+                #                                             waiting out its backoff (the user 2026-08-16)
                 return self._send({"ok": True, "id": mid, "parked": phost,
                                    "note": "parked for %s (unreachable) — delivers on reconnect, "
                                            "or bounces back to you" % phost})

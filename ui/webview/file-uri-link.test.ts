@@ -12,7 +12,7 @@ const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview"
 const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "styles.css"), "utf8");
 
 test("a bare file:// URL becomes a clickable .file-uri-link that opens the file in the host app", () => {
-  assert.match(RENDER, /function linkifyFileUris\(root: HTMLElement, skipThumbs\?: string\[\], spacePaths\?: string\[\],\s*\n\s*pathLinks\?: Record<string, string>\): void/);
+  assert.match(RENDER, /function linkifyFileUris\(root: HTMLElement, skipThumbs\?: string\[\], spacePaths\?: string\[\],\s*\n\s*pathLinks\?: Record<string, string>, pathPins\?: Record<string, string>\): void/);
   assert.match(RENDER, /el\("span", "file-uri-link"\)/);
   // clicking is ROUTED by openPath, never a blocked window.open(file://) — a file:// URI is absolute,
   // so it takes the shared openPathLink's no-session-id branch
@@ -24,9 +24,9 @@ test("a bare file:// URL becomes a clickable .file-uri-link that opens the file 
 });
 
 test("linkify runs on chat message bodies (assistant reply + user bubble + nudge full text) and nowhere else — never tool summaries", () => {
-  assert.match(RENDER, /linkifyFileUris\(body, undefined, ev\.spacePaths, ev\.pathLinks\)/);   // the assistant reply
-  assert.match(RENDER, /linkifyFileUris\(bubble, imgPaths, ev\.spacePaths, ev\.pathLinks\)/); // your own bubble (in-bubble images don't re-thumb)
-  assert.match(RENDER, /linkifyFileUris\(full, imgPaths, ev\.spacePaths, ev\.pathLinks\)/);   // a compact nudge's expanded full text (2026-07-17)
+  assert.match(RENDER, /linkifyFileUris\(body, undefined, ev\.spacePaths, ev\.pathLinks, ev\.pathPins\)/);   // the assistant reply
+  assert.match(RENDER, /linkifyFileUris\(bubble, imgPaths, ev\.spacePaths, ev\.pathLinks, ev\.pathPins\)/); // your own bubble (in-bubble images don't re-thumb)
+  assert.match(RENDER, /linkifyFileUris\(full, imgPaths, ev\.spacePaths, ev\.pathLinks, ev\.pathPins\)/);   // a compact nudge's expanded full text (2026-07-17)
   // exactly the definition + those three applications — so tool-use reports/summaries stay untouched
   const uses = RENDER.match(/linkifyFileUris\(/g) || [];
   assert.equal(uses.length, 4, "linkifyFileUris is defined once and applied to exactly the three chat bodies");

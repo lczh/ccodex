@@ -8534,6 +8534,38 @@ def _tunnel_proc_alive(r):
     return bool(p) and p.poll() is None
 
 
+def _demand_redial(host, kind):
+    """A DATA PATH just hit this host's tunnel dead — a preview relay, a WS splice, a forwarded op,
+    a postal delivery. That demand is an EVENT (the user 2026-08-16, on flaky wifi: the backoff
+    ladder reaches 300-900s while they sit there retrying — anything they do that needs the tunnel
+    should re-send the connect signal, the way the network panel's own Try-now does): clear the
+    ladder and wake the supervisor to dial NOW. Evidence-proportional, mirroring attach_remote:
+      kind "refused"  — the local -L listener refused/reset: the ssh is dead or dying; put a still-
+                        breathing zombie down so the fresh dial owns the ports.
+      kind "timeout"  — an accepted connection starved: the half-dead shape, OR just a slow remote
+                        kernel. Counts as one silent poll (the same evidence class _poll_remote_sids
+                        files), so the woken supervisor's immediate pass decides — one more silent
+                        poll tears down and re-dials; an answered one clears the miss.
+    Self-limiting: a dial already in flight ("starting"/"authorizing" with a live proc) is left to
+    finish — each user action buys at most one fresh dial, never a storm."""
+    with _remotes_lock:
+        r = _remotes.get(host)
+        if not r or r.get("checkin_peer"):
+            return
+        alive = _tunnel_proc_alive(r)
+        if alive and r.get("status") in ("starting", "authorizing"):
+            return                                   # a dial is mid-flight — the demand is already served
+        r["fails"], r["next_try"] = 0, 0
+        if alive and kind == "refused":
+            try:
+                r["proc"].terminate()
+            except OSError:
+                pass
+        elif alive and kind == "timeout":
+            r["misses"] = max(r.get("misses", 0), STALE_MISSES - 1)
+    _tunnel_wake.set()
+
+
 def _tunnel_status(proc_alive, port_up, remote_answered):
     """The tunnel row's TRUE status. `port_up` (the local -L listener accepting) said 'up' on its own
     for a dead far end — ssh accepts the local connect, then resets when the remote side refuses — so a
@@ -9161,7 +9193,9 @@ def _remote_forward(r, path, body):
         data = resp.read()
         c.close()
         return json.loads(data.decode("utf-8") or "{}") if resp.status == 200 else None
-    except Exception:
+    except Exception as e:
+        # a forwarded op hitting a dead tunnel is USER DEMAND — re-send the connect signal
+        _demand_redial(r.get("host") or "", "refused" if isinstance(e, ConnectionRefusedError) else "timeout")
         return None
 
 
@@ -9266,7 +9300,10 @@ def _sha_base(s):
     return (str(s or "").split("-", 1)[0]) or None
 
 
-_HEAD_CACHE = {"ts": 0.0, "full": None, "short": None}   # ~2s TTL: HEAD is read per-remote on every /tunnels poll
+_HEAD_CACHE = {"ts": 0.0, "full": None, "short": None}   # HEAD is read per-remote on every /tunnels poll; the
+#   TTL must OUTLAST the dashboard's 4s poll or every poll re-forks two `git rev-parse` per open page
+#   (one of the fork multipliers behind the Mac 66% CPU burn, 2026-08-16). HEAD only moves on a converge
+#   (which restarts the kernel anyway) or a manual checkout, so 15s costs at most one stale-badge beat.
 
 
 def _local_head(short=False):
@@ -9277,7 +9314,7 @@ def _local_head(short=False):
     banner never cleared — the user 2026-07-04.) Cached ~2s since it's read on every /tunnels poll but HEAD
     rarely moves."""
     now = time.time()
-    if now - _HEAD_CACHE["ts"] > 2:
+    if now - _HEAD_CACHE["ts"] > 15:
         full = short_s = None
         try:
             r = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -14018,19 +14055,54 @@ def _tree_of(d):
 
 
 _branch_cache = {}   # cwd -> (branch, head_mtime) — git branch derived straight from the FOLDER
+_head_path_cache = {}   # cwd -> the resolved HEAD file path (worktrees indirect through a .git FILE)
+
+
+def _git_head_file(cwd):
+    """The path of the HEAD file that moves when this directory's branch changes. A plain repo keeps it
+    at .git/HEAD; a WORKTREE's .git is a one-line FILE ('gitdir: <private-dir>') and its HEAD lives in
+    that private dir. Resolved once per cwd (the pointer never moves for a live worktree) — treating the
+    worktree shape as uncacheable made _git_branch fork 2-3 `git rev-parse` per session per rebuild
+    forever, ~10-40 forks/s on a busy kernel whose convention is one worktree per session (the Mac 66%
+    CPU burn, 2026-08-16, sampled as __fork at 68/2s). '' when there is no resolvable HEAD."""
+    hp = _head_path_cache.get(cwd)
+    if hp is not None:
+        return hp
+    hp = ""
+    dotgit = os.path.join(cwd, ".git")
+    try:
+        if os.path.isdir(dotgit):
+            hp = os.path.join(dotgit, "HEAD")
+        elif os.path.isfile(dotgit):
+            with open(dotgit) as f:
+                line = f.readline().strip()
+            if line.startswith("gitdir:"):
+                gd = line[len("gitdir:"):].strip()
+                if not os.path.isabs(gd):
+                    gd = os.path.normpath(os.path.join(cwd, gd))
+                hp = os.path.join(gd, "HEAD")
+    except OSError:
+        hp = ""
+    if len(_head_path_cache) > 512:                  # bounded, like _tree_cache
+        _head_path_cache.clear()
+    _head_path_cache[cwd] = hp
+    return hp
 
 
 def _git_branch(cwd):
     """The git branch for a directory, derived DIRECTLY from the folder — so it shows the instant a session
     is opened, before any turn writes gitBranch into the transcript (the user 2026-06-24: branch should be a
-    property of the dir, known in advance). Cached per cwd, refreshed when .git/HEAD changes. '' when not a
-    repo / detached / unavailable. Applies to BOTH backends (a never-run tmux session shows it now too)."""
+    property of the dir, known in advance). Cached per cwd, refreshed when the resolved HEAD file changes
+    (worktrees included — see _git_head_file). '' when not a repo / detached / unavailable. Applies to BOTH
+    backends (a never-run tmux session shows it now too)."""
     if not cwd:
         return ""
     cwd = os.path.expanduser(cwd)
     mt = None
     try:
-        mt = os.path.getmtime(os.path.join(cwd, ".git", "HEAD"))   # plain repo; worktrees use a .git FILE → mt stays None (uncached)
+        hp = _git_head_file(cwd)
+        if hp:
+            mt = os.path.getmtime(hp)
     except OSError:
         pass
     hit = _branch_cache.get(cwd)
@@ -14783,6 +14855,9 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None):
                             pl = _path_links(prompt, sid, a.get("uuid"), _pl_memo)
                             if pl is not None:
                                 ev["pathLinks"] = pl    # path-shaped tokens, filesystem-verified/fixed → the client's link gate
+                            pp = _path_pins(sid, a.get("uuid"))
+                            if pp:
+                                ev["pathPins"] = pp     # mention-time snapshots: this message's embeds keep these bytes
                             if reminders:                # join each task-notification to its command + output tail
                                 to = _task_outputs_for(reminders, sess["path"])
                                 if to:
@@ -14872,6 +14947,9 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None):
                         pl = _path_links(txt, sid, a.get("uuid"), _pl_memo)
                         if pl is not None:
                             ev["pathLinks"] = pl    # path-shaped tokens, filesystem-verified/fixed → the client's link gate
+                        pp = _path_pins(sid, a.get("uuid"))
+                        if pp:
+                            ev["pathPins"] = pp     # mention-time snapshots: this message's embeds keep these bytes
                         if _interrupt_settle(events, txt, a):   # the null settle-reply closing an interrupted
                             ev["interruptSettle"] = True        # turn → rendered as seam marker, not a bubble
                         events.append(ev)
@@ -16747,8 +16825,20 @@ def build_feed(now, tmux=None):
             # The node's deep-link target SEGMENT: its NEWEST trail seg — the resolve turn for
             # done/blocked nodes, the latest activity for open ones (where it stands, not where born).
             _pa, _wa = _node_anchor_uuids(nd, seg_trig, seg_uuid)
-            out.append({"id": nid, "kind": "ask", "text": nd["text"], "who": name, "whoSid": fsid,
-                        "whoColor": color, "whoWorking": who_working, "status": st, "derived": derived,
+            # A HANDOFF tracking node ("↪ delegated to <peer>") finally ships as its designed kind: the
+            # feed's delegations section (fask-delegations, built to the 2026-06-10 handoff spec) keys on
+            # kind "handoff" and had sat dormant because flatten hardcoded "ask" — the sender's card
+            # showed a bare text row with no recipient identity and no visible cross-card LINK (the user
+            # 2026-08-16, who watched a clear take the linked card with it and had no way to see why).
+            # who/whoSid/whoColor become the RECIPIENT's identity for these rows — exact, from the
+            # courier-recorded handoff.peer, never inferred.
+            _ho = nd.get("handoff") if isinstance(nd.get("handoff"), dict) else None
+            _ho_sid = str(_ho.get("peer") or "") if _ho else ""
+            out.append({"id": nid, "kind": "handoff" if _ho_sid else "ask", "text": nd["text"],
+                        "who": (_name_of(_ho_sid) or _ho_sid[:8]) if _ho_sid else name,
+                        "whoSid": _ho_sid or fsid,
+                        "whoColor": _name_color(_ho_sid) if _ho_sid else color,
+                        "whoWorking": who_working, "status": st, "derived": derived,
                         # user-cleared sub (nodeOverride op:clear) → renders struck-through + faded with a
                         # "cleared" chip; `status` above stays honest (box = done, the user 2026-07-26)
                         "cleared": bool(nd.get("cleared")),
@@ -16929,21 +17019,27 @@ def build_feed(now, tmux=None):
             o = nodes[nid].get("origin")             # courier delegation provenance: planted by a peer
             origin = None
             if isinstance(o, dict) and o.get("peer"):
-                # Show the "↪ from <peer>" badge only while the handoff is LIVE — the sender still has an
-                # OPEN linked goal. Once the sender's piece is done/cleared/gone (or there was no link),
-                # the work is fully absorbed → render as the recipient's native goal. (the user 2026-06-16.)
+                # The "↪ from <peer>" badge is PROVENANCE and stays for the card's life (the user
+                # 2026-08-16: the badge used to vanish at the exact moment the recipient finished —
+                # run_propagate completes the sender's tracking node instantly — so a COMPLETED card
+                # never showed where its work came from, and a propagated clear read as one card
+                # mysteriously taking another with it). `live` says whether the sender's linked goal
+                # is still OPEN: live → the affordance of an active handoff; absorbed → the same badge,
+                # dimmed, purely historical. This is the completed-column MERGE, heuristic-free: the
+                # one surviving card wears both identities, keyed on the courier's recorded link.
                 psid, gid = o["peer"], o.get("goalId")
                 sgoal = jd.load_goals(psid).get("nodes", {}).get(gid) if gid else None
-                if sgoal and not sgoal.get("nodeComplete") and not sgoal.get("cleared") and gid not in cleared:
-                    # Name resolution: the live names registry first (a local sender may have been
-                    # renamed), then the courier's plant-time snapshot (the only source for a
-                    # FEDERATED sender, whose sid this kernel can't resolve), then the sid stub.
-                    # peerHost renders as the same quiet "host:" prefix remote sessions wear on the
-                    # timeline (host-prefix.ts) — a local resolve means a local sender, no host.
-                    pname = _name_of(psid)
-                    origin = {"peer": pname or o.get("peerName") or psid[:8],
-                              "peerHost": ("" if pname else o.get("peerHost") or ""),
-                              "peerSid": psid, "color": _name_color(psid)}
+                live = bool(sgoal and not sgoal.get("nodeComplete") and not sgoal.get("cleared")
+                            and gid not in cleared)
+                # Name resolution: the live names registry first (a local sender may have been
+                # renamed), then the courier's plant-time snapshot (the only source for a
+                # FEDERATED sender, whose sid this kernel can't resolve), then the sid stub.
+                # peerHost renders as the same quiet "host:" prefix remote sessions wear on the
+                # timeline (host-prefix.ts) — a local resolve means a local sender, no host.
+                pname = _name_of(psid)
+                origin = {"peer": pname or o.get("peerName") or psid[:8],
+                          "peerHost": ("" if pname else o.get("peerHost") or ""),
+                          "peerSid": psid, "color": _name_color(psid), "live": live}
             await_why = (sess_awaiting_why or _stamp_why or _deleg_why or _owned_why) if col == "awaiting" else None   # the ⏳ awaiting badge's "why": live snapshot, then the judge's durable stamp, then the delegation graph, then the blocked-yield's owned dispatch (None for the postal-only case → the waitingOn chip names the peer)
             await_kind = None                        # the winning why's KIND rides beside it, mirroring the
             if col == "awaiting":                    # or-chain exactly (a kindless winner stays kindless)
@@ -19868,10 +19964,30 @@ def _space_paths(md, sid, uuid):
                 continue
             if tok not in out and os.path.isfile(_resolve_open_path(tok, sid)):
                 out.append(tok)
+        pins = {}
+        for tok in out:                      # the verify moment doubles as the mention-time snapshot
+            pin = _pin_for(tok, sid)         # (see _pin_mention) — latched with the span's verdict
+            if pin:
+                pins[tok] = pin
         if len(_SPACE_PATH_CACHE) > 50000:   # runaway backstop; one entry per rendered message
             _SPACE_PATH_CACHE.clear()
-        _SPACE_PATH_CACHE[key] = hit = tuple(out)
-    return list(hit) or None
+        _SPACE_PATH_CACHE[key] = hit = (tuple(out), pins)
+    spans = hit[0] if isinstance(hit, tuple) and len(hit) == 2 and isinstance(hit[0], tuple) else hit
+    return list(spans) or None
+
+
+def _path_pins(sid, uuid):
+    """The mention-time pins latched for this message by _path_links / _space_paths — {open target:
+    pin id}, shipped as pathPins on the chat event (a SIBLING map: pathLinks values must stay strings,
+    or an older client's string-gate would unlink every token). Empty when nothing pinned."""
+    pins = {}
+    hit = _SPACE_PATH_CACHE.get((sid, uuid))
+    if isinstance(hit, tuple) and len(hit) == 2 and isinstance(hit[1], dict):
+        pins.update(hit[1])
+    hit = _PATH_LINK_CACHE.get((sid, uuid))
+    if hit is not None and len(hit) == 3:
+        pins.update(hit[2])
+    return pins
 
 
 # ── verified path links ────────────────────────────────────────────────────────────────────────────
@@ -19898,10 +20014,39 @@ _REPO_LIST_MAX = 200_000              # a runaway listing skips tiers 2/3 rather
 _PATH_LINK_CACHE = {}                 # (sid, uuid) -> (links dict, misses tuple) — see _path_links
 
 
+_repo_index_cache = {}   # cwd -> (key, index) — key = (git-index mtime, toplevel-dir mtime), see below
+
+
 def _repo_file_index(cwd):
     """basename -> [repo-relative paths] for every tracked or untracked-unignored file under `cwd`,
     or None when there is no list to be had (not a git repo, git absent/failing, or a listing past
-    _REPO_LIST_MAX). None means tiers 2/3 stand down for this build; tier 1 needs no list."""
+    _REPO_LIST_MAX). None means tiers 2/3 stand down for this build; tier 1 needs no list.
+
+    Cached per cwd on the events that change the answer: the git INDEX file's mtime (every
+    add/rm/commit/checkout touches it), the repo top dir's mtime (a new untracked file at the top,
+    the common drop shape), and the mtimes of the top's immediate SUBDIRS (a file created in one —
+    the agent-writes-the-file-it-just-mentioned flow — moves its parent's mtime; one scandir of
+    stats, no fork). Without this, one unresolved path-shaped token in a transcript — the
+    near-universal case — re-forked `git ls-files` on EVERY chat rebuild of that session, one of the
+    fork multipliers behind the Mac 66% CPU burn (2026-08-16). A creation the key can't see (depth
+    two or deeper, untracked) only delays that file's tier-2/3 path LINK until the next observable
+    touch — a rendering nicety, never data; a click's own resolution is unaffected."""
+    tree = _tree_of(cwd)[0] or cwd                   # _tree_of returns (toplevel, branch)
+    key = None
+    try:
+        gi = _git_head_file(tree)                    # <gitdir>/HEAD — the index sits beside it
+        subs = []
+        with os.scandir(tree) as it:
+            for e in it:
+                if e.name != ".git" and e.is_dir(follow_symlinks=False):
+                    subs.append((e.name, e.stat().st_mtime))
+        key = ((os.path.getmtime(os.path.join(os.path.dirname(gi), "index")) if gi else None),
+               os.path.getmtime(tree), tuple(sorted(subs)))
+    except OSError:
+        key = None
+    hit = _repo_index_cache.get(cwd)
+    if hit is not None and key is not None and hit[0] == key:
+        return hit[1]
     try:
         out = subprocess.run(["git", "ls-files", "-co", "--exclude-standard"],
                              cwd=cwd, capture_output=True, text=True, timeout=10)
@@ -19915,6 +20060,10 @@ def _repo_file_index(cwd):
     idx = {}
     for p in names:
         idx.setdefault(p.rsplit("/", 1)[-1], []).append(p)
+    if key is not None:
+        if len(_repo_index_cache) > 64:              # bounded; an index is sizable
+            _repo_index_cache.clear()
+        _repo_index_cache[cwd] = (key, idx)
     return idx
 
 
@@ -19960,6 +20109,77 @@ def _path_tokens(md):
     return toks
 
 
+_MENTION_PINS = None                                   # resolved lazily: jd.STATE / "mention-pins"
+_PIN_STORE_MAX_BYTES = 500 * 1024 * 1024               # bounded: evict oldest-mtime past this
+_PIN_ID_RE = re.compile(r"^[0-9a-f]{64}\.[a-z0-9]{1,8}$")   # sha256 + the original extension
+
+
+def _pin_dir():
+    global _MENTION_PINS
+    if _MENTION_PINS is None:
+        _MENTION_PINS = jd.STATE / "mention-pins"
+        try:
+            _MENTION_PINS.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    return _MENTION_PINS
+
+
+def _pin_mention(fp):
+    """Snapshot a mentioned IMAGE's bytes as they are RIGHT NOW, content-addressed — the pin an old
+    chat message's embed keeps forever (the user 2026-08-16: an agent re-generating a plot under the
+    same filename rewrote the picture inside every older message that had embedded it; history must
+    not change, and the agent's freedom to name files must not shrink). Runs at the pathLinks resolve
+    latch — the first build after the mention, the closest observable moment to the mention itself.
+    Content-addressing dedups unchanged files for free; a changed file simply stores a new blob. The
+    store is bounded: past _PIN_STORE_MAX_BYTES the oldest-mtime blobs go, and a message whose pin was
+    evicted falls back to the live file — exactly today's behavior, a nicety lost, never data.
+    Returns the pin id (sha256 + original extension) or None (not an image, oversize, unreadable)."""
+    ext = os.path.splitext(fp)[1].lower()
+    if ext not in _IMG_MIME:
+        return None
+    try:
+        if os.path.getsize(fp) > _PREVIEW_MAX_BYTES:   # /file would 413 it anyway — nothing to pin
+            return None
+        with open(fp, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    pid = hashlib.sha256(raw).hexdigest() + ext
+    d = _pin_dir()
+    dst = d / pid
+    try:
+        if not dst.exists():
+            tmp = d / (pid + ".tmp.%d" % os.getpid())
+            tmp.write_bytes(raw)
+            os.replace(tmp, dst)
+            # bound the store on the write event, oldest first (mtime; serves don't touch it — a pin
+            # for a busy old chat can age out, and the fallback is the live file)
+            try:
+                rows = [(e.stat().st_mtime, e.stat().st_size, e.path)
+                        for e in os.scandir(d) if e.is_file() and not e.name.endswith(".tmp")]
+                total = sum(sz for _, sz, _ in rows)
+                for _, sz, path_ in sorted(rows):
+                    if total <= _PIN_STORE_MAX_BYTES:
+                        break
+                    os.unlink(path_)
+                    total -= sz
+            except OSError:
+                pass
+    except OSError:
+        return None
+    return pid
+
+
+def _pin_for(target, sid):
+    """The pin for a freshly-RESOLVED open target (token or repo-relative path) — absolute-resolved the
+    same way a click is, so the snapshot reads the same file the user would open."""
+    ap = _resolve_open_path(target, sid)
+    if os.path.isabs(ap) and os.path.isfile(ap):
+        return _pin_mention(ap)
+    return None
+
+
 def _path_links(md, sid, uuid, memo):
     """Path-shaped tokens in `md` the filesystem VERIFIES → {token: open target}, shipped as pathLinks
     on the chat event. Returns None when the message has no candidate tokens at all (the common message
@@ -19976,8 +20196,9 @@ def _path_links(md, sid, uuid, memo):
     hit = _PATH_LINK_CACHE.get(key)
     if hit is None:
         hit = ({}, tuple(t for t in _path_tokens(md)
-                         if not t.lower().startswith("file://")))   # file:// stays the client's verbatim link, ungated
-    links, misses = hit
+                         if not t.lower().startswith("file://")),   # file:// stays the client's verbatim link, ungated
+               {})
+    links, misses, pins = hit if len(hit) == 3 else (hit[0], hit[1], {})
     if misses:
         still = []
         for tok in misses:
@@ -19986,10 +20207,13 @@ def _path_links(md, sid, uuid, memo):
                 still.append(tok)
             else:
                 links[tok] = r
+                pin = _pin_for(r, sid)                    # the resolve moment IS the mention-time snapshot
+                if pin:                                   # (see _pin_mention) — latched with the link, so an
+                    pins[r] = pin                         # overwrite can never rewrite this message's embed
         misses = tuple(still)
     if len(_PATH_LINK_CACHE) > 50000:                     # runaway backstop; one entry per rendered message
         _PATH_LINK_CACHE.clear()
-    _PATH_LINK_CACHE[key] = (links, misses)
+    _PATH_LINK_CACHE[key] = (links, misses, pins)
     return dict(links) if (links or misses) else None
 
 
@@ -24419,6 +24643,15 @@ class Handler(BaseHTTPRequestHandler):
         fp = _resolve_open_path((q.get("path") or [""])[0], (q.get("sid") or [None])[0])
         if (q.get("download") or [""])[0] == "1":
             return self._file_download(fp, head=head)
+        # A mention-time PIN (see _pin_mention): serve the snapshot this message's embed latched, so a
+        # later overwrite of the same filename can never rewrite an old message's picture. The id is
+        # strictly shape-validated and joined only onto the pin dir (no traversal); a pin whose blob
+        # was evicted falls back to the LIVE file below — a nicety lost, never an error.
+        pin = (q.get("pin") or [""])[0]
+        if pin and _PIN_ID_RE.match(pin):
+            pf = _pin_dir() / pin
+            if pf.is_file():
+                fp = str(pf)
         mime = _PREVIEW_MIME.get(os.path.splitext(fp)[1].lower())
         text = not mime and _is_text_path(fp)
         if text:
@@ -25362,6 +25595,20 @@ class Handler(BaseHTTPRequestHandler):
                 if pub is None:
                     return self._send(404, json.dumps({"ok": False, "error": "no attached host '%s' — attach it first" % host}), "application/json")
                 return self._send(200, json.dumps({"ok": True, "tunnel": pub}), "application/json")
+            if u.path == "/redial":
+                # A CONSUMER just needed a host and found it unreachable (the postal bus parking mail,
+                # the composer refusing a send to a downed host): user demand, so re-send the connect
+                # signal now instead of waiting out the backoff ladder (the user 2026-08-16, on flaky
+                # wifi). Best-effort by design — an unknown host is a quiet no-op, never an error the
+                # caller has to handle on top of the failure it is already reporting.
+                try:
+                    body = json.loads(raw_body or b"{}")
+                except Exception:
+                    body = {}
+                h = str((body or {}).get("host") or "")
+                if h:
+                    _demand_redial(h, "timeout")
+                return self._send(200, json.dumps({"ok": True}), "application/json")
             if u.path == "/tunnels/autoupdate":
                 # The popover's "Automatically update" checkbox. Body: {"on": bool}. Fleet-wide, not per-host
                 # and not per-tab: the push must fire once per advance from the kernel's own supervisor.
@@ -26002,6 +26249,9 @@ class Handler(BaseHTTPRequestHandler):
             # requested path: that's what the client's element cache is waiting on.
             _reply(client, {"type": "imgData", "path": p,
                             "url": _img_data_url(_resolve_open_path(p, msg.get("id")))})
+        elif msg and msg.get("type") == "redial" and msg.get("host"):
+            # the composer just refused a send to a downed host — user demand, dial it now (2026-08-16)
+            _demand_redial(str(msg["host"]), "timeout")
         elif msg and msg.get("type") == "dropFile" and msg.get("name") and msg.get("b64"):
             fp = _save_dropped_file(str(msg["name"]), str(msg["b64"]))   # bytes → saved file → insert its path
             if fp:
@@ -26167,8 +26417,9 @@ class Handler(BaseHTTPRequestHandler):
             q["token"] = [rtok]      # the remote's own credential; whatever the browser sent means nothing there
         try:
             up = socket.create_connection(("127.0.0.1", int(port)), timeout=6)
-        except OSError:
-            return self._send(502, "tunnel to %s is not answering" % host, "text/plain")
+        except OSError as e:
+            _demand_redial(host, "refused" if isinstance(e, ConnectionRefusedError) else "timeout")
+            return self._send(502, "tunnel to %s is not answering — re-dialing now" % host, "text/plain")
         up.settimeout(None)          # create_connection's timeout would otherwise cut the long-lived splice
         lines = ["GET /ws?%s HTTP/1.1" % urlencode(q, doseq=True),
                  "Host: 127.0.0.1:%d" % int(port)]
@@ -26285,8 +26536,10 @@ class Handler(BaseHTTPRequestHandler):
             status, ctype = resp.status, mime          # OUR mime, never resp.getheader("Content-Type")
             clen = resp.getheader("Content-Length")
             crange = resp.getheader("Content-Range") or ""
-        except (OSError, http.client.HTTPException):
-            return self._send(502, b"" if head else ("tunnel to %s is not answering" % host), "text/plain")
+        except (OSError, http.client.HTTPException) as e:
+            _demand_redial(host, "refused" if isinstance(e, ConnectionRefusedError) else "timeout")
+            return self._send(502, b"" if head else ("tunnel to %s is not answering — re-dialing now" % host),
+                              "text/plain")
         finally:
             try:
                 conn.close()
@@ -26350,7 +26603,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(resp.status, body, "text/plain", cache="no-cache")
                 clen = resp.getheader("Content-Length")
             except (OSError, http.client.HTTPException):
-                return self._send(502, b"" if head else ("tunnel to %s is not answering" % host), "text/plain")
+                _demand_redial(host, "timeout")
+                return self._send(502, b"" if head else ("tunnel to %s is not answering — re-dialing now" % host),
+                                  "text/plain")
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Disposition",

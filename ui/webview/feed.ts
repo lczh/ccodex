@@ -93,7 +93,7 @@ interface AskItem {
   warns?: { kind: string; t: number; msg: string; detail: string }[] | null;   // judge-stamped anomalies (judge _node_warn → kernel build_feed): yellow "warning" chip; click opens the detail modal (the user 2026-07-02)
   nudged?: { count: number; times: number[] } | null;   // auto-nudge HISTORY (kernel _nudge_times): how many times romp followed up + when — the stalled chip's evidence (tooltip + modal line, the user 2026-07-02)
   warnRows?: { t: number; judge: string; err: string; note?: string; debug?: { input?: string; reply?: string } }[] | null;   // DEBUG MODE only (romp debug on): every judge failure touching this card (kernel _card_warn_rows) → "Warnings (debug)" modal section; rows captured in debug carry the failing call's input + reply (the user 2026-07-09)
-  origin?: { peer: string; peerSid: string; peerHost?: string; color: { bg: string; fg: string } | null } | null;  // courier handoff: planted by a peer's message → "↪ from <peer>"; peerHost = a FEDERATED sender's host, rendered as the quiet "host:" prefix (absent on older payloads / local senders)
+  origin?: { peer: string; peerSid: string; peerHost?: string; color: { bg: string; fg: string } | null; live?: boolean } | null;  // courier handoff: planted by a peer's message → "↪ from <peer>"; peerHost = a FEDERATED sender's host, rendered as the quiet "host:" prefix (absent on older payloads / local senders). live = the sender's linked entry is still OPEN; false → the badge is PROVENANCE, dimmed (the completed-column merge, the user 2026-08-16)
   waitingOn?: { peerSid: string; name: string; color: { bg: string; fg: string } | null; inCycle: boolean; kind?: string } | null;  // unanswered msg out to a live peer → "Awaiting <peer>" chip, or "Handed off to <peer>" when kind is "delegate" (peer name in native colour, no emoji; kernel _wait_for_graph; the user 2026-06-22 / 2026-07-25)
   awaiting?: { why?: string | null; kind?: string | null; tasks?: string[] | null } | null;   // AWAITING flavor: held in Working, ⏳ awaiting badge — waiting on dispatched/delegated work (agents/subagents/a build), NOT on you (kernel build_feed; the user 2026-06-22). The peer case rides waitingOn; this carries the generic "why". `tasks` = live bg-task descriptions (the user 2026-07-13): present → the compact "Awaiting task" pill (expands the list, like Sub-goals) replaces the boxed why.
   groupTitle?: string;                             // host: this ask shares a typed turn with siblings → the group's title
@@ -1181,6 +1181,11 @@ const cardTreeExpanded = new Set<string>();
 // above are exactly the state worth carrying: what the USER chose to open. Everything else module-level here
 // is a DOM cache or an in-flight optimistic record, and restoring those would resurrect predictions made
 // against a kernel that no longer exists — see feed-view-state.ts.
+// Stacked-layout column state (the user 2026-08-16): which categories are folded to their header, and
+// the dragged top-down order. Layout state, not card state — prune-exempt, persisted with the rest.
+const collapsedCols = new Set<string>();
+let stackOrder: string[] = [];                       // [] = the CSS default (Completed, Blocked, Working)
+
 (function hydrateViewState() {
   let st;
   try { st = parseViewState(localStorage.getItem(VIEW_STATE_KEY)); } catch { return; }   // private mode / blocked storage → run without it
@@ -1190,13 +1195,16 @@ const cardTreeExpanded = new Set<string>();
   for (const k of st.logs) nodeLogOpen.add(k);
   for (const k of st.asks) expandedAsks.add(k);
   for (const k of st.threads) collapsedThreads.add(k);
+  for (const k of st.cols) collapsedCols.add(k);
+  stackOrder = st.order.slice();
 })();
 
 function currentViewState(): FeedViewState {
   const sec: Record<string, string> = {};
   secChoice.forEach((v, k) => { sec[k] = v; });
   return { v: 1, sec, tree: [...cardTreeExpanded], nodes: [...collapsedNodes], logs: [...nodeLogOpen],
-           asks: [...expandedAsks], threads: [...collapsedThreads] };
+           asks: [...expandedAsks], threads: [...collapsedThreads], cols: [...collapsedCols],
+           order: stackOrder.slice() };
 }
 
 // Written at the END of every render rather than from each toggle handler: the feed re-renders on every
@@ -1461,6 +1469,15 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
     peer.replaceChildren(...hostPartsNodes(it.origin.peerHost, it.origin.peer));
     if (it.origin.color) peer.style.color = it.origin.color.bg;
     og.append(pre, peer);
+    // absorbed (the sender's linked entry closed — usually because THIS card completed and the
+    // link-back checked it off): same badge, dimmed — provenance, not an active handoff. The title
+    // also warns that a clear takes the linked entry with it (the user 2026-08-16, who watched that
+    // happen with no visible cause).
+    og.classList.toggle("fask-origin-absorbed", it.origin.live === false);
+    og.title = (it.origin.live === false
+      ? "delegated by " + it.origin.peer + "; their linked entry closed with this card"
+      : "delegated by " + it.origin.peer + " — clearing this card also clears their linked entry")
+      + " · click opens the session";
     og.onclick = (ev: Event) => { ev.stopPropagation(); vscodeApi?.postMessage({ type: "openSession", id: it.origin!.peerSid }); };
   } else {
     og.style.display = "none";
@@ -3155,6 +3172,106 @@ function ensureSessionFilter(): HTMLElement {
 // rebuild if torn down (empty state). "Awaiting" (the user's ruling 2026-06-10):
 // matches the session-chip vocabulary — anything here awaits HIM (a question,
 // an action like reload, an idea), red like the awaiting chip.
+const STACK_DEFAULT = ["completed", "needsInput", "asks"];   // the CSS default top-down stacking
+
+// Paint the stacked-column state: each section's fold (list hidden, caret pointed) and its top-down
+// slot (a --stack-order var the container query applies — the side-by-side layout ignores it, so a
+// drag in the narrow view never rearranges the wide one). Idempotent; runs at build and per toggle.
+function applyColStack(): void {
+  const order = stackOrder.length === 3 ? stackOrder : STACK_DEFAULT;
+  for (const key of ["asks", "needsInput", "completed"]) {
+    const col = document.querySelector<HTMLElement>(".feed-col.col-" + key);
+    if (!col) continue;
+    const folded = collapsedCols.has(key);
+    col.classList.toggle("col-collapsed", folded);
+    col.style.setProperty("--stack-order", String(order.indexOf(key) + 1));
+    const fold = col.querySelector<HTMLElement>(".fcol-fold");
+    if (fold) {
+      fold.textContent = folded ? "▸" : "▾";
+      fold.setAttribute("aria-expanded", String(!folded));
+    }
+  }
+}
+
+// Drag a section header by its grip to re-slot the category in the STACK (pointer events, capture on
+// the grip so the drag survives leaving it). Only the stacked layout listens: in the side-by-side
+// layout the grip is display:none. The order updates live while dragging (flex `order` reflows), and
+// the drop persists it.
+// Drag a section by its CATEGORY CHIP (the user 2026-08-16, dropping the earlier grip handle): the
+// grab cursor on the chip is the affordance. While dragging, the grabbed section FOLLOWS the pointer
+// (a transform, so nothing reflows under the hand) and the displaced sections FLIP-animate into their
+// provisional slots — the arrangement you see mid-drag is the arrangement you get. Only the stacked
+// layout listens: side by side the chip keeps its normal cursor and this returns before capturing.
+function wireColDrag(chip: HTMLElement, col: HTMLElement, key: string): void {
+  chip.addEventListener("pointerdown", (down) => {
+    const colsEl = document.getElementById("feed-cols");
+    if (!colsEl || getComputedStyle(colsEl).flexDirection !== "column") return;
+    down.preventDefault();
+    down.stopPropagation();
+    chip.setPointerCapture(down.pointerId);
+    col.classList.add("col-dragging");
+    const startY = down.clientY;
+    let slotShift = 0;   // the dragged section's own accumulated slot movement — folded into its
+    //                      follow-transform so a re-slot never yanks it out from under the pointer
+    const applyOrderFlip = (order: string[]) => {
+      const els: Array<[string, HTMLElement]> = [];
+      for (const k of ["asks", "needsInput", "completed"]) {
+        const e = document.querySelector<HTMLElement>(".feed-col.col-" + k);
+        if (e) els.push([k, e]);
+      }
+      const before = new Map(els.map(([k, e]) => [k, e.getBoundingClientRect().top]));
+      stackOrder = order;
+      applyColStack();
+      for (const [k, e] of els) {
+        const d = (before.get(k) || 0) - e.getBoundingClientRect().top;
+        if (!d) continue;
+        if (k === key) { slotShift -= d; continue; }   // both rects carry the follow-transform, so d is pure slot delta
+        e.animate([{ transform: "translateY(" + d + "px)" }, { transform: "translateY(0)" }],
+                  { duration: 150, easing: "ease" });
+      }
+    };
+    const move = (ev: PointerEvent) => {
+      const order = (stackOrder.length === 3 ? stackOrder : STACK_DEFAULT).slice();
+      const from = order.indexOf(key);
+      // the slot whose vertical midpoint the pointer is past — walk the OTHER two sections' rects
+      let to = from;
+      for (const other of order) {
+        if (other === key) continue;
+        const oc = document.querySelector<HTMLElement>(".feed-col.col-" + other);
+        if (!oc) continue;
+        const r = oc.getBoundingClientRect();
+        const mid = r.top + r.height / 2;
+        const oi = order.indexOf(other);
+        if (oi < from && ev.clientY < mid) { to = Math.min(to, oi); }
+        if (oi > from && ev.clientY > mid) { to = Math.max(to, oi); }
+      }
+      if (to !== from) {
+        order.splice(from, 1);
+        order.splice(to, 0, key);
+        applyOrderFlip(order);
+      }
+      col.style.transform = "translateY(" + (ev.clientY - startY - slotShift) + "px)";
+    };
+    const up = () => {
+      chip.removeEventListener("pointermove", move);
+      chip.removeEventListener("pointerup", up);
+      chip.removeEventListener("pointercancel", up);
+      // settle: animate from wherever the hand left it into its slot, then drop the transform
+      const hang = col.style.transform;
+      col.style.transform = "";
+      if (hang && hang !== "translateY(0px)") {
+        col.animate([{ transform: hang }, { transform: "translateY(0)" }],
+                    { duration: 150, easing: "ease" });
+      }
+      col.classList.remove("col-dragging");
+      persistViewState();
+    };
+    chip.addEventListener("pointermove", move);
+    chip.addEventListener("pointerup", up);
+    chip.addEventListener("pointercancel", up);
+  });
+}
+
 function ensureCols(list: HTMLElement) {
   if (!document.getElementById("feed-cols")) {
     list.innerHTML = "";
@@ -3166,14 +3283,31 @@ function ensureCols(list: HTMLElement) {
     for (const [key, label, chip] of [["asks", "Working", "working"], ["needsInput", "Blocked", "blocked"], ["completed", "Completed", "completed"]] as const) {
       const col = el("div", "feed-col col-" + key);
       const head = el("div", "feed-col-head");
+      // stacked-layout furniture (the user 2026-08-16), both hidden in the side-by-side layout by CSS:
+      // a caret LEFT of the chip folds the whole category to its header, and a grip (hover-revealed on
+      // pointer devices, faintly visible on touch) drags the section to a new spot in the stack. These
+      // live on the build-once header, so they are click-safe across the feed's constant re-renders.
+      const fold = el("button", "fcol-fold");
+      fold.setAttribute("aria-label", "Collapse " + label);
+      fold.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (collapsedCols.has(key)) collapsedCols.delete(key); else collapsedCols.add(key);
+        applyColStack();
+        persistViewState();
+      });
       const name = el("span", "feed-col-name fcol-chip fcol-chip-" + chip); name.textContent = label;
+      name.title = "drag to reorder";
+      wireColDrag(name, col, key);            // the chip ITSELF drags (the user 2026-08-16) — the grab
+      //                                         cursor it wears in the stacked layout is the affordance
       const count = el("span", "feed-col-count"); count.id = "col-" + key + "-count";
-      head.append(name, count);
+      head.append(name, fold, count);         // caret RIGHT of the chip — the same side as the
+      //                                          session headers' fold (the user 2026-07-31 / 2026-08-16)
       const body = el("div", "feed-col-list"); body.id = "col-" + key + "-list";
       col.append(head, body);
       cols.appendChild(col);
     }
     list.appendChild(cols);
+    applyColStack();
   }
   return {
     asks: document.getElementById("col-asks-list")!,

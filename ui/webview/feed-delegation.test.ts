@@ -57,3 +57,21 @@ test("a delegation card's title anchors on 'work' (not 'prompt') so it doesn't j
   assert.match(FEED, /let titleAnchor = it\.origin \? "work" : "prompt"/);
   assert.match(FEED, /anchor: titleAnchor/);
 });
+
+test("the '↪ from' badge is provenance for the card's LIFE: dimmed once absorbed, never removed", () => {
+  // the user 2026-08-16: the badge used to vanish the moment the recipient finished (run_propagate
+  // closes the sender's entry instantly), so a completed card never showed where its work came from
+  // — and a propagated clear read as one card mysteriously taking another with it.
+  assert.match(FEED, /live\?: boolean/);
+  assert.match(FEED, /og\.classList\.toggle\("fask-origin-absorbed", it\.origin\.live === false\);/);
+  assert.match(FEED, /their linked entry closed with this card/);
+  assert.match(FEED, /clearing this card also clears their linked entry/,
+    "the standing link is explained before the user discovers it by surprise");
+  assert.match(CSS, /\.fask-origin-absorbed \{ opacity: 0\.55; \}/);
+});
+
+test("flatten finally feeds the delegations section: kind 'handoff' with the recipient's identity", () => {
+  const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
+  assert.match(KERNEL, /"kind": "handoff" if _ho_sid else "ask"/);
+  assert.match(KERNEL, /_name_of\(_ho_sid\) or _ho_sid\[:8\]/, "recipient name from the recorded handoff.peer");
+});
