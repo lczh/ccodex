@@ -388,6 +388,7 @@ class RunUpdate(Fresh):
     def _execute_captured_updater(self, verify_rc, enforce=False):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "repo"; root.mkdir()
+            (root / ".git").mkdir()                   # the interprocess update flock lives here
             state = Path(td) / "state"; state.mkdir()
             fakebin = Path(td) / "bin"; fakebin.mkdir()
             calls = Path(td) / "git-calls"
@@ -566,6 +567,34 @@ class Routes(Fresh):
         self.assertEqual((status, d["tag"], d["mode"], d["state"]), (200, "v0.7.0", "ask", ""))
         self.assertEqual(d["boot"], km._BOOT_ID, "the banner detects the NEW kernel by this flipping")
 
+    def test_update_check_surfaces_converge_refusals_so_the_banner_unsticks(self):
+        # a refused converge left the banner's spinner polling /update-check forever: the route
+        # reported nothing, because converge errors lived only in the notice ring (the user's
+        # audit, 2026-08-17). They ride the same `failed` slot the banner already acts on.
+        km._CONVERGE_ERROR[0] = "the checkout advanced to aaaa1111 but install.sh failed: boom"
+        try:
+            _, body = _serve_get("/update-check", headers={"X-Romp-Token": km.TOKEN})
+            self.assertIn("install.sh failed", json.loads(body)["failed"])
+        finally:
+            km._CONVERGE_ERROR[0] = ""
+
+    def test_a_held_update_lock_refuses_the_tag_update_too(self):
+        # the tag path and the converge share the interprocess flock: several kernels can share
+        # one checkout, and two install.sh runs interleaving corrupts the build (the user's
+        # audit, 2026-08-17). Hold the lock; the tag update must refuse before spawning.
+        km._UPDATE_STATE[0] = ""
+        fd = km._update_flock()
+        self.assertIsNotNone(fd, "the lock is free at rest")
+        try:
+            with mock.patch.object(km.subprocess, "Popen",
+                                   side_effect=AssertionError("must not spawn")):
+                self.assertFalse(km._run_update("v0.7.0"))
+            self.assertIn("another update is already running", km._UPDATE_ERROR[0])
+            self.assertEqual(km._UPDATE_STATE[0], "", "the in-flight latch is released on refusal")
+        finally:
+            km.os.close(fd)
+            km._UPDATE_ERROR[0] = ""
+
     def test_update_check_poll_consumes_a_failed_report_mid_run(self):
         km._UPDATE_STATE[0] = "running"
         (jd.STATE / "update-report.json").write_text(json.dumps({"ok": False, "tag": "v0.7.0",
@@ -606,7 +635,7 @@ class Routes(Fresh):
         km._UPDATE_AVAIL[0] = ""
         km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = "a" * 40, ""
         ran = []
-        with mock.patch.object(km, "_release_verify_enforced", return_value=False), \
+        with mock.patch.object(km, "_update_channel", return_value="dev"), \
              mock.patch.object(km, "_run_main_update",
                                side_effect=lambda kind, immediate=False, target="":
                                ran.append((kind, immediate, target))):
@@ -621,14 +650,15 @@ class Routes(Fresh):
                          "the click is the user's own cut, BOUND to the sha the kernel offered")
         km._MAIN_DRIFT[0] = ""
 
-    def test_post_update_refuses_main_convergence_on_a_release_trusting_install(self):
-        # a configured trust root means code moves only via signed release tags; the banner never
-        # fires there, but the route itself must not trust the banner (the user's audit, 2026-08-17)
+    def test_post_update_refuses_main_convergence_on_the_stable_channel(self):
+        # stable installs (the DEFAULT — trust root or none) move only via signed release tags;
+        # the banner never fires there, but the route itself must not trust the banner (the
+        # user's audits, 2026-08-17). Channel absent = stable: nobody converges by default.
         km._UPDATE_AVAIL[0] = ""
         km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = "a" * 40, ""
         try:
-            with mock.patch.object(km, "_release_verify_enforced", return_value=True), \
-                 mock.patch.object(km, "_run_main_update",
+            (jd.STATE / "update-channel").unlink(missing_ok=True)   # the default posture
+            with mock.patch.object(km, "_run_main_update",
                                    side_effect=AssertionError("must not converge")):
                 code, body = self._post("/update")
             self.assertEqual(code, 409)

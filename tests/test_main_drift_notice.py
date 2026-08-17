@@ -61,35 +61,64 @@ class DriftWiring(unittest.TestCase):
                       "even unattended, the converge is bound to the sha this pass advertised")
         self.assertIn('"kind": "main"', src, "ask mode fires the shared banner with the drift variant")
 
-    def test_a_release_trusting_install_never_probes_or_pulls_main(self):
-        # a configured trust root means code moves ONLY via signed release tags: the check must not
-        # even ls-remote origin (no probe → no pull verdict → no banner, no auto converge), and the
-        # pull step itself refuses as defence in depth (the user's audit, 2026-08-17)
-        src = inspect.getsource(km._main_drift_check)
-        self.assertIn('"" if _release_verify_enforced() else _origin_main_sha()', src)
-        self.assertIn("signed release tags", inspect.getsource(km._run_main_update_locked))
+    def test_the_default_channel_is_stable_and_only_dev_reads_as_dev(self):
+        # the CHANNEL is persisted separately from signature policy: keying convergence off the
+        # trust root left default no-trust-root installs silently tracking unsigned main (the
+        # user's audit, 2026-08-17). Absent, unreadable, or garbage all read STABLE.
+        ch = km.jd.STATE / "update-channel"
+        ch.unlink(missing_ok=True)
+        self.assertEqual(km._update_channel(), "stable", "absent file → stable, never dev")
+        ch.write_text("banana\n")
+        self.assertEqual(km._update_channel(), "stable", "garbage → stable")
+        ch.write_text("dev\n")
+        self.assertEqual(km._update_channel(), "dev")
+        ch.unlink(missing_ok=True)
 
-    def test_the_restart_half_still_fires_under_a_trust_root(self):
+    def test_a_stable_install_never_probes_or_pulls_main(self):
+        # stable means code moves ONLY via signed release tags: the check must not even ls-remote
+        # origin (no probe → no pull verdict → no banner, no auto converge), and the pull step
+        # itself refuses as defence in depth (the user's audits, 2026-08-17)
+        src = inspect.getsource(km._main_drift_check)
+        self.assertIn('_origin_main_sha() if _update_channel() == "dev" else ""', src)
+        self.assertIn("stable channel", inspect.getsource(km._run_main_update_locked))
+        probes = []
+        saved = (km._update_mode, km._origin_main_sha, km._checkout_sha, km._kernel_sha,
+                 km._MAIN_DRIFT[0], km._MAIN_DRIFT[1])
+        km._update_mode = lambda: "ask"
+        km._origin_main_sha = lambda: probes.append(1) or OA
+        km._checkout_sha = lambda: "bbbb2222"
+        km._kernel_sha = lambda: "bbbb2222"
+        try:
+            km._MAIN_DRIFT[0] = km._MAIN_DRIFT[1] = ""
+            (km.jd.STATE / "update-channel").unlink(missing_ok=True)   # default = stable
+            km._main_drift_check()
+            self.assertEqual(probes, [], "a stable install never dials origin")
+            self.assertEqual(km._MAIN_DRIFT[0], "", "and no pull offer is ever latched")
+        finally:
+            (km._update_mode, km._origin_main_sha, km._checkout_sha, km._kernel_sha) = saved[:4]
+            km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = saved[4], saved[5]
+
+    def test_the_restart_half_still_fires_on_stable(self):
         # restart-drift moves no code — it runs what is already on disk (a landed tag update whose
-        # bounce died). Functional: enforced, checkout ahead of the running build → restart verdict.
+        # bounce died). Functional: stable (default) channel, checkout ahead of running → restart.
         ran = []
-        saved = (km._update_mode, km._release_verify_enforced, km._checkout_sha, km._kernel_sha,
+        saved = (km._update_mode, km._checkout_sha, km._kernel_sha,
                  km._run_main_update, km._LAST_AUTO_CONVERGE[0], km._MAIN_DRIFT[0], km._MAIN_DRIFT[1])
         km._update_mode = lambda: "auto"
-        km._release_verify_enforced = lambda: True
         km._checkout_sha = lambda: "bbbb2222"
         km._kernel_sha = lambda: "cccc3333"
         km._run_main_update = lambda kind, immediate=False, target="": ran.append((kind, target))
         try:
             km._MAIN_DRIFT[0] = km._MAIN_DRIFT[1] = ""
             km._LAST_AUTO_CONVERGE[0] = 0.0
+            (km.jd.STATE / "update-channel").unlink(missing_ok=True)   # default = stable
             km._main_drift_check()
             self.assertEqual(ran, [("restart", "bbbb2222")])
         finally:
-            (km._update_mode, km._release_verify_enforced, km._checkout_sha, km._kernel_sha,
-             km._run_main_update) = saved[:5]
-            km._LAST_AUTO_CONVERGE[0] = saved[5]
-            km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = saved[6], saved[7]
+            (km._update_mode, km._checkout_sha, km._kernel_sha,
+             km._run_main_update) = saved[:4]
+            km._LAST_AUTO_CONVERGE[0] = saved[4]
+            km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = saved[5], saved[6]
 
     def test_the_pull_step_verifies_every_precondition_and_says_why_not(self):
         # the first cut checked none of these (the user's audit, 2026-08-17): a quiet fetch failure
@@ -123,10 +152,10 @@ class DriftWiring(unittest.TestCase):
         # cool-down, N merges inside the window become ONE restart to the LATEST sha.
         ran = []
         saved = (km._update_mode, km._origin_main_sha, km._checkout_sha, km._kernel_sha,
-                 km._run_main_update, km._LAST_AUTO_CONVERGE[0], km._MAIN_DRIFT[0], km._MAIN_DRIFT[1],
-                 km._release_verify_enforced)
+                 km._run_main_update, km._LAST_AUTO_CONVERGE[0], km._MAIN_DRIFT[0], km._MAIN_DRIFT[1])
         km._update_mode = lambda: "auto"
-        km._release_verify_enforced = lambda: False   # dev-box posture; the machine's own config must not leak in
+        (km.jd.STATE / "update-channel").write_text("dev\n")   # only the dev channel pulls main
+        self.addCleanup(lambda: (km.jd.STATE / "update-channel").unlink(missing_ok=True))
         km._checkout_sha = lambda: "aaa"
         km._kernel_sha = lambda: "aaa"
         km._run_main_update = lambda kind, immediate=False, target="": ran.append(kind)
@@ -148,7 +177,6 @@ class DriftWiring(unittest.TestCase):
              km._run_main_update) = saved[:5]
             km._LAST_AUTO_CONVERGE[0] = saved[5]
             km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = saved[6], saved[7]
-            km._release_verify_enforced = saved[8]
 
     def test_the_shell_banner_carries_the_drift_variants(self):
         src = inspect.getsource(km)
@@ -174,24 +202,26 @@ class ConvergeFunctional(unittest.TestCase):
     OTHER = "0" * 40
 
     def setUp(self):
-        self._saved = (km._MAIN_DRIFT[0], km._MAIN_DRIFT[1],
-                       km._CONVERGE_STATE[0], km._CONVERGE_INSTALL_FAILED[0])
+        self._saved = (km._MAIN_DRIFT[0], km._MAIN_DRIFT[1], km._CONVERGE_STATE[0])
         km._MAIN_DRIFT[0] = km._MAIN_DRIFT[1] = ""
-        km._CONVERGE_STATE[0] = km._CONVERGE_INSTALL_FAILED[0] = ""
+        km._CONVERGE_STATE[0] = ""
+        km._set_install_failed("")
+        (km.jd.STATE / "update-channel").write_text("dev\n")   # only dev converges; per-test default
         self.notices = []
         self.requests = []
 
     def tearDown(self):
-        (km._MAIN_DRIFT[0], km._MAIN_DRIFT[1],
-         km._CONVERGE_STATE[0], km._CONVERGE_INSTALL_FAILED[0]) = self._saved
+        (km._MAIN_DRIFT[0], km._MAIN_DRIFT[1], km._CONVERGE_STATE[0]) = self._saved
+        km._set_install_failed("")
+        (km.jd.STATE / "update-channel").unlink(missing_ok=True)
 
-    def _run(self, kind="pull", target=None, fail=(), tip=None, enforced=False):
+    def _run(self, kind="pull", target=None, fail=(), tip=None, channel=None):
         """Drive _run_main_update with every subprocess scripted. `fail` names steps that exit 1."""
         import subprocess as sp
-        import urllib.request
         target = self.FULL if target is None else target
         tip = self.FULL if tip is None else tip
         calls = []
+        requests = self.requests
 
         def fake_run(argv, **kw):
             step = ("install" if any("install.sh" in str(a) for a in argv) else
@@ -206,15 +236,32 @@ class ConvergeFunctional(unittest.TestCase):
                 rc, out = 0, "M peer-session-edit.py\n"   # "failing" status = a DIRTY tree answer
             return sp.CompletedProcess(argv, rc, stdout=out, stderr="boom" if rc else "")
 
-        env = dict(km.os.environ, ROMP_MANAGER_TOKEN="tok-abc12", ROMP_MANAGER_PORT="1")
+        class FakeConn:
+            # the restart POST is DIRECT http.client (urllib honors HTTP_PROXY and leaked the
+            # manager token to a configured proxy — the user's audit, 2026-08-17)
+            def __init__(self, host, port, timeout=0):
+                self.host = host
+
+            def request(self, method, path, headers=None):
+                requests.append((method, path, dict(headers or {})))
+
+            def getresponse(self):
+                r = mock.MagicMock()
+                r.status = 200
+                return r
+
+            def close(self):
+                pass
+
+        if channel is not None:
+            (km.jd.STATE / "update-channel").write_text(channel + "\n")
+        env = dict(km.os.environ, ROMP_MANAGER_TOKEN="tok-abc12", ROMP_MANAGER_PORT="1",
+                   HTTP_PROXY="http://127.0.0.1:9")   # a proxy that must NEVER be consulted
         with mock.patch.object(km.subprocess, "run", side_effect=fake_run), \
-             mock.patch.object(km, "_release_verify_enforced", return_value=enforced), \
              mock.patch.object(km, "_sync_notice",
                                side_effect=lambda m, ok=True: self.notices.append(m)), \
              mock.patch.dict(km.os.environ, env, clear=True), \
-             mock.patch.object(urllib.request, "urlopen",
-                               side_effect=lambda req, timeout=0: self.requests.append(req) or
-                               mock.MagicMock()):
+             mock.patch.object(km.http.client, "HTTPConnection", FakeConn):
             km._run_main_update(kind, target=target)
         return [s for s, _ in calls], calls
 
@@ -225,8 +272,11 @@ class ConvergeFunctional(unittest.TestCase):
         self.assertIn(self.FULL, checkout_argv, "the checkout lands on the resolved+bound sha")
         self.assertNotIn("origin/main", checkout_argv, "never the ref — it can move under us")
         self.assertEqual(len(self.requests), 1)
-        self.assertIn("tok-abc12", str(self.requests[0].header_items()),
-                      "the restart authenticates to the manager")
+        method, path, headers = self.requests[0]
+        self.assertEqual((method, path), ("POST", "/restart-all?when=quiet"),
+                         "an unattended converge rides the quiet window")
+        self.assertEqual(headers.get("X-Romp-Manager-Token"), "tok-abc12",
+                         "the restart authenticates to the manager, proxy env notwithstanding")
 
     def test_each_refusal_stops_the_sequence_and_restarts_nothing(self):
         for fail_step, last_expected in (("status", "status"), ("fetch", "fetch"),
@@ -245,26 +295,56 @@ class ConvergeFunctional(unittest.TestCase):
         self.assertNotIn("checkout", steps)
         self.assertEqual(self.requests, [])
 
-    def test_enforcement_stops_the_pull_before_any_subprocess(self):
-        steps, _ = self._run(enforced=True)
+    def test_the_stable_channel_stops_the_pull_before_any_subprocess(self):
+        steps, _ = self._run(channel="stable")
         self.assertEqual(steps, [])
-        self.assertTrue(any("signed release tags" in n for n in self.notices))
+        self.assertTrue(any("stable channel" in n for n in self.notices))
+        self.assertIn(km._CONVERGE_ERROR[0], self.notices[-1],
+                      "the refusal parks where /update-check's poll reads it — the banner unsticks")
 
-    def test_a_failed_install_latches_and_the_restart_half_heals_it(self):
+    def test_a_failed_install_latches_DURABLY_and_the_restart_half_heals_it(self):
         steps, _ = self._run(fail=("install",))
         self.assertEqual(steps[-1], "install")
         self.assertEqual(self.requests, [], "no restart onto a build whose install failed")
-        self.assertEqual(km._CONVERGE_INSTALL_FAILED[0], "f" * 8)
+        self.assertEqual(km._install_failed_sha(), "f" * 8)
+        self.assertEqual((km.jd.STATE / "converge-install-failed").read_text().strip(), "f" * 8,
+                         "the latch survives a process death — it lives in STATE, not memory")
         with mock.patch.object(km, "_checkout_sha", return_value="f" * 8):
             steps, _ = self._run(kind="restart")
         self.assertEqual(steps, ["install"], "the restart half retries the install first")
-        self.assertEqual(km._CONVERGE_INSTALL_FAILED[0], "", "a passing install spends the latch")
+        self.assertEqual(km._install_failed_sha(), "", "a passing install spends the latch")
         self.assertEqual(len(self.requests), 1, "and only then does the restart go out")
+
+    def test_a_nonzero_install_with_no_output_is_still_a_failure(self):
+        # rc!=0 with empty stdout+stderr counted as SUCCESS in the first cut (the why-string was
+        # the success test) — the user's audit, 2026-08-17
+        import subprocess as sp
+        with mock.patch.object(km.subprocess, "run",
+                               return_value=sp.CompletedProcess([], 2, stdout="", stderr="")), \
+             mock.patch.object(km, "_sync_notice",
+                               side_effect=lambda m, ok=True: self.notices.append(m)):
+            self.assertFalse(km._converge_install("f" * 8))
+        self.assertEqual(km._install_failed_sha(), "f" * 8)
+        self.assertTrue(any("exit 2 with no output" in n for n in self.notices))
+        self.assertFalse(any("romp refresh" in n for n in self.notices),
+                         "the advice must never be the restart the latch exists to stop")
 
     def test_one_converge_at_a_time(self):
         km._CONVERGE_STATE[0] = "running"
         steps, _ = self._run()
         self.assertEqual(steps, [], "a second converge while one runs is a no-op")
+
+    def test_the_interprocess_flock_refuses_a_second_update(self):
+        # several kernels can share one checkout, and the tag path races the converge: only the
+        # flock serializes them (the user's audit, 2026-08-17). Hold it; the converge must refuse.
+        fd = km._update_flock()
+        self.assertIsNotNone(fd, "the lock is free at rest")
+        try:
+            steps, _ = self._run()
+            self.assertEqual(steps, [], "a held lock stops the pull before any subprocess")
+            self.assertTrue(any("another update is already running" in n for n in self.notices))
+        finally:
+            km.os.close(fd)
 
 
 if __name__ == "__main__":

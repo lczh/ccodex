@@ -291,3 +291,38 @@ EOF
     [[ "$output" == *"does not have a valid signature"* ]]
     [[ "$output" != *STUB_INSTALL_RAN* ]]
 }
+
+@test "bootstrap.sh: a configured-but-EMPTY signers value still enforces (never warn-only)" {
+    # rc-0-with-empty-value is a MISCONFIGURATION for verification to fail loudly against, not an
+    # absent trust root: collapsing it into "no trust root" downgraded a hardened install to
+    # warning-only (the user's audit, 2026-08-17). Only git's clean rc-1 "key absent" downgrades.
+    ROMP_DIR="$HOME/romp" bash "$REPO_ROOT/bootstrap.sh"
+    git -C "$HOME/romp" config --local gpg.ssh.allowedSignersFile ""
+    git -C "$ROMP_REPO" tag -a v0.3.0 -m unsigned
+    unset ROMP_RELEASE_ALLOWED_SIGNERS
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"does not have a valid signature"* ]]
+    [[ "$output" != *STUB_INSTALL_RAN* ]]
+}
+
+@test "bootstrap.sh: a release install lands on the STABLE update channel" {
+    # the channel is persisted separately from signature policy: the kernel's main-convergence
+    # follows origin/main only on `dev`, and keying that off the trust root left default installs
+    # silently tracking unsigned main (the user's audit, 2026-08-17)
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Update channel: stable"* ]]
+    [ "$(cat "$HOME/.local/state/romp/update-channel")" = "stable" ]
+}
+
+@test "bootstrap.sh: ROMP_REF=main is the explicit dev opt-in, and a tag re-run flips back" {
+    ROMP_DIR="$HOME/romp" ROMP_REF=main run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$HOME/.local/state/romp/update-channel")" = "dev" ]
+    # re-bootstrapping onto a release moves the install back to stable — the channel follows
+    # the last explicit choice, never a sticky accident
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$HOME/.local/state/romp/update-channel")" = "stable" ]
+}

@@ -127,8 +127,14 @@ if git -C "$DIR" show-ref --verify --quiet "refs/tags/$ref"; then
     # A trust root CONFIGURED IN GIT also enforces — a signers file persisted in this clone by an
     # earlier bootstrap, or the user's global config. Without this, a re-run WITHOUT the one-shot
     # env var silently downgraded an already-hardened install back to warn-and-proceed
-    # (the user's audit, 2026-08-16).
-    configured_signers="$(git -C "$DIR" config --get gpg.ssh.allowedSignersFile 2>/dev/null || true)"
+    # (the user's audit, 2026-08-16). The probe fails CLOSED like the kernel's: only git's clean
+    # "key absent" answer (rc 1) reads as no trust root — a query error can't prove absence, and a
+    # configured-but-EMPTY value is a misconfiguration for verification to fail loudly against,
+    # never a downgrade to warning-only (the user's audit, 2026-08-17).
+    configured_signers_rc=0
+    git -C "$DIR" config --get gpg.ssh.allowedSignersFile >/dev/null 2>&1 || configured_signers_rc=$?
+    trust_root_in_git=1
+    [ "$configured_signers_rc" -eq 1 ] && trust_root_in_git=0
     echo "==> Verifying release signature for $ref"
     signature_ok=1
     if [ -n "$allowed_signers" ]; then
@@ -144,7 +150,7 @@ if git -C "$DIR" show-ref --verify --quiet "refs/tags/$ref"; then
         # every install: the repo's releases are not signed yet and no key is distributed anywhere,
         # so there was nothing any installer could trust (2026-08-14 review). Configured deployments
         # keep the full hard-fail; everyone else gets a loud, honest warning instead of a dead end.
-        if [ -n "$allowed_signers" ] || [ -n "${ROMP_VERIFY_RELEASES:-}" ] || [ -n "$configured_signers" ]; then
+        if [ -n "$allowed_signers" ] || [ -n "${ROMP_VERIFY_RELEASES:-}" ] || [ "$trust_root_in_git" -eq 1 ]; then
             echo "romp: release tag '$ref' does not have a valid signature trusted by git; refusing to install it." >&2
             echo "  Import the maintainer's GPG key or configure Git's SSH allowed-signers file, then rerun." >&2
             exit 1
@@ -188,6 +194,19 @@ else
     git -C "$DIR" checkout --quiet "$ref" || {
         echo "romp: ref '$ref' was not found after fetching origin." >&2; exit 1; }
 fi
+
+# Persist the UPDATE CHANNEL this install chose — a release tag is stable, anything else
+# (ROMP_REF=main, a branch, a bare sha) is an explicit development opt-in. The kernel's
+# main-convergence updater follows origin/main ONLY on the dev channel; keying that off the
+# trust root instead left default no-trust-root installs silently tracking unsigned main
+# (the user's audit, 2026-08-17). Re-running bootstrap onto a tag moves the install back
+# to stable — the channel follows the last explicit choice.
+state_dir="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}"
+channel="dev"
+[ "$is_tag" -eq 1 ] && channel="stable"
+mkdir -p "$state_dir" && printf '%s\n' "$channel" > "$state_dir/update-channel" || {
+    echo "romp: could not record the update channel in $state_dir." >&2; exit 1; }
+echo "==> Update channel: $channel"
 
 echo "==> Running install.sh"
 "$DIR/install.sh"

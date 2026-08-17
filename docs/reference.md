@@ -190,7 +190,11 @@ through to `install.sh`:
 - `ROMP_REF=<tag|branch>` install a specific ref; default is the newest stable
   `vX.Y.Z` release tag. Tags are verified with `git verify-tag` — a hard stop on failure when a
   trust root is configured, a loud note otherwise (see below); no published release always stops.
-  `ROMP_REF=main` is an explicit development-code opt-in.
+  `ROMP_REF=main` is an explicit development-code opt-in: it also sets the install's **update
+  channel** to `dev` (`update-channel` in the state dir), the only channel on which the in-app
+  updater offers or follows new commits on `main`. A release install is `stable`, and a stable
+  install updates **only** through signed release tags — re-running bootstrap onto a tag flips a
+  dev install back. The channel is independent of signature enforcement.
 - `ROMP_RELEASE_ALLOWED_SIGNERS=<absolute-path>` supplies Git's SSH allowed-signers file
   to bootstrap and the in-app updater. OpenPGP signatures use Git's configured GPG keyring
   and must meet `gpg.minTrustLevel=fully`.

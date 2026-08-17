@@ -11,7 +11,7 @@ zero protocol change at switchover. WS is hand-rolled on the stdlib socket (no d
 
 Run:  bin/romp-kernel   → opens http://127.0.0.1:29855
 """
-import json, os, queue, random, re, signal, socket, sys, time, threading, traceback, base64, bisect, errno, hashlib, hmac, struct, subprocess, shutil, shlex, http.client, uuid
+import json, os, queue, random, re, signal, socket, sys, time, threading, traceback, base64, bisect, errno, fcntl, hashlib, hmac, struct, subprocess, shutil, shlex, http.client, uuid
 from pathlib import Path
 from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
@@ -1845,6 +1845,21 @@ def _set_update_mode(mode):
         _atomic_write(jd.STATE / "update-mode.json", json.dumps({"mode": mode}))
 
 
+def _update_channel():
+    """"stable" or "dev" — WHICH code this install follows, persisted in STATE/update-channel and
+    fully separate from signature-enforcement policy (the user's audit, 2026-08-17: the first cut
+    keyed main-convergence off the trust root, so a default install with NO trust root configured —
+    a supported state, not a declared dev checkout — silently tracked unsigned origin/main).
+    Stable follows signed release tags only; dev opts into tracking main. ABSENT or unreadable or
+    garbage reads STABLE: nobody lands on the unsigned channel by default or by accident —
+    bootstrap.sh writes "dev" only for an explicit non-release ROMP_REF install."""
+    try:
+        c = (jd.STATE / "update-channel").read_text().strip()
+        return c if c in ("stable", "dev") else "stable"
+    except OSError:
+        return "stable"
+
+
 def _semver(tag):
     """'v0.6.0' → (0, 6, 0); None for anything that is not a plain release number."""
     m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", str(tag or "").strip())
@@ -1991,8 +2006,25 @@ def _run_update(tag):
                                                       "why": "the fetch, signature verification, "
                                                              "fast-forward or install failed"})), rep)
         + "fi\n")
-    subprocess.Popen(["bash", "-c", script], start_new_session=True, cwd=str(ROOT),
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # The CROSS-PROCESS update lock rides into the detached child: the child inherits the locked
+    # fd (pass_fds) and never closes it, so the flock lives exactly as long as the update — no
+    # in-process state can serialize two KERNELS sharing one checkout, or this path against the
+    # main-convergence path (the user's audit, 2026-08-17). The parent closes its copy right
+    # after the spawn; refusal here reports like any other launch refusal (422 on the route).
+    lock_fd = _update_flock()
+    if lock_fd is None:
+        _UPDATE_ERROR[0] = "another update is already running on this checkout"
+        _UPDATE_STATE[0] = ""
+        return False
+    try:
+        subprocess.Popen(["bash", "-c", script], start_new_session=True, cwd=str(ROOT),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, pass_fds=(lock_fd,))
+    finally:
+        try:
+            os.close(lock_fd)                         # the child's inherited copy holds the flock
+        except OSError:
+            pass
     return True
 
 
@@ -2093,9 +2125,76 @@ _MAIN_CHECK_EVERY_S = 300
 _CONVERGE_COOLDOWN_S = float(os.environ.get("ROMP_CONVERGE_COOLDOWN", "1500"))   # min gap between AUTO converges (25 min → ≤2-3 restarts/hour on a hot main)
 _LAST_AUTO_CONVERGE = [0.0]   # when the last auto converge fired (module state; a restart resets it, which is fine — the restart WAS the converge)              # one ls-remote — cheap enough to notice a merge within minutes
 _MAIN_DRIFT = ["", ""]                 # [origin sha a notice fired for, checkout sha one fired for]
-_CONVERGE_LOCK = threading.Lock()      # one converge at a time — concurrent install.sh runs corrupt the build
+_CONVERGE_LOCK = threading.Lock()      # one converge per PROCESS — _update_flock() serializes across processes
 _CONVERGE_STATE = [""]                 # "running" while a converge is in flight (the tag path's _UPDATE_STATE twin)
-_CONVERGE_INSTALL_FAILED = [""]        # _sha8 of a checkout whose install.sh failed; restarts refuse it until install passes
+_CONVERGE_ERROR = [""]                 # the last converge refusal, surfaced via /update-check so the banner
+#                                        stops polling a spinner forever (the user's audit, 2026-08-17); the
+#                                        install-failed latch itself is FILE-backed (STATE/converge-install-failed)
+#                                        — an in-memory latch forgot the broken build on any restart
+
+
+def _install_failed_sha():
+    """The _sha8 of a checkout whose install.sh failed, or "". DURABLE (STATE file): the checkout
+    moves before install runs, so a kernel/manager/machine restart between the two must not forget
+    that the code on disk never finished installing (the user's audit, 2026-08-17 — the in-memory
+    latch died with the process, and its own failure message recommended the restart that kills it)."""
+    try:
+        return (jd.STATE / "converge-install-failed").read_text().strip()[:8]
+    except OSError:
+        return ""
+
+
+def _set_install_failed(sha8):
+    try:
+        if sha8:
+            _atomic_write(jd.STATE / "converge-install-failed", sha8)
+        else:
+            (jd.STATE / "converge-install-failed").unlink(missing_ok=True)
+    except OSError as e:
+        _sync_notice("could not persist the install-failed latch (%s) — a restart may boot the "
+                     "half-installed checkout" % e, ok=False)
+
+
+def _update_git_dir():
+    """The checkout's own git dir, worktree-aware: in a linked worktree `.git` is a FILE holding
+    `gitdir: <path>` (per-worktree, inside the main repo's .git/worktrees/) — exactly the right
+    scope for the update lock, since each worktree is its own checkout with its own HEAD. None
+    when unresolvable."""
+    g = ROOT / ".git"
+    if g.is_dir():
+        return g
+    try:
+        line = g.read_text().strip()
+    except OSError:
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    p = Path(line.split(":", 1)[1].strip())
+    return p if p.is_absolute() else (ROOT / p)
+
+
+def _update_flock():
+    """The CROSS-PROCESS update lock: romp-update.lock in the checkout's git dir. Returns a locked
+    fd to hold for the update's lifetime (close = release), or None when another update holds it —
+    the tag updater and the converge share this, and several kernels can share one checkout, so a
+    threading.Lock alone still let two install.sh runs interleave (the user's audit, 2026-08-17).
+    An unresolvable/unopenable lockfile also returns None: no lock, no update — fail closed."""
+    gd = _update_git_dir()
+    if gd is None:
+        return None
+    try:
+        fd = os.open(str(gd / "romp-update.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None
 
 
 def _origin_main_sha():
@@ -2147,17 +2246,16 @@ def _main_drift_check():
     shell's offer() renders the main-drift wording off kind:"main"). Re-fires only when the target sha
     CHANGES — new information, never a re-nag of the sha already offered or dismissed.
 
-    A CONFIGURED RELEASE TRUST ROOT ends the PULL half here: that install has said its code moves
-    only through signed, verified release tags (bootstrap.sh sets exactly that up), and converging
-    on a bare origin/main tip would swap in code nothing ever signed — bypassing the entire
-    verification chain the tag updater enforces (the user's audit, 2026-08-17). Dev clones (no
-    trust root) keep the main-tracking flow. The RESTART half still fires everywhere: it moves no
-    code, it only offers to run what is already on disk."""
+    The PULL half exists only on the DEV channel (_update_channel): stable installs — the default,
+    trust root or none — follow signed release tags alone, and converging on a bare origin/main tip
+    would swap in code nothing ever signed (the user's audits, 2026-08-17: keying this off the
+    trust root left default no-trust-root installs silently tracking unsigned main). The RESTART
+    half still fires everywhere: it moves no code, it only offers to run what is already on disk."""
     if _update_mode() == "off":
         return
-    # Enforced installs never even probe origin/main (no ls-remote): with origin unknown the
+    # Stable installs never even probe origin/main (no ls-remote): with origin unknown the
     # verdict cannot say "pull", and the restart half needs no network.
-    origin = "" if _release_verify_enforced() else _origin_main_sha()
+    origin = _origin_main_sha() if _update_channel() == "dev" else ""
     kind, target = _main_drift_verdict(origin, _checkout_sha(), _kernel_sha())
     if not kind:
         _MAIN_DRIFT[0] = _MAIN_DRIFT[1] = ""          # in sync: a future drift is new information again
@@ -2211,33 +2309,60 @@ def _run_main_update(kind, immediate=False, target=""):
         if _CONVERGE_STATE[0] == "running":
             return
         _CONVERGE_STATE[0] = "running"
+    lock_fd = None
     try:
+        lock_fd = _update_flock()
+        if lock_fd is None:
+            _converge_note("another update is already running on this checkout — not starting a second.")
+            return
+        _CONVERGE_ERROR[0] = ""                       # a fresh converge owns the error slot
         _run_main_update_locked(kind, immediate, target)
     finally:
         _CONVERGE_STATE[0] = ""
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+
+
+def _converge_note(msg):
+    """A converge refusal: file the notice AND park it where /update-check's poll reads it —
+    without this, a clicked Update that refused left the banner's spinner polling forever
+    (the user's audit, 2026-08-17)."""
+    _CONVERGE_ERROR[0] = msg
+    _sync_notice(msg, ok=False)
 
 
 def _run_main_update_locked(kind, immediate, target):
     if kind == "pull":
         tip = ""
         try:
-            if _release_verify_enforced():
-                _sync_notice("this install updates only through signed release tags — "
-                             "not converging on origin/main.", ok=False)
+            if _update_channel() != "dev":
+                _converge_note("this install is on the stable channel — it updates only through "
+                               "signed release tags, never a bare origin/main.")
                 _MAIN_DRIFT[0] = ""
                 return
-            dirty = subprocess.run(["git", "status", "--porcelain"], cwd=str(ROOT),
-                                   capture_output=True, text=True, timeout=10).stdout.strip()
-            if dirty:
-                _sync_notice("main moved at origin, but the romp checkout has uncommitted work — "
-                             "not touching it. Commit or stash it, then Update again.", ok=False)
+            st = subprocess.run(["git", "status", "--porcelain"], cwd=str(ROOT),
+                                capture_output=True, text=True, timeout=10)
+            if st.returncode != 0:
+                # an unreadable tree is NOT a clean tree — proceeding here reset peers' work on
+                # the strength of a failed command (the user's audit, 2026-08-17)
+                _converge_note("main moved at origin, but reading the checkout's state failed: %s"
+                               % (st.stderr or st.stdout or "git status exited %d" % st.returncode)
+                               .strip()[-200:])
+                _MAIN_DRIFT[0] = ""
+                return
+            if st.stdout.strip():
+                _converge_note("main moved at origin, but the romp checkout has uncommitted work — "
+                               "not touching it. Commit or stash it, then Update again.")
                 _MAIN_DRIFT[0] = ""                   # let the notice re-fire once the tree is clean
                 return
             f = subprocess.run(["git", "fetch", "origin", "main"], cwd=str(ROOT),
                                capture_output=True, text=True, timeout=60)
             if f.returncode != 0:
-                _sync_notice("main moved at origin, but fetching it failed: %s"
-                             % (f.stderr or f.stdout or "").strip()[-200:], ok=False)
+                _converge_note("main moved at origin, but fetching it failed: %s"
+                               % (f.stderr or f.stdout or "").strip()[-200:])
                 _MAIN_DRIFT[0] = ""
                 return
             tip = subprocess.run(["git", "rev-parse", "origin/main"], cwd=str(ROOT),
@@ -2245,76 +2370,92 @@ def _run_main_update_locked(kind, immediate, target):
             if not tip or not target or tip != target:
                 # binding is MANDATORY: an empty target must fail like a moved one, never
                 # silently take whatever the fetch returned (the adversarial review, 2026-08-17)
-                _sync_notice("main moved again while updating — offering the newer commit instead.",
-                             ok=False)
+                _converge_note("main moved again while updating — offering the newer commit instead.")
                 _MAIN_DRIFT[0] = ""                   # the next pass advertises the fresh tip
                 return
             ff = subprocess.run(["git", "merge-base", "--is-ancestor", "HEAD", tip],
                                 cwd=str(ROOT), capture_output=True, text=True, timeout=10)
             if ff.returncode != 0:
-                _sync_notice("origin/main is not a fast-forward of this checkout (diverged or "
-                             "rewound) — not moving. Reconcile the clone yourself.", ok=False)
+                _converge_note("origin/main is not a fast-forward of this checkout (diverged or "
+                               "rewound) — not moving. Reconcile the clone yourself.")
                 _MAIN_DRIFT[0] = ""
                 return
             r = subprocess.run(["git", "checkout", "--detach", tip], cwd=str(ROOT),
                                capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
-                _sync_notice("main moved at origin, but advancing the checkout failed: %s"
-                             % (r.stderr or r.stdout or "").strip()[-200:], ok=False)
+                _converge_note("main moved at origin, but advancing the checkout failed: %s"
+                               % (r.stderr or r.stdout or "").strip()[-200:])
                 _MAIN_DRIFT[0] = ""
                 return
         except Exception as e:
-            _sync_notice("main moved at origin, but the pull step failed: %s" % e, ok=False)
+            _converge_note("main moved at origin, but the pull step failed: %s" % e)
             _MAIN_DRIFT[0] = ""
             return
         if not _converge_install(tip[:8]):
             return
-    if kind == "restart" and _CONVERGE_INSTALL_FAILED[0]:
-        # the checkout sitting on disk is one whose install failed — booting it is exactly the
-        # stale-deps update the pull path refused; retry the install and restart only on a pass
-        if _CONVERGE_INSTALL_FAILED[0] == _sha8(_checkout_sha()):
-            if not _converge_install(_CONVERGE_INSTALL_FAILED[0]):
-                return
-        else:
-            _CONVERGE_INSTALL_FAILED[0] = ""          # a different sha landed since; latch is moot
+    if kind == "restart":
+        failed = _install_failed_sha()
+        if failed:
+            # the checkout sitting on disk is one whose install failed — booting it is exactly the
+            # stale-deps update the pull path refused; retry the install and restart only on a pass
+            if failed == _sha8(_checkout_sha()):
+                if not _converge_install(failed):
+                    return
+            else:
+                _set_install_failed("")               # a different sha landed since; latch is moot
     try:
-        import urllib.request
-        req = urllib.request.Request("http://127.0.0.1:%d/restart-all%s"
-                                     % (int(os.environ.get("ROMP_MANAGER_PORT") or 7432),
-                                        "" if immediate else "?when=quiet"), method="POST",
-                                     headers={"X-Romp-Manager-Token":
-                                              os.environ.get("ROMP_MANAGER_TOKEN", "")})
-        urllib.request.urlopen(req, timeout=5).read()
+        # DIRECT http.client, never urllib: urllib honors HTTP_PROXY, and with one set (NO_PROXY
+        # absent) this localhost POST — manager token included — went to the proxy
+        # (the user's audit, 2026-08-17). Same transport as the tag updater's restart helper.
+        c = http.client.HTTPConnection("127.0.0.1",
+                                       int(os.environ.get("ROMP_MANAGER_PORT") or 7432), timeout=5)
+        c.request("POST", "/restart-all" + ("" if immediate else "?when=quiet"),
+                  headers={"X-Romp-Manager-Token": os.environ.get("ROMP_MANAGER_TOKEN", "")})
+        resp = c.getresponse()
+        resp.read()
+        c.close()
+        if resp.status >= 400:
+            raise OSError("manager answered HTTP %d" % resp.status)
     except Exception as e:
-        _sync_notice("romp is updated on disk but the restart request failed (%s) — "
-                     "restart it yourself: romp refresh" % e, ok=False)
+        _converge_note("romp is updated on disk but the restart request failed (%s) — "
+                       "restart it yourself: romp refresh" % e)
 
 
 def _converge_install(sha8):
-    """Run install.sh for a converge; True on pass. A failure or timeout LATCHES the sha — the
-    checkout has already moved, and the report must say so rather than pretend nothing happened
-    (the adversarial review, 2026-08-17: a TimeoutExpired here read as 'the pull step failed')."""
+    """Run install.sh for a converge; True means EXIT 0 — nothing else does (an rc!=0 with empty
+    output counted as success in the first cut; the user's audit, 2026-08-17). A failure or timeout
+    latches the sha durably (_set_install_failed) — the checkout has already moved, and the report
+    must say so rather than pretend nothing happened. The advice is 'Update again', deliberately
+    NOT 'romp refresh': a refresh is precisely the restart-onto-the-broken-build the latch exists
+    to stop (same audit)."""
     try:
         inst = subprocess.run(["bash", str(ROOT / "install.sh")], cwd=str(ROOT),
                               capture_output=True, text=True, timeout=600)
-        why = (inst.stderr or inst.stdout or "").strip()[-200:] if inst.returncode != 0 else ""
+        ok = inst.returncode == 0
+        why = "" if ok else ((inst.stderr or inst.stdout or "").strip()[-200:]
+                             or "exit %d with no output" % inst.returncode)
     except subprocess.TimeoutExpired:
-        why = "timed out after 600s"
+        ok, why = False, "timed out after 600s"
     except Exception as e:
-        why = str(e)[:200]
-    if why:
-        _CONVERGE_INSTALL_FAILED[0] = sha8
-        _sync_notice("the checkout advanced to %s but install.sh failed: %s — nothing restarts "
-                     "onto it until install passes; fix it, then: romp refresh" % (sha8, why),
-                     ok=False)
+        ok, why = False, str(e)[:200]
+    if not ok:
+        _set_install_failed(sha8)
+        _converge_note("the checkout advanced to %s but install.sh failed: %s — nothing restarts "
+                       "onto it until install passes; fix the cause, then Update again" % (sha8, why))
         return False
-    _CONVERGE_INSTALL_FAILED[0] = ""
+    _set_install_failed("")
     return True
 
 
 def _update_check_loop():
     """The daemon thread: one pass at boot, then one per cadence, forever. The cheap main-drift probe
     runs every pass; the release-tag check keeps its six-hour stride."""
+    failed = _install_failed_sha()
+    if failed and failed == _sha8(_checkout_sha()):
+        # This kernel BOOTED a checkout whose install.sh never finished (an external restart —
+        # romp refresh, a reboot — ignores the latch by nature). Heal at boot: re-run the install
+        # (idempotent); the latch clears on a pass and the notice re-fires on another failure.
+        _converge_install(failed)
     last_release = 0.0
     while True:
         try:
@@ -25016,7 +25157,9 @@ class Handler(BaseHTTPRequestHandler):
                 # kernel answering after a successful update (same trick as the restart flow); polling
                 # this route is also what consumes a report the still-running kernel would otherwise
                 # sit on (the failure path, and the no-manager success).
-                failed, updated = _UPDATE_ERROR[0], ""
+                # converge refusals ride the same `failed` slot the banner already unsticks on —
+                # without this, a refused converge left the spinner polling forever (2026-08-17)
+                failed, updated = _UPDATE_ERROR[0] or _CONVERGE_ERROR[0], ""
                 if _UPDATE_STATE[0] == "running":
                     # PEEK before consuming: a success that is about to restart belongs to the NEXT
                     # kernel's boot — consuming it here would file the notice into this dying
@@ -25192,9 +25335,9 @@ class Handler(BaseHTTPRequestHandler):
                 kind = "pull" if d0 else ("restart" if d1 else "")  # in-flight converge write these,
                 if kind:                                  # and a re-read could pair "pull" with an
                     # emptied target — an UNBOUND checkout (the adversarial review, 2026-08-17)
-                    if kind == "pull" and _release_verify_enforced():
-                        # The banner never fires under a trust root, but the route must not trust
-                        # the banner: this install moves only via signed release tags.
+                    if kind == "pull" and _update_channel() != "dev":
+                        # The banner never fires on stable, but the route must not trust the
+                        # banner: a stable install moves only via signed release tags.
                         return self._send(409, json.dumps({"ok": False, "error":
                                           "this install updates only through signed release tags"}),
                                           "application/json")
