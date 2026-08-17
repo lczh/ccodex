@@ -2581,7 +2581,12 @@ def _migrate_channel():
         have = subprocess.run(["git", "-C", str(ROOT), "config", "--get", "romp.updateChannel"],
                               capture_output=True, text=True, timeout=10)
         v_cfg = have.stdout.strip() if have.returncode == 0 else ""
-        wants_dev = v_state == "dev" or (v_cfg == "dev" and (ROOT / ".git").is_dir())
+        # BOTH legacy spellings count only on the MAIN checkout: the state dir is per-user by
+        # default, so a linked worktree's kernel reading the shared v1.3.2 file would claim the
+        # MAIN install's dev opt-in as its own (the adversarial review, 2026-08-17).
+        if not (ROOT / ".git").is_dir():
+            return
+        wants_dev = v_state == "dev" or v_cfg == "dev"
         if wants_dev and not marker.exists():
             _atomic_write(marker, "dev")
         old.unlink(missing_ok=True)
@@ -2591,6 +2596,17 @@ def _migrate_channel():
     except Exception as e:
         _sync_notice("update-channel migration failed (%s) — a dev install may read STABLE until "
                      "bootstrap re-runs." % e, ok=False)
+
+
+def _refuse_half_installed():
+    """True when this kernel must NOT serve: the latch is still armed and either names the running
+    HEAD or HEAD cannot be read at all — an unreadable HEAD is unknown, not moot; treating it as
+    moot let a git failure fail the gate OPEN (the adversarial review, 2026-08-17)."""
+    armed = _install_failed_sha()
+    if not armed:
+        return False
+    cur = _sha8(_checkout_sha())
+    return not cur or armed == cur
 
 
 def _boot_heal():
@@ -2616,7 +2632,12 @@ def _boot_heal():
         failed = _install_failed_sha()                # re-read under the lock; a holder may have spent it
         if not failed:
             return
-        if failed != _sha8(_checkout_sha()):
+        cur = _sha8(_checkout_sha())
+        if not cur:
+            _converge_note("cannot read this checkout's HEAD while its install latch is armed — "
+                           "leaving the latch; nothing is healed or cleared on a guess.")
+            return                                    # unknown is NOT moot (fail closed)
+        if failed != cur:
             _set_install_failed("")                   # the move it recorded never landed; moot
             return
         _converge_install(failed, fd)
@@ -10047,7 +10068,7 @@ def _update_remote(host):
         "os.replace(tmp,lp)\n"
         'if subprocess.run(["git","-C",r,"reset","--hard",target]).returncode:\n'
         "    sys.exit(6)\n"
-        'if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r).returncode:\n'
+        'if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
         "    sys.exit(4)\n"
         "os.remove(lp)' "
         '"$GD/romp-update.lock" "$R" %s >/dev/null 2>&1; RRC=$?; '
@@ -27155,12 +27176,11 @@ def main():
     _migrate_channel()                                        # one-time: older channel spellings move into the worktree marker
     _boot_heal()                                              # a latched half-installed checkout heals FIRST — before
     #                                                           _ensure_bundles builds on it, before any subsystem
-    _armed = _install_failed_sha()
-    if _armed and _armed == _sha8(_checkout_sha()):
-        # The heal could not spend the latch (install failed again, or another process holds the
-        # lock). SERVING is not an option: subsystems on a half-installed build are the audit's
-        # exact scenario. Abort; the manager's backoff respawn — and romp-serve's own pre-exec
-        # gate — are the retry (the user's audit, 2026-08-17).
+    if _refuse_half_installed():
+        # The heal could not spend the latch (install failed again, another process holds the
+        # lock, or HEAD is unreadable). SERVING is not an option: subsystems on a half-installed
+        # build are the audit's exact scenario. Abort; the manager's backoff respawn — and
+        # romp-serve's own pre-exec gate — are the retry (the user's audits, 2026-08-17).
         sys.stderr.write("romp-kernel: this checkout's install never finished and could not be "
                          "healed at boot — refusing to serve a half-installed build.\n")
         sys.exit(70)

@@ -264,6 +264,41 @@ class UpdateRemote(unittest.TestCase):
             ops = log.read_text() if log.exists() else ""
             self.assertNotIn("reset --hard", ops, "and the reset never ran")
 
+    def test_the_INSTALLFAIL_wrapper_executed_arms_the_latch_and_a_pass_spends_it(self):
+        # string pins alone let the audited replant pass (this very file documents why); run the
+        # real apply script against a fixture whose install.sh fails, then one whose passes
+        import tempfile
+        from pathlib import Path
+        calls = self._wire(apply_out="SYNCED:abcdef0")
+        km._update_remote("TESTHOST")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        with tempfile.TemporaryDirectory() as td:
+            fix = Path(td) / "romp"
+            gd = fix / ".git"
+            gd.mkdir(parents=True)
+            fakebin = Path(td) / "bin"
+            fakebin.mkdir()
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "esac\nexit 0\n" % gd)
+            (fakebin / "git").chmod(0o755)
+            (fix / "install.sh").write_text("#!/bin/sh\nexit 1\n")
+            (fix / "install.sh").chmod(0o755)
+            env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
+            apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("INSTALLFAIL", a.stdout, "a failed install is its own executed verdict")
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2",
+                             "the remote latch stays ARMED for its boot heal")
+            (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertNotIn("INSTALLFAIL", a.stdout)
+            self.assertFalse((gd / "romp-install-failed").exists(),
+                             "a passing install spends the latch, executed end to end")
+
     def test_the_apply_recheck_catches_an_edit_landing_after_the_probe(self):
         # the discover-step dirty probe is an ssh round-trip old by apply time; an edit landing in
         # that window must be re-caught IN THE SAME SHELL as the reset, or reset --hard destroys it

@@ -203,7 +203,13 @@ fi
 # would authorize converging it onto a main it never asked to follow. Everything else — tags
 # included — is stable; re-running bootstrap follows the last explicit choice.
 channel="stable"
-[ "$ref" = "main" ] && channel="dev"
+# dev means the MAIN BRANCH opt-in in any spelling (main / refs/heads/main / origin/main) — and
+# never a TAG that happens to be named main: a tag install is a pinned, verified artifact
+# whatever its name, and a branch install under another spelling is still main-tracking
+# (the adversarial review, 2026-08-17).
+if [ "$is_tag" -eq 0 ]; then
+    case "$ref" in main|refs/heads/main|origin/main) channel="dev" ;; esac
+fi
 # The marker lives in the WORKTREE's own git dir: `git config --local` is repository-scoped, so a
 # dev worktree could flip a sibling release worktree's channel via the shared config (the
 # user's audit, 2026-08-17). The legacy key is unset so it can never shadow the marker.

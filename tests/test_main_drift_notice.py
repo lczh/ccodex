@@ -499,16 +499,83 @@ class BootHeal(unittest.TestCase):
         self.assertLess(heal, src.index("    _boot_warm()"),
                         "the heal precedes every subsystem start — half-installed code must not serve")
 
+    def test_refuse_half_installed_decides_functionally_and_fails_closed(self):
+        # the abort gate was only source-pinned; an inverted condition passed (the adversarial
+        # review, 2026-08-17) — drive the decision itself, unreadable-HEAD case included
+        with mock.patch.object(km, "_install_failed_sha", return_value=""):
+            self.assertFalse(km._refuse_half_installed(), "no latch → serve")
+        with mock.patch.object(km, "_install_failed_sha", return_value="f" * 8):
+            with mock.patch.object(km, "_checkout_sha", return_value="f" * 8):
+                self.assertTrue(km._refuse_half_installed(), "latched for the running HEAD → refuse")
+            with mock.patch.object(km, "_checkout_sha", return_value="00000000"):
+                self.assertFalse(km._refuse_half_installed(), "latched for another commit → moot → serve")
+            with mock.patch.object(km, "_checkout_sha", return_value=""):
+                self.assertTrue(km._refuse_half_installed(),
+                                "unreadable HEAD is UNKNOWN, not moot — fail closed")
+
+    def test_set_install_failed_reports_whether_the_intent_landed(self):
+        # the audited noticed-but-proceeded bug replants green without this: the arm's return is
+        # what blocks the move (the adversarial review, 2026-08-17)
+        with mock.patch.object(km, "_sync_notice"):
+            with mock.patch.object(km, "_install_latch_path", return_value=None):
+                self.assertFalse(km._set_install_failed("f" * 8), "nowhere to persist → False")
+            self.assertTrue(km._set_install_failed("f" * 8))
+            self.assertEqual(km._install_failed_sha(), "f" * 8)
+            self.assertTrue(km._set_install_failed(""), "a clear that lands reports True")
+            self.assertEqual(km._install_failed_sha(), "")
+
+    def test_boot_heal_leaves_the_latch_when_HEAD_is_unreadable(self):
+        km._set_install_failed("f" * 8)
+        try:
+            with mock.patch.object(km, "_checkout_sha", return_value=""), \
+                 mock.patch.object(km, "_sync_notice"), \
+                 mock.patch.object(km, "_converge_install",
+                                   side_effect=AssertionError("nothing is healed on a guess")):
+                km._boot_heal()
+            self.assertEqual(km._install_failed_sha(), "f" * 8,
+                             "unknown HEAD clears nothing — the record survives")
+        finally:
+            km._set_install_failed("")
+
+    def test_migrate_channel_claims_dev_only_on_the_main_checkout(self):
+        # the v1.3.2 STATE file is per-USER by default: a linked worktree's kernel reading it
+        # would claim the MAIN install's dev opt-in as its own (the adversarial review, 2026-08-17)
+        import subprocess as sp
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td) / "gd"; gd.mkdir()
+            state_file = km.jd.STATE / "update-channel"
+            # linked worktree (.git a file): never claims, never consumes
+            wt = Path(td) / "wt"; wt.mkdir(); (wt / ".git").write_text("gitdir: /elsewhere\n")
+            state_file.write_text("dev\n")
+            with mock.patch.object(km, "_update_git_dir", return_value=gd), \
+                 mock.patch.object(km, "ROOT", wt), \
+                 mock.patch.object(km.subprocess, "run",
+                                   return_value=sp.CompletedProcess([], 1, stdout="", stderr="")):
+                km._migrate_channel()
+            self.assertFalse((gd / "romp-update-channel").exists(), "a worktree never claims the shared file")
+            self.assertTrue(state_file.exists(), "and leaves it for the main checkout's kernel")
+            # main checkout (.git a dir): claims it into the marker and consumes the old spelling
+            mn = Path(td) / "mn"; (mn / ".git").mkdir(parents=True)
+            with mock.patch.object(km, "_update_git_dir", return_value=gd), \
+                 mock.patch.object(km, "ROOT", mn), \
+                 mock.patch.object(km.subprocess, "run",
+                                   return_value=sp.CompletedProcess([], 1, stdout="", stderr="")):
+                km._migrate_channel()
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "dev")
+            self.assertFalse(state_file.exists(), "consumed")
+
     def test_boot_ABORTS_when_the_latch_survives_the_heal(self):
         # returning after a failed/contended heal started every subsystem on the half-installed
         # checkout anyway (the user's audit, 2026-08-17): serving is not an option; the manager's
-        # backoff respawn — and romp-serve's pre-exec gate — are the retry
+        # backoff respawn — and romp-serve's pre-exec gate — are the retry. The DECISION is
+        # functionally tested above; this pins that main actually consults it and exits.
         src = inspect.getsource(km)
-        gate = src.index("_armed = _install_failed_sha()")
+        gate = src.index("    if _refuse_half_installed():")
         self.assertLess(src.index("    _boot_heal()"), gate)
         self.assertLess(gate, src.index("    _ensure_bundles()"))
         self.assertIn("sys.exit(70)", src[gate:gate + 800],
-                      "still latched for the running HEAD → refuse to serve")
+                      "still latched (or unreadable) → refuse to serve")
 
 
 if __name__ == "__main__":

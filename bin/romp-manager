@@ -240,6 +240,11 @@ function managerStale() { return fileStamp(SELF_PATH) !== SELF_STAMP; }
 // port is held by a foreign process). Escalate the delay so we never hot-spin a doomed spawn.
 const QUICK_CRASH_MS = 2000;
 const MAX_BACKOFF_MS = 10000;
+// Exit 70 is romp-serve/the kernel REFUSING to serve a half-installed checkout (its install latch
+// is armed and install.sh keeps failing). That is a policy refusal, not a crash: a slow-failing
+// install outlives QUICK_CRASH_MS, so the quick-crash counter reset back-to-back install attempts
+// forever (the adversarial review, 2026-08-17). A fixed long delay is the honest cadence.
+const HALF_INSTALLED_BACKOFF_MS = 60000;
 
 // Restart-storm guard (the user 2026-06-24): the kernel was SIGTERM'd + respawned 300+ times in a tight
 // loop because every /restart restarted 1:1 — concurrent `romp refresh`es (heavy fleet kernel work) or a
@@ -297,8 +302,10 @@ function spawnKernel(spec) {
     cur.restarts++;
     // crash-loop? back off. A healthy run (uptime ≥ QUICK_CRASH_MS) resets the counter.
     cur.quickCrashes = (Date.now() - cur.startedAt) < QUICK_CRASH_MS ? cur.quickCrashes + 1 : 0;
-    const delay = Math.min(cur.quickCrashes * 1000, MAX_BACKOFF_MS);
-    log(`kernel '${spec.id}' exited (code=${code} sig=${sig || '-'}) — respawning in ${delay}ms [#${cur.restarts}]`);
+    const delay = code === 70 ? HALF_INSTALLED_BACKOFF_MS
+                              : Math.min(cur.quickCrashes * 1000, MAX_BACKOFF_MS);
+    log(`kernel '${spec.id}' exited (code=${code} sig=${sig || '-'}) — respawning in ${delay}ms [#${cur.restarts}]`
+        + (code === 70 ? ' (half-installed checkout: install.sh must pass before it serves)' : ''));
     setTimeout(() => {
       const c = kernels.get(spec.id);
       if (c && c.child === child && !c.stopping) spawnKernel(spec);   // still ours & not asked to stop

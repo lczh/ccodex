@@ -92,35 +92,59 @@ PY="$(pick_python)"
 # GATE ON THE INSTALL LATCH before the kernel ever execs (the user's audit, 2026-08-17: module
 # imports and subsystems otherwise start on a half-installed checkout before any in-kernel heal
 # can run). An armed latch naming THIS HEAD means the last update moved the code but install.sh
-# never finished: run it here, under the checkout's own update lock, and refuse to start the
-# kernel unless it passes -- the manager's backoff respawn is the retry. A latch naming some
-# OTHER commit is moot (that move never landed) and is cleared.
-GD="$(git -C "$ROMP_DIR" rev-parse --absolute-git-dir 2>/dev/null || true)"
-LATCH="${GD:+$GD/romp-install-failed}"
-if [[ -n "$GD" && -s "$LATCH" ]]; then
-    _want="$(head -c 8 "$LATCH" 2>/dev/null || true)"
-    _cur="$(git -C "$ROMP_DIR" rev-parse --short=8 HEAD 2>/dev/null | head -c 8 || true)"
-    if [[ -n "$_want" && "$_want" != "$_cur" ]]; then
-        rm -f "$LATCH"
-    elif [[ -n "$_want" ]]; then
-        echo "romp-serve: this checkout's last install never finished -- running install.sh before the kernel starts" >&2
-        if python3 - "$GD/romp-update.lock" "$ROMP_DIR" <<'LOCKPY'
+# never finished: heal it here and refuse to start the kernel unless install passes — the
+# manager's backoff respawn is the retry. EVERY latch read, moot-check, and clear happens inside
+# ONE flock-holding python (the adversarial review, 2026-08-17: the first cut moot-cleared and
+# rm'd outside the lock, re-introducing at the shell level the erased-live-latch race the
+# kernel's _boot_heal fix documents; and an unreadable HEAD must fail CLOSED, never read as
+# "moot" — a git failure is not permission to erase the only recovery record). The lock fd rides
+# into install.sh (pass_fds) so an orphaned installer keeps holding it.
+# Exit 0 = clear to start; 70 = refuse (latched and unhealed, lock held elsewhere, HEAD unreadable).
+if ! python3 - "$ROMP_DIR" <<'GATEPY'
 import fcntl, os, subprocess, sys
-fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+
+root = sys.argv[1]
+gd = subprocess.run(["git", "-C", root, "rev-parse", "--absolute-git-dir"],
+                    capture_output=True, text=True)
+gdir = (gd.stdout or "").strip()
+if gd.returncode or not gdir:
+    sys.exit(0)                        # not a git checkout: no latch can exist to gate on
+latch = os.path.join(gdir, "romp-install-failed")
+try:
+    want = open(latch).read().strip()[:8]
+except OSError:
+    sys.exit(0)                        # no latch: clear to start
+fd = os.open(os.path.join(gdir, "romp-update.lock"), os.O_RDWR | os.O_CREAT, 0o644)
 try:
     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 except OSError:
-    sys.exit(3)
-sys.exit(subprocess.run(["bash", os.path.join(sys.argv[2], "install.sh")], cwd=sys.argv[2]).returncode)
-LOCKPY
-        then
-            rm -f "$LATCH"
-        else
-            echo "romp-serve: install.sh did not pass (or another update holds this checkout's lock) --" >&2
-            echo "  refusing to start a kernel on a half-installed build; the manager retries with backoff." >&2
-            exit 70
-        fi
-    fi
+    sys.exit(70)                       # an update/heal is running this instant: do not start on it
+# UNDER the lock: re-read (the holder may have spent it), moot-check, heal, clear.
+try:
+    want = open(latch).read().strip()[:8]
+except OSError:
+    sys.exit(0)
+if not want:
+    os.remove(latch)
+    sys.exit(0)
+cur = subprocess.run(["git", "-C", root, "rev-parse", "--short=8", "HEAD"],
+                     capture_output=True, text=True)
+cur8 = (cur.stdout or "").strip()[:8]
+if cur.returncode or not cur8:
+    sys.exit(70)                       # unreadable HEAD: fail CLOSED, never "moot"
+if want != cur8:
+    os.remove(latch)                   # the move it recorded never landed — moot, cleared under the lock
+    sys.exit(0)
+sys.stderr.write("romp-serve: this checkout's last install never finished — running install.sh before the kernel starts\n")
+if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root, pass_fds=(fd,)).returncode:
+    sys.exit(70)                       # latch stays armed for the next retry
+os.remove(latch)                       # healed — spent under the same lock
+sys.exit(0)
+GATEPY
+then
+    echo "romp-serve: install.sh did not pass (or another update holds this checkout's lock, or HEAD is unreadable) --" >&2
+    echo "  refusing to start a kernel on a half-installed build; the manager retries with backoff." >&2
+    exit 70
 fi
 
 # Map onto the kernel's env, then exec it (preserving the PID for the manager).

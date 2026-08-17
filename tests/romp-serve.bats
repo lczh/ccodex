@@ -228,3 +228,20 @@ _latch_fixture() {
     [[ "$output" != *INSTALL_RAN* ]]
     [ ! -e "$GD/romp-install-failed" ]
 }
+
+@test "romp-serve: an UNREADABLE HEAD with an armed latch refuses — never reads as moot" {
+    _latch_fixture
+    printf '%s' "$CUR" > "$GD/romp-install-failed"
+    printf 'ref: refs/heads/never-born\n' > "$GD/HEAD"   # repo still detected; HEAD unresolvable
+    run "$FIX/bin/romp-serve"
+    [ "$status" -eq 70 ]
+    [[ "$output" != *KERNEL_RAN* ]]
+    [ -s "$GD/romp-install-failed" ]                   # a git failure never erases the record
+}
+
+@test "romp-manager: exit 70 respawns on the long half-installed cadence, not the crash counter" {
+    # a slow-failing install outlives the quick-crash window, so the counter reset back-to-back
+    # install attempts forever (the adversarial review, 2026-08-17); code 70 gets a fixed delay
+    grep -q "HALF_INSTALLED_BACKOFF_MS = 60000" "$BIN/romp-manager"
+    grep -q "code === 70 ? HALF_INSTALLED_BACKOFF_MS" "$BIN/romp-manager"
+}
