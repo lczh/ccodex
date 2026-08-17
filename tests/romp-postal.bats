@@ -34,17 +34,26 @@ setup() {
     chmod +x "$MOCK/tmux"
     export PATH="$MOCK:$PATH"
 
-    "$POSTAL" serve >/dev/null 2>&1 &
-    BUS_PID=$!
     # Readiness is load-bearing: every test assumes the bus is up, and proceeding without it surfaces as a
     # confusing DOWNSTREAM failure (a 2026-08-14 CI runner lost this race: "remote --force" probed a port
     # the bus hadn't bound yet and failed three asserts later, reading like a tunnel bug). Fail HERE,
     # naming the real problem. A dead bus process is the early exit; the doubled bound is only a backstop.
-    local up=0 _
-    for _ in $(seq 1 100); do
-        curl -s "127.0.0.1:$ROMP_POSTAL_PORT/ping" >/dev/null 2>&1 && { up=1; break; }
-        kill -0 "$BUS_PID" 2>/dev/null || break
-        sleep 0.1
+    # ONE relaunch when the process DIED (vs. merely slow): the fixed port can still be held for a
+    # beat by the previous test's exiting bus on a slow runner — teardown now waits, but a bus that
+    # lost that race exits instantly, and a single fresh start after it is the event-shaped retry
+    # (a 2026-08-17 CI runner hit exactly this: pid dead at setup, green on rerun).
+    local up=0 attempt _
+    for attempt in 1 2; do
+        "$POSTAL" serve >/dev/null 2>&1 &
+        BUS_PID=$!
+        for _ in $(seq 1 100); do
+            curl -s "127.0.0.1:$ROMP_POSTAL_PORT/ping" >/dev/null 2>&1 && { up=1; break; }
+            kill -0 "$BUS_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        [ "$up" = 1 ] && break
+        kill -0 "$BUS_PID" 2>/dev/null && break      # alive but never ready: relaunching won't help
+        wait "$BUS_PID" 2>/dev/null || true          # died (lost the port race) → one fresh start
     done
     if [ "$up" != 1 ]; then
         local alive=no; kill -0 "$BUS_PID" 2>/dev/null && alive=yes
@@ -55,6 +64,7 @@ setup() {
 
 teardown() {
     kill "$BUS_PID" 2>/dev/null
+    wait "$BUS_PID" 2>/dev/null || true    # the port must actually be FREE before the next setup binds it
     rm -rf "$TEST_DIR"
 }
 

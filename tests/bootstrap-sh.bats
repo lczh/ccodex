@@ -36,6 +36,13 @@ setup() {
     chmod +x "$ROMP_REPO/install.sh"
     touch "$ROMP_REPO/kernel/.keep"
     git -C "$ROMP_REPO" init -q -b main .
+    # The fixture takes several commits+tags per test; git's background auto-gc can then REPACK the
+    # fixture while bootstrap's clone is copying its packs — the pack file vanishes mid-copy and the
+    # clone dies with ENOENT on a .tmp-*-pack-*.rev (a 2026-08-17 CI runner, green on rerun). The
+    # fixture never needs gc; forbid it outright so the clone can't race it.
+    git -C "$ROMP_REPO" config gc.auto 0
+    git -C "$ROMP_REPO" config gc.autoDetach false
+    git -C "$ROMP_REPO" config maintenance.auto false
     git -C "$ROMP_REPO" config gpg.format ssh
     git -C "$ROMP_REPO" config user.signingKey "$TEST_DIR/release-key"
     git -C "$ROMP_REPO" config user.email release@example.invalid
