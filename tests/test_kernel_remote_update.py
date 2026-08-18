@@ -298,6 +298,25 @@ class UpdateRemote(unittest.TestCase):
             self.assertNotIn("INSTALLFAIL", a.stdout)
             self.assertFalse((gd / "romp-install-failed").exists(),
                              "a passing install spends the latch, executed end to end")
+            # the reset must target the exact 40-char sha the push validated — the scratch ref
+            # is force-updated by any concurrent sender (the user's audit, 2026-08-18). The sha
+            # rides into the wrapper as its argv target, and the wrapper resets to that target.
+            self.assertIn('"$R" %s' % ("1" * 40), apply_r,
+                          "the wrapper's target argv is the pinned sha, never the mutable ref")
+            self.assertIn('"reset","--hard",target', apply_r.replace("'", '"'),
+                          "and the reset acts on exactly that target")
+            # the ancestry check lives INSIDE the locked wrapper; a non-ancestor target must
+            # refuse with DIVERGED, executed — make merge-base fail and rerun
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' merge-base '*) exit 1;;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "esac\nexit 0\n" % gd)
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("DIVERGED", a.stdout, "divergence is decided UNDER the lock, executed")
+            self.assertFalse((gd / "romp-install-failed").exists(),
+                             "a diverged refusal arms nothing and moves nothing")
 
     def test_the_apply_recheck_catches_an_edit_landing_after_the_probe(self):
         # the discover-step dirty probe is an ssh round-trip old by apply time; an edit landing in

@@ -2275,13 +2275,29 @@ def _update_flock_wait(seconds):
     """_update_flock with a bounded wait: retry the non-blocking acquire until `seconds` pass.
     Boot-time healing must not fail open just because an updater holds the lock THIS instant —
     reading the latch before locking let a kernel start mid-update (the user's audit,
-    2026-08-18). Returns the locked fd or None on timeout."""
+    2026-08-18). Retries ONLY the genuinely-HELD case: an unresolvable git dir or an unopenable
+    lockfile can never change by waiting, and spinning on them stalled every boot of a non-git
+    install the full window (the adversarial review, same day). None on timeout/unresolvable."""
+    gd = _update_git_dir()
+    if gd is None:
+        return None
+    try:
+        fd = os.open(str(gd / "romp-update.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return None
     deadline = time.time() + seconds
     while True:
-        fd = _update_flock()
-        if fd is not None or time.time() >= deadline:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return fd
-        time.sleep(0.5)
+        except OSError:
+            if time.time() >= deadline:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                return None
+            time.sleep(0.5)
 
 
 def _update_flock():
@@ -2500,6 +2516,7 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
             # crash/kill/reboot between the checkout and that write booting half-installed code
             # with no record (the user's audit, 2026-08-17). A crash anywhere past this line finds
             # the latch matching the new HEAD at boot and heals; a failed checkout disarms it.
+            prior_latch = _install_failed_sha()   # somebody's recovery record — never OURS to erase
             if not _set_install_failed(tip[:8]):
                 # an intent that cannot PERSIST blocks the move outright — an unwritable git dir
                 # must never mean "proceed unrecorded" (the user's audit, 2026-08-17)
@@ -2509,7 +2526,10 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
             r = subprocess.run(["git", "checkout", "--detach", tip], cwd=str(ROOT),
                                capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
-                _set_install_failed("")               # HEAD did not move; nothing to heal
+                _set_install_failed(prior_latch)      # HEAD did not move; RESTORE, never blank —
+                #                                       clearing erased a pre-existing latch that
+                #                                       protected a half-installed build (the
+                #                                       adversarial review, 2026-08-18)
                 _converge_note("main moved at origin, but advancing the checkout failed: %s"
                                % (r.stderr or r.stdout or "").strip()[-200:])
                 _MAIN_DRIFT[0] = ""
@@ -2622,10 +2642,27 @@ def _migrate_channel():
                      "bootstrap re-runs." % e, ok=False)
 
 
+def _inside_update_txn():
+    """True while the install transaction that SPAWNED this process is still alive (bootstrap's
+    TXNPY exports its pid): its lock and latch govern the checkout, and gating against it
+    deadlocked the fresh install's link poll (the adversarial review, 2026-08-18). The pid check
+    keeps a long-lived manager from carrying the bypass past the transaction's death."""
+    txn = os.environ.get("ROMP_INSIDE_UPDATE_TXN", "")
+    if not txn.isdigit():
+        return False
+    try:
+        os.kill(int(txn), 0)
+        return True
+    except OSError:
+        return False
+
+
 def _refuse_half_installed():
     """True when this kernel must NOT serve: the latch is still armed and either names the running
     HEAD or HEAD cannot be read at all — an unreadable HEAD is unknown, not moot; treating it as
     moot let a git failure fail the gate OPEN (the adversarial review, 2026-08-17)."""
+    if _inside_update_txn():
+        return False
     armed = _install_failed_sha()
     if not armed:
         return False
@@ -2644,6 +2681,8 @@ def _boot_heal(wait_s=0):
     and its merge (the adversarial review, 2026-08-17). Contention is a LOUD skip, and the update
     check loop calls back here every pass — a held lock at boot (that very orphaned installer
     keeping the flock alive through the kernel's death) is retried, never a forever-unhealed hole."""
+    if _inside_update_txn():
+        return                                        # the transaction that spawned us owns the checkout
     # The LOCK comes FIRST: reading the latch before locking left a fail-open window where an
     # updater held the lock but had not armed the latch yet (the user's audit, 2026-08-18). At
     # boot the wait is generous (a live install may hold it); the check-loop retry uses no wait —
@@ -10309,12 +10348,13 @@ def _pull_remote(host, expected_sha=None):
         if lock_fd is None:
             return False, "another update is already running on this checkout — try again when it finishes"
         try:
+            prior_latch = _install_failed_sha()   # a pre-existing record is not ours to erase
             if not _set_install_failed(_sha8(fetched_sha)):
                 return False, "could not record the install intent — not moving HEAD"
             m = subprocess.run(["git", "-C", str(ROOT), "merge", "--ff-only", fetched_sha],
                                capture_output=True, text=True, timeout=30)
             if m.returncode != 0:
-                _set_install_failed("")    # HEAD did not move; nothing to heal
+                _set_install_failed(prior_latch)   # HEAD did not move; restore, never blank
                 return False, ("fast-forward failed: %s"
                                % ((m.stderr or m.stdout or "").strip()[:160] or "unknown"))
             installed = _converge_install(_sha8(fetched_sha), lock_fd)

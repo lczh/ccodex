@@ -170,6 +170,13 @@ class PullRemote(unittest.TestCase):
         self.assertTrue(any("install.sh" in str(a) for c in calls for a in c),
                         "install.sh is part of the transaction, not an afterthought")
         self.assertEqual(km._install_failed_sha(), "", "a passing install spends the latch")
+        merge = next(a for a in calls if a[0] == "git" and "merge" in a and "merge-base" not in a)
+        self.assertIn(REMOTE, merge, "the merge binds to the pinned validated sha")
+        self.assertNotIn("FETCH_HEAD", merge,
+                         "never mutable FETCH_HEAD — a concurrent fetch rewrites it "
+                         "(the user's audit, 2026-08-18)")
+        anc = next(a for a in calls if a[0] == "git" and "merge-base" in a)
+        self.assertNotIn("FETCH_HEAD", anc)
 
     def test_a_failed_install_after_the_pull_keeps_the_latch_and_says_so(self):
         self._wire(install_rc=1)

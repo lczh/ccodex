@@ -404,7 +404,7 @@ class RunUpdate(Fresh):
                 self.assertFalse(km._run_update("v0.7.0"))
             self.assertIn("readable regular file", km._UPDATE_ERROR[0])
 
-    def _execute_captured_updater(self, verify_rc, enforce=False, install_rc=0):
+    def _execute_captured_updater(self, verify_rc, enforce=False, install_rc=0, manager_port=None):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "repo"; root.mkdir()
             (root / ".git").mkdir()                   # the interprocess update flock lives here
@@ -441,6 +441,8 @@ class RunUpdate(Fresh):
             # with global signers would otherwise flip the no-trust-root cases
             env.update(PATH=str(fakebin) + os.pathsep + env.get("PATH", ""),
                        GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+            if manager_port is not None:
+                env["ROMP_MANAGER_PORT"] = str(manager_port)
             if enforce == "global":
                 # the trust root lives ONLY in the global git config, and only behind an [include]
                 # — the exact resolution a raw file scan missed (the user's audit, 2026-08-16);
@@ -473,6 +475,16 @@ class RunUpdate(Fresh):
             latch = root / ".git" / "romp-install-failed"   # checkout-scoped, beside the update lock
             self._latch = latch.read_text().strip() if latch.exists() else None
             return ran.returncode, rows, report
+
+    def test_the_report_states_what_the_restart_actually_did(self):
+        # restarted:true was written BEFORE the manager request; when that request failed,
+        # /update-check waited forever on a restart that never happened (the user's audit,
+        # 2026-08-18). Executed: a dead manager port → the helper fails → ok + restarted:false.
+        rc, rows, report = self._execute_captured_updater(0, manager_port=1)
+        self.assertEqual(rc, 0)
+        self.assertTrue(report["ok"])
+        self.assertFalse(report["restarted"],
+                         "the report says what HAPPENED, not what was hoped")
 
     def test_good_signature_verifier_allows_merge_and_install(self):
         rc, rows, report = self._execute_captured_updater(0)

@@ -104,6 +104,18 @@ if ! python3 - "$ROMP_DIR" <<'GATEPY'
 import errno, fcntl, os, subprocess, sys, time
 
 root = sys.argv[1]
+# INSIDE the install transaction (bootstrap's TXNPY runs install.sh, which starts the service,
+# whose manager spawns THIS gate — all while TXNPY holds the update lock), waiting on the lock
+# deadlocked the fresh install's dashboard-link poll against our own transaction (the adversarial
+# review, 2026-08-18). The marker names the transaction's pid and counts only while it is alive,
+# so a manager that outlives bootstrap cannot carry the bypass forward.
+txn = os.environ.get("ROMP_INSIDE_UPDATE_TXN", "")
+if txn.isdigit():
+    try:
+        os.kill(int(txn), 0)
+        sys.exit(0)                    # the transaction owns the checkout; its verdict governs
+    except OSError:
+        pass                           # holder is gone: the marker is stale — gate normally
 gd = subprocess.run(["git", "-C", root, "rev-parse", "--absolute-git-dir"],
                     capture_output=True, text=True)
 gdir = (gd.stdout or "").strip()
@@ -114,7 +126,13 @@ if gd.returncode or not gdir:
 # move under the booting kernel's imports (the user's audit, 2026-08-18, reproduced directly).
 # Bounded wait: a live install can legitimately hold this for a while; sibling kernels booting
 # together contend for microseconds. Timing out still refuses (exit 70), never proceeds blind.
-fd = os.open(os.path.join(gdir, "romp-update.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+latch = os.path.join(gdir, "romp-install-failed")
+try:
+    fd = os.open(os.path.join(gdir, "romp-update.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+except OSError:
+    # can't even open the lock (read-only/unowned git dir): with NO latch there is nothing to
+    # gate — such a checkout can't host updates either; with one, protect it (fail closed)
+    sys.exit(70 if os.path.exists(latch) else 0)
 deadline = time.time() + float(os.environ.get("ROMP_GATE_LOCK_WAIT", "90"))
 while True:
     try:
@@ -125,7 +143,6 @@ while True:
             sys.exit(70)               # an update/heal is still running: do not start on it
         time.sleep(0.5)
 # UNDER the lock: read, moot-check, heal, clear.
-latch = os.path.join(gdir, "romp-install-failed")
 try:
     want = open(latch).read().strip()[:8]
 except FileNotFoundError:

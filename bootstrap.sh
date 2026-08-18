@@ -207,11 +207,19 @@ elif git -C "$DIR" show-ref --verify --quiet "refs/remotes/origin/$ref"; then
     # doing so used to reinstall stale local code while announcing a successful update.
     target="$(git -C "$DIR" rev-parse "refs/remotes/origin/$ref")" || {
         echo "romp: origin/$ref could not be resolved to a commit." >&2; exit 1; }
+    # LATCH-COHERENT move order (the adversarial review, 2026-08-18: checkout-then-ff-merge moved
+    # HEAD to the stale local tip and a failed merge then erased the latch as "nothing moved").
+    # The ancestry check runs FIRST (read-only; a diverged branch refuses before anything moves),
+    # then HEAD detaches onto the exact target — so from the first move onward the armed latch
+    # matches HEAD — and only then does the local branch label catch up.
     if git -C "$DIR" show-ref --verify --quiet "refs/heads/$ref"; then
-        set -- checkout --quiet "$ref" -- merge --quiet --ff-only "origin/$ref"
-    else
-        set -- checkout --quiet -b "$ref" "origin/$ref" -- merge --quiet --ff-only "origin/$ref"
+        if ! git -C "$DIR" merge-base --is-ancestor "refs/heads/$ref" "$target"; then
+            echo "romp: local branch $ref cannot fast-forward to origin/$ref; refusing to install stale code." >&2
+            echo "  Resolve or preserve the local commits, then rerun bootstrap.sh." >&2
+            exit 1
+        fi
     fi
+    set -- checkout --quiet --detach "$target" -- branch --quiet -f "$ref" "$target" -- checkout --quiet "$ref"
 else
     # Tags and explicit commit IDs are immutable checkouts; pulling them is neither useful nor valid.
     target="$(git -C "$DIR" rev-parse "$ref^{commit}" 2>/dev/null)" || {
@@ -244,18 +252,50 @@ while True:
             sys.exit(3)
         time.sleep(0.5)
 latch = os.path.join(gdir, "romp-install-failed")
-tmp = latch + ".tmp"
-try:
+
+
+def head8():
+    r = subprocess.run(["git", "-C", root, "rev-parse", "--short=8", "HEAD"],
+                       capture_output=True, text=True)
+    return (r.stdout or "").strip()[:8] if r.returncode == 0 else ""
+
+
+def write_latch(sha8):
+    tmp = latch + ".tmp"
     with open(tmp, "w") as f:
-        f.write(target[:8])
+        f.write(sha8)
     os.replace(tmp, latch)
+
+
+try:
+    prior = open(latch).read().strip()[:8]   # a pre-existing armed latch is somebody's only
+except OSError:                              # recovery record — never destroy it on OUR failure
+    prior = ""
+pre_head = head8()
+try:
+    write_latch(target[:8])
 except OSError:
     sys.exit(5)
 for mv in moves:
     if subprocess.run(["git", "-C", root] + mv).returncode:
-        os.remove(latch)               # nothing moved past a failed step's refusal — moot
+        # A failed move must leave an HONEST latch (the adversarial review, 2026-08-18: an
+        # unconditional remove erased the record after a step that DID move HEAD, and erased a
+        # pre-existing latch protecting a half-installed build). HEAD unmoved → restore what was
+        # there before; HEAD moved → arm for wherever we actually landed.
+        now = head8()
+        try:
+            if now and now != pre_head:
+                write_latch(now)
+            elif prior:
+                write_latch(prior)
+            else:
+                os.remove(latch)
+        except OSError:
+            pass                             # the armed target latch stays — fail closed
         sys.exit(6)
-if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root, pass_fds=(fd,)).returncode:
+env = dict(os.environ, ROMP_INSIDE_UPDATE_TXN=str(os.getpid()))
+if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root, pass_fds=(fd,),
+                  env=env).returncode:
     sys.exit(4)                        # latch stays armed: nothing runs this build until install passes
 os.remove(latch)
 sys.exit(0)

@@ -363,6 +363,33 @@ class ConvergeFunctional(unittest.TestCase):
         steps, _ = self._run()
         self.assertEqual(steps, [], "a second converge while one runs is a no-op")
 
+    def test_boot_heal_takes_the_lock_before_any_latch_read(self):
+        # reading first left a fail-open window where an updater held the lock but had not armed
+        # the latch yet (the user's audit, 2026-08-18)
+        src = inspect.getsource(km._boot_heal)
+        self.assertLess(src.index("_update_flock"), src.index("_install_failed_sha"),
+                        "lock, THEN read — never the reverse")
+
+    def test_update_flock_wait_retries_only_the_genuinely_held_case(self):
+        # spinning on an unresolvable git dir stalled every boot of a non-git install the full
+        # window (the adversarial review, 2026-08-18): only "held" can change by waiting
+        import time as _t
+        with mock.patch.object(km, "_update_git_dir", return_value=None):
+            t0 = _t.time()
+            self.assertIsNone(km._update_flock_wait(5), "unresolvable → None")
+            self.assertLess(_t.time() - t0, 2, "…and INSTANTLY, no spin")
+        fd = km._update_flock()
+        self.assertIsNotNone(fd)
+        try:
+            t0 = _t.time()
+            self.assertIsNone(km._update_flock_wait(1), "held → bounded wait → None")
+            self.assertGreaterEqual(_t.time() - t0, 0.9)
+        finally:
+            km.os.close(fd)
+        fd2 = km._update_flock_wait(1)
+        self.assertIsNotNone(fd2, "free → acquired")
+        km.os.close(fd2)
+
     def test_the_interprocess_flock_refuses_a_second_update(self):
         # several kernels can share one checkout, and the tag path races the converge: only the
         # flock serializes them (the user's audit, 2026-08-17). Hold it; the converge must refuse.

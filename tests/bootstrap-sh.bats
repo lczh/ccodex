@@ -399,3 +399,42 @@ HOLDPY
     [[ "$output" == *"another update holds"* ]]
     [[ "$output" != *STUB_INSTALL_RAN* ]]
 }
+
+@test "bootstrap.sh: an unpersistable install intent refuses BEFORE anything moves (exit-5 leg)" {
+    ROMP_DIR="$HOME/romp" bash "$REPO_ROOT/bootstrap.sh"
+    gd="$(git -C "$HOME/romp" rev-parse --absolute-git-dir)"
+    git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m r3
+    git -C "$ROMP_REPO" tag -s v0.3.0 -m v0.3.0
+    head_before="$(git -C "$HOME/romp" rev-parse HEAD)"
+    mkdir "$gd/romp-install-failed.tmp"   # the latch's tmp path is a DIRECTORY: only the arm fails
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    rmdir "$gd/romp-install-failed.tmp"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"could not record the install intent"* ]]
+    [ "$(git -C "$HOME/romp" rev-parse HEAD)" = "$head_before" ]
+    [[ "$output" != *STUB_INSTALL_RAN* ]]
+}
+
+@test "bootstrap.sh: a successful transaction SPENDS the latch" {
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -eq 0 ]
+    gd="$(git -C "$HOME/romp" rev-parse --absolute-git-dir)"
+    [ ! -e "$gd/romp-install-failed" ]
+}
+
+@test "bootstrap.sh: a failed move never erases a PRE-EXISTING armed latch" {
+    # the unconditional remove destroyed the only record protecting a half-installed build when a
+    # later re-run's move failed (the adversarial review, 2026-08-18, reproduced live)
+    ROMP_DIR="$HOME/romp" bash "$REPO_ROOT/bootstrap.sh"
+    gd="$(git -C "$HOME/romp" rev-parse --absolute-git-dir)"
+    cur8="$(git -C "$HOME/romp" rev-parse --short=8 HEAD | head -c 8)"
+    printf '%s' "$cur8" > "$gd/romp-install-failed"          # a half-installed HEAD's record
+    git -C "$HOME/romp" config user.email t@t
+    git -C "$HOME/romp" config user.name t
+    git -C "$HOME/romp" checkout -q -b main 2>/dev/null || git -C "$HOME/romp" checkout -q main 2>/dev/null || true
+    git -C "$HOME/romp" commit -q --allow-empty -m local
+    git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m remote
+    ROMP_DIR="$HOME/romp" ROMP_REF=main run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -ne 0 ]
+    [ -s "$gd/romp-install-failed" ]   # SOME honest latch survives the refusal
+}

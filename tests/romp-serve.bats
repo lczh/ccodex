@@ -265,3 +265,35 @@ HOLDPY
     [ "$status" -eq 70 ]
     [[ "$output" != *KERNEL_RAN* ]]
 }
+
+@test "romp-serve: an EXISTING latch that cannot be read refuses — unknown is not absent" {
+    _latch_fixture
+    printf '%s' "$CUR" > "$GD/romp-install-failed"
+    chmod 000 "$GD/romp-install-failed"
+    run "$FIX/bin/romp-serve"
+    chmod 644 "$GD/romp-install-failed"
+    [ "$status" -eq 70 ]
+    [[ "$output" != *KERNEL_RAN* ]]
+}
+
+@test "romp-serve: INSIDE the install transaction (live marker) the gate stands down" {
+    # gating against our own transaction deadlocked the fresh install's dashboard-link poll
+    # (the adversarial review, 2026-08-18); the marker counts only while its pid is alive
+    _latch_fixture
+    python3 - "$GD/romp-update.lock" <<'HOLDPY' &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+time.sleep(60)
+HOLDPY
+    HOLDER=$!
+    sleep 1
+    ROMP_INSIDE_UPDATE_TXN="$HOLDER" run "$FIX/bin/romp-serve"
+    st_live=$status out_live=$output
+    ROMP_GATE_LOCK_WAIT=1 ROMP_INSIDE_UPDATE_TXN="999999" run "$FIX/bin/romp-serve"
+    st_stale=$status
+    kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null || true
+    [ "$st_live" -eq 0 ]
+    [[ "$out_live" == *KERNEL_RAN* ]]
+    [ "$st_stale" -eq 70 ]      # a DEAD holder's marker is stale: the gate is back
+}
