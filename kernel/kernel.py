@@ -2001,10 +2001,22 @@ def _run_update(tag):
                     "c.request('POST','/restart-all',headers={'X-Romp-Manager-Token':"
                     "os.environ.get('ROMP_MANAGER_TOKEN','')});"
                     "r=c.getresponse();r.read();c.close();sys.exit(0 if r.status<400 else 1)")
-    restart = ("  %s -c %s %d >/dev/null 2>&1\n" %
-               (q(sys.executable), q(manager_post), int(mport))) if mport.isdigit() \
-        else "  : # no manager — the new code arms on the next romp start (the report says so)\n"
-    ok_rep = {"ok": True, "tag": tag, "restarted": bool(mport.isdigit())}
+    # The report is written AFTER the restart attempt, with the outcome that actually happened:
+    # writing restarted:true beforehand wedged /update-check on a failed manager request — it
+    # deliberately leaves an ok+restarted report for the NEXT boot, which never came (the user's
+    # audit, 2026-08-18).
+    ok_restarted = {"ok": True, "tag": tag, "restarted": True}
+    ok_plain = {"ok": True, "tag": tag, "restarted": False}
+    if mport.isdigit():
+        restart = ("  if %s -c %s %d >/dev/null 2>&1; then\n"
+                   "    printf '%%s' %s > %s\n"
+                   "  else\n"
+                   "    printf '%%s' %s > %s\n"
+                   "  fi\n" % (q(sys.executable), q(manager_post), int(mport),
+                                q(json.dumps(ok_restarted)), rep, q(json.dumps(ok_plain)), rep))
+    else:
+        restart = ("  : # no manager — the new code arms on the next romp start (the report says so)\n"
+                   "  printf '%%s' %s > %s\n" % (q(json.dumps(ok_plain)), rep))
     verify_sh = " ".join(q(x) for x in verify_argv)
     if not _release_verify_enforced():
         # best-effort: the attempt and its outcome land in the log either way, but an unsigned tag
@@ -2040,7 +2052,6 @@ def _run_update(tag):
         + "  fi\n"
         + "fi\n"
         + "if [ \"$OK\" = 1 ]; then\n"
-        + "  printf '%%s' %s > %s\n" % (q(json.dumps(ok_rep)), rep)
         + restart
         + "else\n"
         + "  printf '%%s' %s > %s\n" % (q(json.dumps({"ok": False, "tag": tag,
@@ -2258,6 +2269,19 @@ def _update_git_dir():
         return None
     p = Path(line.split(":", 1)[1].strip())
     return p if p.is_absolute() else (ROOT / p)
+
+
+def _update_flock_wait(seconds):
+    """_update_flock with a bounded wait: retry the non-blocking acquire until `seconds` pass.
+    Boot-time healing must not fail open just because an updater holds the lock THIS instant —
+    reading the latch before locking let a kernel start mid-update (the user's audit,
+    2026-08-18). Returns the locked fd or None on timeout."""
+    deadline = time.time() + seconds
+    while True:
+        fd = _update_flock()
+        if fd is not None or time.time() >= deadline:
+            return fd
+        time.sleep(0.5)
 
 
 def _update_flock():
@@ -2609,7 +2633,7 @@ def _refuse_half_installed():
     return not cur or armed == cur
 
 
-def _boot_heal():
+def _boot_heal(wait_s=0):
     """This kernel may have BOOTED a checkout whose install.sh never finished (an external restart
     — romp refresh, a reboot — ignores the latch by nature; and the intent latch is armed BEFORE
     HEAD moves, so a crash mid-update lands here too). Heal SYNCHRONOUSLY at boot, before the
@@ -2620,16 +2644,19 @@ def _boot_heal():
     and its merge (the adversarial review, 2026-08-17). Contention is a LOUD skip, and the update
     check loop calls back here every pass — a held lock at boot (that very orphaned installer
     keeping the flock alive through the kernel's death) is retried, never a forever-unhealed hole."""
-    if not _install_failed_sha():
-        return
-    fd = _update_flock()
+    # The LOCK comes FIRST: reading the latch before locking left a fail-open window where an
+    # updater held the lock but had not armed the latch yet (the user's audit, 2026-08-18). At
+    # boot the wait is generous (a live install may hold it); the check-loop retry uses no wait —
+    # a held lock there means an updater is active and will restart us itself.
+    fd = _update_flock_wait(wait_s) if wait_s else _update_flock()
     if fd is None:
-        _converge_note("this checkout has a half-finished install and another process holds the "
-                       "update lock — waiting for it; this kernel may be running a half-installed "
-                       "build until then.")
+        if _install_failed_sha():
+            _converge_note("this checkout has a half-finished install and another process holds "
+                           "the update lock — waiting for it; this kernel may be running a "
+                           "half-installed build until then.")
         return
     try:
-        failed = _install_failed_sha()                # re-read under the lock; a holder may have spent it
+        failed = _install_failed_sha()                # read UNDER the lock
         if not failed:
             return
         cur = _sha8(_checkout_sha())
@@ -10031,8 +10058,6 @@ def _update_remote(host):
     # (3) verify no divergence, reset the remote to the pushed HEAD, clean up, restart
     apply_cmd = (
         'LOGDIR="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}"; mkdir -p "$LOGDIR"; R=%s; '
-        'if ! git -C "$R" merge-base --is-ancestor HEAD %s 2>/dev/null; then '
-        'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIVERGED; exit 0; fi; '
         # Re-check dirtiness HERE, in the same shell as the reset — the discover-step probe ran an
         # ssh round-trip ago, and an edit landing in that window would be destroyed by reset --hard
         # on the strength of a stale answer (the user's audit, 2026-08-17). A status that FAILS is
@@ -10051,6 +10076,10 @@ def _update_remote(host):
         # 5 = could not arm the latch (nothing moved), else the reset's own rc.
         'GD="$(git -C "$R" rev-parse --absolute-git-dir 2>/dev/null)"; '
         '[ -n "$GD" ] || { git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; }; '
+        # The wrapper's target is the EXACT 40-char sha the push validated — never the scratch
+        # ref, which any concurrent sender force-updates (the user's audit, 2026-08-18) — and the
+        # ancestry check runs HERE, under the lock: outside it, HEAD could move between the check
+        # and the reset and the reset would rewind it. Exit 7 = diverged under the lock.
         "python3 -c 'import fcntl,os,subprocess,sys\n"
         "lock,r,target=sys.argv[1],sys.argv[2],sys.argv[3]\n"
         "fd=os.open(lock,os.O_RDWR|os.O_CREAT,0o644)\n"
@@ -10058,6 +10087,8 @@ def _update_remote(host):
         "    fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
         "except OSError:\n"
         "    sys.exit(3)\n"
+        'if subprocess.run(["git","-C",r,"merge-base","--is-ancestor","HEAD",target]).returncode:\n'
+        "    sys.exit(7)\n"
         'res=subprocess.run(["git","-C",r,"rev-parse","--short=8",target],capture_output=True,text=True)\n'
         'sha8=(res.stdout or "").strip()[:8]\n'
         "if res.returncode or not sha8:\n"
@@ -10073,6 +10104,7 @@ def _update_remote(host):
         "os.remove(lp)' "
         '"$GD/romp-update.lock" "$R" %s >/dev/null 2>&1; RRC=$?; '
         'if [ "$RRC" = 3 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo UPDATERUNNING; exit 0; fi; '
+        'if [ "$RRC" = 7 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIVERGED; exit 0; fi; '
         'if [ "$RRC" = 4 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo INSTALLFAIL; exit 0; fi; '
         'if [ "$RRC" != 0 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; fi; '
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; '
@@ -10099,8 +10131,8 @@ def _update_remote(host):
         'UP=0; for i in 1 2 3 4 5 6 7 8; do sleep 1; if bash -c "exec 3<>/dev/tcp/127.0.0.1/%d" 2>/dev/null; then UP=1; break; fi; done; '
         'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null &  sleep 1; fi; '
         'echo "SYNCED:$NEW"'
-    ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
-         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
+    ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, lfull, _P2P_REF, _P2P_REF,
+         _P2P_REF, _P2P_REF, _P2P_REF, kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -10251,12 +10283,14 @@ def _pull_remote(host, expected_sha=None):
         if fetched_sha != expected:
             return False, ("%s did not supply the expected commit %s — nothing merged"
                            % (host, expected[:12]))
-        anc = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"],
+        # every later git operation binds to the EXACT validated sha — FETCH_HEAD is mutable
+        # (a concurrent fetch rewrites it between validation and merge; the user's audit, 2026-08-18)
+        anc = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", "HEAD", fetched_sha],
                              capture_output=True, text=True, timeout=10)
         if anc.returncode != 0:
             return False, ("local and %s have diverged — a pull would need a merge, which is yours to "
                            "do by hand" % host)
-        n = subprocess.run(["git", "-C", str(ROOT), "rev-list", "--count", "HEAD..FETCH_HEAD"],
+        n = subprocess.run(["git", "-C", str(ROOT), "rev-list", "--count", "HEAD..%s" % fetched_sha],
                            capture_output=True, text=True, timeout=10)
         count = (n.stdout or "").strip() or "?"
         # Trust can change while ssh/fetch is in flight.  The merge is the code-execution boundary,
@@ -10277,7 +10311,7 @@ def _pull_remote(host, expected_sha=None):
         try:
             if not _set_install_failed(_sha8(fetched_sha)):
                 return False, "could not record the install intent — not moving HEAD"
-            m = subprocess.run(["git", "-C", str(ROOT), "merge", "--ff-only", "FETCH_HEAD"],
+            m = subprocess.run(["git", "-C", str(ROOT), "merge", "--ff-only", fetched_sha],
                                capture_output=True, text=True, timeout=30)
             if m.returncode != 0:
                 _set_install_failed("")    # HEAD did not move; nothing to heal
@@ -27174,7 +27208,7 @@ def main():
     os.environ.setdefault("ROMP_CLAUDE_BIN", _claude_bin())
     signal.signal(signal.SIGTERM, _graceful_term)             # drain, don't die mid-flight (see _graceful_term)
     _migrate_channel()                                        # one-time: older channel spellings move into the worktree marker
-    _boot_heal()                                              # a latched half-installed checkout heals FIRST — before
+    _boot_heal(wait_s=90)                                     # a latched half-installed checkout heals FIRST — before
     #                                                           _ensure_bundles builds on it, before any subsystem
     if _refuse_half_installed():
         # The heal could not spend the latch (install failed again, another process holds the

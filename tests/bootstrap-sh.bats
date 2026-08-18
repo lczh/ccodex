@@ -367,3 +367,35 @@ WRAP
     [[ "$output" == *"does not have a valid signature"* ]]
     [[ "$output" != *STUB_INSTALL_RAN* ]]
 }
+
+@test "bootstrap.sh: a failed install leaves the latch ARMED — the build is gated until it passes" {
+    # the move+install is one locked transaction now: a re-run whose install.sh fails must leave
+    # the durable intent for romp-serve's gate and the kernel's boot heal (the user's audit, 2026-08-18)
+    ROMP_DIR="$HOME/romp" bash "$REPO_ROOT/bootstrap.sh"
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$ROMP_REPO/install.sh"
+    git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -qam broken-install
+    git -C "$ROMP_REPO" tag -s v0.3.0 -m v0.3.0
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"latch is armed"* ]]
+    gd="$(git -C "$HOME/romp" rev-parse --absolute-git-dir)"
+    [ "$(cat "$gd/romp-install-failed")" = "$(git -C "$HOME/romp" rev-parse --short=8 HEAD | head -c 8)" ]
+}
+
+@test "bootstrap.sh: a held update lock refuses the re-run instead of racing the updater" {
+    ROMP_DIR="$HOME/romp" bash "$REPO_ROOT/bootstrap.sh"
+    gd="$(git -C "$HOME/romp" rev-parse --absolute-git-dir)"
+    python3 - "$gd/romp-update.lock" <<'HOLDPY' &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+time.sleep(60)
+HOLDPY
+    HOLDER=$!
+    sleep 1
+    ROMP_TXN_LOCK_WAIT=1 ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null || true
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"another update holds"* ]]
+    [[ "$output" != *STUB_INSTALL_RAN* ]]
+}

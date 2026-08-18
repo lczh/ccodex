@@ -245,3 +245,23 @@ _latch_fixture() {
     grep -q "HALF_INSTALLED_BACKOFF_MS = 60000" "$BIN/romp-manager"
     grep -q "code === 70 ? HALF_INSTALLED_BACKOFF_MS" "$BIN/romp-manager"
 }
+
+@test "romp-serve: a HELD update lock refuses startup even with NO latch (the mid-update window)" {
+    # the audit reproduced this directly: latch-before-lock let a kernel start in the window where
+    # an updater held the lock but had not armed the latch yet — mid-update, HEAD about to move
+    # under the booting kernel's imports (the user's audit, 2026-08-18). Lock comes FIRST now.
+    _latch_fixture
+    printf '#!/bin/sh\nexit 0\n' > "$FIX/install.sh"; chmod +x "$FIX/install.sh"
+    python3 - "$GD/romp-update.lock" <<'HOLDPY' &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+time.sleep(60)
+HOLDPY
+    HOLDER=$!
+    sleep 1
+    ROMP_GATE_LOCK_WAIT=1 run "$FIX/bin/romp-serve"
+    kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null || true
+    [ "$status" -eq 70 ]
+    [[ "$output" != *KERNEL_RAN* ]]
+}

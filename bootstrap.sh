@@ -104,7 +104,6 @@ if [ -z "$ref" ]; then
     fi
 fi
 
-echo "==> Checking out $ref"
 is_tag=0
 if git -C "$DIR" show-ref --verify --quiet "refs/tags/$ref"; then
     is_tag=1
@@ -169,39 +168,16 @@ if git -C "$DIR" show-ref --verify --quiet "refs/tags/$ref"; then
     fi
 fi
 
-if [ "$is_tag" -eq 1 ]; then
-    # Address the tag by its full ref and detach. If a remote branch has the same short name,
-    # installing that branch after verifying the tag would install different, unsigned code.
-    git -C "$DIR" checkout --quiet --detach "refs/tags/$ref" || {
-        echo "romp: verified tag '$ref' could not be checked out." >&2; exit 1; }
-elif git -C "$DIR" show-ref --verify --quiet "refs/remotes/origin/$ref"; then
-    # Branch installs follow exactly the fetched remote branch. Never suppress a non-fast-forward:
-    # doing so used to reinstall stale local code while announcing a successful update.
-    if git -C "$DIR" show-ref --verify --quiet "refs/heads/$ref"; then
-        git -C "$DIR" checkout --quiet "$ref" || {
-            echo "romp: could not check out branch $ref (is the worktree dirty?)." >&2; exit 1; }
-    else
-        git -C "$DIR" checkout --quiet -b "$ref" "origin/$ref" || {
-            echo "romp: could not create local branch $ref from origin/$ref." >&2; exit 1; }
-    fi
-    git -C "$DIR" merge --quiet --ff-only "origin/$ref" || {
-        echo "romp: local branch $ref cannot fast-forward to origin/$ref; refusing to install stale code." >&2
-        echo "  Resolve or preserve the local commits, then rerun bootstrap.sh." >&2
-        exit 1
-    }
-else
-    # Tags and explicit commit IDs are immutable checkouts; pulling them is neither useful nor valid.
-    git -C "$DIR" checkout --quiet "$ref" || {
-        echo "romp: ref '$ref' was not found after fetching origin." >&2; exit 1; }
-fi
+# ── the MOVE + INSTALL are one transaction (the user's audit, 2026-08-18) ────────────────────
+# A bootstrap re-run used to check out new code and run install.sh with no update lock and no
+# recovery latch: a crash mid-install, or a concurrent in-app updater, left an unrecorded partial
+# install — the exact hole every other update path closes. The runner below takes the checkout's
+# own romp-update.lock (bounded wait), arms the latch with the TARGET commit before anything
+# moves, executes the move, runs install.sh with the lock fd riding along, and spends the latch
+# only on success. A failed install leaves the latch armed: romp-serve's gate and the kernel's
+# boot heal refuse to run the build until install passes.
 
-# Persist the UPDATE CHANNEL this install chose, in the CHECKOUT's own git config — the channel
-# describes the checkout, and a per-state-dir copy let kernels sharing one checkout disagree
-# about it (the user's audits, 2026-08-17). The kernel's main-convergence updater follows
-# origin/main ONLY on `dev`, and `dev` means exactly the documented ROMP_REF=main opt-in: a
-# feature branch or a pinned commit is a deliberate NON-main install, and recording it as dev
-# would authorize converging it onto a main it never asked to follow. Everything else — tags
-# included — is stable; re-running bootstrap follows the last explicit choice.
+# Resolve the channel and target commit BEFORE the move, then record the channel (it moves no code).
 channel="stable"
 # dev means the MAIN BRANCH opt-in in any spelling (main / refs/heads/main / origin/main) — and
 # never a TAG that happens to be named main: a tag install is a pinned, verified artifact
@@ -220,8 +196,82 @@ printf '%s\n' "$channel" > "$gd/romp-update-channel" || {
 git -C "$DIR" config --unset romp.updateChannel 2>/dev/null || true
 echo "==> Update channel: $channel"
 
-echo "==> Running install.sh"
-"$DIR/install.sh"
+if [ "$is_tag" -eq 1 ]; then
+    # Address the tag by its full ref and detach. If a remote branch has the same short name,
+    # installing that branch after verifying the tag would install different, unsigned code.
+    target="$(git -C "$DIR" rev-parse "refs/tags/$ref^{commit}")" || {
+        echo "romp: verified tag '$ref' could not be resolved to a commit." >&2; exit 1; }
+    set -- checkout --quiet --detach "refs/tags/$ref"
+elif git -C "$DIR" show-ref --verify --quiet "refs/remotes/origin/$ref"; then
+    # Branch installs follow exactly the fetched remote branch. Never suppress a non-fast-forward:
+    # doing so used to reinstall stale local code while announcing a successful update.
+    target="$(git -C "$DIR" rev-parse "refs/remotes/origin/$ref")" || {
+        echo "romp: origin/$ref could not be resolved to a commit." >&2; exit 1; }
+    if git -C "$DIR" show-ref --verify --quiet "refs/heads/$ref"; then
+        set -- checkout --quiet "$ref" -- merge --quiet --ff-only "origin/$ref"
+    else
+        set -- checkout --quiet -b "$ref" "origin/$ref" -- merge --quiet --ff-only "origin/$ref"
+    fi
+else
+    # Tags and explicit commit IDs are immutable checkouts; pulling them is neither useful nor valid.
+    target="$(git -C "$DIR" rev-parse "$ref^{commit}" 2>/dev/null)" || {
+        echo "romp: ref '$ref' was not found after fetching origin." >&2; exit 1; }
+    set -- checkout --quiet "$ref"
+fi
+
+echo "==> Checking out $ref + installing (one locked transaction)"
+txn_rc=0
+python3 - "$DIR" "$gd" "$target" "$@" <<'TXNPY' || txn_rc=$?
+import fcntl, os, subprocess, sys, time
+
+root, gdir, target = sys.argv[1], sys.argv[2], sys.argv[3]
+moves, cur = [], []
+for tok in sys.argv[4:]:
+    if tok == "--":
+        moves.append(cur); cur = []
+    else:
+        cur.append(tok)
+if cur:
+    moves.append(cur)
+fd = os.open(os.path.join(gdir, "romp-update.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+deadline = time.time() + float(os.environ.get("ROMP_TXN_LOCK_WAIT", "120"))
+while True:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except OSError:
+        if time.time() >= deadline:
+            sys.exit(3)
+        time.sleep(0.5)
+latch = os.path.join(gdir, "romp-install-failed")
+tmp = latch + ".tmp"
+try:
+    with open(tmp, "w") as f:
+        f.write(target[:8])
+    os.replace(tmp, latch)
+except OSError:
+    sys.exit(5)
+for mv in moves:
+    if subprocess.run(["git", "-C", root] + mv).returncode:
+        os.remove(latch)               # nothing moved past a failed step's refusal — moot
+        sys.exit(6)
+if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root, pass_fds=(fd,)).returncode:
+    sys.exit(4)                        # latch stays armed: nothing runs this build until install passes
+os.remove(latch)
+sys.exit(0)
+TXNPY
+case "$txn_rc" in
+    0) : ;;
+    3) echo "romp: another update holds this checkout's lock — try again when it finishes." >&2; exit 1 ;;
+    5) echo "romp: could not record the install intent in $gd — not moving the checkout." >&2; exit 1 ;;
+    6) echo "romp: the checkout could not be moved to $ref — most often the local branch cannot fast-forward" >&2
+       echo "  to origin/$ref (see git's message above). Resolve or preserve the local commits, then rerun." >&2
+       echo "  Nothing was installed." >&2; exit 1 ;;
+    4) echo "romp: install.sh failed AFTER the checkout moved — the install latch is armed, so" >&2
+       echo "  romp will refuse to run this build until a re-run of bootstrap or its boot heal" >&2
+       echo "  gets install.sh to pass." >&2; exit 1 ;;
+    *) echo "romp: the install transaction failed (rc=$txn_rc)." >&2; exit 1 ;;
+esac
 
 # Put bin/ on PATH. Idempotent: keyed on the exact line, so re-running this
 # script never stacks up duplicates.
