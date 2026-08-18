@@ -133,5 +133,5 @@ test("the composer placeholder hints that / opens commands (the user 2026-06-30)
   // full hint row — send, newline, stage, and the bare "/ for commands" (the user 2026-08-15: "type"
   // was filler) — while mobile keeps just the core prompt (see the composer-send mobile test)
   assert.match(RENDER, /composer\.placeholder = closed \? "Session closed — read-only" : composerRestingPlaceholder\(\);/);
-  assert.match(RENDER, /"Message this session…  \(⏎ send · ⇧⏎ newline · ⌘⏎ stage · \/ for commands\)"/);
+  assert.match(RENDER, /"Message this session…  \(⏎ send · ⇧⏎ newline · ⌘⏎ stage · ↑ history · \/ for commands\)"/);
 });

@@ -22,16 +22,16 @@ test("the composer is a flex row with the buttons seated at the bottom", () => {
 });
 
 test("flex order puts the paperclip LEFT of the input and send on its right", () => {
-  assert.match(CSS, /#composer-attach \{ color: var\(--accent\); opacity: 0\.8; order: 1; \}/);
+  assert.match(CSS, /#composer-attach, \.cmt-attach \{ color: var\(--accent\); opacity: 0\.8; order: 1; \}/);   // the comment popover clip shares the rule (2026-08-17)
   assert.match(CSS, /#composer-input \{\s*\n\s*order: 2; flex: 1 1 auto; min-width: 0;/);
-  assert.match(CSS, /#composer-send \{ order: 3; \}/);
+  assert.match(CSS, /#composer-send, \.cmt-send \{ order: 3; \}/);
 });
 
 test("the two buttons are the SAME rounded square, as tall as the one-line box — by arithmetic", () => {
   // the size is the input's min-height formula written against var(--fs): em on the button would key on
   // its larger glyph font and drift taller than the box (the user 2026-07-30, round 2: smaller, rounded
   // rectangle, matching the resting box height)
-  const m = CSS.match(/#composer-attach, #composer-send \{\s*\n\s*flex: 0 0 auto; width: (calc\(1\.4 \* var\(--fs\) \+ 18px\)); height: (calc\(1\.4 \* var\(--fs\) \+ 18px\)); border-radius: 10px;/);
+  const m = CSS.match(/#composer-attach, #composer-send, \.cmt-attach, \.cmt-send \{\s*\n\s*flex: 0 0 auto; width: (calc\(1\.4 \* var\(--fs\) \+ 18px\)); height: (calc\(1\.4 \* var\(--fs\) \+ 18px\)); border-radius: 10px;/);
   assert.ok(m, "the shared sizing rule is missing");
   assert.equal(m![1], m![2], "width must equal height — a square, not a bar");
   // ...and the input's own floor uses the SAME formula (1.4em at the input's font IS 1.4 * --fs)
@@ -46,7 +46,7 @@ test("the corner-overlay geometry is gone for good", () => {
 });
 
 test("a coarse pointer gets 40px rounded squares, matching the 40px one-line box", () => {
-  assert.match(coarse, /#composer-attach, #composer-send \{ width: 40px; height: 40px; border-radius: 12px; \}/);
+  assert.match(coarse, /#composer-attach, #composer-send, \.cmt-attach, \.cmt-send \{ width: 40px; height: 40px; border-radius: 12px; \}/);
   // and the resting box is ONE line — the pill — not the old two-line floor
   assert.match(coarse, /#composer-input \{ min-height: 40px; border-radius: 20px; padding: 10px 14px; \}/);
   assert.doesNotMatch(CSS, /min-height: calc\(2\.8em/);

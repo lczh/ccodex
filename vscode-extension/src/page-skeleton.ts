@@ -25,7 +25,7 @@ export function chatBody(attachTitle: string): string {
   <div id="footer">
     <div id="composer-resize" title="Drag to resize the message box"></div>
     <div id="statusline" class="statusline"></div>
-    <div id="composer"><div id="composer-files" style="display:none"></div><div id="composer-staged" style="display:none"></div><div id="composer-chips" style="display:none"></div><textarea id="composer-input" rows="1" placeholder="Message this session…  (⏎ send · ⇧⏎ newline · ⌘⏎ stage · / for commands)"></textarea><button id="composer-attach" title="${attachTitle}" aria-label="Attach file"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button><button id="composer-send" title="Send (⏎)" aria-label="Send">➤</button></div>
+    <div id="composer"><div id="composer-files" style="display:none"></div><div id="composer-staged" style="display:none"></div><div id="composer-chips" style="display:none"></div><textarea id="composer-input" rows="1" placeholder="Message this session…  (⏎ send · ⇧⏎ newline · ⌘⏎ stage · ↑ history · / for commands)"></textarea><button id="composer-attach" title="${attachTitle}" aria-label="Attach file"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button><button id="composer-send" title="Send (⏎)" aria-label="Send">➤</button></div>
   </div>`;
 }
 

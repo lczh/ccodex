@@ -67,8 +67,8 @@ test("the send button is disabled on a closed (read-only) session", () => {
 test("send sits on the input's right, the paperclip on its left — flex order, not offsets", () => {
   // re-laid 2026-07-30 as the Signal-style compose row; the circle sizing and the touch layout live in
   // composer-buttons.test.ts
-  assert.match(CSS, /#composer-attach \{ color: var\(--accent\); opacity: 0\.8; order: 1; \}/);
-  assert.match(CSS, /#composer-send \{ order: 3; \}/);
+  assert.match(CSS, /#composer-attach, \.cmt-attach \{ color: var\(--accent\); opacity: 0\.8; order: 1; \}/);
+  assert.match(CSS, /#composer-send, \.cmt-send \{ order: 3; \}/);
 });
 
 test("the composer sits tight to the bottom — no wasted gap below it (the user 2026-06-23)", () => {

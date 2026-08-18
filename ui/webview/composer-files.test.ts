@@ -39,7 +39,9 @@ test("every file arrival becomes an attachment, never raw path text in the box",
   // paste-with-files and the host round-trip (dropped bytes, 📎 dialog, phone picker) too — the
   // paste's path branch is gated on LOCAL ownership (composer-attach.test.ts owns the remote rule)
   assert.match(RENDER, /if \(p && !hostOf\(activeId \|\| ""\)\) addComposerFile\(activeId, p\);\s*\n\s*else shipFileToHost\(f\);/);
-  assert.match(RENDER, /m\.type === "droppedPath" && typeof m\.path === "string"\) \{[\s\S]{0,300}addComposerFile\(owner, m\.path\);/);
+  // the window spans the popover-owned branch first (an open comment popover claims its own
+  // clip's ack; the COMPOSER path below it still always lands as an attachment)
+  assert.match(RENDER, /m\.type === "droppedPath" && typeof m\.path === "string"\) \{[\s\S]{0,900}addComposerFile\(owner, m\.path\);/);
   // the old insert-at-cursor path is gone with its last caller
   assert.doesNotMatch(RENDER, /function insertComposerText/);
 });

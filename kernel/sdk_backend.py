@@ -281,6 +281,20 @@ def msg_to_atom(msg, sid, fsid, t, skill_tool_ids=()):
     still shows the confirmation line."""
     n = type(msg).__name__
     u = getattr(msg, "uuid", None)
+    # SIDECHAIN traffic is not the parent's conversation (the user 2026-08-17, screenshot of a
+    # subagent's full kickoff prompt painted as a huge expanded box below the collapsed tool group):
+    # the CLI streams a Task/Agent subagent's OWN turns tagged with parent_tool_use_id — its kickoff
+    # prompt as a UserMessage, its replies and tool calls as AssistantMessages. Untagged, the prompt
+    # fell through to the generic user atom below and, being a live-tail atom whose uuid never
+    # appears in the parent's transcript (the subagent writes its own file), the leak persisted
+    # instead of being superseded. The subagent's designed surfaces are the Task/Agent head's
+    # prompt+report folds and the background-task rows — the parent stream carries only the parent's
+    # turns. The ONE tagged shape that IS the parent's own is a Skill payload (parent_tool_use_id
+    # naming a Skill tool_use from this session's set — skills run inline, not as subagents); it
+    # passes through to the skillMd classification in the UserMessage branch.
+    ptid = getattr(msg, "parent_tool_use_id", None)
+    if ptid and ptid not in (skill_tool_ids or ()):
+        return None
     if n == "AssistantMessage":
         content = [d for b in (getattr(msg, "content", []) or []) if (d := _block_to_dict(b))]
         if not content:
@@ -3636,7 +3650,7 @@ class SdkBackend:
         return sid
 
     def fork(self, name: str, parent_sid: str, cut_uuid: str = "", bg: str = "", fg: str = "",
-             sid: str | None = None, thread_of: str = "") -> str:
+             sid: str | None = None, thread_of: str = "", model: str = "", effort: str = "") -> str:
         """Mint a NEW session that is a FORK of `parent_sid`'s conversation — up to `cut_uuid` when given
         (a transcript record uuid; empty = the whole conversation), the parent untouched either way (the
         user 2026-08-13). The new session gets its OWN sid, registry, name and identity colour — a fork
@@ -3680,6 +3694,17 @@ class SdkBackend:
             reg["threadOf"] = thread_of
         if parent.get("model") and parent["model"] != "default":
             reg["model"] = parent["model"]
+        # Per-fork model/effort OVERRIDES (the user 2026-08-17: a comment thread on a different model
+        # or effort, without touching the parent). Applied HERE, in the reg the first connect reads —
+        # never via set_model, whose write_sdk_default side effect would make a thread's pick the seed
+        # for every future session. 'default' clears the inherited model back to the account default.
+        if model:
+            if model == "default":
+                reg.pop("model", None)
+            else:
+                reg["model"] = model
+        if effort in EFFORT_LEVELS:
+            reg["effort"] = effort
         if parent.get("auth") in ("login", "key"):
             reg["auth"] = parent["auth"]
         write_reg(self.state_dir, sid, reg)
@@ -3723,10 +3748,24 @@ class SdkBackend:
         registry (spread) and especially its lastSid when set — lastSid tracks the NEWEST transcript
         fsid (a /clear or relaunch mints new fsids under the same romp sid) and SdkSession resumes from
         it; stamping the original sid here would silently resume an OLD conversation state (the
-        picker-revive fix, the user 2026-07-05)."""
+        picker-revive fix, the user 2026-07-05).
+
+        A REVIVAL PRESERVES IDENTITY (2026-08-17): when the reg already carries a name, that name WINS
+        over the caller's — the caller's copy came from the names/ registry or a discovery row, both of
+        which other paths rewrite (the tmux launcher's dead-name freeing, fork-lane rows whose "sid" is
+        a transcript stem), and trusting it let a machine-panic relaunch respawn a session under a name
+        nobody chose while it carried its whole history (the local session incident, 2026-08-17: reg
+        name X, caller name Y → revived as Y with X's past, and the spawn-frozen env made Y permanent).
+        The caller's name is only ever ADOPTED when the reg has none — the create-from-nothing revive
+        of a session this backend has never seen, which is also logged, because a sid with no reg is
+        usually a transcript fsid that leaked out of a discovery row rather than a real romp sid."""
         reg = read_reg(self.state_dir, sid) or {}
+        kept = str(reg.get("name") or "").strip()
+        if not reg:
+            self._log("resume minting a reg for unknown sid %s as %r — a sid with no reg is usually "
+                      "a transcript fsid, not a romp session" % (sid[:13], name))
         cwd = cwd or reg.get("cwd") or os.path.expanduser("~")
-        self._update_reg(sid, name=name, cwd=cwd,              # locked RMW — a concurrent reg
+        self._update_reg(sid, name=kept or name, cwd=cwd,      # locked RMW — a concurrent reg
                          mode=reg.get("mode", "acceptEdits"),  # writer must not lose fields
                          effort=reg.get("effort", DEFAULT_EFFORT),
                          lastSid=reg.get("lastSid") or sid, alive=True)

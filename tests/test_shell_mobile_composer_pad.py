@@ -43,9 +43,9 @@ class MobileComposerPadding(unittest.TestCase):
 
     def test_the_buttons_are_in_flow_flex_rounded_squares(self):
         self.assertIn(
-            "#composer-attach, #composer-send {\n"
+            "#composer-attach, #composer-send, .cmt-attach, .cmt-send {\n"
             "  flex: 0 0 auto; width: calc(1.4 * var(--fs) + 18px); "
-            "height: calc(1.4 * var(--fs) + 18px); border-radius: 10px;", STYLES)
+            "height: calc(1.4 * var(--fs) + 18px); border-radius: 10px;", STYLES)   # the comment popover shares the rule (2026-08-17)
 
 
 if __name__ == "__main__":

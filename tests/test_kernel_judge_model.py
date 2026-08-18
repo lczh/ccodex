@@ -64,7 +64,8 @@ class JudgeSettings(unittest.TestCase):
     def test_models_endpoint_serves_the_shared_lists(self):
         ksrc = inspect.getsource(km)
         self.assertIn('if p == "/models":', ksrc)
-        self.assertIn('"models": MODEL_CHOICES, "efforts": EFFORT_CHOICES', ksrc)
+        # the shared lists, each choice carrying its colormap tint (the user 2026-08-17)
+        self.assertIn('{"models": [dict(c, color=_model_color(c["value"], _stops)) for c in MODEL_CHOICES]', ksrc)
 
     # ---- per-tier overrides honored + validated ----
     def test_overrides_are_honored(self):

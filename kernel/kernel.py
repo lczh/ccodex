@@ -5679,6 +5679,9 @@ def _thread_messages(tsid, cut_uuid, floor_t=0):
             break                                   # tip fork: copied history keeps its original (older) stamps
         if r.get("type") in ("user", "assistant"):
             txt = _comment_msg_text(r)
+            if r.get("type") == "user" and txt.lstrip().startswith("<task-notification>"):
+                txt = ""                            # harness bookkeeping for the AGENT (a parent bg task died
+                #                                     with the fork) — never the user's own words (2026-08-17)
             if txt and txt != boot_nudge and not (r.get("type") == "user" and "<!-- romp-" in txt):
                 rows.append({"who": "you" if r.get("type") == "user" else "agent",
                              "text": txt[:4000],
@@ -5701,7 +5704,40 @@ def _thread_messages(tsid, cut_uuid, floor_t=0):
     return merged
 
 
-def _comments_frame(sid):
+def _thread_events(tsid, cut_uuid, now, tmux):
+    """The thread rendered with the CHAT's own builder (the user 2026-08-17: the popover shows the
+    same thing the chat shows), sliced to AFTER the branch point: build_session on the thread sid
+    (reachable via _sdk_sess's reg fallback — no names/ entry), events after the cut record's, the
+    head system card never included (it sits before the cut by construction). [] pre-fork, same
+    guard as the plain projection."""
+    reg = _thread_reg(tsid)
+    if reg.get("forkOf"):
+        return []
+    try:
+        m = build_session(tsid, now, tmux if tmux is not None else {})
+    except Exception:
+        return []
+    evs = (m or {}).get("events") or []
+    if cut_uuid:
+        at = next((i for i, e in enumerate(evs)
+                   if e.get("uuid") == cut_uuid or e.get("resultUuid") == cut_uuid), None)
+        if at is None:
+            return []                              # the cut isn't in this transcript — never the copy
+        evs = evs[at + 1:]
+    else:
+        floor = int((_comment_thread_row_created(tsid) or 0))
+        evs = [e for e in evs if not e.get("ts") or int(em.parse_z(e.get("ts")) or 0) >= floor]
+    return evs[-80:]
+
+
+_comment_created_memo = {}                          # tsid -> createdT, for the tip-fork event floor
+
+
+def _comment_thread_row_created(tsid):
+    return _comment_created_memo.get(tsid)
+
+
+def _comments_frame(sid, tmux=None):
     """The chat pane's {type:"comments"} frame for parent session `sid`, or None when it has never
     had a thread. Built per push for sessions WITH a store (few) — _send_client's dedup keeps an
     unchanged frame off the wire."""
@@ -5709,10 +5745,14 @@ def _comments_frame(sid):
     if not p.exists():
         return None
     be = _sdk()
+    now = int(time.time())
     threads = []
     for th in _load_comments(sid).get("threads") or []:
         tsid = str(th.get("sid") or "")
         status = th.get("status") or "open"
+        _comment_created_memo[tsid] = int(th.get("createdT") or 0)
+        if len(_comment_created_memo) > 512:
+            _comment_created_memo.clear()
         # A promoted thread whose session was later ENDED is done, full stop (the user 2026-08-13,
         # who found the highlight still claiming "now its own session" after closing that session):
         # drop it from the frame entirely rather than point at a session that no longer runs. The
@@ -5733,16 +5773,23 @@ def _comments_frame(sid):
                 #                                                 say so, not pulse dots forever
             except Exception:
                 err = ""
+        # the plain projection still computes UNREAD (cheap, mtime-cached); the DISPLAY is the
+        # chat's own events from the branch point on (the user 2026-08-17: same component, rail
+        # dots and all — tool folds, notice cards, markdown, exactly as the chat renders them)
         msgs = [] if status == "promoted" else _thread_messages(
             tsid, str(th.get("cutUuid") or ""), floor_t=(0 if th.get("cutUuid") else int(th.get("createdT") or 0)))
         seen = int(th.get("lastSeenT") or 0)
         unread = any(m["who"] == "agent" and m["t"] > seen for m in msgs)
+        events = [] if status == "promoted" else _thread_events(tsid, str(th.get("cutUuid") or ""), now, tmux)
+        reg = _thread_reg(tsid)
         threads.append({"tid": th.get("tid"), "anchorUuid": th.get("anchorUuid"),
-                        "name": th.get("name") or "",
+                        "name": th.get("name") or "", "color": th.get("color") or "",
                         "exact": str(th.get("exact") or "")[:500], "status": status,
                         "createdT": th.get("createdT") or 0, "state": state, "error": err,
                         "unread": unread, "promotedName": th.get("promotedName") or "",
-                        "msgs": msgs})
+                        "model": (reg.get("liveModel") or reg.get("model") or "") if reg else "",
+                        "effort": (reg.get("effort") or "") if reg else "",
+                        "msgs": msgs, "events": events})
     return {"type": "comments", "id": sid, "threads": threads}
 
 
@@ -5765,7 +5812,7 @@ def _comment_markers(sid):
     return out
 
 
-def _comment_create(parent_sid, anchor_uuid, exact, text, name="", now=None):
+def _comment_create(parent_sid, anchor_uuid, exact, text, name="", model="", effort="", color="", now=None):
     """Anchor a new comment thread: fork the parent at the highlighted message (inclusive) as a
     threadOf fork — no names/ entry, so no judge seeding is needed until promotion — and send the
     opening message. Returns (error, tid): error is the warn-toast string (tid None), success is
@@ -5773,7 +5820,10 @@ def _comment_create(parent_sid, anchor_uuid, exact, text, name="", now=None):
 
     `name` (the user 2026-08-15, who wanted to name the thread right in the dialog): the thread's
     editable name, defaulting to <parent>-comment-<N> where N counts the threads this session has
-    had. It rides the reg (so a break-out inherits it) and the frame (the popover's title)."""
+    had. It rides the reg (so a break-out inherits it) and the frame (the popover's title).
+
+    `model`/`effort` (the user 2026-08-17): per-thread overrides picked in the same dialog — the
+    thread runs on them, the parent is untouched (fork() writes them into the thread's reg only)."""
     be = Sessions.backend_for(parent_sid)
     if not (hasattr(be, "fork") and _sdk_ready()):
         return "threads need the SDK backend; this session runs on tmux, so there is nothing to fork.", None
@@ -5789,6 +5839,9 @@ def _comment_create(parent_sid, anchor_uuid, exact, text, name="", now=None):
     nm = str(name or "").strip()
     if nm and not NAME_RE.match(nm):
         return "thread names use letters, digits, . _ - only.", None
+    col = str(color or "").strip()
+    if col and not re.fullmatch(r"#[0-9a-fA-F]{6}", col):
+        col = ""                                   # not a palette hex → let the backend hash one
     tsid = str(uuid.uuid4())
     row = {"tid": tsid, "sid": tsid, "anchorUuid": str(anchor_uuid), "cutUuid": cut,
            "anchorT": cut_t,   # the commented message's own time — the timeline square's x
@@ -5799,10 +5852,13 @@ def _comment_create(parent_sid, anchor_uuid, exact, text, name="", now=None):
         if not nm:
             nm = "%s-comment-%d" % (sess["name"], len(data.get("threads") or []) + 1)
         row["name"] = nm
+        if col:
+            row["color"] = col                     # the comment's identity color (the dialog's name tint)
         data.setdefault("threads", []).append(row)
         _save_comments(parent_sid, data)
     try:
-        be.fork(nm, parent_sid, cut, sid=tsid, thread_of=parent_sid)
+        be.fork(nm, parent_sid, cut, bg=col, fg=("#ffffff" if col else ""), sid=tsid, thread_of=parent_sid,
+                model=str(model or ""), effort=str(effort or ""))
         be.connect(tsid)
         be.send(tsid, _comment_first_message(exact, text))
     except Exception as e:
@@ -5878,6 +5934,13 @@ def _comment_delete(parent_sid, tid):
         _save_comments(parent_sid, data)
     be = Sessions.backend_for(parent_sid)
     if hasattr(be, "kill") and status != "promoted":
+        # CUT the in-flight reply first, then shut the CLI down: deleting a thread mid-generation
+        # must stop the work it represents, not just its cue (the user 2026-08-17, who deleted a
+        # marching highlight and watched the reply keep coming)
+        try:
+            be.interrupt(th["sid"])
+        except Exception:
+            pass
         try:
             be.kill(th["sid"])
         except Exception:
@@ -6881,7 +6944,9 @@ def _drive(msg, client):
         # success a commentCreated ack names the new thread (the popover adopts exactly it — never a
         # guess) and the fresh {type:"comments"} frame rides straight back, ahead of the pusher cycle.
         err, tid = _comment_create(sid, str(msg["uuid"]), str(msg["exact"]), str(msg["text"]),
-                                   name=str(msg.get("name") or ""))
+                                   name=str(msg.get("name") or ""),
+                                   model=str(msg.get("model") or ""), effort=str(msg.get("effort") or ""),
+                                   color=str(msg.get("color") or ""))
         if err:
             client["send"](json.dumps({"type": "warn", "text": err}))
         else:
@@ -14906,13 +14971,23 @@ def _sdk_transcript_path(sid):
 
 def _sdk_sess(sid, now):
     """A _sessions()-shaped entry for a live SDK session that discover() can't see yet (no transcript
-    on disk). Lets its tab open + chat build immediately; once it runs, discover() takes over."""
+    on disk). Lets its tab open + chat build immediately; once it runs, discover() takes over.
+
+    A comment THREAD never gets a names/ entry, so _sdk_transcript_path (names-fed cwd, sid-named
+    file) points nowhere for it — its reg is the authority: cwd + lastSid name the real transcript
+    (the user 2026-08-17: the popover renders the thread with the chat's own builder)."""
     p = _sdk_transcript_path(sid)
+    name = _name_of(sid)
+    if not name and not os.path.exists(str(p)):
+        reg = _thread_reg(sid)
+        if reg:
+            p = jd._proj_dir(reg.get("cwd") or os.path.expanduser("~")) / ((reg.get("lastSid") or sid) + ".jsonl")
+            name = reg.get("name") or ""
     try:
         mtime = p.stat().st_mtime
     except OSError:
         mtime = now
-    return {"sid": sid, "name": _name_of(sid) or sid[:8], "path": str(p), "mtime": mtime}
+    return {"sid": sid, "name": name or sid[:8], "path": str(p), "mtime": mtime}
 
 
 _arch_tops_cache = {}    # archive path -> (mtime, [projected top nodes]); the fleet's archived-completed tops
@@ -19577,9 +19652,10 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
     if with_bars:
         messages = _postal_messages(now, set(id2name), id2name)
         _bind_message_execs(messages, turns)             # connector exec → the recipient's process-start (real transit)
-        for _bs in turns.values():                       # mids/fromOrig are the binder's INPUTS, not payload
-            for _b in _bs:                               # (2026-07-07 payload audit: no client ever read them)
-                _b.pop("mids", None)
+        # mids STAY on the wire (2026-08-17): the merged-view dmid join (romp-timeline-view.js) re-binds
+        # a relayed connector's exec to the recipient turn by bar mids — the 2026-07-07 payload-audit pop
+        # ("no client ever read them") predated that 2026-08-06 feature and had silently starved it: the
+        # join's key set was always empty on live payloads, so relayed execs never re-bound client-side.
         for _m in messages:
             _m.pop("fromOrig", None)
         # The band's marks are the per-call RUN SPANS (g70): each judge call plotted at its real [sent, recv],
@@ -20977,7 +21053,7 @@ def _push(targets, connect=False, tmux=None):
             # an unchanged frame costs nothing on the wire and the chatTail stream stays untouched.
             for s in (chat_list if chat_clients else []):
                 try:
-                    fr = _comments_frame(s["sid"])
+                    fr = _comments_frame(s["sid"], tmux)
                 except Exception:
                     sys.stderr.write("comments frame failed for %s: %s\n" % (s["sid"], traceback.format_exc()))
                     continue
@@ -22357,7 +22433,7 @@ def _chat_body():
             '<div id="composer-staged" style="display:none"></div>'  # staged-message strip: held until the next send (the user 2026-08-15; NOT the queue — see render.ts)
             '<div id="composer-chips" style="display:none"></div>'   # click-to-cite chip strip (the user 2026-07-01)
             '<textarea id="composer-input" rows="1" '
-            'placeholder="Message this session…  (⏎ send · ⇧⏎ newline · ⌘⏎ stage · / for commands)"></textarea>'
+            'placeholder="Message this session…  (⏎ send · ⇧⏎ newline · ⌘⏎ stage · ↑ history · / for commands)"></textarea>'
             '<button id="composer-attach" title="Attach a file">'
             '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" '
             'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
@@ -25384,10 +25460,13 @@ class Handler(BaseHTTPRequestHandler):
                     "palettes": [{"name": k, "label": v["label"], "colors": v["bg"]}
                                  for k, v in pal.PALETTES.items()]}), "application/json", cache="no-cache")
             if p == "/models":                                # the ONE model + effort choice list — chat statusline, timeline lanes, AND judge settings all read it (the user 2026-07-02: no hardcoding in multiple places)
-                # the codex section: what a CODEX session's pickers offer (docs/codex.md). Models
-                # come from the app-server's own list via the backend (the authoritative source;
-                # [] until the backend runs, so no picker ever shows another vendor's models);
-                # efforts are the four Codex accepts — max/ultracode are Claude-only.
+                # each choice carries its colormap tint (upstream 2026-08-17: the new-comment
+                # dialog's selectors wear the same colors the statusline badges do, for ANY pick).
+                # The codex section rides along untinted: what a CODEX session's pickers offer
+                # (docs/codex.md) — models from the app-server's own list via the backend (the
+                # authoritative source; [] until the backend runs, so no picker ever shows another
+                # vendor's models); efforts are the four Codex accepts — max/ultracode are Claude-only.
+                _stops = cm.stops_for(_colormap())
                 cx = _codex()
                 cx_models = []
                 if cx:
@@ -25396,7 +25475,8 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
                 return self._send(200, json.dumps(
-                    {"models": MODEL_CHOICES, "efforts": EFFORT_CHOICES,
+                    {"models": [dict(c, color=_model_color(c["value"], _stops)) for c in MODEL_CHOICES],
+                     "efforts": [dict(c, color=_effort_color(c["value"], _stops)) for c in EFFORT_CHOICES],
                      "codex": {"models": cx_models,
                                "efforts": [{"value": v, "label": v}
                                            for v in ("low", "medium", "high", "xhigh")]}}),

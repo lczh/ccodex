@@ -85,6 +85,21 @@ class ForkStampsLineage(unittest.TestCase):
         self.assertEqual(self._reg(CHILD)["forkedFrom"]["cut"], "a9",
                          "no cut given = the histories diverge at the parent's leaf")
 
+    def test_fork_model_and_effort_overrides_land_in_the_reg_only(self):
+        self.be.fork("child", PARENT, "a1", sid=CHILD, model="haiku", effort="low")
+        reg = self._reg(CHILD)
+        self.assertEqual(reg.get("model"), "haiku")
+        self.assertEqual(reg.get("effort"), "low")
+        self.assertNotIn("model", self._reg(PARENT), "the parent's reg is untouched")
+
+    def test_fork_model_default_clears_the_inherited_pick(self):
+        (Path(self.td) / "sdk" / (PARENT + ".json")).write_text(json.dumps(
+            {**self._reg(PARENT), "model": "opus"}))
+        self.be.fork("child", PARENT, "a1", sid=CHILD, model="default", effort="not-a-level")
+        reg = self._reg(CHILD)
+        self.assertNotIn("model", reg, "'default' = back to the account default, not a literal")
+        self.assertNotEqual(reg.get("effort"), "not-a-level", "an unknown effort is ignored")
+
     def test_fork_children_indexes_by_parent_and_skips_threads(self):
         self.be.fork("child", PARENT, "a1", sid=CHILD)
         self.be.fork("thread-x", PARENT, "a1", sid=THREAD, thread_of=PARENT)

@@ -132,6 +132,11 @@ function _prefixIdBearing(host: string, o: any, idKey: string): any {
   // and keep peerSid bare — the viewer may be that very host, where the bare uuid opens directly.
   if (out.origin && typeof out.origin === "object" && typeof out.origin.peerSid === "string" && !out.origin.peerHost)
     out.origin = { ...out.origin, peerHost: host, peerSid: prefixId(host, out.origin.peerSid) };
+  // a timeline lane's fork parent (sessions[].branch.fromId): the view looks it up against PREFIXED
+  // lane ids (vidx), so an unprefixed remote parent silently missed and the branch connector never
+  // drew for remote lanes (found 2026-08-17 auditing the merge)
+  if (out.branch && typeof out.branch === "object" && typeof out.branch.fromId === "string")
+    out.branch = { ...out.branch, fromId: prefixId(host, out.branch.fromId) };
   return out;
 }
 
@@ -652,6 +657,13 @@ export class FederationManager {
     // lines, no bars" bug, 2026-07-15). The local kernel pushes on connect, so the hold is momentary,
     // and the local arrival itself emits (event-based, no timer).
     if (!(LOCAL in this.perHostTl)) return;
+    // The BARS emission holds for the LOCAL bars snapshot too (2026-08-17, the after-attach "most of
+    // my sessions vanished" report): at page boot with hosts already attached, a remote's bars can
+    // land before the local kernel's — and the panel's applyBars REPLACES turns wholesale, so the
+    // merged-without-local emission blanked every local lane until the next local push. Same
+    // discipline as the lanes hold above: the local kernel pushes bars on connect, so the hold is
+    // momentary, and the local arrival itself emits.
+    if (bars && !(LOCAL in this.perHostTlBars)) return;
     const data = bars
       // the bars message carries no lanes — hand the merged lane list in for the connector stitch
       ? mergeHostBars(this.perHostTlBars, this.hostSeq, mergeHostTimelines(this.perHostTl, this.hostSeq, this.view()).sessions)
@@ -773,6 +785,14 @@ export class FederationManager {
     // "last seen" a pane shows survives a page reload and doesn't restart with the browser.
     for (const [host, t] of want) if (typeof t.lastOk === "number" && t.lastOk) this.lastSeen[host] = t.lastOk;
     const changed = down.size !== this.downHosts.size || [...down].some((h) => !this.downHosts.has(h));
+    // A host coming BACK is the recovery event failed previews wait for. The message-driven heal
+    // (render.ts's listener re-runs retryFailedPreviews on any kernel message) never ticks on an
+    // idle session — no traffic flows — so a relay-failed figure sat as a chip until the user's
+    // next send generated pushes (the user 2026-08-17). This poll is the authority on tunnel
+    // state; the down→up transition is the exact moment the relay works again, so it dispatches
+    // through the same message path and the heal fires with zero chat traffic.
+    const recovered = [...this.downHosts].filter((h) => want.has(h) && !down.has(h));
+    if (recovered.length) window.dispatchEvent(new MessageEvent("message", { data: { type: "hostUp", hosts: recovered } }));
     this.downHosts = down;
     if (changed) window.dispatchEvent(new Event("romp-hosts"));   // panes repaint their disconnected marks
   }

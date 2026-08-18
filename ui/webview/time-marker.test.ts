@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { markerLabel } from "./time-marker";
+import { markerLabel, dayContext } from "./time-marker";
 
 // All epochs below are built from local-time components so the test is timezone-agnostic
 // (markerLabel reads getHours()/getMinutes()/getDate() in local time, matching the browser).
@@ -85,4 +85,22 @@ test("the stamp returns exactly when the minute changes", () => {
   const t1103 = at(2026, 5, 12, 11, 3), t1104 = at(2026, 5, 12, 11, 4);
   assert.equal(markerLabel(t1104, t1103, NOW).text, "11:04", "a new minute is a real change → stamp it");
   assert.equal(markerLabel(t1104 + 30, t1104, NOW).text, "", "still 11:04 → suppressed again");
+});
+
+// ── dayContext: the top-of-view day label (the user 2026-08-17) ──
+// Real behavior, not source pins: the vocabulary the label speaks, midnight-relative (calendar days,
+// never 24h buckets — 23:50 yesterday is "Yesterday" ten minutes later).
+test("dayContext speaks the relative-day vocabulary, midnight-relative", () => {
+  const now = new Date(2026, 7, 17, 10, 0, 0).getTime();          // Mon Aug 17 2026, 10:00 local
+  const at = (y: number, mo: number, d: number, h = 12) => new Date(y, mo, d, h).getTime() / 1000;
+  assert.equal(dayContext(at(2026, 7, 17, 1), now), "", "today → no label, even 9h ago");
+  assert.equal(dayContext(at(2026, 7, 16, 23), now), "Yesterday", "23:00 yesterday, 11h ago — calendar, not 24h");
+  assert.equal(dayContext(at(2026, 7, 15), now), "2 days ago");
+  assert.equal(dayContext(at(2026, 7, 11), now), "6 days ago");
+  assert.equal(dayContext(at(2026, 7, 10), now), "Last week", "7 days");
+  assert.equal(dayContext(at(2026, 7, 4), now), "Last week", "13 days");
+  assert.equal(dayContext(at(2026, 7, 3), now), "2 weeks ago", "14 days");
+  assert.equal(dayContext(at(2026, 6, 22), now), "3 weeks ago", "26 days");
+  assert.equal(dayContext(at(2026, 6, 15), now), "Jul 15", "past a month → the divider's own date form");
+  assert.equal(dayContext(at(2025, 11, 30), now), "Dec 30 2025", "a different year says so");
 });

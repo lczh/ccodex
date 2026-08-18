@@ -13,7 +13,7 @@ import diff from "highlight.js/lib/languages/diff";
 import yaml from "highlight.js/lib/languages/yaml";
 import type { ParsedAsk } from "../ask-types";
 import { quoteReply } from "../quote";
-import { markerLabel } from "./time-marker";
+import { markerLabel, dayContext } from "./time-marker";
 import { compactDisplay, toolCounts, type DisplayItem } from "./compact";
 import { loadSettings, onExternalSettingsChange, installSettingsSync, type RompSettings } from "./settings";
 import { delegate } from "./actions";
@@ -1573,6 +1573,7 @@ function timeMarker(epoch: number, prevEpoch: number | null): HTMLElement {
   const { text, day, hm } = markerLabel(epoch, prevEpoch, Date.now());
   const m = el("div", "time-marker");
   m.dataset.hm = hm;
+  m.dataset.epoch = String(epoch);   // the top-of-view day-context label reads this (paintRailSticky)
   // The gutter shows the TIME and nothing else. The date rides a full-width day divider
   // instead (dayDividerFor below) — no date word has to fit 47px of rail any more.
   if (text) m.textContent = day ? hm : text;
@@ -1625,11 +1626,171 @@ function ensureRailSticky(): HTMLElement {
   return railSticky;
 }
 
+// The DAY CONTEXT label (the user 2026-08-17): "Yesterday" / "3 days ago" / "Last week" riding just
+// above the rail's TOP stamp whenever that stamp is not from today — so mid-scroll through history
+// the day is always in view even with the day divider scrolled away. One fixed element, painted by
+// the same pass that owns the sticky stamp; its text swaps only at day boundaries, and its position
+// tracks whichever stamp owns the top slot (the sticky at the line, or the leading real stamp as it
+// scrolls toward the line) — the handoff lands at the same pixel, so there is no jump.
+let railDay: HTMLElement | null = null;
+function ensureRailDay(): HTMLElement {
+  if (railDay && railDay.isConnected) return railDay;
+  railDay = el("div", "rail-day");
+  railDay.style.display = "none";
+  document.body.appendChild(railDay);
+  return railDay;
+}
+
+// SCROLL MARKS (the user 2026-08-17): a thin blue notch on the chat's right scroll edge for every
+// USER message — the conversation's shape at a glance, VS Code overview-ruler style. Positions are
+// proportional (turn offset over scroll height), so they are scroll-INVARIANT: the paint rides the
+// rail-sticky scheduler for free, but a signature check skips the DOM work on pure scrolls and only
+// rebuilds when the geometry or the set of user turns actually changed. Passive fixed chrome, like
+// the sticky: it never intercepts the native scrollbar underneath. The blue is the outgoing-bubble
+// blue — the color that already means "yours" — never the romp accent.
+let scrollMarks: HTMLElement | null = null;
+let scrollMarksSig = "";
+// Measured unit heights, remembered once rendered (the user 2026-08-17, whose video showed notches
+// wiggling non-uniformly while scrolling: a message crossing the render-window boundary corrected
+// from the uniform average-height estimate to its true pixels). One number per event, per session —
+// trivial memory — and spacer-slot positions built from these cumulative heights (normalized to the
+// spacer's actual height) match truth so closely that boundary crossings correct by ~nothing.
+const unitHeights = new Map<string, Map<number, number>>();
+
+// ONE content-space frame for every scrollbar overlay (the user 2026-08-17, watching comment ticks
+// drift past message notches as history loaded): marks anchored to transcript positions share an
+// inherent monotonic order, so every overlay must place them with the SAME event-index → pixel
+// mapping — rendered turns by their true offset, spacer-covered turns by cumulative cached heights
+// normalized to the spacer's real height. The comment rail's old uniform index-fraction percents
+// were a second, disagreeing frame. Returns null while the pane is hidden or degenerate; offsetOf
+// returns null for an event mid-window-update — callers skip that mark, the next paint lands it.
+function contentOffsetFrame(content: HTMLElement, v: View, s: Session):
+    { sh: number; offsetOf: (i: number) => number | null } | null {
+  const cRect = content.getBoundingClientRect();
+  const sh = content.scrollHeight;
+  if (!sh || cRect.height <= 40) return null;
+  const winStart = v.winStart ?? 0;
+  const winEnd = v.winEnd ?? s.events.length;
+  const unitTotal = v.unitTotal ?? s.events.length;
+  const topSp = v.el.querySelector<HTMLElement>(".tx-spacer-top");
+  const botSp = v.el.querySelector<HTMLElement>(".tx-spacer-bot");
+  const topH = topSp ? topSp.offsetHeight : 0;
+  const botH = botSp ? botSp.offsetHeight : 0;
+  const scrollTop = content.scrollTop;
+  // remember every rendered unit's measured height — the spacer estimates below feed on them
+  let uh = unitHeights.get(activeId!);
+  if (!uh) { uh = new Map(); unitHeights.set(activeId!, uh); }
+  for (const node of Array.from(v.el.querySelectorAll<HTMLElement>(".turn[data-unit]"))) {
+    const u = Number(node.dataset.unit);
+    const h = node.offsetHeight;
+    if (Number.isFinite(u) && h > 0) uh.set(u, h);
+  }
+  const avg = v.avgTurnH ?? 60;
+  // Cumulative-height slots within each spacer run, NORMALIZED to the spacer's actual rendered
+  // height (the frame the scrollbar itself stands on) — cached truth where a unit was ever
+  // rendered, the renderer's average for the rest. One prefix-sum pass per spacer per paint (O(n)
+  // total), then O(1) per mark. Normalizing keeps mark and thumb in one frame even when the
+  // cache disagrees with the spacer's uniform sizing.
+  const prefixOver = (from: number, to: number): number[] => {
+    const pre: number[] = [0];
+    let t = 0;
+    for (let u = from; u < to; u++) { t += uh!.get(u) ?? avg; pre.push(t); }
+    return pre;
+  };
+  const topPre = winStart > 0 ? prefixOver(0, winStart) : null;
+  const botPre = unitTotal > winEnd ? prefixOver(winEnd, unitTotal) : null;
+  const slotIn = (pre: number[], k: number, spanH: number): number => {
+    const total = pre[pre.length - 1];
+    if (!(total > 0)) return spanH / 2;
+    return spanH * ((pre[k] + (pre[k + 1] - pre[k]) / 2) / total);
+  };
+  const offsetOf = (i: number): number | null => {
+    let off: number | null = null;
+    if (i >= winStart && i < winEnd) {
+      const node = v.el.querySelector<HTMLElement>('.turn[data-unit="' + i + '"]');
+      if (node) off = node.getBoundingClientRect().top - cRect.top + scrollTop;
+    }
+    if (off == null) {
+      if (i < winStart && topPre) off = slotIn(topPre, i, topH);                        // inside the top spacer
+      else if (i >= winEnd && botPre) off = (sh - botH) + slotIn(botPre, i - winEnd, botH);
+    }
+    return off;                                      // null → window bookkeeping mid-update — skip this one, next paint has it
+  };
+  return { sh, offsetOf };
+}
+
+function ensureScrollMarks(): HTMLElement {
+  if (scrollMarks && scrollMarks.isConnected) return scrollMarks;
+  scrollMarks = el("div", "scroll-marks");
+  scrollMarks.style.display = "none";
+  document.body.appendChild(scrollMarks);
+  return scrollMarks;
+}
+
+function paintScrollMarks(): void {
+  const box = ensureScrollMarks();
+  const content = document.getElementById("content");
+  const v = activeId ? views.get(activeId) : null;
+  const s = activeId ? sessions.get(activeId) : null;
+  if (!content || !v || !s || v.el.style.display === "none") { box.style.display = "none"; scrollMarksSig = ""; return; }
+  const cRect = content.getBoundingClientRect();
+  // The WHOLE loaded conversation gets notches, not just the rendered DOM window (the user
+  // 2026-08-17, who scrolled back and watched the newer messages' marks vanish): the chat
+  // virtualizes — a window of real turns between two spacers sized by the renderer's avg-height
+  // estimate, and the scrollbar spans that estimated whole. contentOffsetFrame owns that mapping —
+  // exactly as accurate as the scrollbar the user is reading the notches against, and shared with
+  // the comment rail so the two mark kinds can never disagree about order.
+  const frame = contentOffsetFrame(content, v, s);
+  if (!frame) { box.style.display = "none"; scrollMarksSig = ""; return; }
+  const sh = frame.sh;
+  const offs: number[] = [];
+  for (let i = 0; i < s.events.length; i++) {
+    const ev = s.events[i] as ChatEvent & { human?: boolean; romp?: boolean; rompAuto?: boolean; canned?: string; md?: string };
+    if (ev.kind !== "user" || !ev.human || ev.romp || ev.rompAuto) continue;
+    const md = (ev.md || "").trim();
+    // gestures are the user's DOINGS, not their words — no notch (the Continue row, a /command)
+    if (!md || ev.canned === "continue" || SLASH_CMD_RE.test(md)) continue;
+    const off = frame.offsetOf(i);
+    if (off == null) continue;
+    offs.push(off);
+  }
+  const ys = offs.map((top) => Math.round((top / sh) * (cRect.height - 4)));
+  const sig = activeId + "|" + Math.round(cRect.top) + "," + Math.round(cRect.right) + ","
+    + Math.round(cRect.height) + "|" + ys.join(",");
+  if (sig !== scrollMarksSig) {
+    scrollMarksSig = sig;
+    // UPDATE IN PLACE when the notch count is unchanged (the user 2026-08-17: scrolling back streams
+    // older history in, the scroller's world grows, and every proportional position legitimately
+    // compresses — the native thumb does the same — but rebuilt nodes TELEPORTED there). Moving the
+    // existing nodes lets the CSS transition carry them, so a history load reads as the map
+    // rescaling rather than notches jumping to wrong places. Count changes (new messages, a fresh
+    // tab) still rebuild outright — those are new marks, not moved ones.
+    const kids = Array.from(box.children) as HTMLElement[];
+    if (kids.length === ys.length) {
+      ys.forEach((y, i) => { kids[i].style.top = y + "px"; });
+    } else {
+      box.replaceChildren(...ys.map((y) => {
+        const m = el("div", "scroll-mark");
+        m.style.top = y + "px";
+        return m;
+      }));
+    }
+    box.style.left = (cRect.right - 12) + "px";
+    box.style.top = cRect.top + "px";
+    box.style.height = cRect.height + "px";
+  }
+  box.style.display = ys.length ? "" : "none";
+}
+
 function paintRailSticky(): void {
   const stamp = ensureRailSticky();
   const content = document.getElementById("content");
   const v = activeId ? views.get(activeId) : null;
-  if (!content || !v || v.el.style.display === "none") { stamp.style.display = "none"; return; }
+  if (!content || !v || v.el.style.display === "none") {
+    stamp.style.display = "none";
+    if (railDay) railDay.style.display = "none";
+    return;
+  }
   const cRect = content.getBoundingClientRect();
   const cTop = cRect.top, cBottom = cRect.bottom;
   const BUFFER = 6;                             // the gap kept above the sticky; ALSO the hand-off line
@@ -1652,6 +1813,35 @@ function paintRailSticky(): void {
     }
   }
   const hm = marker ? (marker.dataset.hm || "") : "";
+  // DAY CONTEXT (the user 2026-08-17): whichever stamp owns the top slot also names its DAY, in a
+  // small label riding just above it, whenever that day is not today — so scrolling through history
+  // always says where you are even with the day divider off-screen. The anchor is the tracked turn's
+  // marker when there is one, else the first stamp below the line ("the next one"); its position is
+  // wherever that stamp sits (the line itself once the sticky leads), so the label moves WITH the
+  // leading stamp and the sticky handoff lands at the same pixel — no jump at the transition. The
+  // text swaps only at day boundaries.
+  const day = ensureRailDay();
+  const firstBelow = all.find(([, top]) => top >= line);
+  const anchorM = marker || (firstBelow ? firstBelow[0] : null);
+  // The label sits BELOW the top stamp, in the STAMP'S OWN BOX (same left/width, right-aligned like
+  // the time itself, so the two right edges line up by construction — the user 2026-08-17, whose
+  // first cut floated the label ABOVE the slot: at the top of the view that bled into the tab bar,
+  // and its transform-based alignment didn't match the stamp's). Below-stamp keeps it inside the
+  // pane at every scroll position, and the handoff stays seamless: a leading stamp carries its
+  // label at markerBottom, and the sticky shows it at the very same y when it takes over.
+  const gRect = anyMarker ? anyMarker.getBoundingClientRect() : null;
+  const stampH = anchorM ? anchorM.getBoundingClientRect().height || 11 : 11;
+  const paintDay = (slotTop: number) => {
+    const ep = anchorM ? Number(anchorM.dataset.epoch || 0) : 0;
+    const label = ep && gRect ? dayContext(ep, Date.now()) : "";
+    const yTop = slotTop + stampH + 1;
+    if (!label || yTop > cBottom) { day.style.display = "none"; return; }
+    if (day.textContent !== label) day.textContent = label;
+    day.style.left = gRect!.left + "px";
+    day.style.width = gRect!.width + "px";
+    day.style.top = yTop + "px";
+    day.style.display = "";
+  };
   // The tracked turn's OWN stamp leads the top slot while it is at or below the line — it scrolls up freely
   // until it reaches the line, and the instant it crosses ABOVE (markerTop < line) the sticky takes the same
   // slot showing the same time, so the swap is invisible: no gap, no clipped sliver (the user 2026-07-23).
@@ -1662,6 +1852,8 @@ function paintRailSticky(): void {
   if (!hm || realLeads) {
     stamp.style.display = "none";
     for (const [m] of all) m.style.visibility = "";   // real stamp leads → nothing suppressed
+    if (anyMarker) paintDay(realLeads ? markerTop : (firstBelow ? firstBelow[1] : cBottom + 1));
+    else day.style.display = "none";
     return;
   }
   // The sticky leads: pin it at the line and hide every marker that has crossed ABOVE it, so the real stamp
@@ -1674,6 +1866,7 @@ function paintRailSticky(): void {
   stamp.style.width = g.width + "px";
   stamp.style.top = line + "px";
   stamp.style.display = "";
+  paintDay(line);
 }
 
 // Scroll is the sticky stamp's primary driver, and a re-render moves the geometry under it — both funnel
@@ -1684,7 +1877,7 @@ let railStickyPending = false;
 function scheduleRailSticky(): void {
   if (railStickyPending) return;
   railStickyPending = true;
-  requestAnimationFrame(() => { railStickyPending = false; paintRailSticky(); });
+  requestAnimationFrame(() => { railStickyPending = false; paintRailSticky(); paintScrollMarks(); updateCommentRail(); });
 }
 
 function renderEventInner(ev: ChatEvent): HTMLElement {
@@ -1788,25 +1981,25 @@ function renderEventInner(ev: ChatEvent): HTMLElement {
         turn.classList.add("turn-cmd");
         bubble.classList.add("cmd-row");
       } else if (!romp && !injected && !tagged && ev.md && ev.canned === "continue") {
-        // The card's Continue button: a user GESTURE, not typed prose. The 2026-08-13 cut kept the
-        // blue bubble with a PARAPHRASED gist — which made it the one "user message" that expanded,
-        // and to different words than its label (the user 2026-08-15: unclear what was actually
-        // sent). Superseded: gestures read in the slash-command family (✦ mark, mono chip) — chip
-        // "Continue", then the SENT text's own first line, the rest one click deeper, so expanding
-        // only ever reveals MORE of the same words. The judges still file it as your reply, and the
-        // ↩ follow-up header above still names the goal it answers.
-        turn.classList.add("turn-cmd");
-        bubble.classList.add("cmd-row");
-        const chip = el("span", "slash-cmd-chip"); chip.textContent = "Continue";
-        bubble.appendChild(chip);
+        // The card's Continue button: a user GESTURE, not typed prose. Third cut (the user
+        // 2026-08-17, superseding the 2026-08-15 slash-command dress — its ✦ mark said nothing, and
+        // the boxed chip + trailing caret made a second gesture grammar next to ↩ Follow-up's):
+        // Continue now wears the SAME grammar as the Follow-up header — caret, "→ Continue" in the
+        // accent, the SENT text's own first line dimmed beside it, the rest one click deeper, so
+        // expanding only ever reveals MORE of the same words. Uniqueness rides the word + the →
+        // glyph exactly as Follow-up's rides ↩. The judges still file it as your reply, and the ↩
+        // follow-up header above still names the goal it answers.
+        bubble.classList.add("cont-row");
         const raw = ev.md.replace(/<!--[\s\S]*?-->/g, "").trim();
         const lines = raw.split("\n").map((l) => l.trim());
         const first = lines.find((l) => l && !l.startsWith(">")) || lines.find((l) => l) || raw;   // skip a goal-context "> …" quote
         const clipped = first.length > 90 ? first.slice(0, 88).replace(/\s+\S*$/, "") + "…" : first;
-        const gistEl = el("span", "nudge-gist");
-        const c = el("span", "nudge-caret"); c.textContent = "▸"; gistEl.appendChild(c);
-        gistEl.appendChild(document.createTextNode(clipped));
-        bubble.appendChild(gistEl);
+        const head = el("div", "followup-tag cont-tag");
+        const tri = el("span", "followup-tri cont-tri");         // glyph via CSS, so expansion flips it
+        const lbl = el("span", "followup-lbl"); lbl.textContent = "→ Continue";
+        const g = el("span", "followup-goal"); g.textContent = clipped;
+        head.append(tri, lbl, g);
+        bubble.appendChild(head);
         const full = el("div", "nudge-full md");
         full.innerHTML = md(ev.md);
         bubble.appendChild(full);
@@ -5271,9 +5464,23 @@ const commentThreads = new Map<string, CommentThread[]>();          // parent si
 const commentPending = new Map<string, { text: string; t: number }[]>(); // tid → optimistic sends
 const commentDrafts = new Map<string, string>();                    // draft key → unsent popover text
 let openCommentKey: { sid: string; tid: string } | null = null;     // the open thread popover
-let pendingCommentAnchor: { sid: string; uuid: string; exact: string } | null = null; // create mode
+let pendingCommentAnchor: { sid: string; uuid: string; exact: string;
+  model?: string; effort?: string; color?: string } | null = null; // create mode (+ the thread's own picks)
 let pendingAdoptTid: string | null = null;                          // commentCreated ack that beat its frame
 let commentPopPos: { x: number; y: number } | null = null;
+
+// the popover's own file picker (the user 2026-08-17: the attach clip, like the chat's) — files
+// ship through the SAME dropFile flow; the droppedPath ack sees the open popover and lands there
+const cmtFilePicker = document.createElement("input");
+cmtFilePicker.type = "file";
+cmtFilePicker.multiple = true;
+cmtFilePicker.style.display = "none";
+cmtFilePicker.addEventListener("change", () => {
+  const sid = pendingCommentAnchor?.sid || openCommentKey?.sid || activeId;
+  Array.from(cmtFilePicker.files || []).forEach((f) => shipFileToHost(f, sid));
+  cmtFilePicker.value = "";
+});
+document.body.appendChild(cmtFilePicker);
 
 function closeCommentPop(): void {
   document.getElementById("cmt-pop")?.remove();
@@ -5300,15 +5507,10 @@ function applyCommentMarks(sid: string): void {
   for (const old of Array.from(v.el.querySelectorAll("mark.cmt-hl"))) {
     if (!have.has((old as HTMLElement).dataset.tid || "")) unwrapCommentMark(old as HTMLElement);
   }
-  for (const b of Array.from(v.el.querySelectorAll(".cmt-badge"))) {
-    const uuid = (b.closest(".turn") as HTMLElement | null)?.dataset.uuid || "";
-    if (!threads.some((t) => t.anchorUuid === uuid)) b.remove();
-  }
   if (!threads.length) return;
   for (const [uuid, list] of threadsByAnchor(threads)) {
     const turn = v.el.querySelector(`.turn[data-uuid="${cssEscape(uuid)}"]`) as HTMLElement | null;
     if (!turn) continue;                       // windowed out — the mark returns when the turn does
-    ensureCommentBadge(turn, list);
     for (const th of list) ensureCommentMark(turn, th);
   }
 }
@@ -5343,39 +5545,65 @@ function applyBranchChips(sid: string, v: View): void {
 }
 
 /** Yellow ticks on the chat's scroll rail marking commented spots (the user 2026-08-15) — one per
- *  open/resolved thread of the ACTIVE session, placed by the anchor's position in the event list
- *  (windowing-proof: no DOM measurement of unrendered turns), clicking jumps there and opens the
- *  thread. A fixed strip over #content's right edge, rebuilt with the marks — a handful of ticks. */
+ *  open/resolved thread of the ACTIVE session, clicking jumps there and opens the thread. Placed in
+ *  the SAME content-space frame as the message notches (contentOffsetFrame): the old uniform
+ *  index-fraction percents were a second frame that drifted past the notches as history loaded and
+ *  real turn heights diverged from uniform (the user 2026-08-17) — two marks on one scrollbar may
+ *  never disagree about order. Rides the notches' rAF scheduler so both repaint from one world; a
+ *  signature skips untouched paints, and an unchanged tick set moves IN PLACE (same tids, same
+ *  order) so a mid-press rebuild can't eat the click (these ticks are buttons). */
+let cmtRailSig = "";
 function updateCommentRail(): void {
   let rail = document.getElementById("cmt-rail");
   const content = document.getElementById("content");
+  const v = activeId ? views.get(activeId) : null;
   const s = activeId ? sessions.get(activeId) : null;
   const threads = ((activeId && commentThreads.get(activeId)) || [])
     .filter((t) => t.status === "open" || t.status === "resolved");
-  if (!content || !s || !threads.length) { rail?.remove(); return; }
+  if (!content || !v || !s || !threads.length || v.el.style.display === "none") { rail?.remove(); cmtRailSig = ""; return; }
   const r = content.getBoundingClientRect();
-  if (!r.height) { rail?.remove(); return; }              // hidden pane
+  if (!r.height) { rail?.remove(); cmtRailSig = ""; return; }              // hidden pane
+  const frame = contentOffsetFrame(content, v, s);
+  if (!frame) { rail?.remove(); cmtRailSig = ""; return; }
+  const ticks: Array<{ th: CommentThread; y: number }> = [];
+  for (const th of threads) {
+    const idx = s.events.findIndex((e) => e.uuid === th.anchorUuid);
+    if (idx < 0) continue;
+    const off = frame.offsetOf(idx);
+    if (off == null) continue;
+    // the same proportional map the notches use, clamped so the last tick stays on the strip
+    ticks.push({ th, y: Math.min(r.height - 6, Math.round((off / frame.sh) * (r.height - 4))) });
+  }
+  const sig = activeId + "|" + Math.round(r.top) + "," + Math.round(r.right) + "," + Math.round(r.height)
+    + "|" + ticks.map((t) => t.th.tid + ":" + t.y + ":" + t.th.status + ":" + (t.th.unread ? 1 : 0)).join(",");
+  if (sig === cmtRailSig && rail) return;
+  cmtRailSig = sig;
   if (!rail) { rail = el("div", "cmt-rail"); rail.id = "cmt-rail"; document.body.appendChild(rail); }
   rail.style.left = (r.right - 10) + "px";
   rail.style.top = r.top + "px";
   rail.style.height = r.height + "px";
-  rail.replaceChildren();
-  const n = s.events.length || 1;
-  for (const th of threads) {
-    const idx = s.events.findIndex((e) => e.uuid === th.anchorUuid);
-    if (idx < 0) continue;
-    const tick = el("button", "cmt-tick" + (th.status === "resolved" ? " resolved" : "")
-      + (th.unread && th.status === "open" ? " unread" : "")) as HTMLButtonElement;
+  const cls = (th: CommentThread) => "cmt-tick" + (th.status === "resolved" ? " resolved" : "")
+    + (th.unread && th.status === "open" ? " unread" : "");
+  const kids = Array.from(rail.children) as HTMLElement[];
+  if (kids.length === ticks.length && kids.every((k, i) => k.dataset.tid === ticks[i].th.tid)) {
+    ticks.forEach((t, i) => { kids[i].style.top = t.y + "px"; kids[i].className = cls(t.th); });
+    return;
+  }
+  rail.replaceChildren(...ticks.map((t) => {
+    const tick = el("button", cls(t.th)) as HTMLButtonElement;
     tick.type = "button";
     tick.dataset.act = "cmtjump";
-    tick.dataset.tid = th.tid;
-    tick.dataset.uuid = th.anchorUuid;
-    tick.style.top = Math.min(96.5, (idx / n) * 100) + "%";
-    tick.title = (th.name || "comment") + ": click to jump to it";
-    rail.appendChild(tick);
-  }
+    tick.dataset.tid = t.th.tid;
+    tick.dataset.uuid = t.th.anchorUuid;
+    tick.style.top = t.y + "px";
+    tick.title = (t.th.name || "comment") + ": click to jump to it";
+    return tick;
+  }));
 }
 window.addEventListener("resize", () => updateCommentRail());
+
+// (The per-turn count badge is GONE — the user 2026-08-17: the highlight does the speaking, and
+// the scroll-rail tick already covers a thread whose rendered text drifted beyond re-matching.)
 
 function unwrapCommentMark(markEl: HTMLElement): void {
   const p = markEl.parentNode;
@@ -5387,22 +5615,6 @@ function unwrapCommentMark(markEl: HTMLElement): void {
   while (markEl.firstChild) p.insertBefore(markEl.firstChild, markEl);
   markEl.remove();
   p.normalize();
-}
-
-function ensureCommentBadge(turn: HTMLElement, list: CommentThread[]): void {
-  turn.classList.add("has-cmt");               // positions the badge (styles.css .turn.has-cmt)
-  let b = turn.querySelector(":scope > .cmt-badge") as HTMLButtonElement | null;
-  if (!b) {
-    b = el("button", "cmt-badge") as HTMLButtonElement;
-    b.type = "button";
-    b.dataset.act = "cmtopen";                 // delegated on document.body — click-safe across rebuilds
-    turn.appendChild(b);
-  }
-  b.textContent = String(list.length);
-  b.dataset.tid = (list.find((t) => t.unread && t.status === "open") || list[list.length - 1]).tid;
-  b.classList.toggle("unread", list.some((t) => t.unread && t.status === "open"));
-  b.classList.toggle("busy", list.some((t) => threadBusy(t.state) && t.status === "open"));
-  b.title = (list.length === 1 ? "1 thread" : list.length + " threads") + " on this message. Click to open";
 }
 
 function ensureCommentMark(turn: HTMLElement, th: CommentThread): void {
@@ -5463,8 +5675,21 @@ function styleCommentMark(m: HTMLElement, th: CommentThread): void {
     : "thread: click to open";
 }
 
+/** The comment's identity color (the user 2026-08-17): one of the session palette's colors,
+ *  DISTINCT from the parent session's and, where the palette allows, from every open tab's —
+ *  the same standing-out rule _pick_identity_color applies to new sessions, decided client-side
+ *  so the dialog can wear it before the thread exists. */
+function pickThreadColor(sid: string): string {
+  const parent = (sessions.get(sid)?.color?.bg || "").toLowerCase();
+  const worn = new Set<string>();
+  sessions.forEach((se) => { const c = (se.color?.bg || "").toLowerCase(); if (c) worn.add(c); });
+  (commentThreads.get(sid) || []).forEach((t) => { if (t.color) worn.add(t.color.toLowerCase()); });
+  const free = paletteColors.find((c) => !worn.has(c.toLowerCase()) && c.toLowerCase() !== parent);
+  return free || paletteColors.find((c) => c.toLowerCase() !== parent) || "#e8b220";
+}
+
 function openCommentComposer(sid: string, uuid: string, exact: string, x: number, y: number): void {
-  pendingCommentAnchor = { sid, uuid, exact };
+  pendingCommentAnchor = { sid, uuid, exact, color: pickThreadColor(sid) };
   openCommentKey = null;
   commentPopPos = { x, y };
   renderCommentPopover();
@@ -5520,7 +5745,21 @@ function fillCommentMsgs(list: HTMLElement, th: CommentThread): void {
   list.replaceChildren();
   const pend = prunePending(commentPending.get(th.tid) || [], th.msgs);
   commentPending.set(th.tid, pend);
-  for (const m of th.msgs) list.appendChild(commentMsgEl(m.who, m.text));
+  const evs = (th.events || []) as ChatEvent[];
+  if (evs.length) {
+    // the CHAT's own renderer, from the branch point on (the user 2026-08-17: the same component —
+    // rail dots, markdown, tool folds, notice cards — never a simplified twin). renderingSid keys
+    // the folds per thread, exactly as a chat tab would.
+    const saved = renderingSid;
+    renderingSid = th.tid;
+    let prev: number | null = null;
+    for (const ev of evs) {
+      list.appendChild(renderEvent(ev, prev, null));
+      const ep = eventEpoch(ev);
+      if (ep != null) prev = ep;
+    }
+    renderingSid = saved;
+  } else for (const m of th.msgs) list.appendChild(commentMsgEl(m.who, m.text));
   for (const p of pend) {
     const n = commentMsgEl("you", p.text);
     n.classList.add("pending");
@@ -5547,7 +5786,7 @@ function fillCommentMsgs(list: HTMLElement, th: CommentThread): void {
 
 function commentPopTitle(create: boolean, th: CommentThread | null | undefined): string {
   const nm = th?.name || "Thread";
-  return create ? "New thread"
+  return create ? "New comment:"
     : th!.status === "promoted" ? "Now its own session: " + th!.promotedName
     : th!.status === "promoting" ? "Breaking out…"
     : th!.status === "resolved" ? nm + " (resolved)" : nm;
@@ -5565,14 +5804,27 @@ function commentSendFromPop(pop: HTMLElement): void {
     const nameBox = pop.querySelector(".cmt-name") as HTMLInputElement | null;
     const nm = (nameBox?.value || "").trim();
     if (nm && !/^[A-Za-z0-9._-]+$/.test(nm)) { nameBox?.classList.add("bad"); nameBox?.focus(); return; }
-    if (send) { send.disabled = true; send.textContent = "Starting…"; }   // ack before the round-trip;
-    //                                       the draft survives until commentCreated adopts the thread
-    vscodeApi.postMessage({ type: "commentCreate", id: create.sid, uuid: create.uuid, exact: create.exact, text, name: nm });
+    if (send) { send.disabled = true; send.classList.add("busy"); }   // ack before the round-trip (the ➤
+    //                                       dims); the draft survives until commentCreated adopts the thread
+    // the ants start on the GESTURE (the user 2026-08-17: the cue lagged the kernel round-trip):
+    // a synthetic working thread marks the passage NOW; the kernel's frame replaces the whole list,
+    // so its never-listed tid unwraps through the standard sweep the moment the real thread lands
+    const synth: CommentThread = { tid: "pending:" + create.uuid, anchorUuid: create.uuid,
+      exact: create.exact, status: "open", createdT: Date.now() / 1000, state: "working",
+      unread: false, promotedName: "", msgs: [], name: nm || "comment", color: create.color || "" };
+    const cur0 = commentThreads.get(create.sid) || [];
+    commentThreads.set(create.sid, [...cur0.filter((t) => t.tid !== synth.tid), synth]);
+    applyCommentMarks(create.sid);
+    vscodeApi.postMessage({ type: "commentCreate", id: create.sid, uuid: create.uuid, exact: create.exact,
+      text, name: nm, model: create.model || "", effort: create.effort || "",
+      color: create.color || "" });
     return;
   }
   const cur = openCommentThread();
   if (!cur) return;
   vscodeApi.postMessage({ type: "commentReply", id: cur.sid, tid: cur.th.tid, text });
+  cur.th.state = "working";                     // optimistic: the ants march on the SEND, not the
+  applyCommentMarks(cur.sid);                   // round-trip (the kernel's next frame confirms)
   const pl = commentPending.get(cur.th.tid) || [];
   pl.push({ text, t: Date.now() / 1000 });
   commentPending.set(cur.th.tid, pl);
@@ -5616,56 +5868,14 @@ function renderCommentPopover(): void {
   const head = el("div", "cmt-head");
   const title = el("span", "cmt-title");
   title.textContent = commentPopTitle(!!create, th);
-  const closeBtn = el("button", "cmt-x") as HTMLButtonElement;
-  closeBtn.type = "button";
-  closeBtn.textContent = "×";
-  closeBtn.title = "Close (the thread stays on its highlight)";
-  closeBtn.dataset.act = "cmtclose";
-  head.append(title, closeBtn);
-  // DRAG by the header (the user 2026-08-13, who found the popover's spot inconvenient): pointer
-  // capture, viewport-clamped, and the position writes through to commentPopPos so a later full
-  // rebuild (a status flip) reopens where the user parked it. The header survives in-place
-  // refreshes, so a drag is never cut by a comments frame; a full rebuild mid-drag just ends it.
-  head.title = "Drag to move";
-  head.addEventListener("pointerdown", (ev: PointerEvent) => {
-    if ((ev.target as HTMLElement).closest(".cmt-x")) return;
-    ev.preventDefault();
-    const dx = ev.clientX - pop.offsetLeft, dy = ev.clientY - pop.offsetTop;
-    head.setPointerCapture(ev.pointerId);
-    head.classList.add("dragging");
-    const move = (mv: PointerEvent) => {
-      const x = Math.max(4, Math.min(mv.clientX - dx, window.innerWidth - pop.offsetWidth - 4));
-      const y = Math.max(4, Math.min(mv.clientY - dy, window.innerHeight - 40));
-      pop.style.left = x + "px";
-      pop.style.top = y + "px";
-      commentPopPos = { x, y };
-    };
-    const up = () => {
-      head.classList.remove("dragging");
-      head.removeEventListener("pointermove", move);
-      head.removeEventListener("pointerup", up);
-      head.removeEventListener("pointercancel", up);
-    };
-    head.addEventListener("pointermove", move);
-    head.addEventListener("pointerup", up);
-    head.addEventListener("pointercancel", up);
-  });
-  pop.appendChild(head);
-  const quote = el("div", "cmt-quote");
-  quote.textContent = create ? create.exact : th!.exact;
-  quote.title = "the highlighted passage this thread is about";
-  pop.appendChild(quote);
-  if (th) {
-    const list = el("div", "cmt-msgs");
-    fillCommentMsgs(list, th);
-    pop.appendChild(list);
-  }
+  if (th?.color) title.style.color = th.color;   // an existing thread's title wears its identity color
+  let nameBox: HTMLInputElement | null = null;
   if (create) {
-    // the thread's NAME, editable right here (the user 2026-08-15): prefilled
-    // <session>-comment-<N>, N counting the threads this session has had; an edited value
-    // drafts under its own key so a refused create hands it back too
+    // the name lives IN the header — "New comment: <name>" — bold and editable right there (the
+    // user 2026-08-17); prefilled <session>-comment-<N>, drafted under its own key so a refused
+    // create hands an edited name back too
     const nk = "newname:" + create.uuid;
-    const nameBox = document.createElement("input");
+    nameBox = document.createElement("input");
     nameBox.type = "text";
     nameBox.className = "cmt-name";
     nameBox.setAttribute("autocapitalize", "off");
@@ -5675,8 +5885,113 @@ function renderCommentPopover(): void {
     nameBox.value = commentDrafts.get(nk)
       || ((sess0?.name || "session").replace(/[^A-Za-z0-9._-]/g, "-")
           + "-comment-" + ((commentThreads.get(sid) || []).length + 1));
-    nameBox.addEventListener("input", () => { nameBox.classList.remove("bad"); commentDrafts.set(nk, nameBox.value); });
-    pop.appendChild(nameBox);
+    nameBox.title = "The comment's name — edit it right here";
+    if (create.color) nameBox.style.color = create.color;   // its identity color, distinct from the parent's
+    const nb = nameBox;
+    nb.addEventListener("input", () => { nb.classList.remove("bad"); commentDrafts.set(nk, nb.value); });
+  }
+  const closeBtn = el("button", "cmt-x") as HTMLButtonElement;
+  closeBtn.type = "button";
+  closeBtn.textContent = "×";
+  closeBtn.title = "Close (the thread stays on its highlight)";
+  closeBtn.dataset.act = "cmtclose";
+  if (nameBox) head.append(title, nameBox, closeBtn);
+  else head.append(title, closeBtn);
+  // DRAG by the header (the user 2026-08-13, who found the popover's spot inconvenient): pointer
+  // capture, viewport-clamped, and the position writes through to commentPopPos so a later full
+  // rebuild (a status flip) reopens where the user parked it. The header survives in-place
+  // refreshes, so a drag is never cut by a comments frame; a full rebuild mid-drag just ends it.
+  head.title = "Drag to move";
+  // the WHOLE box drags (the user 2026-08-17), not just the header — any grip that isn't an
+  // interactive control or selectable text, and never the bottom-right resize corner
+  pop.addEventListener("pointerdown", (ev: PointerEvent) => {
+    const t = ev.target as HTMLElement;
+    if (t.closest(".cmt-x, .cmt-name, .cmt-input, .cmt-msgs, .cmt-quote, button, input, textarea, .meta-btn, .meta-menu")) return;
+    const pr = pop.getBoundingClientRect();
+    if (ev.clientX > pr.right - 18 && ev.clientY > pr.bottom - 18) return;   // the resize handle's corner
+    ev.preventDefault();
+    const dx = ev.clientX - pop.offsetLeft, dy = ev.clientY - pop.offsetTop;
+    pop.setPointerCapture(ev.pointerId);
+    pop.classList.add("dragging");
+    const move = (mv: PointerEvent) => {
+      const x = Math.max(4, Math.min(mv.clientX - dx, window.innerWidth - pop.offsetWidth - 4));
+      const y = Math.max(4, Math.min(mv.clientY - dy, window.innerHeight - 40));
+      pop.style.left = x + "px";
+      pop.style.top = y + "px";
+      commentPopPos = { x, y };
+    };
+    const up = () => {
+      pop.classList.remove("dragging");
+      pop.removeEventListener("pointermove", move);
+      pop.removeEventListener("pointerup", up);
+      pop.removeEventListener("pointercancel", up);
+    };
+    pop.addEventListener("pointermove", move);
+    pop.addEventListener("pointerup", up);
+    pop.addEventListener("pointercancel", up);
+  });
+  pop.appendChild(head);
+  if (create || !(th!.events || []).length) {
+    // the chat-parity view opens ON the quoting message, so a second quote block would say it twice
+    const quote = el("div", "cmt-quote");
+    quote.textContent = create ? create.exact : th!.exact;
+    quote.title = "the highlighted passage this thread is about";
+    pop.appendChild(quote);
+  }
+  if (th) {
+    const list = el("div", "cmt-msgs");
+    fillCommentMsgs(list, th);
+    pop.appendChild(list);
+  }
+  let metaRowPending: HTMLElement | null = null;   // appended under the composer row — the statusline position
+  if (create) {
+    // the thread's OWN model + effort (the user 2026-08-17): the same /models-fed choices the
+    // chat's statusline selectors use, defaulting to what this session runs now — picking one
+    // affects only the thread; the conversation it branches from is never touched
+    const st = sessions.get(sid)?.status;
+    const metaRow = el("div", "cmt-meta-row");
+    const mkSel = (kind: "model" | "effort") => {
+      // the statusline's own badge chrome (.meta-btn/.meta-label/.meta-caret) so the two stay in
+      // sync by construction (the user 2026-08-17), tinted from the /models list's shared colors
+      const btn = el("span", "meta-btn cmt-meta") as HTMLElement;
+      const chosen = kind === "model" ? create.model : create.effort;
+      const choice = chosen ? META_CHOICES[kind].find((c) => c.value === chosen) : null;
+      const label = el("span", "meta-label");
+      label.textContent = choice ? choice.label : (kind === "model" ? (st?.model || "Default") : (st?.effort || "default"));
+      const tint = choice?.color || (kind === "model" ? st?.modelColor : st?.effortColor);
+      if (tint && tint.length === 3) label.style.color = `rgb(${tint[0]},${tint[1]},${tint[2]})`;
+      const caret = el("span", "meta-caret");
+      caret.textContent = "▾";
+      btn.append(label, caret);
+      btn.title = chosen ? "the comment runs on its own " + kind + "; this session keeps its"
+        : "inherits this session's " + kind + " — click to pick another for the comment only";
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        closeMetaMenu();
+        const menu = el("div", "meta-menu");
+        for (const c of META_CHOICES[kind]) {
+          const cur = chosen ? c.value === chosen : (st ? isCurrentMeta(kind, st, c.value) : false);
+          const item = el("div", "meta-item" + (cur ? " current" : ""));
+          item.textContent = c.label;
+          item.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            if (pendingCommentAnchor) pendingCommentAnchor[kind] = c.value;
+            closeMetaMenu();
+            document.getElementById("cmt-pop")?.remove();   // full rebuild shows the pick
+            renderCommentPopover();
+          });
+          menu.appendChild(item);
+        }
+        document.body.appendChild(menu);
+        const r2 = btn.getBoundingClientRect();
+        menu.style.left = r2.left + "px";
+        menu.style.top = (r2.bottom + 4) + "px";
+        metaMenuEl = menu;
+      });
+      return btn;
+    };
+    metaRow.append(mkSel("model"), mkSel("effort"));
+    metaRowPending = metaRow;
   }
   if (create || th!.status !== "promoted") {
     const dk = create ? "new:" + create.uuid : th!.tid;
@@ -5691,13 +6006,65 @@ function renderCommentPopover(): void {
       if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); commentSendFromPop(pop); }
       else if (ev.key === "Escape") { ev.stopPropagation(); closeCommentPop(); }
     });
-    pop.appendChild(box);
-    const row = el("div", "cmt-actions");
+    const crow = el("div", "cmt-composer");   // the chat composer's shape: clip left, ➤ right
+    const attach = el("button", "cmt-attach") as HTMLButtonElement;
+    attach.type = "button";
+    attach.title = "Attach a file";
+    attach.innerHTML = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" '
+      + 'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66'
+      + 'l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>';
+    attach.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); cmtFilePicker.click(); });
     const send = el("button", "cmt-send") as HTMLButtonElement;
     send.type = "button";
-    send.textContent = create ? "Start thread" : "Send";
+    send.textContent = "➤";
+    send.title = create ? "Comment (Enter)" : "Send (Enter)";
+    send.setAttribute("aria-label", create ? "Comment" : "Send");
     send.dataset.act = "cmtsend";
-    row.appendChild(send);
+    crow.append(attach, box, send);
+    pop.appendChild(crow);
+    if (metaRowPending) pop.appendChild(metaRowPending);   // model/effort under the box, like the chat
+    if (th && th.status === "open") {
+      // the thread is a real session under the hood — its model/effort switch LIVE through the
+      // chat's own ops (setModel/setEffort route by sid; be.owns makes the thread reachable)
+      const mrow = el("div", "cmt-meta-row");
+      const mkLive = (kind: "model" | "effort") => {
+        const btn = el("span", "meta-btn cmt-meta") as HTMLElement;
+        const label = el("span", "meta-label");
+        label.textContent = (kind === "model" ? (th.model || "Default") : (th.effort || "default"));
+        const choice = META_CHOICES[kind].find((c) => (label.textContent || "").toLowerCase().startsWith(c.value));
+        if (choice?.color && choice.color.length === 3)
+          label.style.color = `rgb(${choice.color[0]},${choice.color[1]},${choice.color[2]})`;
+        const caret = el("span", "meta-caret");
+        caret.textContent = "▾";
+        btn.append(label, caret);
+        btn.title = "the thread's own " + kind + " — switching it never touches the session it branched from";
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          closeMetaMenu();
+          const menu = el("div", "meta-menu");
+          for (const c of META_CHOICES[kind]) {
+            const item = el("div", "meta-item");
+            item.textContent = c.label;
+            item.addEventListener("click", (ev) => {
+              ev.stopPropagation();
+              vscodeApi?.postMessage({ type: kind === "model" ? "setModel" : "setEffort", id: th.tid, value: c.value });
+              closeMetaMenu();
+            });
+            menu.appendChild(item);
+          }
+          document.body.appendChild(menu);
+          const r2 = btn.getBoundingClientRect();
+          menu.style.left = r2.left + "px";
+          menu.style.top = (r2.bottom + 4) + "px";
+          metaMenuEl = menu;
+        });
+        return btn;
+      };
+      mrow.append(mkLive("model"), mkLive("effort"));
+      pop.appendChild(mrow);
+    }
+    const row = el("div", "cmt-actions");
     if (th) {
       const br = el("button", "cmt-act") as HTMLButtonElement;
       br.type = "button";
@@ -5705,18 +6072,15 @@ function renderCommentPopover(): void {
       br.title = "Continue this thread as its own session; it keeps everything it knows";
       br.dataset.act = "cmtbreak";
       row.appendChild(br);
-      if (th.status === "open") {
-        const rs = el("button", "cmt-act") as HTMLButtonElement;
-        rs.type = "button";
-        rs.textContent = "Resolve";
-        rs.title = "Settle this thread: the highlight dims, and replying reopens it";
-        rs.dataset.act = "cmtresolve";
-        row.appendChild(rs);
-      } else if (th.status === "resolved") {   // never for 'promoting' — the kernel would refuse anyway
+      // Resolve is GONE (the user 2026-08-17): an idle thread draws no usage and its transcript
+      // is on disk either way, so the real verbs are Break out and Delete. Legacy resolved rows
+      // still render dimmed and reopen on reply; they just can't be minted anymore. Never for
+      // 'promoting' — the kernel would refuse anyway.
+      if (th.status === "open" || th.status === "resolved") {
         const dl = el("button", "cmt-act cmt-del") as HTMLButtonElement;
         dl.type = "button";
         dl.textContent = "Delete";
-        dl.title = "Remove this thread and its highlight";
+        dl.title = "Remove this thread and its highlight (the conversation file stays on disk)";
         dl.dataset.act = "cmtdelete";
         dl.addEventListener("pointerleave", () => { dl.classList.remove("armed"); dl.textContent = "Delete"; });
         row.appendChild(dl);
@@ -5734,6 +6098,15 @@ function renderCommentPopover(): void {
     pop.appendChild(row);
   }
   document.body.appendChild(pop);
+  if (typeof ResizeObserver === "function") {
+    // resizing the BOX (resize: both) hands the extra room to the quoted context: the .sized class
+    // unlocks the quote's clamp; armed only after a real user resize, so the natural size stays tight
+    const w0 = pop.offsetWidth, h0 = pop.offsetHeight;
+    const ro = new ResizeObserver(() => {
+      if (Math.abs(pop.offsetWidth - w0) > 6 || Math.abs(pop.offsetHeight - h0) > 6) pop.classList.add("sized");
+    });
+    ro.observe(pop);
+  }
   const r = pop.getBoundingClientRect();
   const px = Math.max(8, Math.min(commentPopPos?.x ?? (window.innerWidth - r.width) / 2, window.innerWidth - r.width - 8));
   const py = Math.max(8, Math.min(commentPopPos?.y ?? 120, window.innerHeight - r.height - 8));
@@ -7413,7 +7786,7 @@ function composerRestingPlaceholder(): string {
   // "/ for commands", not "type / for commands". The static skeletons carry the same string.
   return isCoarsePointer()
     ? "Message this session…"
-    : "Message this session…  (⏎ send · ⇧⏎ newline · ⌘⏎ stage · / for commands)";
+    : "Message this session…  (⏎ send · ⇧⏎ newline · ⌘⏎ stage · ↑ history · / for commands)";
 }
 
 // How a message typed into the NORMAL composer should be routed while a live picker is up — the picker's
@@ -7877,18 +8250,18 @@ function elapsedMs(sinceMs: number | null): string {
 type MetaKind = "mode" | "model" | "effort" | "fast";
 // One dropdown entry. `sub` is the second line for a choice whose consequence is not obvious from its
 // label; `sdkOnly` drops the entry on a tmux session, whose backend cannot apply it.
-interface MetaChoice { label: string; value: string; sub?: string; sdkOnly?: boolean }
+interface MetaChoice { label: string; value: string; sub?: string; sdkOnly?: boolean; color?: number[] | null }
 // Model + effort choices come from the kernel's /models — the ONE list shared with the timeline lanes and the
 // judge-tier settings (the user 2026-07-02, who wanted one shared code path, not hardcoded in multiple places), so
 // the client holds no model literals (mirrors paletteColors above). Populated in place on load so META_CHOICES
 // keeps its reference; the session picker appends its own "Default" (use-the-CLI-default) sentinel — not a model.
-const MODEL_CHOICES: { label: string; value: string }[] = [];
-const EFFORT_CHOICES: { label: string; value: string }[] = [];
+const MODEL_CHOICES: { label: string; value: string; color?: number[] | null }[] = [];
+const EFFORT_CHOICES: { label: string; value: string; color?: number[] | null }[] = [];
 // A CODEX session's pickers speak Codex's vocabulary (the payload's codex section — models from
 // the app-server's own list, efforts the four Codex accepts). Empty until the codex backend has
 // run: an empty model menu beats offering another vendor's models (docs/codex.md).
-const CODEX_MODEL_CHOICES: { label: string; value: string }[] = [];
-const CODEX_EFFORT_CHOICES: { label: string; value: string }[] = [];
+const CODEX_MODEL_CHOICES: { label: string; value: string; color?: number[] | null }[] = [];
+const CODEX_EFFORT_CHOICES: { label: string; value: string; color?: number[] | null }[] = [];
 fetch(kernelUrl("/models"), { cache: "no-store" }).then((r) => r.json()).then((d) => {
   if (Array.isArray(d.models)) { MODEL_CHOICES.length = 0; MODEL_CHOICES.push(...d.models, { label: "Default", value: "default" }); }
   if (Array.isArray(d.efforts)) { EFFORT_CHOICES.length = 0; EFFORT_CHOICES.push(...d.efforts); }
@@ -9500,7 +9873,10 @@ window.addEventListener("message", (e: MessageEvent) => {
   if (m.romp === "chatNav") { navHist.go(m.dir === 1 ? 1 : -1); return; }
   if (m.type === "pipeState") { pipeBanner(!!m.up, Number(m.queued) || 0); return; }
   // any kernel message proves the kernel is reachable again — heal previews whose fetch died in a
-  // restart window (preview.ts retryFailedPreviews; a no-op when nothing failed)
+  // restart window (preview.ts retryFailedPreviews; a no-op when nothing failed). federation's
+  // tunnel poll rides this same path: it dispatches {type:"hostUp"} on a host's down→up transition,
+  // so relay-failed figures heal the moment the tunnel returns even when no chat traffic flows
+  // (idle sessions generated no messages, so figures sat until the user's next send — 2026-08-17)
   retryFailedPreviews();
   if (m.type === "session") upsert(m);
   else if (m.type === "globalRetryPaused") {
@@ -9715,6 +10091,15 @@ window.addEventListener("message", (e: MessageEvent) => {
     if (s && s.name !== m.name) { s.name = m.name; renderTabs(); }
   }
   else if (m.type === "droppedPath" && typeof m.path === "string") {   // host-saved drop/paste/pick → a thumbnail, not path text (the user 2026-08-04)
+    const cbox = document.getElementById("cmt-pop")?.querySelector(".cmt-input") as HTMLTextAreaElement | null;
+    if (cbox) {
+      // a comment popover is open — its own clip shipped this file, so the path lands in ITS box
+      retirePendingShip(m.path);
+      cbox.value = (cbox.value ? cbox.value.trimEnd() + " " : "") + m.path + " ";
+      cbox.dispatchEvent(new Event("input"));   // the draft listener persists it
+      cbox.focus();
+      return;
+    }
     const owner = retirePendingShip(m.path) || activeId;               // the chip this ack answers names the OWNING composer (no-op for pickFile, which never ships)
     addComposerFile(owner, m.path);
     if (owner && sendOnShip.has(owner) && !(pendingShips.get(owner) || []).length) {
@@ -9794,6 +10179,10 @@ window.addEventListener("message", (e: MessageEvent) => {
   // FULL rebuild: the in-place refresh path deliberately never touches the composer, so it would
   // leave the disabled "Starting…" button stuck (the user 2026-08-15, screenshot of exactly that)
   if (m && m.type === "warn" && pendingCommentAnchor) {
+    // the synthetic working mark must die with the refusal, or it marches forever
+    const pa = pendingCommentAnchor;
+    commentThreads.set(pa.sid, (commentThreads.get(pa.sid) || []).filter((t) => t.tid !== "pending:" + pa.uuid));
+    applyCommentMarks(pa.sid);
     document.getElementById("cmt-pop")?.remove();
     renderCommentPopover();
   }
@@ -10238,6 +10627,7 @@ function setupComposer() {
   // the session payload's own human-sent messages — authoritative, survives reloads — with romp's
   // injected turns excluded and adjacent repeats collapsed. The walk drops on send.
   const histWalk = new Map<string, { idx: number; stash: string }>();   // sid → walk position + stashed draft
+  let recalling = false;                               // fences the recall's own synthetic input event
   const composerHistory = (sid: string): string[] => {
     const out: string[] = [];
     for (const ev of sessions.get(sid)?.events || []) {
@@ -10249,35 +10639,42 @@ function setupComposer() {
   };
   ta.addEventListener("keydown", (e) => {
     if (slashKey(e)) return;   // the slash menu owns ↑/↓/⏎/Tab/Esc while it's open
-    // ↑/↓ recall history ONLY from the boundary lines with a collapsed caret and no modifiers —
-    // mid-text arrows keep their native caret movement, so multi-line editing is never hijacked.
+    // ↑/↓ recall history ONLY from an EMPTY box (the user 2026-08-17, tightening the first cut's
+    // first-line rule: any text already in the box — even one character — means a draft in progress,
+    // and arrows must never hijack it). Once a walk is ACTIVE the recalled text is the walk's own, so
+    // ↑/↓ keep navigating from its boundary lines; the first manual edit ends the walk (see the input
+    // listener) and the text becomes an ordinary draft that recall won't touch.
     if ((e.key === "ArrowUp" || e.key === "ArrowDown") && activeId
         && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey
         && ta.selectionStart === ta.selectionEnd) {
       const onFirst = !ta.value.slice(0, ta.selectionStart).includes("\n");
       const onLast = !ta.value.slice(ta.selectionStart).includes("\n");
       const w = histWalk.get(activeId);
-      if (e.key === "ArrowUp" ? onFirst : (onLast && w)) {
+      if (e.key === "ArrowUp" ? (w ? onFirst : ta.value === "") : (onLast && w)) {
         const hist = composerHistory(activeId);
         if (e.key === "ArrowUp") {
           const idx = w ? w.idx - 1 : hist.length - 1;
           if (idx >= 0 && hist.length) {
             e.preventDefault();
             histWalk.set(activeId, { idx, stash: w ? w.stash : ta.value });
+            recalling = true;
             ta.value = hist[idx];
             ta.setSelectionRange(ta.value.length, ta.value.length);
             growComposer(ta);
             ta.dispatchEvent(new Event("input"));      // draft/slash/ask-mode bookkeeping stays true
+            recalling = false;
           }
           return;                                      // nothing older → native caret-to-start is fine
         }
         e.preventDefault();
         const idx = w!.idx + 1;
+        recalling = true;
         if (idx >= hist.length) { ta.value = w!.stash; histWalk.delete(activeId); }
         else { w!.idx = idx; ta.value = hist[idx]; }
         ta.setSelectionRange(ta.value.length, ta.value.length);
         growComposer(ta);
         ta.dispatchEvent(new Event("input"));
+        recalling = false;
         return;
       }
     }
@@ -10332,6 +10729,9 @@ function setupComposer() {
     }
   });
   ta.addEventListener("input", () => {
+    // a MANUAL edit ends any history walk (the user 2026-08-17): the text becomes an ordinary
+    // draft, and recall stays away from drafts. The recall's own synthetic dispatch is fenced.
+    if (!recalling && activeId) histWalk.delete(activeId);
     growComposer(ta);
     updateSlash();   // open/refresh/close the slash-command menu as the leading "/token" changes
     // keep the per-tab draft (and its persisted copy) current as you type, so a reload restores it
@@ -10666,6 +11066,11 @@ setupSettings();
       if (!cur) return;
       if (!elx.classList.contains("armed")) { elx.classList.add("armed"); elx.textContent = "Really delete?"; return; }
       vscodeApi?.postMessage({ type: "commentDelete", id: cur.sid, tid: cur.th.tid });
+      // optimistic removal (the user 2026-08-17: the highlight must go NOW, mid-animation included);
+      // the kernel's next frame confirms, and kernel-side the delete also interrupts the in-flight
+      // reply so the work stops with its cue
+      commentThreads.set(cur.sid, (commentThreads.get(cur.sid) || []).filter((t) => t.tid !== cur.th.tid));
+      applyCommentMarks(cur.sid);
       closeCommentPop();
     },
     cmtopensession: (elx) => {

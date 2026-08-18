@@ -399,8 +399,11 @@ class FakeBackend:
         self.calls = []
         self.sent = []
 
-    def fork(self, name, parent_sid, cut_uuid="", bg="", fg="", sid=None, thread_of=""):
+    def fork(self, name, parent_sid, cut_uuid="", bg="", fg="", sid=None, thread_of="",
+             model="", effort=""):
         self.calls.append(("fork", name, parent_sid, cut_uuid, sid, thread_of))
+        self.forked_meta = (model, effort)
+        self.forked_bg = bg
         return sid
 
     def connect(self, sid):
@@ -414,6 +417,10 @@ class FakeBackend:
 
     def resume(self, name, sid, cwd=None):
         self.calls.append(("resume", sid))
+        return True
+
+    def interrupt(self, sid):
+        self.calls.append(("interrupt", sid))
         return True
 
     def kill(self, sid):
@@ -479,6 +486,37 @@ class CommentOps(CommentBase):
         self.assertEqual(fr["threads"][0]["name"], "parent-comment-1",
                          "the popover titles threads by name off the frame")
 
+    def test_model_and_effort_picks_ride_the_fork_untouched_by_default(self):
+        km._comment_create(PARENT, "a1", "exponential backoff", "Why?", model="haiku", effort="low")
+        self.assertEqual(self.be.forked_meta, ("haiku", "low"))
+        km._comment_create(PARENT, "a1", "the cap", "Plain.")
+        self.assertEqual(self.be.forked_meta, ("", ""), "no pick = inherit; the parent is never touched")
+
+    def test_the_comments_identity_color_rides_create_fork_row_and_frame(self):
+        _, tid = km._comment_create(PARENT, "a1", "exponential backoff", "Why?", color="#a3be8c")
+        self.assertEqual(self.be.forked_bg, "#a3be8c")
+        self.assertEqual(km._comment_thread(PARENT, tid)["color"], "#a3be8c")
+        self.assertEqual(km._comments_frame(PARENT)["threads"][0]["color"], "#a3be8c")
+        _, tid2 = km._comment_create(PARENT, "a1", "the cap", "Junk color.", color="not-a-hex")
+        self.assertEqual(self.be.forked_bg, "", "a non-hex color falls to the backend's own pick")
+        self.assertNotIn("color", km._comment_thread(PARENT, tid2))
+
+    def test_a_harness_task_notification_never_renders_as_the_users_words(self):
+        recs = self._parent_records()
+        t = self.now - 200
+        recs += [uline(t, km._comment_first_message("exponential backoff", "Why?"), "cu1", parent="a2"),
+                 uline(t + 5, "<task-notification>\n<task-id>b1</task-id>\n<status>stopped</status>"
+                       "\n</task-notification>", "tn1", parent="cu1"),
+                 aline(t + 10, "Because herds.", "ca1", parent="tn1")]
+        self._write(THREAD, recs)
+        (jd.SDKDIR / (THREAD + ".json")).write_text(json.dumps(
+            {"sid": THREAD, "name": "t", "cwd": self.cdir, "lastSid": THREAD,
+             "alive": True, "threadOf": PARENT}))
+        msgs = km._thread_messages(THREAD, "a2")
+        self.assertEqual([m["who"] for m in msgs], ["you", "agent"],
+                         "the harness notice is for the AGENT, not a popover bubble")
+        self.assertNotIn("task-notification", json.dumps(msgs))
+
     def test_a_refused_cut_leaves_no_thread_row_behind(self):
         err, tid = km._comment_create(PARENT, "missing-uuid", "text", "comment")
         self.assertTrue(err)
@@ -496,6 +534,13 @@ class CommentOps(CommentBase):
         self.assertIn(("resume", tid), self.be.calls, "replying IS the reopen gesture")
         self.assertEqual(km._comment_thread(PARENT, tid)["status"], "open")
         self.assertEqual(self.be.sent[-1], (tid, "one more question"))
+
+    def test_delete_interrupts_the_inflight_reply_before_the_kill(self):
+        # deleting a thread mid-generation must STOP the work, not just its cue (the user 2026-08-17)
+        _, tid = km._comment_create(PARENT, "a1", "exponential backoff", "Why?")
+        km._comment_delete(PARENT, tid)
+        kinds = [c[0] for c in self.be.calls if c[0] in ("interrupt", "kill")]
+        self.assertEqual(kinds, ["interrupt", "kill"], "cut the turn first, then shut the CLI down")
 
     def test_delete_removes_the_row(self):
         _, tid = km._comment_create(PARENT, "a1", "exponential backoff", "Why?")

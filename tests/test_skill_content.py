@@ -183,10 +183,12 @@ class LiveTwin(unittest.TestCase):
         self.assertEqual(a["type"], "assistant")
         self.assertIn("# cleanplots", a["skillMd"])
         self.assertEqual(a["message"]["content"], [])
-        # same message with the id NOT in the session's Skill set → an ordinary user atom
+        # same message with the id NOT in the session's Skill set → SIDECHAIN traffic, dropped
+        # (2026-08-17: a parent_tool_use_id outside the Skill set marks a subagent's own turn — the
+        # old ordinary-user-atom fallback is exactly how kickoff prompts leaked into the parent chat
+        # as giant expanded boxes; see test_sidechain_atoms.py)
         b = sb.msg_to_atom(UserMessage([TextBlock(SKILL_MD_V2)]), "s", "f", 5, skill_tool_ids={"other"})
-        self.assertEqual(b["type"], "user")
-        self.assertNotIn("skillMd", b)
+        self.assertIsNone(b)
 
     def test_note_skill_tool_ids_collects_from_the_stream(self):
         sb = SourceFileLoader("romp_sdk_backend_skill3", os.path.join(BIN, "romp_sdk_backend.py")).load_module()

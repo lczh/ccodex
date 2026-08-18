@@ -666,7 +666,7 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
    against var(--fs) — em here would key on the BUTTON's larger font and drift — so the pair tracks the
    resting box height by construction. In-flow flex items, not corner overlays: no offset arithmetic
    couples them to the composer's padding, and a peer's padding change can't strand them outside the box. */
-#composer-attach, #composer-send {
+#composer-attach, #composer-send, .cmt-attach, .cmt-send {
   flex: 0 0 auto; width: calc(1.4 * var(--fs) + 18px); height: calc(1.4 * var(--fs) + 18px); border-radius: 10px;
   padding: 0; line-height: 1;
   display: flex; align-items: center; justify-content: center;
@@ -675,11 +675,11 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
 }
 /* the paperclip + send glyphs wear the romp accent blue (the user 2026-07-15) — action affordances, not
    status, so var(--accent) is the intended use; resting a touch dim, full on hover */
-#composer-attach { color: var(--accent); opacity: 0.8; order: 1; }   /* clip sits LEFT of the input */
-#composer-attach:hover, #composer-send:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08)); }
-#composer-send { order: 3; }                                         /* send on the input's right */
-#composer-send:not(:disabled) { color: var(--accent); opacity: 0.85; }   /* romp-blue send affordance */
-#composer-send:disabled { opacity: 0.3; cursor: not-allowed; }
+#composer-attach, .cmt-attach { color: var(--accent); opacity: 0.8; order: 1; }   /* clip sits LEFT of the input */
+#composer-attach:hover, #composer-send:hover, .cmt-attach:hover, .cmt-send:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08)); }
+#composer-send, .cmt-send { order: 3; }                              /* send on the input's right */
+#composer-send:not(:disabled), .cmt-send:not(:disabled) { color: var(--accent); opacity: 0.85; }   /* romp-blue send affordance */
+#composer-send:disabled, .cmt-send:disabled, .cmt-send.busy { opacity: 0.3; cursor: not-allowed; }
 #composer-input {
   order: 2; flex: 1 1 auto; min-width: 0;
   resize: none; box-sizing: border-box;
@@ -705,7 +705,7 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
    messenger's send, the paperclip on a faint chip fill so both read as buttons. The resting box stays
    ONE line, like Signal's; the mobile placeholder is shortened to fit it (composerRestingPlaceholder). */
 @media (pointer: coarse) {
-  #composer-attach, #composer-send { width: 40px; height: 40px; border-radius: 12px; }
+  #composer-attach, #composer-send, .cmt-attach, .cmt-send { width: 40px; height: 40px; border-radius: 12px; }
   #composer-attach { font-size: 19px; background: rgba(255, 255, 255, 0.07); }
   #composer-send { font-size: 21px; }
   /* hover is included on purpose: a touch device can leave a sticky :hover that would otherwise
@@ -1085,6 +1085,26 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
   position: fixed; z-index: 3; pointer-events: none;
   color: var(--dim); opacity: 0.92;
 }
+/* The day-context label above the top rail stamp (render.ts paintDay, the user 2026-08-17):
+   "Yesterday" / "3 days ago" / "Last week" whenever the top stamp's day is not today. Fixed like
+   the sticky, passive like the sticky; right-aligned to the gutter's right edge via the translate
+   (left is set to that edge, no width math), sitting just above the stamp it names. Smaller than
+   the stamp on purpose — context, not the time itself — and nowrap: fixed positioning escapes the
+   pane's overflow clip, and the longest form ("2 weeks ago") clears the gutter into the turn
+   padding, never over prose. */
+/* the user-message scroll notches (render.ts paintScrollMarks, the user 2026-08-17): passive fixed
+   chrome over the scroller's right edge, one 2px tick per user message at its proportional position.
+   The blue is the OUTGOING-BUBBLE blue (#2b6cef, "yours"), deliberately not the romp accent. */
+.scroll-marks { position: fixed; z-index: 3; pointer-events: none; width: 12px; }
+.scroll-marks .scroll-mark { position: absolute; right: 1px; width: 8px; height: 2px;
+  border-radius: 1px; background: #2b6cef; opacity: 0.65;
+  transition: top 180ms ease; }   /* history streaming in rescales the map — carried, not teleported */
+@media (prefers-reduced-motion: reduce) { .scroll-marks .scroll-mark { transition: none; } }
+.rail-day {
+  position: fixed; z-index: 3; pointer-events: none; white-space: nowrap;
+  text-align: right;   /* the STAMP's own box + its own alignment — the right edges match by construction */
+  font-size: 0.68em; letter-spacing: 0.03em; color: var(--dim); opacity: 0.85;
+}
 /* match the dot's vertical position per turn type (default dot top:15, tool/thinking top:10) */
 .turn-tool .time-marker, .turn-thinking .time-marker { top: 10px; }
 /* DAY DIVIDER (the user 2026-08-01) — the date on a hairline rule across the prose column,
@@ -1228,12 +1248,20 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
 .user-bubble.cmd-row .slash-cmd-chip { background: var(--bg); color: #2b6cef;
   border-color: #2b6cef; }
 .user-bubble.cmd-row .slash-cmd-args { color: var(--dim); }
-/* The Continue button's turn wears the same gesture dress (render.ts canned === "continue", the user
-   2026-08-15): chip "Continue", then the SENT text's own first line — dim like the command family, not
-   the white-on-blue fold — with the full words unfolding in place under the row. */
 .user-bubble.cmd-row .nudge-gist, .user-bubble.cmd-row .nudge-caret { color: var(--dim); }
 .user-bubble.cmd-row .nudge-gist { margin-left: 8px; }
 .user-bubble.cmd-row .nudge-full { color: var(--dim); margin-top: 4px; max-width: 640px; }
+/* The Continue button's turn wears the FOLLOW-UP grammar (render.ts canned === "continue", the user
+   2026-08-17, superseding the 2026-08-15 ✦ + boxed-chip dress — one gesture grammar, fewer elements):
+   caret, "→ Continue" in the accent (the same dress "↩ Follow-up" wears), the sent text's own first
+   line dimmed beside it, the full words unfolding in place under the row. The caret glyph lives in CSS
+   so the same .expanded class the fold delegate flips also turns it. */
+.user-bubble.cont-row { max-width: none; background: none; border: none; border-radius: 0; padding: 2px 0; }
+.user-bubble.cont-row .followup-tag { max-width: none; }
+.user-bubble.cont-row .cont-tri::before { content: "▸"; }
+.user-bubble.cont-row.expanded .cont-tri::before { content: "▾"; }
+.user-bubble.cont-row .nudge-full { display: none; color: var(--dim); margin-top: 4px; max-width: 640px; }
+.user-bubble.cont-row.expanded .nudge-full { display: block; }
 /* ---------- romp-injected message (a feed nudge / follow-up) ----------
    A GRAY bubble in the SAME right-aligned spot as the blue user bubble (so it sits where "an outgoing
    message" goes), but clearly NOT you — gray, with a small "↯ romp" tag above it (the user 2026-06-19).
@@ -2434,29 +2462,58 @@ mark.cmt-hl {
 mark.cmt-hl.unread { background: color-mix(in srgb, var(--cmt-hl) 45%, transparent); }
 mark.cmt-hl:hover { background: color-mix(in srgb, var(--cmt-hl) 58%, transparent); }
 mark.cmt-hl.resolved { background: rgba(255, 255, 255, 0.08); }
-mark.cmt-hl.busy { animation: cmt-busy-pulse 1.2s ease-in-out infinite; }
+/* WRITING (the user 2026-08-17): while the thread is mid-reply the region wears MARCHING ANTS —
+   a dashed outline whose dashes crawl slowly around the box — and turns into the solid highlight
+   the moment the reply lands (the busy class drops with the thread's working state). Four gradient
+   strips with an animated offset, never a border: an inline border would shift the text it wraps.
+   This rule must stay AFTER :hover — its shorthand would otherwise wipe the strips mid-hover. */
+mark.cmt-hl.busy {
+  background-color: transparent;
+  background-image:
+    repeating-linear-gradient(90deg, color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
+    repeating-linear-gradient(90deg, color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
+    repeating-linear-gradient(0deg,  color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
+    repeating-linear-gradient(0deg,  color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px);
+  background-size: 100% 1.5px, 100% 1.5px, 1.5px 100%, 1.5px 100%;
+  background-position: 0 0, 0 100%, 0 0, 100% 0;
+  background-repeat: no-repeat;
+  animation: cmt-ants 1.2s linear infinite;
+}
 mark.cmt-hl.hl-first { border-top-left-radius: 2px; border-bottom-left-radius: 2px; }
 mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 2px; }
-@keyframes cmt-busy-pulse { 50% { background: color-mix(in srgb, var(--cmt-hl) 50%, transparent); } }
+/* the ants march clockwise: top strip right, bottom left, left edge up, right edge down — one
+   12px dash cycle per period, slow and steady */
+@keyframes cmt-ants {
+  to { background-position: 12px 0, -12px 100%, 0 -12px, 100% 12px; }
+}
+/* a code/math HOST whose mark is mid-reply wears the ants too — its element tint would otherwise
+   stay solid and defeat the outline-then-fill cue */
+.md :not(pre) > code.cmt-hl-host:has(mark.cmt-hl.busy),
+.md .katex.cmt-hl-host:has(mark.cmt-hl.busy) {
+  background-color: transparent;
+  background-image:
+    repeating-linear-gradient(90deg, color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
+    repeating-linear-gradient(90deg, color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
+    repeating-linear-gradient(0deg,  color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
+    repeating-linear-gradient(0deg,  color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px);
+  background-size: 100% 1.5px, 100% 1.5px, 1.5px 100%, 1.5px 100%;
+  background-position: 0 0, 0 100%, 0 0, 100% 0;
+  background-repeat: no-repeat;
+  animation: cmt-ants 1.2s linear infinite;
+}
+.md :not(pre) > code.cmt-hl-host:has(mark.cmt-hl.busy) { background-color: var(--code-bg); }
 .md :not(pre) > code.cmt-hl-host { background: color-mix(in srgb, var(--cmt-hl) 30%, var(--code-bg)); }
 .md :not(pre) > code.cmt-hl-host > mark.cmt-hl { background: transparent; }
 .md :not(pre) > code.cmt-hl-host:hover { background: color-mix(in srgb, var(--cmt-hl) 58%, var(--code-bg)); }
 
 .turn.has-cmt { position: relative; }
-.cmt-badge {
-  position: absolute; top: 2px; right: 4px; z-index: 5;
-  min-width: 16px; height: 16px; padding: 0 4px;
-  border: 1px solid var(--box-border); border-radius: 8px;
-  background: var(--vscode-menu-background, #252526);
-  color: var(--accent); font-size: 10px; line-height: 14px;
-  cursor: pointer; opacity: 0.75;
-}
-.cmt-badge:hover { opacity: 1; }
-.cmt-badge.unread { border-color: var(--accent); opacity: 1; }
-.cmt-badge.busy { animation: cmt-busy-pulse 1.2s ease-in-out infinite; }
+/* (the count badge is gone — the user 2026-08-17: the highlight does the speaking; the busy pulse
+   below and the scroll-rail tick carry the states it used to) */
 
 .cmt-pop {
-  position: fixed; z-index: 120; width: 360px; max-width: 94vw;
+  position: fixed; z-index: 120; width: 440px; max-width: 94vw;
+  resize: both; overflow: auto; min-width: 300px; min-height: 120px; max-height: 90vh;
+  cursor: grab;                       /* the whole box drags (interactive children override below) */
   display: flex; flex-direction: column; gap: 6px; padding: 8px;
   background: var(--vscode-menu-background, #252526);
   color: var(--vscode-menu-foreground, var(--fg));
@@ -2464,8 +2521,7 @@ mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
   font-size: 12px;
 }
-.cmt-head { display: flex; align-items: center; cursor: grab; user-select: none; }
-.cmt-head.dragging { cursor: grabbing; }
+.cmt-head { display: flex; align-items: center; user-select: none; }
 .cmt-head .cmt-x { cursor: pointer; }
 .cmt-title { font-weight: 600; }
 .cmt-x {
@@ -2479,7 +2535,18 @@ mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 
   font-size: 0.92em; opacity: 0.75;
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
 }
+.cmt-pop.dragging { cursor: grabbing; }
+.cmt-pop .cmt-quote, .cmt-pop .cmt-msgs, .cmt-pop .cmt-input, .cmt-pop .cmt-name { cursor: auto; }
+.cmt-pop button, .cmt-pop .meta-btn { cursor: pointer; }
+/* user-resized (.sized): the quoted context takes the extra room — its clamp unlocks and it flexes */
+.cmt-pop.sized .cmt-quote {
+  display: block; -webkit-line-clamp: unset; flex: 1 1 auto; min-height: 3em; overflow-y: auto;
+}
+.cmt-pop.sized .cmt-msgs { flex: 2 1 auto; max-height: none; }
 .cmt-msgs { max-height: 45vh; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+/* chat-parity turns inside the popover (the user 2026-08-17): the chat's own .turn nodes, given a
+   little rail room; the popover's card is the backdrop, so no extra chrome */
+.cmt-msgs .turn { max-width: 100%; box-sizing: border-box; }
 .cmt-msg { padding: 5px 8px; border-radius: 6px; line-height: 1.35; overflow-wrap: anywhere; }
 .cmt-msg.you { background: color-mix(in srgb, var(--accent) 14%, transparent); align-self: flex-end; max-width: 92%; white-space: pre-wrap; }
 .cmt-msg.agent { background: rgba(255, 255, 255, 0.05); align-self: flex-start; max-width: 96%; }
@@ -2495,19 +2562,19 @@ mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 
 .cmt-dots span:nth-child(3) { animation-delay: 0.4s; }
 @keyframes cmt-dot-pulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
 .cmt-note { font-size: 0.92em; opacity: 0.7; padding: 2px 6px; }
+/* the popover's message row mirrors the CHAT composer (the user 2026-08-17): clip left, ➤ right,
+   pill input — the attach/send buttons share the chat's own selectors above, so they stay in sync */
+.cmt-composer { display: flex; align-items: flex-end; gap: 4px; }
 .cmt-input {
-  width: 100%; box-sizing: border-box; resize: vertical; min-height: 34px;
-  padding: 5px 7px; border: 1px solid var(--box-border); border-radius: 4px;
-  background: rgba(255, 255, 255, 0.05); color: inherit;
+  order: 2; flex: 1 1 auto; min-width: 0; box-sizing: border-box; resize: vertical; min-height: 34px;
+  padding: 6px 12px; border: 1px solid var(--vscode-input-border, var(--box-border));
+  border-radius: 16px;
+  background: var(--vscode-input-background, rgba(255, 255, 255, 0.05)); color: inherit;
   font: inherit;
 }
 .cmt-input:focus { outline: none; border-color: var(--accent); }
 .cmt-actions { display: flex; gap: 6px; align-items: center; }
-.cmt-send {
-  padding: 3px 10px; border: 0; border-radius: 4px; cursor: pointer;
-  background: var(--accent); color: var(--accent-fg); font: inherit; font-weight: 600;
-}
-.cmt-send:disabled { opacity: 0.55; cursor: default; }
+.cmt-actions:empty { display: none; }
 .cmt-act {
   padding: 3px 8px; border: 1px solid var(--box-border); border-radius: 4px; cursor: pointer;
   background: none; color: inherit; font: inherit; opacity: 0.85;
@@ -2539,7 +2606,6 @@ mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 
   position: absolute; top: 2px; right: 24px; z-index: 5;
   display: flex; gap: 4px;
 }
-.cmt-badge ~ .branch-chips, .turn:has(> .cmt-badge) .branch-chips { right: 28px; }
 .branch-chip {
   height: 16px; padding: 0 6px; border: 1px solid var(--box-border); border-radius: 8px;
   background: var(--vscode-menu-background, #252526);
@@ -2548,15 +2614,26 @@ mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 
 }
 .branch-chip:hover { opacity: 1; border-color: var(--accent); }
 
-/* the create popover's thread-name row (the user 2026-08-15): editable, prefilled
-   <session>-comment-<N>; .bad = failed the session-name charset, matching the fork modal */
+/* the comment's NAME, inline in the header — "New comment: <name>" (the user 2026-08-17): bold and
+   accent-tinted so it reads as a name, editable in place; a dashed underline hints at that. .bad =
+   failed the session-name charset, matching the fork modal. */
 .cmt-name {
-  width: 100%; box-sizing: border-box; padding: 4px 7px;
-  border: 1px solid var(--box-border); border-radius: 4px;
-  background: rgba(255, 255, 255, 0.05); color: inherit; font: inherit;
+  flex: 1; min-width: 60px; margin: 0 6px; padding: 0 2px;
+  border: 0; border-bottom: 1px dashed color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: 0; background: transparent;
+  color: var(--accent); font: inherit; font-weight: 600;
 }
-.cmt-name:focus { outline: none; border-color: var(--accent); }
-.cmt-name.bad { border-color: var(--st-blocked-bg, #c94f4f); }
+.cmt-name:focus { outline: none; border-bottom-color: var(--accent); }
+.cmt-name.bad { border-bottom: 1px solid var(--st-blocked-bg, #c94f4f); color: var(--st-blocked-bg, #c94f4f); }
+
+/* the comment's own model/effort selectors (the user 2026-08-17) — chip-shaped buttons opening the
+   same .meta-menu the statusline uses; the picks ride the create call and touch only the thread */
+.cmt-meta-row { display: flex; gap: 6px; }
+.cmt-meta {
+  padding: 2px 8px; border: 1px solid var(--box-border); border-radius: 4px; cursor: pointer;
+  background: none; color: inherit; font: inherit; opacity: 0.85;
+}
+.cmt-meta:hover { opacity: 1; border-color: var(--accent); }
 
 /* comment ticks on the chat's scroll rail (the user 2026-08-15): where the comments are, at the
    anchor's proportional position in the whole conversation; click = jump + open the thread */

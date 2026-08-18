@@ -33,6 +33,6 @@ test("the statusline directory shows a monochrome folder icon (folderIcon), not 
 test("the paperclip and send glyphs wear the romp accent blue (the user 2026-07-15)", () => {
   // action affordances (not status), so var(--accent) is the intended use — currentColor on the paperclip SVG
   // then picks up the accent tint from the button color
-  assert.match(CSS, /#composer-attach \{ color: var\(--accent\)/);   // the offset moved to the sizing block (2026-07-29)
-  assert.match(CSS, /#composer-send:not\(:disabled\) \{ color: var\(--accent\)/);
+  assert.match(CSS, /#composer-attach, \.cmt-attach \{ color: var\(--accent\)/);   // the offset moved to the sizing block (2026-07-29); the comment popover's clip shares the rule (2026-08-17)
+  assert.match(CSS, /#composer-send:not\(:disabled\), \.cmt-send:not\(:disabled\) \{ color: var\(--accent\)/);
 });

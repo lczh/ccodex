@@ -53,3 +53,22 @@ export function markerLabel(epoch: number, prevEpoch: number | null, nowMs: numb
 // ~6 rows so the gutter never went long without a time. The sticky rail stamp now guarantees a time at the
 // top of the view at all times, which made those repeats pure noise — so the pass is gone and a stamp means
 // exactly one thing: the time CHANGED here (the user 2026-07-23). See paintRailSticky in render.ts.)
+
+// The DAY CONTEXT for the stamp at the top of the view (the user 2026-08-17): a human-readable
+// relative day ("Yesterday", "3 days ago", "Last week", "2 weeks ago") painted ABOVE the top
+// visible rail stamp whenever that stamp is not from today — so mid-scroll through history you
+// always know which day you are reading, even with the day divider off-screen. "" for today
+// (no label). Bounded vocabulary, oldest form the divider's own "Mmm D" (+ year when different).
+export function dayContext(epoch: number, nowMs: number): string {
+  const d = new Date(epoch * 1000);
+  const now = new Date(nowMs);
+  const sod = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round((sod(now) - sod(d)) / 86400000);
+  if (days <= 0) return "";
+  if (days === 1) return "Yesterday";
+  if (days < 7) return days + " days ago";
+  if (days < 14) return "Last week";
+  if (days < 28) return Math.floor(days / 7) + " weeks ago";
+  const md = MONTH[d.getMonth()] + " " + d.getDate();
+  return d.getFullYear() === now.getFullYear() ? md : md + " " + d.getFullYear();
+}

@@ -228,8 +228,15 @@ export function previewFull(path: string, sid?: string | null, verified = false,
       // failure and the plan ("dropped at 1.2 MB of 3.4 MB — retrying · tap to retry now"), the
       // whole box tappable — and the ⚠ chip appears only when the budget is genuinely spent. A
       // repeat failure must still READ as a response to a tap: the note re-pulses on swap-in.
-      if (autoRetries > 0) {
-        autoRetries--;
+      // INFRASTRUCTURE-DOWN failures are FREE (the user 2026-08-17: figures gave up seconds after a
+      // kernel restart — the tunnel re-dial window produces instant "no attached host" 404s and
+      // "tunnel not answering" 502s, and three of those spent the whole budget right before the link
+      // came back). A failure that names the LINK, not the image, doesn't decrement: the preview
+      // keeps retrying on every kernel push until the tunnel is up, and only real verdicts — a true
+      // not-found from the owning kernel, a transfer that died with zero progress — spend attempts.
+      const transient = /tunnel to .* is not answering|no attached host|re-dialing/i.test(lastErr);
+      if (autoRetries > 0 || transient) {
+        if (!transient) autoRetries--;
         failedPreviews.set(box, () => build(true));
         const wait = mkWait(box);
         wait.title = path + " — tap to retry now";

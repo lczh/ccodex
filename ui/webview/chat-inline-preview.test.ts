@@ -55,7 +55,7 @@ test("the failure chip narrates what happens next, escalates on repeat, and a re
   // while auto-retries remain the box KEEPS its loading persona (swirl + note, whole box tappable);
   // the ⚠ chip is the GIVE-UP state only (the user 2026-08-16, third report: state bouncing between
   // "trying" and "unavailable" on every retry cycle read as impatient even when it eventually loaded)
-  assert.match(pf, /if \(autoRetries > 0\) \{\s*\n\s*autoRetries--;\s*\n\s*failedPreviews\.set\(box, \(\) => build\(true\)\);/);
+  assert.match(pf, /if \(autoRetries > 0 \|\| transient\) \{\s*\n\s*if \(!transient\) autoRetries--;\s*\n\s*failedPreviews\.set\(box, \(\) => build\(true\)\);/);
   assert.match(pf, /\+ " — retrying · tap to retry now";/);
   assert.match(pf, /wait\.onclick = \(ev\) => \{ ev\.stopPropagation\(\); autoRetries = 3; build\(true\); \};/,
     "the whole retrying box is the tap target — and a tap re-arms persistence");
@@ -79,7 +79,10 @@ test("a failed preview heals on the next kernel push — the kernel-is-back even
   // kernel is reachable again; no pushes arrive while it's down, so retry-on-push can't spam.
   const pf = PREVIEW.slice(PREVIEW.indexOf("export function previewFull"));
   assert.match(pf, /let autoRetries = 3;/, "bounded — a genuinely-dead file settles on the tap chip");
-  assert.match(pf, /if \(autoRetries > 0\) \{\s*\n\s*autoRetries--;\s*\n\s*failedPreviews\.set\(box, \(\) => build\(true\)\);/);
+  // a failure naming the LINK, not the image, never spends the budget (the user 2026-08-17: the
+  // kernel-restart tunnel window burned all three attempts right before the link came back)
+  assert.match(pf, /const transient = \/tunnel to \.\* is not answering\|no attached host\|re-dialing\/i\.test\(lastErr\);/);
+  assert.match(pf, /if \(autoRetries > 0 \|\| transient\) \{\s*\n\s*if \(!transient\) autoRetries--;\s*\n\s*failedPreviews\.set\(box, \(\) => build\(true\)\);/);
   assert.match(PREVIEW, /export function retryFailedPreviews\(\): void/);
   assert.match(PREVIEW, /if \(box\.isConnected\) rebuild\(\);/, "a re-rendered turn's fresh box supersedes the old");
   assert.match(RENDER, /retryFailedPreviews\(\);/, "called from the kernel message handler");

@@ -115,11 +115,15 @@ test("the selection menu offers Comment, gated on a real transcript turn", () =>
 test("marks, badges AND every popover button ride the stable document.body delegate", () => {
   assert.match(UI, /cmtopen: \(elx\) =>/, "delegated — marks are re-created on every rebuild");
   assert.match(UI, /m\.dataset\.act = "cmtopen"/);
-  assert.match(UI, /b\.dataset\.act = "cmtopen"/);
-  for (const act of ["cmtclose", "cmtsend", "cmtbreak", "cmtresolve", "cmtdelete", "cmtopensession"]) {
+  // the count badge is GONE (the user 2026-08-17): the highlight + the rail tick do the speaking
+  assert.doesNotMatch(UI, /cmt-badge/);
+  for (const act of ["cmtclose", "cmtsend", "cmtbreak", "cmtdelete", "cmtopensession"]) {
     assert.ok(UI.includes(`${act}:`), `${act} handler missing from the body delegate`);
     assert.ok(UI.includes(`dataset.act = "${act}"`), `${act} button missing its data-act`);
   }
+  // Resolve is GONE (the user 2026-08-17): Delete is the only closer — the handler survives for
+  // legacy resolved rows, but no button mints new ones
+  assert.ok(!UI.includes('rs.dataset.act = "cmtresolve"'), "no Resolve button remains");
 });
 
 test("highlights re-apply after every render path", () => {
@@ -135,8 +139,21 @@ test("a comments frame refreshes the open popover IN PLACE — composer and care
   assert.match(UI, /function fillCommentMsgs\(list: HTMLElement, th: CommentThread\)/);
 });
 
+test("the ants start on the gesture, and delete is optimistic and cuts the work", () => {
+  // create: a synthetic working thread marks the passage before any round-trip; the frame's
+  // wholesale list replacement retires it, and a refusal drops it with the warn
+  assert.match(UI, /tid: "pending:" \+ create\.uuid, anchorUuid: create\.uuid/);
+  assert.match(UI, /state: "working",\s*\n\s*unread: false/);
+  assert.match(UI, /t\.tid !== "pending:" \+ pa\.uuid/);
+  // reply: the local state flips on send; the kernel's next frame confirms
+  assert.match(UI, /cur\.th\.state = "working";\s+\/\/ optimistic/);
+  // delete: the highlight goes NOW, and the kernel interrupts the in-flight reply before the kill
+  assert.match(UI, /filter\(\(t\) => t\.tid !== cur\.th\.tid\)\);\s*\n\s*applyCommentMarks\(cur\.sid\);\s*\n\s*closeCommentPop\(\);/);
+  assert.match(KERNEL, /be\.interrupt\(th\["sid"\]\)[\s\S]{0,200}be\.kill\(th\["sid"\]\)/);
+});
+
 test("the popover send acknowledges before any round-trip", () => {
-  assert.match(UI, /send\.disabled = true; send\.textContent = "Starting…"; \}\s+\/\/ ack before the round-trip/);
+  assert.match(UI, /send\.disabled = true; send\.classList\.add\("busy"\); \}\s+\/\/ ack before the round-trip/);
   assert.match(UI, /the pending bubble IS the acknowledgement/);
 });
 
@@ -160,7 +177,7 @@ test("ending the parent sweeps its threads' CLIs — no unreachable running sess
 });
 
 test("a refused create un-sticks the popover; a pre-seam anchor tip-forks instead of erroring", () => {
-  assert.match(UI, /m\.type === "warn" && pendingCommentAnchor\) \{\s*\n\s*document\.getElementById\("cmt-pop"\)\?\.remove\(\);/);
+  assert.match(UI, /m\.type === "warn" && pendingCommentAnchor\) \{[\s\S]{0,400}document\.getElementById\("cmt-pop"\)\?\.remove\(\);/);
   assert.match(KERNEL, /def _anchor_adapter\(path, sid\)/);
   assert.match(KERNEL, /return "", cut_t, None/);
 });
@@ -189,8 +206,10 @@ test("a thread that couldn't start says so instead of pulsing dots forever", () 
   assert.match(UI, /!th\.error && \(threadBusy\(th\.state\) \|\| pend\.length\)/);
 });
 
-test("Delete is offered only on resolved threads, never mid-promote", () => {
-  assert.match(UI, /\} else if \(th\.status === "resolved"\) \{\s+\/\/ never for 'promoting'/);
+test("Delete is offered on open and resolved threads, never mid-promote", () => {
+  // Resolve is gone (the user 2026-08-17) — Delete is the closer for BOTH, still gated off
+  // 'promoting'/'promoted' (the kernel refuses those anyway; the button never dangles one)
+  assert.match(UI, /if \(th\.status === "open" \|\| th\.status === "resolved"\) \{/);
 });
 
 test("break out posts commentPromote and acks with a provisional tab", () => {
@@ -215,12 +234,15 @@ test("a thread fork withholds the names/ entry; promote seeds first, then regist
   assert.match(KERNEL, /err = _seed_fork_stores\(parent_sid, tsid, parent_path, str\(th\.get\("cutUuid"\) or ""\)\)/);
 });
 
-test("the popover drags by its header and closes when you leave the session", () => {
-  assert.match(UI, /head\.addEventListener\("pointerdown"/);
-  assert.match(UI, /head\.setPointerCapture\(ev\.pointerId\)/);
+test("the WHOLE popover drags — grip anywhere that isn't a control — and closes on tab switch", () => {
+  assert.match(UI, /pop\.addEventListener\("pointerdown"/);
+  assert.match(UI, /pop\.setPointerCapture\(ev\.pointerId\)/);
+  assert.match(UI, /ev\.clientX > pr\.right - 18 && ev\.clientY > pr\.bottom - 18\) return;/);
+  assert.match(CSS, /\.cmt-pop \{[^}]*resize: both/s);
+  assert.match(CSS, /\.cmt-pop\.sized \.cmt-quote \{/, "a user resize hands the room to the quoted context");
   assert.match(UI, /commentPopPos = \{ x, y \};/);
   assert.match(UI, /if \(openCommentKey && openCommentKey\.sid !== id\) closeCommentPop\(\);/);
-  assert.match(CSS, /\.cmt-head \{[^}]*cursor: grab/s);
+  assert.match(CSS, /\.cmt-pop \{[^}]*cursor: grab/s, "the grab hand covers the whole box now");
 });
 
 test("marks use the prefix-tolerant anchor matcher", () => {
@@ -244,7 +266,15 @@ test("the highlight is highlighter-YELLOW — never the selection blue — and o
 
 test("the create dialog names the thread right there: prefilled <session>-comment-<N>, validated", () => {
   assert.match(UI, /nameBox\.value = commentDrafts\.get\(nk\)\s*\n\s*\|\| \(\(sess0\?\.name \|\| "session"\)\.replace\(\/\[\^A-Za-z0-9._-\]\/g, "-"\)\s*\n\s*\+ "-comment-" \+ \(\(commentThreads\.get\(sid\) \|\| \[\]\)\.length \+ 1\)\);/);
-  assert.match(UI, /type: "commentCreate", id: create\.sid, uuid: create\.uuid, exact: create\.exact, text, name: nm/);
+  // the name lives IN the header ("New comment: <name>"), the button says Comment, and the picks ride along
+  assert.match(UI, /"New comment:"/);
+  assert.match(UI, /if \(nameBox\) head\.append\(title, nameBox, closeBtn\);/);
+  assert.match(UI, /send\.setAttribute\("aria-label", create \? "Comment" : "Send"\);/);   // the ➤ carries the word
+  assert.match(UI, /text, name: nm, model: create\.model \|\| "", effort: create\.effort \|\| "",\s*\n\s*color: create\.color \|\| ""/);
+  // the comment's own model/effort selectors reuse the statusline's /models-fed choices + menu skin
+  assert.match(UI, /const metaRow = el\("div", "cmt-meta-row"\);/);
+  assert.match(UI, /META_CHOICES\[kind\]/);
+  assert.match(KERNEL, /model=str\(msg\.get\("model"\) or ""\), effort=str\(msg\.get\("effort"\) or ""\)/);
   assert.match(KERNEL, /"%s-comment-%d" % \(sess\["name"\], len\(data\.get\("threads"\) or \[\]\) \+ 1\)/);
   assert.match(UI, /const base = thName \|\|/, "break-out prefills the thread's own name");
 });
@@ -269,6 +299,41 @@ test("scroll-rail ticks mark the commented spots and jump-open on click", () => 
   assert.match(UI, /if \(sid === activeId\) updateCommentRail\(\);/);
   assert.match(CSS, /\.cmt-tick \{/);
   assert.match(CSS, /\.cmt-rail \{ position: fixed;/);
+});
+
+test("ticks and message notches share ONE scrollbar frame, so they can never disagree about order", () => {
+  // the user 2026-08-17: scrolling through a history load moved the comment highlights relative to
+  // the blue message notches — the ticks were placed by uniform index fraction, a second frame that
+  // drifts from the notches' measured-height pixel offsets. Both painters now consume
+  // contentOffsetFrame, the one event-index → content-pixel mapping.
+  assert.match(UI, /function contentOffsetFrame\(/);
+  assert.match(UI, /const off = frame\.offsetOf\(idx\);/, "ticks place by the shared frame");
+  assert.doesNotMatch(UI, /\(idx \/ n\) \* 100/, "the uniform index-fraction percent frame is gone");
+  // the rail repaints with the notches (same rAF), so both always draw from one world
+  assert.match(UI, /paintRailSticky\(\); paintScrollMarks\(\); updateCommentRail\(\);/);
+  // an unchanged tick set moves IN PLACE — ticks are buttons, and a mid-press rebuild eats the click
+  assert.match(UI, /kids\.every\(\(k, i\) => k\.dataset\.tid === ticks\[i\]\.th\.tid\)/);
+  assert.match(UI, /kids\[i\]\.style\.top = t\.y \+ "px";/);
+});
+
+test("while the thread is WRITING the region wears marching ants; the fill lands with the reply", () => {
+  assert.match(UI, /m\.classList\.toggle\("busy", threadBusy\(th\.state\) && th\.status === "open"\)/);
+  // a dashed outline whose dashes crawl around the box — four gradient strips, animated offsets,
+  // no fill, never a border (it would shift the inline text); solid returns when busy drops
+  assert.match(CSS, /mark\.cmt-hl\.busy \{\s*\n\s*background-color: transparent;\s*\n\s*background-image:\s*\n\s*repeating-linear-gradient/);
+  assert.match(CSS, /background-size: 100% 1\.5px, 100% 1\.5px, 1\.5px 100%, 1\.5px 100%;/);
+  assert.match(CSS, /@keyframes cmt-ants \{\s*\n\s*to \{ background-position: 12px 0, -12px 100%, 0 -12px, 100% 12px; \}/);
+  assert.match(CSS, /code\.cmt-hl-host:has\(mark\.cmt-hl\.busy\)/, "hosts march too, or their tint defeats the cue");
+  assert.match(KERNEL, /state = be\.session_state\(tsid\)/);
+});
+
+test("the popover renders the thread with the CHAT's own renderer from the branch point", () => {
+  assert.match(UI, /renderingSid = th\.tid;/);
+  assert.match(UI, /list\.appendChild\(renderEvent\(ev, prev, null\)\);/);
+  assert.match(KERNEL, /def _thread_events\(tsid, cut_uuid, now, tmux\):/);
+  assert.match(KERNEL, /evs = evs\[at \+ 1:\]/, "sliced to AFTER the branch point — the head system card never rides");
+  // the thread's own live model/effort chips post the chat's own ops, keyed to the thread sid
+  assert.match(UI, /type: kind === "model" \? "setModel" : "setEffort", id: th\.tid, value: c\.value/);
 });
 
 test("the tint ladder keeps every state distinct: base < unread < hover", () => {
