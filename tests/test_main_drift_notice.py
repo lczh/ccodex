@@ -363,6 +363,40 @@ class ConvergeFunctional(unittest.TestCase):
         steps, _ = self._run()
         self.assertEqual(steps, [], "a second converge while one runs is a no-op")
 
+    def test_settle_prior_latch_heals_or_clears_but_never_lets_arming_overwrite(self):
+        # arming by overwrite orphaned an older unfinished-install record — a crash between the
+        # new arm and the new move left the OLD half-installed HEAD unprotected (the user's
+        # audit, 2026-08-18): a prior record is settled FIRST, under the same lock
+        with mock.patch.object(km, "_sync_notice"):
+            self.assertEqual(km._settle_prior_latch(None), "", "no latch → nothing to settle")
+            km._set_install_failed("f" * 8)
+            with mock.patch.object(km, "_checkout_sha", return_value="f" * 8), \
+                 mock.patch.object(km, "_converge_install", return_value=True) as heal:
+                self.assertEqual(km._settle_prior_latch(None), "",
+                                 "matching HEAD + passing install → settled")
+                heal.assert_called_once_with("f" * 8, None)
+            km._set_install_failed("f" * 8)
+            with mock.patch.object(km, "_checkout_sha", return_value="f" * 8), \
+                 mock.patch.object(km, "_converge_install", return_value=False):
+                self.assertIn("unfinished install", km._settle_prior_latch(None),
+                              "matching HEAD + failing install → the NEW update is refused")
+            self.assertEqual(km._install_failed_sha(), "f" * 8, "and the prior record SURVIVES")
+            with mock.patch.object(km, "_checkout_sha", return_value="00000000"):
+                self.assertEqual(km._settle_prior_latch(None), "", "moot → cleared")
+            self.assertEqual(km._install_failed_sha(), "")
+            km._set_install_failed("f" * 8)
+            with mock.patch.object(km, "_checkout_sha", return_value=""):
+                self.assertIn("unreadable", km._settle_prior_latch(None).replace("cannot read", "unreadable"),
+                              "unknown HEAD settles nothing")
+            km._set_install_failed("")
+
+    def test_a_prior_latch_that_cannot_heal_blocks_the_new_pull_and_survives(self):
+        km._set_install_failed("aaaa1111")
+        with mock.patch.object(km, "_checkout_sha", return_value="aaaa1111"):
+            steps, _ = self._run(fail=("install",))
+        self.assertNotIn("checkout", steps, "the new update never moves HEAD")
+        self.assertEqual(km._install_failed_sha(), "aaaa1111", "the prior record is intact")
+
     def test_boot_heal_takes_the_lock_before_any_latch_read(self):
         # reading first left a fail-open window where an updater held the lock but had not armed
         # the latch yet (the user's audit, 2026-08-18)

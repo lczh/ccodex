@@ -95,8 +95,15 @@ def _load_serve_token():
     v = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
     try:
         f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(v)
-        os.chmod(f, 0o600)
+        # BORN 0600 and claimed atomically: write-then-chmod left a world-readable window, and two
+        # concurrent starts could mint different tokens (the user's audit, 2026-08-18). O_EXCL makes
+        # the first creator win; a loser re-reads the winner's token.
+        try:
+            fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return f.read_text().strip() or v
+        with os.fdopen(fd, "w") as fh:
+            fh.write(v)
     except OSError:
         pass
     return v

@@ -317,6 +317,19 @@ class UpdateRemote(unittest.TestCase):
             self.assertIn("DIVERGED", a.stdout, "divergence is decided UNDER the lock, executed")
             self.assertFalse((gd / "romp-install-failed").exists(),
                              "a diverged refusal arms nothing and moves nothing")
+            # dirtiness is ALSO decided under the lock now (the pre-lock probe raced an edit
+            # landing in the gap — the user's audit, 2026-08-18): a dirty answer from the locked
+            # wrapper's own status check refuses before arm/reset
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' merge-base '*) exit 0;;\n"
+                "  *' status '*) echo ' M peer-edit.py';;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "esac\nexit 0\n" % gd)
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("DIRTYNOW", a.stdout, "the locked wrapper's own dirty check refuses")
+            self.assertFalse((gd / "romp-install-failed").exists())
 
     def test_the_apply_recheck_catches_an_edit_landing_after_the_probe(self):
         # the discover-step dirty probe is an ssh round-trip old by apply time; an edit landing in

@@ -196,6 +196,7 @@ printf '%s\n' "$channel" > "$gd/romp-update-channel" || {
 git -C "$DIR" config --unset romp.updateChannel 2>/dev/null || true
 echo "==> Update channel: $channel"
 
+precheck="-"
 if [ "$is_tag" -eq 1 ]; then
     # Address the tag by its full ref and detach. If a remote branch has the same short name,
     # installing that branch after verifying the tag would install different, unsigned code.
@@ -212,8 +213,10 @@ elif git -C "$DIR" show-ref --verify --quiet "refs/remotes/origin/$ref"; then
     # The ancestry check runs FIRST (read-only; a diverged branch refuses before anything moves),
     # then HEAD detaches onto the exact target — so from the first move onward the armed latch
     # matches HEAD — and only then does the local branch label catch up.
+    precheck="-"
     if git -C "$DIR" show-ref --verify --quiet "refs/heads/$ref"; then
-        if ! git -C "$DIR" merge-base --is-ancestor "refs/heads/$ref" "$target"; then
+        precheck="refs/heads/$ref"
+        if ! git -C "$DIR" merge-base --is-ancestor "$precheck" "$target"; then
             echo "romp: local branch $ref cannot fast-forward to origin/$ref; refusing to install stale code." >&2
             echo "  Resolve or preserve the local commits, then rerun bootstrap.sh." >&2
             exit 1
@@ -229,12 +232,12 @@ fi
 
 echo "==> Checking out $ref + installing (one locked transaction)"
 txn_rc=0
-python3 - "$DIR" "$gd" "$target" "$@" <<'TXNPY' || txn_rc=$?
+python3 - "$DIR" "$gd" "$target" "$precheck" "$@" <<'TXNPY' || txn_rc=$?
 import fcntl, os, subprocess, sys, time
 
-root, gdir, target = sys.argv[1], sys.argv[2], sys.argv[3]
+root, gdir, target, precheck = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 moves, cur = [], []
-for tok in sys.argv[4:]:
+for tok in sys.argv[5:]:
     if tok == "--":
         moves.append(cur); cur = []
     else:
@@ -251,6 +254,12 @@ while True:
         if time.time() >= deadline:
             sys.exit(3)
         time.sleep(0.5)
+# UNDER the lock: ancestry decided here (the read-only pre-check raced a concurrent updater
+# moving refs — the user's audit, 2026-08-18), and a PRIOR latch is SETTLED, never overwritten
+# (heal a matching one by running install; clear a moot one).
+if precheck != "-":
+    if subprocess.run(["git", "-C", root, "merge-base", "--is-ancestor", precheck, target]).returncode:
+        sys.exit(7)
 latch = os.path.join(gdir, "romp-install-failed")
 
 
@@ -268,10 +277,21 @@ def write_latch(sha8):
 
 
 try:
-    prior = open(latch).read().strip()[:8]   # a pre-existing armed latch is somebody's only
-except OSError:                              # recovery record — never destroy it on OUR failure
+    prior = open(latch).read().strip()[:8]
+except OSError:
     prior = ""
 pre_head = head8()
+if prior:
+    if not pre_head:
+        sys.exit(3)                          # can't settle a prior record against an unreadable HEAD
+    if prior == pre_head:
+        # heal-first: the checkout already runs a half-installed build — a new arm would
+        # ORPHAN this record if we crashed before our own move (the user's audit, 2026-08-18)
+        if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root,
+                          pass_fds=(fd,)).returncode:
+            sys.exit(4)
+    os.remove(latch)
+    prior = ""
 try:
     write_latch(target[:8])
 except OSError:
@@ -302,7 +322,9 @@ sys.exit(0)
 TXNPY
 case "$txn_rc" in
     0) : ;;
-    3) echo "romp: another update holds this checkout's lock — try again when it finishes." >&2; exit 1 ;;
+    3) echo "romp: another update holds this checkout's lock (or HEAD is unreadable) — try again when it finishes." >&2; exit 1 ;;
+    7) echo "romp: local branch $ref cannot fast-forward to origin/$ref (it moved while waiting for the lock)." >&2
+       echo "  Resolve or preserve the local commits, then rerun bootstrap.sh." >&2; exit 1 ;;
     5) echo "romp: could not record the install intent in $gd — not moving the checkout." >&2; exit 1 ;;
     6) echo "romp: the checkout could not be moved to $ref — most often the local branch cannot fast-forward" >&2
        echo "  to origin/$ref (see git's message above). Resolve or preserve the local commits, then rerun." >&2

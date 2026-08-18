@@ -617,6 +617,31 @@ class Routes(Fresh):
         self.assertEqual((status, d["tag"], d["mode"], d["state"]), (200, "v0.7.0", "ask", ""))
         self.assertEqual(d["boot"], km._BOOT_ID, "the banner detects the NEW kernel by this flipping")
 
+    def test_update_check_unsticks_a_dead_reportless_updater(self):
+        # the detached updater holds the checkout flock for its whole life: running + no report +
+        # a FREE lock = it died silently, which wedged the banner and refused every further update
+        # until a kernel restart (the user's audit, 2026-08-18)
+        km._UPDATE_STATE[0] = "running"
+        (jd.STATE / "update-report.json").unlink(missing_ok=True)
+        try:
+            _, body = _serve_get("/update-check", headers={"X-Romp-Token": km.TOKEN})
+            d = json.loads(body)
+            self.assertEqual(d["state"], "", "a dead updater no longer reads as running")
+            self.assertIn("without reporting", d["failed"])
+            # negative: while the lock IS held (the updater alive), running stands
+            km._UPDATE_STATE[0] = "running"
+            km._UPDATE_ERROR[0] = ""
+            fd = km._update_flock()
+            self.assertIsNotNone(fd)
+            try:
+                _, body = _serve_get("/update-check", headers={"X-Romp-Token": km.TOKEN})
+                self.assertEqual(json.loads(body)["state"], "running")
+            finally:
+                km.os.close(fd)
+        finally:
+            km._UPDATE_STATE[0] = ""
+            km._UPDATE_ERROR[0] = ""
+
     def test_update_check_reports_a_running_converge_as_in_flight(self):
         # a page loading mid-converge must get the wait treatment, not a fresh offer — converge
         # errors already ride `failed`; the running state rides `state` (the user's audit, 2026-08-17)

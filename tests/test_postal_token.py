@@ -199,5 +199,27 @@ class PeerTokenPlumbing(unittest.TestCase):
         self.assertLessEqual(len(text), 200)
 
 
+
+
+class TokenBirth(unittest.TestCase):
+    def test_the_token_file_is_born_0600_and_a_loser_rereads_the_winner(self):
+        # write-then-chmod left a world-readable window, and two concurrent starts could mint
+        # different tokens (the user's audit, 2026-08-18): O_EXCL + mode closes both
+        import stat
+        f = ps.STATE.parent / "serve-token"
+        f.unlink(missing_ok=True)
+        old = dict(os.environ)
+        os.environ.pop("ROMP_SERVE_TOKEN", None)
+        try:
+            v = ps._load_serve_token()
+            self.assertTrue(v)
+            mode = stat.S_IMODE(os.stat(f).st_mode)
+            self.assertEqual(mode, 0o600, "born 0600 — no chmod window")
+            self.assertEqual(ps._load_serve_token(), v, "a second minter re-reads the winner's token")
+        finally:
+            os.environ.clear(); os.environ.update(old)
+            f.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

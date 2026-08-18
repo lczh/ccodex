@@ -438,3 +438,19 @@ HOLDPY
     [ "$status" -ne 0 ]
     [ -s "$gd/romp-install-failed" ]   # SOME honest latch survives the refusal
 }
+
+@test "bootstrap.sh: a prior latch naming the CURRENT build heals first — a failing heal blocks the new update" {
+    # arming by overwrite orphaned the old record if we crashed before our own move (the user's
+    # audit, 2026-08-18): the transaction settles it first, under the same lock
+    ROMP_DIR="$HOME/romp" bash "$REPO_ROOT/bootstrap.sh"
+    gd="$(git -C "$HOME/romp" rev-parse --absolute-git-dir)"
+    cur8="$(git -C "$HOME/romp" rev-parse --short=8 HEAD | head -c 8)"
+    printf '%s' "$cur8" > "$gd/romp-install-failed"
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$HOME/romp/install.sh"   # the heal runs THIS and fails
+    git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m r3
+    git -C "$ROMP_REPO" tag -s v0.3.0 -m v0.3.0
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -ne 0 ]
+    [ "$(cat "$gd/romp-install-failed")" = "$cur8" ]   # the OLD record survives, never overwritten
+    [ "$(git -C "$HOME/romp" rev-parse --short=8 HEAD | head -c 8)" = "$cur8" ]   # and HEAD never moved
+}

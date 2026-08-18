@@ -2516,7 +2516,11 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
             # crash/kill/reboot between the checkout and that write booting half-installed code
             # with no record (the user's audit, 2026-08-17). A crash anywhere past this line finds
             # the latch matching the new HEAD at boot and heals; a failed checkout disarms it.
-            prior_latch = _install_failed_sha()   # somebody's recovery record — never OURS to erase
+            settle = _settle_prior_latch(lock_fd)  # heal-first: a prior record is SETTLED, never
+            if settle:                             # overwritten (the user's audit, 2026-08-18)
+                _converge_note("main moved at origin, but: %s" % settle)
+                _MAIN_DRIFT[0] = ""
+                return
             if not _set_install_failed(tip[:8]):
                 # an intent that cannot PERSIST blocks the move outright — an unwritable git dir
                 # must never mean "proceed unrecorded" (the user's audit, 2026-08-17)
@@ -2526,10 +2530,8 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
             r = subprocess.run(["git", "checkout", "--detach", tip], cwd=str(ROOT),
                                capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
-                _set_install_failed(prior_latch)      # HEAD did not move; RESTORE, never blank —
-                #                                       clearing erased a pre-existing latch that
-                #                                       protected a half-installed build (the
-                #                                       adversarial review, 2026-08-18)
+                _set_install_failed("")               # HEAD did not move, and settle guaranteed
+                #                                       no prior record existed to restore
                 _converge_note("main moved at origin, but advancing the checkout failed: %s"
                                % (r.stderr or r.stdout or "").strip()[-200:])
                 _MAIN_DRIFT[0] = ""
@@ -2570,6 +2572,28 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
         # lets the next pass re-derive and RE-OFFER it instead of latching a stale "already
         # offered" that never completes (the user's audit, 2026-08-17).
         _MAIN_DRIFT[0] = _MAIN_DRIFT[1] = ""
+
+
+def _settle_prior_latch(lock_fd):
+    """UNDER the update lock, settle any latch armed before a NEW update may arm its own: arming
+    by overwrite orphaned an older unfinished-install record — a crash between the new arm and the
+    new move left a latch naming the new target while HEAD sat on the OLD half-installed build,
+    which the gate then moot-cleared (the user's audit, 2026-08-18). Matching HEAD → heal NOW,
+    under this same lock (a pass settles it; a fail refuses the new update); moot → clear.
+    Returns "" when settled, else the refusal message."""
+    armed = _install_failed_sha()
+    if not armed:
+        return ""
+    cur = _sha8(_checkout_sha())
+    if not cur:
+        return "cannot read HEAD while an install latch is armed — settling nothing on a guess"
+    if armed == cur:
+        if not _converge_install(armed, lock_fd):
+            return ("this checkout has an unfinished install that still fails — nothing new "
+                    "starts until install passes")
+        return ""
+    _set_install_failed("")
+    return ""
 
 
 def _converge_install(sha8, lock_fd=None):
@@ -10193,11 +10217,29 @@ def _update_remote(host):
         "    sys.exit(3)\n"
         'if subprocess.run(["git","-C",r,"merge-base","--is-ancestor","HEAD",target]).returncode:\n'
         "    sys.exit(7)\n"
+        'st=subprocess.run(["git","-C",r,"status","--porcelain"],capture_output=True,text=True)\n'
+        "if st.returncode:\n"
+        "    sys.exit(9)\n"
+        "if (st.stdout or \"\").strip():\n"
+        "    sys.exit(8)\n"
         'res=subprocess.run(["git","-C",r,"rev-parse","--short=8",target],capture_output=True,text=True)\n'
         'sha8=(res.stdout or "").strip()[:8]\n'
         "if res.returncode or not sha8:\n"
         "    sys.exit(5)\n"
         'lp=os.path.join(os.path.dirname(lock),"romp-install-failed")\n'
+        "try:\n"
+        '    prior=open(lp).read().strip()[:8]\n'
+        "except OSError:\n"
+        '    prior=""\n'
+        "if prior:\n"
+        '    curh=subprocess.run(["git","-C",r,"rev-parse","--short=8","HEAD"],capture_output=True,text=True)\n'
+        '    cur8=(curh.stdout or "").strip()[:8]\n'
+        "    if not cur8:\n"
+        "        sys.exit(9)\n"
+        "    if prior==cur8:\n"
+        '        if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
+        "            sys.exit(4)\n"
+        "    os.remove(lp)\n"
         'tmp=lp+".tmp"\n'
         'open(tmp,"w").write(sha8)\n'
         "os.replace(tmp,lp)\n"
@@ -10209,6 +10251,8 @@ def _update_remote(host):
         '"$GD/romp-update.lock" "$R" %s >/dev/null 2>&1; RRC=$?; '
         'if [ "$RRC" = 3 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo UPDATERUNNING; exit 0; fi; '
         'if [ "$RRC" = 7 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIVERGED; exit 0; fi; '
+        'if [ "$RRC" = 8 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYNOW; exit 0; fi; '
+        'if [ "$RRC" = 9 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERR; exit 0; fi; '
         'if [ "$RRC" = 4 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo INSTALLFAIL; exit 0; fi; '
         'if [ "$RRC" != 0 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; fi; '
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; '
@@ -10236,7 +10280,7 @@ def _update_remote(host):
         'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null &  sleep 1; fi; '
         'echo "SYNCED:$NEW"'
     ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, lfull, _P2P_REF, _P2P_REF,
-         _P2P_REF, _P2P_REF, _P2P_REF, kport)
+         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -10413,13 +10457,22 @@ def _pull_remote(host, expected_sha=None):
         if lock_fd is None:
             return False, "another update is already running on this checkout — try again when it finishes"
         try:
-            prior_latch = _install_failed_sha()   # a pre-existing record is not ours to erase
+            settle = _settle_prior_latch(lock_fd)  # heal-first: never overwrite a prior record
+            if settle:
+                return False, settle
+            # ancestry decided UNDER the lock: the pre-lock check raced a concurrent updater
+            # moving HEAD (the user's audit, 2026-08-18)
+            anc2 = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", "HEAD",
+                                   fetched_sha], capture_output=True, text=True, timeout=10)
+            if anc2.returncode != 0:
+                return False, ("local and %s diverged while waiting for the update lock — "
+                               "nothing merged" % host)
             if not _set_install_failed(_sha8(fetched_sha)):
                 return False, "could not record the install intent — not moving HEAD"
             m = subprocess.run(["git", "-C", str(ROOT), "merge", "--ff-only", fetched_sha],
                                capture_output=True, text=True, timeout=30)
             if m.returncode != 0:
-                _set_install_failed(prior_latch)   # HEAD did not move; restore, never blank
+                _set_install_failed("")            # HEAD did not move; settle left no prior record
                 return False, ("fast-forward failed: %s"
                                % ((m.stderr or m.stdout or "").strip()[:160] or "unknown"))
             installed = _converge_install(_sha8(fetched_sha), lock_fd)
@@ -25591,6 +25644,22 @@ class Handler(BaseHTTPRequestHandler):
                 # converge refusals ride the same `failed` slot the banner already unsticks on —
                 # without this, a refused converge left the spinner polling forever (2026-08-17)
                 failed, updated = _UPDATE_ERROR[0] or _CONVERGE_ERROR[0], ""
+                if _UPDATE_STATE[0] == "running":
+                    # LIVENESS: the detached updater holds the checkout's flock for its whole
+                    # life. running + no report + a FREE lock = it died without reporting — a
+                    # state that wedged the banner at "running" and refused every further update
+                    # until a kernel restart (the user's audit, 2026-08-18).
+                    if not (jd.STATE / "update-report.json").exists():
+                        _probe = _update_flock()
+                        if _probe is not None:
+                            try:
+                                os.close(_probe)
+                            except OSError:
+                                pass
+                            _UPDATE_STATE[0] = ""
+                            _UPDATE_ERROR[0] = ("the updater exited without reporting — "
+                                                "update.log under the state dir has the story")
+                            failed = failed or _UPDATE_ERROR[0]
                 if _UPDATE_STATE[0] == "running":
                     # PEEK before consuming: a success that is about to restart belongs to the NEXT
                     # kernel's boot — consuming it here would file the notice into this dying
