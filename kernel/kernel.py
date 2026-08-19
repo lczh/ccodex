@@ -10899,16 +10899,24 @@ def _pull_remote(host, expected_sha=None):
                 if not _set_install_failed(_QUARANTINE_LATCH):
                     # the atomic write failed (the fs degraded mid-transaction) — rewriting the
                     # EXISTING latch IN PLACE needs no new blocks, so it survives ENOSPC, the
-                    # common dynamic failure; we hold the update flock and every reader locks
-                    # before reading, so the non-atomic write races nobody (same review: the
-                    # swallowed failure left the armed auto-run latch behind a message that
-                    # claimed quarantine)
+                    # common dynamic failure. UNBUFFERED pwrite, never open(.., "w"): O_TRUNC
+                    # erased the armed record at open, and when the buffered flush then failed
+                    # at close the latch was left EMPTY — which every reader moot-removes,
+                    # serving the rejected build with install.sh never run (the adversarial
+                    # review, 2026-08-19, reproduced). pwrite either lands whole or raises with
+                    # the armed bytes still on disk, and the 23-byte quarantine always covers
+                    # the <=17-byte armed record, so no truncation is ever needed.
                     lp = _install_latch_path()
                     try:
                         if lp is None:
                             raise OSError("no resolvable git dir")
-                        with open(lp, "w") as qf:
-                            qf.write(_QUARANTINE_LATCH)
+                        qfd = os.open(str(lp), os.O_RDWR)
+                        try:
+                            _qb = _QUARANTINE_LATCH.encode()
+                            if os.pwrite(qfd, _qb, 0) != len(_qb):
+                                raise OSError("short quarantine write")
+                        finally:
+                            os.close(qfd)
                     except OSError:
                         return False, ("%s trust changed during the pull, the rollback failed, "
                                        "AND the quarantine record could not be written — assume "

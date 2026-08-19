@@ -322,12 +322,23 @@ def stuck_latch():
         return True
     except OSError:
         try:
-            with open(latch, "w") as qf:
-                qf.write("quarantined\nquarantined")
+            # UNBUFFERED pwrite, never open(.., "w"): O_TRUNC erased the armed record at open,
+            # and a failed buffered flush then left the latch EMPTY — which every reader
+            # moot-removes, serving the moved build with install.sh never run (the adversarial
+            # review, 2026-08-19, reproduced). pwrite either lands whole or raises with the
+            # armed bytes still on disk; 23 bytes always covers the <=17-byte armed record.
+            qfd = os.open(latch, os.O_RDWR)
+            try:
+                qb = b"quarantined\nquarantined"
+                if os.pwrite(qfd, qb, 0) != len(qb):
+                    raise OSError("short quarantine write")
+            finally:
+                os.close(qfd)
             return True
         except OSError:
-            return False                         # the armed target latch stays: the caller must
-            #                                      say so instead of claiming quarantine
+            return False                         # the armed target latch stays (pwrite cannot
+            #                                      truncate): the caller says so instead of
+            #                                      claiming quarantine
 
 
 try:

@@ -379,26 +379,28 @@ class PullRemote(unittest.TestCase):
         self.assertIn("quarantined", detail)
         self.assertEqual(km._install_latch_lines(), ["quaranti", "quaranti"],
                          "the in-place rewrite lands the quarantine when the atomic write cannot")
-        # and when even THAT fails, the detail must stop claiming quarantine
+        # and when even THAT fails, the detail must stop claiming quarantine — and the ARMED
+        # record must SURVIVE: the previous fallback opened the latch with O_TRUNC, so a write
+        # that then failed left an EMPTY latch, which every reader moot-removes — serving the
+        # trust-rejected build with install.sh never run (the adversarial review, 2026-08-19,
+        # reproduced with an injected close-time failure). pwrite cannot truncate.
         km._set_install_failed(km._sha8(REMOTE))       # re-arm the pre-quarantine state
         km._remotes["TESTHOST"]["trust"] = "trusted"   # leg 1's downgrade must not gate leg 2
         self._wire()
         km.subprocess.run = degrading
-        _orig_open = open
-
-        def deny_latch(path, *a, **kw):
-            if "romp-install-failed" in str(path) and a and "w" in str(a[0]):
-                raise OSError(28, "No space left on device")
-            return _orig_open(path, *a, **kw)
-        import builtins
         with mock.patch.object(km, "_set_install_failed", return_value=False):
-            with mock.patch.object(builtins, "open", side_effect=deny_latch):
+            with mock.patch.object(km.os, "pwrite",
+                                   side_effect=OSError(28, "No space left on device")):
                 ok, detail = km._pull_remote("TESTHOST")
         self.assertFalse(ok)
         self.assertNotIn("is quarantined", detail)
         self.assertIn("could not be written", detail)
         self.assertIn("REVIVE", detail,
                       "the one thing the user must know: this state can revive the rejected build")
+        self.assertEqual(km._install_latch_lines(), [km._sha8(REMOTE)],
+                         "the ARMED record survives a failed quarantine write — a truncating "
+                         "fallback left an EMPTY latch that every reader moot-removed, serving "
+                         "the rejected build with install.sh never run")
 
     def test_an_unpersistable_intent_blocks_the_merge(self):
         calls = self._wire()

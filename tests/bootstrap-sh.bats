@@ -553,6 +553,54 @@ HOLDPY
     [ "$(cat "$gd/romp-install-failed")" = "$(printf 'quarantined\nquarantined')" ]
 }
 
+@test "bootstrap.sh: a totally-failed quarantine write exits 13 with the ARMED latch intact" {
+    # the fs degrades AFTER the arm: the marker publish fails, the atomic stuck write fails, and
+    # the unbuffered pwrite fails too — the transaction must exit 13 (saying the quarantine could
+    # not be recorded) with the ARMED latch bytes STILL on disk. The previous fallback opened the
+    # latch with O_TRUNC, so this same schedule left an EMPTY latch that the gate moot-removes —
+    # serving the moved build with install.sh never run (the adversarial review, 2026-08-19,
+    # reproduced with an injected close-time failure).
+    sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
+    cat > "$TEST_DIR/wrap.py" <<'PYEOF'
+import os, sys
+real_replace = os.replace
+state = {"latch": 0}
+
+
+def flaky_replace(src, dst):
+    d = str(dst)
+    if "romp-update-channel" in d:
+        raise OSError(28, "No space left on device")     # the publish fails
+    if d.endswith("romp-install-failed"):
+        state["latch"] += 1
+        if state["latch"] > 1:                           # the ARM landed; the fs then degraded
+            raise OSError(28, "No space left on device")
+    return real_replace(src, dst)
+
+
+def no_pwrite(*a, **kw):
+    raise OSError(28, "No space left on device")
+
+
+os.replace = flaky_replace
+os.pwrite = no_pwrite
+txn = sys.argv[1]
+sys.argv = ["txn"] + sys.argv[2:]
+exec(compile(open(txn).read(), txn, "exec"))
+PYEOF
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    target="$(git -C "$root" rev-parse HEAD)"
+    run python3 "$TEST_DIR/wrap.py" "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "stable"
+    [ "$status" -eq 13 ]
+    [ "$(cat "$gd/romp-install-failed")" = "$(git -C "$root" rev-parse --short=8 HEAD)" ]
+    [ ! -e "$gd/romp-update-channel" ]
+}
+
 @test "bootstrap.sh: a failed LATER move on an already-at-target checkout never flips the marker" {
     # HEAD==target from the start (the normal state right after installing a release cut from
     # main), a later move (branch -f) fails: rc 6, nothing installed, NO latch survives — so the
