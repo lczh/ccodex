@@ -82,7 +82,25 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install bats + tmux (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y bats tmux
+        timeout-minutes: 10
+        # bats comes from the PINNED release tarball, so apt is only needed for tmux — and the
+        # Ubuntu archive stalling must never eat the job's whole budget again (two release gates
+        # died at 35m inside apt-get update, 2026-08-19): bounded retries, then fail fast so the
+        # failure is visible and re-dispatchable instead of a silent 35-minute hang.
+        run: |
+          curl -fsSL --retry 3 -o /tmp/bats.tar.gz \
+            https://github.com/bats-core/bats-core/archive/refs/tags/v1.11.0.tar.gz
+          tar -xzf /tmp/bats.tar.gz -C /tmp
+          sudo /tmp/bats-core-1.11.0/install.sh /usr/local
+          for i in 1 2 3; do
+            if sudo timeout 150 apt-get update -o Acquire::Retries=2 \
+               && sudo timeout 150 apt-get install -y --no-install-recommends tmux; then
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "apt could not install tmux after 3 bounded attempts" >&2
+          exit 1
       - name: Install bats + tmux (macOS)
         if: runner.os == 'macOS'
         run: brew install bats-core tmux
