@@ -2411,6 +2411,14 @@ def _install_latch_lines():
     return []
 
 
+# The quarantine form of the install latch: two NON-HEX lines no checkout sha can ever match, so
+# every reader (boot heal, the check loop, romp-serve's gate, both updaters' settles) takes its
+# fail-closed heal-by-hand branch — never the `cur in lines` auto-run. Non-hex is load-bearing:
+# a hex sentinel is minable by the very peer the quarantine exists to stop (the adversarial
+# review, 2026-08-19).
+_QUARANTINE_LATCH = "quarantined\nquarantined"
+
+
 def _arm_latch(target8, prior8=""):
     """Arm the intent, CARRYING a prior record instead of overwriting it; True when persisted."""
     p = _install_latch_path()
@@ -10856,26 +10864,58 @@ def _pull_remote(host, expected_sha=None):
             if not _still2:
                 rb = None
                 if pre_head:
-                    # --keep, not --hard: the clean-tree check ran BEFORE this flock, and settle
-                    # can run install.sh for minutes — a peer session's uncommitted edit saved in
-                    # that window is not ours to destroy (--hard reverted it; the adversarial
-                    # review, 2026-08-19, reproduced). --keep rewinds the merge exactly and
-                    # REFUSES if any locally-modified file differs across the rewind — then we
-                    # quarantine below instead of destroying the edit.
-                    rb = subprocess.run(["git", "-C", str(ROOT), "reset", "--keep", pre_head],
-                                        capture_output=True, text=True, timeout=30)
+                    # The rewind must not destroy a peer's work OR raise past the quarantine, so
+                    # both steps sit in one try (a TimeoutExpired from a slow reset used to skip
+                    # the quarantine entirely and leave the auto-run latch; the adversarial
+                    # review, 2026-08-19, reproduced): first the tree is re-checked AT THE
+                    # DECISION MOMENT, under this flock — the boot check ran before the lock and
+                    # settle can run install.sh for minutes, and --keep alone is not enough (it
+                    # REFUSES on working-tree conflicts but silently resets INDEX-only state — a
+                    # peer's staged edit whose working copy was reverted is destroyed with rc 0;
+                    # reproduced). Anything in the tree → no reset at all, quarantine below.
+                    try:
+                        st2 = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain",
+                                              "--untracked-files=no"],
+                                             capture_output=True, text=True, timeout=10)
+                        if st2.returncode == 0 and not (st2.stdout or "").strip():
+                            rb = subprocess.run(["git", "-C", str(ROOT), "reset", "--keep",
+                                                 pre_head],
+                                                capture_output=True, text=True, timeout=30)
+                    except Exception:
+                        rb = None                  # an exception is a FAILED rewind, never a skip
                 if rb is not None and rb.returncode == 0:
                     _set_install_failed(carry)     # HEAD is back on the prior build: the carried
                     #                                record returns (or the latch clears)
                     return False, "%s trust changed during the pull — the move was rolled back" % host
-                # The rewind failed (or the pre-merge HEAD was unreadable): HEAD sits on a commit
-                # the trust decision just REJECTED. A latch matching HEAD is NOT a gate here — it
-                # is every healer's auto-run trigger (boot heal, the 300s check loop, and
-                # romp-serve's gate would each run the rejected build's install.sh and then serve
-                # it; the adversarial review, 2026-08-19, reproduced all three). Arm the STUCK
-                # form instead — two differing lines HEAD cannot match — which every reader
-                # refuses to heal without a human.
-                _set_install_failed("00000000\nffffffff")
+                # The rewind failed, was unsafe, or the pre-merge HEAD was unreadable: HEAD sits
+                # on a commit the trust decision just REJECTED. A latch matching HEAD is NOT a
+                # gate here — it is every healer's auto-run trigger (boot heal, the 300s check
+                # loop, and romp-serve's gate would each run the rejected build's install.sh and
+                # then serve it; the adversarial review, 2026-08-19, reproduced all three).
+                # Quarantine with the NON-HEX stuck form: hex sentinels were minable — a peer
+                # controls its own commit and an 8-hex prefix costs ~2^32 hashes, so a mined
+                # '00000000' HEAD walked straight through every reader's `cur in lines` test
+                # (same review). No real sha8 can ever equal 'quaranti'.
+                if not _set_install_failed(_QUARANTINE_LATCH):
+                    # the atomic write failed (the fs degraded mid-transaction) — rewriting the
+                    # EXISTING latch IN PLACE needs no new blocks, so it survives ENOSPC, the
+                    # common dynamic failure; we hold the update flock and every reader locks
+                    # before reading, so the non-atomic write races nobody (same review: the
+                    # swallowed failure left the armed auto-run latch behind a message that
+                    # claimed quarantine)
+                    lp = _install_latch_path()
+                    try:
+                        if lp is None:
+                            raise OSError("no resolvable git dir")
+                        with open(lp, "w") as qf:
+                            qf.write(_QUARANTINE_LATCH)
+                    except OSError:
+                        return False, ("%s trust changed during the pull, the rollback failed, "
+                                       "AND the quarantine record could not be written — assume "
+                                       "this checkout can REVIVE the rejected build; heal by "
+                                       "hand NOW: git reset --keep %s, then remove "
+                                       "romp-install-failed from its git dir"
+                                       % (host, pre_head[:12] or "<the prior commit>"))
                 return False, ("%s trust changed during the pull and the rollback failed — this "
                                "checkout is quarantined until healed by hand: reset it to a commit "
                                "you trust (e.g. git reset --keep %s), then remove romp-install-failed "

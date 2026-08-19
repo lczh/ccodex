@@ -547,7 +547,32 @@ HOLDPY
     mkdir "$gd/romp-update-channel"        # the FINAL name blocked: staging succeeds, publish fails
     run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "stable"
     [ "$status" -eq 12 ]
-    [ "$(cat "$gd/romp-install-failed")" = "$(printf '00000000\nffffffff')" ]
+    # NON-HEX lines: a hex sentinel was minable by a peer that controls its commit (an 8-hex
+    # prefix costs ~2^32 hashes), and every reader's `cur in lines` treated it as an ordinary
+    # commit (the adversarial review, 2026-08-19)
+    [ "$(cat "$gd/romp-install-failed")" = "$(printf 'quarantined\nquarantined')" ]
+}
+
+@test "bootstrap.sh: a failed LATER move on an already-at-target checkout never flips the marker" {
+    # HEAD==target from the start (the normal state right after installing a release cut from
+    # main), a later move (branch -f) fails: rc 6, nothing installed, NO latch survives — so the
+    # marker must not move either. Publishing here flipped a stable checkout's marker to dev on
+    # a FAILED bootstrap, with nothing left to heal (the adversarial review, 2026-08-19,
+    # reproduced end-to-end).
+    sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    target="$(git -C "$root" rev-parse HEAD)"
+    printf 'stable\n' > "$gd/romp-update-channel"
+    git -C "$root" branch rel                       # makes `branch -f rel/14` a D/F refusal
+    run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "dev" branch -f rel/14 "$target"
+    [ "$status" -eq 6 ]
+    [ "$(cat "$gd/romp-update-channel")" = "stable" ]   # the FAILED bootstrap changed nothing
+    [ ! -e "$gd/romp-install-failed" ]
 }
 
 @test "bootstrap.sh: the channel marker follows the MOVE, inside the transaction" {

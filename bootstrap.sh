@@ -307,15 +307,27 @@ except OSError:
 
 
 def stuck_latch():
-    """Quarantine: two differing lines HEAD cannot match. Every reader (boot heal, the gate,
-    settle — this script's own included) refuses to heal that without a human, which is the
-    point: a single-line latch matching HEAD is an AUTO-RUN trigger, and the healers know
-    nothing about the stale channel marker they would be reviving the build under (the
-    adversarial review, 2026-08-19, reproduced against the gate and the boot heal)."""
+    """Quarantine: two NON-HEX lines no checkout sha can ever match, so every reader (boot heal,
+    the gate, settle — this script's own included) takes its fail-closed heal-by-hand branch: a
+    single-line latch matching HEAD is an AUTO-RUN trigger, and the healers know nothing about
+    the stale channel marker they would be reviving the build under (the adversarial review,
+    2026-08-19, reproduced against the gate and the boot heal; hex sentinels were MINABLE by a
+    peer that controls its commit — same review). Returns False only when even the in-place
+    rewrite failed: the atomic tmp+rename needs new blocks, but rewriting the EXISTING armed
+    latch in place survives ENOSPC, the common dynamic failure — and we hold the update flock,
+    which every reader takes before reading, so the non-atomic write races nobody. A silent
+    best-effort here left the armed auto-run latch behind an exit that claimed quarantine."""
     try:
-        write_latch("00000000\nffffffff")
+        write_latch("quarantined\nquarantined")
+        return True
     except OSError:
-        pass                                     # the armed target latch stays — still gated
+        try:
+            with open(latch, "w") as qf:
+                qf.write("quarantined\nquarantined")
+            return True
+        except OSError:
+            return False                         # the armed target latch stays: the caller must
+            #                                      say so instead of claiming quarantine
 
 
 try:
@@ -329,16 +341,18 @@ for mv in moves:
         # pre-existing latch protecting a half-installed build). HEAD unmoved → restore what was
         # there before; HEAD moved → arm for wherever we actually landed.
         now = head8()
-        if now == target[:8]:
-            # HEAD reached the target before a LATER move failed (branch -f, symbolic-ref): the
+        if now == target[:8] and now != pre_head:
+            # HEAD MOVED to the target before a LATER move failed (branch -f, symbolic-ref): the
             # marker must follow it — the latch below matches HEAD, so the ordinary healers will
             # revive this build, and reviving it under the OLD channel marker is the stale-dev-
-            # marker-on-a-stable-checkout hole (the adversarial review, 2026-08-19, reproduced)
+            # marker-on-a-stable-checkout hole (the adversarial review, 2026-08-19, reproduced).
+            # `now != pre_head` is load-bearing: a checkout ALREADY at the target whose later
+            # move failed ends with no latch and nothing installed — publishing there flipped a
+            # stable checkout's marker to dev on a FAILED bootstrap (same review, reproduced).
             try:
                 os.replace(ctmp, os.path.join(gdir, "romp-update-channel"))
             except OSError:
-                stuck_latch()                # moved + unrecordable channel: human hands only
-                sys.exit(12)
+                sys.exit(12 if stuck_latch() else 13)
         try:
             if now and now != pre_head:
                 write_latch(now + ("\n" + carry if carry and carry != now else ""))
@@ -357,10 +371,11 @@ for mv in moves:
 try:
     os.replace(ctmp, os.path.join(gdir, "romp-update-channel"))
 except OSError:
-    stuck_latch()                      # moved + unrecordable channel: quarantined — the armed
-    sys.exit(12)                       # single-line latch would be auto-healed into a build
-    #                                    wearing the OLD marker (a stable checkout following
-    #                                    unsigned main), so it is not left behind
+    sys.exit(12 if stuck_latch() else 13)   # moved + unrecordable channel: quarantined — the
+    #                                         armed single-line latch would be auto-healed into
+    #                                         a build wearing the OLD marker (a stable checkout
+    #                                         following unsigned main); 13 = even the quarantine
+    #                                         could not be recorded, and the exit says so
 env = dict(os.environ, ROMP_INSIDE_UPDATE_TXN=str(os.getpid()))
 if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root, pass_fds=(fd,),
                   env=env).returncode:
@@ -391,6 +406,10 @@ case "$txn_rc" in
     12) echo "romp: the checkout moved but the update channel could not be recorded in $gd —" >&2
         echo "  the install is quarantined so nothing revives this build under the OLD channel." >&2
         echo "  Heal by hand: remove $gd/romp-install-failed, then rerun bootstrap.sh." >&2
+        exit 1 ;;
+    13) echo "romp: the checkout moved, the update channel could not be recorded in $gd, AND the" >&2
+        echo "  quarantine record could not be written — assume this build can revive under the" >&2
+        echo "  OLD channel. Fix the git dir (space/permissions) and rerun bootstrap.sh NOW." >&2
         exit 1 ;;
     4) echo "romp: install.sh failed AFTER the checkout moved — the install latch is armed, so" >&2
        echo "  romp will refuse to run this build until a re-run of bootstrap or its boot heal" >&2
