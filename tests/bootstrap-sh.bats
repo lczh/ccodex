@@ -439,18 +439,56 @@ HOLDPY
     [ -s "$gd/romp-install-failed" ]   # SOME honest latch survives the refusal
 }
 
-@test "bootstrap.sh: a prior latch naming the CURRENT build heals first — a failing heal blocks the new update" {
-    # arming by overwrite orphaned the old record if we crashed before our own move (the user's
-    # audit, 2026-08-18): the transaction settles it first, under the same lock
+@test "bootstrap.sh: a failing heal CARRIES the old record forward — no wedge, nothing orphaned" {
+    # heal-ONLY wedged every path when the old install failed deterministically; arming by
+    # overwrite orphaned the old record (the audits, 2026-08-18/19). The synthesis: the update
+    # PROCEEDS, and the new arm carries BOTH shas — a crash before the move still protects the
+    # old build, and a fixed install in the new commit is reachable.
     ROMP_DIR="$HOME/romp" bash "$REPO_ROOT/bootstrap.sh"
     gd="$(git -C "$HOME/romp" rev-parse --absolute-git-dir)"
     cur8="$(git -C "$HOME/romp" rev-parse --short=8 HEAD | head -c 8)"
     printf '%s' "$cur8" > "$gd/romp-install-failed"
-    printf '#!/usr/bin/env bash\nexit 1\n' > "$HOME/romp/install.sh"   # the heal runs THIS and fails
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$HOME/romp/install.sh"   # broken at BOTH commits
     git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m r3
     git -C "$ROMP_REPO" tag -s v0.3.0 -m v0.3.0
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -ne 0 ]
-    [ "$(cat "$gd/romp-install-failed")" = "$cur8" ]   # the OLD record survives, never overwritten
-    [ "$(git -C "$HOME/romp" rev-parse --short=8 HEAD | head -c 8)" = "$cur8" ]   # and HEAD never moved
+    new8="$(git -C "$HOME/romp" rev-parse --short=8 HEAD | head -c 8)"
+    [ "$new8" != "$cur8" ]                              # forward progress: HEAD reached the new tag
+    [ "$(sed -n 1p "$gd/romp-install-failed")" = "$new8" ]   # the intent line
+    [ "$(sed -n 2p "$gd/romp-install-failed")" = "$cur8" ]   # the CARRIED prior — never orphaned
+    # and when install is FIXED, a re-run heals everything and spends the latch entirely
+    printf '#!/usr/bin/env bash\necho STUB_INSTALL_RAN\n' > "$HOME/romp/install.sh"
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -eq 0 ]
+    [ ! -e "$gd/romp-install-failed" ]
+}
+
+@test "bootstrap.sh: ancestry is re-decided UNDER the lock — a divergence landing during the wait refuses" {
+    # the read-only pre-check raced a concurrent updater (the adversarial review, 2026-08-18);
+    # choreography: hold the lock, diverge the local branch while bootstrap waits, release —
+    # TXNPY's under-lock re-check must catch what the pre-check could not see
+    ROMP_DIR="$HOME/romp" ROMP_REF=main bash "$REPO_ROOT/bootstrap.sh"
+    gd="$(git -C "$HOME/romp" rev-parse --absolute-git-dir)"
+    git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m remote
+    ( python3 - "$gd/romp-update.lock" <<'HOLDPY'
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+time.sleep(4)
+HOLDPY
+    ) &
+    HOLDER=$!
+    sleep 1
+    ( sleep 2
+      git -C "$HOME/romp" config user.email t@t
+      git -C "$HOME/romp" config user.name t
+      git -C "$HOME/romp" commit -q --allow-empty -m diverge-during-wait ) &
+    DIVERGER=$!
+    ROMP_TXN_LOCK_WAIT=20 ROMP_DIR="$HOME/romp" ROMP_REF=main run bash "$REPO_ROOT/bootstrap.sh"
+    wait "$HOLDER" 2>/dev/null || true
+    wait "$DIVERGER" 2>/dev/null || true
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"moved while waiting for the lock"* ]]
+    [[ "$output" != *STUB_INSTALL_RAN* ]]
 }

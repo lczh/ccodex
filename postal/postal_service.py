@@ -95,15 +95,24 @@ def _load_serve_token():
     v = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
     try:
         f.parent.mkdir(parents=True, exist_ok=True)
-        # BORN 0600 and claimed atomically: write-then-chmod left a world-readable window, and two
-        # concurrent starts could mint different tokens (the user's audit, 2026-08-18). O_EXCL makes
-        # the first creator win; a loser re-reads the winner's token.
-        try:
-            fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            return f.read_text().strip() or v
+        # BORN 0600, complete, and claimed atomically: write-then-chmod left a world-readable
+        # window (the user's audit, 2026-08-18), and O_EXCL-then-write let a loser read the
+        # winner's still-EMPTY file (the adversarial review, 2026-08-19). The token is written to
+        # a private temp first and CLAIMED via os.link — the name appears only with its content,
+        # so whoever loses the link race re-reads a complete winner.
+        tmp = f.with_name("%s.%d.tmp" % (f.name, os.getpid()))
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as fh:
             fh.write(v)
+        try:
+            os.link(str(tmp), str(f))
+        except FileExistsError:
+            v = f.read_text().strip() or v
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
     except OSError:
         pass
     return v

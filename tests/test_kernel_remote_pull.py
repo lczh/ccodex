@@ -10,6 +10,7 @@ SYNTHETIC fixtures only — invented hosts and placeholder shas; subprocess/ssh 
 import os
 import unittest
 from importlib.machinery import SourceFileLoader
+from unittest import mock
 import tempfile
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -197,10 +198,38 @@ class PullRemote(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("another update is already running", detail)
 
+    def test_a_prior_latch_heals_inside_the_pull_and_a_divergence_under_the_lock_refuses(self):
+        # settle and the ancestry re-check both run UNDER the lock (the adversarial review,
+        # 2026-08-19: neither had executing coverage). Stateful fake: the first is-ancestor
+        # (pre-lock) passes, the second (under-lock) fails → the pull refuses, nothing armed.
+        calls = self._wire()
+        anc = {"n": 0}
+        orig = km.subprocess.run
+
+        def flaky(argv, **kw):
+            if argv[0] == "git" and "merge-base" in argv:
+                anc["n"] += 1
+                if anc["n"] == 2:
+                    return _R(rc=1)
+            return orig(argv, **kw)
+        km.subprocess.run = flaky
+        ok, detail = km._pull_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("diverged while waiting", detail)
+        self.assertEqual(km._install_latch_lines(), [], "nothing armed on an under-lock refusal")
+        # settle-heal: a prior latch matching HEAD is healed inside the locked pull, then the
+        # transaction proceeds
+        self._wire()
+        km._set_install_failed(km._sha8(LOCAL))
+        with mock.patch.object(km, "_checkout_sha", return_value=km._sha8(LOCAL)):
+            ok, detail = km._pull_remote("TESTHOST")
+        self.assertTrue(ok, detail)
+        self.assertEqual(km._install_latch_lines(), [], "healed and the new install spent it all")
+
     def test_an_unpersistable_intent_blocks_the_merge(self):
         calls = self._wire()
         from unittest import mock
-        with mock.patch.object(km, "_set_install_failed", return_value=False):
+        with mock.patch.object(km, "_arm_latch", return_value=False):
             ok, detail = km._pull_remote("TESTHOST")
         self.assertFalse(ok)
         self.assertIn("install intent", detail)

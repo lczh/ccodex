@@ -353,7 +353,8 @@ class RunUpdate(Fresh):
         self.assertIn("update-report.json", script)
         # the restart rides the SUCCESS branch only: everything after `if` up to `else` has it,
         # the failure branch does not
-        ok_branch, fail_branch = script.split("else\n", 1)
+        _tail = script.split('if [ "$OK" = 1 ]', 1)[1]   # the settle block has its own else now
+        ok_branch, fail_branch = _tail.split("else\n", 1)
         self.assertIn("/restart-all", ok_branch)
         self.assertIn("X-Romp-Manager-Token", ok_branch)
         self.assertNotIn("$ROMP_MANAGER_TOKEN", ok_branch,
@@ -689,17 +690,46 @@ class Routes(Fresh):
         self.assertEqual((d["failed"], d["state"]), ("the pull or install failed", ""))
         self.assertTrue(any(not n["ok"] for n in self.notices()), "the failure reached the Log too")
 
-    def test_a_success_headed_for_restart_is_left_for_the_next_boot(self):
-        # consuming it mid-run would file the notice into THIS dying kernel's in-memory ring — the
-        # new kernel's boot must find the report and log the success durably
+    def test_a_success_headed_for_restart_waits_only_while_the_updater_lives(self):
+        # ok+restarted belongs to the NEXT boot — but only while the child still holds the
+        # checkout flock. A restart the manager accepted and never delivered wedged this kernel
+        # forever (the adversarial review, 2026-08-19): the child freeing the lock is the event
+        # that hands the report to the running kernel, consumed loudly.
         km._UPDATE_STATE[0] = "running"
         (jd.STATE / "update-report.json").write_text(json.dumps({"ok": True, "tag": "v0.7.0",
                                                                  "restarted": True}))
+        fd = km._update_flock()                       # the child alive: report stays for the boot
+        self.assertIsNotNone(fd)
+        try:
+            _, body = _serve_get("/update-check", headers={"X-Romp-Token": km.TOKEN})
+            d = json.loads(body)
+            self.assertEqual((d["failed"], d["updated"], d["state"]), ("", "", "running"))
+            self.assertTrue((jd.STATE / "update-report.json").exists(), "not consumed while it lives")
+        finally:
+            km.os.close(fd)
         _, body = _serve_get("/update-check", headers={"X-Romp-Token": km.TOKEN})
         d = json.loads(body)
-        self.assertEqual((d["failed"], d["updated"], d["state"]), ("", "", "running"))
-        self.assertTrue((jd.STATE / "update-report.json").exists(), "not consumed — the next boot files it")
-        self.assertEqual(self.notices(), [])
+        self.assertEqual(d["updated"], "v0.7.0", "child gone → the running kernel consumes it")
+        self.assertFalse((jd.STATE / "update-report.json").exists())
+        self.assertTrue(any("romp refresh" in n["text"] for n in self.notices()),
+                        "and says what to do if the promised restart never shows")
+        km._UPDATE_STATE[0] = ""
+
+    def test_a_corrupt_report_never_defeats_the_liveness_probe(self):
+        # exists() gating let a zero-byte/garbage report wedge 'running' forever (the adversarial
+        # review, 2026-08-19): unparseable is set aside as .bad and treated as missing
+        km._UPDATE_STATE[0] = "running"
+        (jd.STATE / "update-report.json").write_text("{not json")
+        try:
+            _, body = _serve_get("/update-check", headers={"X-Romp-Token": km.TOKEN})
+            d = json.loads(body)
+            self.assertEqual(d["state"], "", "corrupt report + free lock → unstuck")
+            self.assertFalse((jd.STATE / "update-report.json").exists())
+            self.assertTrue((jd.STATE / "update-report.json.bad").exists(), "set aside, not lost")
+        finally:
+            (jd.STATE / "update-report.json.bad").unlink(missing_ok=True)
+            km._UPDATE_STATE[0] = ""
+            km._UPDATE_ERROR[0] = ""
 
     def test_post_update_requires_something_known_and_the_token(self):
         code, _ = self._post("/update", token=False)

@@ -331,6 +331,63 @@ class UpdateRemote(unittest.TestCase):
             self.assertIn("DIRTYNOW", a.stdout, "the locked wrapper's own dirty check refuses")
             self.assertFalse((gd / "romp-install-failed").exists())
 
+    def test_the_wrapper_itself_recheck_dirt_heals_priors_and_carries_on_failure(self):
+        # the wrapper's OWN under-lock legs, executed (the adversarial review, 2026-08-19: the
+        # outer shell probes fired first in every prior test, leaving the wrapper's dead code)
+        import tempfile
+        from pathlib import Path
+        calls = self._wire(apply_out="SYNCED:abcdef0")
+        km._update_remote("TESTHOST")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        with tempfile.TemporaryDirectory() as td:
+            fix = Path(td) / "romp"
+            gd = fix / ".git"
+            gd.mkdir(parents=True)
+            fakebin = Path(td) / "bin"
+            fakebin.mkdir()
+            marker = Path(td) / "status-called"
+            # exit-8: the OUTER status probe (call 1) reports clean; the wrapper's under-lock
+            # status (call 2) sees the edit that landed in the gap
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' merge-base '*) exit 0;;\n"
+                "  *' status '*) if [ -e '%s' ]; then echo ' M raced-edit.py'; else touch '%s'; fi;;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "esac\nexit 0\n" % (gd, marker, marker))
+            (fakebin / "git").chmod(0o755)
+            (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "install.sh").chmod(0o755)
+            env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
+            apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("DIRTYNOW", a.stdout, "the wrapper's own locked status check refused")
+            self.assertFalse((gd / "romp-install-failed").exists())
+            # heal-first executed: a prior latch naming HEAD, install fails → INSTALLFAIL with
+            # the record CARRIED (two lines); install fixed → the whole latch is spent
+            marker.unlink(missing_ok=True)
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' merge-base '*) exit 0;;\n"
+                "  *' rev-parse --short=8 HEAD'*) echo 0ldbu1ld;;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "esac\nexit 0\n" % gd)
+            (gd / "romp-install-failed").write_text("0ldbu1ld")
+            (fix / "install.sh").write_text("#!/bin/sh\nexit 1\n")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("INSTALLFAIL", a.stdout)
+            self.assertEqual([l.strip() for l in (gd / "romp-install-failed").read_text().splitlines()],
+                             ["deadbee2", "0ldbu1ld"],
+                             "the arm names the new intent AND CARRIES the prior — never overwritten")
+            (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("NOLAUNCH", a.stdout,
+                          "the fixture has no launcher — reaching the launch check proves the "
+                          "heal+reset+install transaction completed")
+            self.assertFalse((gd / "romp-install-failed").exists(),
+                             "healed + reset + installed: everything spent")
+
     def test_the_apply_recheck_catches_an_edit_landing_after_the_probe(self):
         # the discover-step dirty probe is an ssh round-trip old by apply time; an edit landing in
         # that window must be re-caught IN THE SAME SHELL as the reset, or reset --hard destroys it

@@ -211,11 +211,22 @@ class TokenBirth(unittest.TestCase):
         old = dict(os.environ)
         os.environ.pop("ROMP_SERVE_TOKEN", None)
         try:
-            v = ps._load_serve_token()
+            chmods = []
+            real_chmod = os.chmod
+            with_unittest = __import__("unittest").mock
+            with with_unittest.patch.object(ps.os, "chmod",
+                                            side_effect=lambda *a, **k: chmods.append(a) or real_chmod(*a, **k)):
+                v = ps._load_serve_token()
             self.assertTrue(v)
             mode = stat.S_IMODE(os.stat(f).st_mode)
-            self.assertEqual(mode, 0o600, "born 0600 — no chmod window")
+            self.assertEqual(mode, 0o600, "born 0600")
+            self.assertEqual(chmods, [], "born 0600 by OPEN MODE — a chmod call IS the audited window")
             self.assertEqual(ps._load_serve_token(), v, "a second minter re-reads the winner's token")
+            # a loser must never read an incomplete token: the name appears only WITH its content
+            # (link-claim), so a pre-existing complete file always wins
+            f.unlink()
+            f.write_text("winner-token-value")
+            self.assertEqual(ps._load_serve_token(), "winner-token-value")
         finally:
             os.environ.clear(); os.environ.update(old)
             f.unlink(missing_ok=True)

@@ -142,14 +142,18 @@ while True:
         if time.time() >= deadline:
             sys.exit(70)               # an update/heal is still running: do not start on it
         time.sleep(0.5)
-# UNDER the lock: read, moot-check, heal, clear.
+# UNDER the lock: read, moot-check, heal, clear. The latch may carry TWO lines — the intent and
+# the PRIOR record it superseded (a heal that keeps failing no longer blocks updates; the new arm
+# carries the old sha instead — the adversarial review, 2026-08-19): heal whichever line HEAD
+# matches; a prior present with HEAD matching nothing is an update that died mid-move from a
+# broken state — fail closed, never moot.
 try:
-    want = open(latch).read().strip()[:8]
+    lines = [ln.strip()[:8] for ln in open(latch).read().splitlines() if ln.strip()]
 except FileNotFoundError:
     sys.exit(0)                        # no latch: clear to start
 except OSError:
     sys.exit(70)                       # an EXISTING latch we cannot read is unknown, not absent
-if not want:
+if not lines:
     os.remove(latch)
     sys.exit(0)
 cur = subprocess.run(["git", "-C", root, "rev-parse", "--short=8", "HEAD"],
@@ -157,8 +161,13 @@ cur = subprocess.run(["git", "-C", root, "rev-parse", "--short=8", "HEAD"],
 cur8 = (cur.stdout or "").strip()[:8]
 if cur.returncode or not cur8:
     sys.exit(70)                       # unreadable HEAD: fail CLOSED, never "moot"
-if want != cur8:
-    os.remove(latch)                   # the move it recorded never landed — moot, cleared under the lock
+if cur8 not in lines:
+    if len(lines) > 1:
+        sys.stderr.write("romp-serve: the install latch names %s and prior %s but HEAD is %s — "
+                         "heal by hand (run install.sh, then remove the latch)\n"
+                         % (lines[0], lines[1], cur8))
+        sys.exit(70)
+    os.remove(latch)                   # intent-only mismatch: the move never landed — moot
     sys.exit(0)
 sys.stderr.write("romp-serve: this checkout's last install never finished — running install.sh before the kernel starts\n")
 if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root, pass_fds=(fd,)).returncode:

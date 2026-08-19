@@ -1990,7 +1990,6 @@ def _run_update(tag):
             sys.stderr.write("romp-kernel: update refused: %s\n" % why)
         return False
     _UPDATE_ERROR[0] = ""
-    _UPDATE_STATE[0] = "running"
     q = shlex.quote
     log, rep = q(str(jd.STATE / "update.log")), q(str(jd.STATE / "update-report.json"))
     mport = os.environ.get("ROMP_MANAGER_PORT") or ""
@@ -2041,14 +2040,36 @@ def _run_update(tag):
         "cd %s || exit 1\n" % q(str(ROOT))
         + "{ echo; echo \"== romp self-update to %s ==\"; date; } >> %s 2>&1\n" % (tag, log)
         + "OK=0\n"
-        + "if git fetch origin refs/tags/%s:refs/tags/%s >> %s 2>&1 && %s >> %s 2>&1; then\n"
-          % (tag, tag, log, verify_sh, log)
-        + "  if git rev-parse --short=8 'refs/tags/%s^{commit}' > %s 2>> %s "
-          "&& [ -s %s ] "
-          "&& git merge --ff-only %s >> %s 2>&1 && ./install.sh >> %s 2>&1; then\n"
-          % (tag, latch, log, latch, tag, log, log)
+        + "SETTLED=1\n"
+        # SETTLE like every other arming path (the adversarial review, 2026-08-19: this was the
+        # one updater still arming by overwrite): a latch line matching HEAD heals here, under the
+        # inherited flock; a heal that still fails CARRIES the sha into the new arm's second line.
+        + "CARRY=''\n"
+        + "CUR=$(git rev-parse --short=8 HEAD 2>/dev/null | head -c 8)\n"
+        + "if [ -s %s ] && [ -n \"$CUR\" ]; then\n" % latch
+        + "  if grep -qx \"$CUR\" %s 2>/dev/null; then\n" % latch
+        + "    if ./install.sh >> %s 2>&1; then rm -f %s; else CARRY=\"$CUR\"; fi\n" % (log, latch)
+        + "  elif [ \"$(grep -c . %s 2>/dev/null)\" -gt 1 ]; then\n" % latch
+        + "    SETTLED=0\n"
+        + "  else\n"
         + "    rm -f %s\n" % latch
-        + "    OK=1\n"
+        + "  fi\n"
+        + "elif [ -s %s ]; then\n" % latch
+        + "  SETTLED=0\n"
+        + "fi\n"
+        + "if [ \"$SETTLED\" = 1 ] "
+          "&& git fetch origin refs/tags/%s:refs/tags/%s >> %s 2>&1 && %s >> %s 2>&1; then\n"
+          % (tag, tag, log, verify_sh, log)
+        + "  NEW8=$(git rev-parse --short=8 'refs/tags/%s^{commit}' 2>> %s | head -c 8)\n" % (tag, log)
+        + "  if [ -n \"$NEW8\" ]; then\n"
+        + "    if [ -n \"$CARRY\" ]; then printf '%%s\\n%%s' \"$NEW8\" \"$CARRY\" > %s; "
+          "else printf '%%s' \"$NEW8\" > %s; fi\n" % (latch, latch)
+        + "    if [ -s %s ] "
+          "&& git merge --ff-only %s >> %s 2>&1 && ./install.sh >> %s 2>&1; then\n"
+          % (latch, tag, log, log)
+        + "      rm -f %s\n" % latch
+        + "      OK=1\n"
+        + "    fi\n"
         + "  fi\n"
         + "fi\n"
         + "if [ \"$OK\" = 1 ]; then\n"
@@ -2063,11 +2084,14 @@ def _run_update(tag):
     # in-process state can serialize two KERNELS sharing one checkout, or this path against the
     # main-convergence path (the user's audit, 2026-08-17). The parent closes its copy right
     # after the spawn; refusal here reports like any other launch refusal (422 on the route).
-    lock_fd = _update_flock()
+    # a brief bounded wait absorbs the /update-check liveness probe's momentary hold; and the
+    # in-flight state arms only WITH the lock, so the probe can never see running+free during the
+    # arm window and cry "exited without reporting" (the adversarial review, 2026-08-19)
+    lock_fd = _update_flock_wait(2)
     if lock_fd is None:
         _UPDATE_ERROR[0] = "another update is already running on this checkout"
-        _UPDATE_STATE[0] = ""
         return False
+    _UPDATE_STATE[0] = "running"
     try:
         subprocess.Popen(["bash", "-c", script], start_new_session=True, cwd=str(ROOT),
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -2213,6 +2237,38 @@ def _install_latch_path():
     dir is unresolvable."""
     gd = _update_git_dir()
     return (gd / "romp-install-failed") if gd is not None else None
+
+
+def _install_latch_lines():
+    """Every sha8 the latch records, first line = the current INTENT, optional second = the PRIOR
+    record it superseded. Two lines exist so moving FORWARD past a build whose install fails
+    deterministically stays possible (heal-only wedged every path — the adversarial review,
+    2026-08-19) while a crash between the new arm and the new move can no longer orphan the old
+    protection: the gate heals whichever recorded sha HEAD matches, and fails closed when a prior
+    exists but HEAD matches nothing."""
+    p = _install_latch_path()
+    for cand in ([p] if p is not None else []) + [jd.STATE / "converge-install-failed"]:
+        try:
+            lines = [ln.strip()[:8] for ln in cand.read_text().splitlines() if ln.strip()]
+        except OSError:
+            continue
+        if lines:
+            return lines
+    return []
+
+
+def _arm_latch(target8, prior8=""):
+    """Arm the intent, CARRYING a prior record instead of overwriting it; True when persisted."""
+    p = _install_latch_path()
+    try:
+        if p is None:
+            raise OSError("no resolvable git dir for the checkout")
+        _atomic_write(p, target8 + ("\n" + prior8 if prior8 and prior8 != target8 else ""))
+        return True
+    except OSError as e:
+        _sync_notice("could not persist the install-failed latch (%s) — a restart may boot the "
+                     "half-installed checkout" % e, ok=False)
+        return False
 
 
 def _install_failed_sha():
@@ -2516,12 +2572,12 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
             # crash/kill/reboot between the checkout and that write booting half-installed code
             # with no record (the user's audit, 2026-08-17). A crash anywhere past this line finds
             # the latch matching the new HEAD at boot and heals; a failed checkout disarms it.
-            settle = _settle_prior_latch(lock_fd)  # heal-first: a prior record is SETTLED, never
-            if settle:                             # overwritten (the user's audit, 2026-08-18)
+            settle, carry = _settle_prior_latch(lock_fd)   # a prior record is settled or CARRIED,
+            if settle:                                     # never overwritten (audits 2026-08-18/19)
                 _converge_note("main moved at origin, but: %s" % settle)
                 _MAIN_DRIFT[0] = ""
                 return
-            if not _set_install_failed(tip[:8]):
+            if not _arm_latch(tip[:8], carry):
                 # an intent that cannot PERSIST blocks the move outright — an unwritable git dir
                 # must never mean "proceed unrecorded" (the user's audit, 2026-08-17)
                 _converge_note("could not record the install intent — not moving HEAD.")
@@ -2530,8 +2586,8 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
             r = subprocess.run(["git", "checkout", "--detach", tip], cwd=str(ROOT),
                                capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
-                _set_install_failed("")               # HEAD did not move, and settle guaranteed
-                #                                       no prior record existed to restore
+                _set_install_failed(carry)            # HEAD did not move: the carried prior (if
+                #                                       any) is restored; a clean settle clears
                 _converge_note("main moved at origin, but advancing the checkout failed: %s"
                                % (r.stderr or r.stdout or "").strip()[-200:])
                 _MAIN_DRIFT[0] = ""
@@ -2575,25 +2631,30 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
 
 
 def _settle_prior_latch(lock_fd):
-    """UNDER the update lock, settle any latch armed before a NEW update may arm its own: arming
-    by overwrite orphaned an older unfinished-install record — a crash between the new arm and the
-    new move left a latch naming the new target while HEAD sat on the OLD half-installed build,
-    which the gate then moot-cleared (the user's audit, 2026-08-18). Matching HEAD → heal NOW,
-    under this same lock (a pass settles it; a fail refuses the new update); moot → clear.
-    Returns "" when settled, else the refusal message."""
-    armed = _install_failed_sha()
-    if not armed:
-        return ""
+    """UNDER the update lock, settle any latch armed before a NEW update arms its own — arming by
+    overwrite orphaned an older unfinished-install record (the user's audit, 2026-08-18). A record
+    matching HEAD is healed now; a heal that still FAILS no longer refuses the new update (that
+    wedged every path when the old install.sh failed deterministically, the very case an update
+    exists to fix — the adversarial review, 2026-08-19): the new update proceeds and must CARRY
+    the prior sha in its own arm (the second latch line), so a crash before its move still leaves
+    the old build protected. Returns (refusal, carry): refusal "" to proceed, carry = the sha8 the
+    new arm must record as prior ("" when settled clean)."""
+    lines = _install_latch_lines()
+    if not lines:
+        return "", ""
     cur = _sha8(_checkout_sha())
     if not cur:
-        return "cannot read HEAD while an install latch is armed — settling nothing on a guess"
-    if armed == cur:
-        if not _converge_install(armed, lock_fd):
-            return ("this checkout has an unfinished install that still fails — nothing new "
-                    "starts until install passes")
-        return ""
-    _set_install_failed("")
-    return ""
+        return "cannot read HEAD while an install latch is armed — settling nothing on a guess", ""
+    if cur in lines:
+        if _converge_install(cur, lock_fd):
+            return "", ""                             # healed and cleared
+        return "", cur                                # still broken: move FORWARD, carrying the record
+    if len(lines) > 1:
+        return ("this checkout's install latch names %s and a prior %s but HEAD is %s — an update "
+                "died mid-move from a broken state; heal it by hand (run install.sh, then remove "
+                "the latch)" % (lines[0], lines[1], cur)), ""
+    _set_install_failed("")                           # intent-only mismatch: the move never landed
+    return "", ""
 
 
 def _converge_install(sha8, lock_fd=None):
@@ -2682,16 +2743,18 @@ def _inside_update_txn():
 
 
 def _refuse_half_installed():
-    """True when this kernel must NOT serve: the latch is still armed and either names the running
-    HEAD or HEAD cannot be read at all — an unreadable HEAD is unknown, not moot; treating it as
-    moot let a git failure fail the gate OPEN (the adversarial review, 2026-08-17)."""
+    """True when this kernel must NOT serve: the latch still records the running HEAD (either
+    line), HEAD cannot be read at all, or a PRIOR record exists while HEAD matches nothing — all
+    three are unhealed states, never moot (the adversarial reviews, 2026-08-17/19)."""
     if _inside_update_txn():
         return False
-    armed = _install_failed_sha()
-    if not armed:
+    lines = _install_latch_lines()
+    if not lines:
         return False
     cur = _sha8(_checkout_sha())
-    return not cur or armed == cur
+    if not cur or cur in lines:
+        return True
+    return len(lines) > 1
 
 
 def _boot_heal(wait_s=0):
@@ -2719,18 +2782,23 @@ def _boot_heal(wait_s=0):
                            "half-installed build until then.")
         return
     try:
-        failed = _install_failed_sha()                # read UNDER the lock
-        if not failed:
+        lines = _install_latch_lines()                # read UNDER the lock
+        if not lines:
             return
         cur = _sha8(_checkout_sha())
         if not cur:
             _converge_note("cannot read this checkout's HEAD while its install latch is armed — "
                            "leaving the latch; nothing is healed or cleared on a guess.")
             return                                    # unknown is NOT moot (fail closed)
-        if failed != cur:
-            _set_install_failed("")                   # the move it recorded never landed; moot
+        if cur in lines:
+            _converge_install(cur, fd)                # heal whichever recorded state we RUN
             return
-        _converge_install(failed, fd)
+        if len(lines) > 1:
+            _converge_note("this checkout's install latch names %s and a prior %s but HEAD is %s "
+                           "— an update died mid-move from a broken state; heal it by hand (run "
+                           "install.sh, then remove the latch)." % (lines[0], lines[1], cur))
+            return                                    # unknown is NOT moot (fail closed)
+        _set_install_failed("")                       # intent-only mismatch: the move never landed
     finally:
         try:
             os.close(fd)
@@ -10228,20 +10296,27 @@ def _update_remote(host):
         "    sys.exit(5)\n"
         'lp=os.path.join(os.path.dirname(lock),"romp-install-failed")\n'
         "try:\n"
-        '    prior=open(lp).read().strip()[:8]\n'
+        '    lines=[l.strip()[:8] for l in open(lp).read().splitlines() if l.strip()]\n'
         "except OSError:\n"
-        '    prior=""\n'
-        "if prior:\n"
+        "    lines=[]\n"
+        'carry=""\n'
+        "if lines:\n"
         '    curh=subprocess.run(["git","-C",r,"rev-parse","--short=8","HEAD"],capture_output=True,text=True)\n'
         '    cur8=(curh.stdout or "").strip()[:8]\n'
         "    if not cur8:\n"
         "        sys.exit(9)\n"
-        "    if prior==cur8:\n"
+        "    if cur8 in lines:\n"
         '        if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
-        "            sys.exit(4)\n"
-        "    os.remove(lp)\n"
+        "            carry=cur8\n"
+        "        else:\n"
+        "            os.remove(lp)\n"
+        "    elif len(lines)>1:\n"
+        "        sys.exit(10)\n"
+        "    else:\n"
+        "        os.remove(lp)\n"
         'tmp=lp+".tmp"\n'
-        'open(tmp,"w").write(sha8)\n'
+        'body=sha8+("\\n"+carry if carry and carry!=sha8 else "")\n'
+        'open(tmp,"w").write(body)\n'
         "os.replace(tmp,lp)\n"
         'if subprocess.run(["git","-C",r,"reset","--hard",target]).returncode:\n'
         "    sys.exit(6)\n"
@@ -10253,6 +10328,7 @@ def _update_remote(host):
         'if [ "$RRC" = 7 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIVERGED; exit 0; fi; '
         'if [ "$RRC" = 8 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYNOW; exit 0; fi; '
         'if [ "$RRC" = 9 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERR; exit 0; fi; '
+        'if [ "$RRC" = 10 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo LATCHSTUCK; exit 0; fi; '
         'if [ "$RRC" = 4 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo INSTALLFAIL; exit 0; fi; '
         'if [ "$RRC" != 0 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; fi; '
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; '
@@ -10280,7 +10356,7 @@ def _update_remote(host):
         'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null &  sleep 1; fi; '
         'echo "SYNCED:$NEW"'
     ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, lfull, _P2P_REF, _P2P_REF,
-         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
+         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -10321,6 +10397,10 @@ def _update_remote(host):
     if tag == "UPDATERUNNING":
         return False, ("pushed, but %s is mid-update (its own updater holds the checkout's "
                        "update lock) — try again when it finishes" % host)
+    if tag == "LATCHSTUCK":
+        return False, ("pushed, but %s's install latch names commits its HEAD doesn't match — an "
+                       "update died there mid-move from a broken state; heal it by hand on that "
+                       "machine (run install.sh, then remove the latch)" % host)
     if tag == "INSTALLFAIL":
         return False, ("pushed and reset %s, but its install.sh failed — the latch is armed, so "
                        "nothing restarts onto it until install passes there (its boot heal "
@@ -10457,7 +10537,7 @@ def _pull_remote(host, expected_sha=None):
         if lock_fd is None:
             return False, "another update is already running on this checkout — try again when it finishes"
         try:
-            settle = _settle_prior_latch(lock_fd)  # heal-first: never overwrite a prior record
+            settle, carry = _settle_prior_latch(lock_fd)   # settled or carried, never overwritten
             if settle:
                 return False, settle
             # ancestry decided UNDER the lock: the pre-lock check raced a concurrent updater
@@ -10467,12 +10547,12 @@ def _pull_remote(host, expected_sha=None):
             if anc2.returncode != 0:
                 return False, ("local and %s diverged while waiting for the update lock — "
                                "nothing merged" % host)
-            if not _set_install_failed(_sha8(fetched_sha)):
+            if not _arm_latch(_sha8(fetched_sha), carry):
                 return False, "could not record the install intent — not moving HEAD"
             m = subprocess.run(["git", "-C", str(ROOT), "merge", "--ff-only", fetched_sha],
                                capture_output=True, text=True, timeout=30)
             if m.returncode != 0:
-                _set_install_failed("")            # HEAD did not move; settle left no prior record
+                _set_install_failed(carry)         # HEAD did not move; the carried prior returns
                 return False, ("fast-forward failed: %s"
                                % ((m.stderr or m.stdout or "").strip()[:160] or "unknown"))
             installed = _converge_install(_sha8(fetched_sha), lock_fd)
@@ -25646,10 +25726,24 @@ class Handler(BaseHTTPRequestHandler):
                 failed, updated = _UPDATE_ERROR[0] or _CONVERGE_ERROR[0], ""
                 if _UPDATE_STATE[0] == "running":
                     # LIVENESS: the detached updater holds the checkout's flock for its whole
-                    # life. running + no report + a FREE lock = it died without reporting — a
-                    # state that wedged the banner at "running" and refused every further update
-                    # until a kernel restart (the user's audit, 2026-08-18).
-                    if not (jd.STATE / "update-report.json").exists():
+                    # life. running + no USABLE report + a FREE lock = it died without reporting —
+                    # a state that wedged the banner at "running" and refused every further update
+                    # until a kernel restart (the user's audit, 2026-08-18). A report that EXISTS
+                    # but cannot parse must not defeat the probe (the adversarial review,
+                    # 2026-08-19): it is set aside as .bad and treated as missing.
+                    _rp = jd.STATE / "update-report.json"
+                    _usable = False
+                    try:
+                        json.loads(_rp.read_text())
+                        _usable = True
+                    except OSError:
+                        pass
+                    except ValueError:
+                        try:
+                            _rp.rename(_rp.with_suffix(".json.bad"))
+                        except OSError:
+                            pass
+                    if not _usable:
                         _probe = _update_flock()
                         if _probe is not None:
                             try:
@@ -25669,12 +25763,31 @@ class Handler(BaseHTTPRequestHandler):
                         _peek = json.loads((jd.STATE / "update-report.json").read_text())
                     except (OSError, ValueError):
                         _peek = None
-                    if _peek is not None and not (_peek.get("ok") and _peek.get("restarted")):
+                    _child_gone = False
+                    if _peek is not None and _peek.get("ok") and _peek.get("restarted"):
+                        # ok+restarted normally belongs to the NEXT boot — but a restart the
+                        # manager accepted and never delivered left this kernel waiting forever,
+                        # refusing every further update (the adversarial review, 2026-08-19).
+                        # The child freeing the checkout flock is the event that says it is done;
+                        # from there the report is THIS kernel's to consume, loudly.
+                        _probe = _update_flock()
+                        if _probe is not None:
+                            try:
+                                os.close(_probe)
+                            except OSError:
+                                pass
+                            _child_gone = True
+                    if _peek is not None and (_child_gone or
+                                              not (_peek.get("ok") and _peek.get("restarted"))):
                         rep = _consume_update_report(running_only=True)
                         if rep is not None and not rep.get("ok"):
                             failed = str(rep.get("why") or "the pull or install failed")
                         elif rep is not None:
                             updated = str(rep.get("tag") or "")
+                            if rep.get("restarted"):
+                                _sync_notice("romp updated to %s and asked the manager to restart "
+                                             "— if the dashboard doesn't reload shortly, run "
+                                             "`romp refresh` yourself." % updated, ok=True)
                 return self._send(200, json.dumps({
                     "cur": _kernel_ver() or "", "tag": _UPDATE_AVAIL[0], "mode": _update_mode(),
                     # a running CONVERGE is as in-flight as a running tag update: a page loading

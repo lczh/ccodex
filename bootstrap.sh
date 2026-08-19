@@ -277,23 +277,28 @@ def write_latch(sha8):
 
 
 try:
-    prior = open(latch).read().strip()[:8]
+    lines = [ln.strip()[:8] for ln in open(latch).read().splitlines() if ln.strip()]
 except OSError:
-    prior = ""
+    lines = []
 pre_head = head8()
-if prior:
+carry = ""
+if lines:
     if not pre_head:
         sys.exit(3)                          # can't settle a prior record against an unreadable HEAD
-    if prior == pre_head:
-        # heal-first: the checkout already runs a half-installed build — a new arm would
-        # ORPHAN this record if we crashed before our own move (the user's audit, 2026-08-18)
+    if pre_head in lines:
+        # heal-first, but a heal that still fails CARRIES the record into the new arm instead of
+        # blocking the very update that may fix install.sh (the adversarial review, 2026-08-19)
         if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root,
                           pass_fds=(fd,)).returncode:
-            sys.exit(4)
-    os.remove(latch)
-    prior = ""
+            carry = pre_head
+        else:
+            os.remove(latch)
+    elif len(lines) > 1:
+        sys.exit(10)                         # died mid-move from a broken state: heal by hand
+    else:
+        os.remove(latch)                     # intent-only mismatch: the move never landed
 try:
-    write_latch(target[:8])
+    write_latch(target[:8] + ("\n" + carry if carry and carry != target[:8] else ""))
 except OSError:
     sys.exit(5)
 for mv in moves:
@@ -305,9 +310,9 @@ for mv in moves:
         now = head8()
         try:
             if now and now != pre_head:
-                write_latch(now)
-            elif prior:
-                write_latch(prior)
+                write_latch(now + ("\n" + carry if carry and carry != now else ""))
+            elif carry:
+                write_latch(carry)           # HEAD unmoved: the carried prior record returns
             else:
                 os.remove(latch)
         except OSError:
@@ -329,6 +334,9 @@ case "$txn_rc" in
     6) echo "romp: the checkout could not be moved to $ref — most often the local branch cannot fast-forward" >&2
        echo "  to origin/$ref (see git's message above). Resolve or preserve the local commits, then rerun." >&2
        echo "  Nothing was installed." >&2; exit 1 ;;
+    10) echo "romp: this checkout's install latch names commits HEAD doesn't match — an update died" >&2
+        echo "  mid-move from a broken state. Heal by hand: run install.sh, then remove the latch" >&2
+        echo "  file in the clone's git dir, and rerun bootstrap." >&2; exit 1 ;;
     4) echo "romp: install.sh failed AFTER the checkout moved — the install latch is armed, so" >&2
        echo "  romp will refuse to run this build until a re-run of bootstrap or its boot heal" >&2
        echo "  gets install.sh to pass." >&2; exit 1 ;;

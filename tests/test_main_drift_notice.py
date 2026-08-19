@@ -363,39 +363,65 @@ class ConvergeFunctional(unittest.TestCase):
         steps, _ = self._run()
         self.assertEqual(steps, [], "a second converge while one runs is a no-op")
 
-    def test_settle_prior_latch_heals_or_clears_but_never_lets_arming_overwrite(self):
-        # arming by overwrite orphaned an older unfinished-install record — a crash between the
-        # new arm and the new move left the OLD half-installed HEAD unprotected (the user's
-        # audit, 2026-08-18): a prior record is settled FIRST, under the same lock
+    def test_settle_prior_latch_heals_clears_or_carries_but_never_overwrites_or_wedges(self):
+        # arming by overwrite orphaned an older record (audit 2026-08-18); heal-ONLY then wedged
+        # every path when the old install failed deterministically (review 2026-08-19). The
+        # synthesis: heal what matches HEAD; a failing heal CARRIES the sha into the new arm;
+        # a prior present with HEAD matching nothing fails closed; intent-only mismatch is moot.
         with mock.patch.object(km, "_sync_notice"):
-            self.assertEqual(km._settle_prior_latch(None), "", "no latch → nothing to settle")
+            self.assertEqual(km._settle_prior_latch(None), ("", ""), "no latch → nothing to settle")
             km._set_install_failed("f" * 8)
             with mock.patch.object(km, "_checkout_sha", return_value="f" * 8), \
                  mock.patch.object(km, "_converge_install", return_value=True) as heal:
-                self.assertEqual(km._settle_prior_latch(None), "",
-                                 "matching HEAD + passing install → settled")
+                self.assertEqual(km._settle_prior_latch(None), ("", ""),
+                                 "matching HEAD + passing install → settled clean")
                 heal.assert_called_once_with("f" * 8, None)
             km._set_install_failed("f" * 8)
             with mock.patch.object(km, "_checkout_sha", return_value="f" * 8), \
                  mock.patch.object(km, "_converge_install", return_value=False):
-                self.assertIn("unfinished install", km._settle_prior_latch(None),
-                              "matching HEAD + failing install → the NEW update is refused")
-            self.assertEqual(km._install_failed_sha(), "f" * 8, "and the prior record SURVIVES")
+                self.assertEqual(km._settle_prior_latch(None), ("", "f" * 8),
+                                 "a heal that still fails CARRIES the record — never wedges")
             with mock.patch.object(km, "_checkout_sha", return_value="00000000"):
-                self.assertEqual(km._settle_prior_latch(None), "", "moot → cleared")
+                self.assertEqual(km._settle_prior_latch(None), ("", ""), "intent-only moot → cleared")
             self.assertEqual(km._install_failed_sha(), "")
+            km._arm_latch("11111111", "22222222")
+            with mock.patch.object(km, "_checkout_sha", return_value="33333333"):
+                refusal, carry = km._settle_prior_latch(None)
+                self.assertIn("heal it by hand", refusal,
+                              "prior present + HEAD matching nothing → fail closed")
+            km._set_install_failed("")
             km._set_install_failed("f" * 8)
             with mock.patch.object(km, "_checkout_sha", return_value=""):
-                self.assertIn("unreadable", km._settle_prior_latch(None).replace("cannot read", "unreadable"),
-                              "unknown HEAD settles nothing")
+                refusal, _ = km._settle_prior_latch(None)
+                self.assertIn("cannot read HEAD", refusal)
             km._set_install_failed("")
 
-    def test_a_prior_latch_that_cannot_heal_blocks_the_new_pull_and_survives(self):
+    def test_a_prior_latch_that_cannot_heal_is_carried_forward_and_spent_by_the_new_install(self):
+        # the forward path is the escape from a deterministically-broken old install (the
+        # adversarial review, 2026-08-19): the update proceeds, the arm carries both shas, and
+        # the NEW build's passing install spends everything
         km._set_install_failed("aaaa1111")
-        with mock.patch.object(km, "_checkout_sha", return_value="aaaa1111"):
-            steps, _ = self._run(fail=("install",))
-        self.assertNotIn("checkout", steps, "the new update never moves HEAD")
-        self.assertEqual(km._install_failed_sha(), "aaaa1111", "the prior record is intact")
+        latch_during = []
+        with mock.patch.object(km, "_checkout_sha", return_value="aaaa1111"), \
+             mock.patch.object(km, "_settle_prior_latch", wraps=km._settle_prior_latch):
+            # the settle's own heal uses install (fails once for the OLD sha), then the new
+            # transaction's install passes — script the two calls apart
+            calls = {"n": 0}
+            real_ci = km._converge_install
+
+            def scripted_install(sha8, lock_fd=None):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return False                     # the OLD build's heal still fails
+                latch_during.append(km._install_latch_lines())
+                return real_ci(sha8, lock_fd)
+
+            with mock.patch.object(km, "_converge_install", side_effect=scripted_install):
+                steps, _ = self._run()
+        self.assertIn("checkout", steps, "the update PROCEEDS — no wedge")
+        self.assertEqual(latch_during, [[self.FULL[:8], "aaaa1111"]],
+                         "mid-transaction the latch carries intent AND the prior record")
+        self.assertEqual(km._install_latch_lines(), [], "the new build's passing install spends both")
 
     def test_boot_heal_takes_the_lock_before_any_latch_read(self):
         # reading first left a fail-open window where an updater held the lock but had not armed
@@ -480,7 +506,7 @@ class ConvergeFunctional(unittest.TestCase):
     def test_an_unpersistable_intent_blocks_the_checkout(self):
         # noticing-but-proceeding let a full/unwritable git dir move HEAD with no recovery record
         # (the user's audit, 2026-08-17): the arm's return is load-bearing
-        with mock.patch.object(km, "_set_install_failed", return_value=False):
+        with mock.patch.object(km, "_arm_latch", return_value=False):
             steps, _ = self._run()
         self.assertNotIn("checkout", steps, "no durable intent, no move")
         self.assertTrue(any("install intent" in n for n in self.notices))
@@ -563,16 +589,22 @@ class BootHeal(unittest.TestCase):
     def test_refuse_half_installed_decides_functionally_and_fails_closed(self):
         # the abort gate was only source-pinned; an inverted condition passed (the adversarial
         # review, 2026-08-17) — drive the decision itself, unreadable-HEAD case included
-        with mock.patch.object(km, "_install_failed_sha", return_value=""):
+        with mock.patch.object(km, "_install_latch_lines", return_value=[]):
             self.assertFalse(km._refuse_half_installed(), "no latch → serve")
-        with mock.patch.object(km, "_install_failed_sha", return_value="f" * 8):
+        with mock.patch.object(km, "_install_latch_lines", return_value=["f" * 8]):
             with mock.patch.object(km, "_checkout_sha", return_value="f" * 8):
                 self.assertTrue(km._refuse_half_installed(), "latched for the running HEAD → refuse")
             with mock.patch.object(km, "_checkout_sha", return_value="00000000"):
-                self.assertFalse(km._refuse_half_installed(), "latched for another commit → moot → serve")
+                self.assertFalse(km._refuse_half_installed(), "intent-only mismatch → moot → serve")
             with mock.patch.object(km, "_checkout_sha", return_value=""):
                 self.assertTrue(km._refuse_half_installed(),
                                 "unreadable HEAD is UNKNOWN, not moot — fail closed")
+        with mock.patch.object(km, "_install_latch_lines", return_value=["11111111", "22222222"]):
+            with mock.patch.object(km, "_checkout_sha", return_value="22222222"):
+                self.assertTrue(km._refuse_half_installed(), "the PRIOR line counts as latched too")
+            with mock.patch.object(km, "_checkout_sha", return_value="33333333"):
+                self.assertTrue(km._refuse_half_installed(),
+                                "a prior present with HEAD matching nothing is unhealed, never moot")
 
     def test_set_install_failed_reports_whether_the_intent_landed(self):
         # the audited noticed-but-proceeded bug replants green without this: the arm's return is
