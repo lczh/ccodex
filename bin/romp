@@ -1151,6 +1151,7 @@ effort_arg=""
 use_tmux=false
 use_codex=false
 msg_arg=""
+tag_arg=""
 
 case "${1:-}" in
     new)
@@ -1162,7 +1163,7 @@ case "${1:-}" in
                 --detach)  detach=true; shift ;;
                 -d)        shift
                            if [[ $# -eq 0 || "$1" == -* ]]; then
-                               echo "usage: romp new [-t|--codex] [-d <dir>] [-m <text>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
+                               echo "usage: romp new [-t|--codex] [-d <dir>] [-m <text>] [--tag <label>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
                            fi
                            dir_arg="$1"; shift ;;
                 -m|--message) shift
@@ -1171,34 +1172,44 @@ case "${1:-}" in
                            # last two-step on the idea-to-working path). Empty text is a usage
                            # error, not a silent no-op.
                            if [[ $# -eq 0 || -z "$1" ]]; then
-                               echo "usage: romp new [-t] [-d <dir>] [-m <text>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
+                               echo "usage: romp new [-t|--codex] [-d <dir>] [-m <text>] [--tag <label>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
                            fi
                            msg_arg="$1"; shift ;;
+                --tag)     shift
+                           # scheduled/scripted kickoff (the user 2026-08-18, for the nightly
+                           # optimizer's briefing): the -m text is machine-sent under this label
+                           # (the same third identity `romp send --tag` writes) instead of posing
+                           # as the user's typed words. Rides POST /send's "tag" field — the
+                           # kernel validates and appends the render-hint marker itself.
+                           if [[ $# -eq 0 || -z "$1" || "$1" == -* ]]; then
+                               echo "usage: romp new [-t|--codex] [-d <dir>] [-m <text>] [--tag <label>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
+                           fi
+                           tag_arg="$1"; shift ;;
                 --model)   shift
                            # per-spawn model, riding POST /new (the user 2026-08-14: the nightly
                            # optimizer must always run fable, and a headless script has no WS).
                            # FULL id as the picker sends it (claude-fable-5) — the alias table
                            # stops at opus/sonnet/haiku and quietly resolved "fable" to Opus 5.
                            if [[ $# -eq 0 || -z "$1" || "$1" == -* ]]; then
-                               echo "usage: romp new [-t] [-d <dir>] [-m <text>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
+                               echo "usage: romp new [-t|--codex] [-d <dir>] [-m <text>] [--tag <label>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
                            fi
                            model_arg="$1"; shift ;;
                 --effort)  shift
                            # per-spawn effort (e.g. high, ultracode) — ultracode is per-session
                            # by design, never a machine default, so /new is its sanctioned door.
                            if [[ $# -eq 0 || -z "$1" || "$1" == -* ]]; then
-                               echo "usage: romp new [-t] [-d <dir>] [-m <text>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
+                               echo "usage: romp new [-t|--codex] [-d <dir>] [-m <text>] [--tag <label>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
                            fi
                            effort_arg="$1"; shift ;;
                 -*)        echo "romp new: unknown option: $1" >&2; exit 2 ;;
                 *)         if [[ -n "$session_arg" ]]; then
-                               echo "usage: romp new [-t|--codex] [-d <dir>] [-m <text>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
+                               echo "usage: romp new [-t|--codex] [-d <dir>] [-m <text>] [--tag <label>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
                            fi
                            session_arg="$1"; shift ;;
             esac
         done
         if [[ -z "$session_arg" ]]; then
-            echo "usage: romp new [-t|--codex] [-d <dir>] [-m <text>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
+            echo "usage: romp new [-t|--codex] [-d <dir>] [-m <text>] [--tag <label>] [--model <id>] [--effort <level>] <name>" >&2; exit 2
         fi
         if $use_tmux && $use_codex; then
             echo "romp new: --codex and -t are different session kinds — pick one" >&2; exit 2
@@ -1337,7 +1348,10 @@ if [[ -n "$session_arg" ]] && ! $use_tmux && ! $resume; then
         # session EXISTS by now (the /new above acked), so a failed send names the exact
         # retry command instead of pretending the spawn failed.
         if [[ -n "$msg_arg" ]]; then
-            _mpayload="$(python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "text": sys.argv[2]}))' "$session_arg" "$msg_arg")"
+            _mpayload="$(python3 -c 'import json,sys
+d = {"name": sys.argv[1], "text": sys.argv[2]}
+if len(sys.argv) > 3 and sys.argv[3]: d["tag"] = sys.argv[3]
+print(json.dumps(d))' "$session_arg" "$msg_arg" "$tag_arg")"
             _mresp="$(_romp_token_cfg | curl -sf -m 10 --config - -X POST "http://127.0.0.1:$_kport/send" \
                           -H 'Content-Type: application/json' -d "$_mpayload")" \
                 || { echo "romp new: session is up but the message did NOT land (kernel send failed). Retry: romp send $session_arg '<text>'" >&2; exit 1; }

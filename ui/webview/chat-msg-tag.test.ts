@@ -15,6 +15,7 @@ const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview"
 const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
 const EM = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "event_model.py"), "utf8");
 const CLI = fs.readFileSync(path.resolve(process.cwd(), "..", "bin", "romp"), "utf8");
+const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "styles.css"), "utf8");
 
 test("event_model: the marker is a comment-form regex with a bounded one-word label", () => {
   assert.match(EM, /MSG_TAG_RE = re\.compile\(r"<!--\\s\*romp-tag:\\s\*\(\[A-Za-z0-9\]\[A-Za-z0-9-\]\{0,23\}\)\\s\*-->"\)/,
@@ -28,7 +29,16 @@ test("kernel: the tag lifts on HUMAN-author turns only, riding the user event", 
 
 test("chat: a tagged message wears the gray injected family with the sender's ⚙ label, never user blue", () => {
   assert.match(RENDER, /tag\?: string/, "the user event carries the kernel's lift");
-  assert.match(RENDER, /const tagged = !romp && !injected && !!ev\.tag && !!ev\.md;/);
+  // the predicate lives in sender-identity.ts since 2026-08-18 (ONE classifier for bubble, dot,
+  // and notch); render.ts derives its flags from that one verdict
+  assert.match(RENDER, /const tagged = kind === "tagged";/);
+  // the rail dot is its own identity channel and must AGREE with the bubble (2026-08-18): a tagged
+  // machine-sent message wears the gray tag dot, never the blue "you typed this" one — so `tagged`
+  // is hoisted above the dot call
+  assert.match(RENDER, /turn\.appendChild\(dot\(romp \? "romp" : tagged \? "tag" : injected \? "ring" : "user"\)\);/);
+  assert.ok(RENDER.indexOf('const tagged = kind === "tagged"') < RENDER.indexOf('dot(romp ? "romp" : tagged'),
+    "tagged must be declared before the dot call reads it");
+  assert.match(CSS, /\.dot\.tag \{ background: #8a8f98; border: none; \}/);
   // the label chip reuses the romp-tag dress (one vocabulary), ⚙ marking "scripted" vs romp's swirl
   assert.match(RENDER, /tchip\.appendChild\(document\.createTextNode\("⚙ " \+ ev\.tag\)\);/);
   assert.match(RENDER, /tagged \? "romp-bubble tag-bubble" : injected \? "user-note" : "user-bubble"/);

@@ -68,6 +68,16 @@ test("a romp SYSTEM notice becomes a romp notice card (swirl) — NOT the gray n
   assert.match(CSS, /\.notice-card-romp \{ border-left-color: rgba\(156, 210, 255, 0\.45\); \}/);
 });
 
+test("a standalone ROMP notice sits on the RIGHT, like every message from romp; other variants stay left", () => {
+  // the user 2026-08-18: in the transcript, direction says who is speaking — the session from the
+  // left, romp and the user from the right. The kernel-restart notice wore the session's side.
+  assert.match(CSS, /\.turn-notice\.notice-romp \{ display: flex; flex-direction: column; align-items: flex-end; \}/);
+  assert.match(CSS, /\.turn-notice\.notice-romp > \.notice-card \{ max-width: 72%; \}/,
+    "the bubbles' width cap — it reads beside the nudges it travels with");
+  assert.doesNotMatch(CSS, /\.turn-notice \{[^}]*flex-end/,
+    "unscoped: agent/reminder notices are session-side output and keep the left edge");
+});
+
 test("the notice family is DIFFERENTIABLE from postal + teammate", () => {
   assert.doesNotMatch(NOTICE, /postal-service|--peer-bg|teammate/, "no postal/teammate chrome inside noticeCard");
   // its own keyed collapse rule, not the postal/teammate .expanded toggle

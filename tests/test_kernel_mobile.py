@@ -374,19 +374,19 @@ class ChatSessionPicker(unittest.TestCase):
 
 
 class RevealRouting(unittest.TestCase):
-    def test_reveal_chat_focuses_chat_and_nudges_shell(self):
+    def test_a_reveal_focuses_the_askers_chat_and_nudges_its_shell(self):
+        # the chat focus + the shell's switch-to-Chat travel as a pair, both addressed to the asker's wid
         sent = []
-        orig = km._send_to_app
-        km._send_to_app = lambda app, msg: sent.append((app, msg))
+        orig = km._send_to_view
+        km._send_to_view = lambda app, msg, wid: sent.append((app, wid, msg))
         try:
-            km._reveal_chat({"type": "focus", "id": "s1"})
+            km._reveal_chat_for({"app": "feed", "wid": "win-A"}, {"type": "focus", "id": "s1"})
         finally:
-            km._send_to_app = orig
-        apps = [a for a, _ in sent]
-        self.assertIn("chat", apps)                   # still focuses the chat clients (unchanged behavior)
-        self.assertIn("shell", apps)                  # AND tells the mobile shell to show the Chat tab
-        chat_msg = next(m for a, m in sent if a == "chat")
-        shell_msg = next(m for a, m in sent if a == "shell")
+            km._send_to_view = orig
+        self.assertEqual([(a, w) for a, w, _ in sent], [("chat", "win-A"), ("shell", "win-A")],
+                         "chat focus AND mobile-shell nudge, the asker's window only")
+        chat_msg = next(m for a, _, m in sent if a == "chat")
+        shell_msg = next(m for a, _, m in sent if a == "shell")
         self.assertEqual(chat_msg["id"], "s1")        # the original focus payload is preserved verbatim
         self.assertEqual(shell_msg, {"type": "reveal", "pane": "chat"})
 

@@ -3760,6 +3760,64 @@ class SweepSession(unittest.TestCase):
         jd.closer_llm = lambda tt, mt, *_a: (_ for _ in ()).throw(AssertionError("a stable closed turn must not be re-judged"))
         self.assertEqual(jd.run_close(now=self.now), 0, "unchanged closed turns are skipped (closedSig matches)")
 
+    def _refusing_closer(self, calls):
+        # a safeguards refusal exactly as _judge_run leaves it: "" back to the caller, the literal
+        # error stashed per-thread (the filter ruling on content, not model health)
+        return lambda tt, mt, *_a: (calls.append(1), setattr(
+            jd._judge_ctx, "last_call_fail",
+            {"note": "API Error: the model's safeguards flagged this message.", "model": "fable"}), "")[2]
+
+    def test_safeguards_refusals_tombstone_the_turn_at_the_cap(self):
+        # the 2026-08-18 storm: 2,955 refusals, all the closer re-asking the filter about the same
+        # transcript content every pass, unbounded — a content refusal is deterministic, so the cap
+        # sweeps the turn without verdicts (loud give-up row) instead of burning a call per pass forever
+        jd.run_plan(now=self.now)
+        calls = []
+        jd.closer_llm = self._refusing_closer(calls)
+        for _ in range(jd.DISTILL_FAIL_CAP):
+            jd.run_close(now=self.now)
+        capped = len(calls)
+        self.assertEqual(capped, 2 * jd.DISTILL_FAIL_CAP, "two turns × cap attempts, then no more")
+        jd.run_close(now=self.now)
+        jd.run_close(now=self.now)
+        self.assertEqual(len(calls), capped, "tombstoned turns cost ZERO further calls")
+        store = jd.load_goals(SID)
+        tops = [nd for nd in store["nodes"].values() if nd["parentId"] is None]
+        self.assertTrue(all(not nd.get("nodeComplete") for nd in tops),
+                        "swept WITHOUT verdicts — no goal state was invented")
+        self.assertFalse(store.get("closeFails"), "strike records retire at the cap")
+
+    def test_a_grown_turn_re_judges_past_its_tombstone(self):
+        # the re-arm event is NEW EVIDENCE: growth re-enters through the same closedSig check that
+        # re-judges any closed turn — no clock, no manual step
+        path = next(p for f, p, a, n in jd.discover(self.now) if f == SID)
+        recs = [uline(T0, "fix the thing", "u1", ps="typed"),
+                aline(T0 + 30, "worked on it", "a1", "u1", stop="end_turn")]
+        Path(path).write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        jd.run_plan(now=self.now)
+        calls = []
+        jd.closer_llm = self._refusing_closer(calls)
+        for _ in range(jd.DISTILL_FAIL_CAP):
+            jd.run_close(now=self.now)
+        recs.append(aline(T0 + 200, "finished it end to end", "a2", "a1", stop="end_turn"))
+        Path(path).write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        jd.closer_llm = lambda tt, mt, *_a: '{"done": [{"goal": 1, "why": "finished"}]}'
+        n = jd.run_close(now=self.now)
+        self.assertGreaterEqual(n, 1, "the grown turn re-judged and completed the goal")
+
+    def test_transient_failures_never_tombstone(self):
+        # a 529/timeout recovers when the storm ends — those keep the plain retry-next-pass contract
+        jd.run_plan(now=self.now)
+        calls = []
+        jd.closer_llm = lambda tt, mt, *_a: (calls.append(1), setattr(
+            jd._judge_ctx, "last_call_fail",
+            {"note": "API Error: Repeated 529 Overloaded errors.", "model": "fable"}), "")[2]
+        for _ in range(jd.DISTILL_FAIL_CAP + 2):
+            jd.run_close(now=self.now)
+        self.assertEqual(len(calls), 2 * (jd.DISTILL_FAIL_CAP + 2),
+                         "still retrying every pass — transient failures never adopt the turn")
+        self.assertFalse(jd.load_goals(SID).get("closedTurns"), "nothing swept while the calls fail")
+
 
 class CloserKeyMigration(unittest.TestCase):
     """The closer's per-session 'already processed' set survives the sweep->close rename: it reads the
@@ -4636,6 +4694,21 @@ class ProceduralBlockStillSpeaks(unittest.TestCase):
         self.assertEqual(calls["stall"], [])
         self.assertEqual(calls["brief"], [])
 
+    def test_a_kept_brief_under_a_live_giveup_warn_regenerates_instead_of_keeping(self):
+        # the review's never-retries finding (2026-08-18): a proc-only give-up KEPT an older brief and
+        # stamped brief-failed; the recovery re-arm then cleared briefedMt to force a retry — but the
+        # keep short-circuit (_brief_superseded(None) is False by construction) restamped the gate shut
+        # without any model call, burning the re-arm (and its era) on a no-op forever. A live
+        # brief-failed warn refuses the keep, so the re-arm's retry actually runs and clears the warn.
+        calls, node = self._run(node_extra={
+            "blockSummary": "the give-up's kept older brief", "briefedMt": None,
+            "warns": [{"kind": "brief-failed", "t": T0 + 30, "msg": "synthetic msg",
+                       "detail": "synthetic detail"}]})
+        self.assertEqual(node["blockSummary"], "stall take.",
+                         "regenerated through the staller's prompt, not kept")
+        self.assertFalse(any(w.get("kind") == "brief-failed" for w in node.get("warns") or []),
+                         "the landed note clears the give-up warn")
+
     def test_a_fresh_real_block_reopens_a_settled_blank(self):
         # the launch-prep shape: a procedural block settled the brief to "" (that episode had nothing to
         # say), then a REAL decision landed later in the subtree — "" must not keep muting the card
@@ -5503,6 +5576,43 @@ class Distiller(unittest.TestCase):
         self.assertEqual(nd.get("blockSummary"), "Decide A or B.")
         self.assertFalse(any(w.get("kind") == "brief-failed" for w in nd.get("warns") or []),
                          "a landed brief drops the give-up warn")
+
+    def test_failed_attempts_reach_the_cards_attempt_log(self):
+        # the chip's hover/modal history (the user 2026-08-18): every failed try lands as when + model +
+        # literal error, and the line's eventual success clears its rows
+        gid, now = self._blocked_goal()
+        jd.brief_llm = lambda g, w, ow="": (setattr(jd._judge_ctx, "last_call_fail",
+            {"note": "API Error: Repeated 529 Overloaded errors.", "model": "opus"}), "")[1]
+        for _ in range(jd.DISTILL_FAIL_CAP):
+            jd.run_distill(now=now)
+        log = jd.load_goals(SID)["nodes"][gid].get("failLog") or []
+        self.assertEqual(len(log), jd.DISTILL_FAIL_CAP, "one row per failed attempt")
+        self.assertTrue(all(e["model"] == "opus" and "529" in e["note"] and e["line"] == "brief"
+                            for e in log), "each row carries the model and the literal error")
+        st = jd.load_goals(SID); st["nodes"][gid]["blockSummary"] = None; jd.save_goals(SID, st)
+        jd.brief_llm = lambda g, w, ow="": (setattr(jd._judge_ctx, "last_call_fail", None), "Decide A or B.")[1]
+        jd.run_distill(now=now)
+        self.assertNotIn("failLog", jd.load_goals(SID)["nodes"][gid],
+                         "the landed brief clears its line's attempt history")
+
+    def test_a_landed_brief_ends_its_lines_giveup_era(self):
+        # the mutation-test gap from the review (2026-08-18): with the success-path era pops deleted,
+        # the whole suite still passed — so pin them through the REAL path: an auto-re-armed line whose
+        # retry succeeds must drop its era mark, or the health edge is one-per-lifetime per card
+        gid, now = self._blocked_goal()
+        jd.brief_llm = lambda g, w, ow="": ""
+        for _ in range(jd.DISTILL_FAIL_CAP):
+            jd.run_distill(now=now)
+        st = jd.load_goals(SID)                          # the health edge re-armed it (as rearm would):
+        st["nodes"][gid]["blockSummary"] = None          # line owed again, era spent
+        st["nodes"][gid]["autoRearmed"] = {"brief-failed": True}
+        jd.save_goals(SID, st)
+        jd.brief_llm = lambda g, w, ow="": "Decide A or B."
+        jd.run_distill(now=now)
+        nd = jd.load_goals(SID)["nodes"][gid]
+        self.assertEqual(nd.get("blockSummary"), "Decide A or B.")
+        self.assertNotIn("autoRearmed", nd,
+                         "the landed brief pops its line's era mark — the next give-up era can auto-retry")
 
     def test_scan_counts_failures_and_rearm_reopens_only_warned_cards(self):
         gid, now = self._blocked_goal()

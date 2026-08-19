@@ -15,8 +15,8 @@ test("feed prefs from romp:settings: newestFirst/collapsed default OFF, grouped 
   // newestFirst + collapsed default OFF (=== true); grouped defaults ON (!== false — the user 2026-07-13:
   // by-session grouping is the feed's normal reading mode, the footer Group toggle opts OUT).
   // `subgoals` is no longer a feed-wide pref (per-card button now).
-  assert.match(FEED, /return \{ newestFirst: s\.newestFirst === true, collapsed: s\.collapsed === true, grouped: s\.grouped !== false \};/);
-  assert.match(FEED, /catch \{ return \{ newestFirst: false, collapsed: false, grouped: true \}; \}/);
+  assert.match(FEED, /return \{ newestFirst: s\.newestFirst === true, collapsed: s\.collapsed === true, grouped: s\.grouped !== false,\s*\n\s*stacked: s\.stacked === true \};/);
+  assert.match(FEED, /catch \{ return \{ newestFirst: false, collapsed: false, grouped: true, stacked: false \}; \}/);
   assert.doesNotMatch(FEED, /s\.subgoals/, "no feed-wide subgoals pref — it's a per-card toggle now");
   assert.doesNotMatch(FEED, /explanations/);   // every trace of the old pref is gone from the feed
 });
@@ -59,6 +59,6 @@ test("Sub-goals is a PER-CARD button — the THIRD mutually-exclusive section; n
 });
 
 test("the feed re-renders when the prefs change (storage cross-pane + same-doc romp:settings event)", () => {
-  assert.match(FEED, /window\.addEventListener\("storage", \(e\) => \{ if \(e\.key === "romp:settings"\) render\(\); \}\)/);
-  assert.match(FEED, /window\.addEventListener\("romp:settings", \(\) => render\(\)\)/);
+  assert.match(FEED, /window\.addEventListener\("storage", \(e\) => \{ if \(e\.key === "romp:settings"\) onSettingsChanged\(\); \}\)/);
+  assert.match(FEED, /window\.addEventListener\("romp:settings", \(\) => onSettingsChanged\(\)\)/);
 });

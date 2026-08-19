@@ -25,11 +25,12 @@ class SettingsSectionsTest(unittest.TestCase):
     def test_the_subsection_headers_are_present_in_order(self):
         h = _gear_src()
         self.assertIn("<div class='rs-sec rs-sec-first'>Sessions</div>", h)
-        for sec in ("Judges", "Keyboard shortcuts", "Chat", "Timeline", "Colors", "Debug"):
+        for sec in ("Judges", "Keyboard shortcuts", "Chat", "Feed", "Timeline", "Colors", "Debug"):
             self.assertIn("<div class=rs-sec>%s</div>" % sec, h)
-        self.assertNotIn(">Feed<", h, "the Feed section dissolved into Colors (its colormap is global)")
+        # (The 2026-07-12 "Feed dissolved into Colors" rule ended 2026-08-18: the Feed section is back,
+        # carrying the collapse-by-default checkbox moved off the feed footer.)
         order = [">Sessions<", ">Judges<", ">Keyboard shortcuts<", ">Chat<",
-                 ">Timeline<", ">Colors<", ">Debug<", ">romp · version<"]
+                 ">Feed<", ">Timeline<", ">Colors<", ">Debug<", ">romp · version<"]
         idx = [h.index(t) for t in order]
         self.assertEqual(idx, sorted(idx), "sections in the 2026-07-12 order, version last")
 

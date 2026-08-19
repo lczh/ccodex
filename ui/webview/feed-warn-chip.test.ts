@@ -30,11 +30,24 @@ test("the click reads the card's CURRENT warns and opens the detail overlay (cli
 
 test("updateAskCard toggles the chip on it.warns and refreshes the data it reads", () => {
   assert.match(FEED, /a\._warnsData = it\.warns \|\| null;/);
+  assert.match(FEED, /a\._failLog = it\.failLog \|\| null;/);
   assert.match(FEED, /a\._warnChip\.style\.display = "";/);
   assert.match(FEED, /a\._warnChip\.textContent = it\.warns\.length > 1 \? `\$\{lbl\} ×\$\{it\.warns\.length\}` : lbl;/,
     "multiple live warns show a count");
-  assert.match(FEED, /it\.warns\[it\.warns\.length - 1\]\.msg \+ " — click for what happened and why"/,
-    "hover says the latest msg + that detail is a click away");
+  assert.match(FEED, /it\.warns\[it\.warns\.length - 1\]\.msg\) \+ "\\n— click for what happened and why"/,
+    "hover: the attempt history when one exists, else the latest msg — detail is a click away");
+  assert.match(FEED, /tried \$\{f\.model\} — \$\{f\.note\}/,
+    "each hover line is one attempt: model + literal error (the user 2026-08-18)");
+});
+
+test("the modal lists the attempt log — when, which model, the literal error (the user 2026-08-18)", () => {
+  // "tried opus — 529, tried opus — 529, …" at a glance is what tells the user ONE model is down and
+  // switching it fixes everything; prose can't carry that shape
+  assert.match(FEED, /failLog\?: \{ t: number; line: string; model: string; note: string \}\[\] \| null/);
+  assert.match(FEED, /meta\.textContent = "What was tried";/);
+  assert.match(FEED, /tried \$\{f\.model\} for the \$\{f\.line\} — \$\{f\.note\}/);
+  assert.match(FEED, /\(card as any\)\._failLog as AskItem\["failLog"\]/,
+    "the click hands the modal the card's freshest attempt data");
 });
 
 test("a given-up summarizer wears its NAME — 'distill failed' — and its modal offers Try again (the user 2026-08-13)", () => {

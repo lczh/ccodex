@@ -205,6 +205,7 @@ export function previewFull(path: string, sid?: string | null, verified = false,
     // but an attempt that MADE PROGRESS refills the budget (see the resumable retry below): forward
     // motion is the event proving the link works sometimes, and only truly dead attempts spend it.
     let autoRetries = 3;
+    let chipHealedErr: string | null = null;    // the error a settled chip already spent its one heal on
     let fails = 0;                                   // total failed attempts — the chip's copy escalates
     // RESUMABLE RETRY STATE (the user 2026-08-16, on flaky wifi: every retry restarted the transfer
     // from byte 0, so a large figure never finished arriving — and the swirl gave no idea how far it
@@ -241,7 +242,7 @@ export function previewFull(path: string, sid?: string | null, verified = false,
         const wait = mkWait(box);
         wait.title = path + " — tap to retry now";
         wait.style.cursor = "pointer";
-        wait.onclick = (ev) => { ev.stopPropagation(); autoRetries = 3; build(true); };   // a tap re-arms persistence
+        wait.onclick = (ev) => { ev.stopPropagation(); autoRetries = 3; ackTap(ev); build(true); };   // a tap re-arms persistence
         const spin = document.createElement("img");
         spin.className = "path-load-spin";
         spin.src = "/media/romp-swirl-glyph.svg";
@@ -268,8 +269,18 @@ export function previewFull(path: string, sid?: string | null, verified = false,
                  : (fails > 1 ? "⚠ still unavailable" : "⚠ preview unavailable"))
         + " — tap to retry";
       chip.title = path;
-      chip.onclick = (ev) => { ev.stopPropagation(); autoRetries = 3; build(true); };   // a tap re-arms persistence
+      chip.onclick = (ev) => { ev.stopPropagation(); autoRetries = 3; ackTap(ev); build(true); };   // a tap re-arms persistence
       wait.appendChild(chip);
+      // A settled chip still rides the push-heal (the user 2026-08-18: "they never render on their
+      // own — only when I send a message"): only the retrying branch registered for the heal, so a
+      // spent budget dropped the box from the map forever — pushes and tunnel recovery ignored it,
+      // and a send only "worked" because the tail re-render minted a FRESH box. One heal attempt
+      // per registration, and the box re-registers ONLY when the error CHANGED (new information —
+      // the same verdict re-answered is no reason to fetch again): a truly-dead figure costs one
+      // extra fetch per new-evidence transition, never one per push.
+      if (lastErr !== chipHealedErr) {
+        failedPreviews.set(box, () => { chipHealedErr = lastErr; autoRetries = 1; build(true); });
+      }
       if (fails > 1) {
         chip.classList.add("path-retry-flash");
         chip.addEventListener("animationend", () => chip.classList.remove("path-retry-flash"), { once: true });
@@ -293,6 +304,14 @@ export function previewFull(path: string, sid?: string | null, verified = false,
       img.onclick = (ev) => { ev.stopPropagation(); openLightbox(path, sid, pin); };
       return img;
     };
+    // every tap READS as a tap even when the click lands mid-attempt and build() no-ops on its
+    // `fetching` guard (the buttons-always-acknowledge rule: an unacknowledged tap gets re-tapped)
+    const ackTap = (ev: Event) => {
+      const t = ev.currentTarget as HTMLElement | null;
+      if (!t) return;
+      t.classList.add("path-retry-flash");
+      t.addEventListener("animationend", () => t.classList.remove("path-retry-flash"), { once: true });
+    };
     const resumeFetch = async (note: HTMLElement) => {
       const gotBefore = got;
       const r = await fetch(url, { cache: "no-store",
@@ -308,6 +327,12 @@ export function previewFull(path: string, sid?: string | null, verified = false,
         // answering") — a bare status code hid that the IMAGE was fine and the LINK was down
         let why = "";
         try { why = ((await r.text()) || "").split("\n")[0].slice(0, 120); } catch { /* body unavailable */ }
+        // a refused status VOIDS the resume state (the user 2026-08-18, whose re-generated figures
+        // never loaded): the file changed under our offset — an agent re-plotting the same name
+        // shrinks it — and the kernel's 416 expects the client to RESTART cleanly. Keeping `got`
+        // made every later attempt, tap and heal alike, replay the same stale Range and fail
+        // deterministically fast, while a send's fresh box (got=0) rendered instantly.
+        parts = []; got = 0;
         throw new Error(why || "http " + r.status);
       }
       const reader = r.body!.getReader();

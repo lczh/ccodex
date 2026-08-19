@@ -25,6 +25,7 @@ km = SourceFileLoader("romp_kernel_rev", os.path.join(BIN, "romp-kernel")).load_
 sb = SourceFileLoader("romp_sdk_backend_rev", os.path.join(BIN, "romp_sdk_backend.py")).load_module()
 
 SID = "11111111-2222-3333-4444-555555555555"
+CLIENT = {"app": "chat", "wid": "win-A"}   # the dashboard whose Revive click asked — reveals are per-viewer
 
 
 class FakeSdk:
@@ -49,18 +50,18 @@ class ReviveSession(unittest.TestCase):
     that success → focus while failure → reviveFailed (loud), never both."""
 
     def setUp(self):
-        self.saved = (km._sdk, km._name_of, km._cwd_of, km._push_all, km._reveal_chat,
-                      km._send_to_app, subprocess.run)
+        self.saved = (km._sdk, km._name_of, km._cwd_of, km._push_all, km._reveal_chat_for,
+                      km._send_to_view, subprocess.run)
         self.sent, self.focused, self.runs = [], [], []
         km._name_of = lambda sid: "testsess"
         km._cwd_of = lambda sid: "/nonexistent-dir-for-test"
         km._push_all = lambda: None
-        km._reveal_chat = lambda msg: self.focused.append(msg)
-        km._send_to_app = lambda app, msg: self.sent.append((app, msg))
+        km._reveal_chat_for = lambda client, msg: self.focused.append((client, msg))
+        km._send_to_view = lambda app, msg, wid: self.sent.append((app, msg, wid))
 
     def tearDown(self):
-        (km._sdk, km._name_of, km._cwd_of, km._push_all, km._reveal_chat,
-         km._send_to_app, subprocess.run) = self.saved
+        (km._sdk, km._name_of, km._cwd_of, km._push_all, km._reveal_chat_for,
+         km._send_to_view, subprocess.run) = self.saved
 
     def _stub_run(self, returncode=0, stderr=""):
         def run(cmd, **kw):
@@ -71,39 +72,41 @@ class ReviveSession(unittest.TestCase):
     def test_sdk_session_revives_via_resume_and_connect(self):
         be = FakeSdk()
         km._sdk = lambda: be
-        km._revive_session(SID)
+        km._revive_session(SID, CLIENT)
         self.assertEqual(be.calls, [("resume", "testsess", SID), ("connect", SID)],
                          "SDK-owned dead session → registry alive again + eager connect (resumes lastSid)")
-        self.assertEqual([m["type"] for m in self.focused], ["focus"], "success lands the chat on the tab")
+        self.assertEqual([(c, m["type"]) for c, m in self.focused], [(CLIENT, "focus")],
+                         "success lands the chat on the tab — the ASKER's chat, nobody else's")
         self.assertEqual(self.sent, [], "no failure event on success")
 
     def test_sdk_failure_is_loud_and_does_not_focus(self):
         km._sdk = lambda: FakeSdk(connect_ok=False)
-        km._revive_session(SID)
+        km._revive_session(SID, CLIENT)
         self.assertEqual(self.focused, [], "a failed revive must not focus a still-dead session")
         self.assertEqual(len(self.sent), 1)
-        app, msg = self.sent[0]
-        self.assertEqual((app, msg["type"], msg["id"]), ("chat", "reviveFailed", SID))
+        app, msg, wid = self.sent[0]
+        self.assertEqual((app, msg["type"], msg["id"], wid), ("chat", "reviveFailed", SID, "win-A"),
+                         "the failure notice goes to the window whose revive loader is up")
 
     def test_tmux_session_revives_via_romp_resume_detach(self):
         km._sdk = lambda: None
         self._stub_run(returncode=0)
-        km._revive_session(SID)
+        km._revive_session(SID, CLIENT)
         cmd, kw = self.runs[0]
         self.assertEqual(cmd, [os.path.join(BIN, "romp"), "resume", SID, "--name", "testsess", "--detach"],
                          "the launcher resume path the old postal revive used, now owned by the kernel "
                          "(round-3 spelling, 2026-07-25: resume <id> --name <name>)")
         self.assertEqual(kw.get("cwd"), os.path.expanduser("~"),
                          "a missing recorded dir falls back to $HOME (old postal behavior)")
-        self.assertEqual([m["type"] for m in self.focused], ["focus"])
+        self.assertEqual([m["type"] for _, m in self.focused], ["focus"])
         self.assertEqual(self.sent, [])
 
     def test_tmux_failure_carries_the_launcher_error(self):
         km._sdk = lambda: None
         self._stub_run(returncode=3, stderr="no transcript for that uuid")
-        km._revive_session(SID)
+        km._revive_session(SID, CLIENT)
         self.assertEqual(self.focused, [])
-        app, msg = self.sent[0]
+        _, msg, _ = self.sent[0]
         self.assertEqual(msg["type"], "reviveFailed")
         self.assertIn("no transcript", msg["text"], "the launcher's stderr reaches the user, not DEVNULL")
 

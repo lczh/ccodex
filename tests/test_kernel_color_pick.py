@@ -97,14 +97,14 @@ class PickColor(unittest.TestCase):
             def connect(self, sid):
                 return True
 
-        saved = (km._sdk, km._reveal_chat, km._mark_views_dirty)
+        saved = (km._sdk, km._reveal_chat_for, km._mark_views_dirty)
         km._sdk = lambda: _FakeSdk()
-        km._reveal_chat = lambda *a: None
+        km._reveal_chat_for = lambda *a: None
         km._mark_views_dirty = lambda: None
         try:
             km._create_sdk_session("newsess", "/tmp/x")
         finally:
-            (km._sdk, km._reveal_chat, km._mark_views_dirty) = saved
+            (km._sdk, km._reveal_chat_for, km._mark_views_dirty) = saved
         self.assertEqual(got.get("bg"), self.bgs[1], "colour 0 is live → spawn is handed the next free one")
         self.assertTrue(got.get("fg"), "its paired foreground rides along")
 

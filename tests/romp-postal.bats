@@ -103,6 +103,22 @@ iso() { mkdir -p "$XDG_STATE_HOME/romp"; printf '{"%s":{"postalServiceOff":true}
     grep -q "From: alpha" "$(mb uuid-b)/new/"*
 }
 
+@test "an anonymous send is refused at the door, and by the CLI before it" {
+    # the bus: a raw POST without from_id names the sender's identity resolution as the breakage
+    # (authorized with the machine's serve token, like every direct caller — the CLI carries it)
+    _tok="${ROMP_SERVE_TOKEN:-$(cat "$XDG_STATE_HOME/romp/serve-token")}"
+    run curl -s -X POST -H "X-Romp-Token: $_tok" \
+        "127.0.0.1:$ROMP_POSTAL_PORT/send" \
+        -d '{"to": "beta", "body": "How is it going?", "kind": "question"}'
+    [[ "$output" == *"sender identity required"* ]]
+    [ "$(cnt "$(mb uuid-b)/new")" = "0" ]        # no ghost mail minted
+    # the CLI: with no resolvable self, it refuses with the actionable half and posts nothing
+    CLAUDE_CODE_SESSION_ID= ROMP_SID= run "$POSTAL" send beta "How is it going?"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"identity did not resolve"* ]]
+    [ "$(cnt "$(mb uuid-b)/new")" = "0" ]
+}
+
 @test "send to an unknown session errors" {
     run "$POSTAL" send ghost "x"
     [ "$status" -ne 0 ]

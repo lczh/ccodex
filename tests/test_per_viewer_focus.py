@@ -13,6 +13,7 @@ Synthetic clients only; no sockets.
 """
 import inspect
 import os
+import re
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -126,6 +127,79 @@ class RemoteRevealReachesTheShell(unittest.TestCase):
         # reveal() = un-hide a desktop-toggled-off pane FIRST, then the mobile tab switch (the user
         # 2026-08-13 — see tests/test_shell_reveal_unhide.py).
         self.assertIn("if(m.romp==='reveal'&&m.pane)reveal(m.pane);", km._LANDING_MOBILE_JS)
+
+
+class CreateOpenReviveAreAimedToo(unittest.TestCase):
+    """Creating, opening, forking or reviving a session moved EVERY dashboard's chat (the user
+    2026-08-16, whose chats kept switching to sessions some other surface had just touched — a second
+    window's click, or a bare `romp new` in a terminal). The 2026-07-29 per-viewer fix missed these
+    four: its wiring test counted _reveal_chat_for(client, …) call sites, and the branches it did
+    cover satisfied the count. Every reveal now names its asker, and an op with NO asking dashboard
+    (the CLI's POST /new) moves nobody — the new tab still reaches every window via the push, just
+    unselected."""
+
+    def setUp(self):
+        self.sink = []
+        self._saved_clients = list(km._clients)
+        self.win_a = _client("chat", "win-A", self.sink)
+        km._clients[:] = [self.win_a, _client("chat", "win-B", self.sink)]
+
+    def tearDown(self):
+        km._clients[:] = self._saved_clients
+
+    def test_opening_a_session_moves_the_asking_window_alone(self):
+        saved = (km._tmux_sessions, km._sdk, km._push_all)
+        km._tmux_sessions = lambda: {"s1": "web"}
+        km._sdk = lambda: None
+        km._push_all = lambda: None
+        try:
+            km._open_or_revive("s1", client=self.win_a)
+        finally:
+            (km._tmux_sessions, km._sdk, km._push_all) = saved
+        self.assertEqual([w for w, _ in self.sink], ["win-A"], "win-B keeps the tab it was reading")
+
+    def test_a_create_with_no_asking_dashboard_moves_nobody(self):
+        class _BE:
+            def spawn(self, nm, cwd, bg, fg, auth=""):
+                return "sid-new"
+
+            def connect(self, sid):
+                pass
+        saved = (km._sdk, km._pick_identity_color, km._mark_views_dirty, km._push_session_now)
+        km._sdk = lambda: _BE()
+        km._pick_identity_color = lambda: ("#123456", "#ffffff")
+        km._mark_views_dirty = lambda: None
+        km._push_session_now = lambda sid: None
+        try:
+            km._create_sdk_session("web", "/tmp")                     # the CLI's POST /new: no dashboard in hand
+            self.assertEqual(self.sink, [], "a terminal/script create yanks no window's chat")
+            km._create_sdk_session("api", "/tmp", client=self.win_a)  # the picker's create: the asker follows it
+        finally:
+            (km._sdk, km._pick_identity_color, km._mark_views_dirty, km._push_session_now) = saved
+        self.assertEqual([w for w, _ in self.sink], ["win-A"], "…and only the asker")
+
+    def test_the_ops_that_make_or_wake_sessions_name_their_asker(self):
+        src = inspect.getsource(km.Handler)
+        self.assertIn('_open_or_revive(msg["id"], live=bool(msg.get("live")), client=client)', src,
+                      "openSession — the click-op the 2026-07-29 fix missed")
+        self.assertIn('_create_sdk_session(nm, cwd, auth=(a if a in ("login", "key") else ""), client=client)',
+                      src, "the picker's createSession follows on the asking window")
+        flat = re.sub(r"\s+", "", src)   # the POST /new call wraps; pin it whitespace-blind
+        self.assertIn('sid,extra=_create_sdk_session(nm,cwd,auth=(aifain("login","key")else""),prefs=b)', flat,
+                      "POST /new (the CLI) has no dashboard in hand, and so names none")
+        self.assertIn('threading.Thread(target=_revive_session, args=(msg["id"], client), daemon=True)', src,
+                      "the revive thread carries its asker across to the focus that clears the loader")
+        self.assertIn('_fork_session(sid, str(msg.get("uuid") or ""), str(msg["name"]), client=client)',
+                      inspect.getsource(km._drive), "a fork's new tab arrives focused for the forker alone")
+        self.assertIn('_comment_promote(sid, str(msg["tid"]), str(msg["name"]), client=client)',
+                      inspect.getsource(km._drive), "…and so does a promoted comment thread's")
+
+    def test_the_broadcast_reveal_helper_is_gone(self):
+        # _reveal_chat pushed to EVERY chat and shell client; with all four callers retired, keeping
+        # it around is an invitation to reintroduce the yank. _reveal_chat_for is the only door, and
+        # a caller with no dashboard in hand reveals to nobody rather than passing it None (an empty
+        # wid falls through to the legacy broadcast, by design, for clients that report none).
+        self.assertFalse(hasattr(km, "_reveal_chat"))
 
 
 if __name__ == "__main__":

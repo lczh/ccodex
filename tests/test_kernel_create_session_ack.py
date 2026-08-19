@@ -47,9 +47,9 @@ class CreateSessionAckFast(unittest.TestCase):
         self.fake = _FakeSdk()
         self.events = []
         self._saved = {n: getattr(km, n) for n in
-                       ("_sdk", "_reveal_chat", "_mark_views_dirty", "_push_all")}
+                       ("_sdk", "_reveal_chat_for", "_mark_views_dirty", "_push_all")}
         km._sdk = lambda: self.fake
-        km._reveal_chat = lambda m: self.events.append(("reveal", m))
+        km._reveal_chat_for = lambda c, m: self.events.append(("reveal", c, m))
         km._mark_views_dirty = lambda: self.events.append(("dirty",))
         km._push_all = lambda: self.events.append(("PUSH_ALL",))
 
@@ -58,7 +58,8 @@ class CreateSessionAckFast(unittest.TestCase):
             setattr(km, n, v)
 
     def test_create_reveals_first_and_never_builds_inline(self):
-        sid, extra = km._create_sdk_session("newsesh", "/tmp")   # (sid, applied-prefs echo) since 2026-08-16
+        asker = {"app": "chat", "wid": "win-A"}   # the dashboard whose picker asked — reveals are per-viewer
+        sid, extra = km._create_sdk_session("newsesh", "/tmp", client=asker)   # (sid, applied-prefs echo) since 2026-08-16
         self.assertEqual(sid, "11111111-2222-3333-4444-555555555555")
         self.assertEqual(extra, {}, "no prefs asked for -> nothing applied, nothing echoed")
         self.assertEqual(self.fake.calls[0][0], "spawn")
@@ -69,7 +70,8 @@ class CreateSessionAckFast(unittest.TestCase):
         self.assertIn("dirty", kinds, "the pusher is woken to ship the new tab")
         self.assertLess(kinds.index("reveal"), kinds.index("dirty"),
                         "focus is sent before the (async) build — the tab lands already-selected")
-        reveal = next(e[1] for e in self.events if e[0] == "reveal")
+        _, who, reveal = next(e for e in self.events if e[0] == "reveal")
+        self.assertIs(who, asker, "…selected on the ASKING window alone (the per-viewer rule)")
         self.assertEqual(reveal, {"type": "focus", "id": sid})
 
     def test_createsession_handler_has_no_inline_push(self):

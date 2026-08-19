@@ -67,7 +67,7 @@ test("the timeline's standalone helper splits the tag the same way", () => {
 
 test("chat tabs filter by the #only tag", () => {
   assert.match(RENDER, /import \{ onlyTag, matchesOnly \} from "\.\/only-filter";/);
-  assert.match(RENDER, /const visibleIds = only \? ids\.filter\(\(id\) => matchesOnly\(nameOf\(id\), only\)\) : ids;/);
+  assert.match(RENDER, /const visibleIds = only \? inViewIds\.filter\(\(id\) => matchesOnly\(nameOf\(id\), only\)\) : inViewIds;/);
   assert.match(RENDER, /for \(const id of visibleIds\)/);
 });
 
@@ -75,7 +75,9 @@ test("a filtered view re-points the CHAT BODY, not just the tab bar", () => {
   // the filter hid a non-matching TAB but left its transcript rendering — a real session's chat
   // (nimbus) sat in a `#only=api,tests,web` frame, statusline and all (the user 2026-07-16). The
   // whole point of the filter is a clean recording frame, so the selection must follow it.
-  assert.match(RENDER, /if \(only && activeId && !visibleIds\.includes\(activeId\) && visibleIds\.length\)/);
+  // the re-point covers BOTH filters since session views landed (2026-08-18): a hidden or
+  // filtered-out active session must not keep its transcript on screen
+  assert.match(RENDER, /if \(activeId && ids\.includes\(activeId\) && !visibleIds\.includes\(activeId\) && visibleIds\.length\)/);
   assert.match(RENDER, /setTimeout\(\(\) => \{ if \(activeId !== next\) setActive\(next\); \}, 0\);/);
 });
 

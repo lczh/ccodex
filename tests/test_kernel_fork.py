@@ -145,12 +145,12 @@ class ForkSessionOp(unittest.TestCase):
         write_transcript(self.path)
         self.be = _FakeForkBackend()
         self.saved = (km.Sessions.backend_for, km._sdk_ready, km._sessions, km._pick_identity_color,
-                      km._reveal_chat, km._mark_views_dirty, km._push_session_now, km._seed_fork_stores)
+                      km._reveal_chat_for, km._mark_views_dirty, km._push_session_now, km._seed_fork_stores)
         km.Sessions.backend_for = lambda sid: self.be
         km._sdk_ready = lambda: True
         km._sessions = lambda now: [{"sid": PARENT, "path": self.path}]
         km._pick_identity_color = lambda: ("#123456", "#ffffff")
-        km._reveal_chat = lambda m: None
+        km._reveal_chat_for = lambda c, m: None
         km._mark_views_dirty = lambda: None
         km._push_session_now = lambda sid: None
         self._real_seed = km._seed_fork_stores
@@ -158,7 +158,7 @@ class ForkSessionOp(unittest.TestCase):
 
     def tearDown(self):
         (km.Sessions.backend_for, km._sdk_ready, km._sessions, km._pick_identity_color,
-         km._reveal_chat, km._mark_views_dirty, km._push_session_now, km._seed_fork_stores) = self.saved
+         km._reveal_chat_for, km._mark_views_dirty, km._push_session_now, km._seed_fork_stores) = self.saved
         for d in (jd.EPIDIR, jd.CAPDIR, jd.GOALDIR):
             for f in Path(d).glob("*"):
                 f.unlink()

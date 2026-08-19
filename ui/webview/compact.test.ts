@@ -79,3 +79,24 @@ test("summarizeTools: a single tool is singular; Bash pluralizes correctly", () 
 test("toolCounts: returns ordered, pluralized {label,count} for styled rendering", () => {
   assert.deepEqual(toolCounts(["Edit", "Edit", "Read"]), [{ label: "Edits", count: 2 }, { label: "Read", count: 1 }]);
 });
+
+test("every non-tool event owns exactly one display unit — the scroll-mark translation's ground truth", () => {
+  // eventUnitIndex (render.ts) inverts this stream to map mark anchors (events) onto the frame's
+  // unit space; that inversion is sound only if a user/assistant event is never folded into a
+  // group and never dropped (the user 2026-08-18, whose reply notches vanished in compact mode)
+  const kinds = ["user", "tool", "tool", "assistant", "user", "tool", "user"];
+  const items = compactDisplay(kinds, kinds.map((k) => (k === "tool" ? "Bash" : undefined)));
+  const seen = new Map<number, number>();
+  items.forEach((it, u) => {
+    if (it.kind === "toolgroup") for (const i of it.indices) seen.set(i, u);
+    else seen.set(it.index, u);
+  });
+  for (let i = 0; i < kinds.length; i++) {
+    assert.ok(seen.has(i), "event " + i + " (" + kinds[i] + ") maps to a unit");
+    if (kinds[i] !== "tool") {
+      const u = seen.get(i)!;
+      const it = items[u];
+      assert.equal(it.kind, "event", "a non-tool event is its OWN unit, never inside a fold");
+    }
+  }
+});

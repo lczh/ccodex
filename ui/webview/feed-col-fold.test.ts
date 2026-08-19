@@ -15,7 +15,15 @@ test("the caret folds a category to its header and persists like every other dis
   assert.match(FEED, /const fold = el\("button", "fcol-fold"\);/);
   assert.match(FEED, /if \(collapsedCols\.has\(key\)\) collapsedCols\.delete\(key\); else collapsedCols\.add\(key\);/);
   assert.match(FEED, /cols: \[\.\.\.collapsedCols\],\s*\n\s*order: stackOrder\.slice\(\)/, "rides the persisted view state");
-  assert.match(CSS, /\.feed-col\.col-collapsed \.feed-col-list \{ display: none; \}/);
+  // The fold BITES only in the stacked layout (the user 2026-08-18): collapsed while stacked, then
+  // widened to three columns, the section stayed hidden with no caret to reopen it. The rule must
+  // live INSIDE the stacked container query — side by side, every card always shows.
+  const stacked = CSS.slice(CSS.indexOf("@container (max-width: 540px) or style(--romp-stack: on)"));
+  assert.match(stacked, /\.feed-col\.col-collapsed \.feed-col-list \{ display: none; \}/,
+    "the collapse rule is scoped to the stacked layout");
+  assert.doesNotMatch(CSS.slice(0, CSS.indexOf("@container (max-width: 540px) or style(--romp-stack: on)")),
+    /\.col-collapsed \.feed-col-list/,
+    "and no unscoped copy survives to hide cards side-by-side");
   assert.match(FEED, /fold\.textContent = folded \? "▸" : "▾";/);
   // consistency with the session headers' fold (the user 2026-08-16): same side — caret RIGHT of the
   // label — and the same rendered size (the header's 0.72em compensated back to the feed's base)

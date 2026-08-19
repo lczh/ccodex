@@ -51,8 +51,13 @@ Find any work by when it happened on the timeline or by the task it belonged to,
 
 <img src="docs/assets/guide/navigate.gif" alt="Clicking a message to jump to its place, then opening a card for the full detail" width="100%">
 
-ccodex adds all of this on top of the sessions you already run, without changing how you
-work — whichever vendor they run on.
+### Every machine, one place
+
+Sessions on your server appear alongside your laptop's, agents hand off work across machines, and you can view everything from a laptop or a phone.
+
+<img src="docs/assets/guide/every-machine.png" alt="Sessions on two machines, gathered into one dashboard and the same view on a phone" width="100%">
+
+ccodex works with Claude Code and Codex. It adds all of this on top of the sessions you already run, without changing how you work — whichever vendor they run on.
 
 ## Self-hosted, reachable from anywhere
 

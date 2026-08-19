@@ -53,6 +53,9 @@ MESSAGES = STATE / "timeline" / "messages.jsonl"
 ERRORS   = STATE / "judge-errors.jsonl"  # swallowed judge-call failures (parse-fails, call timeouts/exceptions) — surfaced by `romp judges`
 USAGE    = STATE / "judge-usage.jsonl"   # one line per successful judge call: tokens/cost/ms — the kernel/UI roll up pipeline cost
 JUDGE_AUTH = STATE / "judge-auth.json"   # judge-auth-down latch {fsid: {t, mode, note}}: set by a credential-class error
+JUDGE_LIMIT = STATE / "judge-limit.json"  # usage-limit-down latch {t, bucket, pct, resets_at, model}: the gate
+#                                           (or a limit-shaped error envelope) proved the account can't bill a
+#                                           judge call — build_feed ships it so the pause is LOUD (2026-08-18)
                                          #   envelope, cleared by the session's next successful call — build_feed floors from it
 GONEDIR  = STATE / "gone"                # session-death markers {t, by[, endedAt]} — one small json per sid, written by the
                                          #   kernel's death writers at the death EVENT (kill gesture / probe-confirmed absence),
@@ -109,6 +112,8 @@ def _rebind_state(path):
     GOALARCHDIR = STATE / "goals-archive"
     STATESDIR, PCACHE = STATE / "states", STATE / "judge-units-cache"
     MESSAGES, ERRORS, USAGE = STATE / "timeline" / "messages.jsonl", STATE / "judge-errors.jsonl", STATE / "judge-usage.jsonl"
+    global JUDGE_LIMIT
+    JUDGE_LIMIT = STATE / "judge-limit.json"
     SDKDIR = STATE / "sdk"
     EPIDIR = STATE / "episodes"
     CODEXDIR = STATE / "codex"
@@ -576,6 +581,63 @@ def _mid_elide(s, cap=6200):
         return s
     half = (cap - 40) // 2
     return "%s\n… [%d chars elided] …\n%s" % (s[:half], len(s) - 2 * half, s[-half:])
+
+
+# ── judge call health: the degraded→serving edge (the user 2026-08-18) ─────────────────────────────
+# A give-up card's designed recovery is a retry on a discrete RECOVERY event — but the only wired event
+# was the usage-limit retry-pause clearing, and the failures that actually cause most give-ups (a 529
+# overload storm, an auth blip) never engage that pause, so their cards kept the "distill failed" chip
+# long after the API recovered. This latch tracks the exact event those cards wait on: the first SERVED
+# judge call after a call-level failure, PER MODEL — the 2026-08-18 storm was Opus-scoped, and a Sonnet
+# captioner success fired the old model-blind edge mid-storm, spending each card's one automatic retry
+# on a doomed Opus call; the edge must be the failing model itself serving again. _judge_run's failure
+# sites latch the model degraded (_mark_call_failed); a served reply on that same model flips it back
+# and records the edge (_mark_call_served); the kernel consumes the edge between passes — its
+# single-writer window — and re-arms the give-up cards once per era (rearm_failed_summaries auto=True).
+# Process-global on purpose: every judge thread shares one API.
+_CALL_HEALTH = {"degraded": set(), "recovered": False, "stats": {}}
+_health_lock = threading.Lock()
+
+
+def _mark_call_failed(model, note=""):
+    """A judge call failed at the call level (subprocess error, timeout, error envelope, dead CLI) —
+    latch this model degraded and bump its consecutive-fail count; its next served reply is the
+    recovery edge. The count + last error feed _giveup_cause's model-scoped diagnosis (the user
+    2026-08-18: when one model is down while the others serve, the banner and the chips must SAY so
+    and suggest the fix)."""
+    with _health_lock:
+        _CALL_HEALTH["degraded"].add(model)
+        s = _CALL_HEALTH["stats"].setdefault(model, {"fails": 0, "last": ""})
+        s["fails"] += 1
+        if note:
+            s["last"] = str(note)[:160]
+
+
+def _mark_call_served(model):
+    """A judge call came back with a real reply — if THIS model had been failing, record the edge."""
+    with _health_lock:
+        _CALL_HEALTH["stats"].pop(model, None)
+        if model in _CALL_HEALTH["degraded"]:
+            _CALL_HEALTH["degraded"].discard(model)
+            _CALL_HEALTH["recovered"] = True
+
+
+def _sick_models():
+    """{model: {fails, last}} for every model whose CONSECUTIVE call-failure count has reached the
+    give-up cap — a deterministic count, reset by that model's next served reply, never a clock."""
+    with _health_lock:
+        return {m: dict(s) for m, s in _CALL_HEALTH["stats"].items()
+                if (s.get("fails") or 0) >= DISTILL_FAIL_CAP}
+
+
+def consume_judge_recovery():
+    """True exactly ONCE per degraded→serving transition — the kernel's between-pass re-arm trigger."""
+    with _health_lock:
+        r = _CALL_HEALTH["recovered"]
+        _CALL_HEALTH["recovered"] = False
+        return r
+
+
 def _log_judge_error(judge, fsid, err, note=None, goal=None, seg=None):
     """Append one failure row to ERRORS (judge-errors.jsonl) so `romp judges` can surface it. The row contract
     (the user 2026-07-09) — every row answers who/where/what/why on its own:
@@ -655,6 +717,43 @@ def active_runs():
     """Snapshot of the judge calls in flight RIGHT NOW (the kernel's _run_judging reads this for live bars)."""
     with _active_lock:
         return [dict(v) for v in _active.values()]
+
+
+_USAGE_PRUNE_BYTES = 48 * 1024 * 1024   # prune trigger — never reached at healthy volume (a normal
+                                         # month is a few MB); the 2026-08-18 captioner storm grew the
+                                         # log to 59.5MB, which the kernel then re-read per timeline build
+_USAGE_RETAIN_S = 31 * 86400             # matches the kernel reader's widest consumer window
+                                         # (_JUDGE_USAGE_RETAIN, the 30-day analytics view + slack)
+
+
+def _prune_usage_log():
+    """Rewrite USAGE keeping the newest 31 days once it outgrows the cap. The kernel's incremental
+    reader detects the shrink (size < offset) and re-reads cleanly. Best-effort and racy by design:
+    an append from a concurrent judge process during the rewrite window can be lost — this is
+    telemetry whose consumers read a bounded window, and the trigger only fires in pathological
+    growth. The prune says what it did (one stderr line), never silently."""
+    try:
+        if USAGE.stat().st_size <= _USAGE_PRUNE_BYTES:
+            return
+        parsed = []
+        for ln in USAGE.read_text(errors="replace").splitlines():
+            try:
+                o = json.loads(ln)
+            except Exception:
+                continue
+            if isinstance(o, dict):
+                parsed.append((o.get("t") or 0, ln))
+        floor = max((t for t, _ in parsed), default=0) - _USAGE_RETAIN_S
+        keep = [ln for t, ln in parsed if t >= floor]
+        tmp = USAGE.with_name(USAGE.name + ".tmp")
+        tmp.write_text("\n".join(keep) + ("\n" if keep else ""))
+        os.replace(tmp, USAGE)
+        sys.stderr.write("romp-judge: judge-usage.jsonl outgrew %dMB — pruned to the newest 31 days "
+                         "(%d rows kept)\n" % (_USAGE_PRUNE_BYTES // (1024 * 1024), len(keep)))
+    except Exception:
+        pass
+
+
 def _log_judge_usage(judge, tier, model, fsid, wrap, sent=None, recv=None):
     """Append ONE per-call usage line to USAGE for the kernel/UI cost rollup (judge_ui 2026-06-17).
     `wrap` is the claude -p JSON envelope. `sent`/`recv` are the LITERAL wall-clock floats bracketing the
@@ -665,6 +764,7 @@ def _log_judge_usage(judge, tier, model, fsid, wrap, sent=None, recv=None):
     must not break a judge call."""
     try:
         u = wrap.get("usage") or {}
+        _prune_usage_log()                       # bounded growth (one cheap stat at healthy sizes)
         with open(USAGE, "a") as f:
             f.write(json.dumps({"t": int(time.time()), "judge": judge, "tier": tier, "model": model,
                                 "fsid": fsid or None, "ms": wrap.get("duration_ms"),
@@ -776,6 +876,66 @@ def _auth_down_clear(fsid):
         d = dict(_auth_down_map())
         if d.pop(fsid, None) is not None:
             _auth_write_locked(d)
+
+
+_limit_cache = [None, {}]
+_USAGE_REFRESH_FN = None   # the kernel wires this to SdkBackend.refresh_usage: a limit-shaped error
+#                            envelope triggers ONE exact usage poll, so an idle-stale usage.json
+#                            (get_usage rides turn ends — an idle fleet refreshes nothing, measured
+#                            ~15h stale) updates on the FIRST doomed call and the gate blocks the rest.
+_LIMIT_ENVELOPE_RE = re.compile(r"usage limit|rate.?limit|limit reached", re.I)
+
+
+def _limit_down():
+    """The usage-limit-down latch, or None when absent/expired. SELF-EXPIRING on resets_at — the
+    window reset IS the deciding event, no age heuristics — and mtime-cached like _auth_down_map."""
+    try:
+        key = JUDGE_LIMIT.stat().st_mtime_ns
+    except OSError:
+        return None
+    if _limit_cache[0] != key:
+        try:
+            d = json.loads(JUDGE_LIMIT.read_text())
+            _limit_cache[:] = [key, d if isinstance(d, dict) else {}]
+        except Exception:
+            _limit_cache[:] = [key, {}]
+    row = _limit_cache[1]
+    if not row:
+        return None
+    ra = row.get("resets_at")
+    if isinstance(ra, (int, float)) and ra <= time.time():
+        return None
+    return row
+
+
+def _limit_mark(bucket, pct, resets_at, model):
+    """LATCH usage-limit-down: the gate (or a limit-shaped envelope) just proved the account cannot
+    bill this judge call. The first evidence is decisive; the latch holds until the window resets
+    (self-expiry in _limit_down) or a call SUCCEEDS (_limit_clear) — never re-derived per build.
+    Loud by design (the user 2026-08-18, whose judges failed quietly into ~22,400 doomed retries
+    over two days): build_feed ships this row and the dashboard says the pause out loud."""
+    try:
+        cur = _limit_down() or {}
+        if cur.get("bucket") == bucket and cur.get("resets_at") == resets_at:
+            return
+        tmp = JUDGE_LIMIT.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"t": int(time.time()), "bucket": bucket, "pct": pct,
+                                   "resets_at": resets_at, "model": str(model or "")}))
+        os.replace(tmp, JUDGE_LIMIT)
+    except Exception:
+        pass
+
+
+def _limit_clear():
+    """Unlatch on the deciding event in the other direction: a judge call SUCCEEDED, so whatever
+    window blocked billing is no longer in the way (a reset, or the judges moved to another model)."""
+    try:
+        if JUDGE_LIMIT.exists():
+            JUDGE_LIMIT.unlink()
+    except OSError:
+        pass
+
+
 def _judge_env(tier, auth="login"):
     """The subprocess env for ONE judge call. Drops the TMUX vars (so the child isn't taken for a live
     pane) and trips the Stop-hook recursion guard. For the INDEX tier it also disables extended thinking
@@ -847,6 +1007,9 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
         pass
     engine = _judge_engine()
     if engine != "codex":
+        # Claude-engine only: usage.json is the CLAUDE account's windows — gating codex
+        # calls on it would be wrong in both directions (codex limits surface per call
+        # as error replies instead). docs/codex.md.
         try:
             # RATE-LIMIT GATE (the user 2026-07-07): while the ACCOUNT is limit-exhausted, every judge call
             # fleet-wide just burns a doomed API retry (the archiver postmortem: ~1160 wasted calls in one
@@ -854,14 +1017,21 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
             # the gate self-expiring — a stale "limited" stops gating the moment the window resets, no age
             # heuristics. Skips ride the SAME paused flag, so no give-up counter ever counts one as a
             # failure. The `fable` bucket is deliberately ignored (judges run Sonnet). Unreadable/absent
-            # usage.json → never gate: the gate is an optimization, judging is the job. Claude-engine
-            # only: usage.json is the CLAUDE account's windows — gating codex calls on it would be wrong
-            # in both directions (codex limits surface per call as error replies instead).
+            # usage.json → never gate: the gate is an optimization, judging is the job.
             u = json.loads((STATE / "usage.json").read_text())
-            for _b in ("five_hour", "seven_day"):
+            # The gated buckets FOLLOW THE CALL'S MODEL (2026-08-18, user-approved via the optimizer's
+            # audit): the account-wide windows gate every model, and a model-scoped window gates exactly
+            # the calls that would bill it. The old tuple hardcoded the account buckets and deliberately
+            # ignored `fable` ("judges run Sonnet") — stale the day the judge-model pin read fable: the
+            # fable window sat at 100% through 08-16/17 while this gate saw a healthy account, and
+            # ~22,400 doomed retries burned (9,305 on 08-17 alone), goal filing and mail summarizing
+            # down the whole stretch.
+            _buckets = ["five_hour", "seven_day"] + (["fable"] if "fable" in str(model).lower() else [])
+            for _b in _buckets:
                 _lim = u.get(_b) or {}
                 if (_lim.get("pct") or 0) >= 100 and (_lim.get("resets_at") or 0) > time.time():
                     _judge_ctx.paused = True
+                    _limit_mark(_b, _lim.get("pct"), _lim.get("resets_at"), model)   # the LOUD half: build_feed ships it
                     if _RATE_GATE_LOGGED.get(_b) != _lim.get("resets_at"):   # one log line per limit window
                         _RATE_GATE_LOGGED[_b] = _lim.get("resets_at")
                         _log_judge_error(tier, None, "rate-limited",
@@ -958,6 +1128,8 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
             # _judge_run owns ALL call-level logging (this, the error envelope below, the rate gate above)
             # so callers never double-log: to a caller every failed call is just "", and "call" rows always
             # carry the judge's own name + fsid (pre-07-09 rows said "index"/"triage" with no session).
+            _judge_ctx.last_call_fail = {"note": type(e).__name__, "model": model}
+            _mark_call_failed(model, type(e).__name__)
             _log_judge_error(judge or tier, fsid, "call", note=type(e).__name__)
             return ""
         recv = time.time()                            # literal wall-clock: the response is back
@@ -973,8 +1145,25 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
                 # No usage row: a zero-cost error envelope is not a model call the cost rollup should count.
                 msg = str(wrap.get("result") or wrap.get("subtype") or "")
                 _judge_ctx.last["reply"] = str(wrap.get("result") or "")[:2000]
+                _judge_ctx.last_call_fail = {"note": msg[:160], "model": model}
+                if "safeguards flagged" not in msg:
+                    # A safeguards refusal is the FILTER ruling on this call's CONTENT — deterministic
+                    # per prompt, not model health (the 2026-08-18 closer storm: 2,955 flags on research
+                    # transcripts while the same model served every other call). Latching it would flap
+                    # the degraded→serving edge on every flag/success interleave.
+                    _mark_call_failed(model, msg[:160])
                 _log_judge_error(judge or tier, fsid, "call",
                                  note="error envelope: %r" % msg[:160])
+                if _LIMIT_ENVELOPE_RE.search(msg):
+                    # a limit-shaped envelope is the EVENT that says usage.json is stale (get_usage
+                    # rides turn ends; an idle fleet refreshes nothing): latch the loud banner NOW
+                    # and poke one exact poll so the gate blocks the follow-on calls
+                    _limit_mark("account", None, None, model)
+                    if _USAGE_REFRESH_FN:
+                        try:
+                            _USAGE_REFRESH_FN()
+                        except Exception:
+                            pass
                 if _is_auth_error(msg):
                     # credential-class: only the user can fix it — latch, so build_feed floors this
                     # session's focus card instead of leaving the board silently frozen (2026-08-12)
@@ -984,6 +1173,9 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
                 _judge_ctx.last["reply"] = _mid_elide(wrap["result"])
                 _log_judge_usage(judge or tier, tier, model, fsid, wrap, sent, recv)
                 _auth_down_clear(fsid)                # billing works → unlatch (cheap no-op when unlatched)
+                _limit_clear()                        # ...and the usage-limit latch (a reset, or a model switch)
+                _mark_call_served(model)              # THIS model serves again → the give-up re-arm edge
+                _judge_ctx.last_call_fail = None      # a served reply retires the stashed error evidence
                 return wrap["result"]
         except Exception:
             pass
@@ -994,12 +1186,17 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
             # and the card's warn could only GUESS its cause ("errors or timeouts"). The returncode and
             # stderr tail are the only evidence a dead CLI leaves — record them (fail loudly; a silent
             # fallback hides the very breakage we need to know about).
+            _judge_ctx.last_call_fail = {
+                "note": "the model CLI died with no output (exit %s)" % getattr(p, "returncode", "?"),
+                "model": model}
+            _mark_call_failed(model, _judge_ctx.last_call_fail["note"])
             _log_judge_error(judge or tier, fsid, "call",
                              note="empty stdout (exit %s): %s"
                                   % (getattr(p, "returncode", "?"),
                                      (getattr(p, "stderr", "") or "").strip()[-200:] or "no stderr"))
             return ""
         _judge_ctx.last["reply"] = _mid_elide(out)
+        _mark_call_served(model)                      # a raw reply is still a served call (recovery edge)
         return out                                    # wrapper unparseable but non-empty → raw stdout (defensive)
     finally:
         _active_end(rid)                              # call done (success/timeout/parse-fail) → drop the live bar
@@ -1448,6 +1645,79 @@ def append_caption(fsid, uid, grain, t, caption, live=False, natoms=None):
     CAPDIR.mkdir(parents=True, exist_ok=True)
     with open(CAPDIR / (fsid + ".jsonl"), "a") as f:
         f.write(json.dumps(rec) + "\n")
+
+
+CAPTION_FAIL_CAP = 3   # empty captures per unit-set before the tombstone — ARCH_FAIL_CAP's rationale
+                       # (the 2026-07-06 archiver storm), met again by the captioner on 2026-08-18:
+                       # 2,920 caption calls in 2h produced 62 records (~24/min of pure churn), because
+                       # an empty capture wrote nothing and the same closed units re-captioned every
+                       # pass, forever, fleet-wide — and fed the API-capacity window that broke a brief.
+
+
+def _caption_fails(fsid):
+    """{unit_id: consecutive empty-capture count} for units still under the cap — the captioner's
+    fail ledger (CAPDIR/<fsid>.fails.json), the archiver give-up's per-unit sibling."""
+    try:
+        d = json.loads((CAPDIR / (fsid + ".fails.json")).read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_caption_fails(fsid, d):
+    CAPDIR.mkdir(parents=True, exist_ok=True)
+    path = CAPDIR / (fsid + ".fails.json")
+    if d:
+        path.write_text(json.dumps(d))
+    else:
+        try:
+            path.unlink()                             # empty ledger → no file (nothing to prune later)
+        except OSError:
+            pass
+
+
+def _caption_strike(task, struck, gave):
+    """One EMPTY capture on a CLOSED unit-set: the call actually ran (paused/rate-gated skips never
+    reach here — _judge_run's paused contract) and produced no usable caption. A closed unit's text
+    never changes, so retrying it is superstition: at CAPTION_FAIL_CAP each unit gets an EMPTY
+    tombstone caption record — captioned_ids dedups it, and every reader filters on caption
+    truthiness, so the unit stops costing a call without ever rendering. Re-arm is structural, not
+    timed: only a re-parse minting NEW unit ids (a fork, a cut) makes new caption work.
+    `struck` is the PASS's already-struck id set: two tasks can carry the same unit id at different
+    grains, and one pass is one world-state — the same unchanged unit is one piece of evidence, one
+    strike, however many calls the pass spent on it."""
+    fsid = task["fsid"]
+    fails = _caption_fails(fsid)
+    give_up = []
+    for w in task["writes"]:
+        if w["id"] in struck:
+            continue
+        struck.add(w["id"])
+        n = int(fails.get(w["id"], 0)) + 1
+        if n >= CAPTION_FAIL_CAP:
+            fails.pop(w["id"], None)
+            give_up.append(w)
+        else:
+            fails[w["id"]] = n
+    _write_caption_fails(fsid, fails)
+    if give_up:
+        for w in give_up:
+            append_caption(fsid, w["id"], w["grain"], w["t"], "")
+        gave[fsid] = gave.get(fsid, 0) + len(give_up)     # ONE give-up row per fsid per pass (logged
+        #                                                   after the loop) — several tasks can cross
+        #                                                   the cap in the same pass
+
+
+def _caption_unfail(task):
+    """A successful caption clears its units' strike counts — only CONSECUTIVE empties tombstone."""
+    fsid = task["fsid"]
+    fails = _caption_fails(fsid)
+    ids = {w["id"] for w in task["writes"]}
+    kept = {k: v for k, v in fails.items() if k not in ids}
+    if kept != fails:
+        _write_caption_fails(fsid, kept)
+
+
 # ───────────────────────── the archiver (index tier; per session) ─────────────────────────
 # One record per session: a TOC headline + a 2-3 sentence abstract, summarized from the
 # session's TURN captions (cheap input, not raw transcript). Refreshed when the session gains a
@@ -2220,19 +2490,40 @@ def _replay_overrides(fsid, store):
         elif op == "redistill":
             # The warn modal's "Try again" (the user 2026-08-13): re-arm a GIVEN-UP summary line so the
             # next triage pass re-runs the distiller — the same flip rearm_failed_summaries applies on
-            # the usage-limit recovery edge, journaled here so a concurrent pass's last-writer save
-            # can't silently erase the click. Idempotent by shape: only the "" give-up sentinel flips
-            # to None (owed); a line that has since succeeded (non-empty) or is already owed (None) is
-            # untouched, so replays past a success never clobber it. No supersede guard needed — this
-            # is a field flip, not a log verdict, and its no-op form IS the guard.
-            for k in ("summary", "blockSummary"):
+            # the recovery edges, journaled here so a concurrent pass's last-writer save can't silently
+            # erase the click. Idempotent by shape: only the "" give-up sentinel flips to None (owed); a
+            # line that has since succeeded (non-empty) or is already owed (None) is untouched, so
+            # replays past a success never clobber it. A give-up that KEPT an older real summary (a
+            # re-completion's give-up never blanks prior text) re-arms by clearing its event stamp
+            # instead — gated on the live "*-failed" warn, which a later success clears, so that replay
+            # is a no-op past a success too.
+            # STAND-DOWN (2026-08-18, the eternal-click review finding): the journal replays on every
+            # load forever, so the shape guards alone let one historical click loop a persistently
+            # failing card — the retry re-gives-up, the give-up re-stamps its warn and sentinel, and the
+            # next load's replay re-armed it again (and its old counter reset zeroed distillFails every
+            # load, making DISTILL_FAIL_CAP unreachable: one doomed model call per pass, forever, from a
+            # single click). A give-up warn stamped AFTER the click is the judges ruling on a newer
+            # world: the click answered an OLDER give-up, so it stands down — the writer-predates-diary
+            # rule. No counter reset at all: a click only exists post-give-up, where the counter is
+            # already 0 by the give-up write.
+            if max((int(w.get("t") or 0) for w in nd.get("warns") or []
+                    if isinstance(w, dict) and w.get("kind") in _FAILED_WARN_KINDS), default=0) > t:
+                continue                               # a later give-up superseded this click
+            warned = {w.get("kind") for w in nd.get("warns") or [] if isinstance(w, dict)}
+            for k, stamp, wkind in (("summary", "distilledMt", "summary-failed"),
+                                    ("blockSummary", "briefedMt", "brief-failed"),
+                                    ("stallSummary", "stalledMt", "stall-failed")):
                 if nd.get(k) == "":
                     nd[k] = None
                     applied = True
-            for k in ("distillFails", "briefFails"):
-                if nd.get(k):
-                    nd[k] = 0
+                elif nd.get(k) and wkind in warned and nd.get(stamp) is not None:
+                    nd[stamp] = None
                     applied = True
+            # Deliberately NOT touching nd["autoRearmed"] here: the journal replays on EVERY load,
+            # forever, so a single historical click would erase the era mark on each replay and defeat
+            # the one-auto-retry bound for good. The mark clears only where the era truly ends — a
+            # landed summary, or a discrete recovery event (startup / retry-pause clear) in
+            # rearm_failed_summaries. The click still always retries: the flips above don't consult it.
     return applied
 _NONCONTENT_KEYS = ("rev", "_baseRev")   # the revision counter + the transient CAS base: not store CONTENT
 def _store_content(store):
@@ -2524,6 +2815,32 @@ def _node_warn_clear(nd, kind):
         nd["warns"] = ws
     else:
         nd.pop("warns", None)
+
+
+def _fail_log(nd, line, now):
+    """Append this failed summarizer attempt — WHEN, which LINE, which MODEL, the literal ERROR — to the
+    card's attempt log (the user 2026-08-18: "tried opus — 529 Overloaded, tried opus — 529 …" on the
+    chip beats prose; seeing the same model fail thrice is what tells them to switch it). The evidence is
+    _judge_run's per-thread stash, read here in the same thread right after the failed call. Capped so a
+    store never grows unbounded; that line's next SUCCESS clears its rows (_fail_log_clear)."""
+    last = getattr(_judge_ctx, "last_call_fail", None)
+    if not isinstance(last, dict) or not last.get("note"):
+        return
+    log = [e for e in nd.get("failLog") or [] if isinstance(e, dict)]
+    log.append({"t": int(now), "line": line, "model": last.get("model") or "?",
+                "note": str(last["note"])[:160]})
+    nd["failLog"] = log[-8:]
+
+
+def _fail_log_clear(nd, line):
+    """A summarizer line landed — its attempt history is over; other lines' rows stay."""
+    log = [e for e in nd.get("failLog") or [] if isinstance(e, dict) and e.get("line") != line]
+    if log:
+        nd["failLog"] = log
+    else:
+        nd.pop("failLog", None)
+
+
 def _warn_surface(w):
     """Which card surface a warn annotates: "brief" (the blocked card's decision brief), "summary"
     (the completed card's takeaway), "stall" (the stalled card's stall note), or None (not
@@ -2568,6 +2885,18 @@ def _giveup_cause():
         pass
     if names:
         return ("the account's %s usage limit is maxed out" % " and ".join(names), True)
+    sick = _sick_models()
+    if sick:
+        # MODEL-SCOPED diagnosis (the user 2026-08-18): during the Opus-only 529 storm every give-up
+        # said "errors or timeouts" while every other tier served — the one fact that mattered (WHICH
+        # model, and that switching it would fix everything) was invisible. The count is deterministic:
+        # consecutive call failures per model, reset by that model's next served reply.
+        m = max(sick, key=lambda k: sick[k].get("fails") or 0)
+        cause = "calls on the %s model keep failing — %d in a row, most recently: %s" % (
+            m, sick[m].get("fails") or 0, (sick[m].get("last") or "an error with no message")[:120])
+        if m == _distill_model():
+            cause += ". Switching the distill model in settings retries everything that failed, immediately"
+        return (cause, False)
     return ("the summarizer kept hitting errors or timeouts", False)
 def _warn_line_kind(judge):
     """(user-facing name, warn-kind prefix) for the card surface `judge` writes — so the give-up and
@@ -2579,17 +2908,26 @@ def _warn_line_kind(judge):
     return "decision brief", "brief"
 def _warn_summary_failed(nd, judge, t):
     """Stamp this card's summary/brief-FAILED warning after a give-up. Concise, takeaway-first, names the
-    cause; the developer audit (the raw call failures) stays in judge-errors.jsonl."""
+    cause — including the LAST attempt's literal error and the model it called (the user 2026-08-18, who
+    could not tell from "errors or timeouts" that only the distill tier's model was down while everything
+    else served): _judge_run stashes each call-level failure per-thread, and the give-up is written in the
+    same thread right after the capping failure, so the stash IS this give-up's evidence. The developer
+    audit (every raw call failure) stays in judge-errors.jsonl."""
     line, pre = _warn_line_kind(judge)
     kind = pre + "-failed"
     cause, ratelimited = _giveup_cause()
     retry = ("romp retries it automatically the moment the limit resets; nudging the session refreshes it sooner."
              if ratelimited else
-             "Nudge the session to refresh it, or it retries on its own the next time that session works on this goal.")
+             "romp retries it on its own after it recovers or restarts — or hit Try again to retry it now.")
+    last = getattr(_judge_ctx, "last_call_fail", None)
+    spec = ("" if (ratelimited or not isinstance(last, dict) or not last.get("note")) else
+            ' The last attempt failed with: "%s" (the %s model).' % (last["note"], last.get("model") or "?"))
     _node_warn(nd, kind, t,
                "romp couldn't write this card's %s." % line,
-               "romp tried to generate this %s several times and each attempt failed, because %s. No work was "
-               "lost — this is only the summary line. %s" % (line, cause, retry))
+               "romp tried to generate this %s several times and each attempt failed, because %s.%s No work "
+               "was lost — this is only the summary line. %s" % (line, cause, spec, retry))
+
+
 def _warn_history_unreadable(nd, judge, t):
     """Stamp this card's HISTORY-UNREADABLE warning (the user 2026-07-10): the goal has recorded work
     (trail/placements) but none of it resolved against the transcript, so the summarizer had nothing to
@@ -3243,9 +3581,13 @@ def rollup_status(store, session_closed, now=None):
     # brief-failed, brief-unreadable) annotates the brief, which is the card's surface only while it
     # sits in Needs-you — once the card unblocks, no new brief is ever written to clear it, so a healthy
     # Working card wore the yellow "warning" chip indefinitely. Same for the summary family on a
-    # reopened completed card. Retire each warn with the state that shows its surface; a re-block /
-    # re-completion writes a fresh brief/summary, which re-warns if it fails again. Runs inside rollup —
-    # the status owner — so the store heals on its next touch, no display-side twin logic.
+    # reopened completed card, and (2026-08-18) for the stall family once its stall episode ends: the
+    # staller only ever runs for a goal live in stalled_facts, so an ended stall's warn had NO clear
+    # path and — once stall-failed joined the fleet failure scan — inflated the top banner permanently.
+    # Retire each warn with the state that shows its surface; a re-block / re-completion / fresh stall
+    # writes a fresh brief/summary/note, which re-warns if it fails again. Runs inside rollup — the
+    # status owner — so the store heals on its next touch, no display-side twin logic.
+    _stalls = None                                     # lazy: one stalled_facts read, only if a stall warn exists
     for nid, nd in nodes.items():
         ws = nd.get("warns")
         if not ws:
@@ -3254,8 +3596,18 @@ def rollup_status(store, session_closed, now=None):
         dead = set()
         if st != "blocked":
             dead.add("brief")                          # the card left Needs-you → the brief isn't shown
-        if st != "completed":
-            dead.add("summary")                        # the card isn't completed → the takeaway isn't shown
+        if st != "completed" and nid not in confirming:
+            # the card isn't completed → the takeaway isn't shown. CONFIRMING is the exception (the user
+            # 2026-08-18, the chipless summaryless card): the distiller enters done-confirming tops, so
+            # its give-up/unreadable warns stamp while status still reads "working" — retiring them here
+            # ate the warn within the same pass, before the user ever saw a chip, leaving the "" sentinel
+            # orphaned with nothing armed to retry it.
+            dead.add("summary")
+        if any(_warn_surface(w) == "stall" for w in ws):
+            if _stalls is None:
+                _stalls = stalled_facts(store.get("rompUuid") or "")
+            if st != "working" or nid not in _stalls:
+                dead.add("stall")                      # the stall this note reported is over
         keep = [w for w in ws if _warn_surface(w) not in dead]
         if len(keep) != len(ws):
             if keep:
@@ -3963,11 +4315,14 @@ def _codex_rows(cutoff, seen):
 def _caption_call(task):
     """Caption one unit in a worker thread, tagging its session for usage logging. A 'prompt' task is the
     MESSAGE caption — a present-focused gist of the ask (gist_llm, logged as the captioner); a 'work' task
-    is the past-tense 'what got done' (caption_llm)."""
+    is the past-tense 'what got done' (caption_llm). Returns (caption, paused): paused rides out of the
+    worker thread because _judge_ctx is thread-local — the strike ledger in the main loop must never
+    count a rate-gate/pause skip as the model's empty verdict (the _judge_run paused contract)."""
     _judge_ctx.fsid = task.get("fsid")
-    if task.get("kind") == "prompt":
-        return gist_llm(task["text"])
-    return caption_llm(task["text"])
+    cap = gist_llm(task["text"]) if task.get("kind") == "prompt" else caption_llm(task["text"])
+    return cap, bool(getattr(_judge_ctx, "paused", False))
+
+
 def _archive_call(fsid, caps):
     """(Re)build one session's archive in a worker thread, tagging it for usage logging."""
     _judge_ctx.fsid = fsid
@@ -4011,22 +4366,36 @@ def _run_index(now=None, budget=BUDGET, fairness=FAIRNESS, concurrency=CONCURREN
     if verbose:
         sys.stderr.write("romp-judge: %d undone caption tasks, %d selected\n" % (len(pending), len(selected)))
     captions = 0
+    struck = set()                                        # one strike per unit per PASS (grains share ids)
+    gave = {}                                             # fsid → units tombstoned this pass (one log row each)
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
         futs = {ex.submit(_caption_call, t): t for t in selected}
         for fut in as_completed(futs):
             task = futs[fut]
             try:
-                cap = fut.result()
+                cap, cap_paused = fut.result()
             except Exception:
-                cap = ""
+                cap, cap_paused = "", True                # a crashed worker is not the model's verdict
             if not cap:
-                continue                                  # empty = failed capture; skip, retry next pass
+                # A LIVE task retries by design (the open segment's text grows — the chunk cadence
+                # gates it) and a paused/rate-gated skip is not a verdict. A CLOSED unit's empty
+                # capture STRIKES toward the tombstone (CAPTION_FAIL_CAP): the same unchanged input
+                # re-captioned every pass was the 2026-08-18 churn — 2,920 calls for 62 records in 2h.
+                if not task.get("live") and not cap_paused:
+                    _caption_strike(task, struck, gave)
+                continue
+            if not task.get("live"):
+                _caption_unfail(task)                     # only CONSECUTIVE empties tombstone
             for w in task["writes"]:                      # one call → all the task's records (id-deduped)
                 append_caption(task["fsid"], w["id"], w["grain"], w["t"], cap,
                                live=task.get("live", False), natoms=task.get("natoms"))
                 captions += 1
                 if verbose:
                     sys.stderr.write("  [%s] %s\n" % (w["grain"], cap))
+    for _fsid, _n in gave.items():
+        _log_judge_error("captioner", _fsid, "give-up",
+                         note="%d unit(s) tombstoned after %d empty captures each; a re-parse minting "
+                              "new unit ids re-arms" % (_n, CAPTION_FAIL_CAP))
     # ── archiver: refresh a session's record when its turn-caption count grew (runs AFTER
     #    captioning, so this pass's new turn captions are included) ──
     arch_tasks = []
@@ -6740,7 +7109,11 @@ CLOSER_SYS = (
     "and found still running) and the stated or clear intent to take action again when its result "
     "arrives. Waiting on the user is blocked, never awaiting. Async work whose result already came "
     "back this turn is not awaiting. Unfinished work with nothing actually in flight stays working "
-    "(omit it). When unsure between awaiting and omitting, omit. One shape is never unsure: a WATCHER "
+    "(omit it) — and work the assistant says it will do NEXT ITSELF (finishing checks by hand, "
+    "cleanup it still owes, the next patch it plans to write) is exactly that case: nothing is in "
+    "flight that could report back, and only its own next turn moves it, so omit it. Awaiting is "
+    "only for waits that end with a result ARRIVING from outside. When unsure between awaiting and "
+    "omitting, omit. One shape is never unsure: a WATCHER "
     "turn — the session woke on a schedule or a monitor's report, saw the external job still running, "
     "and ended with the watch still armed — is awaiting kind \"job\": the live watcher is the work in "
     "flight and the wake-on-events arrangement is the intent to act; file it even when the turn "
@@ -7336,10 +7709,37 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
             continue
         if cap is not None and did >= cap:             # cap is None by default now (no per-pass close cap);
             break                                      # an explicit caller (a test) can still bound a backfill
+        _judge_ctx.last_call_fail = None               # a stale stash must never charge THIS turn (below)
         res = _close_turn(store, turn, seg_by_id=seg_by_id)
         if res is None:
+            # SAFEGUARDS TOMBSTONE (the user 2026-08-18): a safeguards refusal is the filter ruling on
+            # this turn's CONTENT — deterministic per prompt — so the retry-next-pass contract for
+            # transient failures burned one doomed call per pass, forever (2,955 refusals in six days,
+            # 1,301 on one research session alone). Strike-count refusals per turn AT ITS CURRENT SIZE;
+            # at the cap, adopt the turn exactly as a success would (swept + closedSig at fp), loudly —
+            # the turn GROWING then re-judges it through the same closedSig growth check that re-judges
+            # any closed turn, so the re-arm event is new evidence, never a clock. Transient failures
+            # (529s, timeouts) keep the plain retry: their recovery is the storm ending, and each pass
+            # costs one call, not a give-up.
+            if not getattr(_judge_ctx, "paused", False):
+                last = getattr(_judge_ctx, "last_call_fail", None)
+                if isinstance(last, dict) and "safeguards flagged" in str(last.get("note") or ""):
+                    fails = dict(store.get("closeFails") or {})
+                    rec = fails.get(tid) if isinstance(fails.get(tid), dict) else None
+                    k = (rec.get("fails", 0) + 1) if rec and rec.get("fp") == fp else 1
+                    if k >= DISTILL_FAIL_CAP:
+                        swept.add(tid); sig[tid] = fp; did += 1
+                        fails.pop(tid, None)
+                        _log_judge_error("closer", fsid, "give-up",
+                                         note="%d safeguards refusals on this turn's content; swept "
+                                              "without verdicts; the turn growing re-judges it" % k)
+                    else:
+                        fails[tid] = {"fp": fp, "fails": k}
+                    store["closeFails"] = fails
             continue                                   # LLM/parse failed → leave unswept, retry next pass
         newly += res
+        if isinstance(store.get("closeFails"), dict):
+            store["closeFails"].pop(tid, None)         # a landed judgment retires the strike record
         swept.add(tid); sig[tid] = fp; did += 1        # remember the size we judged at → detect later growth
     store["closedTurns"] = sorted(swept)
     store["closedSig"] = sig
@@ -8401,6 +8801,7 @@ def _distill_session(fsid, path, now):
                 if getattr(_judge_ctx, "paused", False):   # pause-skip, not a real failure (see the briefer)
                     continue
                 fails = nodes[top].get("stallFails", 0) + 1
+                _fail_log(nodes[top], "stall", now)    # the chip's attempt history: model + literal error
                 if fails >= DISTILL_FAIL_CAP:
                     if nodes[top].get("stallSummary") is None:
                         nodes[top]["stallSummary"] = ""
@@ -8424,6 +8825,8 @@ def _distill_session(fsid, path, now):
             _node_warn_clear(nodes[top], "cite-miss")
             nodes[top]["stalledMt"] = due
             nodes[top]["stallFails"] = 0
+            _era_clear(nodes[top], "stall-failed")     # a landed note ends its line's give-up era (see rearm)
+            _fail_log_clear(nodes[top], "stall")
             _node_warn_clear(nodes[top], "stall-failed")
             _node_warn_clear(nodes[top], "stall-unreadable")
             n += 1; changed = True
@@ -8472,8 +8875,16 @@ def _distill_session(fsid, path, now):
                 # to write one now with the staller's own prompt — grounded in the work, forbidden from
                 # inventing a decision (STALL_BRIEF_SYS), which is what feeding these whys to the BRIEFER
                 # used to do (the 2026-07-21 lesson).
+                # A live brief-failed warn refuses the keep (2026-08-18, review finding): the kept text
+                # under a give-up warn IS the give-up's kept older brief, and the re-arm cleared
+                # briefedMt to force a retry — but _brief_superseded(None) is False by construction, so
+                # this keep restamped the gate shut without ever calling the model: the re-arm's one
+                # retry (and its era) spent on a no-op, the chip permanent. With the warn live, fall
+                # through to a real regeneration; success clears the warn and the keep resumes.
                 if (nodes[top].get("blockSummary") or "").strip() \
-                        and not _brief_superseded(nodes, sub, nodes[top].get("briefedMt")):
+                        and not _brief_superseded(nodes, sub, nodes[top].get("briefedMt")) \
+                        and not any(isinstance(w, dict) and w.get("kind") == "brief-failed"
+                                    for w in nodes[top].get("warns") or []):
                     nodes[top]["briefedMt"] = due; changed = True
                     continue
                 _note = (nodes[top].get("stallSummary") or "").strip()
@@ -8482,6 +8893,7 @@ def _distill_session(fsid, path, now):
                     nodes[top]["briefParts"] = None      # a stall note has no per-item paragraphs
                     nodes[top]["briefedMt"] = due
                     nodes[top]["briefFails"] = 0
+                    _era_clear(nodes[top], "brief-failed")   # a promoted note lands the brief line too
                     _node_warn_clear(nodes[top], "brief-failed")
                     n += 1; changed = True
                     continue
@@ -8513,6 +8925,7 @@ def _distill_session(fsid, path, now):
                     # the "" sentinel though the API was never actually asked (the user 2026-07-03). Leave
                     # blockSummary null → re-enters next pass; retry once the pause clears.
                 fails = nodes[top].get("briefFails", 0) + 1   # the failed call itself was logged by _judge_run
+                _fail_log(nodes[top], "brief", now)    # the chip's attempt history: model + literal error
                 if fails >= DISTILL_FAIL_CAP:          # gave up after K tries → SELF-HEAL: settle to the ""
                     if nodes[top].get("blockSummary") is None:   # sentinel so the card stops showing
                         nodes[top]["blockSummary"] = ""          # "(generating…)" forever (the user 2026-06-24)
@@ -8548,6 +8961,8 @@ def _distill_session(fsid, path, now):
             _node_warn_clear(nodes[top], "cite-miss")      # anchored either way → any older warn is over
             nodes[top]["briefedMt"] = due
             nodes[top]["briefFails"] = 0                # success → reset the counter (for a future re-open)
+            _era_clear(nodes[top], "brief-failed")      # a landed brief ends its line's give-up era (see rearm)
+            _fail_log_clear(nodes[top], "brief")
             _node_warn_clear(nodes[top], "brief-failed")   # a brief landed → drop any earlier give-up warn
             _node_warn_clear(nodes[top], "brief-unreadable")   # …and any earlier orphaned-history warn
             n += 1; changed = True
@@ -8581,6 +8996,7 @@ def _distill_session(fsid, path, now):
             if getattr(_judge_ctx, "paused", False):   # pause-skip, not a real failure — don't count it toward
                 continue                               # give-up (leave summary null → re-enters once unpaused)
             fails = nodes[top].get("distillFails", 0) + 1   # the failed call itself was logged by _judge_run
+            _fail_log(nodes[top], "summary", now)      # the chip's attempt history: model + literal error
             if fails >= DISTILL_FAIL_CAP:              # gave up after K tries → SELF-HEAL to the "" sentinel
                 if nodes[top].get("summary") is None:  # so the card stops showing "(generating…)" forever
                     nodes[top]["summary"] = ""
@@ -8610,6 +9026,8 @@ def _distill_session(fsid, path, now):
         _node_warn_clear(nodes[top], "cite-miss")          # anchored either way → any older warn is over
         nodes[top]["distilledMt"] = due
         nodes[top]["distillFails"] = 0                 # success → reset the counter
+        _era_clear(nodes[top], "summary-failed")       # a landed summary ends its line's give-up era (see rearm)
+        _fail_log_clear(nodes[top], "summary")
         _node_warn_clear(nodes[top], "summary-failed") # a summary landed → drop any earlier give-up warn
         _node_warn_clear(nodes[top], "summary-unreadable")   # …and any earlier orphaned-history warn
         n += 1; changed = True
@@ -8617,7 +9035,14 @@ def _distill_session(fsid, path, now):
         save_goals(fsid, store)
     return n
 # ── failed-summary give-up: fleet count (for the banner) + re-arm on recovery (auto-retry) ──
-_FAILED_WARN_KINDS = ("summary-failed", "brief-failed")
+# stall-failed joined 2026-08-18: the staller's give-up warns "stall-failed" (_warn_line_kind), but the
+# scan/re-arm knew only the other two — a given-up stall note was invisible to the banner and never retried.
+_FAILED_WARN_KINDS = ("summary-failed", "brief-failed", "stall-failed")
+_FAILED_FIELDS = {"summary-failed": ("summary", "distilledMt"),     # warn kind → (line field, event stamp)
+                  "brief-failed": ("blockSummary", "briefedMt"),
+                  "stall-failed": ("stallSummary", "stalledMt")}
+
+
 def _failed_nodes(store):
     """Yield (nid, nd, kind) for every node in a store carrying a live give-up warn."""
     for nid, nd in (store.get("nodes") or {}).items():
@@ -8627,8 +9052,8 @@ def _failed_nodes(store):
             if isinstance(w, dict) and w.get("kind") in _FAILED_WARN_KINDS:
                 yield nid, nd, w["kind"]
 def judge_failure_scan():
-    """Fleet-wide give-up state for the top banner (the user 2026-07-03): every card whose summary/brief GAVE
-    UP carries a live "*-failed" warn; count them across all goal stores and name the current CAUSE (an
+    """Fleet-wide give-up state for the top banner (the user 2026-07-03): every card whose summary/brief/
+    stall note GAVE UP carries a live "*-failed" warn; count them across all goal stores and name the CAUSE (an
     account usage limit if one is maxed, else errors/timeouts). Returns {count, cause, ratelimited} or None
     when nothing is failing. Cheap: read-only, one parse per store; the kernel mtime-caches it."""
     import glob
@@ -8643,13 +9068,51 @@ def judge_failure_scan():
         return None
     cause, ratelimited = _giveup_cause()
     return {"count": count, "cause": cause, "ratelimited": ratelimited}
-def rearm_failed_summaries(now=None):
-    """Auto-retry give-up cards on a RECOVERY event (the kernel calls this when the retry-pause clears and once
-    at startup): a genuine transient failure (a timeout under load, a brief rate-limit spike) blanks a card to
-    the "" sentinel + a "*-failed" warn and would otherwise stay blank until the goal's mt advances. Re-arm =
-    put the sentinel back to None so the distiller re-enters and retries; the warn stays until a re-summarize
-    SUCCEEDS (then _node_warn_clear) or FAILS again (re-gives-up, re-warns, visible). Bounded: only nodes with
-    a live give-up warn, and only on discrete recovery events — never a per-pass loop. Returns the count."""
+
+
+def _era_spent(nd, kind):
+    """Has this LINE's give-up era already had its one automatic retry? The mark is per warn KIND
+    (2026-08-18, review finding): a node can carry two live give-up warns — e.g. an old stall's plus the
+    completion's — and a node-level bool let the first (possibly dead) line consume the whole node's era,
+    skipping the line the user actually sees. A legacy bool True reads as spent-for-every-line; the next
+    discrete event clears it."""
+    m = nd.get("autoRearmed")
+    return bool(m.get(kind)) if isinstance(m, dict) else bool(m)
+
+
+def _era_mark(nd, kind):
+    m = nd.get("autoRearmed")
+    m = dict(m) if isinstance(m, dict) else ({k: True for k in _FAILED_WARN_KINDS} if m else {})
+    m[kind] = True
+    nd["autoRearmed"] = m
+
+
+def _era_clear(nd, kind):
+    """A landed summary/brief/note ends ITS line's give-up era (the summarizer success paths call this)."""
+    m = nd.get("autoRearmed")
+    if isinstance(m, dict):
+        m.pop(kind, None)
+        if not m:
+            nd.pop("autoRearmed", None)
+    elif m:
+        nd.pop("autoRearmed", None)                    # legacy bool: any success opens the whole node
+
+
+def rearm_failed_summaries(now=None, auto=False):
+    """Auto-retry give-up cards on a RECOVERY event — the kernel calls this once at startup, when the
+    retry-pause clears, and (auto=True) on the judge-health edge: the first served judge call after a
+    call-level failure on that same model (consume_judge_recovery). A genuine transient failure (a 529
+    storm, a timeout under load, an auth blip) blanks a card to the "" sentinel + a "*-failed" warn and
+    would otherwise stay failed until a manual Try again. Re-arm = put the sentinel back to None so the
+    summarizer re-enters and retries — or, when the give-up KEPT an older real summary (a re-completion's
+    give-up never clobbers prior text), clear the event stamp instead so the gate re-enters with the
+    prior intact. The warn stays until a re-summarize SUCCEEDS (then _node_warn_clear) or FAILS again
+    (re-gives-up, re-warns, visible). Bounded two ways: only lines whose summarizer GATE can actually
+    reopen (a summary needs a completed/confirming top, a brief a blocked one, a stall note a live stall
+    — flipping a dead line burns work, and an era, on a surface nothing regenerates), and the health edge
+    (auto=True) retries each line's give-up era at most ONCE (nd["autoRearmed"], per warn kind, dropped
+    on that line's success and by the discrete events) — otherwise a card whose own call is broken would
+    burn DISTILL_FAIL_CAP calls on every edge a healthy neighbor produces. Returns the count re-armed."""
     import glob
     n = 0
     for fp in glob.glob(str(GOALDIR / "*.json")):
@@ -8658,12 +9121,56 @@ def rearm_failed_summaries(now=None):
             store = load_goals(fsid)
         except Exception:
             continue
+        status = store.get("status") or {}
+        confirming = set(store.get("confirming") or ())
+        stalls = None                                  # lazy: one stalled_facts read, only if a stall warn shows
         changed = False
         for nid, nd, kind in _failed_nodes(store):
-            if kind == "summary-failed" and nd.get("summary") == "":
-                nd["summary"] = None; changed = True; n += 1
-            elif kind == "brief-failed" and nd.get("blockSummary") == "":
-                nd["blockSummary"] = None; changed = True; n += 1
+            if auto and _era_spent(nd, kind):
+                continue                               # this line's era already got its one automatic retry
+            st = status.get(nid)
+            if kind == "summary-failed" and st != "completed" and nid not in confirming:
+                continue                               # the distiller gate needs a (re)completed top
+            if kind == "brief-failed" and st != "blocked":
+                continue                               # the briefer gate needs a blocked top
+            if kind == "stall-failed":
+                if stalls is None:
+                    stalls = stalled_facts(fsid)
+                if st != "working" or nid not in stalls:
+                    continue                           # the staller gate needs the stall still live
+            field, stamp = _FAILED_FIELDS[kind]
+            if nd.get(field) == "":
+                nd[field] = None                       # "" (gave up) → None (owed): the next pass retries
+            elif nd.get(field) and nd.get(stamp) is not None:
+                nd[stamp] = None                       # give-up kept an older summary → re-enter by stamp
+            else:
+                continue                               # already owed (None) → nothing to flip
+            if auto:
+                _era_mark(nd, kind)
+            else:
+                nd.pop("autoRearmed", None)            # a discrete event (startup/pause-clear) opens a fresh era
+            changed = True; n += 1
+        if not auto:
+            # ORPHANED "" sentinels (the user 2026-08-18, the chipless summaryless card): a completed top
+            # WITH recorded work settled to "" and no summary-surface warn survived (stamped during the
+            # confirming window, rollup's retire ate it — fixed alongside, but already-eaten cards stay
+            # silent forever: every path above is warn-gated and Try again needs the chip). On DISCRETE
+            # recovery events only, clear the stamp so the distiller re-enters: work that resolves now
+            # writes the real summary; work still unreadable re-settles "" and re-warns (the warn now
+            # survives confirming), so the card is loud either way. One-shot per card: once a warn
+            # exists, the no-warn gate here excludes it and the warn-gated path above owns it. Umbrellas
+            # (no recorded work anywhere in the subtree) keep their designed silent "".
+            for nid, nd in (store.get("nodes") or {}).items():
+                if not isinstance(nd, dict) or nd.get("parentId") is not None:
+                    continue
+                if status.get(nid) != "completed" and nid not in confirming:
+                    continue
+                if nd.get("summary") == "" and nd.get("distilledMt") is not None \
+                        and not any(isinstance(w, dict) and _warn_surface(w) == "summary"
+                                    for w in nd.get("warns") or []) \
+                        and _goal_has_recorded_work(store, nid):
+                    nd["distilledMt"] = None
+                    changed = True; n += 1
         if changed:
             save_goals(fsid, store)
     return n

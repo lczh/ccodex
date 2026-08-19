@@ -245,6 +245,18 @@ test("the WHOLE popover drags — grip anywhere that isn't a control — and clo
   assert.match(CSS, /\.cmt-pop \{[^}]*cursor: grab/s, "the grab hand covers the whole box now");
 });
 
+test("picking a model/effort never reads as an outside press — the box stays put", () => {
+  // the dropdowns and the break-out dialog are appended to document.body (fixed position, like the
+  // statusline's menus), so the outside-press closer must exempt them: it used to close the popover
+  // on mousedown and null pendingCommentAnchor before the item's click could land the pick, and a
+  // click on the break-out dialog's Cancel stranded the user the same way (the user 2026-08-18)
+  assert.match(UI, /if \(!pop \|\| pop\.contains\(ev\.target as Node\)\) return;\s*\n\s*if \(\(ev\.target as HTMLElement\)\.closest\?\.\("\.meta-menu, #fork-prompt"\)\) return;\s*\n\s*closeCommentPop\(\);/);
+  // and the surviving popover shows the pick: the click acks the label, the frame keeps it honest
+  assert.match(UI, /function liveMetaLabel\(label: HTMLElement, kind: "model" \| "effort", th: CommentThread\)/);
+  assert.match(UI, /\.meta-btn\[data-kind\]/, "the in-place refresh reaches the live chips");
+  assert.match(UI, /label\.textContent = c\.label;\s+\/\/ acknowledge the pick now/);
+});
+
 test("marks use the prefix-tolerant anchor matcher", () => {
   assert.match(UI, /findAnchorRange\(nodes\.map\(\(t\) => t\.data\)\.join\(""\), th\.exact\)/);
 });
@@ -307,7 +319,8 @@ test("ticks and message notches share ONE scrollbar frame, so they can never dis
   // drifts from the notches' measured-height pixel offsets. Both painters now consume
   // contentOffsetFrame, the one event-index → content-pixel mapping.
   assert.match(UI, /function contentOffsetFrame\(/);
-  assert.match(UI, /const off = frame\.offsetOf\(idx\);/, "ticks place by the shared frame");
+  assert.match(UI, /const off = frame\.offsetOf\(evUnit\[idx\]\);/,
+    "ticks place by the shared frame, in UNIT space (anchors are events; the frame speaks units)");
   assert.doesNotMatch(UI, /\(idx \/ n\) \* 100/, "the uniform index-fraction percent frame is gone");
   // the rail repaints with the notches (same rAF), so both always draw from one world
   assert.match(UI, /paintRailSticky\(\); paintScrollMarks\(\); updateCommentRail\(\);/);

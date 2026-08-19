@@ -439,21 +439,21 @@ class CommentOps(CommentBase):
         self._saved_backend_for = km.Sessions.backend_for
         self._saved_ready = km._sdk_ready
         self._saved_sessions = km._sessions
-        self._saved_reveal = km._reveal_chat
+        self._saved_reveal = km._reveal_chat_for
         self._saved_push_now = km._push_session_now
         km.Sessions.backend_for = staticmethod(lambda sid: self.be)
         km._sdk_ready = lambda: True
         p = self._write(PARENT, self._parent_records())
         km._sessions = lambda now, window=None, forks=True: [
             {"sid": PARENT, "name": "parent", "path": str(p), "mtime": self.now}]
-        km._reveal_chat = lambda msg: None
+        km._reveal_chat_for = lambda client, msg: None
         km._push_session_now = lambda sid: None
 
     def tearDown(self):
         km.Sessions.backend_for = self._saved_backend_for
         km._sdk_ready = self._saved_ready
         km._sessions = self._saved_sessions
-        km._reveal_chat = self._saved_reveal
+        km._reveal_chat_for = self._saved_reveal
         km._push_session_now = self._saved_push_now
         super().tearDown()
 

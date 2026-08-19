@@ -13,8 +13,11 @@ import diff from "highlight.js/lib/languages/diff";
 import yaml from "highlight.js/lib/languages/yaml";
 import type { ParsedAsk } from "../ask-types";
 import { quoteReply } from "../quote";
+import { TABBAR_H_KEY, TABBAR_H_DEFAULT, clampTabbarH, parseTabbarH } from "./tabbar-resize";
+import { SessionViews, viewVisible, viewsKey, hideIn, revealIn } from "./session-views";
 import { markerLabel, dayContext } from "./time-marker";
 import { compactDisplay, toolCounts, type DisplayItem } from "./compact";
+import { senderKind } from "./sender-identity";
 import { loadSettings, onExternalSettingsChange, installSettingsSync, type RompSettings } from "./settings";
 import { delegate } from "./actions";
 import { KIND_WORD } from "./spin-caption";
@@ -438,6 +441,35 @@ const CLOSE_ACK_MS = 15_000;
 // The romp identity palette for the tab right-click color picker (the user 2026-06-29). Fetched once from the
 // kernel's /palette so the client holds no color literals; empty until it lands (the menu just omits the row).
 // The palette is SELECTABLE now (the user 2026-07-12): a {type:"palette"} push lands the new set on switch.
+// ── session views (the user 2026-08-18): the kernel's views blob gates which sessions get TABS.
+// A hidden session is a BACKGROUND session — still running, judged and carded; the + picker lists it
+// under "Hidden" and the timeline's corner panel counts it, so it is always one glance away.
+// Captured from every tabOrder push; a local gesture (hide from the tab menu, reveal from the
+// picker) applies optimistically and holds sticky until a push echoes it — yielding to the kernel
+// after three silent pushes, the same machinery the timeline's copy runs.
+let sessionViews: SessionViews | null = null;
+let pendingSessionViews: SessionViews | null = null;
+let pendingViewsAge = 0;
+let allHiddenBlanked = false;   // the active transcript was blanked because EVERY session is view-hidden
+function effViews(): SessionViews | null { return pendingSessionViews ?? sessionViews; }
+function captureViews(v: SessionViews | null) {
+  if (v) sessionViews = v;
+  // v null = a tabOrder frame WITHOUT the blob (an older kernel in a mixed-version mesh): it still
+  // ages a pending edit, or the optimistic state would fake success forever against a kernel that
+  // will never confirm it
+  if (pendingSessionViews && ((v && viewsKey(v) === viewsKey(pendingSessionViews)) || ++pendingViewsAge >= 3)) {
+    pendingSessionViews = null; pendingViewsAge = 0;
+  }
+}
+function postViews(v: SessionViews) {
+  pendingSessionViews = v; pendingViewsAge = 0;
+  if (vscodeApi) vscodeApi.postMessage({ type: "setTimelineViews", views: v });
+  renderTabs();
+}
+function tabInView(id: string): boolean { return viewVisible(effViews(), id); }
+function visibleOrder(): string[] { return order.filter(tabInView); }
+function revealSession(id: string) { postViews(revealIn(effViews(), id)); }
+
 let paletteColors: string[] = [];
 fetch(kernelUrl("/palette"), { cache: "no-store" }).then((r) => r.json())
   .then((d) => { if (Array.isArray(d.colors)) paletteColors = d.colors; }).catch(() => { /* menu omits the swatch row */ });
@@ -612,7 +644,7 @@ function wrapCodeLines(code: HTMLElement) {
   }).join("");
 }
 
-function dot(kind: "green" | "ring" | "user" | "red" | "romp" | "working"): HTMLElement { return el("span", "dot " + kind); }
+function dot(kind: "green" | "ring" | "user" | "red" | "romp" | "working" | "tag"): HTMLElement { return el("span", "dot " + kind); }
 
 function ioRow(label: "IN" | "OUT", text: string, isError: boolean): HTMLElement {
   const row = el("div", "io-row" + (label === "OUT" ? " io-out" : "") + (isError ? " io-error" : ""));
@@ -1657,6 +1689,23 @@ let scrollMarksSig = "";
 // spacer's actual height) match truth so closely that boundary crossings correct by ~nothing.
 const unitHeights = new Map<string, Map<number, number>>();
 
+// EVENT index → DISPLAY-UNIT index. Unit === event only in NORMAL mode; in compact mode tool runs
+// fold into toolgroup units, so the two spaces diverge — and contentOffsetFrame speaks UNITS
+// (data-unit tags, spacer counts, cached heights are all unit-keyed) while marks anchor to EVENTS.
+// Passing event indices straight through was the missing-notch bug (the user 2026-08-18: "some are
+// displayed, others aren't" — replies land beside big tool runs, exactly where the spaces diverge
+// most, and a wrong unit index found no node, so the mark silently vanished).
+function eventUnitIndex(s: Session): Int32Array {
+  const map = new Int32Array(s.events.length).fill(-1);
+  const items = displayItems(s);
+  for (let u = 0; u < items.length; u++) {
+    const it = items[u];
+    if (it.kind === "toolgroup") { for (const i of it.indices) map[i] = u; }
+    else map[it.index] = u;
+  }
+  return map;
+}
+
 // ONE content-space frame for every scrollbar overlay (the user 2026-08-17, watching comment ticks
 // drift past message notches as history loaded): marks anchored to transcript positions share an
 // inherent monotonic order, so every overlay must place them with the SAME event-index → pixel
@@ -1743,20 +1792,30 @@ function paintScrollMarks(): void {
   const frame = contentOffsetFrame(content, v, s);
   if (!frame) { box.style.display = "none"; scrollMarksSig = ""; return; }
   const sh = frame.sh;
-  const offs: number[] = [];
+  const offs: Array<{ top: number; m: string }> = [];
+  const evUnit = eventUnitIndex(s);                       // marks anchor to EVENTS; the frame speaks UNITS
   for (let i = 0; i < s.events.length; i++) {
-    const ev = s.events[i] as ChatEvent & { human?: boolean; romp?: boolean; rompAuto?: boolean; canned?: string; md?: string };
-    if (ev.kind !== "user" || !ev.human || ev.romp || ev.rompAuto) continue;
+    const ev = s.events[i] as ChatEvent & { human?: boolean; romp?: boolean; rompAuto?: boolean; canned?: string; md?: string; tag?: string };
+    if (ev.kind !== "user") continue;
+    // the SAME classifier the bubble and rail dot read (sender-identity.ts, the user 2026-08-18:
+    // "reuse the same functions that compute how they render in the chat, so there's never any
+    // chance of desynchronization"). user → the blue that means yours; romp/tagged → a light gray
+    // notch (machine-sent activity, visible on the map but never posing as your words); harness
+    // noise ("injected") → no notch at all.
+    const kind = senderKind(ev);
+    if (kind === "injected") continue;
     const md = (ev.md || "").trim();
     // gestures are the user's DOINGS, not their words — no notch (the Continue row, a /command)
     if (!md || ev.canned === "continue" || SLASH_CMD_RE.test(md)) continue;
-    const off = frame.offsetOf(i);
+    const u = evUnit[i];
+    if (u < 0) continue;                                  // not in the display stream (never for user events)
+    const off = frame.offsetOf(u);
     if (off == null) continue;
-    offs.push(off);
+    offs.push({ top: off, m: kind === "user" ? "" : "machine" });
   }
-  const ys = offs.map((top) => Math.round((top / sh) * (cRect.height - 4)));
+  const ys = offs.map((o) => ({ y: Math.round((o.top / sh) * (cRect.height - 4)), m: o.m }));
   const sig = activeId + "|" + Math.round(cRect.top) + "," + Math.round(cRect.right) + ","
-    + Math.round(cRect.height) + "|" + ys.join(",");
+    + Math.round(cRect.height) + "|" + ys.map((o) => o.y + (o.m ? "m" : "")).join(",");
   if (sig !== scrollMarksSig) {
     scrollMarksSig = sig;
     // UPDATE IN PLACE when the notch count is unchanged (the user 2026-08-17: scrolling back streams
@@ -1767,11 +1826,11 @@ function paintScrollMarks(): void {
     // tab) still rebuild outright — those are new marks, not moved ones.
     const kids = Array.from(box.children) as HTMLElement[];
     if (kids.length === ys.length) {
-      ys.forEach((y, i) => { kids[i].style.top = y + "px"; });
+      ys.forEach((o, i) => { kids[i].style.top = o.y + "px"; kids[i].className = "scroll-mark" + (o.m ? " " + o.m : ""); });
     } else {
-      box.replaceChildren(...ys.map((y) => {
-        const m = el("div", "scroll-mark");
-        m.style.top = y + "px";
+      box.replaceChildren(...ys.map((o) => {
+        const m = el("div", "scroll-mark" + (o.m ? " " + o.m : ""));
+        m.style.top = o.y + "px";
         return m;
       }));
     }
@@ -1814,41 +1873,51 @@ function paintRailSticky(): void {
   }
   const hm = marker ? (marker.dataset.hm || "") : "";
   // DAY CONTEXT (the user 2026-08-17): whichever stamp owns the top slot also names its DAY, in a
-  // small label riding just above it, whenever that day is not today — so scrolling through history
+  // small label riding just ABOVE it, whenever that day is not today — so scrolling through history
   // always says where you are even with the day divider off-screen. The anchor is the tracked turn's
-  // marker when there is one, else the first stamp below the line ("the next one"); its position is
-  // wherever that stamp sits (the line itself once the sticky leads), so the label moves WITH the
-  // leading stamp and the sticky handoff lands at the same pixel — no jump at the transition. The
-  // text swaps only at day boundaries.
+  // marker when there is one, else the first stamp below the line ("the next one"); the label moves
+  // WITH the leading stamp, and at handoff the sticky takes the very pixels the stamp and label held,
+  // so there is no jump at the transition. The text swaps only at day boundaries.
   const day = ensureRailDay();
   const firstBelow = all.find(([, top]) => top >= line);
   const anchorM = marker || (firstBelow ? firstBelow[0] : null);
-  // The label sits BELOW the top stamp, in the STAMP'S OWN BOX (same left/width, right-aligned like
-  // the time itself, so the two right edges line up by construction — the user 2026-08-17, whose
-  // first cut floated the label ABOVE the slot: at the top of the view that bled into the tab bar,
-  // and its transform-based alignment didn't match the stamp's). Below-stamp keeps it inside the
-  // pane at every scroll position, and the handoff stays seamless: a leading stamp carries its
-  // label at markerBottom, and the sticky shows it at the very same y when it takes over.
   const gRect = anyMarker ? anyMarker.getBoundingClientRect() : null;
-  const stampH = anchorM ? anchorM.getBoundingClientRect().height || 11 : 11;
-  const paintDay = (slotTop: number) => {
-    const ep = anchorM ? Number(anchorM.dataset.epoch || 0) : 0;
-    const label = ep && gRect ? dayContext(ep, Date.now()) : "";
-    const yTop = slotTop + stampH + 1;
-    if (!label || yTop > cBottom) { day.style.display = "none"; return; }
+  // ABOVE the stamp, not below (the user 2026-08-18, with a video): below it, the next incoming
+  // stamp scrolled straight through the label's spot and the label had to leap over it — a visible
+  // collision and jump at every handoff. Above it, nothing ever crosses the label's path. A leading
+  // real stamp always has room for its label inside the pane: markers sit 10–20px below their
+  // turn's top, and the label band (dayH + 1 ≈ 9.8px at the default 13px chat font) fits even the
+  // smallest 10px offset — barely, so the tab-bar clamp below backstops it. The sticky alone rests
+  // AT the line, so when a
+  // label shows, the slot line drops by the label's height to make that room (the 2026-08-17 first
+  // cut floated the label above the sticky without shifting it, and bled into the tab bar).
+  const ep = anchorM ? Number(anchorM.dataset.epoch || 0) : 0;
+  const label = ep && gRect ? dayContext(ep, Date.now()) : "";
+  let dayW = 0, dayH = 0;
+  if (label) {
     if (day.textContent !== label) day.textContent = label;
-    day.style.left = gRect!.left + "px";
-    day.style.width = gRect!.width + "px";
-    day.style.top = yTop + "px";
+    day.style.display = "";                        // must be visible to measure
+    const r = day.getBoundingClientRect(); dayW = r.width; dayH = r.height;
+  } else day.style.display = "none";
+  const slotLine = line + (label ? dayH + 1 : 0);
+  const paintDay = (slotTop: number) => {
+    if (!label) return;
+    if (slotTop > cBottom) { day.style.display = "none"; return; }   // anchor is off the bottom
+    // Natural width, right edge on the gutter's right edge (the stamp's own) — but never past the
+    // pane's left edge: "2 days ago" at 0.68em is wider than the 47px gutter, and a box pinned to
+    // the gutter clipped its leading digit at the pane edge (the user 2026-08-18, with a
+    // screenshot). When it doesn't fit, the label slides right just enough to stay whole.
+    day.style.left = Math.max(2, gRect!.right - dayW) + "px";
+    day.style.top = Math.max(cTop + 1, slotTop - dayH - 1) + "px";
     day.style.display = "";
   };
-  // The tracked turn's OWN stamp leads the top slot while it is at or below the line — it scrolls up freely
-  // until it reaches the line, and the instant it crosses ABOVE (markerTop < line) the sticky takes the same
-  // slot showing the same time, so the swap is invisible: no gap, no clipped sliver (the user 2026-07-23).
+  // The tracked turn's OWN stamp leads the top slot while it is at or below the slot line — it scrolls up
+  // freely until it reaches it, and the instant it crosses ABOVE (markerTop < slotLine) the sticky takes the
+  // same slot showing the same time, so the swap is invisible: no gap, no clipped sliver (the user 2026-07-23).
   // Deliberately keyed on the TRACKED turn's marker, not on any stamp anywhere: a LATER time change further
   // down the view is a different time, so it must not blank the top — that would leave the slot empty, which
   // is the whole thing the sticky exists to prevent.
-  const realLeads = markerShown && markerTop >= line;
+  const realLeads = markerShown && markerTop >= slotLine;
   if (!hm || realLeads) {
     stamp.style.display = "none";
     for (const [m] of all) m.style.visibility = "";   // real stamp leads → nothing suppressed
@@ -1856,17 +1925,22 @@ function paintRailSticky(): void {
     else day.style.display = "none";
     return;
   }
-  // The sticky leads: pin it at the line and hide every marker that has crossed ABOVE it, so the real stamp
-  // handing off never shows a clipped duplicate beside the sticky. Markers at or below the line stay visible —
-  // they are the genuine lower stamps, not doubles.
-  for (const [m, top] of all) m.style.visibility = top < line ? "hidden" : "";
+  // The sticky leads: pin it at the slot line and hide every marker that has crossed ABOVE it — or INTO
+  // its box: with the slot dropped for the day label, a not-yet-tracked turn's stamp (marker 10–20px below
+  // a turn top that has not reached the line) can enter the sticky's own band while still "below the slot
+  // line", and two HH:MM texts superimpose. The threshold is therefore the sticky's BOTTOM edge, so an
+  // incoming stamp slides under the sticky hidden and re-emerges only when it leads. With no label this
+  // changes nothing: slotLine === line, and a stamp inside [line, line+stampH) forces its own turn tracked
+  // (offsets ≥ stamp height), which is realLeads — this branch never runs. Markers at or below the sticky's
+  // bottom stay visible — they are the genuine lower stamps, not doubles.
   const g = (anyMarker || marker!).getBoundingClientRect();
+  for (const [m, top] of all) m.style.visibility = top < slotLine + g.height ? "hidden" : "";
   stamp.textContent = hm;
   stamp.style.left = g.left + "px";
   stamp.style.width = g.width + "px";
-  stamp.style.top = line + "px";
+  stamp.style.top = slotLine + "px";
   stamp.style.display = "";
-  paintDay(line);
+  paintDay(slotLine);
 }
 
 // Scroll is the sticky stamp's primary driver, and a re-render moves the geometry under it — both funnel
@@ -1925,8 +1999,15 @@ function renderEventInner(ev: ChatEvent): HTMLElement {
     // message romp INJECTED (a feed nudge / follow-up — ev.romp) → a GRAY right-aligned bubble with a
     // "romp" tag, so it's clear romp (not you) sent it (the user 2026-06-19); everything else harness-
     // injected (compact summary, /command stdout, system reminders) → a neutral left note box.
-    const romp = !!ev.romp;
-    const injected = !ev.human && !romp;
+    // ONE classifier (sender-identity.ts, the user 2026-08-18): the bubble dress here, the rail
+    // dot below, and paintScrollMarks' notch color all read the SAME senderKind verdict, so the
+    // surfaces can never desynchronize. The sender-declared render hint (kernel MSG_TAG_RE lift,
+    // the user 2026-08-15) classifies as "tagged": machine-sent on the user's behalf, shedding the
+    // typed-words blue for the gray family under the SENDER's own ⚙ label.
+    const kind = senderKind(ev);
+    const romp = kind === "romp";
+    const injected = kind === "injected";
+    const tagged = kind === "tagged";
     const turn = el("div", "turn turn-user" + (romp ? " romp" : injected ? " injected" : ""));
     // Unresolved postal ids ride the raw turn so a timeline message arc can still land on it. Without
     // this the arc pointed at a turn with nothing to match and the click died silently (the user
@@ -1936,7 +2017,7 @@ function renderEventInner(ev: ChatEvent): HTMLElement {
     // Prompts ride the rail like every other turn: their own dot + a left-gutter HH:MM marker (added in
     // renderEvent). Genuine prompts get the solid blue dot; a romp injection a gray dot; harness notes the
     // hollow ring used by assistant turns.
-    turn.appendChild(dot(romp ? "romp" : injected ? "ring" : "user"));
+    turn.appendChild(dot(romp ? "romp" : tagged ? "tag" : injected ? "ring" : "user"));
     // a TYPED follow-up (resumed a goal) → a compact "↩ Follow-up · <goal>" header, the romp goal-context
     // quote + markers already stripped server-side. Same header the pending queued render uses (consistency).
     if (ev.followUp && !romp) turn.appendChild(followUpHeader(ev.goal, ev.fuCtx, ev.uuid ? "u:" + ev.uuid : undefined));
@@ -1956,11 +2037,6 @@ function renderEventInner(ev: ChatEvent): HTMLElement {
         tag.appendChild(document.createTextNode("romp"));
         turn.appendChild(tag);
       }
-      // sender-declared render hint (kernel MSG_TAG_RE lift, the user 2026-08-15): auto-generated
-      // text — a kickoff template, a scripted brief — is machine-sent on the user's behalf, so it
-      // sheds the typed-words blue for the gray injected family, labeled with the SENDER's own word
-      // (romp attaches no meaning to the label; ⚙ marks "scripted", vs romp's swirl).
-      const tagged = !romp && !injected && !!ev.tag && !!ev.md;
       if (tagged) {
         const tchip = el("div", "romp-tag");
         tchip.appendChild(document.createTextNode("⚙ " + ev.tag));
@@ -3886,7 +3962,7 @@ function makePlaceholderTab(id: string): HTMLElement {
 // The empty transcript case was already handled with a "No messages yet." placeholder; this is its
 // missing sibling, one level up: no sessions rather than no messages. Saying so also beats a spinner —
 // it tells a new user the pane is working and what to do next.
-function syncNoSessionsPlaceholder(visibleCount: number) {
+function syncNoSessionsPlaceholder(visibleCount: number, totalCount = 0) {
   const content = document.getElementById("content");
   if (!content) return;
   const existing = document.getElementById("no-sessions");
@@ -3894,10 +3970,14 @@ function syncNoSessionsPlaceholder(visibleCount: number) {
     existing?.remove();               // a session arrived → the real view takes over
     return;
   }
-  if (existing) return;               // idempotent: renderTabs runs on every push
+  // sessions exist but the active view hides them all — say THAT, not "no sessions yet"
+  const txt = totalCount > 0
+    ? "Every session is hidden from this view. Reveal one from the + picker, or switch views on the timeline's Show menu."
+    : "No sessions yet. Start one with  romp new <name>  or the + above.";
+  if (existing) { existing.textContent = txt; return; }   // idempotent: renderTabs runs on every push
   const ph = el("div", "tx-empty");
   ph.id = "no-sessions";
-  ph.textContent = "No sessions yet. Start one with  romp new <name>  or the + above.";
+  ph.textContent = txt;
   content.appendChild(ph);
 }
 
@@ -3945,14 +4025,17 @@ function renderTabs() {
   // real sessions keep running, just hidden from this view. No tag → visibleIds === ids (unchanged).
   const only = onlyTag();
   const nameOf = (id: string) => sessions.get(id)?.name ?? tabMeta.get(id)?.name ?? "";
-  const visibleIds = only ? ids.filter((id) => matchesOnly(nameOf(id), only)) : ids;
+  // the session VIEWS filter composes here too (the user 2026-08-18): a view-hidden session keeps
+  // its state, drafts and cached transcript — it just loses its tab until revealed
+  const inViewIds = ids.filter(tabInView);
+  const visibleIds = only ? inViewIds.filter((id) => matchesOnly(nameOf(id), only)) : inViewIds;
   // ...and it must govern the CHAT BODY too, not just the bar (the user 2026-07-16). Hiding a
   // non-matching TAB while its transcript keeps rendering leaks precisely what the filter exists to
   // hide: a real session's chat sitting on screen under `#only=api,tests,web`, statusline and all —
   // found while shooting the demo, with nimbus's transcript filling a "filtered" frame. Re-point the
   // selection at the first visible session. Deferred so we never re-enter the render we're inside;
   // setActive is a no-op once activeId is visible, so this settles in one pass.
-  if (only && activeId && !visibleIds.includes(activeId) && visibleIds.length) {
+  if (activeId && ids.includes(activeId) && !visibleIds.includes(activeId) && visibleIds.length) {
     const next = visibleIds[0];
     setTimeout(() => { if (activeId !== next) setActive(next); }, 0);
   }
@@ -4088,7 +4171,16 @@ function renderTabs() {
   bar.appendChild(add);
   // Restore tab-mode focus if a tab held it before this rebuild (see the top of renderTabs).
   if (refocusTab) focusActiveTab();
-  syncNoSessionsPlaceholder(visibleIds.length);
+  syncNoSessionsPlaceholder(visibleIds.length, ids.length);
+  // Hiding the LAST visible session must also blank its transcript: a strip with no tabs cannot sit
+  // over a hidden session's live chat (the ghost would show exactly what the hide asked to put away).
+  // Restored the moment anything is visible again — the placeholder owns the empty state meanwhile.
+  if (activeId) {
+    const av = views.get(activeId);
+    const blank = !visibleIds.length && ids.length > 0 && !tabInView(activeId);
+    if (av && blank && av.el.style.display !== "none") { av.el.style.display = "none"; allHiddenBlanked = true; }
+    else if (av && !blank && allHiddenBlanked) { av.el.style.display = ""; allHiddenBlanked = false; }
+  }
   // (The Fleet toggle that briefly lived here as a tab-bar pill was removed 2026-06-24: Fleet/Chat are now
   // the rotated toggles in the chat pane's vertical strip — see _LANDING_FLEET_JS — so the pill was redundant.)
   // (The collapse caret moved OFF the tab bar into the #ledger strip's title row — the strip now always
@@ -4254,6 +4346,19 @@ function showTabMenu(e: MouseEvent, id: string) {
     onBell ? "Stop notifying" : "Notify me",
     onBell ? "no more system notifications for this session" : "system notification when its work blocks on you or completes",
     () => setSessionFlag(id, "notify", !onBell));
+  // Background the session (the user 2026-08-18): out of the tab strip AND the timeline lanes — it
+  // keeps running, judged and carded; the + picker lists it under "Hidden — reveal" and the
+  // timeline's corner panel counts it. Same views blob the timeline dialog edits. A plain item, not
+  // a toggle: its undo lives where the hidden session lives (the picker, the timeline panel).
+  {
+    const hide = el("div", "ctx-item ctx-item-toggle");
+    const bodyEl = el("span", "ctx-item-body");
+    const l = el("span", "ctx-item-label"); l.textContent = "Hide from chat & timeline"; bodyEl.appendChild(l);
+    const sb = el("span", "ctx-item-sub"); sb.textContent = "background it — the + picker and the feed still surface it"; bodyEl.appendChild(sb);
+    hide.appendChild(bodyEl);
+    hide.addEventListener("click", (ev) => { ev.stopPropagation(); dismissTabMenu(); postViews(hideIn(effViews(), id)); });
+    menu.appendChild(hide);
+  }
   // Billing submenu (the user 2026-08-09, who wants the login/API-key switch here rather than as a
   // statusline badge). Only when the machine offers BOTH choices (st.authBoth) — a one-auth machine
   // keeps the fact on the tab hover, never a dead selector — and the key stays labelled plainly
@@ -4401,10 +4506,11 @@ function onTabKey(e: KeyboardEvent) {
   if (!activeId || !order.length) return;
   if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
     e.preventDefault();
-    const i = order.indexOf(activeId);
+    const ord = visibleOrder();                 // never cycle onto a view-hidden session
+    const i = ord.indexOf(activeId);
     if (i < 0) return;
     const dir = e.key === "ArrowRight" ? 1 : -1;
-    setActive(order[(i + dir + order.length) % order.length]);
+    setActive(ord[(i + dir + ord.length) % ord.length]);
     focusActiveTab();
   } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
     e.preventDefault();
@@ -4461,11 +4567,12 @@ window.addEventListener("keydown", (e) => {
   if (document.querySelector(".picker-overlay")) return;   // #picker / #confirm open
   if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
     if (!activeId || order.length < 2) return;
-    const i = order.indexOf(activeId);
+    const ord = visibleOrder();                 // never cycle onto a view-hidden session
+    const i = ord.indexOf(activeId);
     if (i < 0) return;
     e.preventDefault();
     const dir = e.key === "ArrowRight" ? 1 : -1;
-    setActive(order[(i + dir + order.length) % order.length]);
+    setActive(ord[(i + dir + ord.length) % ord.length]);
   } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
     const content = document.getElementById("content");
     if (!content) return;
@@ -5488,10 +5595,16 @@ function closeCommentPop(): void {
   pendingCommentAnchor = null;
 }
 
-// close on any press outside the popover (drafts persist in commentDrafts; reopening restores them)
+// close on any press outside the popover (drafts persist in commentDrafts; reopening restores them).
+// The model/effort dropdowns and the break-out dialog ride document.body, so popover containment
+// can't see them: without the exemption, pressing a menu item closed the box on mousedown and nulled
+// pendingCommentAnchor before the item's click could land the pick (the user 2026-08-18), and a
+// press inside the break-out dialog stranded its Cancel the same way (Escape-cancel kept the box).
 document.addEventListener("mousedown", (ev) => {
   const pop = document.getElementById("cmt-pop");
-  if (pop && !pop.contains(ev.target as Node)) closeCommentPop();
+  if (!pop || pop.contains(ev.target as Node)) return;
+  if ((ev.target as HTMLElement).closest?.(".meta-menu, #fork-prompt")) return;
+  closeCommentPop();
 }, true);
 
 /** Re-anchor every thread of `sid` onto its rendered turn: the exact-text <mark> plus the turn badge.
@@ -5566,10 +5679,11 @@ function updateCommentRail(): void {
   const frame = contentOffsetFrame(content, v, s);
   if (!frame) { rail?.remove(); cmtRailSig = ""; return; }
   const ticks: Array<{ th: CommentThread; y: number }> = [];
+  const evUnit = eventUnitIndex(s);                       // anchors are EVENTS; the frame speaks UNITS
   for (const th of threads) {
     const idx = s.events.findIndex((e) => e.uuid === th.anchorUuid);
-    if (idx < 0) continue;
-    const off = frame.offsetOf(idx);
+    if (idx < 0 || evUnit[idx] < 0) continue;
+    const off = frame.offsetOf(evUnit[idx]);
     if (off == null) continue;
     // the same proportional map the notches use, clamped so the last tick stays on the strip
     ticks.push({ th, y: Math.min(r.height - 6, Math.round((off / frame.sh) * (r.height - 4))) });
@@ -5834,6 +5948,16 @@ function commentSendFromPop(pop: HTMLElement): void {
   if (list) fillCommentMsgs(list, cur.th);      // the pending bubble IS the acknowledgement
 }
 
+/** A live thread's model/effort chip label: the frame's value, tinted from the shared /models
+ *  colors. Shared by the chip's build and the in-place refresh — the popover survives the pick
+ *  now, so the frame's fresh value must reach the label it left behind. */
+function liveMetaLabel(label: HTMLElement, kind: "model" | "effort", th: CommentThread): void {
+  label.textContent = kind === "model" ? (th.model || "Default") : (th.effort || "default");
+  const choice = META_CHOICES[kind].find((c) => (label.textContent || "").toLowerCase().startsWith(c.value));
+  label.style.color = choice?.color && choice.color.length === 3
+    ? `rgb(${choice.color[0]},${choice.color[1]},${choice.color[2]})` : "";
+}
+
 /** The popover — ONE pane-local card (no backdrop: the conversation stays readable beside it).
  *  Same thread still open → the conversation refreshes IN PLACE: the composer, its caret and the
  *  action row survive every comments frame (a full rebuild per push ate mid-press clicks and
@@ -5851,11 +5975,15 @@ function renderCommentPopover(): void {
   const status = th ? th.status : "";
   if (prev && prev.dataset.mode === mode && prev.dataset.tid === (th ? th.tid : create!.uuid)
       && prev.dataset.status === status) {
-    // in-place refresh: conversation + title only
+    // in-place refresh: conversation, title, and the live model/effort labels
     const t = prev.querySelector(".cmt-title") as HTMLElement | null;
     if (t) t.textContent = commentPopTitle(!!create, th);
     const list = prev.querySelector(".cmt-msgs") as HTMLElement | null;
     if (th && list) fillCommentMsgs(list, th);
+    if (th) for (const b of Array.from(prev.querySelectorAll(".meta-btn[data-kind]")) as HTMLElement[]) {
+      const lbl = b.querySelector(".meta-label") as HTMLElement | null;
+      if (lbl) liveMetaLabel(lbl, b.dataset.kind === "model" ? "model" : "effort", th);
+    }
     return;
   }
   const hadFocus = !!prev?.querySelector(".cmt-input:focus-within, .cmt-input:focus");
@@ -6030,11 +6158,9 @@ function renderCommentPopover(): void {
       const mrow = el("div", "cmt-meta-row");
       const mkLive = (kind: "model" | "effort") => {
         const btn = el("span", "meta-btn cmt-meta") as HTMLElement;
+        btn.dataset.kind = kind;
         const label = el("span", "meta-label");
-        label.textContent = (kind === "model" ? (th.model || "Default") : (th.effort || "default"));
-        const choice = META_CHOICES[kind].find((c) => (label.textContent || "").toLowerCase().startsWith(c.value));
-        if (choice?.color && choice.color.length === 3)
-          label.style.color = `rgb(${choice.color[0]},${choice.color[1]},${choice.color[2]})`;
+        liveMetaLabel(label, kind, th);
         const caret = el("span", "meta-caret");
         caret.textContent = "▾";
         btn.append(label, caret);
@@ -6049,6 +6175,8 @@ function renderCommentPopover(): void {
             item.addEventListener("click", (ev) => {
               ev.stopPropagation();
               vscodeApi?.postMessage({ type: kind === "model" ? "setModel" : "setEffort", id: th.tid, value: c.value });
+              label.textContent = c.label;   // acknowledge the pick now; the next comments frame is authoritative
+              if (c.color && c.color.length === 3) label.style.color = `rgb(${c.color[0]},${c.color[1]},${c.color[2]})`;
               closeMetaMenu();
             });
             menu.appendChild(item);
@@ -6383,7 +6511,10 @@ function renderPicker(items: any[]) {
     name.replaceChildren(...hostNameNodes(it.name, it.id));
     if (it.color && it.color.bg) name.style.color = it.color.bg;
     const time = el("span", "picker-time");
-    if (it.running) {   // a live session (SDK/tmux backend) whose tab is closed → a green "running" badge
+    if (it.hiddenTab) {   // open as a tab but view-hidden (a background session) → picking reveals it
+      time.textContent = "hidden";
+      time.style.opacity = "0.7";
+    } else if (it.running) {   // a live session (SDK/tmux backend) whose tab is closed → a green "running" badge
       time.classList.add("picker-running-badge");
       time.append(el("span", "picker-run-dot"), document.createTextNode("running"));
     } else {
@@ -6401,6 +6532,9 @@ function renderPicker(items: any[]) {
       if (pickMode) {
         if (vscodeApi) vscodeApi.postMessage({ type: "pickResult", id: it.id, name: it.name });
         pickMode = false; // so closePicker doesn't also post a cancel
+      } else if (it.hiddenTab) {
+        revealSession(it.id);   // its tab already exists — un-hide it and switch to it
+        setActive(it.id);
       } else if (vscodeApi) {
         vscodeApi.postMessage({ type: "openSession", id: it.id });
       }
@@ -6417,10 +6551,16 @@ function renderPicker(items: any[]) {
     for (const it of items) list.appendChild(mkRow(it));
   } else {
     const avail = items.filter((it) => !isOpenTab(it.id));
+    // open-as-tab but view-HIDDEN sessions still list (the user 2026-08-18): a background session's
+    // one visible home on the chat side — omitting them here plus hiding the tab would recreate the
+    // secret-running-session state abolished 2026-08-11
+    const hidden = items.filter((it) => isOpenTab(it.id) && !tabInView(it.id))
+                        .map((it) => Object.assign({}, it, { hiddenTab: true }));
     const running = avail.filter((it) => it.running);
     const rest = avail.filter((it) => !it.running);
     if (running.length) { list.appendChild(label("Running — reopen")); for (const it of running) list.appendChild(mkRow(it)); }
-    if (rest.length) { if (running.length) list.appendChild(label("Recent")); for (const it of rest) list.appendChild(mkRow(it)); }
+    if (hidden.length) { list.appendChild(label("Hidden — reveal")); for (const it of hidden) list.appendChild(mkRow(it)); }
+    if (rest.length) { if (running.length || hidden.length) list.appendChild(label("Recent")); for (const it of rest) list.appendChild(mkRow(it)); }
   }
   if (!list.children.length && pickerListHost) {
     // a machine romp can reach but which has no sessions in the window: say that, or an empty list reads
@@ -7399,6 +7539,80 @@ if (typeof ResizeObserver === "function") {
       lastH = h;
     });
     tro.observe(box);
+  }
+}
+
+// ── drag-to-resize the tab strip (the user 2026-08-18) ── #tabbar wraps its tabs into rows and scrolls
+// past its max-height cap (150px ≈ four rows), which clipped the fifth row of a many-session strip with
+// no way to see more. The #tabbar-resize grip straddles the strip's bottom border: drag DOWN for more
+// rows, UP for fewer; it stays a scroll pane at every size. The dragged cap is per-viewer arrangement
+// like the tab ORDER (romp:vieworder), so it lives in localStorage — applied at boot, written on release
+// (not per-move). A double-click resets to the CSS default. Same pattern as #composer-resize; the grip
+// is a SIBLING below the bar (a child would scroll away with the rows), so it also survives every #tabs
+// re-render. The content-anchor ResizeObserver above cancels the scroll jump the resize would cause.
+{
+  const bar = document.getElementById("tabbar");
+  const grip = document.getElementById("tabbar-resize");
+  if (bar && grip) {
+    // `cap` is the preference of record. The APPLIED value re-clamps to the live window on every
+    // resize (an oversized cap must not crush the transcript when the window shrinks), but a
+    // briefly-small window never rewrites the preference — the applied style heals back when the
+    // window grows. Applied through the --tabbar-cap VAR, never the max-height property: the mobile
+    // page's `#tabbar{max-height:none}` must keep winning (an inline max-height would override that
+    // media rule and clip the mobile header, e.g. after a tablet rotation).
+    let cap = parseTabbarH(localStorage.getItem(TABBAR_H_KEY));
+    const applyCap = () => {
+      if (cap == null) bar.style.removeProperty("--tabbar-cap");
+      else bar.style.setProperty("--tabbar-cap", clampTabbarH(cap, window.innerHeight) + "px");
+    };
+    applyCap();
+    window.addEventListener("resize", applyCap);
+    let startY = 0, startH = 0, pid = 0, dragging = false, stick = false;
+    const onMove = (e: PointerEvent) => {
+      if (!dragging) return;
+      if (!(e.buttons & 1)) { onUp(); return; }    // release swallowed (context menu, off-window) → end, never strand a phantom drag
+      cap = clampTabbarH(startH + (e.clientY - startY), window.innerHeight);
+      applyCap();
+      // growing the bar shrinks #content, which would push a tail-following view off the tail one
+      // sub-threshold step at a time — if it was at the tail when the drag began, keep it there
+      const content = document.getElementById("content");
+      if (stick && content) content.scrollTop = content.scrollHeight;
+    };
+    const onUp = () => {
+      if (!dragging) return;
+      dragging = false;
+      try { grip.releasePointerCapture(pid); } catch { /* already released */ }
+      grip.classList.remove("dragging");
+      document.body.classList.remove("tabbar-resizing");
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      if (cap != null) localStorage.setItem(TABBAR_H_KEY, String(cap));
+    };
+    grip.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;                  // a right-click opens menus, never a drag
+      e.preventDefault();
+      dragging = true;
+      startY = e.clientY;
+      // Anchor to the EFFECTIVE cap, never the rendered height: with fewer rows than the cap the
+      // rect is content-sized, and anchoring there silently collapsed a larger stored cap to about
+      // the content height on any drag — invisible at the time, and the clipped strip came back
+      // weeks later with no visible cause.
+      startH = cap != null ? clampTabbarH(cap, window.innerHeight) : TABBAR_H_DEFAULT;
+      const content = document.getElementById("content");
+      stick = !!content && nearBottom(content);
+      pid = e.pointerId;
+      // capture so the drag survives leaving the pane; a pointer already gone throws — the window
+      // listeners below carry the drag either way, so a failed capture must not abort the setup
+      try { grip.setPointerCapture(pid); } catch { /* pointer already released */ }
+      grip.classList.add("dragging");
+      document.body.classList.add("tabbar-resizing");
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onUp);
+    });
+    // a double-click resets to the CSS default cap — the quick escape hatch, like the composer's
+    grip.addEventListener("dblclick", () => { cap = null; applyCap(); localStorage.removeItem(TABBAR_H_KEY); });
   }
 }
 
@@ -9489,10 +9703,11 @@ function setActive(id: string, anchor?: string, anchorT?: number, anchorKind?: s
 }
 
 function cycleTab(dir: number) {
-  if (order.length < 2 || !activeId) return;
-  const i = order.indexOf(activeId);
+  const ord = visibleOrder();                   // never cycle onto a view-hidden session
+  if (ord.length < 2 || !activeId) return;
+  const i = ord.indexOf(activeId);
   if (i < 0) return;
-  setActive(order[(i + dir + order.length) % order.length]);
+  setActive(ord[(i + dir + ord.length) % ord.length]);
 }
 
 // First event carrying a uuid — a stable identity for "which transcript is this".
@@ -10085,7 +10300,7 @@ window.addEventListener("message", (e: MessageEvent) => {
   else if (m.type === "ledger") setLedger(m.id, m.ledger ?? null);
   else if (m.type === "working") { workingSet = new Set(Array.isArray(m.names) ? m.names : []); refreshPostalDots(); }
   else if (m.type === "imgData" && typeof m.path === "string") onImgData(m.path, typeof m.url === "string" ? m.url : null);
-  else if (m.type === "tabOrder") applyTabOrder(m.order, m.tabs);
+  else if (m.type === "tabOrder") { captureViews(m.views || null); applyTabOrder(m.order, m.tabs); }
   else if (m.type === "renamed" && m.id && typeof m.name === "string") {
     const s = sessions.get(m.id);
     if (s && s.name !== m.name) { s.name = m.name; renderTabs(); }

@@ -1487,6 +1487,7 @@ def _ordered(sessions):
             a = _nm(sid)
             sib = [i for i, n in enumerate(name_at) if a and n == a]   # same-name entries already placed
             if sib:
+                _heal_timeline_views(order[sib[-1]], sid)   # the fork inherits hidden/group state too
                 order.insert(sib[-1] + 1, sid)           # a fork inherits its session's slot, not the END
                 name_at.insert(sib[-1] + 1, a)           # keep name_at aligned with order as we splice
             else:
@@ -1508,6 +1509,102 @@ def _ordered_alive(now, tmux):
 # carded and billed: a secret running session, a tmux-era affordance (sessions lived outside romp) with
 # no SDK-era use case. Every running session now always shows; × means End session, and close-and-reopen
 # is End + Revive, which keeps history. A stale hidden-tabs.json on disk is inert, like web-kernel.json.)
+
+
+# ── session VIEWS: which sessions the user is looking at (the user 2026-08-18) ────────────────────
+# One blob under STATE (timeline-views.json), shared by every dashboard this kernel serves (browser,
+# VS Code, Obsidian): {"active": "all"|group-id, "hidden": [id...], "groups": [{"id","name","color",
+# "members": [id...]}]}. "all" shows every session EXCEPT the hidden set — hiding makes a BACKGROUND
+# session: out of the timeline lanes and the chat tab strip, still judged, carded and reachable (the
+# feed and the session pickers keep surfacing it, so nothing runs in secret — the 2026-08-11 rule).
+# A named group shows exactly its members; explicit membership beats the hidden set, which is the
+# one clean answer to "does a hidden session show when its group is picked". Persisted by the LOCAL
+# kernel like colormap/palette (a viewer display pref, deliberately not federated); ids are stored
+# as the viewer sees them (host-prefixed for remote sessions), opaque to this kernel. mtime-cached
+# like _session_flags. Remote-session ids that churn on a REMOTE kernel are not healed here (that
+# kernel cannot reach this blob) — same accepted gap session-flags has; SDK sids are stable anyway.
+_VIEWS_MAX_GROUPS = 32
+_VIEWS_MAX_NAME = 40
+
+
+def _views_path():
+    return jd.STATE / "timeline-views.json"
+
+
+def _norm_timeline_views(d):
+    """Validate + normalize a views blob from disk or a client: always returns the full shape, drops
+    junk quietly, clamps sizes, and falls back active→"all" when the named group does not exist."""
+    if not isinstance(d, dict):
+        d = {}
+    _lst = lambda x: x if isinstance(x, list) else []   # wrong-typed junk (a number, a string) drops, never raises
+    hidden = [str(x) for x in _lst(d.get("hidden")) if isinstance(x, str) and x]
+    groups = []
+    for g in _lst(d.get("groups"))[:_VIEWS_MAX_GROUPS]:
+        if not isinstance(g, dict) or not g.get("id") or not isinstance(g.get("id"), str):
+            continue
+        members = [str(x) for x in _lst(g.get("members")) if isinstance(x, str) and x]
+        groups.append({"id": g["id"][:64],
+                       "name": str(g.get("name") or "group")[:_VIEWS_MAX_NAME],
+                       "color": str(g.get("color") or "")[:16],
+                       "members": sorted(set(members))})
+    active = d.get("active") if isinstance(d.get("active"), str) else "all"
+    if active != "all" and not any(g["id"] == active for g in groups):
+        active = "all"
+    return {"active": active, "hidden": sorted(set(hidden)), "groups": groups}
+
+
+def _timeline_views():
+    p = _views_path()
+    try:
+        st = p.stat(); key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return _norm_timeline_views({})
+    hit = _flags_cache.get(str(p))
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    try:
+        d = json.loads(p.read_text())
+    except Exception:
+        d = {}
+    d = _norm_timeline_views(d)
+    _flags_cache[str(p)] = (key, d)
+    return d
+
+
+def _set_timeline_views(blob):
+    _atomic_write(_views_path(), json.dumps(_norm_timeline_views(blob), sort_keys=True))
+
+
+def _view_visible(views, sid):
+    """The one visibility decision, kernel-authoritative: mirrored (three lines each) by the chat
+    renderer and the timeline for optimistic feedback — tests pin all three against this shape."""
+    if views["active"] == "all":
+        return sid not in views["hidden"]
+    for g in views["groups"]:
+        if g["id"] == views["active"]:
+            return sid in g["members"]
+    return True
+
+
+def _heal_timeline_views(old_sid, new_sid):
+    """fsid churn (a /clear, relaunch or revive mints a new transcript fsid for the same logical
+    session): carry the old sid's hidden bit and group memberships to the new one, exactly like the
+    order-slot inheritance that detects the churn. Without this a hidden tmux session would pop back
+    visible on every /clear — and worse, a grouped one would silently fall out of its group."""
+    v = _timeline_views()
+    if old_sid not in v["hidden"] and not any(old_sid in g["members"] for g in v["groups"]):
+        return
+    v = json.loads(json.dumps(v))                    # deep copy: never mutate the cached blob
+    # COPY, never move: stripping the old sid un-hid its DEAD lane, which lingers on the timeline for
+    # hours — and when the old sid is still alive (a fork beside a living parent, or an unrelated new
+    # session reusing a name), moving would steal the living session's state. A dead sid left in the
+    # lists is inert; the normalizer keeps them bounded.
+    if old_sid in v["hidden"]:
+        v["hidden"] = sorted(set(v["hidden"]) | {new_sid})
+    for g in v["groups"]:
+        if old_sid in g["members"]:
+            g["members"] = sorted(set(g["members"]) | {new_sid})
+    _set_timeline_views(v)
 
 
 # ── per-session view flags (the user 2026-06-19) ──────────────────────────────────────────────────
@@ -3759,9 +3856,13 @@ AWAITING_BACKSTOP_SECS = 6 * 3600
 # banned by the injected-voice rule — and sat outside tests/test_injected_voice.py's index, which is how it
 # survived the 2026-07-24 sweep. It is indexed there now.
 AWAITING_BACKSTOP_TEXT = (
-    "Checking in on the background work you set in motion here. If it finished, pick the result up and "
-    "keep going. If it stalled or died, relaunch it or find another way; your call. If you're now blocked, "
-    "say exactly what you need from me. If it's genuinely still running, a one-line status is enough.")
+    "Checking in on the background work you set in motion here. Go LOOK at the thing itself first — "
+    "the job queue, the pull request, the run's output, whatever you were waiting on — rather than "
+    "answering from memory. If it finished, pick the result up and keep going. If it stalled or died, "
+    "relaunch it or find another way; your call. If it can only move when someone acts on it and "
+    "they haven't, chase it or route around it. If you're now blocked, say exactly what you need "
+    "from me. Only if you checked just now and it's genuinely still running is a one-line status "
+    "enough.")
 
 
 def _put_nudged(gid, rec):
@@ -5333,7 +5434,7 @@ def _apply_new_session_prefs(sid, body):
     return out
 
 
-def _create_sdk_session(nm, cwd, auth="", prefs=None):
+def _create_sdk_session(nm, cwd, auth="", prefs=None, client=None):
     """Create + open a new SDK-backed session, ACK-FAST (the user 2026-07-14, who asked why it took so long
     to open a new SDK session). spawn() is file writes and connect() is threaded (~0.4s to a booting
     CLI) — the 7-10s the user waited was the handler's inline _push_all(): a new session invalidates the
@@ -5352,13 +5453,21 @@ def _create_sdk_session(nm, cwd, auth="", prefs=None):
     kickoff fed into that dying client's stdin was cancelled mid-delivery and landed nowhere (a fresh
     spawn's briefing sat as a dropped echo for 5.5h on a conversation that never started, 2026-08-16).
     Pre-connect there is no session object yet, so the setters are pure reg writes the connect reads —
-    no reconnect exists to race. Returns (sid, echo) — echo is the applied-prefs ack for /new's reply."""
+    no reconnect exists to race. Returns (sid, echo) — echo is the applied-prefs ack for /new's reply.
+
+    The focus is aimed at `client` — the dashboard whose picker asked — per the per-viewer rule
+    (which tab you are looking at is yours, 2026-07-29). No client means NOBODY moves: the CLI's
+    POST /new has no dashboard in hand, and broadcasting its focus switched every open window's chat
+    to whatever session a terminal or a script just created (the user 2026-08-16, whose chats kept
+    jumping to sessions they had not touched). The tab itself still reaches every window via the
+    push."""
     bg, fg = _pick_identity_color()   # fleet-aware: only the kernel sees BOTH backends' live sessions
     _commands_for_cwd(cwd)   # pre-warm the slash-command list — a new session predicts a composer (the user 2026-08-13)
     sid = _sdk().spawn(nm, cwd, bg, fg, auth=auth)
     extra = _apply_new_session_prefs(sid, prefs or {})
     _sdk().connect(sid)    # eager-connect so the model lists immediately, not only after the 1st message
-    _reveal_chat({"type": "focus", "id": sid})
+    if client is not None:
+        _reveal_chat_for(client, {"type": "focus", "id": sid})
     _mark_views_dirty()
     _push_session_now(sid)   # the tab the user is staring at, ahead of the woken cycle
     return sid, extra
@@ -5377,7 +5486,7 @@ def _create_codex_session(nm, cwd):
     return sid
 
 
-def _fork_session(parent_sid, cut_msg_uuid, new_name, now=None):
+def _fork_session(parent_sid, cut_msg_uuid, new_name, now=None, client=None):
     """Fork `parent_sid`'s conversation into a NEW parallel session named `new_name` — from just BEFORE
     user message `cut_msg_uuid` when given (the chat's fork button; same _rewind_target resolution and
     guards as the edit/delete rewind, so "before this message" means the same thing everywhere), the
@@ -5413,7 +5522,8 @@ def _fork_session(parent_sid, cut_msg_uuid, new_name, now=None):
     bg, fg = _pick_identity_color()
     be.fork(nm, parent_sid, cut_uuid, bg, fg, sid=sid)
     be.connect(sid)          # eager-connect: the CLI copies the conversation and the tab fills in
-    _reveal_chat({"type": "focus", "id": sid})
+    if client is not None:   # the asker's window follows its fork; nobody else's chat moves
+        _reveal_chat_for(client, {"type": "focus", "id": sid})
     _mark_views_dirty()
     _push_session_now(sid)
     return None
@@ -6078,7 +6188,7 @@ def _comment_kill_all(parent_sid, be):
                 pass
 
 
-def _comment_promote(parent_sid, tid, new_name, now=None):
+def _comment_promote(parent_sid, tid, new_name, now=None, client=None):
     """Break a thread out into a FULL board session. Ordering contract (same as _fork_session):
     judge stores are seeded BEFORE promote_thread writes the names/ entry. The seeds run against
     the PARENT transcript at the ORIGINAL cut (the history the two transcripts share, verbatim),
@@ -6128,7 +6238,8 @@ def _comment_promote(parent_sid, tid, new_name, now=None):
         return _revert("couldn't promote this thread.")
     _comment_update(parent_sid, tid, status="promoted", promotedName=nm)
     started = be.connect(tsid)
-    _reveal_chat({"type": "focus", "id": tsid})
+    if client is not None:   # the promoter's window follows the new session; nobody else's chat moves
+        _reveal_chat_for(client, {"type": "focus", "id": tsid})
     _mark_views_dirty()
     _push_session_now(tsid)
     if not started:
@@ -6231,6 +6342,10 @@ def _sdk_locked():
                 append_prompt_path=(str(_SDK_PROMPT) if _SDK_PROMPT.exists() else None),
                 log=lambda m: sys.stderr.write("sdk-backend: %s\n" % m),
                 reconcile=True)   # boot reconcile: reap orphaned CLIs, resume cut turns, deliver persisted queues
+            # a limit-shaped judge error envelope pokes ONE exact usage poll (get_usage rides turn
+            # ends, so an idle fleet's usage.json goes stale — measured ~15h — and the rate gate is
+            # only as good as that file); the backend picks any live login session to ask
+            jd._USAGE_REFRESH_FN = getattr(_sdk_backend, "refresh_usage", None)   # best-effort hook (judge guards None)
         except Exception:
             sys.stderr.write("sdk-backend unavailable: %s\n" % traceback.format_exc())
             _sdk_problem("the SDK backend could not be built: %s" % traceback.format_exc())
@@ -7045,7 +7160,7 @@ def _drive(msg, client):
         # Fork this conversation into a NEW parallel session (the user 2026-08-13). uuid (optional) is the
         # user message the fork cuts just BEFORE — absent means the whole conversation. LOUD on refusal;
         # on success the new tab arrives focused via _fork_session's own push.
-        err = _fork_session(sid, str(msg.get("uuid") or ""), str(msg["name"]))
+        err = _fork_session(sid, str(msg.get("uuid") or ""), str(msg["name"]), client=client)
         if err:
             client["send"](json.dumps({"type": "warn", "text": err}))
     elif t == "commentCreate" and msg.get("uuid") and msg.get("exact") and msg.get("text"):
@@ -7087,7 +7202,7 @@ def _drive(msg, client):
     elif t == "commentPromote" and msg.get("tid") and msg.get("name"):
         # Break the thread out into its own board session. LOUD on refusal; on success the new tab
         # arrives focused via _comment_promote's own push (the forkSession acknowledgement shape).
-        err = _comment_promote(sid, str(msg["tid"]), str(msg["name"]))
+        err = _comment_promote(sid, str(msg["tid"]), str(msg["name"]), client=client)
         if err:
             client["send"](json.dumps({"type": "warn", "text": err}))
     elif t == "endSession":
@@ -7109,7 +7224,7 @@ def _drive(msg, client):
 def _reveal_or_confirm(sid, focus_msg, client=None):
     """Bring the chat to `sid`. LIVE → the focus message. DEAD → never silently reveal; pop the chat's
     confirmRevive modal (Revive / View read-only), bringing the chat forward (the user 2026-06-17: dead
-    = timeline-only, reopen on demand). Routing the prompt through _reveal_chat means a feed/timeline tap
+    = timeline-only, reopen on demand). Routing the prompt through _reveal_chat_for means a feed/timeline tap
     lands the modal in the chat, which owns it — even though the tap came from another pane.
 
     Where a CLIENT is in scope (every WS op that calls this), the reveal is aimed at that dashboard
@@ -7269,11 +7384,16 @@ def _split_host_id(sid):
     return (s[:i], s[i + 1:]) if i > 0 else ("", s)
 
 
-def _open_or_revive(sid, live=False):
+def _open_or_revive(sid, live=False, client=None):
     """openSession routing: a LIVE session → focus the chat (its tab is always shown); a DEAD one → the
     confirmRevive modal (no silent reopen, no auto read-only tab — the user 2026-06-17). `live` (the user
     2026-07-08): land the chat on its LIVE TAIL, not the last scroll — a blocked card's picker/permission
-    prompt is the live bottom, so its feed chip drops you right on it."""
+    prompt is the live bottom, so its feed chip drops you right on it.
+
+    `client` rides through to _reveal_or_confirm so the jump moves the ASKING dashboard alone. This was
+    the one click-op the per-viewer fix (2026-07-29) missed — its guard test counted _reveal_chat_for
+    call sites and the other branches satisfied the count — so every feed/fleet/picker tap kept
+    switching the chat in EVERY open window (the user 2026-08-16)."""
     if sid in _tmux_sessions():
         be = _sdk()
         if be:
@@ -7285,11 +7405,13 @@ def _open_or_revive(sid, live=False):
     focus = {"type": "focus", "id": sid}
     if live:
         focus["live"] = True
-    _reveal_or_confirm(sid, focus)
+    _reveal_or_confirm(sid, focus, client)
 
 
-def _revive_session(sid):
-    """Bring a DEAD session back, per backend, then un-hide its tab and focus the chat on it. SDK-owned
+def _revive_session(sid, client=None):
+    """Bring a DEAD session back, per backend, then un-hide its tab and focus the chat on it — the chat
+    of the dashboard that clicked Revive (`client`), not every open window's (the per-viewer rule; the
+    reviveFailed notice is aimed the same way, since only the asker has a revive loader up). SDK-owned
     (registry entry exists) → SdkBackend.resume + connect: alive again, resuming its newest transcript
     (lastSid) with history intact. Otherwise tmux → `romp <name> --resume <sid> --detach` in the session's
     recorded dir (dir resolution, picker-grace via bin/romp's own picker-check). Runs in a thread off the
@@ -7321,12 +7443,13 @@ def _revive_session(sid):
         ok, detail = False, str(e)[:200]
     if not ok:
         sys.stderr.write("revive '%s' (%s): %s\n" % (name, sid, detail))
-        _send_to_app("chat", {"type": "reviveFailed", "id": sid, "name": name,
-                              "text": detail or "unknown error"})
+        _send_to_view("chat", {"type": "reviveFailed", "id": sid, "name": name,
+                               "text": detail or "unknown error"}, (client or {}).get("wid") or "")
         return
     _kept_open.discard(sid)       # it's live again → no longer a read-only kept tab
     _push_all()                   # surface it promptly (the 4s pusher would catch it anyway)
-    _reveal_chat({"type": "focus", "id": sid})
+    if client is not None:        # the asker's revive loader clears on this focus; other windows stay put
+        _reveal_chat_for(client, {"type": "focus", "id": sid})
 
 
 # ─────────────────────────── TmuxBackend: the ONE place that shells tmux ───────────────────────────
@@ -11589,7 +11712,17 @@ def _tmux_send(name, text, model_cmd=False, _async=True):
 
 def _parse_send_body(raw):
     """Parse a POST /send body into {"who","text"}, or None if invalid. who = id or
-    name; text must be a non-empty string. Pure (no I/O) so the route is unit-testable."""
+    name; text must be a non-empty string. Pure (no I/O) so the route is unit-testable.
+
+    Optional "tag": a one-word label (letters/digits/dashes, <=24 chars — MSG_TAG_RE's
+    grammar) for SCHEDULED/SCRIPTED senders (the user 2026-08-18, whose nightly
+    optimizer briefing wore the wrong dress): the kernel appends the render-hint marker
+    `<!-- romp-tag: <label> -->` so the chat shows the message machine-sent under that
+    label — the same third identity `romp send --tag` writes by hand — instead of
+    posing it as the user's typed words or dressing it as romp's own. A malformed tag
+    fails the WHOLE parse (loud, per the fail-loudly rule): the caller asked for an
+    identity the kernel can't honor, and delivering the text anyway would silently
+    misattribute it."""
     try:
         body = json.loads(raw or b"{}")
     except Exception:
@@ -11600,6 +11733,11 @@ def _parse_send_body(raw):
     text = body.get("text")
     if not who or not isinstance(text, str) or not text:
         return None
+    tag = body.get("tag")
+    if tag is not None:
+        if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,23}", tag):
+            return None
+        text = text + "\n\n<!-- romp-tag: " + tag + " -->"
     return {"who": who, "text": text}
 
 
@@ -17108,7 +17246,13 @@ def _postal_wait_maps():
             # toName ("<host>:<name>") resolves to the real sid through the alias map above; an
             # unresolvable relay keeps the raw id and behaves exactly as before.
             if isinstance(t_, str) and t_.startswith("peer:") and o.get("toName"):
-                t_ = alias.get(str(o["toName"]), t_)
+                # unresolvable (the peer never sent a row, so the alias map can't know its sid) →
+                # key on the NAMED recipient rather than the bare relay: two asks to different
+                # sessions on one detached host used to collapse onto the single (from, relay)
+                # pair, the later silently overwriting the earlier (the 2026-08-18 audit found a
+                # 29.6h-invisible ask eaten this way). The maps rebuild from the full log, so the
+                # moment the peer speaks the alias resolves and every row re-keys to the real sid.
+                t_ = alias.get(str(o["toName"]), "peer:" + str(o["toName"]))
             ts = int(ts)
             last_any[(f, t_)] = max(last_any.get((f, t_), 0), ts)
             k = o.get("kind")                            # the sender's DECLARED intent (schema field) wins
@@ -17170,11 +17314,17 @@ def _peer_answered_at(sid):
     carry the wait, and the closer's next pass can re-stamp with a fresh awaitingAt."""
     last_any, last_ask = _postal_wait_maps()
     best = 0
-    for (f, t_), (ts, _k, _h) in last_ask.items():
+    # OUTBOUND rides last_any, not last_ask (2026-08-18 audit): the 2026-08-15 change that stopped
+    # DELEGATES from making chip edges also emptied last_ask of them — which silently removed this
+    # release, so a delegated peer's reply no longer superseded a judge kind=peer stamp (a cross-host
+    # handoff answered in 23 minutes still wore Awaiting six hours later, with the 6h wake as the
+    # only exit). Reading every outbound restores the designed exact ending event for questions and
+    # handoffs alike; the chip edge stays question-only, exactly as #430 intended.
+    for (f, t_), sent in last_any.items():
         if f != sid:
             continue
         r = last_any.get((t_, f), 0)
-        if r >= ts:                                      # the pair's newest ask is answered
+        if r >= sent:                                    # the pair's newest outbound is answered
             best = max(best, r)
     return best
 
@@ -18029,6 +18179,7 @@ def build_feed(now, tmux=None):
                 "background": nodes[nid].get("background"),    # the distiller's BACKGROUND section: re-orientation for a reader who forgot the thread — collapsed by default on the card (the user 2026-07-02)
                 "summaryAnchorUuid": _sa_u,    # click the summary line → the completion turn's wrap-up (completed pin), else the cited/latest prose (the user 2026-07-14)
                 "warns": nodes[nid].get("warns") or None,   # judge-stamped anomalies (judge _node_warn) → yellow "warning" chip; click shows each warn's what/why detail (the user 2026-07-02)
+                "failLog": nodes[nid].get("failLog") or None,   # the summarizer's failed attempts (judge _fail_log): model + literal error per try → the chip's hover history + modal "What was tried" (the user 2026-08-18)
                 "nudged": ({"count": int(nrec.get("count", 0)), "times": _nudge_times().get(nid, [])[-8:]}
                            if nrec.get("count") else None),   # auto-nudge HISTORY (fires + when) → the stalled chip's evidence, on the chip tooltip + modal (the user 2026-07-02)
                 "blocked": ({"state": "apiError",
@@ -18157,6 +18308,10 @@ def build_feed(now, tmux=None):
     for _a in asks:
         _a["notify"] = True if _notify_card_effective(_ncards, _a["itemId"], str(_a.get("sid") or "")) else None
     return {"type": "feed", "asks": asks, "now": now,
+            # usage-limit-down latch (judge-limit.json): analysis is paused because the account
+            # cannot bill judge calls — the dashboard must SAY so, never fail quietly into retries
+            # (the user 2026-08-18); self-expires at the window reset, cleared by the next success
+            "judgeLimit": jd._limit_down(),
             "working": working, "awaiting": awaiting,   # awaiting = idle-but-waiting-on-bg-work names → await-green dot (the user 2026-07-13)
             # listed-but-unreadable names → an explicit gray ring, so a BLANK pip means "alive and
             # quiet" and nothing else (see _state_unknown_names)
@@ -19486,6 +19641,27 @@ def _attach_run_usage(judging, t0, alive_sids):
                 mk["sent"], mk["recv"] = r.get("sent"), r.get("recv")
 
 
+_BARS_COMPLAINED = {}   # (who, stage) → cause head already logged: one line per DISTINCT cause,
+#                       never one per 2s build — but never silence (fail loudly, 2026-07-03)
+
+
+def _bars_complain(who, stage, e):
+    """A bars-build stage failed for `who` (a sid, or "*" for a global stage). The old behavior was a
+    silent swallow — a working session rendered its lane with ZERO bars forever and nothing said why
+    (the user 2026-08-18). The lane/frame still degrades the same way; the difference is the trace."""
+    head = "%s: %s" % (type(e).__name__, str(e)[:160])
+    if _BARS_COMPLAINED.get((who, stage)) == head:
+        return
+    _BARS_COMPLAINED[(who, stage)] = head
+    sys.stderr.write("timeline bars: %s %s failed — rendering without that data: %s\n"
+                     % (str(who)[:8], stage, head))
+
+
+_JUDGING_ROW_CAP = 20000     # judging marks per bars frame — far above any legible band density,
+                             # far below the 147k-mark storm frame that starved bars (2026-08-18)
+_JUDGING_TRIMMED = {}        # transition latch for the trim log line (order-of-magnitude keyed)
+
+
 def _run_judging(t0, alive_sids, semantic):
     """The judging band built from the per-call LOG (judge-usage.jsonl) instead of back-placed onto the
     work: ONE span per API call, plotted at its real wall-clock [sent, recv] — so the band shows WHEN each
@@ -19501,16 +19677,15 @@ def _run_judging(t0, alive_sids, semantic):
     for v in by.values():
         v.sort(key=lambda m: m["t"])
     out = []
-    try:
-        lines = (jd.STATE / "judge-usage.jsonl").read_text(errors="replace").splitlines()
-    except OSError:
-        return out
+    # The SHARED incremental reader, not a per-build full read: this used to read_text + json.loads
+    # the whole of judge-usage.jsonl on EVERY bars build (measured 2026-08-18 during the captioner
+    # storm: 59.5MB / 222,947 rows ≈ 1s per build, cache-busted every ~2s by the next usage row) —
+    # the pusher then spent its cycles parsing telemetry while {type:"bars"} frames starved and
+    # working sessions painted lanes with no bars. _judge_usage_rows already existed for exactly
+    # this (the 2026-08-13 analytics freeze); the band just never adopted it.
+    rows = _judge_usage_rows()
     done = set()                                      # (sid, judge, sent) of completed runs — to dedup live ones
-    for ln in lines:
-        try:
-            o = json.loads(ln)
-        except Exception:
-            continue
+    for o in rows:
         sid, judge = o.get("fsid"), o.get("judge")
         judge = _JUDGE_FAMILY.get(judge, judge)
         if sid not in alive_sids:
@@ -19546,6 +19721,21 @@ def _run_judging(t0, alive_sids, semantic):
         out.append({"judge": judge, "sid": sid, "t": sent, "t1": now,
                     "kind": (src or {}).get("kind", "run"), "text": (src or {}).get("text", ""),
                     "ms": 0, "in": 0, "out": 0, "sent": sent, "recv": None, "open": True})
+    # VOLUME BOUND on what rides the wire: every {type:"bars"} frame carries this array, and during
+    # the 2026-08-18 captioner storm 147,803 rows passed the 48h horizon and serialized to ~35MB per
+    # frame per client — the frames arrived minutes late or killed the socket, which IS the
+    # lanes-without-bars symptom. Past any legible density the band gains nothing, so keep the
+    # NEWEST marks and say what was dropped (never a silent cap) — one line per order-of-change,
+    # not per 2s build.
+    if len(out) > _JUDGING_ROW_CAP:
+        out.sort(key=lambda m: m["t"])
+        cut = len(out) - _JUDGING_ROW_CAP
+        del out[:cut]
+        if _JUDGING_TRIMMED.get("mag") != cut // 10000:
+            _JUDGING_TRIMMED["mag"] = cut // 10000
+            sys.stderr.write("timeline judging band: %d oldest marks trimmed from the frame "
+                             "(cap %d; a judge storm is the usual cause — see judge-usage.jsonl)\n"
+                             % (cut, _JUDGING_ROW_CAP))
     return out
 
 
@@ -19627,7 +19817,8 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
         if with_bars:
             try:
                 session = _parse(s["path"], sid, now)
-            except Exception:
+            except Exception as e:
+                _bars_complain(sid, "parse", e)           # a lane with zero bars must SAY why
                 session = {"turns": []}
             if live:
                 # Merge the LIVE TAIL like the chat does (the user 2026-07-02): a /model change streams the
@@ -19638,8 +19829,8 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
                 # Safe for the working signal — a command atom never forces the turn open (live_work).
                 try:
                     session = _merge_live_atoms(session, sid)
-                except Exception:
-                    pass
+                except Exception as e:
+                    _bars_complain(sid, "live-merge", e)  # disk-only bars from here — say so
             caps = _captions(sid)
             st_turns = session["turns"]
             open_now = _session_working(st_turns)         # WORKING from the event model — the one shared signal
@@ -19697,7 +19888,16 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
             turn_open = (live and ti == len(st_turns) - 1 and not turn["ended"]
                          and not any(x["type"] == "idle" for x in turn["atoms"])
                          and not _suspended_after(turn["end"]))   # dead lane (live False) or pre-sleep freeze → not an open bar
-            segs = _segs_seam(turn, goals)
+            try:
+                segs = _segs_seam(turn, goals)
+            except Exception as e:
+                # a malformed goals row must cost the SEAMS, not the lane's bars (2026-08-18: any
+                # exception here used to abort the whole bars frame after the skeleton had shipped)
+                _bars_complain(sid, "seams", e)
+                try:
+                    segs = em.segments(turn)
+                except Exception:
+                    segs = []
             _bft = (branch_of.get(sid) or {}).get("t")
             for si, seg in enumerate(segs):
                 if _bft and (seg.get("end") or seg["t"]) <= _bft:
@@ -19745,7 +19945,10 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
                 pass
         if with_bars:
             turns[sid] = bars
-            _derive_judging(sid, caps, goals, now - TL_HORIZON, semantic, seg_ends)
+            try:
+                _derive_judging(sid, caps, goals, now - TL_HORIZON, semantic, seg_ends)
+            except Exception as e:
+                _bars_complain(sid, "judging-marks", e)   # this lane loses its marks, the frame ships
         _bft = (branch_of.get(sid) or {}).get("t")
         compactions = [{"t": a["t"]} for turn in st_turns for a in turn["atoms"]
                        if a.get("type") == "system" and a.get("subtype") == "compact_boundary" and a.get("t")
@@ -19800,18 +20003,31 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
             "postalServiceOff": _session_flag(sid, "postalServiceOff") or _session_flag(sid, "postalOff"),  # lane mailbox → isolate from the Romp Postal Service (bin/romp-postal-service)
             "notify": _notify_session_effective(sid)})   # lane bell, EFFECTIVE (override, else the master default) → OS notification when this session's work blocks on you / completes (the user 2026-07-28)
     if with_bars:
-        messages = _postal_messages(now, set(id2name), id2name)
-        _bind_message_execs(messages, turns)             # connector exec → the recipient's process-start (real transit)
-        # mids STAY on the wire (2026-08-17): the merged-view dmid join (romp-timeline-view.js) re-binds
-        # a relayed connector's exec to the recipient turn by bar mids — the 2026-07-07 payload-audit pop
-        # ("no client ever read them") predated that 2026-08-06 feature and had silently starved it: the
-        # join's key set was always empty on live payloads, so relayed execs never re-bound client-side.
-        for _m in messages:
-            _m.pop("fromOrig", None)
+        # Each with_bars-only stage is guarded ALONE (2026-08-18): the pusher sends the cheap lane
+        # SKELETON before this heavy build, and its shared try used to abort the WHOLE bars frame on
+        # one malformed store row — every cycle re-sent fresh skeletons while {type:"bars"} never
+        # shipped, so every live lane painted bar-less with only a "push build:" stderr line as
+        # evidence. A band that fails now costs THAT band, loudly, never the frame.
+        try:
+            messages = _postal_messages(now, set(id2name), id2name)
+            _bind_message_execs(messages, turns)         # connector exec → the recipient's process-start (real transit)
+            # mids STAY on the wire (2026-08-17): the merged-view dmid join (romp-timeline-view.js) re-binds
+            # a relayed connector's exec to the recipient turn by bar mids — the 2026-07-07 payload-audit pop
+            # ("no client ever read them") predated that 2026-08-06 feature and had silently starved it: the
+            # join's key set was always empty on live payloads, so relayed execs never re-bound client-side.
+            for _m in messages:
+                _m.pop("fromOrig", None)
+        except Exception as e:
+            _bars_complain("*", "messages", e)
+            messages = []
         # The band's marks are the per-call RUN SPANS (g70): each judge call plotted at its real [sent, recv],
         # glossed by the nearest artifact mark — so a judge that ran shows up WHEN it ran (incl. distiller lag +
         # coordinating-courier classifications the artifact marks miss), not back-placed onto the work.
-        judging = _run_judging(now - TL_HORIZON, set(id2name), semantic)
+        try:
+            judging = _run_judging(now - TL_HORIZON, set(id2name), semantic)
+        except Exception as e:
+            _bars_complain("*", "judging", e)
+            judging = []
     else:                                                # SKELETON: the heavy time-plotted detail rides the {type:"bars"} message
         messages, judging = [], []
     # compaction-sweep gradient (widest→narrowest): the timeline's scan-bar has no client-side colormap, so
@@ -19819,6 +20035,8 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
     # letting the bar slide through the map's hues as it compresses — mirroring the context battery fill.
     cmap_grad = [list(cm.ramp(v, ctx_stops)) for v in (0.12, 0.34, 0.56, 0.78, 1.0)]
     return {"type": "timeline", "now": now, "sessions": sessions, "turns": turns,
+            "views": _timeline_views(),
+            "palette": pal.colors(_palette_name()),   # group color choices — the same set sessions draw identity colors from
             "messages": messages, "judging": judging,
             "cmapGrad": cmap_grad,
             "activeChat": None, "focus": None, "hover": None, "usage": _usage_for_client()}
@@ -20051,20 +20269,6 @@ def _heartbeat():
             sys.stderr.write("heartbeat: %s\n" % traceback.format_exc())
 
 
-def _reveal_chat(focus_msg):
-    """A cross-pane action that brings the chat forward (a feed/timeline session tap): focus the chat
-    clients AND tell the mobile shell (app=shell) to switch to its Chat tab. On desktop the shell
-    ignores the reveal (all three panes are visible at once), so this is a no-op there.
-
-    The shell half only ever reaches THIS kernel's own dashboards: a federated dashboard opens a socket
-    per host for each PANE, never for the shell, so a click on a remote host's session routes to that
-    host's kernel and its reveal lands nowhere. The chat pane therefore asks for the switch itself when
-    it takes a focus (render.ts revealSelfPane) — which covers every kernel, local included, and makes
-    this line a harmless duplicate rather than the only mover."""
-    _send_to_app("chat", focus_msg)
-    _send_to_app("shell", {"type": "reveal", "pane": "chat"})
-
-
 def _send_to_view(app, msg, wid):
     """Push to the clients of `app` belonging to ONE dashboard — the one whose `wid` this is. Which tab a
     viewer is looking at, and where in a transcript they jumped, is theirs alone: broadcasting it made two
@@ -20084,9 +20288,36 @@ def _send_to_view(app, msg, wid):
 
 
 def _reveal_chat_for(client, focus_msg):
-    """_reveal_chat, aimed at the dashboard that asked. Use this wherever a WS op is being handled: the
-    client IS the asker, so its wid names the one window that should follow the click."""
+    """Bring the chat forward for the dashboard that asked — and ONLY that one: the client IS the asker,
+    so its wid names the one window that should follow the click (which tab you are looking at is yours,
+    2026-07-29). This is the sole reveal path since 2026-08-16, when the last broadcast reveals
+    (create/fork/open/revive) were retired for switching every open window's chat; a caller with no
+    dashboard in hand (the CLI's POST /new) reveals to nobody instead of calling this with None —
+    None's empty wid would fall through to _send_to_view's legacy broadcast.
+
+    Focus the chat clients AND tell the mobile shell (app=shell) to switch to its Chat tab; on desktop
+    the shell ignores the reveal (all three panes are visible at once). The shell half only ever reaches
+    THIS kernel's own dashboards: a federated dashboard opens a socket per host for each PANE, never for
+    the shell, so a click on a remote host's session routes to that host's kernel and its shell reveal
+    lands nowhere. The chat pane therefore asks for the switch itself when it takes a focus (render.ts
+    revealSelfPane) — which covers every kernel, local included, and makes the shell line a harmless
+    duplicate rather than the only mover."""
     wid = (client or {}).get("wid") or ""
+    # The reveal rule (the user 2026-08-18): every gesture that focuses a session's chat — create,
+    # open, revive, a deep link, a feed chip — REVEALS it in the session views first, or the focus
+    # would land on a tab the strip doesn't show (a session created under an active group view was
+    # born invisible, with the focus yanked away by the strip's re-point). Drop its hidden bit; when
+    # the active group excludes it, fall back to All — the same one rule the chat picker applies.
+    sid = focus_msg.get("id") if isinstance(focus_msg, dict) else None
+    if sid:
+        v = _timeline_views()
+        if not _view_visible(v, sid):
+            v = json.loads(json.dumps(v))
+            v["hidden"] = [x for x in v["hidden"] if x != sid]
+            if v["active"] != "all" and not any(g["id"] == v["active"] and sid in g["members"] for g in v["groups"]):
+                v["active"] = "all"
+            _set_timeline_views(v)
+            _mark_views_dirty()
     _send_to_view("chat", focus_msg, wid)
     _send_to_view("shell", {"type": "reveal", "pane": "chat"}, wid)
 
@@ -20463,9 +20694,27 @@ def _apply_judge_settings(body):
     the ack shows what actually landed, since an invalid value is deliberately ignored. The
     distill pair answers RAW ("triage" = following the triage pick), matching /version: the
     gear shows the user's choice, not its resolution."""
+    _dm_before = jd._distill_model()
     for key, setter in _JUDGE_SETTING_FIELDS:
         if isinstance(body, dict) and key in body:
             setter(str(body.get(key) or ""))
+    if jd._distill_model() != _dm_before:
+        # Switching the distill tier's EFFECTIVE model is a discrete recovery event (the user
+        # 2026-08-18, who pointed the tier away from an outage-scoped model and expected the failed
+        # cards to retry): re-arm every given-up summary/brief/stall line so the next pass retries on
+        # the new model, wake the producer so that pass starts now, and push so the cards trade their
+        # "distill failed" chip for the live "Distilling…" swirl immediately. The effective compare
+        # (jd._distill_model, not the raw field) also catches a triage-model change while the distill
+        # pick is "triage" (follow). Propagated picks land here too on each receiving kernel, so a
+        # switch made on one machine re-arms the whole mesh.
+        try:
+            _n = jd.rearm_failed_summaries(int(time.time()))
+            if _n:
+                sys.stderr.write("distiller: re-armed %d given-up card(s) — distill model changed\n" % _n)
+        except Exception:
+            sys.stderr.write("rearm-on-model-change: %s\n" % traceback.format_exc())
+        _producer_wake.set()
+        _push_all()
     return {"ok": True, "judgeModel": jd._triage_model(), "indexModel": jd._index_model(),
             "judgeEffort": jd._triage_effort(), "indexEffort": jd._index_effort(),
             "distillModel": jd._state_str("distill-model", "triage"),
@@ -21125,7 +21374,7 @@ def _push(targets, connect=False, tmux=None):
                 _send_client(c, ("globalRetryPaused",), {"type": "globalRetryPaused", "value": _retry_paused_on(),
                                                          "resumeAt": _retry_resume_at(),   # limit reset epoch → the card counts down to the real retry
                                                          "reason": _retry_pause_reason()})   # "spend" → the card says 'raise your cap', no countdown
-                _send_client(c, ("taborder",), {"type": "tabOrder", "order": tab_order, "tabs": tab_meta})
+                _send_client(c, ("taborder",), {"type": "tabOrder", "order": tab_order, "tabs": tab_meta, "views": _timeline_views()})
             active = {c.get("active") for c in chat_clients if c.get("active")}
             # Stable: active tabs first — and TRANSCRIPT-LESS sessions with them. A just-created session
             # has no transcript, so its build is near-free, and its creator is guaranteed to be staring
@@ -21336,7 +21585,7 @@ def _push_session_now(sid):
             return
         ms = None                                    # lazy: the first full send materializes it, the rest reuse
         for c in targets:
-            _send_client(c, ("taborder",), {"type": "tabOrder", "order": tab_order, "tabs": tab_meta})
+            _send_client(c, ("taborder",), {"type": "tabOrder", "order": tab_order, "tabs": tab_meta, "views": _timeline_views()})
             ms = _send_chat(c, m, ms, 0, True)       # change_from 0 → always the full-session form
     except Exception:
         sys.stderr.write("push-session-now (%s): %s\n" % (sid, traceback.format_exc()))
@@ -21968,6 +22217,13 @@ def _producer():
                     sys.stderr.write("compact: archived %d cleared goal node(s)\n" % moved)
             except Exception:
                 sys.stderr.write("compact: %s\n" % traceback.format_exc())
+            try:                                       # judge calls served again after failing (the degraded→
+                if jd.consume_judge_recovery():        # serving edge, e.g. a 529 storm ending) → re-arm the
+                    _n = jd.rearm_failed_summaries(int(time.time()), auto=True)   # give-up cards; next pass retries
+                    if _n:
+                        sys.stderr.write("distiller: re-armed %d given-up card(s) — judge calls serving again\n" % _n)
+            except Exception:
+                sys.stderr.write("rearm-on-recovery: %s\n" % traceback.format_exc())
             _end_goals_pass()      # pass + compact done → drop the snapshot BEFORE bumping the gen, so the cache-
                                    # busting rebuild below reads the fully-applied (post-pass) state, not pre-pass.
             _judge_gen[0] += 1     # a judge pass may have changed goal/caption state WITHOUT touching any
@@ -22233,6 +22489,7 @@ _CHAT_MOBILE_CSS = (
     "@media (pointer:coarse) and (max-width:1024px){"
     "#tabbar{max-height:none;overflow:visible;position:relative;padding:6px 8px}"
     "#tabbar #tabs{display:none}"                       # the wrapping multi-row tab strip
+    "#tabbar-resize{display:none}"                      # nothing to resize under the mobile header
     "#mhdr{display:flex;align-items:stretch;gap:6px;width:100%}"
     "#mcur{flex:1 1 auto;min-width:0;display:flex;align-items:center;gap:8px;cursor:pointer;"
     "background:#2a2a2a;color:#dddddd;border:1px solid #3a3a3a;border-radius:6px;padding:7px 10px;"
@@ -22528,6 +22785,7 @@ window.__rompTimelineWriteOrder=function(order){if(window.__rompWriteOrder)windo
 window.__rompTimelineCompact=function(name){post({type:"compact",name:name});};
 window.__rompTimelineSendCommand=function(name,cmd){post({type:"sendCommand",name:name,cmd:cmd});};
 window.__rompTimelineSetFlag=function(id,flag,value){post({type:"setSessionFlag",id:id,flag:flag,value:!!value});};
+window.__rompTimelineSetViews=function(views){post({type:"setTimelineViews",views:views});};
 window.__rompTimelineDismiss=function(id){post({type:"dismissLane",id:id});};
 window.__rompTimelineHover=function(sid,segIds,t0,t1){post(sid?{type:"timelineHover",sid:sid,segIds:segIds||[],t0:t0,t1:t1}:{type:"timelineHover",off:true});};
 window.__rompConnectTimeline=function(p){panel=p;post({type:"ready"});};})();
@@ -22567,6 +22825,7 @@ def _timeline_page():
 def _chat_body():
     # ported from vscode-extension/src/page-skeleton.chatBody
     return ('<div id="winframe"></div><div id="tabbar"><span id="tabs"></span></div>'
+            '<div id="tabbar-resize" title="Drag to resize the tab strip"></div>'
             '<div id="ledger" style="display:none"></div>'
             # the live-ask picker lives INSIDE #content (the user 2026-06-27) so it flows at the bottom of the
             # transcript and scrolls WITH the chat history, instead of a fixed mini-window below it.
@@ -23980,7 +24239,7 @@ refresh();   // self-schedules (fast while attaching, slow keep-alive otherwise)
 # Mobile shell behavior, layered on top of the desktop splitter above. The bottom tab bar (#mtabs,
 # shown only by the media query below) swaps which single iframe is full-screen by toggling `m-on`.
 # A cross-pane "reveal" auto-switches the visible tab: the kernel pushes {type:"reveal",pane} over an
-# app=shell WebSocket when a feed/timeline tap brings the chat forward (see _reveal_chat), and the
+# app=shell WebSocket when a feed/timeline tap brings the chat forward (see _reveal_chat_for), and the
 # timeline deep-link posts the same shape as a window message. The active tab persists in localStorage.
 # Entirely inert on desktop, where #mtabs is hidden and all three panes are shown at once.
 _LANDING_MOBILE_JS = """
@@ -26106,7 +26365,8 @@ class Handler(BaseHTTPRequestHandler):
                 # (X-Romp-Token read from the 0600 file, or ?token=).
                 body = _parse_send_body(raw_body)
                 if not body:
-                    return self._send(400, json.dumps({"ok": False, "error": "id and text required"}), "application/json")
+                    return self._send(400, json.dumps({"ok": False, "error":
+                        "id and text required (optional tag: one word, letters/digits/dashes, <=24 chars)"}), "application/json")
                 sid = _sid_of(body["who"])
                 # POSTAL ISOLATION holds on every sanctioned route (the user 2026-07-10): postal-SHAPED
                 # content to a mailbox-off session is agent mail arriving by the wrong door — refuse it
@@ -26653,7 +26913,7 @@ class Handler(BaseHTTPRequestHandler):
                 _o = [s["sid"] for s in _alive]
                 # name+color per tab → the client paints the whole strip as placeholders up front (tabs-first)
                 _tabs = [{"id": s["sid"], "name": s.get("name", ""), "color": _name_color(s["sid"])} for s in _alive]
-                client["send"](json.dumps({"type": "tabOrder", "order": _o, "tabs": _tabs}))
+                client["send"](json.dumps({"type": "tabOrder", "order": _o, "tabs": _tabs, "views": _timeline_views()}))
             except Exception:
                 pass
             # a push tap parked a reveal for this window's chat pane → deliver it now, AFTER the
@@ -26674,6 +26934,11 @@ class Handler(BaseHTTPRequestHandler):
                 _set_notify_session(str(msg["id"]), bool(msg.get("value")))
             else:
                 _set_session_flag(str(msg["id"]), str(msg["flag"]), bool(msg.get("value")))
+            _mark_views_dirty()
+        elif msg and msg.get("type") == "setTimelineViews" and isinstance(msg.get("views"), dict):
+            # timeline corner panel → replace the whole views blob (tiny; last-write-wins across
+            # dashboards, like colormap). Validation/normalization happens in the setter.
+            _set_timeline_views(msg["views"])
             _mark_views_dirty()
         elif msg and msg.get("type") == "cardNotify" and msg.get("itemId"):
             # feed card right-click → per-card bell (OS notification when THIS card blocks on you /
@@ -26866,7 +27131,7 @@ class Handler(BaseHTTPRequestHandler):
                         # auth ('login'|'key') is the picker's per-session billing pick; anything else
                         # (older clients, no pick) means the remembered/ambient default (spawn's seed).
                         a = msg.get("auth")
-                        _create_sdk_session(nm, cwd, auth=(a if a in ("login", "key") else ""))
+                        _create_sdk_session(nm, cwd, auth=(a if a in ("login", "key") else ""), client=client)
                     else:
                         # NEVER silently fall back to tmux (the user asked for SDK and got a mystery tmux
                         # session on a remote host without the venv, 2026-07-02). Say what's missing.
@@ -26932,7 +27197,7 @@ class Handler(BaseHTTPRequestHandler):
         elif msg and msg.get("type") == "openSession" and msg.get("id"):
             # live → focus its (always-shown) tab; dead → the chat's confirmRevive modal. `live` lands on
             # the chat's LIVE TAIL (a blocked card's picker chip → right on the prompt, the user 2026-07-08).
-            _open_or_revive(msg["id"], live=bool(msg.get("live")))
+            _open_or_revive(msg["id"], live=bool(msg.get("live")), client=client)
         elif msg and msg.get("type") == "openFolder" and msg.get("cwd"):
             # A REMOTE session's folder icon must SSH out, not open a local path that doesn't exist here
             # (the user 2026-07-03) — federation.ts routes this message type to stay LOCAL with the id's
@@ -26946,7 +27211,7 @@ class Handler(BaseHTTPRequestHandler):
         elif msg and msg.get("type") == "reviveSession" and msg.get("id"):
             # confirmRevive → "Revive": resume the dead session in the background (the kernel had
             # no handler, so the modal's Revive silently did nothing — the user 2026-06-16)
-            threading.Thread(target=_revive_session, args=(msg["id"],), daemon=True).start()
+            threading.Thread(target=_revive_session, args=(msg["id"], client), daemon=True).start()
         elif msg and msg.get("type") == "viewReadOnly" and msg.get("id"):
             _kept_open.add(msg["id"])            # confirmRevive → "View read-only": this dead session
             #                                      gets a (struck) read-only tab now, without resuming it
@@ -27557,6 +27822,12 @@ def main():
             sys.stderr.write("romp-kernel: pruned %d judge scratch transcript(s)\n" % _n)
     except Exception:
         sys.stderr.write("judge scratch prune: %s\n" % traceback.format_exc())
+    try:                                                      # a restart is a discrete recovery event: re-arm
+        _n = jd.rearm_failed_summaries(int(time.time()))      # every given-up summary/brief/stall line so the
+        if _n:                                                # first passes retry them (rearm's docstring
+            sys.stderr.write("romp-kernel: re-armed %d given-up summary line(s) at startup\n" % _n)   # promised this since 07-03; now wired)
+    except Exception:
+        sys.stderr.write("startup rearm: %s\n" % traceback.format_exc())
     _write_palette_mirror()                                   # keep bin/romp's palette-colors mirror current across code updates
     _boot_warm()                                              # pre-parse the live fleet during the reconnect gap (fast first paint)
     threading.Thread(target=_sdk, daemon=True).start()        # construct the SDK backend NOW so its boot

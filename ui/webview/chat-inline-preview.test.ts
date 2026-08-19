@@ -37,7 +37,8 @@ test("a kernel-VERIFIED preview fails LOUDLY: a retry chip holds the figure's sp
   // unverified (old kernel, no pathLinks verdict) keeps self-removal — there the error means "no such file"
   assert.match(pf, /if \(!verified\) \{ box\.remove\(\); return; \}/);
   assert.match(pf, /chip\.className = "path-full-retry";/);
-  assert.match(pf, /chip\.onclick = \(ev\) => \{ ev\.stopPropagation\(\); autoRetries = 3; build\(true\); \};/, "a tap re-arms persistence, then retries");
+  assert.match(pf, /chip\.onclick = \(ev\) => \{ ev\.stopPropagation\(\); autoRetries = 3; ackTap\(ev\); build\(true\); \};/,
+    "a tap re-arms persistence, acknowledges even mid-attempt, then retries");
   assert.match(pf, /headers: got > 0 \? \{ Range: "bytes=" \+ got \+ "-" \} : \{\}/,
     "a retry RESUMES from the bytes already received (kernel /file honors the suffix range)");
   // the render layer feeds the verdict: spacePaths and pathLinks hits are kernel-stat'd paths
@@ -57,8 +58,8 @@ test("the failure chip narrates what happens next, escalates on repeat, and a re
   // "trying" and "unavailable" on every retry cycle read as impatient even when it eventually loaded)
   assert.match(pf, /if \(autoRetries > 0 \|\| transient\) \{\s*\n\s*if \(!transient\) autoRetries--;\s*\n\s*failedPreviews\.set\(box, \(\) => build\(true\)\);/);
   assert.match(pf, /\+ " — retrying · tap to retry now";/);
-  assert.match(pf, /wait\.onclick = \(ev\) => \{ ev\.stopPropagation\(\); autoRetries = 3; build\(true\); \};/,
-    "the whole retrying box is the tap target — and a tap re-arms persistence");
+  assert.match(pf, /wait\.onclick = \(ev\) => \{ ev\.stopPropagation\(\); autoRetries = 3; ackTap\(ev\); build\(true\); \};/,
+    "the whole retrying box is the tap target — a tap re-arms persistence and acknowledges");
   assert.match(pf, /"⚠ preview unavailable"\)\)\s*\n\s*\+ " — tap to retry";/,
     "the chip exists only once the budget is spent, so it carries no retrying-automatically claim");
   // a repeat failure pulses the chip on swap-in — the acknowledge-every-click rule

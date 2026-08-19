@@ -81,8 +81,10 @@ body { display: flex; flex-direction: column; overflow-x: hidden; }   /* the cha
   display: flex; align-items: flex-start; gap: 4px;
   padding: 5px 8px 0;
   flex: 0 0 auto;
-  /* wrap tabs onto extra rows; only scroll once they'd eat ~4+ rows */
-  max-height: 150px; overflow-y: auto; overflow-x: hidden;
+  /* wrap tabs onto extra rows; only scroll once they'd eat ~4+ rows. The cap rides a VAR so the
+     #tabbar-resize drag can move it while the mobile page's max-height:none still wins over it
+     (an inline max-height would override that media rule and clip the mobile header) */
+  max-height: var(--tabbar-cap, 150px); overflow-y: auto; overflow-x: hidden;
   border-bottom: 1px solid var(--box-border);
   background: var(--vscode-sideBar-background, var(--bg));
 }
@@ -90,6 +92,23 @@ body { display: flex; flex-direction: column; overflow-x: hidden; }   /* the cha
    2026-08-08): the strip trades its empty inter-tab space for room for the per-tab context gauge —
    the active/hover fills and per-tab padding still separate neighbours visually. */
 #tabs { display: flex; flex: 1 1 auto; flex-wrap: wrap; align-items: stretch; gap: 0; }
+/* Drag handle straddling the tab strip's bottom border (the user 2026-08-18): the strip scrolls past
+   its max-height cap, which clipped the fifth row of a many-session strip with no way to see more.
+   Drag DOWN for more rows, UP for fewer; double-click resets; the strip stays a scroll pane at every
+   size. A SIBLING below #tabbar (a child would scroll away with the rows) whose negative margins
+   cancel its 7px grab zone, so it costs zero layout height — the #composer-resize affordance, worn
+   the same way. */
+#tabbar-resize {
+  position: relative; z-index: 6; flex: 0 0 auto;
+  height: 7px; margin: -3px 0 -4px;   /* 2px over the last tab row (net of the border), 4px over the transcript's top padding — tabs are interactive, the padding isn't */
+  cursor: ns-resize; touch-action: none;
+}
+#tabbar-resize::after {
+  content: ""; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: 36px; height: 3px; border-radius: 2px; background: var(--box-border); transition: background 0.12s, width 0.12s;
+}
+#tabbar-resize:hover::after, #tabbar-resize.dragging::after { background: var(--accent); width: 52px; }
+body.tabbar-resizing { cursor: ns-resize; user-select: none; }
 /* (the settings gear + modal live on the TIMELINE now — see ui/romp-timeline-view.js) */
 
 .tab {
@@ -1085,13 +1104,15 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
   position: fixed; z-index: 3; pointer-events: none;
   color: var(--dim); opacity: 0.92;
 }
-/* The day-context label above the top rail stamp (render.ts paintDay, the user 2026-08-17):
+/* The day-context label ABOVE the top rail stamp (render.ts paintDay, the user 2026-08-17):
    "Yesterday" / "3 days ago" / "Last week" whenever the top stamp's day is not today. Fixed like
-   the sticky, passive like the sticky; right-aligned to the gutter's right edge via the translate
-   (left is set to that edge, no width math), sitting just above the stamp it names. Smaller than
-   the stamp on purpose — context, not the time itself — and nowrap: fixed positioning escapes the
-   pane's overflow clip, and the longest form ("2 weeks ago") clears the gutter into the turn
-   padding, never over prose. */
+   the sticky, passive like the sticky. It sat BELOW the stamp until 2026-08-18 (the user, with a
+   video): there, the next incoming stamp scrolled straight through it and the label leapt over —
+   above the stamp nothing crosses its path. No width pin: the box shrinkwraps its nowrap text, and
+   paintDay puts its right edge on the gutter's right edge while never letting its left edge past
+   the pane's — "2 days ago" is wider than the 47px gutter, and the old gutter-pinned box clipped
+   the leading digit at the pane edge (the user 2026-08-18, with a screenshot). Smaller than the
+   stamp on purpose — context, not the time itself. */
 /* the user-message scroll notches (render.ts paintScrollMarks, the user 2026-08-17): passive fixed
    chrome over the scroller's right edge, one 2px tick per user message at its proportional position.
    The blue is the OUTGOING-BUBBLE blue (#2b6cef, "yours"), deliberately not the romp accent. */
@@ -1101,9 +1122,11 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
   transition: top 180ms ease; }   /* history streaming in rescales the map — carried, not teleported */
 @media (prefers-reduced-motion: reduce) { .scroll-marks .scroll-mark { transition: none; } }
 .rail-day {
-  position: fixed; z-index: 3; pointer-events: none; white-space: nowrap;
-  text-align: right;   /* the STAMP's own box + its own alignment — the right edges match by construction */
+  position: fixed; z-index: 3; pointer-events: none; white-space: nowrap; line-height: 1;
   font-size: 0.68em; letter-spacing: 0.03em; color: var(--dim); opacity: 0.85;
+  background: var(--bg);   /* the widest labels ("2 weeks ago") poke a few px past the gutter into the
+                              session rail line; a pane-bg plate interrupts the line cleanly instead of
+                              striking text through it */
 }
 /* match the dot's vertical position per turn type (default dot top:15, tool/thinking top:10) */
 .turn-tool .time-marker, .turn-thinking .time-marker { top: 10px; }
@@ -1140,6 +1163,9 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
 /* your prompt — the SAME royal/indigo blue as your message bubble (#2b6cef), so the dot matches your
    chat box (the user 2026-06-15). Distinct from the cyan ✓ success disc (--check-bg #1EA1EB). */
 .dot.user { background: #2b6cef; border: none; }
+/* a TAGGED (machine-sent under a label) prompt: the gray of its tag-bubble family, so the rail agrees
+   with the bubble — it used to wear the blue "you typed this" dot (the identity-channel gap, 2026-08-18) */
+.dot.tag { background: #8a8f98; border: none; }
 /* A romp-injected message (a nudge, a status note) wears the SWIRL in a dark disc — the same mark the
    timeline already puts on a romp event (romp-timeline-view.js draws a black dot with the glyph inside),
    so one kind of event looks like itself on both surfaces (the user 2026-07-23). It used to be an
@@ -1724,6 +1750,14 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
    it from the content above (the turn's own padding no longer wraps it). A standalone romp notice keeps its
    .turn dot. */
 .notice-nested { margin-top: 8px; }
+/* A standalone ROMP notice right-justifies like every other message FROM romp (the user 2026-08-18):
+   in the transcript, direction says who is speaking — the session from the left, romp and the user
+   from the right — and the kernel-restart/Retry notices wore the session's side, reading as session
+   output. Same card otherwise, with the bubbles' 72% width cap so it sits beside the nudges it
+   travels with. Other notice variants (an agent's report, folded reminders) ARE session-side
+   output and stay left. The dot and time marker are absolute, so the flex moves only the card. */
+.turn-notice.notice-romp { display: flex; flex-direction: column; align-items: flex-end; }
+.turn-notice.notice-romp > .notice-card { max-width: 72%; }
 .notice-head { display: flex; align-items: baseline; gap: 7px; font-size: 0.9em; }
 .notice-collapsible .notice-head { cursor: pointer; }
 .notice-caret { flex: 0 0 auto; font-size: 0.74em; opacity: 0.7; }
@@ -2773,3 +2807,8 @@ body.fileview-open { overflow: hidden; }
 .fileview-md th, .fileview-md td { border: 1px solid var(--box-border); padding: 4px 10px; text-align: left; }
 .fileview-md th { background: rgba(255, 255, 255, 0.03); }
 .fileview-md img { max-width: 100%; }
+
+/* a MACHINE-sent message's notch (romp injections, ⚙-tagged sends — the same senderKind verdict the
+   bubble wears): light gray, visibly quieter than the user's blue, so the scroll map separates "you
+   spoke" from "something was injected" at a glance (the user 2026-08-18) */
+.scroll-marks .scroll-mark.machine { background: #8a8f98; opacity: 0.55; }

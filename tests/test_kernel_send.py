@@ -32,6 +32,22 @@ class ParseSendBody(unittest.TestCase):
         self.assertIsNone(km._parse_send_body(b'{"id":"alpha","text":""}'))  # empty text
         self.assertIsNone(km._parse_send_body(b'{"id":"","text":"hi"}'))    # empty id
 
+    def test_tag_appends_the_render_hint_marker(self):
+        # scheduled/scripted senders (the user 2026-08-18, the nightly optimizer briefing):
+        # the "tag" field makes the kernel append the SAME marker `romp send --tag` writes,
+        # so the chat dresses the message machine-sent under that label
+        self.assertEqual(km._parse_send_body(b'{"id":"alpha","text":"hi","tag":"nightly-optimizer"}'),
+                         {"who": "alpha", "text": "hi\n\n<!-- romp-tag: nightly-optimizer -->"})
+
+    def test_bad_tag_fails_the_whole_parse(self):
+        # a malformed tag is a 400, never a silent plain delivery — delivering anyway would
+        # misattribute the text (fail loudly, 2026-07-03)
+        self.assertIsNone(km._parse_send_body(b'{"id":"a","text":"hi","tag":"two words"}'))
+        self.assertIsNone(km._parse_send_body(b'{"id":"a","text":"hi","tag":""}'))
+        self.assertIsNone(km._parse_send_body(b'{"id":"a","text":"hi","tag":123}'))
+        self.assertIsNone(km._parse_send_body(b'{"id":"a","text":"hi","tag":"-leading-dash"}'))
+        self.assertIsNone(km._parse_send_body(b'{"id":"a","text":"hi","tag":"' + b"x" * 25 + b'"}'))
+
     def test_rejects_bad_json_non_object_and_non_string_text(self):
         self.assertIsNone(km._parse_send_body(b'not json'))
         self.assertIsNone(km._parse_send_body(b'[1,2,3]'))

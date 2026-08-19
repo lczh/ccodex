@@ -541,6 +541,7 @@ export class FederationManager {
   private conns = new Map<string, Conn>();
   private perHostOrder: Record<string, string[]> = {};
   private perHostTabs: Record<string, any[]> = {};
+  private localViews: any = null;   // the LOCAL kernel's session-views blob, carried on merged tabOrder re-emits
   private perHostSids: Record<string, Set<string>> = {};
   private perHostFeed: Record<string, any> = {}; // last feed snapshot per host — merged so they don't clobber
   private perHostTl: Record<string, any> = {}; //   last timeline lanes payload ({type:"data"}.data) per host
@@ -597,6 +598,11 @@ export class FederationManager {
       const prevTabs = this.perHostTabs[host] || [];
       this.perHostOrder[host] = Array.isArray(m.order) ? m.order.filter((x: any) => typeof x === "string") : [];
       this.perHostTabs[host] = Array.isArray(m.tabs) ? m.tabs : [];
+      // session VIEWS (the user 2026-08-18): the blob is the LOCAL kernel's viewer pref (ids arrive
+      // host-prefixed inside it already) — remote kernels' copies are their own dashboards' prefs.
+      // Without this passthrough the merged re-emit silently dropped the field and the browser
+      // dashboard's chat never learned the views at all.
+      if (host === LOCAL && m.views && typeof m.views === "object") this.localViews = m.views;
       this.ensureHost(host);
       this.absorbHostReport(host, prevOrder, prevTabs);   // a host just reported its sessions → the one
       this.emitMergedOrder();                             //   moment the stored arrangement may be touched
@@ -679,7 +685,7 @@ export class FederationManager {
   private emitMergedOrder(): void {
     const order = mergeHostOrder(this.perHostOrder, this.hostSeq, this.view());
     const tabs = this.hostSeq.flatMap((h) => this.perHostTabs[h] || []);
-    window.dispatchEvent(new MessageEvent("message", { data: { type: "tabOrder", order, tabs } }));
+    window.dispatchEvent(new MessageEvent("message", { data: { type: "tabOrder", order, tabs, views: this.localViews ?? undefined } }));
   }
 
   // Fold a host's OWN report — the one moment with fresh evidence about what exists — into the stored

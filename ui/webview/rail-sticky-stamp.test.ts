@@ -26,19 +26,24 @@ test("the hand-off happens at the buffer line, with the crossed marker hidden", 
   const end = SRC.indexOf("// Scroll is the sticky stamp's primary driver");
   assert.ok(end > 0, "the slice end anchor still exists (else every assertion below matches the whole file)");
   const fn = SRC.slice(SRC.indexOf("function paintRailSticky"), end);
-  // the buffer line doubles as the sticky's rest position AND the hand-off threshold
+  // the buffer line doubles as the sticky's rest position AND the hand-off threshold. When a day
+  // label shows (old-day history), both drop by the label's height — the slot line — so the label
+  // riding above the stamp stays inside the pane; with no label, slotLine === line and nothing
+  // moves (see rail-day.test.ts).
   assert.match(fn, /const BUFFER = 6;/);
   assert.match(fn, /const line = cTop \+ BUFFER;/);
+  assert.match(fn, /const slotLine = line \+ \(label \? dayH \+ 1 : 0\);/);
   // the TRACKED turn's own stamp leads while it is at or below the line; the sticky takes over once it
   // crosses. Keyed on the tracked marker, NOT on any stamp anywhere — a later time change further down the
   // view must not blank the top slot, which would reintroduce the empty gap this exists to prevent.
   assert.match(fn, /marker = m; markerTop = r\.top; markerShown = !!m\.textContent;/);
-  assert.match(fn, /const realLeads = markerShown && markerTop >= line;/);
+  assert.match(fn, /const realLeads = markerShown && markerTop >= slotLine;/);
   assert.match(fn, /if \(!hm \|\| realLeads\) \{/);
-  // when the sticky leads, every marker that crossed ABOVE the line is hidden so no clipped duplicate shows
-  assert.match(fn, /for \(const \[m, top\] of all\) m\.style\.visibility = top < line \? "hidden" : "";/);
-  // and it rests exactly at the line
-  assert.match(fn, /stamp\.style\.top = line \+ "px";/);
+  // when the sticky leads, every marker that crossed ABOVE the slot line — or INTO the sticky's own
+  // box — is hidden, so no clipped duplicate shows and no incoming stamp superimposes the sticky
+  assert.match(fn, /for \(const \[m, top\] of all\) m\.style\.visibility = top < slotLine \+ g\.height \? "hidden" : "";/);
+  // and it rests exactly at the slot line
+  assert.match(fn, /stamp\.style\.top = slotLine \+ "px";/);
   // ...while a real stamp leading means nothing is suppressed
   assert.match(fn, /for \(const \[m\] of all\) m\.style\.visibility = "";/);
 });
@@ -60,11 +65,14 @@ test("the CSS pins it to the viewport, above the rail, click-through", () => {
 });
 
 // ── executed replica of the selection + hand-off decision ────────────────────────────────────────────────
-// Faithful to paintRailSticky: line = cTop + BUFFER; marker = the last turn whose top <= line (its time is
+// Faithful to paintRailSticky in the label-free case (today's history: slotLine === line; the day-label
+// shift is pinned at the source above and in rail-day.test.ts): line = cTop + BUFFER; marker = the last turn whose top <= line (its time is
 // what sits at the top), tracked along with WHERE its own marker is and whether that marker is stamped. That
 // tracked marker leads while it is at or below the line; otherwise the sticky leads at the line and every
-// marker with mTop < line is hidden. A turn models {top} and its marker {id, hm, text, mTop, mBottom}.
+// marker with mTop < line + STAMP_H is hidden — the sticky's bottom edge, so a stamp can never superimpose
+// it. A turn models {top} and its marker {id, hm, text, mTop, mBottom}.
 const BUFFER = 6;
+const STAMP_H = 13;   // the modeled marker box height (mBottom - mTop below)
 type Marker = { id: string; hm: string; text: string; mTop: number; mBottom: number };
 type Turn = { top: number; marker: Marker | null };
 function decideSticky(turns: Turn[], cTop: number, _cBottom: number): { show: boolean; hm: string; hidden: string[] } {
@@ -83,7 +91,7 @@ function decideSticky(turns: Turn[], cTop: number, _cBottom: number): { show: bo
   if (!hm || realLeads) return { show: false, hm: "", hidden: [] };
   // the code hides EVERY marker with top < line (so a straggler resets when it scrolls back); only the TIMED
   // ones are visually meaningful, so the replica reports those — hiding an empty same-minute marker is a no-op
-  return { show: true, hm, hidden: all.filter((m) => m.text && m.mTop < line).map((m) => m.id) };
+  return { show: true, hm, hidden: all.filter((m) => m.text && m.mTop < line + STAMP_H).map((m) => m.id) };
 }
 
 const CTOP = 100, CBOT = 700, LINE = CTOP + BUFFER;   // #content spans [100, 700]; the line sits at 106
@@ -179,4 +187,19 @@ test("executed property: the top slot always holds exactly one time — never a 
       .some((t) => !!t.marker!.text && t.marker!.mTop >= LINE);
     assert.equal(r.show || trackedLeads, true, "and never nothing: something always holds the slot");
   }
+});
+
+test("executed: a stamp intruding into the sticky's box is hidden, never superimposed", () => {
+  // The tracked turn's stamp crossed above (sticky leads, suppressed same-minute marker), and the next
+  // turn — a tool turn, marker only 10px below its top — has scrolled its stamped minute-change into the
+  // sticky's own band without its turn reaching the line yet. Under a top-edge-only threshold the two
+  // HH:MM texts superimpose in the gutter; the bottom-edge threshold hides the intruder until it leads.
+  const turns: Turn[] = [
+    { top: 90, marker: { id: "tracked", hm: "10:05", text: "", mTop: 100, mBottom: 113 } },
+    { top: 107, marker: { id: "incoming", hm: "10:06", text: "10:06", mTop: 117, mBottom: 130 } },
+  ];
+  const r = decideSticky(turns, CTOP, CBOT);
+  assert.equal(r.show, true, "the sticky still holds the slot");
+  assert.equal(r.hm, "10:05", "showing the tracked turn's time");
+  assert.deepEqual(r.hidden, ["incoming"], "the intruding stamp is hidden until it takes the lead");
 });

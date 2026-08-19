@@ -168,6 +168,22 @@ MOCK
     grep '/send' "$MOCK_LOG" | grep 'ideabox' | grep -q 'look into the flaky test'
 }
 
+@test "new --tag rides the /send tag field; needs -m; bad labels exit 2" {
+    _stub_curl
+    touch "$MOCK_LOG"
+    export ROMP_SERVE_TOKEN=testtok
+    run run_romp new -m "nightly briefing body" --tag nightly-optimizer ideabox
+    [ "$status" -eq 0 ]
+    # the send payload carries the tag as a FIELD — the kernel appends the marker itself
+    grep '/send' "$MOCK_LOG" | grep -q '"tag": *"nightly-optimizer"'
+    run run_romp new --tag nightly-optimizer ideabox
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--tag needs -m"* ]]
+    run run_romp new -m "text" --tag "two words" ideabox
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--tag must be one word"* ]]
+}
+
 @test "new -m: a failed send is loud and names the retry (the session IS up)" {
     _stub_curl
     touch "$MOCK_LOG"

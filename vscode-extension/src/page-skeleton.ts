@@ -20,6 +20,7 @@
 export function chatBody(attachTitle: string): string {
   return `  <div id="winframe"></div>
   <div id="tabbar"><span id="tabs"></span></div>
+  <div id="tabbar-resize" title="Drag to resize the tab strip"></div>
   <div id="ledger" style="display:none"></div>
   <div id="content"><div id="live-ask" style="display:none"></div></div>
   <div id="footer">

@@ -82,6 +82,7 @@ export function bridgeFunctions(post: Post): Record<string, (...a: any[]) => voi
     __rompTimelineCompact: (name: string) => post({ type: "compact", name }),
     __rompTimelineSendCommand: (name: string, cmd: string) => post({ type: "sendCommand", name, cmd }),
     __rompTimelineSetFlag: (id: string, flag: string, value: unknown) => post({ type: "setSessionFlag", id, flag, value: !!value }),
+    __rompTimelineSetViews: (views: unknown) => post({ type: "setTimelineViews", views }),
     __rompTimelineDismiss: (id: string) => post({ type: "dismissLane", id }),
     __rompTimelineHover: (sid?: string, segIds?: unknown[], t0?: number, t1?: number) =>
       post(sid ? { type: "timelineHover", sid, segIds: segIds || [], t0, t1 } : { type: "timelineHover", off: true }),

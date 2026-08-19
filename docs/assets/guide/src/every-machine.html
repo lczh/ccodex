@@ -1,0 +1,254 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>every machine, one place</title>
+<!--
+  Static, backend-free rendering of the multi-machine story for the docs
+  landing page: the laptop's view of three sessions, one of them on a server,
+  with the handoff crossing machines, the timeline showing all of it, and the
+  same view on a phone. All content is synthetic (the docs' neutral notes-api
+  world). Colors and type mirror the live UI: .host-prefix (dim italic 0.88em),
+  the timeline pane's anatomy from ui/romp-timeline-view.js (gutter: name,
+  model+effort, status pill BADGE colors, BAT context battery; lanes: BAR_H
+  bars on faint baselines, sender-colored message dots with white rings, time
+  labels below), and the phone bottom bar from the kernel's mobile layout.
+  Deliberate departures (the user 2026-08-18): the gutter's feed/mail toggle
+  icons are dropped and window chrome is minimal (no traffic lights) — this is
+  a composed scene, not a screenshot. Type runs ~30% larger than the live UI
+  on purpose: the docs column shows this at ~55% scale. Render with:
+    chrome --headless=new --screenshot=../every-machine.png --window-size=1600,620 \
+           --force-device-scale-factor=2 --hide-scrollbars file://.../every-machine.html
+-->
+<style>
+  :root{
+    --bg:#141517; --win:#1e1e1e; --panel:#252526; --bar:#2b2b2c;
+    --border:rgba(255,255,255,0.12); --hair:rgba(255,255,255,0.08);
+    --fg:#cccccc; --dim:#9a9a9a; --dimmer:#6e7681;
+    --accent:#9cd2ff; --accent-fg:#0c1a2e;
+    --working:#e0b020; --ready:#54B204;
+    --c-web:#1EA1EB; --c-tests:#4EA8A9; --c-api:#54B204;
+  }
+  *{box-sizing:border-box;margin:0}
+  body{background:var(--bg);font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;color:var(--fg)}
+  #fig{position:relative;width:1600px;height:620px;background:var(--bg);overflow:hidden}
+
+  /* ---------- window chrome (minimal: header bar, no traffic lights) ---------- */
+  .win{position:absolute;background:var(--win);border:1px solid var(--border);border-radius:9px;
+       box-shadow:0 10px 30px rgba(0,0,0,0.45);overflow:hidden}
+  .winbar{height:30px;background:var(--bar);display:flex;align-items:center;justify-content:center;
+          padding:0 11px;border-bottom:1px solid var(--hair)}
+  .wintitle{font-size:13px;font-weight:600;color:var(--dim)}
+
+  /* ---------- machine boxes ---------- */
+  .machine{position:absolute;border:1px solid var(--hair);border-radius:14px;background:rgba(255,255,255,0.02)}
+  .machine>.mlabel{position:absolute;top:-11px;left:20px;background:var(--bg);padding:0 9px;
+                   color:var(--dim);font-size:15px;font-style:italic}
+
+  /* ---------- mini session windows ---------- */
+  .mini{width:264px;height:178px}
+  .mini .body{padding:12px 14px;display:flex;flex-direction:column;gap:9px;height:calc(100% - 30px)}
+  .g{height:8px;border-radius:4px;background:rgba(255,255,255,0.10)}
+  .g.br{background:rgba(255,255,255,0.16)}
+  .toolrow{display:flex;align-items:center;gap:8px}
+  .toolrow .tg{width:10px;height:10px;border-radius:2px;background:rgba(255,255,255,0.22);flex:none}
+  .toolrow .g{flex:1}
+  .minifoot{margin-top:auto;display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--dim)}
+  .stdot{width:8px;height:8px;border-radius:50%;flex:none}
+
+  /* ---------- host-prefix, exactly as the UI renders it ---------- */
+  .host-prefix{color:var(--dim);font-weight:400;font-style:italic;font-size:0.88em}
+
+  /* ---------- postal message card (dashed, like teammate cards) ---------- */
+  .mailcard{position:absolute;width:264px;background:var(--panel);border:1px dashed rgba(255,255,255,0.30);
+            border-radius:6px;padding:10px 13px;box-shadow:0 8px 22px rgba(0,0,0,0.5)}
+  .mailhead{font-size:14px;font-weight:600;display:flex;align-items:center;gap:7px}
+  .mailhead .arr{color:var(--dim);font-weight:400}
+  .mailgist{margin-top:6px;font-size:13px;color:var(--dim);line-height:1.4}
+
+  /* ---------- phone ---------- */
+  #phone{position:absolute;background:#0a0a0a;width:256px;height:396px;
+         border:2px solid #3a3a3a;border-radius:32px;box-shadow:0 14px 38px rgba(0,0,0,0.55);padding:9px}
+  #screen{position:relative;width:100%;height:100%;background:var(--win);border-radius:24px;overflow:hidden;
+          display:flex;flex-direction:column}
+  #screen .phead{padding:11px 14px 8px;font-size:12.5px;color:var(--dimmer)}
+  .fcards{padding:2px 11px;display:flex;flex-direction:column;gap:9px;flex:1}
+  .fcard{background:var(--panel);border:1px solid var(--hair);border-left:3px solid;border-radius:6px;padding:9px 11px}
+  .fname{font-size:13px;font-weight:600;display:flex;align-items:center;gap:6px}
+  .fname .stdot{width:7px;height:7px}
+  .ftitle{font-size:13.5px;color:var(--fg);margin-top:4px}
+  .fchip{margin-top:6px;font-size:12px;color:var(--dim)}
+  .fchip b{font-weight:600}
+  .fgl{margin-top:7px}
+  .fgl .g{height:6px}
+  #mtabs{height:46px;background:#181818;border-top:1px solid #303031;display:flex;align-items:center;
+         justify-content:space-around;font-size:12.5px;font-weight:600;color:#9aa0a6;flex:none}
+  #mtabs .on{color:#4da4ff}
+
+  svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
+</style>
+<body>
+<div id="fig">
+
+  <!-- ======= laptop: three sessions (one on the server), the handoff, and the timeline ======= -->
+  <div class="machine" style="left:40px;top:48px;width:1226px;height:520px">
+    <span class="mlabel">laptop</span>
+
+    <!-- link stubs tying the in-flight message to its sender and recipient -->
+    <svg width="1226" height="520" style="position:absolute;inset:0" fill="none">
+      <path d="M 588 135 L 616 135" stroke="rgba(255,255,255,0.22)" stroke-width="1.5" stroke-dasharray="5 5"/>
+      <path d="M 880 135 L 908 135" stroke="rgba(255,255,255,0.22)" stroke-width="1.5" stroke-dasharray="5 5"/>
+    </svg>
+
+    <div class="win mini" style="left:32px;top:46px">
+      <div class="winbar"><span class="wintitle" style="color:var(--c-web)">web</span></div>
+      <div class="body">
+        <div class="g" style="width:78%"></div>
+        <div class="g" style="width:62%"></div>
+        <div class="toolrow"><span class="tg"></span><div class="g br" style="max-width:55%"></div></div>
+        <div class="g" style="width:70%"></div>
+        <div class="minifoot"><span class="stdot" style="background:var(--working)"></span>working</div>
+      </div>
+    </div>
+
+    <div class="win mini" style="left:324px;top:46px">
+      <div class="winbar"><span class="wintitle" style="color:var(--c-tests)">tests</span></div>
+      <div class="body">
+        <div class="g" style="width:70%"></div>
+        <div class="toolrow"><span class="tg"></span><div class="g br" style="max-width:48%"></div></div>
+        <div class="g" style="width:82%"></div>
+        <div class="g" style="width:40%"></div>
+        <div class="minifoot"><span class="stdot" style="background:var(--ready)"></span>done, handed off</div>
+      </div>
+    </div>
+
+    <!-- the message crossing machines, in flight between sender and recipient -->
+    <div class="mailcard" style="left:616px;top:80px">
+      <div class="mailhead">
+        <span style="color:var(--c-tests)">tests</span><span class="arr">&#8594;</span>
+        <span><span class="host-prefix">server:</span><span style="color:var(--c-api)">api</span></span>
+      </div>
+      <div class="mailgist">Suite is green on the release branch. Run the load test there and send me the numbers.</div>
+    </div>
+
+    <div class="win mini" style="left:908px;top:46px">
+      <div class="winbar"><span class="wintitle"><span class="host-prefix">server:</span><span style="color:var(--c-api)">api</span></span></div>
+      <div class="body">
+        <div class="g" style="width:66%"></div>
+        <div class="toolrow"><span class="tg"></span><div class="g br" style="max-width:58%"></div></div>
+        <div class="toolrow"><span class="tg"></span><div class="g br" style="max-width:44%"></div></div>
+        <div class="g" style="width:74%"></div>
+        <div class="minifoot"><span class="stdot" style="background:var(--working)"></span>working</div>
+      </div>
+    </div>
+
+    <!-- ======= the timeline, on this laptop ======= -->
+    <div class="win" style="left:32px;top:250px;width:1162px;height:238px">
+      <div class="winbar"><span class="wintitle">timeline</span></div>
+      <svg width="1160" height="210" viewBox="0 0 1160 210">
+        <!-- vertical gridlines + time labels -->
+        <g stroke="rgba(255,255,255,0.05)">
+          <line x1="560" y1="16" x2="560" y2="164"/><line x1="700" y1="16" x2="700" y2="164"/>
+          <line x1="840" y1="16" x2="840" y2="164"/><line x1="980" y1="16" x2="980" y2="164"/>
+        </g>
+        <g font-size="13" fill="#6e7681">
+          <text x="560" y="196" text-anchor="middle">1:00</text>
+          <text x="700" y="196" text-anchor="middle">1:15</text>
+          <text x="840" y="196" text-anchor="middle">1:30</text>
+          <text x="980" y="196" text-anchor="middle">1:45</text>
+        </g>
+        <!-- lane baselines -->
+        <g stroke="rgba(255,255,255,0.08)" stroke-width="1.5">
+          <line x1="452" y1="50" x2="1130" y2="50"/>
+          <line x1="452" y1="98" x2="1130" y2="98"/>
+          <line x1="452" y1="146" x2="1130" y2="146"/>
+        </g>
+
+        <!-- ============ gutter: name | model+effort | state | context ============ -->
+        <!-- lane: web -->
+        <text x="18" y="55" font-size="16" font-weight="650" fill="#1EA1EB">web</text>
+        <text x="126" y="55" font-size="14" font-weight="600" fill="#7db8f5">Opus 4.8</text>
+        <text x="213" y="55" font-size="14" font-weight="600" fill="#7db8f5">xhigh</text>
+        <rect x="272" y="39" width="88" height="22" rx="11" fill="#E0B020"/>
+        <text x="316" y="54" text-anchor="middle" font-size="12" font-weight="700" fill="#332600">Working</text>
+        <rect x="376" y="41" width="62" height="18" rx="4" fill="#1b1d22" stroke="rgba(255,255,255,0.35)"/>
+        <rect x="379" y="44" width="7" height="12" rx="2" fill="#54B204"/>
+        <text x="412" y="54" text-anchor="middle" font-size="12" font-weight="700" fill="#e8eaed">12%</text>
+
+        <!-- lane: tests (at rest, name faded) -->
+        <text x="18" y="103" font-size="16" font-weight="650" fill="#4EA8A9" opacity="0.55">tests</text>
+        <text x="126" y="103" font-size="14" font-weight="600" fill="#7db8f5">Sonnet 5</text>
+        <text x="213" y="103" font-size="14" font-weight="600" fill="#7db8f5">xhigh</text>
+        <rect x="272" y="87" width="70" height="22" rx="11" fill="#2B7FB8"/>
+        <text x="307" y="102" text-anchor="middle" font-size="12" font-weight="700" fill="#ffffff">Ready</text>
+        <rect x="376" y="89" width="62" height="18" rx="4" fill="#1b1d22" stroke="rgba(255,255,255,0.35)"/>
+        <rect x="379" y="92" width="4" height="12" rx="2" fill="#54B204"/>
+        <text x="412" y="102" text-anchor="middle" font-size="12" font-weight="700" fill="#e8eaed">4%</text>
+
+        <!-- lane: server:api -->
+        <text x="18" y="151" font-size="16" font-weight="650">
+          <tspan fill="#9aa0a6" font-weight="400" font-style="italic" font-size="13.5">server:</tspan><tspan fill="#54B204">api</tspan>
+        </text>
+        <text x="126" y="151" font-size="14" font-weight="600" fill="#7db8f5">Sonnet 5</text>
+        <text x="213" y="151" font-size="14" font-weight="600" fill="#7db8f5">xhigh</text>
+        <rect x="272" y="135" width="88" height="22" rx="11" fill="#E0B020"/>
+        <text x="316" y="150" text-anchor="middle" font-size="12" font-weight="700" fill="#332600">Working</text>
+        <rect x="376" y="137" width="62" height="18" rx="4" fill="#1b1d22" stroke="rgba(255,255,255,0.35)"/>
+        <rect x="379" y="140" width="5" height="12" rx="2" fill="#54B204"/>
+        <text x="412" y="150" text-anchor="middle" font-size="12" font-weight="700" fill="#e8eaed">7%</text>
+
+        <!-- ============ plot ============ -->
+        <!-- web: a message you sent starts the work; working tail is thicker -->
+        <g fill="#1EA1EB">
+          <rect x="486" y="45" width="132" height="10" rx="5" opacity="0.9"/>
+          <rect x="633" y="45" width="120" height="10" rx="5" opacity="0.9"/>
+          <rect x="1030" y="42.5" width="100" height="15" rx="7.5"/>
+        </g>
+        <circle cx="486" cy="50" r="7.5" fill="#1EA1EB" stroke="#ffffff" stroke-width="1.6"/>
+
+        <!-- tests: works, then hands off and goes quiet -->
+        <g fill="#4EA8A9">
+          <rect x="512" y="93" width="388" height="10" rx="5" opacity="0.9"/>
+        </g>
+        <circle cx="512" cy="98" r="7.5" fill="#4EA8A9" stroke="#ffffff" stroke-width="1.6"/>
+
+        <!-- server:api: an early run, then the handoff lands and it works -->
+        <g fill="#54B204">
+          <rect x="540" y="141" width="86" height="10" rx="5" opacity="0.9"/>
+          <rect x="892" y="138.5" width="238" height="15" rx="7.5"/>
+        </g>
+        <!-- the message: tests -> server:api (dot in the SENDER's color) -->
+        <path d="M 892 98 L 892 137" stroke="#4EA8A9" stroke-width="2.6" fill="none"/>
+        <circle cx="892" cy="146" r="7.5" fill="#4EA8A9" stroke="#ffffff" stroke-width="1.6"/>
+      </svg>
+    </div>
+  </div>
+
+  <!-- ======= mobile: the same view, anywhere ======= -->
+  <div class="machine" style="left:1290px;top:78px;width:294px;height:490px">
+    <span class="mlabel">mobile</span>
+  </div>
+  <div id="phone" style="left:1309px;top:130px">
+    <div id="screen">
+      <div class="phead">romp &middot; 3 sessions &middot; 2 machines</div>
+      <div class="fcards">
+        <div class="fcard" style="border-left-color:rgba(30,161,235,0.6)">
+          <div class="fname" style="color:var(--c-web)"><span class="stdot" style="background:var(--working)"></span>web</div>
+          <div class="ftitle">Ship the signup flow</div>
+          <div class="fgl"><div class="g" style="width:72%"></div></div>
+        </div>
+        <div class="fcard" style="border-left-color:rgba(78,168,169,0.6)">
+          <div class="fname" style="color:var(--c-tests)"><span class="stdot" style="background:var(--ready)"></span>tests</div>
+          <div class="ftitle">Green-light the release branch</div>
+          <div class="fgl"><div class="g" style="width:56%"></div></div>
+        </div>
+        <div class="fcard" style="border-left-color:rgba(84,178,4,0.6)">
+          <div class="fname"><span class="stdot" style="background:var(--working)"></span><span><span class="host-prefix">server:</span><span style="color:var(--c-api)">api</span></span></div>
+          <div class="ftitle">Run the release load test</div>
+          <div class="fchip"><span style="opacity:.7">&#8618; from</span> <b style="color:var(--c-tests)">tests</b></div>
+        </div>
+      </div>
+      <div id="mtabs"><span>Chat</span><span>Outline</span><span class="on">Feed</span><span>Timeline</span></div>
+    </div>
+  </div>
+
+</div>
+</body>

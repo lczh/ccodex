@@ -21,7 +21,7 @@ test("the + (open) flow hides already-open tabs and splits Running vs Recent", (
   assert.match(RENDER, /const rest = avail\.filter\(\(it\) => !it\.running\);/);
   // running group first, with a header; then Recent (only when there was a running group above)
   assert.match(RENDER, /if \(running\.length\) \{ list\.appendChild\(label\("Running — reopen"\)\);/);
-  assert.match(RENDER, /if \(rest\.length\) \{ if \(running\.length\) list\.appendChild\(label\("Recent"\)\);/);
+  assert.match(RENDER, /if \(rest\.length\) \{ if \(running\.length \|\| hidden\.length\) list\.appendChild\(label\("Recent"\)\);/);
 });
 
 test("PICK mode still shows every session, open or not", () => {

@@ -47,7 +47,8 @@ test("the palette forks the ACTIVE session from the tip, via the chat pane", () 
 test("kernel: forkSession is a session op; seeding precedes discoverability; the fsid is pinned to the sid", () => {
   assert.match(KERNEL, /"mcpAction", "forkSession",/);   // in ID_OPS — routed by session id like every session op
   assert.match(KERNEL, /elif t == "forkSession" and msg\.get\("name"\):/);
-  assert.match(KERNEL, /def _fork_session\(parent_sid, cut_msg_uuid, new_name, now=None\):/);
+  // client rides through so only the ASKING dashboard's chat follows the fork (the per-viewer rule)
+  assert.match(KERNEL, /def _fork_session\(parent_sid, cut_msg_uuid, new_name, now=None, client=None\):/);
   // the cut means the same thing the edit/delete rewind means: just before the clicked user message
   assert.match(KERNEL, /cut_uuid, err = _rewind_target\(sess\["path"\], parent_sid, str\(cut_msg_uuid\)\)/);
   // the judge stores are seeded BEFORE be.fork writes the names/ entry (discoverability)

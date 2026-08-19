@@ -14,9 +14,9 @@ test("a user ChatEvent can carry a romp flag", () => {
 });
 
 test("a romp event renders the gray romp-bubble + a romp tag, NOT the blue or the note box", () => {
-  assert.match(RENDER, /const romp = !!ev\.romp;/);
+  assert.match(RENDER, /const romp = kind === "romp";/, "derived from the ONE senderKind verdict (2026-08-18)");
   // 'injected' (the neutral left note) excludes romp, so romp gets its own branch
-  assert.match(RENDER, /const injected = !ev\.human && !romp;/);
+  assert.match(RENDER, /const injected = kind === "injected";/, "same verdict — the predicate itself lives in sender-identity.ts");
   // the tag shows the romp swirl-glyph LOGO (not the old ↯ symbol) + "romp" (the user 2026-06-19)
   assert.match(RENDER, /el\("img", "romp-tag-logo"\)/);
   assert.match(RENDER, /logo\.src = mediaSrc\("romp-swirl-glyph\.svg"\)/);
@@ -24,7 +24,7 @@ test("a romp event renders the gray romp-bubble + a romp tag, NOT the blue or th
   assert.doesNotMatch(RENDER, /tag\.textContent = "↯ romp"/, "the ↯ placeholder is gone");
   assert.match(RENDER, /\(romp \? "romp-bubble" : tagged \? "romp-bubble tag-bubble" : injected \? "user-note" : "user-bubble"\)/);
   // its own gray rail dot
-  assert.match(RENDER, /dot\(romp \? "romp" : injected \? "ring" : "user"\)/);
+  assert.match(RENDER, /dot\(romp \? "romp" : tagged \? "tag" : injected \? "ring" : "user"\)/);
   assert.match(RENDER, /"green" \| "ring" \| "user" \| "red" \| "romp"/, "the dot helper knows the romp variant");
 });
 

@@ -264,7 +264,7 @@ test("an ALL-quiet window falls back to the live lanes — never a blank, un-gra
   panel.draw();
   assert.equal(panel._vis.length, 2, "both LIVE lanes stand in an all-quiet window");
   const src = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "romp-timeline-view.js"), "utf8");
-  assert.match(src, /if \(this\._activeOnly && !vis\.length\) vis = data\.sessions\.filter\(\(s\) => s\.live \|\| hasWork\(s\)\)/);
+  assert.match(src, /if \(this\._activeOnly && !vis\.length\) vis = data\.sessions\.filter\(inView\)\.filter\(\(s\) => s\.live \|\| hasWork\(s\)\)/);
 });
 
 test("the active-only flag rides romp:settings like collapseGaps (source pins)", () => {

@@ -35,7 +35,7 @@ test("when the feed stacks (narrow), the columns read Completed → Blocked → 
   // the side-by-side DOM order stays Working/Blocked/Completed; a container query stacks them and `order`
   // re-sequences ONLY the stacked case: done first (moved up from the middle, superseding the 2026-07-08
   // Blocked-first order), then needs-you, then still-running.
-  assert.match(CSS, /@container \(max-width: 540px\) \{[\s\S]*?\.feed-cols \{ flex-direction: column; \}/);
+  assert.match(CSS, /@container \(max-width: 540px\) or style\(--romp-stack: on\) \{[\s\S]*?\.feed-cols \{ flex-direction: column; \}/);
   assert.match(CSS, /\.feed-col\.col-completed\s+\{ order: var\(--stack-order, 1\); \}/);   // the DEFAULT — a
   // dragged section overrides via --stack-order (feed-col-fold.test.ts owns that rule)
   assert.match(CSS, /\.feed-col\.col-needsInput \{ order: var\(--stack-order, 2\); \}/);

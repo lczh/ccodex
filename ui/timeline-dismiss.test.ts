@@ -80,5 +80,5 @@ test("the click holds the sid, and update() re-applies it on every push", () => 
   assert.match(SRC, /this\._dismissed\.add\(s\.id\);/);              // click site
   assert.match(SRC, /this\._reconcileDismissed\(\);/);               // called from update()
   // ...right after the wholesale replace that used to undo the optimistic removal
-  assert.match(SRC, /this\.data = data;[\s\S]{0,400}?this\._reconcileDismissed\(\);/);
+  assert.match(SRC, /this\.data = data;[\s\S]{0,700}?this\._reconcileDismissed\(\);/);
 });

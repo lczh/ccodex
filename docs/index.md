@@ -57,3 +57,11 @@ Find any work by when it happened on the timeline or by the task it belonged
 to, then open it for the full detail.
 
 <video src="assets/guide/navigate.mp4" controls loop muted playsinline preload="none" data-romp-autoplay width="100%"></video>
+
+## Every machine, one place { .feature-h }
+
+Sessions on your server appear alongside your laptop's, agents hand off work
+across [machines](guide.md#linking-kernels-on-other-machines), and you can view
+everything from a laptop or [a phone](guide.md#from-your-phone).
+
+![Sessions on two machines, gathered into one dashboard and the same view on a phone](assets/guide/every-machine.png){ width="100%" }

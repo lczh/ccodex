@@ -77,11 +77,13 @@ class SplitCaptions(unittest.TestCase):
         self.assertEqual(jd._prompt_text(self.open_seg["atoms"]), "now add a regression test")
 
     def test_caption_call_routes_prompt_to_the_gister(self):
+        # _caption_call returns (caption, paused) since 2026-08-18 — paused rides out of the worker
+        # thread so the strike ledger never counts a rate-gate skip as the model's empty verdict
         with mock.patch.object(jd, "gist_llm", return_value="G") as g, \
              mock.patch.object(jd, "caption_llm", return_value="W") as c:
-            self.assertEqual(jd._caption_call({"kind": "prompt", "text": "x"}), "G")
+            self.assertEqual(jd._caption_call({"kind": "prompt", "text": "x"}), ("G", False))
             g.assert_called_once_with("x")                                # message caption → the gister (its own label, 2026-07-08)
-            self.assertEqual(jd._caption_call({"kind": "work", "text": "y"}), "W")
+            self.assertEqual(jd._caption_call({"kind": "work", "text": "y"}), ("W", False))
             c.assert_called_once_with("y")                                # work caption → the past-tense captioner
 
 

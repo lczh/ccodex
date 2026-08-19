@@ -73,9 +73,48 @@ class RateLimitGate(unittest.TestCase):
     def test_missing_usage_never_gates(self):
         self.assertEqual(jd._judge_run("m", "sys", "user"), "the-model-reply")
 
-    def test_fable_bucket_is_ignored(self):
-        self._usage(100, 3600, bucket="fable")        # judges run Sonnet: the Fable cap is irrelevant
-        self.assertEqual(jd._judge_run("m", "sys", "user"), "the-model-reply")
+    def test_fable_bucket_gates_exactly_the_calls_that_bill_it(self):
+        # The gated buckets FOLLOW THE CALL'S MODEL (2026-08-18): the old tuple ignored `fable`
+        # ("judges run Sonnet") — stale once the judge-model pin read fable, and ~22,400 doomed
+        # retries burned across 08-16/17 while the fable window sat at 100%.
+        self._usage(100, 3600, bucket="fable")
+        self.assertEqual(jd._judge_run("sonnet", "sys", "user"), "the-model-reply",
+                         "a sonnet call does not bill the fable window — never gated by it")
+        self.assertEqual(jd._judge_run("fable", "sys", "user"), "",
+                         "a fable call IS gated by the fable window")
+        self.assertTrue(jd._judge_ctx.paused)
+
+    def test_the_gate_latches_the_loud_limit_banner(self):
+        # a limit-down judge layer must SAY so (the user 2026-08-18), never fail quietly: the gate
+        # writes the judge-limit latch, self-expiring at the window reset, cleared by a success
+        self._usage(100, 3600, bucket="fable")
+        jd._judge_run("fable", "sys", "user")
+        row = jd._limit_down()
+        self.assertEqual(row["bucket"], "fable")
+        self.assertEqual(row["model"], "fable")
+        # a successful call (model switched to sonnet, say) clears the latch — the deciding event
+        self.assertEqual(jd._judge_run("sonnet", "sys", "user"), "the-model-reply")
+        self.assertIsNone(jd._limit_down())
+
+    def test_the_latch_self_expires_at_the_reset(self):
+        jd._limit_mark("fable", 100, int(time.time()) - 5, "fable")   # already past its reset
+        self.assertIsNone(jd._limit_down(), "the window reset IS the deciding event — no age heuristics")
+
+    def test_limit_shaped_envelope_latches_and_pokes_a_usage_poll(self):
+        # get_usage rides turn ends, so an idle fleet's usage.json goes stale; the FIRST doomed call
+        # is the event that refreshes it — the envelope latches the banner and fires the wired poll
+        class _FakeErr:
+            stdout = '{"is_error": true, "result": "Claude AI usage limit reached — resets 12:00"}'
+        jd.subprocess.run = lambda *a, **k: _FakeErr()
+        poked = []
+        saved = jd._USAGE_REFRESH_FN
+        try:
+            jd._USAGE_REFRESH_FN = lambda: poked.append(1)
+            self.assertEqual(jd._judge_run("fable", "sys", "user"), "")
+            self.assertEqual(poked, [1], "one exact usage poll fired")
+            self.assertEqual((jd._limit_down() or {}).get("bucket"), "account")
+        finally:
+            jd._USAGE_REFRESH_FN = saved
 
 
 class SegKeyUnified(unittest.TestCase):

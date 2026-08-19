@@ -60,8 +60,8 @@ test("menu rows toggle with the SAME optimistic + sticky + reconcile-before-draw
 
 test("the gear menu closes on outside click / Escape / teardown, alongside the meta menu", () => {
   assert.match(SRC, /_closeLaneMenu\(\) \{ if \(this\._laneMenu\) \{ this\._laneMenu\.remove\(\); this\._laneMenu = null; \} \}/);
-  assert.match(SRC, /this\._onDocClick = \(\) => \{ this\._closeMetaMenu\(\); this\._closeLaneMenu\(\); \};/);
-  assert.match(SRC, /if \(e\.key === 'Escape'\) \{ this\._closeMetaMenu\(\); this\._closeLaneMenu\(\); \}/);
+  assert.match(SRC, /this\._onDocClick = \(\) => \{ this\._closeMetaMenu\(\); this\._closeLaneMenu\(\); this\._closeViewsMenu\(\); \};/);
+  assert.match(SRC, /if \(e\.key === 'Escape'\) \{ this\._closeMetaMenu\(\); this\._closeLaneMenu\(\); this\._closeViewsMenu\(\); \}/);
 });
 
 test("the icon drawers survive (they render inside the menu now): ON = romp blue, OFF = slashed gray", () => {
@@ -81,7 +81,7 @@ test("setSessionFlag still posts via the web host hook, with a Node-fs fallback 
 
 test("the sticky-flag machinery survives: pendingFlags reconcile on every update (no flicker-back)", () => {
   assert.match(SRC, /this\._pendingFlags = \{\};/);
-  assert.match(SRC, /this\.data = data;\s*\n(?:[^\n]*\n)?\s*this\._reconcilePendingFlags\(\);/);
+  assert.match(SRC, /this\.data = data;\s*\n(?:[^\n]*\n){0,4}\s*this\._reconcilePendingFlags\(\);/);
   assert.match(SRC, /_reconcilePendingFlags\(\) \{[\s\S]*?if \(s\[flag\] === p\[flag\]\) delete p\[flag\];[\s\S]*?else s\[flag\] = p\[flag\];/);
 });
 
