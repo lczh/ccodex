@@ -2008,14 +2008,16 @@ def _run_update(tag):
     ok_plain = {"ok": True, "tag": tag, "restarted": False}
     if mport.isdigit():
         restart = ("  if %s -c %s %d >/dev/null 2>&1; then\n"
-                   "    printf '%%s' %s > %s\n"
+                   "    printf '%%s' %s > %s.tmp && mv -f %s.tmp %s\n"
                    "  else\n"
-                   "    printf '%%s' %s > %s\n"
+                   "    printf '%%s' %s > %s.tmp && mv -f %s.tmp %s\n"
                    "  fi\n" % (q(sys.executable), q(manager_post), int(mport),
-                                q(json.dumps(ok_restarted)), rep, q(json.dumps(ok_plain)), rep))
+                                q(json.dumps(ok_restarted)), rep, rep, rep,
+                                q(json.dumps(ok_plain)), rep, rep, rep))
     else:
         restart = ("  : # no manager — the new code arms on the next romp start (the report says so)\n"
-                   "  printf '%%s' %s > %s\n" % (q(json.dumps(ok_plain)), rep))
+                   "  printf '%%s' %s > %s.tmp && mv -f %s.tmp %s\n"
+                   % (q(json.dumps(ok_plain)), rep, rep, rep))
     verify_sh = " ".join(q(x) for x in verify_argv)
     if not _release_verify_enforced():
         # best-effort: the attempt and its outcome land in the log either way, but an unsigned tag
@@ -2062,8 +2064,9 @@ def _run_update(tag):
           % (tag, tag, log, verify_sh, log)
         + "  NEW8=$(git rev-parse --short=8 'refs/tags/%s^{commit}' 2>> %s | head -c 8)\n" % (tag, log)
         + "  if [ -n \"$NEW8\" ]; then\n"
-        + "    if [ -n \"$CARRY\" ]; then printf '%%s\\n%%s' \"$NEW8\" \"$CARRY\" > %s; "
-          "else printf '%%s' \"$NEW8\" > %s; fi\n" % (latch, latch)
+        + "    if [ -n \"$CARRY\" ]; then printf '%%s\\n%%s' \"$NEW8\" \"$CARRY\" > %s.tmp; "
+          "else printf '%%s' \"$NEW8\" > %s.tmp; fi\n" % (latch, latch)
+        + "    mv -f %s.tmp %s\n" % (latch, latch)
         + "    if [ -s %s ] "
           "&& git merge --ff-only %s >> %s 2>&1 && ./install.sh >> %s 2>&1; then\n"
           % (latch, tag, log, log)
@@ -2075,9 +2078,10 @@ def _run_update(tag):
         + "if [ \"$OK\" = 1 ]; then\n"
         + restart
         + "else\n"
-        + "  printf '%%s' %s > %s\n" % (q(json.dumps({"ok": False, "tag": tag,
+        + "  printf '%%s' %s > %s.tmp && mv -f %s.tmp %s\n" % (q(json.dumps({"ok": False, "tag": tag,
                                                       "why": "the fetch, signature verification, "
-                                                             "fast-forward or install failed"})), rep)
+                                                             "fast-forward or install failed"})),
+                                                     rep, rep, rep)
         + "fi\n")
     # The CROSS-PROCESS update lock rides into the detached child: the child inherits the locked
     # fd (pass_fds) and never closes it, so the flock lives exactly as long as the update — no
@@ -2599,15 +2603,28 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
         if not _converge_install(tip[:8], lock_fd):
             return
     if kind == "restart":
-        failed = _install_failed_sha()
-        if failed:
+        lines = _install_latch_lines()
+        if lines:
             # the checkout sitting on disk is one whose install failed — booting it is exactly the
-            # stale-deps update the pull path refused; retry the install and restart only on a pass
-            if failed == _sha8(_checkout_sha()):
-                if not _converge_install(failed, lock_fd):
+            # stale-deps update the pull path refused; retry the install and restart only on a
+            # pass. LINES rule, like every other latch reader (the adversarial check, 2026-08-19:
+            # this one still parsed a single line and moot-cleared a carrying latch — erasing the
+            # prior record and restarting every kernel onto the half-installed build):
+            cur = _sha8(_checkout_sha())
+            if not cur:
+                _converge_note("cannot read HEAD while an install latch is armed — not restarting "
+                               "onto an unknown build.")
+                return
+            if cur in lines:
+                if not _converge_install(cur, lock_fd):
                     return
+            elif len(lines) > 1:
+                _converge_note("this checkout's install latch names %s and a prior %s but HEAD is "
+                               "%s — heal it by hand (run install.sh, then remove the latch)."
+                               % (lines[0], lines[1], cur))
+                return
             else:
-                _set_install_failed("")               # a different sha landed since; latch is moot
+                _set_install_failed("")               # intent-only mismatch; the move never landed
     try:
         # DIRECT http.client, never urllib: urllib honors HTTP_PROXY, and with one set (NO_PROXY
         # absent) this localhost POST — manager token included — went to the proxy
@@ -25788,6 +25805,12 @@ class Handler(BaseHTTPRequestHandler):
                                 _sync_notice("romp updated to %s and asked the manager to restart "
                                              "— if the dashboard doesn't reload shortly, run "
                                              "`romp refresh` yourself." % updated, ok=True)
+                                try:                # durable: the restart may land AFTER this
+                                    with (jd.STATE / "update.log").open("a") as _ulf:
+                                        _ulf.write("update to %s reported ok+restarted; consumed "
+                                                   "by the running kernel (child gone)\n" % updated)
+                                except OSError:
+                                    pass
                 return self._send(200, json.dumps({
                     "cur": _kernel_ver() or "", "tag": _UPDATE_AVAIL[0], "mode": _update_mode(),
                     # a running CONVERGE is as in-flight as a running tag update: a page loading
