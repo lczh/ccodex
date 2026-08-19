@@ -715,6 +715,45 @@ class Routes(Fresh):
                         "and says what to do if the promised restart never shows")
         km._UPDATE_STATE[0] = ""
 
+    def test_non_object_reports_are_as_corrupt_as_garbage(self):
+        # null parses (wedging state:running forever) and []/numbers 500'd at _peek.get (the
+        # user's audit, 2026-08-19): anything but a dict is set aside and the probe unsticks
+        for payload in ("null", "[]", "42", '"a string"'):
+            km._UPDATE_STATE[0] = "running"
+            (jd.STATE / "update-report.json").write_text(payload)
+            try:
+                status, body = _serve_get("/update-check", headers={"X-Romp-Token": km.TOKEN})
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(json.loads(body)["state"], "", payload)
+            finally:
+                (jd.STATE / "update-report.json.bad").unlink(missing_ok=True)
+                km._UPDATE_STATE[0] = ""
+                km._UPDATE_ERROR[0] = ""
+
+    def test_a_stale_latch_cannot_satisfy_the_tag_scripts_publish_gate(self):
+        # a failed tmp/mv left the OLD latch satisfying [ -s ] and the merge proceeded with no
+        # record of the new build (the user's audit, 2026-08-19): the gate now demands the
+        # published first line EQUAL the new tag's sha
+        km._UPDATE_STATE[0] = ""
+        calls = []
+        real_popen = subprocess.Popen
+        def _popen(*a, **kw):
+            argv = a[0] if a else kw.get("args")
+            if argv and argv[0] == "git":
+                return real_popen(*a, **kw)
+            calls.append((a, kw))
+            return mock.MagicMock()
+        with mock.patch.object(km.subprocess, "Popen", side_effect=_popen), \
+             mock.patch.dict(km.os.environ, {"GIT_CONFIG_GLOBAL": "/dev/null",
+                                             "GIT_CONFIG_SYSTEM": "/dev/null"}):
+            self.assertTrue(km._run_update("v0.7.0"))
+        script = calls[0][0][0][2]
+        self.assertIn('sed -n 1p', script)
+        self.assertIn('= "$NEW8" ]', script.replace("\\", ""),
+                      "the gate compares the PUBLISHED latch line to the new sha — a stale "
+                      "survivor of a failed publish can never green-light the merge")
+        km._UPDATE_STATE[0] = ""
+
     def test_a_corrupt_report_never_defeats_the_liveness_probe(self):
         # exists() gating let a zero-byte/garbage report wedge 'running' forever (the adversarial
         # review, 2026-08-19): unparseable is set aside as .bad and treated as missing

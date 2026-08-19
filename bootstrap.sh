@@ -177,7 +177,9 @@ fi
 # only on success. A failed install leaves the latch armed: romp-serve's gate and the kernel's
 # boot heal refuse to run the build until install passes.
 
-# Resolve the channel and target commit BEFORE the move, then record the channel (it moves no code).
+# Resolve the channel BEFORE the move (it needs only $ref/$is_tag); its WRITE lands after the
+# locked transaction succeeds — decisive state must not change outside it (the user's audit,
+# 2026-08-19), and a failed install keeps the OLD install's channel.
 channel="stable"
 # dev means the MAIN BRANCH opt-in in any spelling (main / refs/heads/main / origin/main) — and
 # never a TAG that happens to be named main: a tag install is a pinned, verified artifact
@@ -186,15 +188,6 @@ channel="stable"
 if [ "$is_tag" -eq 0 ]; then
     case "$ref" in main|refs/heads/main|origin/main) channel="dev" ;; esac
 fi
-# The marker lives in the WORKTREE's own git dir: `git config --local` is repository-scoped, so a
-# dev worktree could flip a sibling release worktree's channel via the shared config (the
-# user's audit, 2026-08-17). The legacy key is unset so it can never shadow the marker.
-gd="$(git -C "$DIR" rev-parse --absolute-git-dir)" || {
-    echo "romp: could not resolve the clone's git dir for the update channel." >&2; exit 1; }
-printf '%s\n' "$channel" > "$gd/romp-update-channel" || {
-    echo "romp: could not record the update channel in $gd." >&2; exit 1; }
-git -C "$DIR" config --unset romp.updateChannel 2>/dev/null || true
-echo "==> Update channel: $channel"
 
 precheck="-"
 if [ "$is_tag" -eq 1 ]; then
@@ -230,6 +223,8 @@ else
     set -- checkout --quiet "$ref"
 fi
 
+gd="$(git -C "$DIR" rev-parse --absolute-git-dir)" || {
+    echo "romp: could not resolve the clone's git dir for the update transaction." >&2; exit 1; }
 echo "==> Checking out $ref + installing (one locked transaction)"
 txn_rc=0
 python3 - "$DIR" "$gd" "$target" "$precheck" "$@" <<'TXNPY' || txn_rc=$?
@@ -278,8 +273,10 @@ def write_latch(sha8):
 
 try:
     lines = [ln.strip()[:8] for ln in open(latch).read().splitlines() if ln.strip()]
-except OSError:
+except FileNotFoundError:
     lines = []
+except OSError:
+    sys.exit(3)                              # an EXISTING record we cannot read is UNKNOWN, never absent
 pre_head = head8()
 carry = ""
 if lines:
@@ -326,7 +323,15 @@ os.remove(latch)
 sys.exit(0)
 TXNPY
 case "$txn_rc" in
-    0) : ;;
+    0)
+       # The marker lives in the WORKTREE's own git dir: `git config --local` is repository-scoped, so a
+       # dev worktree could flip a sibling release worktree's channel via the shared config (the
+       # user's audit, 2026-08-17). The legacy key is unset so it can never shadow the marker.
+       printf '%s\n' "$channel" > "$gd/romp-update-channel" || {
+           echo "romp: could not record the update channel in $gd." >&2; exit 1; }
+       git -C "$DIR" config --unset romp.updateChannel 2>/dev/null || true
+       echo "==> Update channel: $channel"
+       ;;
     3) echo "romp: another update holds this checkout's lock (or HEAD is unreadable) — try again when it finishes." >&2; exit 1 ;;
     7) echo "romp: local branch $ref cannot fast-forward to origin/$ref (it moved while waiting for the lock)." >&2
        echo "  Resolve or preserve the local commits, then rerun bootstrap.sh." >&2; exit 1 ;;

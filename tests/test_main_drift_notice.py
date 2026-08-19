@@ -423,6 +423,29 @@ class ConvergeFunctional(unittest.TestCase):
                          "mid-transaction the latch carries intent AND the prior record")
         self.assertEqual(km._install_latch_lines(), [], "the new build's passing install spends both")
 
+    def test_an_unreadable_existing_latch_is_unknown_to_every_kernel_reader(self):
+        # treating unreadable-existing as ABSENT let a writer overwrite the record — reopening
+        # the crash window the carrying design closed (the user's audit, 2026-08-19)
+        with mock.patch.object(km, "_install_latch_lines", return_value=None):
+            self.assertTrue(km._refuse_half_installed(), "unknown latch → never serve")
+            with mock.patch.object(km, "_sync_notice"):
+                refusal, carry = km._settle_prior_latch(None)
+            self.assertIn("cannot be read", refusal)
+            self.assertEqual(carry, "")
+        # and the helper itself returns None for unreadable-existing, [] only for truly absent
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            with mock.patch.object(km, "_install_latch_path", return_value=gd / "romp-install-failed"):
+                self.assertEqual(km._install_latch_lines(), [], "absent → []")
+                (gd / "romp-install-failed").write_text("aaaa1111\n")
+                (gd / "romp-install-failed").chmod(0)
+                try:
+                    self.assertIsNone(km._install_latch_lines(), "existing-unreadable → None")
+                finally:
+                    (gd / "romp-install-failed").chmod(0o644)
+
     def test_boot_heal_takes_the_lock_before_any_latch_read(self):
         # reading first left a fail-open window where an updater held the lock but had not armed
         # the latch yet (the user's audit, 2026-08-18)
@@ -525,6 +548,52 @@ class ConvergeFunctional(unittest.TestCase):
         self.assertTrue(any("restart request failed" in n for n in self.notices))
         self.assertEqual((km._MAIN_DRIFT[0], km._MAIN_DRIFT[1]), ("", ""),
                          "the restart never happened — the next pass must re-offer, not latch stale")
+
+
+class CodexCreateWiring(unittest.TestCase):
+    def test_codex_create_survives_the_reveal_rename_and_focuses_the_asking_client(self):
+        # the v1.3.6 merge renamed _reveal_chat → _reveal_chat_for and this caller kept the old
+        # name: every Codex create spawned the session then raised NameError — an orphan plus a
+        # failed /new (the user's audit, 2026-08-19, ruff's sole F821). Drive the real function.
+        revealed = []
+        fake_backend = mock.MagicMock()
+        fake_backend.spawn.return_value = "11111111-2222-3333-4444-555555555555"
+        with mock.patch.object(km, "_codex", return_value=fake_backend), \
+             mock.patch.object(km, "_pick_identity_color", return_value=("#111111", "#ffffff")), \
+             mock.patch.object(km, "_reveal_chat_for",
+                               side_effect=lambda c, m: revealed.append((c, m))), \
+             mock.patch.object(km, "_mark_views_dirty"), \
+             mock.patch.object(km, "_push_session_now"):
+            sid = km._create_codex_session("web", "/tmp", client={"who": "asker"})
+        self.assertEqual(sid, "11111111-2222-3333-4444-555555555555")
+        self.assertEqual(revealed, [({"who": "asker"},
+                                     {"type": "focus", "id": sid})],
+                         "focus lands on the asking window, through the CURRENT reveal spelling")
+
+
+class KernelTokenBirth(unittest.TestCase):
+    def test_the_kernel_mint_is_link_claimed_like_postals(self):
+        # the kernel still O_TRUNC'd the shared file: a concurrent kernel/postal start could run
+        # on DIFFERENT tokens with only one persisted (the user's audit, 2026-08-19)
+        import stat
+        f = km.jd.STATE / "serve-token"
+        old = f.read_text() if f.exists() else None
+        env = {k: v for k, v in km.os.environ.items() if k != "ROMP_SERVE_TOKEN"}
+        try:
+            f.unlink(missing_ok=True)
+            with mock.patch.dict(km.os.environ, env, clear=True):
+                v = km._load_token()
+                self.assertTrue(v)
+                self.assertEqual(stat.S_IMODE(km.os.stat(f).st_mode), 0o600, "born 0600")
+                self.assertEqual(f.read_text().strip(), v)
+                f.unlink()
+                f.write_text("winner-token")
+                self.assertEqual(km._load_token(), "winner-token",
+                                 "a complete pre-existing token always wins — never truncated")
+        finally:
+            f.unlink(missing_ok=True)
+            if old is not None:
+                f.write_text(old)
 
 
 class BootHeal(unittest.TestCase):

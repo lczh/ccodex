@@ -492,3 +492,16 @@ HOLDPY
     [[ "$output" == *"moved while waiting for the lock"* ]]
     [[ "$output" != *STUB_INSTALL_RAN* ]]
 }
+
+@test "bootstrap.sh: the channel marker lands only AFTER the transaction succeeds" {
+    # decisive state must not change outside the locked transaction (the user's audit,
+    # 2026-08-19): a failed install keeps the OLD install's channel — and a fresh clone whose
+    # install fails records no channel at all
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$ROMP_REPO/install.sh"
+    git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -qam broken
+    git -C "$ROMP_REPO" tag -s v0.3.0 -m v0.3.0
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -ne 0 ]
+    gd="$(git -C "$HOME/romp" rev-parse --absolute-git-dir)"
+    [ ! -e "$gd/romp-update-channel" ]
+}

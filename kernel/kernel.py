@@ -577,14 +577,25 @@ def _load_token():
     v = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
     try:
         jd.STATE.mkdir(parents=True, exist_ok=True)
-        # 0600 from birth, not written-then-chmod'd: between those two calls the file carried the
-        # token at the umask's mercy, and the whole same-user gate is this file's mode.
-        fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # 0600 from birth AND link-claimed like the postal mint (the user's audit, 2026-08-19:
+        # this side still O_TRUNC'd the shared file, so a concurrent kernel/postal start could
+        # end up on different in-memory tokens with only one persisted). The temp is private;
+        # the final name appears only with its content; the link-race loser re-reads the winner.
+        tmp = f.with_name("%s.%d.tmp" % (f.name, os.getpid()))
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             os.write(fd, v.encode())
         finally:
             os.close(fd)
-        os.chmod(f, 0o600)                       # a PRE-EXISTING file keeps its old mode through O_CREAT
+        try:
+            os.link(str(tmp), str(f))
+        except FileExistsError:
+            v = f.read_text().strip() or v
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
     except OSError:
         pass
     return v
@@ -2164,7 +2175,7 @@ def _run_update(tag):
         + "    if [ -n \"$CARRY\" ]; then printf '%%s\\n%%s' \"$NEW8\" \"$CARRY\" > %s.tmp; "
           "else printf '%%s' \"$NEW8\" > %s.tmp; fi\n" % (latch, latch)
         + "    mv -f %s.tmp %s\n" % (latch, latch)
-        + "    if [ -s %s ] "
+        + "    if [ \"$(sed -n 1p %s 2>/dev/null | head -c 8)\" = \"$NEW8\" ] "
           "&& git merge --ff-only %s >> %s 2>&1 && ./install.sh >> %s 2>&1; then\n"
           % (latch, tag, log, log)
         + "      rm -f %s\n" % latch
@@ -2351,10 +2362,12 @@ def _install_latch_lines():
     for cand in ([p] if p is not None else []) + [jd.STATE / "converge-install-failed"]:
         try:
             lines = [ln.strip()[:8] for ln in cand.read_text().splitlines() if ln.strip()]
-        except OSError:
+        except FileNotFoundError:
             continue
-        if lines:
-            return lines
+        except OSError:
+            return None                               # an EXISTING record we cannot read is UNKNOWN,
+        if lines:                                     # never absent — absent let a writer overwrite
+            return lines                              # it (the user's audit, 2026-08-19)
     return []
 
 
@@ -2701,6 +2714,10 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
             return
     if kind == "restart":
         lines = _install_latch_lines()
+        if lines is None:
+            _converge_note("this checkout's install latch exists but cannot be read — not "
+                           "restarting onto an unknown build.")
+            return
         if lines:
             # the checkout sitting on disk is one whose install failed — booting it is exactly the
             # stale-deps update the pull path refused; retry the install and restart only on a
@@ -2754,6 +2771,8 @@ def _settle_prior_latch(lock_fd):
     the old build protected. Returns (refusal, carry): refusal "" to proceed, carry = the sha8 the
     new arm must record as prior ("" when settled clean)."""
     lines = _install_latch_lines()
+    if lines is None:
+        return "an existing install latch cannot be read — settling nothing on a guess", ""
     if not lines:
         return "", ""
     cur = _sha8(_checkout_sha())
@@ -2863,6 +2882,8 @@ def _refuse_half_installed():
     if _inside_update_txn():
         return False
     lines = _install_latch_lines()
+    if lines is None:
+        return True                                   # unreadable-existing is unknown: never serve
     if not lines:
         return False
     cur = _sha8(_checkout_sha())
@@ -2897,6 +2918,10 @@ def _boot_heal(wait_s=0):
         return
     try:
         lines = _install_latch_lines()                # read UNDER the lock
+        if lines is None:
+            _converge_note("this checkout's install latch exists but cannot be read — healing "
+                           "nothing on a guess; fix its permissions.")
+            return
         if not lines:
             return
         cur = _sha8(_checkout_sha())
@@ -5473,14 +5498,17 @@ def _create_sdk_session(nm, cwd, auth="", prefs=None, client=None):
     return sid, extra
 
 
-def _create_codex_session(nm, cwd):
+def _create_codex_session(nm, cwd, client=None):
     """Create + open a new Codex-backed session — the same ACK-FAST shape as _create_sdk_session
     (focus first, dirty-mark wake, one direct push; never a synchronous fleet build here). spawn()
     starts the app-server thread, touches the materialized transcript (so discover() lists it
-    immediately) and writes the shared names/ identity file."""
+    immediately) and writes the shared names/ identity file. Focus rides _reveal_chat_for — the
+    v1.3.6 merge renamed _reveal_chat and this caller kept the old name, so every Codex create
+    raised NameError AFTER spawning (an orphan session + a failed /new; the user's audit,
+    2026-08-19, ruff's sole F821)."""
     bg, fg = _pick_identity_color()
     sid = _codex().spawn(nm, cwd, bg, fg)
-    _reveal_chat({"type": "focus", "id": sid})
+    _reveal_chat_for(client, {"type": "focus", "id": sid})
     _mark_views_dirty()
     _push_session_now(sid)
     return sid
@@ -10437,8 +10465,10 @@ def _update_remote(host):
         'lp=os.path.join(os.path.dirname(lock),"romp-install-failed")\n'
         "try:\n"
         '    lines=[l.strip()[:8] for l in open(lp).read().splitlines() if l.strip()]\n'
-        "except OSError:\n"
+        "except FileNotFoundError:\n"
         "    lines=[]\n"
+        "except OSError:\n"
+        "    sys.exit(10)\n"
         'carry=""\n'
         "if lines:\n"
         '    curh=subprocess.run(["git","-C",r,"rev-parse","--short=8","HEAD"],capture_output=True,text=True)\n'
@@ -10687,6 +10717,13 @@ def _pull_remote(host, expected_sha=None):
             if anc2.returncode != 0:
                 return False, ("local and %s diverged while waiting for the update lock — "
                                "nothing merged" % host)
+            # trust re-checked here too: settle can run install.sh for minutes, and a downgrade
+            # landing meanwhile must win before the code-execution boundary (the user's audit,
+            # 2026-08-19)
+            with _remotes_lock:
+                _cur = _remotes.get(host)
+                if not (_cur and not _cur.get("checkin_peer") and _cur.get("trust") == "trusted"):
+                    return False, "%s trust changed during the pull — nothing merged" % host
             if not _arm_latch(_sha8(fetched_sha), carry):
                 return False, "could not record the install intent — not moving HEAD"
             m = subprocess.run(["git", "-C", str(ROOT), "merge", "--ff-only", fetched_sha],
@@ -26010,11 +26047,14 @@ class Handler(BaseHTTPRequestHandler):
                     _rp = jd.STATE / "update-report.json"
                     _usable = False
                     try:
-                        json.loads(_rp.read_text())
-                        _usable = True
+                        _usable = isinstance(json.loads(_rp.read_text()), dict)
                     except OSError:
                         pass
                     except ValueError:
+                        pass
+                    if not _usable and _rp.exists():
+                        # null / [] / a number PARSE but carry nothing — as wedging as garbage
+                        # (the user's audit, 2026-08-19): set aside like any corrupt report
                         try:
                             _rp.rename(_rp.with_suffix(".json.bad"))
                         except OSError:
@@ -26039,6 +26079,8 @@ class Handler(BaseHTTPRequestHandler):
                         _peek = json.loads((jd.STATE / "update-report.json").read_text())
                     except (OSError, ValueError):
                         _peek = None
+                    if not isinstance(_peek, dict):
+                        _peek = None                  # null/[]/numbers 500'd at _peek.get (2026-08-19)
                     _child_gone = False
                     if _peek is not None and _peek.get("ok") and _peek.get("restarted"):
                         # ok+restarted normally belongs to the NEXT boot — but a restart the
@@ -27138,7 +27180,7 @@ class Handler(BaseHTTPRequestHandler):
                         client["send"](json.dumps({"type": "warn", "text": SDK_SETUP_HINT}))
                 elif msg.get("backend") == "codex":   # an OpenAI Codex thread (plans/codex-backend.md)
                     if _codex_ready():
-                        _create_codex_session(nm, cwd)
+                        _create_codex_session(nm, cwd, client=client)
                     else:
                         # same rule as SDK: the user asked for Codex — refuse loudly, never a
                         # mystery tmux session. _codex_ready is False for a missing dep, a dead

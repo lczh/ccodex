@@ -226,6 +226,20 @@ class PullRemote(unittest.TestCase):
         self.assertTrue(ok, detail)
         self.assertEqual(km._install_latch_lines(), [], "healed and the new install spent it all")
 
+    def test_a_trust_downgrade_landing_during_settle_wins_before_the_merge(self):
+        # settle can run install.sh for minutes; a downgrade in that window must win before the
+        # code-execution boundary (the user's audit, 2026-08-19)
+        self._wire()
+        km._set_install_failed(km._sha8(LOCAL))
+        def degrading_install(sha8, lock_fd=None):
+            km._remotes["TESTHOST"]["trust"] = "directed"   # the downgrade lands mid-settle
+            return True
+        with mock.patch.object(km, "_checkout_sha", return_value=km._sha8(LOCAL)), \
+             mock.patch.object(km, "_converge_install", side_effect=degrading_install):
+            ok, detail = km._pull_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("trust changed", detail)
+
     def test_an_unpersistable_intent_blocks_the_merge(self):
         calls = self._wire()
         from unittest import mock
