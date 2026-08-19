@@ -512,9 +512,9 @@ HOLDPY
     [ ! -e "$gd/romp-install-failed" ]
 }
 
-@test "bootstrap.sh: an unwritable channel marker leaves the latch armed (rc 11)" {
-    # a moved checkout whose channel cannot be recorded must not run wearing the OLD marker —
-    # the latch stays armed and a rerun heals both
+@test "bootstrap.sh: an unstageable channel marker refuses BEFORE anything moves (rc 11)" {
+    # the fallible step (writing the marker CONTENT) happens before the latch is armed and before
+    # any move, where failing costs nothing: nothing armed, nothing moved, old marker still true
     sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
     root="$TEST_DIR/clone"; mkdir -p "$root"
     git -C "$root" init -q -b main .
@@ -526,8 +526,28 @@ HOLDPY
     mkdir "$gd/romp-update-channel.tmp"    # open() on a directory fails → the txn must refuse
     run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "stable"
     [ "$status" -eq 11 ]
-    [ "$(cat "$gd/romp-install-failed")" = "$(git -C "$root" rev-parse --short=8 HEAD)" ]
+    [ ! -e "$gd/romp-install-failed" ]     # nothing armed — nothing moved
     [ ! -e "$gd/romp-update-channel" ]
+}
+
+@test "bootstrap.sh: an unpublishable channel marker QUARANTINES the moved checkout (rc 12)" {
+    # after the moves, publishing is one atomic rename; if even that fails, a single-line latch
+    # matching HEAD would be auto-healed by marker-unaware healers (romp-serve's gate, the
+    # kernel's boot heal) into a build wearing the OLD channel — a stable checkout following
+    # unsigned main (the adversarial review, 2026-08-19, reproduced against both healers). The
+    # stuck two-line form is what every reader refuses without a human.
+    sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    target="$(git -C "$root" rev-parse HEAD)"
+    mkdir "$gd/romp-update-channel"        # the FINAL name blocked: staging succeeds, publish fails
+    run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "stable"
+    [ "$status" -eq 12 ]
+    [ "$(cat "$gd/romp-install-failed")" = "$(printf '00000000\nffffffff')" ]
 }
 
 @test "bootstrap.sh: the channel marker follows the MOVE, inside the transaction" {

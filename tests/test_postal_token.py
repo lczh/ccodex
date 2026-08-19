@@ -310,6 +310,60 @@ print(ps._load_serve_token(), flush=True)
         self.assertEqual(p.wait(timeout=60), 0)
         self.assertEqual(f.read_text().strip(), "winner-token")
 
+    def test_a_stale_mint_temp_never_wedges_the_loader(self):
+        # same wedge as the kernel loader: a dead mint's temp made every later O_EXCL fail
+        # silently, so the bus ran on a never-persisted token (the adversarial review, 2026-08-19)
+        f = ps.STATE.parent / "serve-token"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        saved = f.read_text() if f.exists() else None
+        env_tok = os.environ.pop("ROMP_SERVE_TOKEN", None)
+        tmp = f.with_name("%s.%d.tmp" % (f.name, os.getpid()))
+        tmp.write_text("stale")
+
+        def _restore():
+            if env_tok is not None:
+                os.environ["ROMP_SERVE_TOKEN"] = env_tok
+            if saved is not None:
+                f.write_text(saved)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        self.addCleanup(_restore)
+        f.unlink(missing_ok=True)                # force the mint path
+        tok = ps._load_serve_token()
+        self.assertEqual(f.read_text().strip(), tok,
+                         "the minted token must be PERSISTED despite the stale temp")
+
+    def test_a_failing_flock_never_leaks_the_lock_fd(self):
+        if not os.path.isdir("/proc/self/fd"):
+            self.skipTest("needs /proc (Linux)")
+        f = ps.STATE.parent / "serve-token"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        saved = f.read_text() if f.exists() else None
+        env_tok = os.environ.pop("ROMP_SERVE_TOKEN", None)
+
+        def _restore():
+            if env_tok is not None:
+                os.environ["ROMP_SERVE_TOKEN"] = env_tok
+            if saved is not None:
+                f.write_text(saved)
+        self.addCleanup(_restore)
+        f.write_text("steady-token\n")           # read path — still opens the lock first
+        real = ps.fcntl.flock
+
+        def no_locks(fd, op):
+            raise OSError(37, "No locks available")
+        ps.fcntl.flock = no_locks
+        try:
+            before = len(os.listdir("/proc/self/fd"))
+            for _ in range(10):
+                ps._load_serve_token()
+            after = len(os.listdir("/proc/self/fd"))
+        finally:
+            ps.fcntl.flock = real
+        self.assertEqual(after, before, "one leaked lock fd per call is an EMFILE outage")
+
     def test_a_nonempty_loose_file_is_tightened_on_read(self):
         # the read path keeps the inode, so it must chmod what it keeps (the user's audit,
         # 2026-08-19: a 0644 nonempty token was returned as-is)

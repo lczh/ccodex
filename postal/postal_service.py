@@ -96,6 +96,11 @@ def _load_serve_token():
         lock_fd = os.open(str(f) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
     except OSError:
+        if lock_fd is not None:
+            try:                                 # flock itself failed: close, never leak the fd
+                os.close(lock_fd)
+            except OSError:
+                pass
         lock_fd = None
     try:
         try:
@@ -109,14 +114,21 @@ def _load_serve_token():
                 pass
             return prior
         v = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
+        tmp = f.with_name("%s.%d.tmp" % (f.name, os.getpid()))
         try:
-            tmp = f.with_name("%s.%d.tmp" % (f.name, os.getpid()))
+            try:
+                tmp.unlink()                     # a stale temp from a mint that died mid-way
+            except OSError:                      # would fail this O_EXCL open forever (the
+                pass                             # adversarial review, 2026-08-19)
             fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w") as fh:
                 fh.write(v)
             os.replace(str(tmp), str(f))
         except OSError:
-            pass
+            try:
+                tmp.unlink()                     # never leave the wedge for the next call
+            except OSError:
+                pass
         return v
     finally:
         if lock_fd is not None:

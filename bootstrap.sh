@@ -295,6 +295,29 @@ if lines:
         sys.exit(10)                         # died mid-move from a broken state: heal by hand
     else:
         os.remove(latch)                     # intent-only mismatch: the move never landed
+# the channel marker is STAGED here — content written to the temp before anything moves, so
+# the only marker step left after the moves is one atomic rename. A failure here costs nothing:
+# HEAD is unmoved, no latch is armed, the old marker still matches the old HEAD (rc 11).
+ctmp = os.path.join(gdir, "romp-update-channel.tmp")
+try:
+    with open(ctmp, "w") as cf:
+        cf.write(channel + "\n")
+except OSError:
+    sys.exit(11)
+
+
+def stuck_latch():
+    """Quarantine: two differing lines HEAD cannot match. Every reader (boot heal, the gate,
+    settle — this script's own included) refuses to heal that without a human, which is the
+    point: a single-line latch matching HEAD is an AUTO-RUN trigger, and the healers know
+    nothing about the stale channel marker they would be reviving the build under (the
+    adversarial review, 2026-08-19, reproduced against the gate and the boot heal)."""
+    try:
+        write_latch("00000000\nffffffff")
+    except OSError:
+        pass                                     # the armed target latch stays — still gated
+
+
 try:
     write_latch(target[:8] + ("\n" + carry if carry and carry != target[:8] else ""))
 except OSError:
@@ -306,6 +329,16 @@ for mv in moves:
         # pre-existing latch protecting a half-installed build). HEAD unmoved → restore what was
         # there before; HEAD moved → arm for wherever we actually landed.
         now = head8()
+        if now == target[:8]:
+            # HEAD reached the target before a LATER move failed (branch -f, symbolic-ref): the
+            # marker must follow it — the latch below matches HEAD, so the ordinary healers will
+            # revive this build, and reviving it under the OLD channel marker is the stale-dev-
+            # marker-on-a-stable-checkout hole (the adversarial review, 2026-08-19, reproduced)
+            try:
+                os.replace(ctmp, os.path.join(gdir, "romp-update-channel"))
+            except OSError:
+                stuck_latch()                # moved + unrecordable channel: human hands only
+                sys.exit(12)
         try:
             if now and now != pre_head:
                 write_latch(now + ("\n" + carry if carry and carry != now else ""))
@@ -316,22 +349,18 @@ for mv in moves:
         except OSError:
             pass                             # the armed target latch stays — fail closed
         sys.exit(6)
-# the CHANNEL marker lands here — INSIDE the lock (the user's audit, 2026-08-19: the shell wrote
-# it after the lock released, so two serial bootstraps could publish their markers in reverse
-# order), and AFTER the moves but BEFORE install.sh: the marker describes the checkout HEAD now
-# IS, so a build that fails install here and is later healed (boot heal runs only install.sh)
-# comes up wearing ITS OWN channel — with the write after install, a dev→stable bootstrap that
-# died in install left the stale dev marker on a stable checkout, and the healed build followed
-# unsigned main. A failed MOVE above exits before this line, keeping the old marker with the old
-# HEAD.
+# the CHANNEL marker is PUBLISHED here — INSIDE the lock (the user's audit, 2026-08-19: the
+# shell wrote it after the lock released, so two serial bootstraps could publish their markers
+# in reverse order), AFTER the moves and BEFORE install.sh: the marker describes what HEAD now
+# IS, so a build that fails install and is later healed (the heal runs only install.sh) comes up
+# wearing ITS OWN channel. The content was staged pre-move; all that remains is one atomic rename.
 try:
-    ctmp = os.path.join(gdir, "romp-update-channel.tmp")
-    with open(ctmp, "w") as cf:
-        cf.write(channel + "\n")
     os.replace(ctmp, os.path.join(gdir, "romp-update-channel"))
 except OSError:
-    sys.exit(11)                       # latch stays armed — the moved checkout must not run
-    #                                    wearing the OLD channel marker (a rerun heals both)
+    stuck_latch()                      # moved + unrecordable channel: quarantined — the armed
+    sys.exit(12)                       # single-line latch would be auto-healed into a build
+    #                                    wearing the OLD marker (a stable checkout following
+    #                                    unsigned main), so it is not left behind
 env = dict(os.environ, ROMP_INSIDE_UPDATE_TXN=str(os.getpid()))
 if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root, pass_fds=(fd,),
                   env=env).returncode:
@@ -356,8 +385,12 @@ case "$txn_rc" in
     10) echo "romp: this checkout's install latch names commits HEAD doesn't match — an update died" >&2
         echo "  mid-move from a broken state. Heal by hand: run install.sh, then remove the latch" >&2
         echo "  file in the clone's git dir, and rerun bootstrap." >&2; exit 1 ;;
-    11) echo "romp: installed, but the update channel could not be recorded in $gd — the install" >&2
-        echo "  latch is left armed so this build cannot run wearing the old channel. Rerun bootstrap." >&2
+    11) echo "romp: could not stage the update-channel record in $gd — nothing was changed." >&2
+        echo "  Fix the git dir's permissions/space and rerun bootstrap." >&2
+        exit 1 ;;
+    12) echo "romp: the checkout moved but the update channel could not be recorded in $gd —" >&2
+        echo "  the install is quarantined so nothing revives this build under the OLD channel." >&2
+        echo "  Heal by hand: remove $gd/romp-install-failed, then rerun bootstrap.sh." >&2
         exit 1 ;;
     4) echo "romp: install.sh failed AFTER the checkout moved — the install latch is armed, so" >&2
        echo "  romp will refuse to run this build until a re-run of bootstrap or its boot heal" >&2

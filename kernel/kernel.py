@@ -579,6 +579,11 @@ def _load_token():
         lock_fd = os.open(str(f) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
     except OSError:
+        if lock_fd is not None:
+            try:                                 # flock ITSELF failed (NFS without lockd, some
+                os.close(lock_fd)                # FUSE mounts): the open fd must not leak — this
+            except OSError:                      # loader runs per checkin handshake, and one fd
+                pass                             # per call walks a long-lived kernel into EMFILE
         lock_fd = None                           # lockless fallback: still correct alone
     try:
         try:
@@ -592,8 +597,14 @@ def _load_token():
                 pass
             return v
         v = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
+        tmp = f.with_name("%s.%d.tmp" % (f.name, os.getpid()))
         try:
-            tmp = f.with_name("%s.%d.tmp" % (f.name, os.getpid()))
+            try:
+                tmp.unlink()                     # a stale temp from a mint that died between the
+            except OSError:                      # O_EXCL open and the replace would fail THIS
+                pass                             # open forever — the loader then returns a fresh,
+            #                                      never-persisted token on every call (the
+            #                                      adversarial review, 2026-08-19, reproduced live)
             fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
                 os.write(fd, v.encode())
@@ -601,7 +612,10 @@ def _load_token():
                 os.close(fd)
             os.replace(str(tmp), str(f))         # atomic; 0600 by birth; the flock made us alone
         except OSError:
-            pass
+            try:
+                tmp.unlink()                     # never leave the wedge for the next call
+            except OSError:
+                pass
         return v
     finally:
         if lock_fd is not None:
@@ -2875,8 +2889,23 @@ def _migrate_channel():
         if not (ROOT / ".git").is_dir():
             return
         wants_dev = v_state == "dev" or v_cfg == "dev"
-        if wants_dev and not marker.exists():
-            _atomic_write(marker, "dev")
+        if wants_dev:
+            # the write joins the update transaction's lock (the adversarial review, 2026-08-19:
+            # an unlocked migrate could land legacy 'dev' OVER the 'stable' a concurrent
+            # bootstrap's transaction had just published — last writer wins). Contended → consume
+            # NOTHING and retry next boot; the exists() re-check under the lock is what makes a
+            # transaction's fresh marker win.
+            lk = _update_flock()
+            if lk is None:
+                return
+            try:
+                if not marker.exists():
+                    _atomic_write(marker, "dev")
+            finally:
+                try:
+                    os.close(lk)
+                except OSError:
+                    pass
         old.unlink(missing_ok=True)
         if v_cfg and (ROOT / ".git").is_dir():
             subprocess.run(["git", "-C", str(ROOT), "config", "--unset", "romp.updateChannel"],
@@ -10827,17 +10856,30 @@ def _pull_remote(host, expected_sha=None):
             if not _still2:
                 rb = None
                 if pre_head:
-                    rb = subprocess.run(["git", "-C", str(ROOT), "reset", "--hard", pre_head],
+                    # --keep, not --hard: the clean-tree check ran BEFORE this flock, and settle
+                    # can run install.sh for minutes — a peer session's uncommitted edit saved in
+                    # that window is not ours to destroy (--hard reverted it; the adversarial
+                    # review, 2026-08-19, reproduced). --keep rewinds the merge exactly and
+                    # REFUSES if any locally-modified file differs across the rewind — then we
+                    # quarantine below instead of destroying the edit.
+                    rb = subprocess.run(["git", "-C", str(ROOT), "reset", "--keep", pre_head],
                                         capture_output=True, text=True, timeout=30)
                 if rb is not None and rb.returncode == 0:
                     _set_install_failed(carry)     # HEAD is back on the prior build: the carried
                     #                                record returns (or the latch clears)
                     return False, "%s trust changed during the pull — the move was rolled back" % host
-                # the rewind itself failed: HEAD sits on the fetched commit with nothing
-                # installed — the ARMED latch is the honest record, leave it (clearing it here
-                # would fail OPEN a build the trust decision just rejected)
+                # The rewind failed (or the pre-merge HEAD was unreadable): HEAD sits on a commit
+                # the trust decision just REJECTED. A latch matching HEAD is NOT a gate here — it
+                # is every healer's auto-run trigger (boot heal, the 300s check loop, and
+                # romp-serve's gate would each run the rejected build's install.sh and then serve
+                # it; the adversarial review, 2026-08-19, reproduced all three). Arm the STUCK
+                # form instead — two differing lines HEAD cannot match — which every reader
+                # refuses to heal without a human.
+                _set_install_failed("00000000\nffffffff")
                 return False, ("%s trust changed during the pull and the rollback failed — this "
-                               "checkout is latched until healed" % host)
+                               "checkout is quarantined until healed by hand: reset it to a commit "
+                               "you trust (e.g. git reset --keep %s), then remove romp-install-failed "
+                               "from its git dir" % (host, pre_head[:12] or "<the prior commit>"))
             installed = _converge_install(_sha8(fetched_sha), lock_fd)
         finally:
             try:

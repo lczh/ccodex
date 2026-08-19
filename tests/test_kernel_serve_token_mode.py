@@ -103,6 +103,39 @@ class ServeTokenFileMode(unittest.TestCase):
                          "the read path must tighten the file it keeps — the mint path never sees "
                          "a nonempty file, so nobody else will")
 
+    def test_a_stale_mint_temp_never_wedges_the_loader(self):
+        # a mint that died between the O_EXCL open and the replace left serve-token.<pid>.tmp;
+        # the next mint's O_EXCL then failed FOREVER for this pid — silently, so the loader
+        # returned a fresh, never-persisted token on EVERY call (the adversarial review,
+        # 2026-08-19, reproduced live)
+        tmp = self.f.with_name("%s.%d.tmp" % (self.f.name, os.getpid()))
+        tmp.write_text("stale")
+        self.addCleanup(lambda: tmp.unlink(missing_ok=True))
+        tok = km._load_token()
+        self.assertEqual(self.f.read_text().strip(), tok,
+                         "the minted token must be PERSISTED despite the stale temp")
+        self.assertEqual(km._load_token(), tok, "and stable across calls")
+
+    def test_a_failing_flock_never_leaks_the_lock_fd(self):
+        # _load_token runs per checkin handshake; on a filesystem whose flock raises (NFS
+        # without lockd) the discarded-open-fd pattern leaked one fd per call, walking a
+        # long-lived kernel into EMFILE (the adversarial review, 2026-08-19, 50 calls = 50 fds)
+        if not os.path.isdir("/proc/self/fd"):
+            self.skipTest("needs /proc (Linux)")
+        real = km.fcntl.flock
+
+        def no_locks(fd, op):
+            raise OSError(37, "No locks available")
+        km.fcntl.flock = no_locks
+        try:
+            before = len(os.listdir("/proc/self/fd"))
+            for _ in range(10):
+                km._load_token()
+            after = len(os.listdir("/proc/self/fd"))
+        finally:
+            km.fcntl.flock = real
+        self.assertEqual(after, before, "one leaked lock fd per call is an EMFILE outage")
+
     def test_the_env_override_never_writes_the_file(self):
         # Guards this test file's own premise: with ROMP_SERVE_TOKEN set there is nothing on disk to
         # have a mode, so the cases above would be vacuous if the pop in setUp ever stopped working.

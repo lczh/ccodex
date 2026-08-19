@@ -86,6 +86,7 @@ class PullRemote(unittest.TestCase):
               ancestor_rc=0, merge_rc=0, count="3", status_rc=0, install_rc=0):
         calls = []
         latch_at_merge = self.latch_at_merge = []
+        merged = self.merged = {"v": False}
 
         def fake(argv, **kw):
             calls.append(argv)
@@ -101,13 +102,18 @@ class PullRemote(unittest.TestCase):
                 return _R(out=count)
             if argv[0] == "git" and "merge" in argv:
                 latch_at_merge.append(km._install_failed_sha())
+                merged["v"] = True
                 return _R(rc=merge_rc, err="not a fast-forward" if merge_rc else "")
             if argv[0] == "git" and "rev-parse" in argv:
                 if "FETCH_HEAD" in argv:
                     return _R(out=fetched)
                 if str(argv[-1]).endswith("^{commit}"):
                     return _R(out=resolved)
-                return _R(out="bbbbbbb")
+                # STATEFUL: a plain `rev-parse HEAD` answers differently before and after the
+                # merge — a stateless answer let a mutant that records pre_head AFTER the merge
+                # pass the rollback tests while rolling back to the fetched commit itself (the
+                # adversarial review, 2026-08-19)
+                return _R(out="postmerg" if merged["v"] else "premerge")
             cmd = argv[-1]                          # ssh: the clone discovery
             if "for d in" in cmd:
                 return _R(out="DIR:/home/u/romp\nHEAD:%s\nDIRTY:" % rhead)
@@ -256,16 +262,22 @@ class PullRemote(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("rolled back", detail)
         resets = [a for a in calls if a[0] == "git" and "reset" in a]
-        self.assertEqual(resets, [["git", "-C", str(km.ROOT), "reset", "--hard", "bbbbbbb"]],
-                         "HEAD returns to the exact pre-merge commit, recorded before the move")
+        self.assertEqual(resets, [["git", "-C", str(km.ROOT), "reset", "--keep", "premerge"]],
+                         "HEAD returns to the exact PRE-merge commit (the stateful fake answers "
+                         "'postmerg' after the merge, so a late capture is caught) — and --keep, "
+                         "never --hard: a peer session's uncommitted edit saved since the "
+                         "pre-lock clean check is not ours to destroy")
         self.assertEqual(km._install_latch_lines(), [],
                          "the intent is moot once the move is undone — nothing stays armed")
         self.assertFalse(any("install.sh" in str(a) for c in calls for a in c),
                          "nothing installs code the trust decision rejected")
 
-    def test_a_failed_rollback_keeps_the_armed_latch(self):
-        # if the rewind itself fails, HEAD sits on the fetched commit with nothing installed —
-        # clearing the latch there would fail OPEN a build the trust decision just rejected
+    def test_a_failed_rollback_QUARANTINES_the_checkout(self):
+        # if the rewind itself fails, HEAD sits on the fetched commit with nothing installed. A
+        # single-line latch matching HEAD is NOT a gate there — it is every healer's auto-run
+        # trigger (boot heal, the 300s check loop, romp-serve's gate would each run the rejected
+        # build's install.sh and then serve it; the adversarial review, 2026-08-19). The stuck
+        # two-line form is what every reader refuses to touch without a human.
         calls = self._wire()
         orig = km.subprocess.run
 
@@ -279,11 +291,19 @@ class PullRemote(unittest.TestCase):
         km.subprocess.run = degrading
         ok, detail = km._pull_remote("TESTHOST")
         self.assertFalse(ok)
-        self.assertIn("rollback failed", detail)
-        self.assertIn("latched", detail)
-        self.assertEqual(km._install_latch_lines(), [km._sha8(REMOTE)],
-                         "armed — the moved, uninstalled, now-untrusted build stays gated")
+        self.assertIn("quarantined", detail)
+        self.assertIn("by hand", detail)
+        self.assertEqual(km._install_latch_lines(), ["00000000", "ffffffff"],
+                         "two differing lines HEAD cannot match — the form no healer touches")
         self.assertFalse(any("install.sh" in str(a) for c in calls for a in c))
+        # and the healers really DO refuse it: boot heal on this exact state must neither run
+        # install.sh nor clear the latch (a single-line latch here would auto-heal — reproduced)
+        km.subprocess.run = orig
+        with mock.patch.object(km, "_checkout_sha", return_value=km._sha8(REMOTE)),              mock.patch.object(km, "_converge_install",
+                               side_effect=AssertionError("the quarantine must not auto-heal")),              mock.patch.object(km, "_converge_note"):
+            km._boot_heal()
+        self.assertEqual(km._install_latch_lines(), ["00000000", "ffffffff"],
+                         "the quarantine survives the heal pass — human hands only")
 
     def test_an_unpersistable_intent_blocks_the_merge(self):
         calls = self._wire()

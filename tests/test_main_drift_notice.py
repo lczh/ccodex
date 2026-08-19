@@ -752,6 +752,39 @@ class BootHeal(unittest.TestCase):
             self.assertEqual((gd / "romp-update-channel").read_text().strip(), "dev")
             self.assertFalse(state_file.exists(), "consumed")
 
+    def test_migrate_channel_yields_to_a_held_update_lock_and_retries_next_boot(self):
+        # an unlocked migrate could land legacy 'dev' OVER the 'stable' a concurrent bootstrap
+        # transaction had just published — last writer wins (the adversarial review, 2026-08-19).
+        # The write joins the update lock; contention consumes NOTHING, so the next boot retries;
+        # and the exists() re-check under the lock defers to a marker published meanwhile.
+        import subprocess as sp
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td) / "gd"; gd.mkdir()
+            state_file = km.jd.STATE / "update-channel"
+            state_file.write_text("dev\n")
+            self.addCleanup(lambda: state_file.unlink(missing_ok=True))
+            mn = Path(td) / "mn"; (mn / ".git").mkdir(parents=True)
+            with mock.patch.object(km, "_update_git_dir", return_value=gd), \
+                 mock.patch.object(km, "ROOT", mn), \
+                 mock.patch.object(km.subprocess, "run",
+                                   return_value=sp.CompletedProcess([], 1, stdout="", stderr="")):
+                fd = km._update_flock()
+                self.assertIsNotNone(fd)
+                try:
+                    km._migrate_channel()          # a transaction holds the checkout
+                finally:
+                    km.os.close(fd)
+                self.assertFalse((gd / "romp-update-channel").exists(),
+                                 "no unlocked write may race a transaction's publish")
+                self.assertTrue(state_file.exists(),
+                                "nothing consumed — the migration retries next boot")
+                (gd / "romp-update-channel").write_text("stable\n")
+                km._migrate_channel()              # lock free now; a marker landed meanwhile
+                self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
+                                 "the exists() re-check under the lock defers to the transaction")
+                self.assertFalse(state_file.exists(), "the legacy spelling is consumed this time")
+
     def test_boot_ABORTS_when_the_latch_survives_the_heal(self):
         # returning after a failed/contended heal started every subsystem on the half-installed
         # checkout anyway (the user's audit, 2026-08-17): serving is not an option; the manager's
