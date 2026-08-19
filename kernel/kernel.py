@@ -590,12 +590,21 @@ def _load_token():
         try:
             os.link(str(tmp), str(f))
         except FileExistsError:
-            v = f.read_text().strip() or v
+            prior = f.read_text().strip()
+            if prior:
+                v = prior                        # the race's winner: complete by construction
+            else:
+                os.replace(str(tmp), str(f))     # an EMPTY existing file is a broken remnant, not
+                #                                  a winner — claim it atomically WITH content
+                #                                  (upstream's own mode tests caught the loser
+                #                                  returning an unpersisted token here)
         finally:
             try:
                 tmp.unlink()
             except OSError:
                 pass
+        os.chmod(f, 0o600)                       # tighten a PRE-EXISTING loose file; a fresh mint
+        #                                          is already 0600 by birth, so this is its no-op
     except OSError:
         pass
     return v

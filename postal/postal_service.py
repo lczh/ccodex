@@ -107,7 +107,11 @@ def _load_serve_token():
         try:
             os.link(str(tmp), str(f))
         except FileExistsError:
-            v = f.read_text().strip() or v
+            prior = f.read_text().strip()
+            if prior:
+                v = prior
+            else:
+                os.replace(str(tmp), str(f))     # an empty existing file is a remnant, never a winner
         finally:
             try:
                 tmp.unlink()
