@@ -2165,7 +2165,9 @@ def _run_update(tag):
         # inherited flock; a heal that still fails CARRIES the sha into the new arm's second line.
         + "CARRY=''\n"
         + "CUR=$(git rev-parse --short=8 HEAD 2>/dev/null | head -c 8)\n"
-        + "if [ -s %s ] && [ -n \"$CUR\" ]; then\n" % latch
+        + "if [ -s %s ] && [ ! -r %s ]; then\n" % (latch, latch)
+        + "  SETTLED=0\n"
+        + "elif [ -s %s ] && [ -n \"$CUR\" ]; then\n" % latch
         + "  if grep -qx \"$CUR\" %s 2>/dev/null; then\n" % latch
         + "    if ./install.sh >> %s 2>&1; then rm -f %s; else CARRY=\"$CUR\"; fi\n" % (log, latch)
         + "  elif [ \"$(grep -c . %s 2>/dev/null)\" -gt 1 ]; then\n" % latch
@@ -2241,6 +2243,12 @@ def _consume_update_report(running_only=False):
     try:
         rep = json.loads(p.read_text())
     except (OSError, ValueError):
+        return None
+    if not isinstance(rep, dict):
+        try:
+            p.rename(p.with_suffix(".json.bad"))         # null/[]/numbers crashed the BOOT consume
+        except OSError:                                  # (the adversarial check, 2026-08-19)
+            pass
         return None
     try:
         p.rename(jd.STATE / "update-report-last.json")   # consumed — never re-filed on later boots
@@ -5517,7 +5525,11 @@ def _create_codex_session(nm, cwd, client=None):
     2026-08-19, ruff's sole F821)."""
     bg, fg = _pick_identity_color()
     sid = _codex().spawn(nm, cwd, bg, fg)
-    _reveal_chat_for(client, {"type": "focus", "id": sid})
+    if client is not None:
+        # like _create_sdk_session/_fork_session: a client-less caller (POST /new — a headless
+        # `romp new`) reveals to NOBODY; None fell through to the legacy every-window broadcast,
+        # the retired chats-kept-jumping bug (the adversarial check, 2026-08-19)
+        _reveal_chat_for(client, {"type": "focus", "id": sid})
     _mark_views_dirty()
     _push_session_now(sid)
     return sid

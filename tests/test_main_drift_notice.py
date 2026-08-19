@@ -569,6 +569,18 @@ class CodexCreateWiring(unittest.TestCase):
         self.assertEqual(revealed, [({"who": "asker"},
                                      {"type": "focus", "id": sid})],
                          "focus lands on the asking window, through the CURRENT reveal spelling")
+        # and a CLIENT-LESS create (POST /new — headless `romp new`) reveals to NOBODY: None fell
+        # through to the legacy every-window broadcast, yanking every open dashboard's chat to the
+        # new session (the adversarial check, 2026-08-19; the sibling creators always guarded)
+        revealed.clear()
+        with mock.patch.object(km, "_codex", return_value=fake_backend), \
+             mock.patch.object(km, "_pick_identity_color", return_value=("#111111", "#ffffff")), \
+             mock.patch.object(km, "_reveal_chat_for",
+                               side_effect=lambda c, m: revealed.append((c, m))), \
+             mock.patch.object(km, "_mark_views_dirty"), \
+             mock.patch.object(km, "_push_session_now"):
+            km._create_codex_session("web", "/tmp", client=None)
+        self.assertEqual(revealed, [], "no asker, no reveal — never a broadcast")
 
 
 class KernelTokenBirth(unittest.TestCase):
@@ -590,6 +602,19 @@ class KernelTokenBirth(unittest.TestCase):
                 f.write_text("winner-token")
                 self.assertEqual(km._load_token(), "winner-token",
                                  "a complete pre-existing token always wins — never truncated")
+                # revert-detector: an EMPTY loose remnant must be claimed by a NEW inode (atomic
+                # replace, content complete at appearance) — the old O_TRUNC path reused the inode
+                # and briefly exposed an empty world-readable token (the adversarial check, 2026-08-19)
+                f.unlink()
+                f.write_text("")
+                km.os.chmod(f, 0o644)
+                ino_before = km.os.stat(f).st_ino
+                v2 = km._load_token()
+                self.assertTrue(v2)
+                self.assertEqual(f.read_text().strip(), v2, "the empty remnant is HEALED, persisted")
+                self.assertNotEqual(km.os.stat(f).st_ino, ino_before,
+                                    "claimed with content atomically — never truncated in place")
+                self.assertEqual(stat.S_IMODE(km.os.stat(f).st_mode), 0o600)
         finally:
             f.unlink(missing_ok=True)
             if old is not None:

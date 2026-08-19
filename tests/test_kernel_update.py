@@ -405,7 +405,8 @@ class RunUpdate(Fresh):
                 self.assertFalse(km._run_update("v0.7.0"))
             self.assertIn("readable regular file", km._UPDATE_ERROR[0])
 
-    def _execute_captured_updater(self, verify_rc, enforce=False, install_rc=0, manager_port=None):
+    def _execute_captured_updater(self, verify_rc, enforce=False, install_rc=0, manager_port=None,
+                                  pre_latch=None, latch_mode=None):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "repo"; root.mkdir()
             (root / ".git").mkdir()                   # the interprocess update flock lives here
@@ -470,7 +471,14 @@ class RunUpdate(Fresh):
                  mock.patch.dict(km.os.environ, env, clear=True):
                 self.assertTrue(km._run_update("v0.7.0"))
             script = spawned[0][0][2]
+            latch_p = root / ".git" / "romp-install-failed"
+            if pre_latch is not None:
+                latch_p.write_text(pre_latch)
+                if latch_mode is not None:
+                    os.chmod(latch_p, latch_mode)
             ran = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+            if pre_latch is not None and latch_mode is not None:
+                os.chmod(latch_p, 0o644)
             rows = calls.read_text().splitlines()
             report = json.loads((state / "update-report.json").read_text())
             latch = root / ".git" / "romp-install-failed"   # checkout-scoped, beside the update lock
@@ -486,6 +494,22 @@ class RunUpdate(Fresh):
         self.assertTrue(report["ok"])
         self.assertFalse(report["restarted"],
                          "the report says what HAPPENED, not what was hoped")
+
+    def test_the_tag_script_refuses_an_unreadable_existing_latch_executed(self):
+        # bash's settle could rm -f a latch it could not READ (unlink needs only dir perms) —
+        # erasing the record every other reader refuses to touch (the adversarial check,
+        # 2026-08-19). Executed: unreadable latch → the update reports failure, the latch survives.
+        import pathlib
+        rc, rows, report = None, None, None
+        # arm an unreadable latch inside the harness root before the script runs
+        orig = self._execute_captured_updater
+        def with_latch(verify_rc, **kw):
+            return orig(verify_rc, pre_latch="deadbee9", latch_mode=0, **kw)
+        rc, rows, report = with_latch(0)
+        self.assertEqual(rc, 0, "the reporter records the refusal")
+        self.assertFalse(report["ok"])
+        self.assertEqual(self._latch, "deadbee9", "the unreadable record SURVIVES, unread and unerased")
+        self.assertFalse(any(row.startswith("merge ") for row in rows), "nothing moved")
 
     def test_good_signature_verifier_allows_merge_and_install(self):
         rc, rows, report = self._execute_captured_updater(0)
