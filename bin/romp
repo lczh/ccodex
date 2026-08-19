@@ -1230,6 +1230,13 @@ case "${1:-}" in
             _why="--codex"; $use_codex || _why="this machine's \`romp engine codex\` default"
             echo "romp new: --model/--effort need an SDK session, and $_why makes this a Codex one — set them from the dashboard instead" >&2; exit 2
         fi
+        if [[ -n "$tag_arg" && -z "$msg_arg" ]]; then
+            # a tag labels the -m text; without -m there is nothing to label
+            echo "romp new: --tag needs -m <text> (the tag labels the delivered message)" >&2; exit 2
+        fi
+        if [[ -n "$tag_arg" ]] && ! [[ "$tag_arg" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,23}$ ]]; then
+            echo "romp new: --tag must be one word (letters/digits/dashes, <=24 chars)" >&2; exit 2
+        fi
         if [[ -n "$msg_arg" ]] && $use_tmux; then
             # the tmux variant attaches a terminal you type into yourself; delivering a first
             # prompt is the SDK path's job. Refuse loudly rather than dropping the text.
