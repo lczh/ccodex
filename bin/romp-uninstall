@@ -203,13 +203,15 @@ echo "==> judge scratch"
 # /tmp/romp-judge (no other non-alnum char in it) and stopped agreeing the moment it moved under
 # ~/.local/state: the dot in `.local` survives, so the two spell the same path differently and the
 # transcripts are left behind.
-# The heredoc lives in a FUNCTION, not inline in the $(...): macOS bash 3.2 scans a command
-# substitution with a naive quote-counter instead of the real parser (rewritten in bash 4), so
-# the apostrophes in this Python body desync it and the script dies with "unexpected EOF" at a
-# quote 120 lines later. A function body is parsed properly everywhere; the $() below then
-# contains only a word. (Caught by the v1.3.0 release's macOS gate, 2026-08-16.)
-_judge_scan() {
-    python3 - "$JUDGE_SCRATCH" "$STATE" "$HOME" <<'PYEOF'
+# The validator is written to a temp file FIRST and run as a plain script (2026-08-19): feeding
+# this heredoc to python3 INSIDE the $("...") substitution parsed fine on bash 4+ but macOS ships
+# bash 3.2, whose substitution scanner tracks quotes THROUGH heredoc bodies — the apostrophes in
+# the comments below ("romp's", "somebody else's") left it hunting a closing quote to EOF and the
+# whole script died at parse time ("unexpected EOF while looking for matching quote"; caught by
+# the release gate's macOS run, which exists because macOS CI is dispatch-only). A top-level
+# heredoc into cat has no such parser, whatever the body holds.
+_judge_py="$(mktemp "${TMPDIR:-/tmp}/romp-uninstall-judge.XXXXXX")"
+cat > "$_judge_py" <<'PYEOF'
 import os, re, sys
 
 raw, state, home = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -249,8 +251,8 @@ for danger in (chome, cstate):
 # string that was validated and the directory removed below are one and the same.
 sys.stdout.write("%s\n%s\n" % (cp, re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(cp))) if ok else "")
 PYEOF
-}
-_judge_lines="$(_judge_scan)"
+_judge_lines="$(python3 "$_judge_py" "$JUDGE_SCRATCH" "$STATE" "$HOME")"
+rm -f "$_judge_py"
 _judge_scratch="$(printf '%s\n' "$_judge_lines" | sed -n 1p)"
 _scratch_slug="$(printf '%s\n' "$_judge_lines" | sed -n 2p)"
 
@@ -339,5 +341,5 @@ fi
 
 echo
 echo "Reinstall from scratch with:"
-echo "  curl -fsSL https://raw.githubusercontent.com/lczh/ccodex/main/bootstrap.sh | bash"
+echo "  curl -fsSL https://raw.githubusercontent.com/romp-on/romp/main/bootstrap.sh | bash"
 echo "Open a NEW terminal afterwards (this one still has the old PATH)."

@@ -22,7 +22,8 @@ test("openPath routes by HOST: the in-pane viewer modal on the web, the editor i
   assert.match(RENDER, /function openPath\(path: string, sid\?: string \| null\): void/);
   // web → the viewer opens in THIS document, framed or standalone alike — no shell relay, no fallback
   assert.match(RENDER, /openFileView\(path, sid \|\| activeId \|\| null\);/);
-  assert.match(RENDER, /import \{ openFileView \} from "\.\/file-view";/);
+  // (the import also carries setCommentSink since 2026-08-14 — the review layer's way back to the composer)
+  assert.match(RENDER, /import \{ openFileView, setCommentSink \} from "\.\/file-view";/);
   assert.doesNotMatch(RENDER, /romp: "viewFile"/, "the chat→shell→feed relay is gone");
   // VS Code keeps the host editor
   assert.match(RENDER, /vscodeApi\.postMessage\(sid \? \{ type: "openFile", path, id: sid \} : \{ type: "openFile", path \}\);/);

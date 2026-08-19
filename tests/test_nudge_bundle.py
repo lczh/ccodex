@@ -373,3 +373,21 @@ class PromptPins(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NudgeFireListAwaitingHold(unittest.TestCase):
+    """A LIVE awaiting stamp holds the fire (the 2026-08-19 audit): a status ask over a judge's own
+    'this goal is waiting, nothing owed' ruling is the wrong-reason nudge — one fired 43 seconds
+    AFTER the closer filed 'awaiting: the full test suite it kicked off', because the stamp's ev_t
+    equals the seen turn's and the offending-rows check can never catch it. Parity with the other
+    two writers (_wake_goal, _mark_nudge_failed), which both re-check the stamp at the write moment."""
+
+    def test_a_live_awaiting_stamp_holds_the_fire(self):
+        nd = _node(G1, "waiting on the suite")
+        nd["awaitingWhy"] = "the full test suite it kicked off"
+        nd["awaitingAt"] = 100
+        fresh = _store({G1: nd, G2: _node(G2, "genuinely stalled")},
+                       status={G1: "working", G2: "working"})
+        out = km._nudge_fire_list(fresh, [(G1, 1, False), (G2, 1, False)])
+        self.assertEqual([f[0] for f in out], [G2],
+                         "the stamped goal is the judges' ruled wait; the unstamped one still fires")

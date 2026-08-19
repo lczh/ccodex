@@ -1154,3 +1154,9 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
   rgba(255, 255, 255, 0.18); background: #333; color: inherit; cursor: pointer; font-size: 0.95em; }
 .judge-limit-banner .jl-switch:hover { background: #3c3c3c; }
 .judge-limit-banner .jl-switch:disabled { opacity: 0.6; cursor: default; }
+
+/* the Stack toggle while the narrow container query FORCES stacking (2026-08-19): faded and inert —
+   unclicking it would change nothing at this width, and the tooltip names the way out (more width).
+   pointer-events stays on so the tooltip still shows on hover; the click handler no-ops instead. */
+#feed-stacked.forced { opacity: 0.4; cursor: default; }
+#feed-stacked.forced:hover { color: inherit; background: inherit; }

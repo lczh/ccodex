@@ -140,11 +140,21 @@ export function openLightbox(path: string, sid?: string | null, pin?: string): v
   name.className = "romp-lightbox-name";
   name.textContent = path;
   name.title = path;
+  // download rides an ANCHOR with the download attribute (the user 2026-08-19): the browser saves
+  // the same bytes the lightbox is showing — the pinned URL when a pin rode in, so a re-generated
+  // file can't swap the image between viewing and saving. The filename is the path's basename.
+  const dl = document.createElement("a");
+  dl.className = "romp-lightbox-dl";
+  dl.href = fileUrl(path, sid) + (pin ? "&pin=" + encodeURIComponent(pin) : "");
+  dl.download = path.slice(path.lastIndexOf("/") + 1) || "image";
+  dl.textContent = "⭳";
+  dl.title = "download";
+  dl.onclick = (ev) => ev.stopPropagation();               // saving must not also dismiss
   const close = document.createElement("button");
   close.className = "romp-lightbox-close";
   close.textContent = "✕";
   close.title = "close (Esc)";
-  bar.append(name, close);
+  bar.append(name, dl, close);
   inner.appendChild(bar);
   wrap.appendChild(inner);
   const dismiss = () => { wrap.remove(); document.removeEventListener("keydown", onKey, true); };

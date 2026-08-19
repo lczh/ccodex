@@ -57,3 +57,18 @@ test("both controls live on the build-once header — click-safe across re-rende
   assert.ok(build.includes('el("button", "fcol-fold")') && build.includes("wireColDrag(name, col, key)"),
     "wired inside ensureCols' one-time scaffold, never in a render loop");
 });
+
+test("the Stack toggle says so when narrow width already forces stacking (2026-08-19)", () => {
+  // at or under the container query's 540px the layout stacks regardless of the pref, so the
+  // toggle is a no-op there: faded (aria-disabled), click no-ops, tooltip names the way out.
+  // The width constant must match the CSS query — the two stacking owners cannot drift.
+  assert.match(FEED, /const STACK_FORCED_W = 540;/);
+  assert.match(CSS, /@container \(max-width: 540px\) or style\(--romp-stack: on\)/);
+  assert.match(FEED, /b\.classList\.toggle\("forced", forced\);/);
+  assert.match(FEED, /widen the feed to unstack into three columns/);
+  assert.match(FEED, /if \(b\.classList\.contains\("forced"\)\) return;/,
+    "keyboard activation bypasses pointer-events, so the handler itself no-ops");
+  assert.match(FEED, /new ResizeObserver\(\(\) => refreshStackForced\(b\)\)/,
+    "width changes are the event — never a poll");
+  assert.match(CSS, /#feed-stacked\.forced \{ opacity: 0\.4; cursor: default; \}/);
+});

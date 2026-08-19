@@ -17,6 +17,8 @@ import hljs from "highlight.js/lib/core";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { fileUrl } from "./preview";
+import { findAnchorRange, sliceRanges } from "./comments";
+import { anchorFor, buildReviewMessage, docKey, type DocComment } from "./docreview";
 
 // hljs is registered per-bundle. Same language set (and grammar registrations) the chat's fence
 // highlighting uses, dup-guarded, so importing this module alongside render.ts costs nothing.
@@ -105,6 +107,38 @@ function el(tag: string, cls?: string): HTMLElement {
   return e;
 }
 
+// ── review comments (the user 2026-08-14, who found coordinating a doc review painful) ─────────────
+// Reading a doc an agent wrote used to mean hand-copying every line you wanted changed back into the
+// chat. Now you comment on passages IN the viewer and one Submit hands the whole set over as a single
+// message drafted into that session's composer, each comment carrying its quote and source line — so
+// the agent applies the lot in one pass and nothing is copy-pasted.
+//
+// The layer is deliberately thin: the viewer already renders the file, so this adds selection →
+// comment, the marks, and the Submit. docreview.ts holds the pure half (anchoring + message shape).
+const CMT_KEY = "romp:fileviewComments";
+const comments = new Map<string, DocComment[]>();      // docKey(sid, path) → un-submitted comments
+
+function loadComments(): void {
+  try {
+    const raw = JSON.parse(localStorage.getItem(CMT_KEY) || "{}");
+    for (const [k, v] of Object.entries(raw)) {
+      const list = (Array.isArray(v) ? v : []).filter((c: any) =>
+        c && typeof c.id === "string" && typeof c.quote === "string" && typeof c.body === "string");
+      if (list.length) comments.set(k, list as DocComment[]);
+    }
+  } catch { /* unreadable store — start empty rather than throw on open */ }
+}
+loadComments();
+
+function saveComments(): void {
+  try { localStorage.setItem(CMT_KEY, JSON.stringify(Object.fromEntries(comments))); } catch { /* quota */ }
+}
+
+// render.ts owns the composer, and it imports THIS module — so the finished message is handed back
+// through a sink it registers at startup rather than importing render.ts here (which would be a cycle).
+let commentSink: ((text: string) => void) | null = null;
+export function setCommentSink(fn: (text: string) => void): void { commentSink = fn; }
+
 export function closeFileView(): void {
   const wrap = document.getElementById("romp-fileview");
   if (!wrap) return;
@@ -137,6 +171,21 @@ export function openFileView(path: string, sid?: string | null): void {
   base.textContent = path.slice(cut + 1);
   name.appendChild(dir); name.appendChild(base);
   const acts = el("div", "fileview-acts");
+
+  // Review controls. Both stay hidden until this file actually has a comment, so a plain read of a
+  // file is exactly as uncluttered as it was before this feature existed.
+  const key = docKey(sid || "", path);
+  const cmtCount = el("div", "fileview-cmtcount");
+  const submitBtn = el("button", "fileview-btn fileview-submit") as HTMLButtonElement;
+  submitBtn.type = "button";
+  submitBtn.title = "Hand every comment on this file to the session as one message";
+  const syncReview = () => {
+    const n = (comments.get(key) || []).length;
+    cmtCount.textContent = n === 1 ? "1 comment" : n + " comments";
+    submitBtn.textContent = "Submit " + n + (n === 1 ? " comment" : " comments");
+    cmtCount.hidden = !n;
+    submitBtn.hidden = !n;
+  };
 
   // ── format toggles (the user 2026-08-09) ── A markdown file opens RENDERED, its Raw form one click
   // away; everything else keeps the code view, whose long lines the Wrap toggle can soft-wrap. Both
@@ -184,6 +233,7 @@ export function openFileView(path: string, sid?: string | null): void {
   close.type = "button"; close.textContent = "✕"; close.title = "Close (Esc)";
   close.setAttribute("aria-label", "Close the file viewer");
   close.addEventListener("click", closeFileView);
+  acts.appendChild(cmtCount); acts.appendChild(submitBtn);
   acts.appendChild(copy); acts.appendChild(close);
   bar.appendChild(name); bar.appendChild(acts);
 
@@ -215,7 +265,159 @@ export function openFileView(path: string, sid?: string | null): void {
     wrapBtn.setAttribute("aria-pressed", String(fmt.wrap));
     if (text === null) return;   // still loading; the saved pref is honored when the bytes land
     body.replaceChildren(rendered ? mdBlock(text) : codeBlock(text, path, fmt.wrap));
+    markComments();
   };
+
+  // Paint every commented span. Reuses the chat comment threads' re-anchoring: findAnchorRange is
+  // whitespace-tolerant, which is what lets a span selected in the RENDERED view still be found in the
+  // Raw one (and the other way round). A span that can no longer be found keeps its comment — only the
+  // highlight is missing, and the Submit still carries it.
+  function markComments(): void {
+    const list = comments.get(key) || [];
+    syncReview();
+    list.forEach((c, i) => {
+      const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+      const nodes: Text[] = [];
+      let n: Node | null;
+      while ((n = walker.nextNode())) if (!n.parentElement?.closest("mark.fv-hl")) nodes.push(n as Text);
+      const r = findAnchorRange(nodes.map((t) => t.data).join(""), c.quote);
+      if (!r) return;
+      const slices = sliceRanges(nodes.map((t) => t.data.length), r.start, r.end);
+      slices.forEach((sl, k) => {
+        const t = nodes[sl.idx];
+        const mid = sl.s > 0 ? t.splitText(sl.s) : t;
+        if (sl.e - sl.s < mid.data.length) mid.splitText(sl.e - sl.s);
+        const m = document.createElement("mark");
+        m.className = "fv-hl";
+        m.title = c.body;
+        mid.parentNode?.insertBefore(m, mid);
+        m.appendChild(mid);
+        if (k === slices.length - 1) {          // the number rides the run's tail; click to read/remove
+          const badge = document.createElement("sup");
+          badge.className = "fv-num";
+          badge.textContent = String(i + 1);
+          badge.title = c.body;
+          badge.addEventListener("click", (ev) => { ev.stopPropagation(); showNote(c, badge); });
+          m.appendChild(badge);
+        }
+      });
+    });
+  }
+
+  // The comment's text, one click under its marker — the compact form is the number (the progressive
+  // disclosure rule). Clicking the same marker again closes it.
+  function showNote(c: DocComment, at: HTMLElement): void {
+    const open = body.querySelector(".fv-note") as HTMLElement | null;
+    const same = open?.dataset.dcid === c.id;
+    open?.remove();
+    if (same) return;
+    const note = el("span", "fv-note");
+    note.dataset.dcid = c.id;
+    const txt = el("span"); txt.textContent = c.body;
+    const del = el("button", "fv-note-x") as HTMLButtonElement;
+    del.type = "button"; del.textContent = "✕"; del.title = "Remove this comment";
+    del.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const left = (comments.get(key) || []).filter((x) => x.id !== c.id);
+      if (left.length) comments.set(key, left); else comments.delete(key);
+      saveComments();
+      renderBody();                              // repaint so the numbering closes up
+    });
+    note.appendChild(txt); note.appendChild(del);
+    at.parentNode?.insertBefore(note, at.nextSibling);
+  }
+
+  // Right-click a selection → Comment. Bound on the viewer body, so it never competes with the chat's
+  // own selection menu behind the backdrop.
+  body.addEventListener("contextmenu", (ev) => {
+    const sel = window.getSelection();
+    const picked = sel ? sel.toString() : "";
+    if (!picked.trim() || !sel?.anchorNode || !body.contains(sel.anchorNode)) return;
+    ev.preventDefault();
+    document.querySelector(".fv-menu")?.remove();
+    const menu = el("div", "ctx-menu fv-menu");
+    const item = (label: string, fn: () => void) => {
+      const it = el("div", "ctx-item");
+      it.textContent = label;
+      it.addEventListener("click", (e2) => { e2.stopPropagation(); menu.remove(); fn(); });
+      menu.appendChild(it);
+    };
+    item("Comment", () => askComment(picked));
+    item("Copy", () => { navigator.clipboard?.writeText(picked).catch(() => { /* best effort */ }); });
+    document.body.appendChild(menu);
+    const r = menu.getBoundingClientRect();
+    menu.style.left = Math.max(0, Math.min(ev.clientX, window.innerWidth - r.width - 4)) + "px";
+    menu.style.top = Math.max(0, Math.min(ev.clientY, window.innerHeight - r.height - 4)) + "px";
+    const away = (e3: MouseEvent) => {
+      if (menu.contains(e3.target as Node)) return;
+      menu.remove();
+      document.removeEventListener("mousedown", away, true);
+    };
+    document.addEventListener("mousedown", away, true);
+  });
+
+  // The box that takes a new comment. Shows the anchor it will carry, so you can see where the agent
+  // will be sent before typing.
+  function askComment(picked: string): void {
+    box.querySelector(".fv-new")?.remove();
+    const a = anchorFor(text || "", picked);
+    if (!a.quote) return;
+    const nb = el("div", "fv-new");
+    const at = el("div", "fv-at");
+    at.textContent = (a.line ? "line " + a.line + " — " : "") + "\u201c" + a.quote.slice(0, 120) + "\u201d";
+    const ta = el("textarea", "fv-ta") as HTMLTextAreaElement;
+    ta.placeholder = "What should change here?";
+    const row = el("div", "fv-newrow");
+    const add = el("button", "fileview-btn fileview-submit") as HTMLButtonElement;
+    add.type = "button"; add.textContent = "Add comment";
+    const cancel = el("button", "fileview-btn") as HTMLButtonElement;
+    cancel.type = "button"; cancel.textContent = "Cancel";
+    const done = () => {
+      if (!ta.value.trim()) return;
+      const list = (comments.get(key) || []).concat([{
+        id: "fc" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+        quote: a.quote, line: a.line, body: ta.value.trim(), ts: Date.now(),
+      }]);
+      comments.set(key, list);
+      saveComments();
+      nb.remove();
+      renderBody();
+    };
+    add.addEventListener("click", done);
+    cancel.addEventListener("click", () => nb.remove());
+    ta.addEventListener("keydown", (e4) => {
+      if (e4.key === "Enter" && (e4.metaKey || e4.ctrlKey)) { e4.preventDefault(); done(); }
+      if (e4.key === "Escape") { e4.preventDefault(); e4.stopPropagation(); nb.remove(); }
+    });
+    row.appendChild(add); row.appendChild(cancel);
+    nb.appendChild(at); nb.appendChild(ta); nb.appendChild(row);
+    box.appendChild(nb);
+    ta.focus();
+  }
+
+  // Submit: every comment on this file becomes ONE message drafted into the composer. Before building
+  // it, re-read the file — if the agent rewrote it while you were reading, the line anchors may now
+  // point somewhere else, and you are told so rather than sending quietly-wrong numbers.
+  submitBtn.addEventListener("click", () => {
+    const list = comments.get(key) || [];
+    if (!list.length || !commentSink) return;
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Submitting\u2026";                 // acknowledge the click before the round trip
+    fetch(fileUrl(path, sid), { cache: "no-store" })
+      .then((r) => (r.ok ? r.text() : Promise.reject(new Error("re-read failed"))))
+      .then((fresh) => fresh !== text)
+      .catch(() => false)                                       // can't re-read → claim no staleness we didn't see
+      .then((stale) => {
+        const msg = buildReviewMessage(path, list);
+        if (!msg) return;
+        commentSink!(stale
+          ? msg + "\n(Heads up: the file changed while I was reading it, so the line numbers may have moved.)\n"
+          : msg);
+        comments.delete(key);
+        saveComments();
+        closeFileView();
+      });
+  });
   renderBody();   // buttons take their initial state now; the loader stays up until the fetch lands
 
   const onKey = (e: KeyboardEvent) => {

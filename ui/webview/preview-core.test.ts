@@ -59,3 +59,21 @@ test("the chat sheet carries the lightbox + preview styles (the feed no longer p
   assert.match(CHAT_CSS, /\.path-full-img \{ display: block; max-width: 100%;/, "the full render's image scale");
   assert.match(CHAT_CSS, /\.path-thumbs \{ display: flex; flex-wrap: wrap;/, "the chat strip container");
 });
+
+test("the lightbox offers a download beside the close, saving the same bytes it shows", () => {
+  // the user 2026-08-19: full-screen images need a save affordance. An anchor with the download
+  // attribute, carrying the SAME pinned url the lightbox <img> renders — so a re-generated file
+  // can't swap the image between viewing and saving — dressed exactly like the ✕ beside it.
+  const at = PREVIEW.indexOf("export function openLightbox");
+  const body = PREVIEW.slice(at, PREVIEW.indexOf("\n}", at));
+  assert.ok(body.indexOf('dl.href = fileUrl(path, sid) + (pin ? "&pin=" + encodeURIComponent(pin) : "")') > 0,
+    "the download url matches the shown image, pin included");
+  assert.ok(body.indexOf('dl.download = path.slice(path.lastIndexOf("/") + 1) || "image"') > 0,
+    "saved under the file's own basename");
+  assert.ok(body.indexOf("dl.onclick = (ev) => ev.stopPropagation()") > 0,
+    "saving must not also dismiss the lightbox");
+  assert.ok(body.indexOf('bar.append(name, dl, close)') > 0, "between the filename and the ✕");
+  const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "styles.css"), "utf8");
+  assert.match(CSS, /\.romp-lightbox-dl \{ font: inherit; font-size: 0\.86em;/,
+    "one control vocabulary — the same chip dress as the close beside it");
+});

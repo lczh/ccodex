@@ -402,3 +402,78 @@ class AwaitingLift(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LiftStandsDown(unittest.TestCase):
+    """The lift joins the stand-down rule (the 2026-08-19 nudge audit): a writer whose evidence
+    predates the diary yields. The lift's evidence is the newest RETURN it can cite; a closer
+    assert filed AFTER every citable return means the judge ruled on a fresher world (the session
+    re-armed something the ownership window can't see), and lifting anyway produced 2-3 second
+    stamp↔lift flaps that reset the nudge ladder (fires 5s after a lift; three first-nudges in 21
+    minutes, each answered "still running")."""
+
+    def setUp(self):
+        AwaitingLift.setUp(self)
+
+    def tearDown(self):
+        AwaitingLift.tearDown(self)
+
+    _transcript = AwaitingLift._transcript
+    _seed = AwaitingLift._seed
+    _tick = AwaitingLift._tick
+    _stamp = AwaitingLift._stamp
+
+    def test_a_reassert_after_a_lift_stands_the_next_lift_down(self):
+        # the FLAP: assert → lift → the closer re-asserts AFTER the lift, citing a fresher world —
+        # every return this lift could cite preceded the prior lift, so lifting again just flaps
+        self._transcript([_launch("t1", LAUNCH), _notification("t1", BACK)])
+        self._seed(written=BACK + 60)
+        import json as _json
+        gp = km.jd.GOALDIR / (SID + ".json")
+        store = _json.loads(gp.read_text())
+        nd = store["nodes"][self.gid]
+        nd["log"] = [
+            {"ev_t": STAMP, "src": "closer", "kind": "awaiting", "why": "w", "at": STAMP},
+            {"ev_t": BACK + 10, "src": "romp", "kind": "awaiting", "lift": True, "at": BACK + 10},
+            {"ev_t": STAMP, "src": "closer", "kind": "awaiting", "why": nd["awaitingWhy"], "at": BACK + 60},
+        ]
+        gp.write_text(_json.dumps(store))
+        self._tick(now=BACK + 120)
+        self.assertIsNotNone(self._stamp(), "a re-assert after a lift means a fresher ruling — yield")
+
+    def test_a_first_stamp_still_lifts_on_audit_lag_returns(self):
+        # NO prior lift: the original design holds — a return the judge never saw still lifts,
+        # even when the stamp's write time postdates it (the same-turn suite pins depend on this)
+        self._transcript([_launch("t1", LAUNCH), _notification("t1", BACK)])
+        self._seed(written=BACK + 60)                    # written after the return, but never lifted before
+        self._tick(now=BACK + 120)
+        self.assertIsNone(self._stamp(), "first-stamp audit-lag lift preserved")
+
+
+class LiftKeepsLiveLedgerRecords(unittest.TestCase):
+    """A lift drops only SPENT ledger records (failed/moot/answered latches — the 2026-08-16
+    idle-in-Working fix). A LIVE mid-count record is the once-per-stall invariant itself: dropping
+    it reset the counter on every stamp↔lift flap and the same arm turn drew fresh first-nudges
+    minutes apart while the escalation ladder never engaged."""
+
+    def test_live_records_survive_the_drop(self):
+        import tempfile as _tf
+        from pathlib import Path as _P
+        with _tf.TemporaryDirectory() as td:
+            saved = km.jd.STATE
+            try:
+                km.jd.STATE = _P(td)
+                km._write_auto_nudge({"enabled": True, "nudged": {
+                    "g-live": {"count": 2, "lastTurnId": "u9"},
+                    "g-failed": {"count": 1, "lastTurnId": "u1", "failed": True},
+                    "g-moot": {"count": 1, "lastTurnId": "u2", "moot": True},
+                    "g-answered": {"count": 1, "lastTurnId": "u3", "answeredAt": 5}}})
+                for gid in ("g-live", "g-failed", "g-moot", "g-answered"):
+                    km._drop_auto_nudge_rec(gid)
+                left = km._auto_nudge_data().get("nudged", {})
+                self.assertIn("g-live", left, "mid-episode memory survives — the ladder can escalate")
+                self.assertEqual(left["g-live"].get("count"), 2, "…with its count intact")
+                for gid in ("g-failed", "g-moot", "g-answered"):
+                    self.assertNotIn(gid, left, "spent latches still drop (the 2026-08-16 fix)")
+            finally:
+                km.jd.STATE = saved

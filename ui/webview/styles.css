@@ -2406,6 +2406,12 @@ body.picker-lifted > #picker.kb-tight { align-items: flex-start; padding: 12px 1
   padding: 2px 9px; border-radius: 6px; background: rgba(255, 255, 255, 0.1); color: var(--fg);
   border: 1px solid rgba(255, 255, 255, 0.18); }
 .romp-lightbox-close:hover { border-color: var(--accent); }
+/* download: an anchor dressed exactly like the close button beside it (one control vocabulary —
+   same chip, same hover cue), sitting between the filename and the ✕ */
+.romp-lightbox-dl { font: inherit; font-size: 0.86em; cursor: pointer; flex: 0 0 auto;
+  padding: 2px 9px; border-radius: 6px; background: rgba(255, 255, 255, 0.1); color: var(--fg);
+  border: 1px solid rgba(255, 255, 255, 0.18); text-decoration: none; line-height: normal; }
+.romp-lightbox-dl:hover { border-color: var(--accent); }
 
 /* The "host:" prefix on a FEDERATED session's name (host-prefix.ts): metadata, not part of the name
    (the user 2026-07-11) — quiet gray, never bold, italic, a step smaller than the name it precedes.
@@ -2508,17 +2514,20 @@ mark.cmt-hl.busy {
     repeating-linear-gradient(90deg, color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
     repeating-linear-gradient(0deg,  color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
     repeating-linear-gradient(0deg,  color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px);
-  background-size: 100% 1.5px, 100% 1.5px, 1.5px 100%, 1.5px 100%;
-  background-position: 0 0, 0 100%, 0 0, 100% 0;
+  background-size: calc(100% + 12px) 1.5px, calc(100% + 12px) 1.5px, 1.5px calc(100% + 12px), 1.5px calc(100% + 12px);
+  background-position: -12px 0, 0 100%, 0 0, 100% -12px;
   background-repeat: no-repeat;
   animation: cmt-ants 1.2s linear infinite;
 }
 mark.cmt-hl.hl-first { border-top-left-radius: 2px; border-bottom-left-radius: 2px; }
 mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 2px; }
-/* the ants march clockwise: top strip right, bottom left, left edge up, right edge down — one
-   12px dash cycle per period, slow and steady */
+/* the ants march clockwise: top strip right, bottom left, left edge up, right edge down — exactly
+   one 12px dash cycle per period, so the loop point is invisible. Each no-repeat strip is oversized
+   by that same 12px along its travel axis and starts one period back: a strip sized exactly to its
+   edge slid open a growing gap at its trailing end and snapped shut every cycle — a lurch that on a
+   text-height vertical edge swallowed most of the edge (the user 2026-08-19). */
 @keyframes cmt-ants {
-  to { background-position: 12px 0, -12px 100%, 0 -12px, 100% 12px; }
+  to { background-position: 0 0, -12px 100%, 0 -12px, 100% 0; }
 }
 /* a code/math HOST whose mark is mid-reply wears the ants too — its element tint would otherwise
    stay solid and defeat the outline-then-fill cue */
@@ -2530,8 +2539,8 @@ mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 
     repeating-linear-gradient(90deg, color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
     repeating-linear-gradient(0deg,  color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
     repeating-linear-gradient(0deg,  color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px);
-  background-size: 100% 1.5px, 100% 1.5px, 1.5px 100%, 1.5px 100%;
-  background-position: 0 0, 0 100%, 0 0, 100% 0;
+  background-size: calc(100% + 12px) 1.5px, calc(100% + 12px) 1.5px, 1.5px calc(100% + 12px), 1.5px calc(100% + 12px);
+  background-position: -12px 0, 0 100%, 0 0, 100% -12px;
   background-repeat: no-repeat;
   animation: cmt-ants 1.2s linear infinite;
 }
@@ -2812,3 +2821,28 @@ body.fileview-open { overflow: hidden; }
    bubble wears): light gray, visibly quieter than the user's blue, so the scroll map separates "you
    spoke" from "something was injected" at a glance (the user 2026-08-18) */
 .scroll-marks .scroll-mark.machine { background: #8a8f98; opacity: 0.55; }
+
+/* ── review comments in the file viewer (the user 2026-08-14) ──────────────────────────────────
+   Comment on passages while you read, then Submit hands the whole set to the session as one
+   message. The highlight borrows the chat comment threads' tint so the two read as one idea. */
+.fileview-cmtcount { font-size: 0.82em; opacity: 0.6; flex: 0 0 auto; }
+.fileview-submit { border-color: var(--accent); color: var(--accent); }
+mark.fv-hl { background: color-mix(in srgb, var(--cmt-hl) 30%, transparent); color: inherit; cursor: pointer; }
+mark.fv-hl:hover { background: color-mix(in srgb, var(--cmt-hl) 58%, transparent); }
+.fv-num { margin-left: 2px; padding: 0 3px; border-radius: 6px; cursor: pointer;
+  background: var(--vscode-menu-background, #252526); color: var(--accent);
+  font-size: 9px; line-height: 13px; }
+.fv-note { display: inline-flex; align-items: baseline; gap: 6px; margin: 0 4px; padding: 2px 6px;
+  border-radius: 4px; background: rgba(255, 255, 255, 0.06); font-size: 0.86em; }
+.fv-note-x { border: 0; background: none; color: inherit; opacity: 0.6; cursor: pointer; font-size: 11px; }
+.fv-note-x:hover { opacity: 1; }
+.fv-new { display: flex; flex-direction: column; gap: 6px; padding: 10px;
+  border-top: 1px solid var(--box-border); }
+.fv-at { font-size: 0.86em; opacity: 0.7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fv-ta { min-height: 62px; padding: 6px 8px; resize: vertical; font: inherit; font-size: 0.92em;
+  background: var(--vscode-input-background, #3c3c3c); color: inherit;
+  border: 1px solid var(--box-border); border-radius: 4px; }
+.fv-newrow { display: flex; gap: 6px; justify-content: flex-end; }
+/* The viewer's backdrop is z 1200 and .ctx-menu is 100, both fixed on <body> — without this lift the
+   menu renders BEHIND the viewer and the right-click looks dead (that exact bug, 2026-08-18). */
+.ctx-menu.fv-menu { z-index: 1300; }

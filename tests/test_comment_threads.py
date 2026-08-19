@@ -429,6 +429,7 @@ class FakeBackend:
 
     def promote_thread(self, sid, name, bg="", fg=""):
         self.calls.append(("promote", sid, name))
+        self.promoted_color = (bg, fg)
         return True
 
 
@@ -576,6 +577,31 @@ class CommentOps(CommentBase):
         self.assertIsNotNone(floor)
         self.assertGreaterEqual(floor, t + 10,
                                 "the floor sits at the thread's leaf — the popover exchange is settled history")
+
+    def _promotable(self, tid):
+        """The transcript + reg a thread needs before _comment_promote will touch it."""
+        t = self.now - 200
+        self._write(tid, [uline(t, "opener", "cu1"), aline(t + 10, "reply", "ca1", parent="cu1")])
+        (jd.SDKDIR / (tid + ".json")).write_text(json.dumps(
+            {"sid": tid, "name": "thread-x", "cwd": self.cdir,
+             "lastSid": tid, "alive": True, "threadOf": PARENT}))
+
+    def test_promote_keeps_the_threads_own_color(self):
+        # the color the dialog suggested rides create → row → PROMOTE (the user 2026-08-19: it used
+        # to be re-picked at break-out, so the session never matched the color the thread had worn)
+        _, tid = km._comment_create(PARENT, "a1", "exponential backoff", "Why?", color="#F9D849")
+        self._promotable(tid)
+        self.assertIsNone(km._comment_promote(PARENT, tid, "sidework"))
+        self.assertEqual(self.be.promoted_color, ("#F9D849", "black"),
+                         "the row's color, with the palette's readable fg — never a fresh pick")
+
+    def test_promote_picks_fresh_only_for_a_colorless_row(self):
+        _, tid = km._comment_create(PARENT, "a1", "exponential backoff", "Why?")
+        self._promotable(tid)
+        self.assertIsNone(km._comment_promote(PARENT, tid, "sidework"))
+        bg, fg = self.be.promoted_color
+        self.assertTrue(bg.startswith("#") and fg in ("white", "black"),
+                        "a pre-color row still gets a real identity")
 
     def test_promote_refuses_a_bad_name(self):
         _, tid = km._comment_create(PARENT, "a1", "exponential backoff", "Why?")

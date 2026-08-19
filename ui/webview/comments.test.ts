@@ -334,9 +334,15 @@ test("while the thread is WRITING the region wears marching ants; the fill lands
   // a dashed outline whose dashes crawl around the box — four gradient strips, animated offsets,
   // no fill, never a border (it would shift the inline text); solid returns when busy drops
   assert.match(CSS, /mark\.cmt-hl\.busy \{\s*\n\s*background-color: transparent;\s*\n\s*background-image:\s*\n\s*repeating-linear-gradient/);
-  assert.match(CSS, /background-size: 100% 1\.5px, 100% 1\.5px, 1\.5px 100%, 1\.5px 100%;/);
-  assert.match(CSS, /@keyframes cmt-ants \{\s*\n\s*to \{ background-position: 12px 0, -12px 100%, 0 -12px, 100% 12px; \}/);
+  // each no-repeat strip is oversized by one 12px dash period along its travel axis and starts a
+  // period back, and the keyframe travels exactly that period — a strip sized to its edge slid open
+  // a gap that snapped shut every cycle, a visible lurch on text-height vertical edges (2026-08-19)
+  assert.match(CSS, /background-size: calc\(100% \+ 12px\) 1\.5px, calc\(100% \+ 12px\) 1\.5px, 1\.5px calc\(100% \+ 12px\), 1\.5px calc\(100% \+ 12px\);/);
+  assert.match(CSS, /background-position: -12px 0, 0 100%, 0 0, 100% -12px;/);
+  assert.match(CSS, /@keyframes cmt-ants \{\s*\n\s*to \{ background-position: 0 0, -12px 100%, 0 -12px, 100% 0; \}/);
   assert.match(CSS, /code\.cmt-hl-host:has\(mark\.cmt-hl\.busy\)/, "hosts march too, or their tint defeats the cue");
+  // both ants blocks (mark + host) carry the oversize — a lone fixed block leaves the other lurching
+  assert.strictEqual((CSS.match(/background-size: calc\(100% \+ 12px\) 1\.5px/g) || []).length, 2);
   assert.match(KERNEL, /state = be\.session_state\(tsid\)/);
 });
 

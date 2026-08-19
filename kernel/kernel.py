@@ -1890,6 +1890,14 @@ def _nudge_text(count, stalled=False):
 _autonudge_cache = {}   # str(path) -> ((mtime_ns,size), dict)
 
 
+# ONE lock for the nudge ledger's read-modify-write spans (2026-08-19 audit: a live episode
+# record vanished with no state-visible writer — the ledger's writers run on the producer tick,
+# judge callbacks, and WS handlers concurrently, and two overlapping dict(read)…write() spans
+# silently drop whichever landed first). The four EPISODE-record writers hold it across their
+# span; remaining writers (debt, settings) migrate as touched.
+_NUDGE_LOCK = threading.RLock()
+
+
 def _auto_nudge_data():
     p = jd.STATE / "auto-nudge.json"
     try:
@@ -3256,32 +3264,46 @@ def _mark_auto_nudged(gid, turn_id, count, arm_atoms=None, at=None):
     fire time — the failed-stamp's parse-lag guard measures its 6h backstop from it (the user 2026-07-24:
     a stamp raced the parse of a second, still-landing nudge turn and blocked two goals whose response
     resolved them; the guard waits for the response segment to become VISIBLE, bounded by the backstop)."""
-    d = dict(_auto_nudge_data())
-    nudged = dict(d.get("nudged", {}))
-    nudged.pop(gid, None)
-    rec = {"count": count, "lastTurnId": turn_id}
-    if isinstance(arm_atoms, int):
-        rec["armAtoms"] = arm_atoms
-    if at is not None:
-        rec["at"] = int(at)
-    nudged[gid] = rec                                       # reinsert → most-recent
-    if len(nudged) > 3000:                                  # bounded; drop the oldest
-        nudged = dict(list(nudged.items())[-3000:])
-    d["nudged"] = nudged
-    _write_auto_nudge(d)
+    with _NUDGE_LOCK:
+        d = dict(_auto_nudge_data())
+        nudged = dict(d.get("nudged", {}))
+        nudged.pop(gid, None)
+        rec = {"count": count, "lastTurnId": turn_id}
+        if isinstance(arm_atoms, int):
+            rec["armAtoms"] = arm_atoms
+        if at is not None:
+            rec["at"] = int(at)
+        nudged[gid] = rec                                       # reinsert → most-recent
+        if len(nudged) > 3000:                                  # bounded; drop the oldest
+            nudged = dict(list(nudged.items())[-3000:])
+        d["nudged"] = nudged
+        _write_auto_nudge(d)
 
 
 def _drop_auto_nudge_rec(gid):
-    """Erase `gid`'s ledger record outright — called when NEW INFORMATION voids the episode the record
+    """Erase `gid`'s SPENT ledger record — called when NEW INFORMATION voids the episode the record
     tracks (today: an awaiting-stamp LIFT in _lift_spent_awaiting — the wait the episode ended on has
-    returned). The record's arm-key dedup and its failed/moot latches all assume the world the episode
-    saw; once a later event supersedes that world, keeping them latched leaves an IDLE session (which
-    never produces the genuine turn a re-arm needs) in Working forever with no reviver (2026-08-16)."""
-    d = dict(_auto_nudge_data())
-    nudged = dict(d.get("nudged", {}))
-    if nudged.pop(gid, None) is not None:
-        d["nudged"] = nudged
-        _write_auto_nudge(d)
+    returned). A spent record's failed/moot/answered latches assume the world the episode saw; once a
+    later event supersedes that world, keeping them latched leaves an IDLE session (which never
+    produces the genuine turn a re-arm needs) in Working forever with no reviver (2026-08-16).
+
+    A LIVE record — mid-count, no latch — is NOT the episode's residue; it IS the once-per-stall
+    invariant and the escalation ladder's memory. Dropping those too (the original form) reset the
+    counter on every stamp↔lift flap, so the same arm turn drew fresh first-nudges minutes apart and
+    _mark_nudge_failed never engaged (the 2026-08-19 audit: three count-1 nudges in 21 minutes, each
+    answered "the suite is still running"). A live record keeps itself honest without our help: a
+    genuine new turn re-arms it through the arm-key dedup, and answering marks it answered."""
+    with _NUDGE_LOCK:
+        d = dict(_auto_nudge_data())
+        nudged = dict(d.get("nudged", {}))
+        rec = nudged.get(gid)
+        if not isinstance(rec, dict):
+            return
+        if not (rec.get("failed") or rec.get("moot") or rec.get("answeredAt")):
+            return                                        # live mid-episode → the ladder's memory, keep it
+        if nudged.pop(gid, None) is not None:
+            d["nudged"] = nudged
+            _write_auto_nudge(d)
 
 
 def _goal_awaiting_stamp(nodes, top, children=None, answered_at=0):
@@ -3327,7 +3349,12 @@ def _goal_awaiting_stamp_full(nodes, top, children=None, answered_at=0):
             # A KINDLESS stamp keeps the old behavior: it may well be a peer wait (the enum predates
             # it), and a false lift there is the known, tested legacy trade.
             kind = nd.get("awaitingKind")
-            if not (at and answered_at and at < answered_at and kind in (None, "peer")):
+            # keyed on the stamp's WRITE time, not the anchor (2026-08-19 audit): awaitingAt is the
+            # audited turn's TRIGGER, which predates the reply that turn solicited — so a fresh
+            # re-stamp was superseded the instant it was filed, contradicting this machinery's own
+            # "a stamp filed AFTER the reply survives" contract. The write time is the closer's
+            # epistemic moment; a reply older than it was already in the audited world.
+            if not (at and answered_at and _stamp_written_at(nd) < answered_at and kind in (None, "peer")):
                 cand = (at, nd["awaitingWhy"], kind or "")   # "" keeps max() comparable
                 best = cand if best is None else max(best, cand)
         stack.extend(children.get(x, []))
@@ -3370,91 +3397,92 @@ def _mark_nudge_failed(gid, ev_t=None, wake=False):
         except Exception:
             pass
     now = int(time.time())
-    d = dict(_auto_nudge_data())
-    nudged = dict(d.get("nudged", {}))
-    rec = nudged.get(gid)
-    if not rec or rec.get("failed") or rec.get("moot"):
-        return None
-    # MOOT, NOT FAILED (the user 2026-07-29): if a real judge FILED a verdict on this node after the
-    # response turn — an unblock ("answered in passing"), a completion — then the judges have already
-    # ruled on evidence at least as new as ours, and "the response didn't resolve this" is a stale
-    # claim. Filing our procedural block anyway would overwrite that ruling AND resurface the node's
-    # LAST decision brief, which the later verdict may have just answered — the audited card sat in
-    # Needs-you presenting a question the user had answered and the unblocker had ruled answered, five
-    # minutes after the fact. Retire the record instead (`moot`, no `failed`, no block): the anti-loop
-    # gate keeps this arm from ever re-firing, and a genuinely still-stalled goal re-arms on the next
-    # GENUINE ended turn, judged against the post-verdict world. The verdict's FILING time (`at`; ev_t
-    # for legacy rows) is the event — same discipline as _nudge_fire_list's arm-time guard, applied at
-    # the eval end of the race. Rows the nudge pipeline itself wrote never count (jd.nudge_pipeline_row,
-    # the user 2026-07-30): placing the reply always files its own "reopened (nudge)" row after the
-    # response turn, and reading that as a fresh ruling mooted EVERY placed-but-unresolved reply — the
-    # ladder's escalation rung went dead and cards parked in Working with no chip, no block, and no
-    # reviver.
-    #
-    # TWO row shapes never moot (2026-08-09, a card wedged in Working on an idle, finished session —
-    # both matched the bare filed-after test and together silenced the escalation with no reviver left):
-    # - a BLOCK row: it AGREES with the escalation ("the goal needs the user"), so it cannot mean stand
-    #   down. It only coexists with a still-'working' goal when a LATER unblock lifted it — judge that
-    #   unblock on its own merits — and a slow pass filing a block about pre-response evidence after the
-    #   response is not "a judge looked after the reply" (filing time as a proxy for a newer world — the
-    #   same-trigger lesson from the fire-side guard, met again at the eval end).
-    # - an UNBLOCK evidenced by the RESPONSE TURN ITSELF (ev_t == _ev): the unblocker judged the very
-    #   reply this evaluator is scoring and moved laterally — it lifted a block and resolved nothing, so
-    #   the stall stands and the escalation must proceed. The card's session had answered the status
-    #   check with a wrong claim that nothing was owed; the unblock believed it, the planner's nudge
-    #   unit declined to resolve, and moot then retired the one rung left — Working forever. An unblock
-    #   evidenced ELSEWHERE (the audited 2026-07-29 shape: the user's own earlier answer) still moots:
-    #   re-blocking there would re-present an answered brief.
-    _ev = int(ev_t or now)
+    with _NUDGE_LOCK:
+        d = dict(_auto_nudge_data())
+        nudged = dict(d.get("nudged", {}))
+        rec = nudged.get(gid)
+        if not rec or rec.get("failed") or rec.get("moot"):
+            return None
+        # MOOT, NOT FAILED (the user 2026-07-29): if a real judge FILED a verdict on this node after the
+        # response turn — an unblock ("answered in passing"), a completion — then the judges have already
+        # ruled on evidence at least as new as ours, and "the response didn't resolve this" is a stale
+        # claim. Filing our procedural block anyway would overwrite that ruling AND resurface the node's
+        # LAST decision brief, which the later verdict may have just answered — the audited card sat in
+        # Needs-you presenting a question the user had answered and the unblocker had ruled answered, five
+        # minutes after the fact. Retire the record instead (`moot`, no `failed`, no block): the anti-loop
+        # gate keeps this arm from ever re-firing, and a genuinely still-stalled goal re-arms on the next
+        # GENUINE ended turn, judged against the post-verdict world. The verdict's FILING time (`at`; ev_t
+        # for legacy rows) is the event — same discipline as _nudge_fire_list's arm-time guard, applied at
+        # the eval end of the race. Rows the nudge pipeline itself wrote never count (jd.nudge_pipeline_row,
+        # the user 2026-07-30): placing the reply always files its own "reopened (nudge)" row after the
+        # response turn, and reading that as a fresh ruling mooted EVERY placed-but-unresolved reply — the
+        # ladder's escalation rung went dead and cards parked in Working with no chip, no block, and no
+        # reviver.
+        #
+        # TWO row shapes never moot (2026-08-09, a card wedged in Working on an idle, finished session —
+        # both matched the bare filed-after test and together silenced the escalation with no reviver left):
+        # - a BLOCK row: it AGREES with the escalation ("the goal needs the user"), so it cannot mean stand
+        #   down. It only coexists with a still-'working' goal when a LATER unblock lifted it — judge that
+        #   unblock on its own merits — and a slow pass filing a block about pre-response evidence after the
+        #   response is not "a judge looked after the reply" (filing time as a proxy for a newer world — the
+        #   same-trigger lesson from the fire-side guard, met again at the eval end).
+        # - an UNBLOCK evidenced by the RESPONSE TURN ITSELF (ev_t == _ev): the unblocker judged the very
+        #   reply this evaluator is scoring and moved laterally — it lifted a block and resolved nothing, so
+        #   the stall stands and the escalation must proceed. The card's session had answered the status
+        #   check with a wrong claim that nothing was owed; the unblock believed it, the planner's nudge
+        #   unit declined to resolve, and moot then retired the one rung left — Working forever. An unblock
+        #   evidenced ELSEWHERE (the audited 2026-07-29 shape: the user's own earlier answer) still moots:
+        #   re-blocking there would re-present an answered brief.
+        _ev = int(ev_t or now)
 
-    def _supersedes(e):
-        if (e.get("at") or e.get("ev_t") or 0) <= _ev or jd.nudge_pipeline_row(e):
-            return False               # predates the reply, or the machinery talking to itself
-        if e.get("kind") == "block":
-            return False               # agrees with the escalation — never a stand-down (see above)
-        if e.get("kind") == "unblock" and (e.get("ev_t") or 0) == _ev:
-            return False               # a lateral move off the reply itself — the stall stands
-        return True
+        def _supersedes(e):
+            if (e.get("at") or e.get("ev_t") or 0) <= _ev or jd.nudge_pipeline_row(e):
+                return False               # predates the reply, or the machinery talking to itself
+            if e.get("kind") == "block":
+                return False               # agrees with the escalation — never a stand-down (see above)
+            if e.get("kind") == "unblock" and (e.get("ev_t") or 0) == _ev:
+                return False               # a lateral move off the reply itself — the stall stands
+            return True
 
-    try:
-        _nd0 = jd.load_goals(gid.rsplit(":", 1)[0]).get("nodes", {}).get(gid)
-        if _nd0 is not None and any(_supersedes(e) for e in _nd0.get("log") or []):
-            nudged[gid] = dict(rec, moot=True)
-            d["nudged"] = nudged
-            _write_auto_nudge(d)
-            return "moot"
-    except Exception:
-        pass
-    # failedAt: the build_feed chip's retire fallback when the block row below goes missing — the two
-    # writes land in different files and only this one is guaranteed (g52, 2026-07-16: a planner pass's
-    # stale save erased the row, and the row-keyed retire left the chip saying "waiting on you" through
-    # the user's own follow-up).
-    nudged[gid] = dict(rec, failed=True, failedAt=now)
-    d["nudged"] = nudged
-    _write_auto_nudge(d)
-    try:
-        sid = gid.rsplit(":", 1)[0]
-        store = jd.load_goals(sid)
-        nd = store.get("nodes", {}).get(gid)
-        why = jd.WAKE_BLOCK_WHY if wake else jd.NUDGE_BLOCK_WHY   # shared constants: the briefer recognizes
-        #                                   these as PROCEDURAL and writes no decision brief, rather than
-        #                                   inventing one from <work>
-        # EVIDENCE TIME (_ev, hoisted above for the moot check) = the nudge RESPONSE turn, not wall-clock
-        # `now` (the user 2026-07-22). The block's evidence IS that response; claiming `now` made the stamp
-        # structurally outrank the user's own reply floor (_block_is_stale voids a block only when
-        # ev_t <= followupAt), so a reply could NEVER void a nudge block — the one mechanism built to stop
-        # a judge re-blocking a just-answered card.
-        if nd is not None and jd.record_verdict(store, nd, "nudge", "block", _ev, why=why):
-            nd["mt"] = _ev                            # the event materialized blocked + blockWhy
-            jd.append_block(sid, gid, "nudge", why, _ev)  # journal before the save it protects: a judge
-            #                                           pass holding this store across its model call
-            #                                           erases the row on save; replay re-records it
-            jd.rollup_status(store, False)
-            jd.save_goals(sid, store)
-            _mark_views_dirty()
-    except Exception:
-        sys.stderr.write("nudge-failed block: %s\n" % traceback.format_exc())
-    return "failed"
+        try:
+            _nd0 = jd.load_goals(gid.rsplit(":", 1)[0]).get("nodes", {}).get(gid)
+            if _nd0 is not None and any(_supersedes(e) for e in _nd0.get("log") or []):
+                nudged[gid] = dict(rec, moot=True)
+                d["nudged"] = nudged
+                _write_auto_nudge(d)
+                return "moot"
+        except Exception:
+            pass
+        # failedAt: the build_feed chip's retire fallback when the block row below goes missing — the two
+        # writes land in different files and only this one is guaranteed (g52, 2026-07-16: a planner pass's
+        # stale save erased the row, and the row-keyed retire left the chip saying "waiting on you" through
+        # the user's own follow-up).
+        nudged[gid] = dict(rec, failed=True, failedAt=now)
+        d["nudged"] = nudged
+        _write_auto_nudge(d)
+        try:
+            sid = gid.rsplit(":", 1)[0]
+            store = jd.load_goals(sid)
+            nd = store.get("nodes", {}).get(gid)
+            why = jd.WAKE_BLOCK_WHY if wake else jd.NUDGE_BLOCK_WHY   # shared constants: the briefer recognizes
+            #                                   these as PROCEDURAL and writes no decision brief, rather than
+            #                                   inventing one from <work>
+            # EVIDENCE TIME (_ev, hoisted above for the moot check) = the nudge RESPONSE turn, not wall-clock
+            # `now` (the user 2026-07-22). The block's evidence IS that response; claiming `now` made the stamp
+            # structurally outrank the user's own reply floor (_block_is_stale voids a block only when
+            # ev_t <= followupAt), so a reply could NEVER void a nudge block — the one mechanism built to stop
+            # a judge re-blocking a just-answered card.
+            if nd is not None and jd.record_verdict(store, nd, "nudge", "block", _ev, why=why):
+                nd["mt"] = _ev                            # the event materialized blocked + blockWhy
+                jd.append_block(sid, gid, "nudge", why, _ev)  # journal before the save it protects: a judge
+                #                                           pass holding this store across its model call
+                #                                           erases the row on save; replay re-records it
+                jd.rollup_status(store, False)
+                jd.save_goals(sid, store)
+                _mark_views_dirty()
+        except Exception:
+            sys.stderr.write("nudge-failed block: %s\n" % traceback.format_exc())
+        return "failed"
 
 
 def _interrupt_focus_top(store):
@@ -3911,11 +3939,12 @@ AWAITING_BACKSTOP_TEXT = (
 def _put_nudged(gid, rec):
     """Persist ONE nudge/wake record into auto-nudge.json's `nudged` ledger — the read-modify-write the
     failed stamp already does inline, shared so the wake's answered/fired records take the same shape."""
-    d = dict(_auto_nudge_data())
-    nudged = dict(d.get("nudged", {}))
-    nudged[gid] = rec
-    d["nudged"] = nudged
-    _write_auto_nudge(d)
+    with _NUDGE_LOCK:
+        d = dict(_auto_nudge_data())
+        nudged = dict(d.get("nudged", {}))
+        nudged[gid] = rec
+        d["nudged"] = nudged
+        _write_auto_nudge(d)
 
 
 def _last_awaiting_is_lift(nd):
@@ -4081,6 +4110,22 @@ def _lift_spent_awaiting(now, tmux):
                     return ((t.get("endT") or 0) > _anchor or (t.get("t") or 0) > _anchor
                             or (t.get("status") == "running" and (t.get("deadline") or 0) > _anchor))
                 if not any(_returned_after(t) for t in own):
+                    continue
+                # THE STAND-DOWN RULE, joined (the 2026-08-19 audit): a writer whose evidence
+                # predates the diary yields — but only on a RE-ASSERT. The flap's signature is the
+                # closer re-affirming the wait AFTER a prior lift of this same stamp: everything
+                # this lift can cite (returns that preceded that lift) was already ruled on once,
+                # so lifting again off it produced the observed 2-3 second stamp↔lift flaps that
+                # reset the nudge ladder (fires 5s after a lift, three first-nudges in 21 minutes —
+                # the session had re-armed a watcher the ownership window cannot see). A FIRST
+                # stamp keeps the designed audit-lag lift: the write postdates the whole audited
+                # turn, and returns the judge never saw must still lift (the suite pins those).
+                _aw = [e for e in (nd.get("log") or []) if e.get("kind") == "awaiting"]
+                _last_lift = max((e.get("at") or e.get("ev_t") or 0 for e in _aw if e.get("lift")), default=0)
+                _last_assert = max((e.get("at") or e.get("ev_t") or 0 for e in _aw if not e.get("lift")), default=0)
+                _evidence = max((max(t.get("endT") or 0, t.get("t") or 0, t.get("deadline") or 0)
+                                 for t in own), default=0)
+                if _last_lift and _last_assert > _last_lift and _stamp_written_at(nd) > _evidence:
                     continue
                 if jd.record_verdict(store, nd, "romp", "awaiting", _lift_ev_t(nd, now), lift=True):
                     changed = True
@@ -4974,6 +5019,17 @@ def _nudge_fire_list(fresh, to_fire, arm_t=None, seen_t=None, held=None):
                 and any(e.get("kind") == "unblock" for e in judge_rows[:-1]):
             if held is not None:                     # a REPEAT unblock mid-oscillation: the unblocker spoke
                 held.append((f, jd.WHY_UNBLOCK_UNSETTLED, 0))   # again, the closer hasn't answered (see docstring)
+            continue
+        if nd.get("awaitingWhy") and nd.get("awaitingAt"):
+            # A LIVE awaiting stamp holds the fire — the judges have ruled "this goal is waiting,
+            # nothing owed", and a status ask over that ruling is exactly the wrong-reason nudge
+            # (the 2026-08-19 audit: one fired 43s AFTER the closer filed "awaiting: the full test
+            # suite it kicked off" — its ev_t equals the seen turn's, so the offending-rows check
+            # above can never catch it). Parity with the other two writers: _wake_goal re-keys on
+            # the store as written and _mark_nudge_failed re-checks the stamp at the write moment;
+            # this was the only fire path without the re-check. The walk's own stamp screening
+            # handles the SNAPSHOT's stamps; this catches one filed since. No `held` record: the
+            # stamp itself is the visible why, and its own wake is the backstop.
             continue
         keep.append(f)
     return keep
@@ -6126,7 +6182,7 @@ def _comment_create(parent_sid, anchor_uuid, exact, text, name="", model="", eff
         data.setdefault("threads", []).append(row)
         _save_comments(parent_sid, data)
     try:
-        be.fork(nm, parent_sid, cut, bg=col, fg=("#ffffff" if col else ""), sid=tsid, thread_of=parent_sid,
+        be.fork(nm, parent_sid, cut, bg=col, fg=(pal.fg_for(col) if col else ""), sid=tsid, thread_of=parent_sid,
                 model=str(model or ""), effort=str(effort or ""))
         be.connect(tsid)
         be.send(tsid, _comment_first_message(exact, text))
@@ -6283,7 +6339,10 @@ def _comment_promote(parent_sid, tid, new_name, now=None, client=None):
         return _revert("not promoted: sealing the thread's history failed: %s" % e)
     if prior == "resolved":
         be.resume(nm, tsid)                          # a resolved thread promotes straight to a live session
-    bg, fg = _pick_identity_color()
+    # the thread KEEPS its identity color (the user 2026-08-19: the color the dialog suggested must
+    # persist to the session it becomes) — a fresh pick here handed the board session a different one
+    col = str(th.get("color") or "")
+    bg, fg = (col, pal.fg_for(col)) if col else _pick_identity_color()
     if not be.promote_thread(tsid, nm, bg, fg):
         return _revert("couldn't promote this thread.")
     _comment_update(parent_sid, tid, status="promoted", promotedName=nm)
@@ -22611,6 +22670,9 @@ _CHAT_MOBILE_CSS = (
     # document to 450px, panning every surface ~15% off-screen. Wrap it on touch (the bar drops to a
     # second line), reclaim the desktop gutter, and clamp stray horizontal overflow at the body so one
     # oversized control can never widen the page again.
+    ".mrow.ph .nm{opacity:.55}"
+    ".mrow.ph::after{content:'syncing\u2026';margin-left:auto;opacity:.5;font-size:.82em;font-style:italic}"
+    ".mrow.pending::after{content:'opening\u2026';margin-left:auto;opacity:.7;font-size:.82em;font-style:italic}"
     "body{overflow-x:hidden}"
     ".statusline{flex-wrap:wrap;gap:6px 8px;padding:6px 10px 0 10px}"
     "#composer{padding:8px 10px 6px}"
@@ -22637,7 +22699,8 @@ function read(){return [].map.call(tabs.querySelectorAll('.tab[data-id]'),functi
 var lab=t.querySelector('.tab-label');
 return {id:t.getAttribute('data-id'),name:(lab?lab.textContent:t.getAttribute('data-id')),lab:lab,
 bg:t.style.getPropertyValue('--chip-bg').trim(),fg:t.style.getPropertyValue('--chip-fg').trim(),
-working:t.classList.contains('tab-working'),awaitbg:!!t.querySelector('.tab-dot.await'),active:t.classList.contains('active')};});}
+working:t.classList.contains('tab-working'),awaitbg:!!t.querySelector('.tab-dot.await'),active:t.classList.contains('active'),
+ph:t.classList.contains('tab-placeholder')};});}
 // A name is filled from the desktop label's own CHILD NODES, cloned — not from its flattened text. A
 // federated session's name carries a <span class="host-prefix"> that renders the "host:" as quiet
 // metadata (host-prefix.ts: dim, italic, never bold, a step smaller), and textContent threw that span
@@ -22650,7 +22713,29 @@ working:t.classList.contains('tab-working'),awaitbg:!!t.querySelector('.tab-dot.
 function fillName(elm,s){elm.textContent='';
 if(s.lab&&s.lab.childNodes.length)[].slice.call(s.lab.cloneNode(true).childNodes).forEach(function(n){elm.appendChild(n);});
 else elm.textContent=s.name;}
-function sync(){var ts=read(),act=null;
+function rowUpdate(row,s){row.classList.toggle('active',!!s.active);
+// a PLACEHOLDER tab (its session payload hasn't merged yet — a remote host still relaying, a fresh
+// reconnect) reads as syncing, never as a normal row whose tap silently dies (the user 2026-08-19,
+// who tapped a remote session on the phone and nothing happened)
+row.classList.toggle('ph',!!s.ph&&pendingId!==s.id);
+row.classList.toggle('pending',pendingId===s.id);
+var wd=row.querySelector('.workdot');
+if(s.working||s.awaitbg){if(!wd){wd=document.createElement('span');wd.className='workdot';row.insertBefore(wd,row.firstChild);}
+wd.classList.toggle('await',!s.working&&!!s.awaitbg);}
+else if(wd)wd.remove();
+var lbl=row.querySelector('.nm');fillName(lbl,s);lbl.style.color=s.bg||'';}
+function rowMake(s){var row=document.createElement('div');row.className='mrow';row.setAttribute('data-id',s.id);
+var lbl=document.createElement('span');lbl.className='nm';row.appendChild(lbl);
+var x=document.createElement('span');x.className='mclose';x.textContent='\u00d7';x.title='End session';
+row.appendChild(x);rowUpdate(row,s);return row;}
+var pendingId=null,held=false,dirty=false;
+function sync(){
+// pointer-held defer (the timeline draw()'s pattern, CLAUDE.md click-safety): a push landing while a
+// finger is DOWN must not move or destroy the row under it — flush on release instead. The old
+// innerHTML wipe here rebuilt every row per push (0.5-3s) and reset the list's scroll to the top,
+// so a tap raced a 2s window and rows below the fold snapped away mid-reach (the user 2026-08-19).
+if(held){dirty=true;return;}
+var ts=read(),act=null;
 for(var i=0;i<ts.length;i++){if(ts[i].active){act=ts[i];break;}}
 if(!act&&ts.length)act=ts[0];
 var nm=cur.querySelector('.nm');
@@ -22660,22 +22745,38 @@ if(act){fillName(nm,act);
 if(act.bg){cur.classList.add('colored');cur.style.setProperty('--cbg',act.bg);cur.style.setProperty('--cfg',act.fg||'#ffffff');}
 else{cur.classList.remove('colored');cur.style.removeProperty('--cbg');cur.style.removeProperty('--cfg');}}
 else{nm.textContent='no sessions';cur.classList.remove('colored');}
-list.innerHTML='';
-ts.forEach(function(s){var row=document.createElement('div');row.className='mrow'+(s.active?' active':'');
-// desktop parity: the identity color tints the NAME (inline, like the Fleet list); the dot mirrors the
-// tab's own dot — gold when working, green (awaitbg) when idle-waiting-on-bg-work, none otherwise.
-if(s.working){var wd=document.createElement('span');wd.className='workdot';row.appendChild(wd);}
-else if(s.awaitbg){var wd=document.createElement('span');wd.className='workdot await';row.appendChild(wd);}
-var lbl=document.createElement('span');lbl.className='nm';fillName(lbl,s);if(s.bg)lbl.style.color=s.bg;
-row.appendChild(lbl);
-// End-session x: clicks the hidden desktop tab's own .tab-close, reusing its confirm dialog (End session /
-// Cancel) + endSession plumbing — the mobile picker's only way to end a session
-// (the user 2026-07-22). stopPropagation so it doesn't also switch to the session.
-var x=document.createElement('span');x.className='mclose';x.textContent='×';x.title='End session';
-x.addEventListener('click',function(e){e.stopPropagation();hide();var rt=realTab(s.id);var c=rt&&rt.querySelector('.tab-close');if(c)c.click();});
-row.appendChild(x);
-row.addEventListener('click',function(){var rt=realTab(s.id);if(rt)rt.click();hide();});
-list.appendChild(row);});}
+// a PENDING tap resolves the moment the payload lands: this sync ran because the tabs changed, so
+// re-check the real tab — real now means activate now (event-based; the arrival is the trigger)
+if(pendingId){var prt=realTab(pendingId);
+if(prt&&!prt.classList.contains('tab-placeholder')){pendingId=null;prt.click();hide();}
+else if(!prt){pendingId=null;}}
+// IN-PLACE list update keyed by data-id — never a wipe: rows persist across pushes (click-safe),
+// and the list keeps its scroll position because nothing detaches unchanged rows
+var want={};ts.forEach(function(s){want[s.id]=1;});
+[].slice.call(list.children).forEach(function(r){if(!want[r.getAttribute('data-id')])r.remove();});
+ts.forEach(function(s,i){var row=list.querySelector('.mrow[data-id="'+s.id.replace(/"/g,'\\"')+'"]');
+if(!row)row=rowMake(s);else rowUpdate(row,s);
+var at=list.children[i];if(at!==row)list.insertBefore(row,at||null);});}
+// ONE delegated listener on the STABLE list (rows are swapped by sync; the parent survives) — the
+// same delegation rule the desktop strip follows, so a mid-press row swap can still land its tap
+list.addEventListener('click',function(e){
+var row=e.target&&e.target.closest?e.target.closest('.mrow'):null;
+if(!row)return;
+var id=row.getAttribute('data-id');
+if(e.target.closest('.mclose')){e.stopPropagation();hide();
+// End-session x: clicks the hidden desktop tab's own .tab-close, reusing its confirm dialog (End
+// session / Cancel) + endSession plumbing — the mobile picker's only way to end a session (2026-07-22)
+var rtc=realTab(id);var c=rtc&&rtc.querySelector('.tab-close');if(c)c.click();return;}
+var rt=realTab(id);
+if(rt&&!rt.classList.contains('tab-placeholder')){rt.click();hide();return;}
+// a tab whose session data hasn't arrived: the tap must never die silently — mark it pending
+// (the row says "opening"), keep the list open, and the arrival-triggered sync above activates it.
+// Classes only — refilling the name here would flatten the host-prefix span (the 2026-07-30 bug).
+pendingId=id;row.classList.add('pending');row.classList.remove('ph');});
+list.addEventListener('pointerdown',function(){held=true;});
+function release(){if(held){held=false;if(dirty){dirty=false;sync();}}}
+document.addEventListener('pointerup',release);
+document.addEventListener('pointercancel',release);
 cur.addEventListener('click',function(e){e.stopPropagation();list.classList.toggle('open');});
 add.addEventListener('click',function(e){e.stopPropagation();var a=tabs.querySelector('.tab-add');if(a)a.click();});
 document.addEventListener('click',function(e){if(!hdr.contains(e.target)&&!list.contains(e.target))hide();});

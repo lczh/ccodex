@@ -3064,6 +3064,7 @@ function makeFeedToggle(id: string, label: string, get: () => boolean, key: stri
   b.id = id; b.textContent = label;
   b.onclick = (ev) => {
     ev.stopPropagation();
+    if (b.classList.contains("forced")) return;   // stacking is automatic at this width — a no-op toggle lies
     const on = !get();
     try {
       const s = JSON.parse(localStorage.getItem("romp:settings") || "{}");
@@ -3102,11 +3103,31 @@ function ensureNewestFirst(): HTMLElement {
 function applyStacked(on: boolean) {
   document.getElementById("feed-list")?.style.setProperty("--romp-stack", on ? "on" : "off");
 }
+// FORCED stacking (the user 2026-08-19): at or under the container query's own 540px the layout
+// stacks regardless of the pref, so the toggle is a no-op there — unclicking it would change
+// nothing. The button says so instead of lying: faded, unclickable, tooltip naming the way out
+// (more width). Width changes are the event — a ResizeObserver on #feed-list, installed once.
+const STACK_FORCED_W = 540;   // MUST match feed.css's @container (max-width: 540px) stack query
+let stackResizeWatch: ResizeObserver | null = null;
+function refreshStackForced(b: HTMLElement): void {
+  const list = document.getElementById("feed-list");
+  const forced = !!list && list.clientWidth > 0 && list.clientWidth <= STACK_FORCED_W;
+  b.classList.toggle("forced", forced);
+  b.setAttribute("aria-disabled", forced ? "true" : "false");
+  if (forced) b.title = "stacked automatically at this width — widen the feed to unstack into three columns";
+}
 function ensureStackToggle(): HTMLElement {
-  return ensureFeedToggle("feed-stacked", "Stack", () => feedPrefs().stacked, "stacked",
+  const b = ensureFeedToggle("feed-stacked", "Stack", () => feedPrefs().stacked, "stacked",
     "one-column layout at any width — click for side-by-side columns when the feed is wide",
     "stack the columns into one, whatever the width",
     (on) => applyStacked(on));
+  refreshStackForced(b);                      // per render: the ensure title above just overwrote ours
+  const list = document.getElementById("feed-list");
+  if (!stackResizeWatch && list && typeof ResizeObserver !== "undefined") {
+    stackResizeWatch = new ResizeObserver(() => refreshStackForced(b));
+    stackResizeWatch.observe(list);
+  }
+  return b;
 }
 // (The "Collapsed" default-section toggle moved into the settings modal, 2026-08-18 — a set-and-forget
 // preference, not a per-glance view action. The pref and its behavior are unchanged; the gear writes

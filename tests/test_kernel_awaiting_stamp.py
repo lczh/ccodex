@@ -738,3 +738,29 @@ class WakeBodyKeepsItsCopy(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SupersedeKeysOnWriteTime(unittest.TestCase):
+    """The peer-answer supersede keys on the stamp's WRITE time, not its anchor (2026-08-19 audit):
+    awaitingAt is the audited turn's TRIGGER, which predates the very replies that turn solicited —
+    so a fresh re-stamp was superseded the instant it was filed, contradicting the machinery's own
+    'a stamp filed AFTER the reply survives' contract."""
+
+    def _nodes(self, anchor, written, kind="peer"):
+        return {"g1": {"id": "g1", "parentId": None, "awaitingWhy": "waiting on the peer's report",
+                       "awaitingAt": anchor, "awaitingKind": kind,
+                       "log": [{"ev_t": anchor, "at": written, "src": "closer", "kind": "awaiting",
+                                "why": "waiting on the peer's report", "awaitKind": kind}]}}
+
+    def test_a_stamp_written_after_the_reply_survives(self):
+        # anchor 100 (trigger), reply 150, stamp WRITTEN 200: the closer knew the reply — stamp stands
+        got = km._goal_awaiting_stamp_full(self._nodes(100, 200), "g1", answered_at=150)
+        self.assertIsNotNone(got, "written after the reply → the ruling already weighed it")
+
+    def test_a_stamp_written_before_the_reply_is_superseded(self):
+        got = km._goal_awaiting_stamp_full(self._nodes(100, 120), "g1", answered_at=150)
+        self.assertIsNone(got, "the reply IS the awaited event — the stamp yields")
+
+    def test_job_stamps_never_yield_to_mail(self):
+        got = km._goal_awaiting_stamp_full(self._nodes(100, 120, kind="job"), "g1", answered_at=150)
+        self.assertIsNotNone(got, "peer-scoped: a slurm wait keeps standing through unrelated mail")
