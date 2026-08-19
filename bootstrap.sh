@@ -227,12 +227,13 @@ gd="$(git -C "$DIR" rev-parse --absolute-git-dir)" || {
     echo "romp: could not resolve the clone's git dir for the update transaction." >&2; exit 1; }
 echo "==> Checking out $ref + installing (one locked transaction)"
 txn_rc=0
-python3 - "$DIR" "$gd" "$target" "$precheck" "$@" <<'TXNPY' || txn_rc=$?
+python3 - "$DIR" "$gd" "$target" "$precheck" "$channel" "$@" <<'TXNPY' || txn_rc=$?
 import fcntl, os, subprocess, sys, time
 
-root, gdir, target, precheck = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+root, gdir, target, precheck, channel = (sys.argv[1], sys.argv[2], sys.argv[3],
+                                          sys.argv[4], sys.argv[5])
 moves, cur = [], []
-for tok in sys.argv[5:]:
+for tok in sys.argv[6:]:
     if tok == "--":
         moves.append(cur); cur = []
     else:
@@ -315,6 +316,22 @@ for mv in moves:
         except OSError:
             pass                             # the armed target latch stays — fail closed
         sys.exit(6)
+# the CHANNEL marker lands here — INSIDE the lock (the user's audit, 2026-08-19: the shell wrote
+# it after the lock released, so two serial bootstraps could publish their markers in reverse
+# order), and AFTER the moves but BEFORE install.sh: the marker describes the checkout HEAD now
+# IS, so a build that fails install here and is later healed (boot heal runs only install.sh)
+# comes up wearing ITS OWN channel — with the write after install, a dev→stable bootstrap that
+# died in install left the stale dev marker on a stable checkout, and the healed build followed
+# unsigned main. A failed MOVE above exits before this line, keeping the old marker with the old
+# HEAD.
+try:
+    ctmp = os.path.join(gdir, "romp-update-channel.tmp")
+    with open(ctmp, "w") as cf:
+        cf.write(channel + "\n")
+    os.replace(ctmp, os.path.join(gdir, "romp-update-channel"))
+except OSError:
+    sys.exit(11)                       # latch stays armed — the moved checkout must not run
+    #                                    wearing the OLD channel marker (a rerun heals both)
 env = dict(os.environ, ROMP_INSIDE_UPDATE_TXN=str(os.getpid()))
 if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root, pass_fds=(fd,),
                   env=env).returncode:
@@ -324,11 +341,8 @@ sys.exit(0)
 TXNPY
 case "$txn_rc" in
     0)
-       # The marker lives in the WORKTREE's own git dir: `git config --local` is repository-scoped, so a
-       # dev worktree could flip a sibling release worktree's channel via the shared config (the
-       # user's audit, 2026-08-17). The legacy key is unset so it can never shadow the marker.
-       printf '%s\n' "$channel" > "$gd/romp-update-channel" || {
-           echo "romp: could not record the update channel in $gd." >&2; exit 1; }
+       # the marker itself was written INSIDE the locked transaction (see TXNPY); only the legacy
+       # git-config unset and the say-so remain out here
        git -C "$DIR" config --unset romp.updateChannel 2>/dev/null || true
        echo "==> Update channel: $channel"
        ;;
@@ -342,6 +356,9 @@ case "$txn_rc" in
     10) echo "romp: this checkout's install latch names commits HEAD doesn't match — an update died" >&2
         echo "  mid-move from a broken state. Heal by hand: run install.sh, then remove the latch" >&2
         echo "  file in the clone's git dir, and rerun bootstrap." >&2; exit 1 ;;
+    11) echo "romp: installed, but the update channel could not be recorded in $gd — the install" >&2
+        echo "  latch is left armed so this build cannot run wearing the old channel. Rerun bootstrap." >&2
+        exit 1 ;;
     4) echo "romp: install.sh failed AFTER the checkout moved — the install latch is armed, so" >&2
        echo "  romp will refuse to run this build until a re-run of bootstrap or its boot heal" >&2
        echo "  gets install.sh to pass." >&2; exit 1 ;;

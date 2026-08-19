@@ -36,6 +36,7 @@
 # ~/.claude/romp-postal-nopush; disable everything with ~/.claude/romp-postal-off.
 
 import base64
+import fcntl
 import hashlib
 import hmac
 import json
@@ -86,40 +87,43 @@ def _load_serve_token():
     if t:
         return t
     f = STATE.parent / "serve-token"              # ~/.local/state/romp/serve-token (STATE is romp/postal)
-    try:
-        v = f.read_text().strip()
-        if v:
-            return v
-    except OSError:
-        pass
-    v = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
+    # ONE FLOCK with the kernel's loader (same <state>/serve-token.lock): every lock-free scheme
+    # kept losing a schedule — two processes both hit the empty-remnant replace and split-brained
+    # (the user's audit, 2026-08-19). Under the lock: re-read, else mint atomically.
+    lock_fd = None
     try:
         f.parent.mkdir(parents=True, exist_ok=True)
-        # BORN 0600, complete, and claimed atomically: write-then-chmod left a world-readable
-        # window (the user's audit, 2026-08-18), and O_EXCL-then-write let a loser read the
-        # winner's still-EMPTY file (the adversarial review, 2026-08-19). The token is written to
-        # a private temp first and CLAIMED via os.link — the name appears only with its content,
-        # so whoever loses the link race re-reads a complete winner.
-        tmp = f.with_name("%s.%d.tmp" % (f.name, os.getpid()))
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(v)
+        lock_fd = os.open(str(f) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except OSError:
+        lock_fd = None
+    try:
         try:
-            os.link(str(tmp), str(f))
-        except FileExistsError:
             prior = f.read_text().strip()
-            if prior:
-                v = prior
-            else:
-                os.replace(str(tmp), str(f))     # an empty existing file is a remnant, never a winner
-        finally:
+        except OSError:
+            prior = ""
+        if prior:
             try:
-                tmp.unlink()
+                os.chmod(f, 0o600)
             except OSError:
                 pass
-    except OSError:
-        pass
-    return v
+            return prior
+        v = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
+        try:
+            tmp = f.with_name("%s.%d.tmp" % (f.name, os.getpid()))
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(v)
+            os.replace(str(tmp), str(f))
+        except OSError:
+            pass
+        return v
+    finally:
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
 
 
 SERVE_TOKEN = _load_serve_token()

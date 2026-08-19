@@ -232,5 +232,105 @@ class TokenBirth(unittest.TestCase):
             f.unlink(missing_ok=True)
 
 
+class PostalTokenFlock(unittest.TestCase):
+    """The bus's loader shares the kernel's serve-token.lock — whichever daemon starts first mints,
+    the other blocks and adopts. Same deterministic schedule as the kernel-side test: the test
+    holds the lock as the kernel-minter mid-mint, the bus announces its lock attempt, the winner
+    publishes and releases, and the bus must come back with the winner's token."""
+
+    _CHILD = r"""
+import os, sys
+os.environ["ROMP_SERVE_TOKEN"] = "import-shield"   # module import loads SERVE_TOKEN; shield it
+os.environ["ROMP_STATE_DIR"] = sys.argv[2]         # pin to the PARENT test's state root (sibling
+#                                                    test modules overwrite XDG_STATE_HOME at import)
+from importlib.machinery import SourceFileLoader
+BIN = sys.argv[1]
+ps = SourceFileLoader("romp_postal_child", os.path.join(BIN, "romp-postal-service")).load_module()
+os.environ.pop("ROMP_SERVE_TOKEN", None)
+import fcntl
+_real = fcntl.flock
+def _spy(fd, op):
+    print("FLOCK", flush=True)
+    return _real(fd, op)
+fcntl.flock = _spy
+print(ps._load_serve_token(), flush=True)
+"""
+
+    def test_the_bus_blocks_on_the_kernels_mint_and_adopts_its_token(self):
+        import fcntl
+        import select
+        import subprocess
+        import sys
+        f = ps.STATE.parent / "serve-token"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        saved = f.read_text() if f.exists() else None
+        f.write_text("")                             # the audit's remnant: exists, empty
+        env_tok = os.environ.pop("ROMP_SERVE_TOKEN", None)
+        script = f.with_name("flock-child.py")
+        script.write_text(self._CHILD)
+        lfd = os.open(str(f) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lfd, fcntl.LOCK_EX)
+        p = subprocess.Popen([sys.executable, str(script), BIN, str(ps.STATE.parent)],
+                             stdout=subprocess.PIPE, text=True)
+
+        def _cleanup():
+            try:
+                os.close(lfd)
+            except OSError:
+                pass
+            if p.poll() is None:
+                p.kill()
+            p.stdout.close()
+            if env_tok is not None:
+                os.environ["ROMP_SERVE_TOKEN"] = env_tok
+            if saved is not None:
+                f.write_text(saved)                  # later gate tests compare ps.SERVE_TOKEN
+            for leftover in (f.with_name(f.name + ".lock"), script):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+        self.addCleanup(_cleanup)
+
+        def _line(why):
+            r, _, _ = select.select([p.stdout], [], [], 120)
+            self.assertTrue(r, "no output within 120s — " + why)
+            return p.stdout.readline().strip()
+
+        self.assertEqual(_line("the loader never spoke"), "FLOCK",
+                         "the bus must try the lock BEFORE reading — reading first is the "
+                         "split-brain schedule (the user's audit, 2026-08-19)")
+        tmp = f.with_name("winner.tmp")
+        tmp.write_text("winner-token")
+        os.replace(tmp, f)
+        os.close(lfd)
+        self.assertEqual(_line("the loader stayed blocked after the lock was freed"),
+                         "winner-token",
+                         "the bus must adopt the token the lock-holder published")
+        self.assertEqual(p.wait(timeout=60), 0)
+        self.assertEqual(f.read_text().strip(), "winner-token")
+
+    def test_a_nonempty_loose_file_is_tightened_on_read(self):
+        # the read path keeps the inode, so it must chmod what it keeps (the user's audit,
+        # 2026-08-19: a 0644 nonempty token was returned as-is)
+        import stat
+        f = ps.STATE.parent / "serve-token"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        saved = f.read_text() if f.exists() else None
+        env_tok = os.environ.pop("ROMP_SERVE_TOKEN", None)
+
+        def _restore():
+            if env_tok is not None:
+                os.environ["ROMP_SERVE_TOKEN"] = env_tok
+            if saved is not None:
+                f.write_text(saved)
+        self.addCleanup(_restore)
+        f.write_text("keep-me-token\n")
+        os.chmod(f, 0o644)
+        self.assertEqual(ps._load_serve_token(), "keep-me-token")
+        self.assertEqual(stat.S_IMODE(os.stat(f).st_mode), 0o600,
+                         "a kept token file must not stay at the loose mode it arrived with")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

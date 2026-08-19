@@ -240,6 +240,51 @@ class PullRemote(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("trust changed", detail)
 
+    def test_a_trust_downgrade_landing_at_the_merge_rolls_the_move_back(self):
+        # the last unguarded window (the user's audit, 2026-08-19): the post-settle re-check
+        # passes, then the downgrade lands while arm+merge run. The post-merge re-check must win —
+        # and since HEAD already moved, winning means MOVING IT BACK, not just refusing.
+        calls = self._wire()
+        orig = km.subprocess.run
+
+        def degrading_merge(argv, **kw):
+            if argv[0] == "git" and "merge" in argv and "merge-base" not in argv:
+                km._remotes["TESTHOST"]["trust"] = "directed"   # lands exactly at the move
+            return orig(argv, **kw)
+        km.subprocess.run = degrading_merge
+        ok, detail = km._pull_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("rolled back", detail)
+        resets = [a for a in calls if a[0] == "git" and "reset" in a]
+        self.assertEqual(resets, [["git", "-C", str(km.ROOT), "reset", "--hard", "bbbbbbb"]],
+                         "HEAD returns to the exact pre-merge commit, recorded before the move")
+        self.assertEqual(km._install_latch_lines(), [],
+                         "the intent is moot once the move is undone — nothing stays armed")
+        self.assertFalse(any("install.sh" in str(a) for c in calls for a in c),
+                         "nothing installs code the trust decision rejected")
+
+    def test_a_failed_rollback_keeps_the_armed_latch(self):
+        # if the rewind itself fails, HEAD sits on the fetched commit with nothing installed —
+        # clearing the latch there would fail OPEN a build the trust decision just rejected
+        calls = self._wire()
+        orig = km.subprocess.run
+
+        def degrading(argv, **kw):
+            if argv[0] == "git" and "reset" in argv:
+                calls.append(argv)
+                return _R(rc=1, err="reset refused")
+            if argv[0] == "git" and "merge" in argv and "merge-base" not in argv:
+                km._remotes["TESTHOST"]["trust"] = "directed"
+            return orig(argv, **kw)
+        km.subprocess.run = degrading
+        ok, detail = km._pull_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("rollback failed", detail)
+        self.assertIn("latched", detail)
+        self.assertEqual(km._install_latch_lines(), [km._sha8(REMOTE)],
+                         "armed — the moved, uninstalled, now-untrusted build stays gated")
+        self.assertFalse(any("install.sh" in str(a) for c in calls for a in c))
+
     def test_an_unpersistable_intent_blocks_the_merge(self):
         calls = self._wire()
         from unittest import mock

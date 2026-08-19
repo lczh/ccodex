@@ -568,46 +568,47 @@ def _load_token():
     if t:
         return t
     f = jd.STATE / "serve-token"
-    try:
-        v = f.read_text().strip()
-        if v:
-            return v
-    except OSError:
-        pass
-    v = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
+    # ONE FLOCK serializes every reader-or-minter (kernel and postal share the lock path): all
+    # lock-free schemes kept losing a schedule — the last one let two processes both hit the
+    # empty-remnant replace and run on DIFFERENT tokens until restart (the user's audit,
+    # 2026-08-19, reproduced deterministically). Under the lock the logic is plain: read
+    # (tightening a loose pre-existing file — the read path never did), else mint atomically.
+    lock_fd = None
     try:
         jd.STATE.mkdir(parents=True, exist_ok=True)
-        # 0600 from birth AND link-claimed like the postal mint (the user's audit, 2026-08-19:
-        # this side still O_TRUNC'd the shared file, so a concurrent kernel/postal start could
-        # end up on different in-memory tokens with only one persisted). The temp is private;
-        # the final name appears only with its content; the link-race loser re-reads the winner.
-        tmp = f.with_name("%s.%d.tmp" % (f.name, os.getpid()))
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        lock_fd = os.open(str(f) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except OSError:
+        lock_fd = None                           # lockless fallback: still correct alone
+    try:
         try:
-            os.write(fd, v.encode())
-        finally:
-            os.close(fd)
-        try:
-            os.link(str(tmp), str(f))
-        except FileExistsError:
-            prior = f.read_text().strip()
-            if prior:
-                v = prior                        # the race's winner: complete by construction
-            else:
-                os.replace(str(tmp), str(f))     # an EMPTY existing file is a broken remnant, not
-                #                                  a winner — claim it atomically WITH content
-                #                                  (upstream's own mode tests caught the loser
-                #                                  returning an unpersisted token here)
-        finally:
+            v = f.read_text().strip()
+        except OSError:
+            v = ""
+        if v:
             try:
-                tmp.unlink()
+                os.chmod(f, 0o600)
             except OSError:
                 pass
-        os.chmod(f, 0o600)                       # tighten a PRE-EXISTING loose file; a fresh mint
-        #                                          is already 0600 by birth, so this is its no-op
-    except OSError:
-        pass
-    return v
+            return v
+        v = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
+        try:
+            tmp = f.with_name("%s.%d.tmp" % (f.name, os.getpid()))
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, v.encode())
+            finally:
+                os.close(fd)
+            os.replace(str(tmp), str(f))         # atomic; 0600 by birth; the flock made us alone
+        except OSError:
+            pass
+        return v
+    finally:
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
 
 TOKEN = _load_token()
 
@@ -10747,12 +10748,37 @@ def _pull_remote(host, expected_sha=None):
                     return False, "%s trust changed during the pull — nothing merged" % host
             if not _arm_latch(_sha8(fetched_sha), carry):
                 return False, "could not record the install intent — not moving HEAD"
+            pre_head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                                      capture_output=True, text=True, timeout=10).stdout.strip()
             m = subprocess.run(["git", "-C", str(ROOT), "merge", "--ff-only", fetched_sha],
                                capture_output=True, text=True, timeout=30)
             if m.returncode != 0:
                 _set_install_failed(carry)         # HEAD did not move; the carried prior returns
                 return False, ("fast-forward failed: %s"
                                % ((m.stderr or m.stdout or "").strip()[:160] or "unknown"))
+            # trust COUPLED to the move (the user's audit, 2026-08-19: a downgrade landing during
+            # the arm/merge still merged code from a now-directed peer): re-checked here, after
+            # the merge and before the code-execution boundary — a downgrade ROLLS THE MOVE BACK
+            # (ff-only from a clean tree under our flock: the rewind is exact) and restores the
+            # carried latch.
+            with _remotes_lock:
+                _cur2 = _remotes.get(host)
+                _still2 = bool(_cur2 and not _cur2.get("checkin_peer")
+                               and _cur2.get("trust") == "trusted")
+            if not _still2:
+                rb = None
+                if pre_head:
+                    rb = subprocess.run(["git", "-C", str(ROOT), "reset", "--hard", pre_head],
+                                        capture_output=True, text=True, timeout=30)
+                if rb is not None and rb.returncode == 0:
+                    _set_install_failed(carry)     # HEAD is back on the prior build: the carried
+                    #                                record returns (or the latch clears)
+                    return False, "%s trust changed during the pull — the move was rolled back" % host
+                # the rewind itself failed: HEAD sits on the fetched commit with nothing
+                # installed — the ARMED latch is the honest record, leave it (clearing it here
+                # would fail OPEN a build the trust decision just rejected)
+                return False, ("%s trust changed during the pull and the rollback failed — this "
+                               "checkout is latched until healed" % host)
             installed = _converge_install(_sha8(fetched_sha), lock_fd)
         finally:
             try:

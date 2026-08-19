@@ -493,15 +493,55 @@ HOLDPY
     [[ "$output" != *STUB_INSTALL_RAN* ]]
 }
 
-@test "bootstrap.sh: the channel marker lands only AFTER the transaction succeeds" {
-    # decisive state must not change outside the locked transaction (the user's audit,
-    # 2026-08-19): a failed install keeps the OLD install's channel — and a fresh clone whose
-    # install fails records no channel at all
+@test "bootstrap.sh: the transaction itself publishes the channel marker" {
+    # the marker write lives in TXNPY, under the update lock (the user's audit, 2026-08-19: the
+    # shell wrote it after the lock released, so two serial bootstraps could publish in reverse
+    # order). Executed directly: the extracted transaction, run with a channel and no moves, must
+    # leave the marker — no shell tail involved.
+    sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    target="$(git -C "$root" rev-parse HEAD)"
+    run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "stable"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$gd/romp-update-channel")" = "stable" ]
+    [ ! -e "$gd/romp-install-failed" ]
+}
+
+@test "bootstrap.sh: an unwritable channel marker leaves the latch armed (rc 11)" {
+    # a moved checkout whose channel cannot be recorded must not run wearing the OLD marker —
+    # the latch stays armed and a rerun heals both
+    sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    target="$(git -C "$root" rev-parse HEAD)"
+    mkdir "$gd/romp-update-channel.tmp"    # open() on a directory fails → the txn must refuse
+    run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "stable"
+    [ "$status" -eq 11 ]
+    [ "$(cat "$gd/romp-install-failed")" = "$(git -C "$root" rev-parse --short=8 HEAD)" ]
+    [ ! -e "$gd/romp-update-channel" ]
+}
+
+@test "bootstrap.sh: the channel marker follows the MOVE, inside the transaction" {
+    # the marker is written under the update lock, after the moves land and before install.sh
+    # (the user's audit, 2026-08-19: the shell wrote it after the lock released). It describes
+    # what HEAD now IS: a build that moved but failed install carries ITS OWN channel, so a later
+    # boot heal (which runs only install.sh) brings it up on the right channel — a stale dev
+    # marker on a stable checkout followed unsigned main.
     printf '#!/usr/bin/env bash\nexit 1\n' > "$ROMP_REPO/install.sh"
     git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -qam broken
     git -C "$ROMP_REPO" tag -s v0.3.0 -m v0.3.0
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -ne 0 ]
     gd="$(git -C "$HOME/romp" rev-parse --absolute-git-dir)"
-    [ ! -e "$gd/romp-update-channel" ]
+    [ "$(cat "$gd/romp-update-channel")" = "stable" ]
+    [ -e "$gd/romp-install-failed" ]   # armed: the moved-but-uninstalled build stays gated
 }

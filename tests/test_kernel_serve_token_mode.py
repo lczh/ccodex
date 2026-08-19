@@ -76,20 +76,32 @@ class ServeTokenFileMode(unittest.TestCase):
                          "the serve token must be 0600 from the open() that created it: writing it "
                          "first and chmod'ing after leaves the credential at the umask's mercy for "
                          "the gap between the two calls")
-        self.assertEqual(chmods, [(str(self.f), 0o600)],
-                         "the chmod after the write must stay — it is what tightens a PRE-EXISTING "
-                         "file, whose mode O_CREAT does not touch")
+        self.assertEqual(chmods, [],
+                         "a fresh mint needs NO repair: the temp is born 0600 and os.replace "
+                         "carries the inode's mode — a chmod here would mean the mode came from a "
+                         "repair window again (the read path owns the tighten now)")
 
     def test_a_pre_existing_loose_file_is_still_tightened(self):
-        # O_CREAT applies its mode only when it actually creates the file. An empty serve-token left
-        # at 0644 (a stale one, or one written before this change) re-mints through the same path and
-        # must come out 0600 — that is the chmod's remaining job, so it does not get dropped.
+        # An empty serve-token left at 0644 (a stale remnant) re-mints through the locked path,
+        # and the os.replace swaps in a fresh 0600 inode — the loose mode goes with the old one.
         self.f.write_text("")                # empty → falsy → falls through to the mint
         os.chmod(self.f, 0o644)
         tok = km._load_token()
         self.assertEqual(self.f.read_text().strip(), tok)
         self.assertEqual(_mode(self.f), 0o600,
                          "a token file that already existed at 0644 must not keep that mode")
+
+    def test_a_nonempty_loose_file_is_tightened_on_read(self):
+        # The READ path is where a pre-existing loose file survives: the loader returns the token
+        # without minting, so nothing replaces the inode — it must chmod what it keeps (the user's
+        # audit, 2026-08-19: a 0644 nonempty token was returned as-is and never tightened).
+        self.f.write_text("keep-me-token\n")
+        os.chmod(self.f, 0o644)
+        self.assertEqual(km._load_token(), "keep-me-token",
+                         "an existing token is kept, never re-minted")
+        self.assertEqual(_mode(self.f), 0o600,
+                         "the read path must tighten the file it keeps — the mint path never sees "
+                         "a nonempty file, so nobody else will")
 
     def test_the_env_override_never_writes_the_file(self):
         # Guards this test file's own premise: with ROMP_SERVE_TOKEN set there is nothing on disk to
@@ -100,6 +112,92 @@ class ServeTokenFileMode(unittest.TestCase):
         finally:
             os.environ.pop("ROMP_SERVE_TOKEN", None)
         self.assertFalse(self.f.exists(), "the env override must not mint or persist anything")
+
+
+class ServeTokenFlock(unittest.TestCase):
+    """The read-or-mint is serialized by <state>/serve-token.lock. Every lock-free scheme lost a
+    schedule — the last let two starters both take the empty-remnant path and run on DIFFERENT
+    tokens until restart (the user's audit, 2026-08-19, deterministic two-process repro). This is
+    that repro, made deterministic in both directions by the lock itself: the test HOLDS the lock
+    as minter A mid-critical-section, a real second process announces its lock attempt, A then
+    publishes its token and releases — the loser must come back with A's token, never its own."""
+
+    _CHILD = r"""
+import os, sys
+os.environ["ROMP_SERVE_TOKEN"] = "import-shield"   # module import loads TOKEN; keep it off disk
+os.environ["ROMP_STATE_DIR"] = sys.argv[2]         # pin to the PARENT test's state root: sibling
+#                                                    test modules each set XDG_STATE_HOME at import,
+#                                                    and pytest imports them all before running, so
+#                                                    the inherited env points at the LAST module's
+#                                                    temp dir, not this one's
+from importlib.machinery import SourceFileLoader
+BIN = sys.argv[1]
+SourceFileLoader("romp_event_model", os.path.join(BIN, "romp-event-model")).load_module()
+SourceFileLoader("romp_judge", os.path.join(BIN, "romp-judge")).load_module()
+km = SourceFileLoader("romp_kernel", os.path.join(BIN, "romp-kernel")).load_module()
+os.environ.pop("ROMP_SERVE_TOKEN", None)
+import fcntl
+_real = fcntl.flock
+def _spy(fd, op):
+    print("FLOCK", flush=True)                     # announce the attempt BEFORE it can block
+    return _real(fd, op)
+fcntl.flock = _spy
+print(km._load_token(), flush=True)
+"""
+
+    def test_a_concurrent_starter_blocks_and_adopts_the_winner_token(self):
+        import fcntl
+        import select
+        import subprocess
+        import sys
+        f = km.jd.STATE / "serve-token"
+        km.jd.STATE.mkdir(parents=True, exist_ok=True)
+        f.write_text("")                             # the audit's remnant: exists, empty
+        env_tok = os.environ.pop("ROMP_SERVE_TOKEN", None)
+        script = f.with_name("flock-child.py")
+        script.write_text(self._CHILD)
+        lfd = os.open(str(f) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lfd, fcntl.LOCK_EX)              # we are minter A, inside the critical section
+        p = subprocess.Popen([sys.executable, str(script), BIN, str(km.jd.STATE)],
+                             stdout=subprocess.PIPE, text=True)
+
+        def _cleanup():
+            try:
+                os.close(lfd)
+            except OSError:
+                pass
+            if p.poll() is None:
+                p.kill()
+            p.stdout.close()
+            if env_tok is not None:
+                os.environ["ROMP_SERVE_TOKEN"] = env_tok
+            for leftover in (f, f.with_name(f.name + ".lock"), script):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+        self.addCleanup(_cleanup)
+
+        def _line(why):
+            r, _, _ = select.select([p.stdout], [], [], 120)
+            self.assertTrue(r, "no output within 120s — " + why)
+            return p.stdout.readline().strip()
+
+        self.assertEqual(_line("the loader never spoke"), "FLOCK",
+                         "the loader must try the lock BEFORE reading: a first line that is "
+                         "already a token means it minted against the empty remnant lock-free — "
+                         "the split-brain schedule")
+        tmp = f.with_name("winner.tmp")              # A publishes and leaves the critical section
+        tmp.write_text("winner-token")
+        os.replace(tmp, f)
+        os.close(lfd)
+        self.assertEqual(_line("the loader stayed blocked after the lock was freed"),
+                         "winner-token",
+                         "the blocked starter must adopt the token the lock-holder published — "
+                         "coming back with any other value is the two-tokens-in-memory bug")
+        self.assertEqual(p.wait(timeout=60), 0)
+        self.assertEqual(f.read_text().strip(), "winner-token",
+                         "the loser must not overwrite the winner's persisted token")
 
 
 if __name__ == "__main__":
