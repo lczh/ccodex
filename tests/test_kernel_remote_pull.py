@@ -246,10 +246,12 @@ class PullRemote(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("trust changed", detail)
 
-    def test_a_trust_downgrade_landing_at_the_merge_rolls_the_move_back(self):
-        # the last unguarded window (the user's audit, 2026-08-19): the post-settle re-check
-        # passes, then the downgrade lands while arm+merge run. The post-merge re-check must win —
-        # and since HEAD already moved, winning means MOVING IT BACK, not just refusing.
+    def test_a_trust_downgrade_landing_at_the_merge_QUARANTINES_without_any_reset(self):
+        # the v1.3.8 audit closed the rollback for good: the cleanliness re-check and the reset
+        # were separate processes, and an edit STAGED between them was silently discarded — no
+        # lock of ours serializes another session's git add, so no check-then-reset can be made
+        # safe. A downgrade landing at the move now quarantines: HEAD stays, gated by the stuck
+        # NON-HEX form, and the human who made the trust call finishes it by hand.
         calls = self._wire()
         orig = km.subprocess.run
 
@@ -260,48 +262,17 @@ class PullRemote(unittest.TestCase):
         km.subprocess.run = degrading_merge
         ok, detail = km._pull_remote("TESTHOST")
         self.assertFalse(ok)
-        self.assertIn("rolled back", detail)
-        resets = [a for a in calls if a[0] == "git" and "reset" in a]
-        self.assertEqual(resets, [["git", "-C", str(km.ROOT), "reset", "--keep", "premerge"]],
-                         "HEAD returns to the exact PRE-merge commit (the stateful fake answers "
-                         "'postmerg' after the merge, so a late capture is caught) — and --keep, "
-                         "never --hard: a peer session's uncommitted edit saved since the "
-                         "pre-lock clean check is not ours to destroy")
-        self.assertEqual(km._install_latch_lines(), [],
-                         "the intent is moot once the move is undone — nothing stays armed")
-        self.assertFalse(any("install.sh" in str(a) for c in calls for a in c),
-                         "nothing installs code the trust decision rejected")
-
-    def test_a_failed_rollback_QUARANTINES_the_checkout(self):
-        # if the rewind itself fails, HEAD sits on the fetched commit with nothing installed. A
-        # single-line latch matching HEAD is NOT a gate there — it is every healer's auto-run
-        # trigger (boot heal, the 300s check loop, romp-serve's gate would each run the rejected
-        # build's install.sh and then serve it; the adversarial review, 2026-08-19). The stuck
-        # NON-HEX form is what every reader refuses to touch without a human.
-        calls = self._wire()
-        orig = km.subprocess.run
-
-        def degrading(argv, **kw):
-            if argv[0] == "git" and "reset" in argv:
-                calls.append(argv)
-                return _R(rc=1, err="reset refused")
-            if argv[0] == "git" and "merge" in argv and "merge-base" not in argv:
-                km._remotes["TESTHOST"]["trust"] = "directed"
-            return orig(argv, **kw)
-        km.subprocess.run = degrading
-        ok, detail = km._pull_remote("TESTHOST")
-        self.assertFalse(ok)
         self.assertIn("quarantined", detail)
         self.assertIn("by hand", detail)
+        self.assertFalse(any(a[0] == "git" and "reset" in a for a in calls),
+                         "NO reset, ever: an auto-rewind destroyed staged peer work in every "
+                         "form it was tried (--hard, --keep, checked-then-reset)")
+        self.assertFalse(any("install.sh" in str(a) for c in calls for a in c),
+                         "nothing installs code the trust decision rejected")
         self.assertEqual(km._install_latch_lines(), ["quaranti", "quaranti"],
                          "two NON-HEX lines no checkout sha can match — hex sentinels were "
-                         "MINABLE by the very peer the quarantine exists to stop (an 8-hex "
-                         "prefix costs ~2^32 hashes; the adversarial review, 2026-08-19)")
-        self.assertFalse(any("install.sh" in str(a) for c in calls for a in c))
-        # and the healers really DO refuse it: boot heal on this exact state must neither run
-        # install.sh nor clear the latch (a single-line latch here would auto-heal — reproduced);
-        # the loop includes the OLD hex sentinels as HEADs: a peer that pre-mined its commit's
-        # sha8 onto one walked straight through every reader's `cur in lines` test
+                         "minable by the very peer the quarantine exists to stop")
+        # the healers really DO refuse it — including HEADs mined onto the OLD hex sentinels
         km.subprocess.run = orig
         for head in (km._sha8(REMOTE), "00000000", "ffffffff"):
             with mock.patch.object(km, "_checkout_sha", return_value=head):
@@ -312,63 +283,45 @@ class PullRemote(unittest.TestCase):
             self.assertEqual(km._install_latch_lines(), ["quaranti", "quaranti"],
                              "the quarantine survives the heal pass — human hands only")
 
-    def test_a_rollback_EXCEPTION_still_quarantines(self):
-        # subprocess.run can RAISE (TimeoutExpired on a slow reset, OSError) instead of returning
-        # rc!=0 — that path used to skip the quarantine entirely and leave the auto-run latch on
-        # the trust-rejected commit (the adversarial review, 2026-08-19, reproduced)
+    def test_a_trust_downgrade_during_install_quarantines_before_anything_serves(self):
+        # the v1.3.8 audit: a downgrade landing while install.sh ran — past the final pre-install
+        # check — installed and would then serve the peer build. _pull_remote never restarts, so
+        # a post-install quarantine still precedes any execution of the new build as romp.
         self._wire()
-        orig = km.subprocess.run
 
-        def degrading(argv, **kw):
-            if argv[0] == "git" and "reset" in argv:
-                raise km.subprocess.TimeoutExpired(argv, 30)
-            if argv[0] == "git" and "merge" in argv and "merge-base" not in argv:
-                km._remotes["TESTHOST"]["trust"] = "directed"
-            return orig(argv, **kw)
-        km.subprocess.run = degrading
-        ok, detail = km._pull_remote("TESTHOST")
+        def degrading_install(sha8, lock_fd=None):
+            km._remotes["TESTHOST"]["trust"] = "directed"   # lands while install.sh runs
+            return True
+        with mock.patch.object(km, "_converge_install", side_effect=degrading_install):
+            ok, detail = km._pull_remote("TESTHOST")
         self.assertFalse(ok)
-        self.assertIn("quarantined", detail)
+        self.assertIn("while install.sh ran", detail)
         self.assertEqual(km._install_latch_lines(), ["quaranti", "quaranti"],
-                         "an exception is a FAILED rewind, never a skip")
+                         "quarantined before anything serves")
+        # and when the install FAILED with the downgrade landing mid-run, the armed single-line
+        # latch (the auto-heal trigger) must not survive either — the healer would run the
+        # now-untrusted commit's install.sh within one 300s pass
+        km._remotes["TESTHOST"]["trust"] = "trusted"
+        self._wire()
 
-    def test_a_tree_dirtied_since_the_boot_check_is_never_reset(self):
-        # the clean check ran BEFORE the flock and settle can run install.sh for minutes; --keep
-        # alone REFUSES working-tree conflicts but silently resets INDEX-only state — a peer's
-        # staged edit whose working copy was reverted was destroyed with rc 0 (the adversarial
-        # review, 2026-08-19, reproduced). The tree is re-checked at the decision moment: dirty
-        # → no reset AT ALL, quarantine.
-        calls = self._wire()
-        orig = km.subprocess.run
-        state = {"merged": False}
-
-        def degrading(argv, **kw):
-            if argv[0] == "git" and "merge" in argv and "merge-base" not in argv:
-                km._remotes["TESTHOST"]["trust"] = "directed"
-                state["merged"] = True
-            if argv[0] == "git" and "status" in argv and state["merged"]:
-                return _R(out=" M kernel/somefile.py")   # a peer saved during settle
-            return orig(argv, **kw)
-        km.subprocess.run = degrading
-        ok, detail = km._pull_remote("TESTHOST")
+        def degrading_failing_install(sha8, lock_fd=None):
+            km._remotes["TESTHOST"]["trust"] = "directed"
+            km._set_install_failed(sha8)                    # what the real converge does on failure
+            return False
+        with mock.patch.object(km, "_converge_install", side_effect=degrading_failing_install):
+            ok, detail = km._pull_remote("TESTHOST")
         self.assertFalse(ok)
-        self.assertIn("quarantined", detail)
-        self.assertFalse(any(a[0] == "git" and "reset" in a for a in calls),
-                         "a tree with ANY local state is never reset — staged-only edits are "
-                         "invisible to --keep's conflict refusal")
-        self.assertEqual(km._install_latch_lines(), ["quaranti", "quaranti"])
+        self.assertEqual(km._install_latch_lines(), ["quaranti", "quaranti"],
+                         "a failed install plus a downgrade is still a quarantine, never the "
+                         "auto-heal form")
 
     def test_a_failed_quarantine_write_falls_back_to_in_place_and_then_says_so(self):
-        # the atomic quarantine write can fail on the same degraded fs that broke the rollback
-        # (correlated, not independent); rewriting the EXISTING latch in place needs no new
-        # blocks so it survives ENOSPC. A silent best-effort left the armed auto-run latch
-        # behind a detail that claimed quarantine (the adversarial review, 2026-08-19).
+        # the atomic quarantine write can fail on the same degraded fs (correlated); rewriting
+        # the EXISTING latch in place via UNBUFFERED pwrite survives ENOSPC and cannot truncate.
         self._wire()
         orig = km.subprocess.run
 
         def degrading(argv, **kw):
-            if argv[0] == "git" and "reset" in argv:
-                return _R(rc=1, err="reset refused")
             if argv[0] == "git" and "merge" in argv and "merge-base" not in argv:
                 km._remotes["TESTHOST"]["trust"] = "directed"
             return orig(argv, **kw)
@@ -380,10 +333,8 @@ class PullRemote(unittest.TestCase):
         self.assertEqual(km._install_latch_lines(), ["quaranti", "quaranti"],
                          "the in-place rewrite lands the quarantine when the atomic write cannot")
         # and when even THAT fails, the detail must stop claiming quarantine — and the ARMED
-        # record must SURVIVE: the previous fallback opened the latch with O_TRUNC, so a write
-        # that then failed left an EMPTY latch, which every reader moot-removes — serving the
-        # trust-rejected build with install.sh never run (the adversarial review, 2026-08-19,
-        # reproduced with an injected close-time failure). pwrite cannot truncate.
+        # record must SURVIVE (a truncating fallback left an EMPTY latch that every reader
+        # moot-removed, serving the rejected build with install.sh never run)
         km._set_install_failed(km._sha8(REMOTE))       # re-arm the pre-quarantine state
         km._remotes["TESTHOST"]["trust"] = "trusted"   # leg 1's downgrade must not gate leg 2
         self._wire()
@@ -396,11 +347,9 @@ class PullRemote(unittest.TestCase):
         self.assertNotIn("is quarantined", detail)
         self.assertIn("could not be written", detail)
         self.assertIn("REVIVE", detail,
-                      "the one thing the user must know: this state can revive the rejected build")
+                      "the one thing the user must know: this state can revive the merged build")
         self.assertEqual(km._install_latch_lines(), [km._sha8(REMOTE)],
-                         "the ARMED record survives a failed quarantine write — a truncating "
-                         "fallback left an EMPTY latch that every reader moot-removed, serving "
-                         "the rejected build with install.sh never run")
+                         "the ARMED record survives a failed quarantine write")
 
     def test_an_unpersistable_intent_blocks_the_merge(self):
         calls = self._wire()

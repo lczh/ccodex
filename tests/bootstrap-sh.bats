@@ -510,6 +510,7 @@ HOLDPY
     [ "$status" -eq 0 ]
     [ "$(cat "$gd/romp-update-channel")" = "stable" ]
     [ ! -e "$gd/romp-install-failed" ]
+    [ ! -e "$gd/romp-update-channel.intent" ]   # spent: the txn itself published
 }
 
 @test "bootstrap.sh: an unstageable channel marker refuses BEFORE anything moves (rc 11)" {
@@ -551,6 +552,100 @@ HOLDPY
     # prefix costs ~2^32 hashes), and every reader's `cur in lines` treated it as an ordinary
     # commit (the adversarial review, 2026-08-19)
     [ "$(cat "$gd/romp-install-failed")" = "$(printf 'quarantined\nquarantined')" ]
+}
+
+@test "bootstrap.sh: a hard death after the move still lands the intended channel via the gate" {
+    # THE v1.3.8 audit's critical repro: the transaction dies right after the checkout moves —
+    # latch armed for the stable target, marker still dev, publish never reached. The gate that
+    # revives the build must publish the staged INTENT before spending the latch; healing under
+    # the stale marker made the stable build follow unsigned main.
+    sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
+    sed -n "/<<'GATEPY'/,/^GATEPY\$/p" "$REPO_ROOT/bin/romp-serve" | sed '1d;$d' > "$TEST_DIR/gate.py"
+    cat > "$TEST_DIR/die-at-publish.py" <<'PYEOF'
+import os, sys
+real_replace = os.replace
+
+
+def dying_replace(src, dst):
+    if str(dst).endswith("romp-update-channel"):
+        os._exit(137)                      # the hard death, exactly at the publish
+    return real_replace(src, dst)
+
+
+os.replace = dying_replace
+txn = sys.argv[1]
+sys.argv = ["txn"] + sys.argv[2:]
+exec(compile(open(txn).read(), txn, "exec"))
+PYEOF
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm one
+    git -C "$root" -c user.email=t@t -c user.name=t commit -q --allow-empty -m two
+    target="$(git -C "$root" rev-parse HEAD)"
+    git -C "$root" checkout -q -d HEAD~1              # the move below is real
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    printf 'dev\n' > "$gd/romp-update-channel"        # the stale marker the death leaves behind
+    run python3 "$TEST_DIR/die-at-publish.py" "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "stable" checkout --detach "$target"
+    [ "$status" -eq 137 ]
+    [ "$(git -C "$root" rev-parse HEAD)" = "$target" ]                     # HEAD moved
+    [ "$(cat "$gd/romp-install-failed")" = "$(git -C "$root" rev-parse --short=8 HEAD)" ]
+    [ "$(cat "$gd/romp-update-channel")" = "dev" ]                         # the audit's exact state
+    [ -e "$gd/romp-update-channel.intent" ]
+    # now the gate revives it — and must publish the intent BEFORE spending the latch
+    run python3 "$TEST_DIR/gate.py" "$root"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$gd/romp-update-channel")" = "stable" ]
+    [ ! -e "$gd/romp-install-failed" ]
+    [ ! -e "$gd/romp-update-channel.intent" ]
+}
+
+@test "bootstrap.sh: the gate refuses to start a healed build whose channel cannot be recorded" {
+    sed -n "/<<'GATEPY'/,/^GATEPY\$/p" "$REPO_ROOT/bin/romp-serve" | sed '1d;$d' > "$TEST_DIR/gate.py"
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    git -C "$root" rev-parse --short=8 HEAD > "$gd/romp-install-failed"
+    printf '%s\nstable\n' "$(git -C "$root" rev-parse --short=8 HEAD)" > "$gd/romp-update-channel.intent"
+    mkdir "$gd/romp-update-channel"        # the marker cannot be written
+    run python3 "$TEST_DIR/gate.py" "$root"
+    [ "$status" -eq 70 ]                   # heal incomplete: not started under the OLD channel
+    [ -e "$gd/romp-install-failed" ]       # the latch survives for the next retry
+}
+
+@test "bootstrap.sh: the gate never moot-removes a single NON-COMMIT latch line" {
+    # the v1.3.8 audit: a torn quarantine prefix parsed as one line, and the gate moot-removed
+    # it and started the uninstalled checkout
+    sed -n "/<<'GATEPY'/,/^GATEPY\$/p" "$REPO_ROOT/bin/romp-serve" | sed '1d;$d' > "$TEST_DIR/gate.py"
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    printf 'quarantin' > "$gd/romp-install-failed"
+    run python3 "$TEST_DIR/gate.py" "$root"
+    [ "$status" -eq 70 ]
+    [ "$(cat "$gd/romp-install-failed")" = "quarantin" ]
+}
+
+@test "bootstrap.sh: TXNPY never moot-clears a single NON-COMMIT latch line either" {
+    sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    target="$(git -C "$root" rev-parse HEAD)"
+    printf 'zzzzzzzz' > "$gd/romp-install-failed"
+    run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "stable"
+    [ "$status" -eq 10 ]
+    [ "$(cat "$gd/romp-install-failed")" = "zzzzzzzz" ]
 }
 
 @test "bootstrap.sh: a totally-failed quarantine write exits 13 with the ARMED latch intact" {

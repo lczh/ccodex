@@ -798,5 +798,84 @@ class BootHeal(unittest.TestCase):
                       "still latched (or unreadable) → refuse to serve")
 
 
+class IntentPublish(unittest.TestCase):
+    """Every kernel-side healer funnels through _converge_install, which must publish a staged
+    CHANNEL INTENT for the healed commit BEFORE spending the latch (the v1.3.8 audit's reproduced
+    hard death right after bootstrap's checkout move: the healer installed the stable target,
+    cleared the latch, and left the dev marker — the healed build then followed unsigned main).
+    These drive _boot_heal, the same chokepoint the check loop, settle, and the restart half use."""
+
+    def tearDown(self):
+        km._set_install_failed("")
+
+    def _heal(self, gd, cur="abcd1234", install_rc=0):
+        import subprocess as sp
+        real = km.subprocess.run
+
+        def fake(argv, **kw):
+            if any("install.sh" in str(a) for a in argv):
+                return sp.CompletedProcess(argv, install_rc, stdout="", stderr="")
+            return real(argv, **kw)
+        with mock.patch.object(km, "_update_git_dir", return_value=gd):
+            with mock.patch.object(km, "_checkout_sha", return_value=cur):
+                with mock.patch.object(km.subprocess, "run", side_effect=fake):
+                    with mock.patch.object(km, "_converge_note"):
+                        km._boot_heal()
+
+    def test_the_heal_publishes_the_staged_intent_before_spending_the_latch(self):
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            (gd / "romp-update-channel").write_text("dev\n")
+            (gd / "romp-update-channel.intent").write_text("abcd1234\nstable\n")
+            with mock.patch.object(km, "_update_git_dir", return_value=gd):
+                km._set_install_failed("abcd1234")
+            self._heal(gd)
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
+                             "the healed build wears the channel its update INTENDED — healing "
+                             "it under the stale marker followed unsigned main")
+            self.assertFalse((gd / "romp-install-failed").exists(), "healed and spent")
+            self.assertFalse((gd / "romp-update-channel.intent").exists(), "the intent is spent")
+
+    def test_an_unpublishable_intent_keeps_the_latch_armed(self):
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            (gd / "romp-update-channel").mkdir()           # the marker cannot be written
+            (gd / "romp-update-channel.intent").write_text("abcd1234\nstable\n")
+            with mock.patch.object(km, "_update_git_dir", return_value=gd):
+                km._set_install_failed("abcd1234")
+            self._heal(gd)
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(), "abcd1234",
+                             "an install whose intended channel cannot land stays LATCHED — "
+                             "spending it would run the build under the OLD marker")
+
+    def test_a_foreign_intent_is_not_published_and_not_blocking(self):
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            (gd / "romp-update-channel").write_text("dev\n")
+            (gd / "romp-update-channel.intent").write_text("ffffeeee\nstable\n")
+            with mock.patch.object(km, "_update_git_dir", return_value=gd):
+                km._set_install_failed("abcd1234")
+            self._heal(gd)
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "dev",
+                             "an intent for a DIFFERENT commit is not ours to publish")
+            self.assertFalse((gd / "romp-install-failed").exists(),
+                             "and it does not block the heal either")
+
+    def test_a_torn_single_nonhex_latch_line_is_never_moot(self):
+        # the v1.3.8 audit: a one-byte-short quarantine write left a single non-hex line, and the
+        # launcher moot-removed it and started the uninstalled build — a single line may be moot
+        # ONLY when it is a plausible commit
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            (gd / "romp-install-failed").write_text("quarantin")
+            self._heal(gd, cur="aaaa1111")
+            self.assertEqual((gd / "romp-install-failed").read_text(), "quarantin",
+                             "a non-commit line is corrupt or foreign — fail closed, never moot")
+
+
 if __name__ == "__main__":
     unittest.main()

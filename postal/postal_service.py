@@ -87,56 +87,43 @@ def _load_serve_token():
     if t:
         return t
     f = STATE.parent / "serve-token"              # ~/.local/state/romp/serve-token (STATE is romp/postal)
-    # ONE FLOCK with the kernel's loader (same <state>/serve-token.lock): every lock-free scheme
-    # kept losing a schedule — two processes both hit the empty-remnant replace and split-brained
-    # (the user's audit, 2026-08-19). Under the lock: re-read, else mint atomically.
+    # FAIL CLOSED on every filesystem/locking error, exactly like the kernel's loader (the
+    # v1.3.8 audit reproduced split tokens after ENOLCK, rotation of an unreadable existing
+    # token, and fresh unpersisted tokens after a failed replace): refuse startup rather than
+    # mint locklessly and diverge from the kernel.
     lock_fd = None
     try:
         f.parent.mkdir(parents=True, exist_ok=True)
         lock_fd = os.open(str(f) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-    except OSError:
-        if lock_fd is not None:
-            try:                                 # flock itself failed: close, never leak the fd
-                os.close(lock_fd)
-            except OSError:
-                pass
-        lock_fd = None
-    try:
         try:
             prior = f.read_text().strip()
-        except OSError:
-            prior = ""
+        except FileNotFoundError:
+            prior = ""                               # absent → mint; any other error propagates
         if prior:
-            try:
-                os.chmod(f, 0o600)
-            except OSError:
-                pass
+            os.chmod(f, 0o600)                       # the mode IS the gate — landing is required
             return prior
         v = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
         tmp = f.with_name("%s.%d.tmp" % (f.name, os.getpid()))
         try:
-            try:
-                tmp.unlink()                     # a stale temp from a mint that died mid-way
-            except OSError:                      # would fail this O_EXCL open forever (the
-                pass                             # adversarial review, 2026-08-19)
-            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w") as fh:
-                fh.write(v)
-            os.replace(str(tmp), str(f))
-        except OSError:
-            try:
-                tmp.unlink()                     # never leave the wedge for the next call
-            except OSError:
-                pass
+            tmp.unlink()                             # a stale temp would fail O_EXCL forever
+        except FileNotFoundError:
+            pass
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(v)
+        os.replace(str(tmp), str(f))
         return v
+    except OSError as e:
+        raise RuntimeError(
+            "cannot establish the serve token securely (%s on %s) — refusing to run on an "
+            "unverified token state; fix the state dir and restart" % (e, f)) from e
     finally:
         if lock_fd is not None:
             try:
                 os.close(lock_fd)
             except OSError:
                 pass
-
 
 SERVE_TOKEN = _load_serve_token()
 

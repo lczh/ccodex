@@ -127,6 +127,32 @@ if gd.returncode or not gdir:
 # Bounded wait: a live install can legitimately hold this for a while; sibling kernels booting
 # together contend for microseconds. Timing out still refuses (exit 70), never proceeds blind.
 latch = os.path.join(gdir, "romp-install-failed")
+intent = os.path.join(gdir, "romp-update-channel.intent")
+
+
+def publish_intent(cur8):
+    """Publish a staged channel intent matching cur8 before the latch is spent — a healed build
+    must wear the channel its update intended (the v1.3.8 audit reproduced THIS gate healing a
+    crashed bootstrap's stable target and starting it under the stale dev marker, which then
+    followed unsigned main). True when there is nothing to do; False only on a real failure."""
+    try:
+        raw = open(intent).read().splitlines()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    want = raw[0].strip()[:8] if raw else ""
+    ch = raw[1].strip() if len(raw) > 1 else ""
+    if want != cur8 or ch not in ("stable", "dev"):
+        return True
+    try:
+        with open(intent + ".pub", "w") as pf:
+            pf.write(ch + "\n")
+        os.replace(intent + ".pub", os.path.join(gdir, "romp-update-channel"))
+        os.remove(intent)
+        return True
+    except OSError:
+        return False
 try:
     fd = os.open(os.path.join(gdir, "romp-update.lock"), os.O_RDWR | os.O_CREAT, 0o644)
 except OSError:
@@ -167,11 +193,24 @@ if cur8 not in lines:
                          "heal by hand (run install.sh, then remove the latch)\n"
                          % (lines[0], lines[1], cur8))
         sys.exit(70)
+    if len(lines[0]) != 8 or any(c not in "0123456789abcdef" for c in lines[0]):
+        sys.stderr.write("romp-serve: the install latch holds %r, which is not a commit — a "
+                         "corrupt or foreign record is never moot; heal by hand\n" % lines[0])
+        sys.exit(70)                   # fail closed (the v1.3.8 audit: a torn quarantine prefix
+        #                                parsed as one line and was moot-removed into serving)
     os.remove(latch)                   # intent-only mismatch: the move never landed — moot
+    try:
+        os.remove(intent)              # a mooted move's intent must not outlive it
+    except OSError:
+        pass
     sys.exit(0)
 sys.stderr.write("romp-serve: this checkout's last install never finished — running install.sh before the kernel starts\n")
 if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root, pass_fds=(fd,)).returncode:
     sys.exit(70)                       # latch stays armed for the next retry
+if not publish_intent(cur8):
+    sys.stderr.write("romp-serve: healed the install but its update channel could not be "
+                     "recorded — not starting this build under the OLD channel marker\n")
+    sys.exit(70)                       # latch stays armed; the next retry publishes
 os.remove(latch)                       # healed — spent under the same lock
 sys.exit(0)
 GATEPY

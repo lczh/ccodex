@@ -568,55 +568,43 @@ def _load_token():
     if t:
         return t
     f = jd.STATE / "serve-token"
-    # ONE FLOCK serializes every reader-or-minter (kernel and postal share the lock path): all
-    # lock-free schemes kept losing a schedule — the last one let two processes both hit the
-    # empty-remnant replace and run on DIFFERENT tokens until restart (the user's audit,
-    # 2026-08-19, reproduced deterministically). Under the lock the logic is plain: read
-    # (tightening a loose pre-existing file — the read path never did), else mint atomically.
+    # FAIL CLOSED on every filesystem/locking error (the v1.3.8 audit reproduced split tokens
+    # after ENOLCK, rotation of an unreadable existing token, and successive fresh tokens with
+    # nothing persisted after a failed replace): the token is the machine's whole auth boundary,
+    # so a state that cannot be established SECURELY refuses startup instead of minting
+    # locklessly and diverging. Absent-file is the only "empty" — every other error propagates.
     lock_fd = None
     try:
         jd.STATE.mkdir(parents=True, exist_ok=True)
         lock_fd = os.open(str(f) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-    except OSError:
-        if lock_fd is not None:
-            try:                                 # flock ITSELF failed (NFS without lockd, some
-                os.close(lock_fd)                # FUSE mounts): the open fd must not leak — this
-            except OSError:                      # loader runs per checkin handshake, and one fd
-                pass                             # per call walks a long-lived kernel into EMFILE
-        lock_fd = None                           # lockless fallback: still correct alone
-    try:
         try:
             v = f.read_text().strip()
-        except OSError:
-            v = ""
+        except FileNotFoundError:
+            v = ""                                   # absent → mint; an EXISTING token we cannot
+            #                                          read must never be rotated out from under
+            #                                          the live clients holding it
         if v:
-            try:
-                os.chmod(f, 0o600)
-            except OSError:
-                pass
+            os.chmod(f, 0o600)                       # the mode IS the same-user gate: a tighten
+            #                                          that cannot land is a refusal, not a shrug
             return v
         v = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
         tmp = f.with_name("%s.%d.tmp" % (f.name, os.getpid()))
         try:
-            try:
-                tmp.unlink()                     # a stale temp from a mint that died between the
-            except OSError:                      # O_EXCL open and the replace would fail THIS
-                pass                             # open forever — the loader then returns a fresh,
-            #                                      never-persisted token on every call (the
-            #                                      adversarial review, 2026-08-19, reproduced live)
-            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                os.write(fd, v.encode())
-            finally:
-                os.close(fd)
-            os.replace(str(tmp), str(f))         # atomic; 0600 by birth; the flock made us alone
-        except OSError:
-            try:
-                tmp.unlink()                     # never leave the wedge for the next call
-            except OSError:
-                pass
+            tmp.unlink()                             # a stale temp from a mint that died mid-way
+        except FileNotFoundError:                    # would fail the O_EXCL open forever
+            pass
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, v.encode())
+        finally:
+            os.close(fd)
+        os.replace(str(tmp), str(f))                 # atomic; 0600 by birth; the flock made us alone
         return v
+    except OSError as e:
+        raise RuntimeError(
+            "cannot establish the serve token securely (%s on %s) — refusing to run on an "
+            "unverified token state; fix the state dir and restart romp" % (e, f)) from e
     finally:
         if lock_fd is not None:
             try:
@@ -2178,10 +2166,26 @@ def _run_update(tag):
         _UPDATE_STATE[0] = ""
         return False
     latch = q(str(latch_path))
+    intent = q(str(latch_path.parent / "romp-update-channel.intent"))
+    marker = q(str(latch_path.parent / "romp-update-channel"))
     script = (
         "cd %s || exit 1\n" % q(str(ROOT))
         + "{ echo; echo \"== romp self-update to %s ==\"; date; } >> %s 2>&1\n" % (tag, log)
         + "OK=0\n"
+        # a healed or completed move publishes any staged CHANNEL INTENT for its commit before
+        # the latch is spent (the v1.3.8 audit: a healer reviving a crashed bootstrap's stable
+        # target under the stale dev marker followed unsigned main); pub_intent returns nonzero
+        # ONLY on a real failure — no intent, or someone else's, is not ours to publish
+        + "INTENT=%s\n" % intent
+        + "MARKER=%s\n" % marker
+        + "pub_intent() {\n"
+        + "  [ -e \"$INTENT\" ] || return 0\n"
+        + "  [ -r \"$INTENT\" ] || return 1\n"
+        + "  W=$(sed -n 1p \"$INTENT\" | head -c 8); CH=$(sed -n 2p \"$INTENT\")\n"
+        + "  [ \"$W\" = \"$1\" ] || return 0\n"
+        + "  case \"$CH\" in stable|dev) ;; *) return 0;; esac\n"
+        + "  printf '%s\\n' \"$CH\" > \"$MARKER.pub\" && mv -f \"$MARKER.pub\" \"$MARKER\" && rm -f \"$INTENT\"\n"
+        + "}\n"
         + "SETTLED=1\n"
         # SETTLE like every other arming path (the adversarial review, 2026-08-19: this was the
         # one updater still arming by overwrite): a latch line matching HEAD heals here, under the
@@ -2192,11 +2196,16 @@ def _run_update(tag):
         + "  SETTLED=0\n"
         + "elif [ -s %s ] && [ -n \"$CUR\" ]; then\n" % latch
         + "  if grep -qx \"$CUR\" %s 2>/dev/null; then\n" % latch
-        + "    if ./install.sh >> %s 2>&1; then rm -f %s; else CARRY=\"$CUR\"; fi\n" % (log, latch)
+        + "    if ./install.sh >> %s 2>&1 && pub_intent \"$CUR\"; then rm -f %s; "
+          "else CARRY=\"$CUR\"; fi\n" % (log, latch)
         + "  elif [ \"$(grep -c . %s 2>/dev/null)\" -gt 1 ]; then\n" % latch
         + "    SETTLED=0\n"
         + "  else\n"
-        + "    rm -f %s\n" % latch
+        + "    L1=$(sed -n 1p %s 2>/dev/null | head -c 8)\n" % latch
+        # a single NON-COMMIT line is corrupt/foreign, never moot (the v1.3.8 audit: a torn
+        # quarantine prefix parsed as one line and was moot-cleared into serving)
+        + "    if printf '%%s' \"$L1\" | grep -qxE '[0-9a-f]{8}'; then rm -f %s; "
+          "rm -f \"$INTENT\"; else SETTLED=0; fi\n" % latch
         + "  fi\n"
         + "elif [ -s %s ]; then\n" % latch
         + "  SETTLED=0\n"
@@ -2212,8 +2221,7 @@ def _run_update(tag):
         + "    if [ \"$(sed -n 1p %s 2>/dev/null | head -c 8)\" = \"$NEW8\" ] "
           "&& git merge --ff-only %s >> %s 2>&1 && ./install.sh >> %s 2>&1; then\n"
           % (latch, tag, log, log)
-        + "      rm -f %s\n" % latch
-        + "      OK=1\n"
+        + "      if pub_intent \"$NEW8\"; then rm -f %s; OK=1; fi\n" % latch
         + "    fi\n"
         + "  fi\n"
         + "fi\n"
@@ -2419,6 +2427,48 @@ def _install_latch_lines():
 _QUARANTINE_LATCH = "quarantined\nquarantined"
 
 
+def _hex8(s):
+    """True for a plausible abbreviated commit — the ONLY thing a single-line latch may hold to
+    be moot-cleared. Anything else (a torn quarantine prefix, a foreign write) is an unknown
+    record: fail closed, never moot (the v1.3.8 audit: a one-byte-short quarantine write left a
+    single non-hex line, and the launcher moot-removed it and started the uninstalled build)."""
+    return bool(re.fullmatch(r"[0-9a-f]{8}", str(s or "")))
+
+
+def _intent_path():
+    gd = _update_git_dir()
+    return (gd / "romp-update-channel.intent") if gd is not None else None
+
+
+def _publish_channel_intent(sha8):
+    """Publish a staged CHANNEL INTENT matching this commit to the marker, before the caller
+    spends the latch. Bootstrap records (target8, channel) durably BEFORE it moves HEAD; a build
+    revived by any healer must wear the channel its update intended — the v1.3.8 audit reproduced
+    a hard death right after the checkout moved: the gate healed the stable build while the
+    marker still said dev, restoring the exact stable-build-following-unsigned-main hole. Returns
+    False ONLY on a real failure (unreadable intent, unwritable marker) — the caller must then
+    KEEP the latch; no intent, or an intent for a different commit, is simply not ours."""
+    ip = _intent_path()
+    if ip is None:
+        return True
+    try:
+        raw = ip.read_text().splitlines()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False                              # an EXISTING intent we cannot read is unknown
+    want = raw[0].strip()[:8] if raw else ""
+    channel = raw[1].strip() if len(raw) > 1 else ""
+    if want != str(sha8 or "")[:8] or channel not in ("stable", "dev"):
+        return True                               # someone else's intent: not ours to publish
+    try:
+        _atomic_write(ip.parent / "romp-update-channel", channel)
+        ip.unlink(missing_ok=True)                # spent
+        return True
+    except OSError:
+        return False
+
+
 def _arm_latch(target8, prior8=""):
     """Arm the intent, CARRYING a prior record instead of overwriting it; True when persisted."""
     p = _install_latch_path()
@@ -2462,7 +2512,10 @@ def _set_install_failed(sha8):
                 raise OSError("no resolvable git dir for the checkout")
             _atomic_write(p, sha8)
         else:
-            for cand in ([p] if p is not None else []) + [jd.STATE / "converge-install-failed"]:
+            ip = _intent_path()
+            for cand in (([p] if p is not None else [])
+                         + ([ip] if ip is not None else [])   # a cleared latch retires its intent
+                         + [jd.STATE / "converge-install-failed"]):
                 cand.unlink(missing_ok=True)
         return True
     except OSError as e:
@@ -2785,6 +2838,10 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
                                "%s — heal it by hand (run install.sh, then remove the latch)."
                                % (lines[0], lines[1], cur))
                 return
+            elif not _hex8(lines[0]):
+                _converge_note("this checkout's install latch holds %r, which is not a commit — "
+                               "not restarting onto an unknown state; heal it by hand." % lines[0])
+                return
             else:
                 _set_install_failed("")               # intent-only mismatch; the move never landed
     try:
@@ -2834,6 +2891,9 @@ def _settle_prior_latch(lock_fd):
         return ("this checkout's install latch names %s and a prior %s but HEAD is %s — an update "
                 "died mid-move from a broken state; heal it by hand (run install.sh, then remove "
                 "the latch)" % (lines[0], lines[1], cur)), ""
+    if not _hex8(lines[0]):
+        return ("this checkout's install latch holds %r, which is not a commit — a corrupt or "
+                "foreign record is never moot; heal it by hand" % lines[0]), ""
     _set_install_failed("")                           # intent-only mismatch: the move never landed
     return "", ""
 
@@ -2866,6 +2926,12 @@ def _converge_install(sha8, lock_fd=None):
         _set_install_failed(sha8)
         _converge_note("the checkout advanced to %s but install.sh failed: %s — nothing restarts "
                        "onto it until install passes; fix the cause, then Update again" % (sha8, why))
+        return False
+    if not _publish_channel_intent(sha8):
+        _converge_note("installed %s, but the update channel intended for it could not be "
+                       "recorded — keeping the install latch so nothing runs this build under "
+                       "the OLD channel marker; fix the checkout's git dir and update again"
+                       % sha8)
         return False
     _set_install_failed("")
     return True
@@ -3000,6 +3066,10 @@ def _boot_heal(wait_s=0):
                            "— an update died mid-move from a broken state; heal it by hand (run "
                            "install.sh, then remove the latch)." % (lines[0], lines[1], cur))
             return                                    # unknown is NOT moot (fail closed)
+        if not _hex8(lines[0]):
+            _converge_note("this checkout's install latch holds %r, which is not a commit — a "
+                           "corrupt or foreign record is never moot; heal it by hand." % lines[0])
+            return                                    # fail closed (see _hex8)
         _set_install_failed("")                       # intent-only mismatch: the move never landed
     finally:
         try:
@@ -10581,6 +10651,25 @@ def _update_remote(host):
         "if res.returncode or not sha8:\n"
         "    sys.exit(5)\n"
         'lp=os.path.join(os.path.dirname(lock),"romp-install-failed")\n'
+        'ip=os.path.join(os.path.dirname(lock),"romp-update-channel.intent")\n'
+        "def pub(c):\n"
+        "    try:\n"
+        "        raw=open(ip).read().splitlines()\n"
+        "    except FileNotFoundError:\n"
+        "        return True\n"
+        "    except OSError:\n"
+        "        return False\n"
+        '    w=raw[0].strip()[:8] if raw else ""\n'
+        '    ch=raw[1].strip() if len(raw)>1 else ""\n'
+        '    if w!=c or ch not in ("stable","dev"):\n'
+        "        return True\n"
+        "    try:\n"
+        '        open(ip+".pub","w").write(ch+"\\n")\n'
+        '        os.replace(ip+".pub",os.path.join(os.path.dirname(lock),"romp-update-channel"))\n'
+        "        os.remove(ip)\n"
+        "        return True\n"
+        "    except OSError:\n"
+        "        return False\n"
         "try:\n"
         '    lines=[l.strip()[:8] for l in open(lp).read().splitlines() if l.strip()]\n'
         "except FileNotFoundError:\n"
@@ -10596,12 +10685,20 @@ def _update_remote(host):
         "    if cur8 in lines:\n"
         '        if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
         "            carry=cur8\n"
+        "        elif not pub(cur8):\n"
+        "            carry=cur8\n"
         "        else:\n"
         "            os.remove(lp)\n"
         "    elif len(lines)>1:\n"
         "        sys.exit(10)\n"
+        '    elif len(lines[0])!=8 or any(c not in "0123456789abcdef" for c in lines[0]):\n'
+        "        sys.exit(10)\n"
         "    else:\n"
         "        os.remove(lp)\n"
+        "        try:\n"
+        "            os.remove(ip)\n"
+        "        except OSError:\n"
+        "            pass\n"
         'tmp=lp+".tmp"\n'
         'body=sha8+("\\n"+carry if carry and carry!=sha8 else "")\n'
         'open(tmp,"w").write(body)\n'
@@ -10609,6 +10706,8 @@ def _update_remote(host):
         'if subprocess.run(["git","-C",r,"reset","--hard",target]).returncode:\n'
         "    sys.exit(6)\n"
         'if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
+        "    sys.exit(4)\n"
+        "if not pub(sha8):\n"
         "    sys.exit(4)\n"
         "os.remove(lp)' "
         '"$GD/romp-update.lock" "$R" %s >/dev/null 2>&1; RRC=$?; '
@@ -10862,50 +10961,20 @@ def _pull_remote(host, expected_sha=None):
                 _still2 = bool(_cur2 and not _cur2.get("checkin_peer")
                                and _cur2.get("trust") == "trusted")
             if not _still2:
-                rb = None
-                if pre_head:
-                    # The rewind must not destroy a peer's work OR raise past the quarantine, so
-                    # both steps sit in one try (a TimeoutExpired from a slow reset used to skip
-                    # the quarantine entirely and leave the auto-run latch; the adversarial
-                    # review, 2026-08-19, reproduced): first the tree is re-checked AT THE
-                    # DECISION MOMENT, under this flock — the boot check ran before the lock and
-                    # settle can run install.sh for minutes, and --keep alone is not enough (it
-                    # REFUSES on working-tree conflicts but silently resets INDEX-only state — a
-                    # peer's staged edit whose working copy was reverted is destroyed with rc 0;
-                    # reproduced). Anything in the tree → no reset at all, quarantine below.
-                    try:
-                        st2 = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain",
-                                              "--untracked-files=no"],
-                                             capture_output=True, text=True, timeout=10)
-                        if st2.returncode == 0 and not (st2.stdout or "").strip():
-                            rb = subprocess.run(["git", "-C", str(ROOT), "reset", "--keep",
-                                                 pre_head],
-                                                capture_output=True, text=True, timeout=30)
-                    except Exception:
-                        rb = None                  # an exception is a FAILED rewind, never a skip
-                if rb is not None and rb.returncode == 0:
-                    _set_install_failed(carry)     # HEAD is back on the prior build: the carried
-                    #                                record returns (or the latch clears)
-                    return False, "%s trust changed during the pull — the move was rolled back" % host
-                # The rewind failed, was unsafe, or the pre-merge HEAD was unreadable: HEAD sits
-                # on a commit the trust decision just REJECTED. A latch matching HEAD is NOT a
-                # gate here — it is every healer's auto-run trigger (boot heal, the 300s check
-                # loop, and romp-serve's gate would each run the rejected build's install.sh and
-                # then serve it; the adversarial review, 2026-08-19, reproduced all three).
-                # Quarantine with the NON-HEX stuck form: hex sentinels were minable — a peer
-                # controls its own commit and an 8-hex prefix costs ~2^32 hashes, so a mined
-                # '00000000' HEAD walked straight through every reader's `cur in lines` test
-                # (same review). No real sha8 can ever equal 'quaranti'.
+                # NO auto-rewind (the v1.3.8 audit: the cleanliness re-check and the reset were
+                # separate processes, and an edit STAGED between them was silently discarded —
+                # no lock of ours serializes another session's git add, so no check-then-reset
+                # can be made safe). The merged-but-now-untrusted checkout QUARANTINES instead:
+                # HEAD stays where the merge put it, gated by the stuck form every reader
+                # refuses to heal, and the human — who just made the trust decision — finishes
+                # it with the exact command in the detail.
                 if not _set_install_failed(_QUARANTINE_LATCH):
                     # the atomic write failed (the fs degraded mid-transaction) — rewriting the
-                    # EXISTING latch IN PLACE needs no new blocks, so it survives ENOSPC, the
-                    # common dynamic failure. UNBUFFERED pwrite, never open(.., "w"): O_TRUNC
-                    # erased the armed record at open, and when the buffered flush then failed
-                    # at close the latch was left EMPTY — which every reader moot-removes,
-                    # serving the rejected build with install.sh never run (the adversarial
-                    # review, 2026-08-19, reproduced). pwrite either lands whole or raises with
-                    # the armed bytes still on disk, and the 23-byte quarantine always covers
-                    # the <=17-byte armed record, so no truncation is ever needed.
+                    # EXISTING latch IN PLACE needs no new blocks, so it survives ENOSPC.
+                    # UNBUFFERED pwrite, never open(.., "w"): O_TRUNC erased the armed record
+                    # when the buffered flush then failed, leaving an EMPTY latch every reader
+                    # moot-removed (the adversarial review, 2026-08-19, reproduced). pwrite
+                    # lands whole or raises with the armed bytes still on disk.
                     lp = _install_latch_path()
                     try:
                         if lp is None:
@@ -10918,17 +10987,49 @@ def _pull_remote(host, expected_sha=None):
                         finally:
                             os.close(qfd)
                     except OSError:
-                        return False, ("%s trust changed during the pull, the rollback failed, "
-                                       "AND the quarantine record could not be written — assume "
-                                       "this checkout can REVIVE the rejected build; heal by "
-                                       "hand NOW: git reset --keep %s, then remove "
-                                       "romp-install-failed from its git dir"
-                                       % (host, pre_head[:12] or "<the prior commit>"))
-                return False, ("%s trust changed during the pull and the rollback failed — this "
-                               "checkout is quarantined until healed by hand: reset it to a commit "
-                               "you trust (e.g. git reset --keep %s), then remove romp-install-failed "
-                               "from its git dir" % (host, pre_head[:12] or "<the prior commit>"))
+                        return False, ("%s trust changed during the pull AND the quarantine "
+                                       "record could not be written — assume this checkout can "
+                                       "REVIVE the merged build; heal by hand NOW: git reset "
+                                       "--keep %s, then remove romp-install-failed from its "
+                                       "git dir" % (host, pre_head[:12] or "<the prior commit>"))
+                return False, ("%s trust changed during the pull — this checkout is quarantined "
+                               "until healed by hand: reset it to a commit you trust (e.g. git "
+                               "reset --keep %s), then remove romp-install-failed from its git "
+                               "dir" % (host, pre_head[:12] or "<the prior commit>"))
             installed = _converge_install(_sha8(fetched_sha), lock_fd)
+            # trust re-checked once more AFTER install.sh returns (the v1.3.8 audit: a downgrade
+            # landing while install ran — past the final pre-install check — still installed and
+            # would then serve the peer build): _pull_remote never restarts anything, so nothing
+            # has SERVED yet; a quarantine here still precedes any execution of the new build as
+            # romp. install.sh itself already ran under the pre-install approval — that window is
+            # bounded by the check directly above the converge call.
+            with _remotes_lock:
+                _cur3 = _remotes.get(host)
+                _still3 = bool(_cur3 and not _cur3.get("checkin_peer")
+                               and _cur3.get("trust") == "trusted")
+            if not _still3:
+                if not _set_install_failed(_QUARANTINE_LATCH):
+                    lp = _install_latch_path()
+                    try:
+                        if lp is None:
+                            raise OSError("no resolvable git dir")
+                        qfd = os.open(str(lp), os.O_RDWR | os.O_CREAT, 0o644)
+                        try:
+                            _qb = _QUARANTINE_LATCH.encode()
+                            if os.pwrite(qfd, _qb, 0) != len(_qb):
+                                raise OSError("short quarantine write")
+                        finally:
+                            os.close(qfd)
+                    except OSError:
+                        return False, ("%s trust changed while install.sh ran AND the quarantine "
+                                       "record could not be written — assume this checkout can "
+                                       "REVIVE the installed build; heal by hand NOW: git reset "
+                                       "--keep %s, then remove romp-install-failed from its git "
+                                       "dir" % (host, pre_head[:12] or "<the prior commit>"))
+                return False, ("%s trust changed while install.sh ran — quarantined before "
+                               "anything serves; heal by hand: git reset --keep %s, then remove "
+                               "romp-install-failed from its git dir"
+                               % (host, pre_head[:12] or "<the prior commit>"))
         finally:
             try:
                 os.close(lock_fd)

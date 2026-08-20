@@ -18,6 +18,7 @@ import os
 import stat
 import tempfile
 import unittest
+from unittest import mock
 from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -116,10 +117,10 @@ class ServeTokenFileMode(unittest.TestCase):
                          "the minted token must be PERSISTED despite the stale temp")
         self.assertEqual(km._load_token(), tok, "and stable across calls")
 
-    def test_a_failing_flock_never_leaks_the_lock_fd(self):
-        # _load_token runs per checkin handshake; on a filesystem whose flock raises (NFS
-        # without lockd) the discarded-open-fd pattern leaked one fd per call, walking a
-        # long-lived kernel into EMFILE (the adversarial review, 2026-08-19, 50 calls = 50 fds)
+    def test_a_failing_flock_REFUSES_and_still_leaks_no_fd(self):
+        # the v1.3.8 audit: the lockless fallback minted without serialization and split tokens
+        # after ENOLCK — a token state that cannot be established SECURELY now refuses startup
+        # (and the opened lock fd still must not leak while doing so)
         if not os.path.isdir("/proc/self/fd"):
             self.skipTest("needs /proc (Linux)")
         real = km.fcntl.flock
@@ -130,11 +131,45 @@ class ServeTokenFileMode(unittest.TestCase):
         try:
             before = len(os.listdir("/proc/self/fd"))
             for _ in range(10):
-                km._load_token()
+                with self.assertRaises(RuntimeError):
+                    km._load_token()
             after = len(os.listdir("/proc/self/fd"))
         finally:
             km.fcntl.flock = real
-        self.assertEqual(after, before, "one leaked lock fd per call is an EMFILE outage")
+        self.assertEqual(after, before, "refusal must not leak the lock fd either")
+        self.assertFalse(self.f.exists(), "and nothing was minted locklessly")
+
+    def test_an_unreadable_existing_token_is_never_rotated(self):
+        # the v1.3.8 audit: an unreadable EXISTING token read as absent and was minted over —
+        # rotating the credential out from under every live client holding it
+        if os.geteuid() == 0:
+            self.skipTest("permission bits do not bind root")
+        self.f.write_text("live-token")
+        os.chmod(self.f, 0)
+        try:
+            with self.assertRaises(RuntimeError):
+                km._load_token()
+        finally:
+            os.chmod(self.f, 0o600)
+        self.assertEqual(self.f.read_text(), "live-token", "the existing token survives, unrotated")
+
+    def test_a_failed_replace_never_returns_an_unpersisted_token(self):
+        # the v1.3.8 audit: successive DISTINCT tokens with no file after a simulated ENOSPC —
+        # the loader returned what it failed to persist
+        with mock.patch.object(km.os, "replace",
+                               side_effect=OSError(28, "No space left on device")):
+            with self.assertRaises(RuntimeError):
+                km._load_token()
+        self.assertFalse(self.f.exists(), "nothing persisted, and nothing pretended otherwise")
+
+    def test_a_failed_tighten_refuses(self):
+        # a 0644 token any local user can read is the boundary itself broken: a tighten that
+        # cannot land is a refusal, not a shrug (the v1.3.8 audit)
+        self.f.write_text("tok")
+        os.chmod(self.f, 0o644)
+        with mock.patch.object(km.os, "chmod", side_effect=OSError(30, "Read-only file system")):
+            with self.assertRaises(RuntimeError):
+                km._load_token()
 
     def test_the_env_override_never_writes_the_file(self):
         # Guards this test file's own premise: with ROMP_SERVE_TOKEN set there is nothing on disk to

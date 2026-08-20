@@ -406,7 +406,7 @@ class RunUpdate(Fresh):
             self.assertIn("readable regular file", km._UPDATE_ERROR[0])
 
     def _execute_captured_updater(self, verify_rc, enforce=False, install_rc=0, manager_port=None,
-                                  pre_latch=None, latch_mode=None):
+                                  pre_latch=None, latch_mode=None, pre_files=None):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "repo"; root.mkdir()
             (root / ".git").mkdir()                   # the interprocess update flock lives here
@@ -476,6 +476,8 @@ class RunUpdate(Fresh):
                 latch_p.write_text(pre_latch)
                 if latch_mode is not None:
                     os.chmod(latch_p, latch_mode)
+            for rel, content in (pre_files or {}).items():
+                (root / rel).write_text(content)
             ran = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
             if pre_latch is not None and latch_mode is not None:
                 os.chmod(latch_p, 0o644)
@@ -483,6 +485,9 @@ class RunUpdate(Fresh):
             report = json.loads((state / "update-report.json").read_text())
             latch = root / ".git" / "romp-install-failed"   # checkout-scoped, beside the update lock
             self._latch = latch.read_text().strip() if latch.exists() else None
+            marker = root / ".git" / "romp-update-channel"
+            self._marker = marker.read_text().strip() if marker.exists() else None
+            self._intent_exists = (root / ".git" / "romp-update-channel.intent").exists()
             return ran.returncode, rows, report
 
     def test_the_report_states_what_the_restart_actually_did(self):
@@ -533,6 +538,30 @@ class RunUpdate(Fresh):
         self.assertFalse(report["ok"])
         self.assertEqual(self._latch, "deadbee1",
                          "the durable latch names the moved-to commit for the boot heal")
+
+    def test_the_settle_heal_publishes_a_staged_channel_intent(self):
+        # the v1.3.8 audit's hard-death repro, tag-updater edition: a crashed bootstrap left the
+        # latch matching HEAD, its intent staged, and the marker stale — the updater's settle
+        # heals it and must publish the intent before spending the latch
+        rc, rows, report = self._execute_captured_updater(
+            0, pre_latch="deadbee1",
+            pre_files={".git/romp-update-channel": "dev\n",
+                       ".git/romp-update-channel.intent": "deadbee1\nstable\n"})
+        self.assertEqual(rc, 0)
+        self.assertTrue(report["ok"])
+        self.assertEqual(self._marker, "stable",
+                         "the healed build wears the channel its update intended")
+        self.assertIsNone(self._latch)
+        self.assertFalse(self._intent_exists, "the intent is spent")
+
+    def test_the_settle_never_moot_clears_a_nonhex_latch_line(self):
+        # a torn quarantine prefix is one non-hex line; the old settle rm -f'd it as moot and
+        # proceeded (the v1.3.8 audit reproduced the launcher doing the same)
+        rc, rows, report = self._execute_captured_updater(0, pre_latch="quarantin")
+        self.assertEqual(rc, 0, "the reporter records the refusal")
+        self.assertFalse(report["ok"])
+        self.assertEqual(self._latch, "quarantin", "the unknown record survives, unerased")
+        self.assertFalse(any(row.startswith("merge ") for row in rows), "nothing moved")
 
     def test_unsigned_or_bad_tag_stops_before_merge_install_and_restart(self):
         # enforcement requires a CONFIGURED trust root (the env opt-in here; bootstrap's persisted

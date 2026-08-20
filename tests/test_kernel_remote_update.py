@@ -331,6 +331,51 @@ class UpdateRemote(unittest.TestCase):
             self.assertIn("DIRTYNOW", a.stdout, "the locked wrapper's own dirty check refuses")
             self.assertFalse((gd / "romp-install-failed").exists())
 
+    def test_the_wrapper_heal_publishes_a_staged_intent_and_nonhex_is_LATCHSTUCK(self):
+        # the v1.3.8 audit's hard-death repro, p2p edition: the remote checkout carries a crashed
+        # bootstrap's latch + intent — the wrapper's settle-heal must publish the intent before
+        # spending the latch, and a torn NON-COMMIT line is never moot
+        import tempfile
+        from pathlib import Path
+        calls = self._wire(apply_out="SYNCED:abcdef0")
+        km._update_remote("TESTHOST")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        with tempfile.TemporaryDirectory() as td:
+            fix = Path(td) / "romp"
+            gd = fix / ".git"
+            gd.mkdir(parents=True)
+            fakebin = Path(td) / "bin"
+            fakebin.mkdir()
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "esac\nexit 0\n" % gd)
+            (fakebin / "git").chmod(0o755)
+            (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "install.sh").chmod(0o755)
+            env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
+            apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
+            (gd / "romp-install-failed").write_text("deadbee2")
+            (gd / "romp-update-channel").write_text("dev\n")
+            (gd / "romp-update-channel.intent").write_text("deadbee2\nstable\n")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            # the fixture has no bin/romp-serve, so a COMPLETED transaction reports NOLAUNCH;
+            # the refusal verdicts are what must be absent
+            self.assertNotIn("LATCHSTUCK", a.stdout)
+            self.assertNotIn("INSTALLFAIL", a.stdout)
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
+                             "the healed build wears the channel its update intended")
+            self.assertFalse((gd / "romp-install-failed").exists())
+            self.assertFalse((gd / "romp-update-channel.intent").exists())
+            # a torn NON-COMMIT single line is never moot — LATCHSTUCK, executed
+            (gd / "romp-install-failed").write_text("quarantin")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("LATCHSTUCK", a.stdout)
+            self.assertEqual((gd / "romp-install-failed").read_text(), "quarantin",
+                             "the unknown record survives, unerased")
+
     def test_the_wrapper_itself_recheck_dirt_heals_priors_and_carries_on_failure(self):
         # the wrapper's OWN under-lock legs, executed (the adversarial review, 2026-08-19: the
         # outer shell probes fired first in every prior test, leaving the wrapper's dead code)
