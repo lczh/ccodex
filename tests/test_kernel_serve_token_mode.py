@@ -139,6 +139,38 @@ class ServeTokenFileMode(unittest.TestCase):
         self.assertEqual(after, before, "refusal must not leak the lock fd either")
         self.assertFalse(self.f.exists(), "and nothing was minted locklessly")
 
+    def test_a_failing_flock_still_serves_an_existing_healthy_token(self):
+        # fail-closed must not brick read-only deployments (the adversarial review, 2026-08-20):
+        # an existing, non-empty, already-0600 token is safe to read lockless — no minter ever
+        # overwrites a non-empty token — so only MINTING or REPAIRING requires the lock
+        self.f.write_text("healthy-token")
+        os.chmod(self.f, 0o600)
+        real = km.fcntl.flock
+
+        def no_locks(fd, op):
+            raise OSError(30, "Read-only file system")
+        km.fcntl.flock = no_locks
+        try:
+            self.assertEqual(km._load_token(), "healthy-token")
+        finally:
+            km.fcntl.flock = real
+
+    def test_a_failing_flock_with_a_LOOSE_token_still_refuses(self):
+        # the grace is exactly as wide as safety allows: a 0644 token needs the REPAIR the lock
+        # protects, so it refuses rather than serve a world-readable credential
+        self.f.write_text("loose-token")
+        os.chmod(self.f, 0o644)
+        real = km.fcntl.flock
+
+        def no_locks(fd, op):
+            raise OSError(30, "Read-only file system")
+        km.fcntl.flock = no_locks
+        try:
+            with self.assertRaises(RuntimeError):
+                km._load_token()
+        finally:
+            km.fcntl.flock = real
+
     def test_an_unreadable_existing_token_is_never_rotated(self):
         # the v1.3.8 audit: an unreadable EXISTING token read as absent and was minted over —
         # rotating the credential out from under every live client holding it

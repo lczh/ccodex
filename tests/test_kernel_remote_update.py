@@ -359,7 +359,7 @@ class UpdateRemote(unittest.TestCase):
             apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
             (gd / "romp-install-failed").write_text("deadbee2")
             (gd / "romp-update-channel").write_text("dev\n")
-            (gd / "romp-update-channel.intent").write_text("deadbee2\nstable\n")
+            (gd / "romp-update-channel.intent.deadbee2").write_text("deadbee2\nstable\n")
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             # the fixture has no bin/romp-serve, so a COMPLETED transaction reports NOLAUNCH;
             # the refusal verdicts are what must be absent
@@ -368,7 +368,28 @@ class UpdateRemote(unittest.TestCase):
             self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
                              "the healed build wears the channel its update intended")
             self.assertFalse((gd / "romp-install-failed").exists())
-            self.assertFalse((gd / "romp-update-channel.intent").exists())
+            self.assertFalse((gd / "romp-update-channel.intent.deadbee2").exists())
+            # a FOREIGN intent (another commit's) is never published — and survives untouched
+            (gd / "romp-update-channel.intent.aaaaaaaa").write_text("aaaaaaaa\ndev\n")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertNotIn("LATCHSTUCK", a.stdout)
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
+                             "someone else's intent is not ours to publish")
+            (gd / "romp-update-channel.intent.aaaaaaaa").unlink()
+            # an UNPUBLISHABLE matching intent keeps the latch armed (exit 4): the marker write
+            # is UNBUFFERED — a buffered close-failure was an unraisable CPython swallowed,
+            # installing a 0-byte marker over 'dev' with the latch spent (the adversarial
+            # review, 2026-08-20, reproduced with an LD_PRELOAD write shim)
+            (gd / "romp-install-failed").write_text("deadbee2")
+            (gd / "romp-update-channel.intent.deadbee2").write_text("deadbee2\nstable\n")
+            (gd / "romp-update-channel").unlink()
+            (gd / "romp-update-channel").mkdir()       # os.replace onto a dir raises
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("INSTALLFAIL", a.stdout,
+                          "an unpublishable intent is an incomplete heal — the latch stays")
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2")
+            self.assertTrue((gd / "romp-update-channel.intent.deadbee2").exists(),
+                            "the intent survives for the retry")
             # a torn NON-COMMIT single line is never moot — LATCHSTUCK, executed
             (gd / "romp-install-failed").write_text("quarantin")
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)

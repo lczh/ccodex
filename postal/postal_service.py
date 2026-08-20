@@ -96,6 +96,27 @@ def _load_serve_token():
         f.parent.mkdir(parents=True, exist_ok=True)
         lock_fd = os.open(str(f) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except OSError as lock_err:
+        # the lock is fatal only when MINTING or REPAIRING might be needed: an existing,
+        # non-empty, already-0600 token is safe to read lockless (no minter ever overwrites a
+        # non-empty token), and refusing here bricked legitimate read-only state dirs where the
+        # token was healthy (the adversarial review, 2026-08-20)
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+        lock_fd = None
+        try:
+            v = f.read_text().strip()
+            if v and (os.stat(f).st_mode & 0o777) == 0o600:
+                return v
+        except OSError:
+            pass
+        raise RuntimeError(
+            "cannot establish the serve token securely (%s on %s) — refusing to run on an "
+            "unverified token state; fix the state dir and restart romp" % (lock_err, f)) from lock_err
+    try:
         try:
             prior = f.read_text().strip()
         except FileNotFoundError:

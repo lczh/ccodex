@@ -578,6 +578,27 @@ def _load_token():
         jd.STATE.mkdir(parents=True, exist_ok=True)
         lock_fd = os.open(str(f) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except OSError as lock_err:
+        # the lock is fatal only when MINTING or REPAIRING might be needed: an existing,
+        # non-empty, already-0600 token is safe to read lockless (no minter ever overwrites a
+        # non-empty token), and refusing here bricked legitimate read-only state dirs where the
+        # token was healthy (the adversarial review, 2026-08-20)
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+        lock_fd = None
+        try:
+            v = f.read_text().strip()
+            if v and (os.stat(f).st_mode & 0o777) == 0o600:
+                return v
+        except OSError:
+            pass
+        raise RuntimeError(
+            "cannot establish the serve token securely (%s on %s) — refusing to run on an "
+            "unverified token state; fix the state dir and restart romp" % (lock_err, f)) from lock_err
+    try:
         try:
             v = f.read_text().strip()
         except FileNotFoundError:
@@ -2166,7 +2187,7 @@ def _run_update(tag):
         _UPDATE_STATE[0] = ""
         return False
     latch = q(str(latch_path))
-    intent = q(str(latch_path.parent / "romp-update-channel.intent"))
+    intent = q(str(latch_path.parent / "romp-update-channel.intent"))   # + ".<sha8>" per target
     marker = q(str(latch_path.parent / "romp-update-channel"))
     script = (
         "cd %s || exit 1\n" % q(str(ROOT))
@@ -2176,15 +2197,16 @@ def _run_update(tag):
         # the latch is spent (the v1.3.8 audit: a healer reviving a crashed bootstrap's stable
         # target under the stale dev marker followed unsigned main); pub_intent returns nonzero
         # ONLY on a real failure — no intent, or someone else's, is not ours to publish
-        + "INTENT=%s\n" % intent
+        + "INTENTBASE=%s\n" % intent
         + "MARKER=%s\n" % marker
         + "pub_intent() {\n"
-        + "  [ -e \"$INTENT\" ] || return 0\n"
-        + "  [ -r \"$INTENT\" ] || return 1\n"
-        + "  W=$(sed -n 1p \"$INTENT\" | head -c 8); CH=$(sed -n 2p \"$INTENT\")\n"
+        + "  IN=\"$INTENTBASE.$1\"\n"
+        + "  [ -e \"$IN\" ] || return 0\n"
+        + "  [ -r \"$IN\" ] || return 1\n"
+        + "  W=$(sed -n 1p \"$IN\" | head -c 8); CH=$(sed -n 2p \"$IN\")\n"
         + "  [ \"$W\" = \"$1\" ] || return 0\n"
         + "  case \"$CH\" in stable|dev) ;; *) return 0;; esac\n"
-        + "  printf '%s\\n' \"$CH\" > \"$MARKER.pub\" && mv -f \"$MARKER.pub\" \"$MARKER\" && rm -f \"$INTENT\"\n"
+        + "  printf '%s\\n' \"$CH\" > \"$MARKER.pub\" && mv -f \"$MARKER.pub\" \"$MARKER\" && rm -f \"$IN\"\n"
         + "}\n"
         + "SETTLED=1\n"
         # SETTLE like every other arming path (the adversarial review, 2026-08-19: this was the
@@ -2205,7 +2227,7 @@ def _run_update(tag):
         # a single NON-COMMIT line is corrupt/foreign, never moot (the v1.3.8 audit: a torn
         # quarantine prefix parsed as one line and was moot-cleared into serving)
         + "    if printf '%%s' \"$L1\" | grep -qxE '[0-9a-f]{8}'; then rm -f %s; "
-          "rm -f \"$INTENT\"; else SETTLED=0; fi\n" % latch
+          "rm -f \"$INTENTBASE.$L1\"; else SETTLED=0; fi\n" % latch
         + "  fi\n"
         + "elif [ -s %s ]; then\n" % latch
         + "  SETTLED=0\n"
@@ -2435,9 +2457,26 @@ def _hex8(s):
     return bool(re.fullmatch(r"[0-9a-f]{8}", str(s or "")))
 
 
-def _intent_path():
+def _intent_path(sha8):
+    """SHA-KEYED, one file per pending target: a fixed name let update B's staging destroy the
+    carried record of crashed update A — B failed too, and A's later heal then revived the stable
+    build under the stale dev marker (the adversarial review, 2026-08-20, reproduced end-to-end).
+    Keyed by sha, a newer staging for the SAME commit is simply the newer truth for it."""
     gd = _update_git_dir()
-    return (gd / "romp-update-channel.intent") if gd is not None else None
+    return (gd / ("romp-update-channel.intent.%s" % sha8)) if gd is not None else None
+
+
+def _drop_channel_intent(sha8):
+    """Retire the intent of a latch line being MOOT-CLEARED: its move never landed, so its
+    channel must never be published by a later heal that happens to land on the same commit
+    (the adversarial review, 2026-08-20: a failed bootstrap's orphaned intent flipped a stable
+    machine to dev months later)."""
+    ip = _intent_path(sha8)
+    if ip is not None:
+        try:
+            ip.unlink()
+        except OSError:
+            pass
 
 
 def _publish_channel_intent(sha8):
@@ -2448,7 +2487,7 @@ def _publish_channel_intent(sha8):
     marker still said dev, restoring the exact stable-build-following-unsigned-main hole. Returns
     False ONLY on a real failure (unreadable intent, unwritable marker) — the caller must then
     KEEP the latch; no intent, or an intent for a different commit, is simply not ours."""
-    ip = _intent_path()
+    ip = _intent_path(str(sha8 or "")[:8])
     if ip is None:
         return True
     try:
@@ -2512,10 +2551,7 @@ def _set_install_failed(sha8):
                 raise OSError("no resolvable git dir for the checkout")
             _atomic_write(p, sha8)
         else:
-            ip = _intent_path()
-            for cand in (([p] if p is not None else [])
-                         + ([ip] if ip is not None else [])   # a cleared latch retires its intent
-                         + [jd.STATE / "converge-install-failed"]):
+            for cand in ([p] if p is not None else []) + [jd.STATE / "converge-install-failed"]:
                 cand.unlink(missing_ok=True)
         return True
     except OSError as e:
@@ -2792,6 +2828,15 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
                 _converge_note("main moved at origin, but: %s" % settle)
                 _MAIN_DRIFT[0] = ""
                 return
+            if _update_channel() != "dev":
+                # the settle can HEAL a crashed stable update whose intent-publish just flipped
+                # the marker (the adversarial review, 2026-08-20: the entry check saw the stale
+                # dev marker and this pass then converged one last unsigned main — permanently
+                # labeled stable). The channel is re-decided on the marker the heal published.
+                _converge_note("this install's channel changed to stable while settling a prior "
+                               "update — it updates only through signed release tags now.")
+                _MAIN_DRIFT[0] = ""
+                return
             if not _arm_latch(tip[:8], carry):
                 # an intent that cannot PERSIST blocks the move outright — an unwritable git dir
                 # must never mean "proceed unrecorded" (the user's audit, 2026-08-17)
@@ -2843,6 +2888,7 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
                                "not restarting onto an unknown state; heal it by hand." % lines[0])
                 return
             else:
+                _drop_channel_intent(lines[0])        # a mooted move's channel is never published
                 _set_install_failed("")               # intent-only mismatch; the move never landed
     try:
         # DIRECT http.client, never urllib: urllib honors HTTP_PROXY, and with one set (NO_PROXY
@@ -2894,6 +2940,7 @@ def _settle_prior_latch(lock_fd):
     if not _hex8(lines[0]):
         return ("this checkout's install latch holds %r, which is not a commit — a corrupt or "
                 "foreign record is never moot; heal it by hand" % lines[0]), ""
+    _drop_channel_intent(lines[0])                    # a mooted move's channel is never published
     _set_install_failed("")                           # intent-only mismatch: the move never landed
     return "", ""
 
@@ -3070,6 +3117,7 @@ def _boot_heal(wait_s=0):
             _converge_note("this checkout's install latch holds %r, which is not a commit — a "
                            "corrupt or foreign record is never moot; heal it by hand." % lines[0])
             return                                    # fail closed (see _hex8)
+        _drop_channel_intent(lines[0])                # a mooted move's channel is never published
         _set_install_failed("")                       # intent-only mismatch: the move never landed
     finally:
         try:
@@ -10651,10 +10699,10 @@ def _update_remote(host):
         "if res.returncode or not sha8:\n"
         "    sys.exit(5)\n"
         'lp=os.path.join(os.path.dirname(lock),"romp-install-failed")\n'
-        'ip=os.path.join(os.path.dirname(lock),"romp-update-channel.intent")\n'
+        'ipb=os.path.join(os.path.dirname(lock),"romp-update-channel.intent.")\n'
         "def pub(c):\n"
         "    try:\n"
-        "        raw=open(ip).read().splitlines()\n"
+        "        raw=open(ipb+c).read().splitlines()\n"
         "    except FileNotFoundError:\n"
         "        return True\n"
         "    except OSError:\n"
@@ -10664,9 +10712,13 @@ def _update_remote(host):
         '    if w!=c or ch not in ("stable","dev"):\n'
         "        return True\n"
         "    try:\n"
-        '        open(ip+".pub","w").write(ch+"\\n")\n'
-        '        os.replace(ip+".pub",os.path.join(os.path.dirname(lock),"romp-update-channel"))\n'
-        "        os.remove(ip)\n"
+        '        pfd=os.open(ipb+c+".pub",os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o644)\n'
+        "        try:\n"
+        '            os.write(pfd,(ch+"\\n").encode())\n'
+        "        finally:\n"
+        "            os.close(pfd)\n"
+        '        os.replace(ipb+c+".pub",os.path.join(os.path.dirname(lock),"romp-update-channel"))\n'
+        "        os.remove(ipb+c)\n"
         "        return True\n"
         "    except OSError:\n"
         "        return False\n"
@@ -10696,12 +10748,16 @@ def _update_remote(host):
         "    else:\n"
         "        os.remove(lp)\n"
         "        try:\n"
-        "            os.remove(ip)\n"
+        "            os.remove(ipb+lines[0])\n"
         "        except OSError:\n"
         "            pass\n"
         'tmp=lp+".tmp"\n'
         'body=sha8+("\\n"+carry if carry and carry!=sha8 else "")\n'
-        'open(tmp,"w").write(body)\n'
+        'tfd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o644)\n'
+        "try:\n"
+        "    os.write(tfd,body.encode())\n"
+        "finally:\n"
+        "    os.close(tfd)\n"
         "os.replace(tmp,lp)\n"
         'if subprocess.run(["git","-C",r,"reset","--hard",target]).returncode:\n'
         "    sys.exit(6)\n"

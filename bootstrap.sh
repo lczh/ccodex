@@ -272,7 +272,11 @@ def write_latch(sha8):
     os.replace(tmp, latch)
 
 
-intent = os.path.join(gdir, "romp-update-channel.intent")
+def intent_for(s8):
+    """SHA-KEYED, one file per pending target (the adversarial review, 2026-08-20: a fixed name
+    let this staging destroy the carried record of a CRASHED earlier update — its later heal then
+    revived the stable build under the stale dev marker)."""
+    return os.path.join(gdir, "romp-update-channel.intent." + s8)
 
 
 def publish_intent(cur8):
@@ -280,8 +284,9 @@ def publish_intent(cur8):
     do. A healed build must wear the channel its update intended: the v1.3.8 audit reproduced a
     hard death right after the checkout moved — the gate healed the stable target while the
     marker still said dev, and the healed build followed unsigned main."""
+    ip = intent_for(cur8)
     try:
-        raw = open(intent).read().splitlines()
+        raw = open(ip).read().splitlines()
     except FileNotFoundError:
         return True
     except OSError:
@@ -291,18 +296,18 @@ def publish_intent(cur8):
     if want != cur8 or ch not in ("stable", "dev"):
         return True                        # someone else's intent: not ours to publish
     try:
-        with open(intent + ".pub", "w") as pf:
+        with open(ip + ".pub", "w") as pf:
             pf.write(ch + "\n")
-        os.replace(intent + ".pub", os.path.join(gdir, "romp-update-channel"))
-        os.remove(intent)
+        os.replace(ip + ".pub", os.path.join(gdir, "romp-update-channel"))
+        os.remove(ip)
         return True
     except OSError:
         return False
 
 
-def drop_intent():
+def drop_intent(s8):
     try:
-        os.remove(intent)                  # a mooted or spent move's intent must not outlive it
+        os.remove(intent_for(s8))         # a mooted/failed move's channel is never published
     except OSError:
         pass
 
@@ -337,7 +342,7 @@ if lines:
         #                                      as one line and was moot-cleared into serving)
     else:
         os.remove(latch)                     # intent-only mismatch: the move never landed
-        drop_intent()
+        drop_intent(lines[0])
 # the channel marker is STAGED here — content written to the temp before anything moves, so
 # the only marker step left after the moves is one atomic rename. A failure here costs nothing:
 # HEAD is unmoved, no latch is armed, the old marker still matches the old HEAD (rc 11).
@@ -348,9 +353,9 @@ try:
     # the INTENT is the durable recovery record: (target sha, channel), staged BEFORE anything
     # moves — a healer reviving this move after a crash publishes the marker FROM it before
     # spending the latch (the v1.3.8 audit's reproduced hard-death-after-checkout)
-    with open(intent + ".stage", "w") as inf:
+    with open(intent_for(target[:8]) + ".stage", "w") as inf:
         inf.write(target[:8] + "\n" + channel + "\n")
-    os.replace(intent + ".stage", intent)
+    os.replace(intent_for(target[:8]) + ".stage", intent_for(target[:8]))
 except OSError:
     sys.exit(11)
 
@@ -393,6 +398,7 @@ def stuck_latch():
 try:
     write_latch(target[:8] + ("\n" + carry if carry and carry != target[:8] else ""))
 except OSError:
+    drop_intent(target[:8])                  # no latch will ever key this intent's retirement
     sys.exit(5)
 for mv in moves:
     if subprocess.run(["git", "-C", root] + mv).returncode:
@@ -422,9 +428,9 @@ for mv in moves:
                 os.remove(latch)
         except OSError:
             pass                             # the armed target latch stays — fail closed
-        if now != target[:8]:
-            drop_intent()                    # the target was never reached: its intent must not
-            #                                  poison a later heal landing on that sha elsewhere
+        drop_intent(target[:8])              # THIS update failed: its channel is never published
+        #                                      (the publish leg above already spent it when the
+        #                                      target was genuinely reached and moved-to)
         sys.exit(6)
 # the CHANNEL marker is PUBLISHED here — INSIDE the lock (the user's audit, 2026-08-19: the
 # shell wrote it after the lock released, so two serial bootstraps could publish their markers
@@ -444,7 +450,7 @@ if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root, pass_fds
                   env=env).returncode:
     sys.exit(4)                        # latch stays armed: nothing runs this build until install passes
 os.remove(latch)
-drop_intent()                          # spent: this transaction already published the marker
+drop_intent(target[:8])                # spent: this transaction already published the marker
 sys.exit(0)
 TXNPY
 case "$txn_rc" in

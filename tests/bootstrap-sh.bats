@@ -510,7 +510,7 @@ HOLDPY
     [ "$status" -eq 0 ]
     [ "$(cat "$gd/romp-update-channel")" = "stable" ]
     [ ! -e "$gd/romp-install-failed" ]
-    [ ! -e "$gd/romp-update-channel.intent" ]   # spent: the txn itself published
+    [ ! -e "$gd/romp-update-channel.intent.$(git -C "$root" rev-parse --short=8 HEAD)" ]   # spent
 }
 
 @test "bootstrap.sh: an unstageable channel marker refuses BEFORE anything moves (rc 11)" {
@@ -592,13 +592,149 @@ PYEOF
     [ "$(git -C "$root" rev-parse HEAD)" = "$target" ]                     # HEAD moved
     [ "$(cat "$gd/romp-install-failed")" = "$(git -C "$root" rev-parse --short=8 HEAD)" ]
     [ "$(cat "$gd/romp-update-channel")" = "dev" ]                         # the audit's exact state
-    [ -e "$gd/romp-update-channel.intent" ]
+    t8="$(git -C "$root" rev-parse --short=8 HEAD)"
+    [ -e "$gd/romp-update-channel.intent.$t8" ]
     # now the gate revives it — and must publish the intent BEFORE spending the latch
     run python3 "$TEST_DIR/gate.py" "$root"
     [ "$status" -eq 0 ]
     [ "$(cat "$gd/romp-update-channel")" = "stable" ]
     [ ! -e "$gd/romp-install-failed" ]
-    [ ! -e "$gd/romp-update-channel.intent" ]
+    [ ! -e "$gd/romp-update-channel.intent.$t8" ]
+}
+
+@test "bootstrap.sh: a hard death AT the checkout move still leaves the staged intent" {
+    # pins the ORDER (the adversarial review, 2026-08-20: the die-at-publish repro let a mutant
+    # that stages the intent after the moves pass): the process dies the instant the move lands,
+    # and the intent must ALREADY be on disk for the healer.
+    sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
+    sed -n "/<<'GATEPY'/,/^GATEPY\$/p" "$REPO_ROOT/bin/romp-serve" | sed '1d;$d' > "$TEST_DIR/gate.py"
+    cat > "$TEST_DIR/die-at-move.py" <<'PYEOF'
+import os, subprocess, sys
+real_run = subprocess.run
+
+
+def dying_run(argv, **kw):
+    r = real_run(argv, **kw)
+    if any(str(a) == "checkout" for a in argv):
+        os._exit(137)                      # the hard death, the instant HEAD moved
+    return r
+
+
+subprocess.run = dying_run
+txn = sys.argv[1]
+sys.argv = ["txn"] + sys.argv[2:]
+exec(compile(open(txn).read(), txn, "exec"))
+PYEOF
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm one
+    git -C "$root" -c user.email=t@t -c user.name=t commit -q --allow-empty -m two
+    target="$(git -C "$root" rev-parse HEAD)"
+    git -C "$root" checkout -q -d HEAD~1
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    printf 'dev\n' > "$gd/romp-update-channel"
+    run python3 "$TEST_DIR/die-at-move.py" "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "stable" checkout --detach "$target"
+    [ "$status" -eq 137 ]
+    t8="$(git -C "$root" rev-parse --short=8 HEAD)"
+    [ "$(git -C "$root" rev-parse HEAD)" = "$target" ]
+    [ -e "$gd/romp-update-channel.intent.$t8" ]     # staged BEFORE anything moved
+    run python3 "$TEST_DIR/gate.py" "$root"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$gd/romp-update-channel")" = "stable" ]
+}
+
+@test "bootstrap.sh: a crashed update's intent survives a LATER update's staging" {
+    # the adversarial review, 2026-08-20 (reproduced end-to-end): with a FIXED intent name,
+    # update B's staging destroyed crashed update A's record while A's latch line was carried —
+    # A's later heal then revived the stable build under the stale dev marker. Keyed by sha,
+    # B stages its own file and A's survives.
+    sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
+    sed -n "/<<'GATEPY'/,/^GATEPY\$/p" "$REPO_ROOT/bin/romp-serve" | sed '1d;$d' > "$TEST_DIR/gate.py"
+    cat > "$TEST_DIR/die-at-publish.py" <<'PYEOF'
+import os, sys
+real_replace = os.replace
+
+
+def dying_replace(src, dst):
+    if str(dst).endswith("romp-update-channel"):
+        os._exit(137)
+    return real_replace(src, dst)
+
+
+os.replace = dying_replace
+txn = sys.argv[1]
+sys.argv = ["txn"] + sys.argv[2:]
+exec(compile(open(txn).read(), txn, "exec"))
+PYEOF
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm one
+    git -C "$root" -c user.email=t@t -c user.name=t commit -q --allow-empty -m two
+    X="$(git -C "$root" rev-parse HEAD)"
+    git -C "$root" checkout -q -d HEAD~1
+    Y="$(git -C "$root" rev-parse HEAD)"
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    printf 'dev\n' > "$gd/romp-update-channel"
+    # update A (stable, target X) dies at its publish: HEAD=X, latch=X, intent.X staged
+    run python3 "$TEST_DIR/die-at-publish.py" "$TEST_DIR/txn.py" "$root" "$gd" "$X" "-" "stable" checkout --detach "$X"
+    [ "$status" -eq 137 ]
+    x8="$(git -C "$root" rev-parse --short=8 HEAD)"
+    [ -e "$gd/romp-update-channel.intent.$x8" ]
+    # update B (dev, target Y) runs before any healer, with a FAILING install: its settle-heal of
+    # A's latch fails (carry), it stages ITS OWN intent, and its move fails — B exits 6
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$root/install.sh"
+    git -C "$root" branch rel
+    run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$Y" "-" "dev" branch -f rel/14 "$Y"
+    [ "$status" -eq 6 ]
+    [ -e "$gd/romp-update-channel.intent.$x8" ]     # A's record SURVIVES B (sha-keyed)
+    # install recovers; the gate heals A's latch and must land A's intended channel
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    run python3 "$TEST_DIR/gate.py" "$root"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$gd/romp-update-channel")" = "stable" ]
+}
+
+@test "bootstrap.sh: a failed move on an already-at-target checkout retires its OWN intent" {
+    # the adversarial review, 2026-08-20 (reproduced): the failed-move leg refused the marker
+    # flip but LEFT the intent — a later heal of an unrelated prior latch at the same commit then
+    # performed exactly the flip the failed bootstrap refused
+    sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    target="$(git -C "$root" rev-parse HEAD)"
+    t8="$(git -C "$root" rev-parse --short=8 HEAD)"
+    printf 'stable\n' > "$gd/romp-update-channel"
+    git -C "$root" branch rel
+    run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "dev" branch -f rel/14 "$target"
+    [ "$status" -eq 6 ]
+    [ "$(cat "$gd/romp-update-channel")" = "stable" ]
+    [ ! -e "$gd/romp-update-channel.intent.$t8" ]   # the failed update's channel is dead with it
+}
+
+@test "bootstrap.sh: the gate never publishes a FOREIGN intent" {
+    # sha-keyed lookup: an intent staged for another commit must not decide this heal's channel
+    sed -n "/<<'GATEPY'/,/^GATEPY\$/p" "$REPO_ROOT/bin/romp-serve" | sed '1d;$d' > "$TEST_DIR/gate.py"
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    git -C "$root" rev-parse --short=8 HEAD > "$gd/romp-install-failed"
+    printf 'dev\n' > "$gd/romp-update-channel"
+    printf 'aaaaaaaa\nstable\n' > "$gd/romp-update-channel.intent.aaaaaaaa"
+    run python3 "$TEST_DIR/gate.py" "$root"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$gd/romp-update-channel")" = "dev" ]  # someone else's intent is not ours
+    [ ! -e "$gd/romp-install-failed" ]
 }
 
 @test "bootstrap.sh: the gate refuses to start a healed build whose channel cannot be recorded" {
@@ -610,7 +746,8 @@ PYEOF
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
     git -C "$root" rev-parse --short=8 HEAD > "$gd/romp-install-failed"
-    printf '%s\nstable\n' "$(git -C "$root" rev-parse --short=8 HEAD)" > "$gd/romp-update-channel.intent"
+    printf '%s\nstable\n' "$(git -C "$root" rev-parse --short=8 HEAD)" \
+        > "$gd/romp-update-channel.intent.$(git -C "$root" rev-parse --short=8 HEAD)"
     mkdir "$gd/romp-update-channel"        # the marker cannot be written
     run python3 "$TEST_DIR/gate.py" "$root"
     [ "$status" -eq 70 ]                   # heal incomplete: not started under the OLD channel

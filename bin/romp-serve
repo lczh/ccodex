@@ -127,7 +127,7 @@ if gd.returncode or not gdir:
 # Bounded wait: a live install can legitimately hold this for a while; sibling kernels booting
 # together contend for microseconds. Timing out still refuses (exit 70), never proceeds blind.
 latch = os.path.join(gdir, "romp-install-failed")
-intent = os.path.join(gdir, "romp-update-channel.intent")
+intent_base = os.path.join(gdir, "romp-update-channel.intent.")   # sha-keyed, one per target
 
 
 def publish_intent(cur8):
@@ -136,7 +136,7 @@ def publish_intent(cur8):
     crashed bootstrap's stable target and starting it under the stale dev marker, which then
     followed unsigned main). True when there is nothing to do; False only on a real failure."""
     try:
-        raw = open(intent).read().splitlines()
+        raw = open(intent_base + cur8).read().splitlines()
     except FileNotFoundError:
         return True
     except OSError:
@@ -146,10 +146,10 @@ def publish_intent(cur8):
     if want != cur8 or ch not in ("stable", "dev"):
         return True
     try:
-        with open(intent + ".pub", "w") as pf:
+        with open(intent_base + cur8 + ".pub", "w") as pf:
             pf.write(ch + "\n")
-        os.replace(intent + ".pub", os.path.join(gdir, "romp-update-channel"))
-        os.remove(intent)
+        os.replace(intent_base + cur8 + ".pub", os.path.join(gdir, "romp-update-channel"))
+        os.remove(intent_base + cur8)
         return True
     except OSError:
         return False
@@ -200,7 +200,7 @@ if cur8 not in lines:
         #                                parsed as one line and was moot-removed into serving)
     os.remove(latch)                   # intent-only mismatch: the move never landed — moot
     try:
-        os.remove(intent)              # a mooted move's intent must not outlive it
+        os.remove(intent_base + lines[0])   # a mooted move's channel is never published
     except OSError:
         pass
     sys.exit(0)
