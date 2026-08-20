@@ -828,71 +828,73 @@ class IntentPublish(unittest.TestCase):
                         km._boot_heal()
 
     def test_the_heal_publishes_the_staged_intent_before_spending_the_latch(self):
+        # the channel rides IN the latch line ("sha8 channel"): every separate-file design failed
+        # twice — orphans published by updates that never staged them, carried records destroyed
+        # (the adversarial reviews, 2026-08-20)
         from pathlib import Path
         with tempfile.TemporaryDirectory() as td:
             gd = Path(td)
             (gd / "romp-update-channel").write_text("dev\n")
-            (gd / "romp-update-channel.intent.abcd1234").write_text("abcd1234\nstable\n")
-            with mock.patch.object(km, "_update_git_dir", return_value=gd):
-                km._set_install_failed("abcd1234")
+            (gd / "romp-install-failed").write_text("abcd1234 stable")
             self._heal(gd)
             self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
                              "the healed build wears the channel its update INTENDED — healing "
                              "it under the stale marker followed unsigned main")
-            self.assertFalse((gd / "romp-install-failed").exists(), "healed and spent")
-            self.assertFalse((gd / "romp-update-channel.intent.abcd1234").exists(),
-                             "the intent is spent")
+            self.assertFalse((gd / "romp-install-failed").exists(),
+                             "healed and spent — the record and its channel die together")
 
     def test_an_unpublishable_intent_keeps_the_latch_armed(self):
         from pathlib import Path
         with tempfile.TemporaryDirectory() as td:
             gd = Path(td)
             (gd / "romp-update-channel").mkdir()           # the marker cannot be written
-            (gd / "romp-update-channel.intent.abcd1234").write_text("abcd1234\nstable\n")
-            with mock.patch.object(km, "_update_git_dir", return_value=gd):
-                km._set_install_failed("abcd1234")
+            (gd / "romp-install-failed").write_text("abcd1234 stable")
             self._heal(gd)
-            self.assertEqual((gd / "romp-install-failed").read_text().strip(), "abcd1234",
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(), "abcd1234 stable",
                              "an install whose intended channel cannot land stays LATCHED — "
                              "spending it would run the build under the OLD marker")
 
-    def test_a_foreign_intent_is_not_published_and_not_blocking(self):
+    def test_a_plain_sha_line_stages_no_channel(self):
+        # the tag, p2p, and pull updaters arm plain sha lines — staying in-channel means
+        # publishing nothing, and there is no separate file for a stranger's record to poison
         from pathlib import Path
         with tempfile.TemporaryDirectory() as td:
             gd = Path(td)
             (gd / "romp-update-channel").write_text("dev\n")
-            (gd / "romp-update-channel.intent.ffffeeee").write_text("ffffeeee\nstable\n")
-            with mock.patch.object(km, "_update_git_dir", return_value=gd):
-                km._set_install_failed("abcd1234")
+            (gd / "romp-install-failed").write_text("abcd1234")
             self._heal(gd)
             self.assertEqual((gd / "romp-update-channel").read_text().strip(), "dev",
-                             "an intent for a DIFFERENT commit is not ours to publish")
+                             "a plain line publishes nothing")
             self.assertFalse((gd / "romp-install-failed").exists(),
-                             "and it does not block the heal either")
+                             "and does not block the heal either")
 
-    def test_a_moot_clear_retires_the_mooted_lines_intent(self):
-        # a mooted move's channel must never be published by a later heal landing on the same
-        # commit (the adversarial review, 2026-08-20: a failed bootstrap's orphaned intent
-        # flipped a stable machine to dev months later)
+    def test_a_moot_clear_kills_the_mooted_lines_channel_with_it(self):
+        # a mooted move's channel must never be published later: the token lives IN the line, so
+        # the moot-clear removes both in one unlink (the adversarial review, 2026-08-20: a
+        # separate orphaned record flipped a stable machine to dev months later)
         from pathlib import Path
         with tempfile.TemporaryDirectory() as td:
             gd = Path(td)
             (gd / "romp-update-channel").write_text("stable\n")
-            (gd / "romp-update-channel.intent.eeee2222").write_text("eeee2222\ndev\n")
-            with mock.patch.object(km, "_update_git_dir", return_value=gd):
-                km._set_install_failed("eeee2222")
+            (gd / "romp-install-failed").write_text("eeee2222 dev")
             self._heal(gd, cur="abcd1234")             # single hex mismatch → moot-clear
             self.assertFalse((gd / "romp-install-failed").exists(), "mooted")
-            self.assertFalse((gd / "romp-update-channel.intent.eeee2222").exists(),
-                             "the mooted move's intent is retired with it")
-            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable")
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
+                             "the mooted record's channel died with its line")
 
     def test_the_dev_pull_re_decides_the_channel_after_the_settle(self):
         # the settle can HEAL a crashed stable update whose intent-publish flips the marker
         # mid-pass; the entry check saw the stale dev marker and the pass then converged one
         # last unsigned main, permanently labeled stable (the adversarial review, 2026-08-20)
         import subprocess as sp
-        chan = {"v": iter(["dev", "stable"])}
+        state = {"settled": False}
+
+        def channel():
+            return "stable" if state["settled"] else "dev"
+
+        def settle(lock_fd):
+            state["settled"] = True                    # the heal flips the marker MID-pass
+            return "", ""
 
         def fake_run(argv, **kw):
             a = [str(x) for x in argv]
@@ -906,9 +908,9 @@ class IntentPublish(unittest.TestCase):
                 return sp.CompletedProcess(argv, 0, stdout="", stderr="")
             return sp.CompletedProcess(argv, 0, stdout="", stderr="")
         notes = []
-        with mock.patch.object(km, "_update_channel", side_effect=lambda: next(chan["v"])):
+        with mock.patch.object(km, "_update_channel", side_effect=channel):
             with mock.patch.object(km.subprocess, "run", side_effect=fake_run):
-                with mock.patch.object(km, "_settle_prior_latch", return_value=("", "")):
+                with mock.patch.object(km, "_settle_prior_latch", side_effect=settle):
                     with mock.patch.object(km, "_arm_latch",
                                            side_effect=AssertionError("must not arm after the flip")):
                         with mock.patch.object(km, "_converge_note",
@@ -916,6 +918,19 @@ class IntentPublish(unittest.TestCase):
                             km._run_main_update_locked("pull", True, "e" * 40)
         self.assertTrue(any("changed to stable" in n for n in notes),
                         "the pass says why it stopped: %r" % notes)
+        self.assertTrue(state["settled"],
+                        "the flip happened INSIDE the settle — a re-check hoisted above the "
+                        "settle would read dev and converge anyway (the adversarial review, "
+                        "2026-08-20)")
+
+    def test_latch_lines_parse_their_sha_half_with_tokens_present(self):
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            (gd / "romp-install-failed").write_text("abcd1234 stable\nffffeeee dev")
+            with mock.patch.object(km, "_update_git_dir", return_value=gd):
+                self.assertEqual(km._install_latch_lines(), ["abcd1234", "ffffeeee"],
+                                 "every reader keeps matching on the sha half")
 
     def test_a_torn_single_nonhex_latch_line_is_never_moot(self):
         # the v1.3.8 audit: a one-byte-short quarantine write left a single non-hex line, and the

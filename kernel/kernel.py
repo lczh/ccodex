@@ -2187,7 +2187,6 @@ def _run_update(tag):
         _UPDATE_STATE[0] = ""
         return False
     latch = q(str(latch_path))
-    intent = q(str(latch_path.parent / "romp-update-channel.intent"))   # + ".<sha8>" per target
     marker = q(str(latch_path.parent / "romp-update-channel"))
     script = (
         "cd %s || exit 1\n" % q(str(ROOT))
@@ -2197,16 +2196,14 @@ def _run_update(tag):
         # the latch is spent (the v1.3.8 audit: a healer reviving a crashed bootstrap's stable
         # target under the stale dev marker followed unsigned main); pub_intent returns nonzero
         # ONLY on a real failure — no intent, or someone else's, is not ours to publish
-        + "INTENTBASE=%s\n" % intent
         + "MARKER=%s\n" % marker
-        + "pub_intent() {\n"
-        + "  IN=\"$INTENTBASE.$1\"\n"
-        + "  [ -e \"$IN\" ] || return 0\n"
-        + "  [ -r \"$IN\" ] || return 1\n"
-        + "  W=$(sed -n 1p \"$IN\" | head -c 8); CH=$(sed -n 2p \"$IN\")\n"
-        + "  [ \"$W\" = \"$1\" ] || return 0\n"
+        # publish the channel token riding ON a latch line ("sha8 channel") before that line is
+        # spent — a plain sha line stages no channel and publishes nothing (see
+        # _publish_latch_channel; the channel lives in the latch since 2026-08-20)
+        + "pub_line() {\n"
+        + "  CH=$(printf '%s' \"$1\" | awk '{print $2}')\n"
         + "  case \"$CH\" in stable|dev) ;; *) return 0;; esac\n"
-        + "  printf '%s\\n' \"$CH\" > \"$MARKER.pub\" && mv -f \"$MARKER.pub\" \"$MARKER\" && rm -f \"$IN\"\n"
+        + "  printf '%s\\n' \"$CH\" > \"$MARKER.pub\" && mv -f \"$MARKER.pub\" \"$MARKER\"\n"
         + "}\n"
         + "SETTLED=1\n"
         # SETTLE like every other arming path (the adversarial review, 2026-08-19: this was the
@@ -2217,17 +2214,18 @@ def _run_update(tag):
         + "if [ -s %s ] && [ ! -r %s ]; then\n" % (latch, latch)
         + "  SETTLED=0\n"
         + "elif [ -s %s ] && [ -n \"$CUR\" ]; then\n" % latch
-        + "  if grep -qx \"$CUR\" %s 2>/dev/null; then\n" % latch
-        + "    if ./install.sh >> %s 2>&1 && pub_intent \"$CUR\"; then rm -f %s; "
-          "else CARRY=\"$CUR\"; fi\n" % (log, latch)
+        + "  if grep -q \"^$CUR\" %s 2>/dev/null; then\n" % latch
+        + "    CURLINE=$(grep \"^$CUR\" %s | head -1)\n" % latch
+        + "    if ./install.sh >> %s 2>&1 && pub_line \"$CURLINE\"; then rm -f %s; "
+          "else CARRY=\"$CURLINE\"; fi\n" % (log, latch)
         + "  elif [ \"$(grep -c . %s 2>/dev/null)\" -gt 1 ]; then\n" % latch
         + "    SETTLED=0\n"
         + "  else\n"
-        + "    L1=$(sed -n 1p %s 2>/dev/null | head -c 8)\n" % latch
+        + "    L1=$(sed -n 1p %s 2>/dev/null | awk '{print $1}' | head -c 8)\n" % latch
         # a single NON-COMMIT line is corrupt/foreign, never moot (the v1.3.8 audit: a torn
         # quarantine prefix parsed as one line and was moot-cleared into serving)
         + "    if printf '%%s' \"$L1\" | grep -qxE '[0-9a-f]{8}'; then rm -f %s; "
-          "rm -f \"$INTENTBASE.$L1\"; else SETTLED=0; fi\n" % latch
+          "else SETTLED=0; fi\n" % latch
         + "  fi\n"
         + "elif [ -s %s ]; then\n" % latch
         + "  SETTLED=0\n"
@@ -2237,13 +2235,15 @@ def _run_update(tag):
           % (tag, tag, log, verify_sh, log)
         + "  NEW8=$(git rev-parse --short=8 'refs/tags/%s^{commit}' 2>> %s | head -c 8)\n" % (tag, log)
         + "  if [ -n \"$NEW8\" ]; then\n"
-        + "    if [ -n \"$CARRY\" ]; then printf '%%s\\n%%s' \"$NEW8\" \"$CARRY\" > %s.tmp; "
-          "else printf '%%s' \"$NEW8\" > %s.tmp; fi\n" % (latch, latch)
+        + "    C1=$(printf '%s' \"$CARRY\" | awk '{print $1}')\n"
+        + "    if [ -n \"$CARRY\" ] && [ \"$C1\" = \"$NEW8\" ]; then printf '%%s' \"$CARRY\" > %s.tmp; "
+          "elif [ -n \"$CARRY\" ]; then printf '%%s\\n%%s' \"$NEW8\" \"$CARRY\" > %s.tmp; "
+          "else printf '%%s' \"$NEW8\" > %s.tmp; fi\n" % (latch, latch, latch)
         + "    mv -f %s.tmp %s\n" % (latch, latch)
-        + "    if [ \"$(sed -n 1p %s 2>/dev/null | head -c 8)\" = \"$NEW8\" ] "
+        + "    if [ \"$(sed -n 1p %s 2>/dev/null | awk '{print $1}' | head -c 8)\" = \"$NEW8\" ] "
           "&& git merge --ff-only %s >> %s 2>&1 && ./install.sh >> %s 2>&1; then\n"
           % (latch, tag, log, log)
-        + "      if pub_intent \"$NEW8\"; then rm -f %s; OK=1; fi\n" % latch
+        + "      if pub_line \"$(sed -n 1p %s 2>/dev/null)\"; then rm -f %s; OK=1; fi\n" % (latch, latch)
         + "    fi\n"
         + "  fi\n"
         + "fi\n"
@@ -2457,26 +2457,37 @@ def _hex8(s):
     return bool(re.fullmatch(r"[0-9a-f]{8}", str(s or "")))
 
 
-def _intent_path(sha8):
-    """SHA-KEYED, one file per pending target: a fixed name let update B's staging destroy the
-    carried record of crashed update A — B failed too, and A's later heal then revived the stable
-    build under the stale dev marker (the adversarial review, 2026-08-20, reproduced end-to-end).
-    Keyed by sha, a newer staging for the SAME commit is simply the newer truth for it."""
-    gd = _update_git_dir()
-    return (gd / ("romp-update-channel.intent.%s" % sha8)) if gd is not None else None
-
-
-def _drop_channel_intent(sha8):
-    """Retire the intent of a latch line being MOOT-CLEARED: its move never landed, so its
-    channel must never be published by a later heal that happens to land on the same commit
-    (the adversarial review, 2026-08-20: a failed bootstrap's orphaned intent flipped a stable
-    machine to dev months later)."""
-    ip = _intent_path(sha8)
-    if ip is not None:
-        try:
-            ip.unlink()
-        except OSError:
-            pass
+def _publish_latch_channel(sha8):
+    """Publish the channel token RIDING ON the healed latch line, before the caller spends the
+    latch. The channel lives IN the line — "sha8 channel" — because every separate-file design
+    failed the same way twice (the adversarial reviews, 2026-08-20): a second file's lifetime
+    cannot be tied to the latch through crashes — orphans in the stage→arm window were published
+    by updates that never staged them (a signed tag update flipped a machine to dev), and drops
+    destroyed carried records. One file, one atomic write, one lifetime: a mooted or superseded
+    line's channel dies with it, and an updater that stages no channel writes a plain sha line
+    that publishes nothing. Every reader keeps parsing, because they all truncate lines to [:8].
+    Returns False ONLY on a real failure (unreadable latch, unwritable marker)."""
+    p = _install_latch_path()
+    if p is None:
+        return True
+    try:
+        raw = p.read_text().splitlines()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    want = str(sha8 or "")[:8]
+    for ln in raw:
+        toks = ln.strip().split()
+        if toks and toks[0][:8] == want:
+            if len(toks) < 2 or toks[1] not in ("stable", "dev"):
+                return True                       # a plain sha line stages no channel
+            try:
+                _atomic_write(p.parent / "romp-update-channel", toks[1])
+                return True
+            except OSError:
+                return False
+    return True
 
 
 def _publish_channel_intent(sha8):
@@ -2509,12 +2520,21 @@ def _publish_channel_intent(sha8):
 
 
 def _arm_latch(target8, prior8=""):
-    """Arm the intent, CARRYING a prior record instead of overwriting it; True when persisted."""
+    """Arm the intent, CARRYING a prior record instead of overwriting it; True when persisted.
+    Either argument may be a full "sha8 channel" line — dedup compares the sha halves only."""
     p = _install_latch_path()
     try:
         if p is None:
             raise OSError("no resolvable git dir for the checkout")
-        _atomic_write(p, target8 + ("\n" + prior8 if prior8 and prior8 != target8 else ""))
+        t_toks = target8.split()
+        p_toks = prior8.split() if prior8 else []
+        if p_toks and p_toks[0][:8] == t_toks[0][:8]:
+            # same commit: keep whichever record carries a channel token (the new one wins when
+            # both do) — a plain re-arm dropping a carried token lost the crashed update's
+            # channel (the adversarial review, 2026-08-20)
+            _atomic_write(p, target8 if len(t_toks) > 1 or len(p_toks) < 2 else prior8)
+        else:
+            _atomic_write(p, target8 + ("\n" + prior8 if prior8 else ""))
         return True
     except OSError as e:
         _sync_notice("could not persist the install-failed latch (%s) — a restart may boot the "
@@ -2888,7 +2908,6 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
                                "not restarting onto an unknown state; heal it by hand." % lines[0])
                 return
             else:
-                _drop_channel_intent(lines[0])        # a mooted move's channel is never published
                 _set_install_failed("")               # intent-only mismatch; the move never landed
     try:
         # DIRECT http.client, never urllib: urllib honors HTTP_PROXY, and with one set (NO_PROXY
@@ -2932,7 +2951,19 @@ def _settle_prior_latch(lock_fd):
     if cur in lines:
         if _converge_install(cur, lock_fd):
             return "", ""                             # healed and cleared
-        return "", cur                                # still broken: move FORWARD, carrying the record
+        # still broken: move FORWARD, carrying the FULL record — the line may hold the crashed
+        # update's channel token, which the eventual heal must still publish (the adversarial
+        # review, 2026-08-20: a carry that kept only the sha dropped the channel)
+        carry_line = cur
+        try:
+            p = _install_latch_path()
+            for ln in (p.read_text().splitlines() if p is not None else []):
+                if ln.strip().split() and ln.strip().split()[0][:8] == cur:
+                    carry_line = ln.strip()
+                    break
+        except OSError:
+            pass
+        return "", carry_line
     if len(lines) > 1:
         return ("this checkout's install latch names %s and a prior %s but HEAD is %s — an update "
                 "died mid-move from a broken state; heal it by hand (run install.sh, then remove "
@@ -2940,7 +2971,6 @@ def _settle_prior_latch(lock_fd):
     if not _hex8(lines[0]):
         return ("this checkout's install latch holds %r, which is not a commit — a corrupt or "
                 "foreign record is never moot; heal it by hand" % lines[0]), ""
-    _drop_channel_intent(lines[0])                    # a mooted move's channel is never published
     _set_install_failed("")                           # intent-only mismatch: the move never landed
     return "", ""
 
@@ -2974,7 +3004,7 @@ def _converge_install(sha8, lock_fd=None):
         _converge_note("the checkout advanced to %s but install.sh failed: %s — nothing restarts "
                        "onto it until install passes; fix the cause, then Update again" % (sha8, why))
         return False
-    if not _publish_channel_intent(sha8):
+    if not _publish_latch_channel(sha8):
         _converge_note("installed %s, but the update channel intended for it could not be "
                        "recorded — keeping the install latch so nothing runs this build under "
                        "the OLD channel marker; fix the checkout's git dir and update again"
@@ -3117,7 +3147,6 @@ def _boot_heal(wait_s=0):
             _converge_note("this checkout's install latch holds %r, which is not a commit — a "
                            "corrupt or foreign record is never moot; heal it by hand." % lines[0])
             return                                    # fail closed (see _hex8)
-        _drop_channel_intent(lines[0])                # a mooted move's channel is never published
         _set_install_failed("")                       # intent-only mismatch: the move never landed
     finally:
         try:
@@ -10699,31 +10728,24 @@ def _update_remote(host):
         "if res.returncode or not sha8:\n"
         "    sys.exit(5)\n"
         'lp=os.path.join(os.path.dirname(lock),"romp-install-failed")\n'
-        'ipb=os.path.join(os.path.dirname(lock),"romp-update-channel.intent.")\n'
-        "def pub(c):\n"
-        "    try:\n"
-        "        raw=open(ipb+c).read().splitlines()\n"
-        "    except FileNotFoundError:\n"
-        "        return True\n"
-        "    except OSError:\n"
-        "        return False\n"
-        '    w=raw[0].strip()[:8] if raw else ""\n'
-        '    ch=raw[1].strip() if len(raw)>1 else ""\n'
-        '    if w!=c or ch not in ("stable","dev"):\n'
+        'mk=os.path.join(os.path.dirname(lock),"romp-update-channel")\n'
+        "def pub_line(full):\n"
+        "    t=full.split()\n"
+        '    if len(t)<2 or t[1] not in ("stable","dev"):\n'
         "        return True\n"
         "    try:\n"
-        '        pfd=os.open(ipb+c+".pub",os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o644)\n'
+        '        pfd=os.open(mk+".pub",os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o644)\n'
         "        try:\n"
-        '            os.write(pfd,(ch+"\\n").encode())\n'
+        '            os.write(pfd,(t[1]+"\\n").encode())\n'
         "        finally:\n"
         "            os.close(pfd)\n"
-        '        os.replace(ipb+c+".pub",os.path.join(os.path.dirname(lock),"romp-update-channel"))\n'
-        "        os.remove(ipb+c)\n"
+        '        os.replace(mk+".pub",mk)\n'
         "        return True\n"
         "    except OSError:\n"
         "        return False\n"
         "try:\n"
-        '    lines=[l.strip()[:8] for l in open(lp).read().splitlines() if l.strip()]\n'
+        '    rawlines=open(lp).read().splitlines()\n'
+        '    lines=[l.strip().split()[0][:8] for l in rawlines if l.strip()]\n'
         "except FileNotFoundError:\n"
         "    lines=[]\n"
         "except OSError:\n"
@@ -10735,10 +10757,11 @@ def _update_remote(host):
         "    if not cur8:\n"
         "        sys.exit(9)\n"
         "    if cur8 in lines:\n"
+        '        curline=next((l.strip() for l in rawlines if l.strip().split() and l.strip().split()[0][:8]==cur8),cur8)\n'
         '        if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
-        "            carry=cur8\n"
-        "        elif not pub(cur8):\n"
-        "            carry=cur8\n"
+        "            carry=curline\n"
+        "        elif not pub_line(curline):\n"
+        "            carry=curline\n"
         "        else:\n"
         "            os.remove(lp)\n"
         "    elif len(lines)>1:\n"
@@ -10747,12 +10770,13 @@ def _update_remote(host):
         "        sys.exit(10)\n"
         "    else:\n"
         "        os.remove(lp)\n"
-        "        try:\n"
-        "            os.remove(ipb+lines[0])\n"
-        "        except OSError:\n"
-        "            pass\n"
         'tmp=lp+".tmp"\n'
-        'body=sha8+("\\n"+carry if carry and carry!=sha8 else "")\n'
+        "if carry and carry.split()[0][:8]==sha8:\n"
+        "    body=carry if len(carry.split())>1 else sha8\n"
+        "elif carry:\n"
+        '    body=sha8+"\\n"+carry\n'
+        "else:\n"
+        "    body=sha8\n"
         'tfd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o644)\n'
         "try:\n"
         "    os.write(tfd,body.encode())\n"
@@ -10763,7 +10787,7 @@ def _update_remote(host):
         "    sys.exit(6)\n"
         'if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
         "    sys.exit(4)\n"
-        "if not pub(sha8):\n"
+        "if not pub_line(body.splitlines()[0]):\n"
         "    sys.exit(4)\n"
         "os.remove(lp)' "
         '"$GD/romp-update.lock" "$R" %s >/dev/null 2>&1; RRC=$?; '

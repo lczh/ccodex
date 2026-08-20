@@ -490,7 +490,6 @@ class RunUpdate(Fresh):
             self._latch = latch.read_text().strip() if latch.exists() else None
             marker = root / ".git" / "romp-update-channel"
             self._marker = marker.read_text().strip() if marker.exists() else None
-            self._intent_exists = any(root.glob(".git/romp-update-channel.intent.*"))
             return ran.returncode, rows, report
 
     def test_the_report_states_what_the_restart_actually_did(self):
@@ -547,26 +546,25 @@ class RunUpdate(Fresh):
         # latch matching HEAD, its intent staged, and the marker stale — the updater's settle
         # heals it and must publish the intent before spending the latch
         rc, rows, report = self._execute_captured_updater(
-            0, pre_latch="deadbee1",
-            pre_files={".git/romp-update-channel": "dev\n",
-                       ".git/romp-update-channel.intent.deadbee1": "deadbee1\nstable\n"})
+            0, pre_latch="deadbee1 stable",
+            pre_files={".git/romp-update-channel": "dev\n"})
         self.assertEqual(rc, 0)
         self.assertTrue(report["ok"])
         self.assertEqual(self._marker, "stable",
                          "the healed build wears the channel its update intended")
         self.assertIsNone(self._latch)
-        self.assertFalse(self._intent_exists, "the intent is spent")
+        self.assertIsNone(self._latch, "the record and its channel are spent together")
 
-    def test_a_foreign_intent_is_not_published_by_the_tag_settle(self):
-        # sha-keyed lookup: an intent staged for ANOTHER commit must never decide this heal's
-        # channel (the adversarial review, 2026-08-20 — publish-on-mismatch mutants survived)
+    def test_a_plain_sha_latch_line_publishes_no_channel(self):
+        # in-channel updaters (this one included) arm plain sha lines: healing one changes no
+        # marker, and there is no separate file for a stranger's record to poison (the
+        # adversarial review, 2026-08-20)
         rc, rows, report = self._execute_captured_updater(
             0, pre_latch="deadbee1",
-            pre_files={".git/romp-update-channel": "dev\n",
-                       ".git/romp-update-channel.intent.aaaaaaaa": "aaaaaaaa\nstable\n"})
+            pre_files={".git/romp-update-channel": "dev\n"})
         self.assertEqual(rc, 0)
         self.assertTrue(report["ok"])
-        self.assertEqual(self._marker, "dev", "someone else's intent is not ours to publish")
+        self.assertEqual(self._marker, "dev", "a plain line stages no channel")
 
     def test_the_settle_never_moot_clears_a_nonhex_latch_line(self):
         # a torn quarantine prefix is one non-hex line; the old settle rm -f'd it as moot and

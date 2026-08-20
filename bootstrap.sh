@@ -272,65 +272,47 @@ def write_latch(sha8):
     os.replace(tmp, latch)
 
 
-def intent_for(s8):
-    """SHA-KEYED, one file per pending target (the adversarial review, 2026-08-20: a fixed name
-    let this staging destroy the carried record of a CRASHED earlier update — its later heal then
-    revived the stable build under the stale dev marker)."""
-    return os.path.join(gdir, "romp-update-channel.intent." + s8)
-
-
-def publish_intent(cur8):
-    """Publish a staged channel intent matching cur8 to the marker; True when there is nothing to
-    do. A healed build must wear the channel its update intended: the v1.3.8 audit reproduced a
-    hard death right after the checkout moved — the gate healed the stable target while the
-    marker still said dev, and the healed build followed unsigned main."""
-    ip = intent_for(cur8)
+def publish_line(full):
+    """Publish the channel token riding ON a latch line ("sha8 channel") to the marker; True when
+    the line stages no channel. The channel lives IN the latch since 2026-08-20: every
+    separate-file design failed the same way twice — a second file's lifetime cannot follow the
+    latch across crashes (orphans were published by updates that never staged them; drops
+    destroyed carried records). One file, one atomic write, one lifetime."""
+    toks = full.split()
+    if len(toks) < 2 or toks[1] not in ("stable", "dev"):
+        return True
+    mk = os.path.join(gdir, "romp-update-channel")
     try:
-        raw = open(ip).read().splitlines()
-    except FileNotFoundError:
+        with open(mk + ".pub", "w") as pf:
+            pf.write(toks[1] + "\n")
+        os.replace(mk + ".pub", mk)
         return True
     except OSError:
         return False
-    want = raw[0].strip()[:8] if raw else ""
-    ch = raw[1].strip() if len(raw) > 1 else ""
-    if want != cur8 or ch not in ("stable", "dev"):
-        return True                        # someone else's intent: not ours to publish
-    try:
-        with open(ip + ".pub", "w") as pf:
-            pf.write(ch + "\n")
-        os.replace(ip + ".pub", os.path.join(gdir, "romp-update-channel"))
-        os.remove(ip)
-        return True
-    except OSError:
-        return False
-
-
-def drop_intent(s8):
-    try:
-        os.remove(intent_for(s8))         # a mooted/failed move's channel is never published
-    except OSError:
-        pass
 
 
 try:
-    lines = [ln.strip()[:8] for ln in open(latch).read().splitlines() if ln.strip()]
+    rawlines = [ln.strip() for ln in open(latch).read().splitlines() if ln.strip()]
 except FileNotFoundError:
-    lines = []
+    rawlines = []
 except OSError:
     sys.exit(3)                              # an EXISTING record we cannot read is UNKNOWN, never absent
+lines = [ln.split()[0][:8] for ln in rawlines]
 pre_head = head8()
 carry = ""
 if lines:
     if not pre_head:
         sys.exit(3)                          # can't settle a prior record against an unreadable HEAD
     if pre_head in lines:
-        # heal-first, but a heal that still fails CARRIES the record into the new arm instead of
-        # blocking the very update that may fix install.sh (the adversarial review, 2026-08-19)
+        # heal-first, but a heal that still fails CARRIES the full record — channel token and
+        # all — into the new arm instead of blocking the very update that may fix install.sh
+        # (the adversarial reviews, 2026-08-19/20)
+        cur_line = next(ln for ln in rawlines if ln.split()[0][:8] == pre_head)
         if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root,
                           pass_fds=(fd,)).returncode:
-            carry = pre_head
-        elif not publish_intent(pre_head):
-            carry = pre_head                 # healed, but its channel could not be recorded: the
+            carry = cur_line
+        elif not publish_line(cur_line):
+            carry = cur_line                 # healed, but its channel could not be recorded: the
             #                                  record rides forward and a later heal retries
         else:
             os.remove(latch)
@@ -341,8 +323,8 @@ if lines:
         #                                      (the v1.3.8 audit: a torn quarantine prefix parsed
         #                                      as one line and was moot-cleared into serving)
     else:
-        os.remove(latch)                     # intent-only mismatch: the move never landed
-        drop_intent(lines[0])
+        os.remove(latch)                     # intent-only mismatch: the move never landed — and
+        #                                      the line's channel token dies with it
 # the channel marker is STAGED here — content written to the temp before anything moves, so
 # the only marker step left after the moves is one atomic rename. A failure here costs nothing:
 # HEAD is unmoved, no latch is armed, the old marker still matches the old HEAD (rc 11).
@@ -350,12 +332,6 @@ ctmp = os.path.join(gdir, "romp-update-channel.tmp")
 try:
     with open(ctmp, "w") as cf:
         cf.write(channel + "\n")
-    # the INTENT is the durable recovery record: (target sha, channel), staged BEFORE anything
-    # moves — a healer reviving this move after a crash publishes the marker FROM it before
-    # spending the latch (the v1.3.8 audit's reproduced hard-death-after-checkout)
-    with open(intent_for(target[:8]) + ".stage", "w") as inf:
-        inf.write(target[:8] + "\n" + channel + "\n")
-    os.replace(intent_for(target[:8]) + ".stage", intent_for(target[:8]))
 except OSError:
     sys.exit(11)
 
@@ -395,10 +371,15 @@ def stuck_latch():
             #                                      claiming quarantine
 
 
+# the ARM line carries the channel: "target8 channel". The durable recovery record and the
+# install intent are ONE atomic write with ONE lifetime — a healer reviving this move after any
+# crash publishes the token before spending the line (the v1.3.8 audit's hard-death repro), a
+# mooted or superseded line's channel dies with it, and there is no second file to orphan or
+# clobber (the adversarial reviews, 2026-08-20, twice).
 try:
-    write_latch(target[:8] + ("\n" + carry if carry and carry != target[:8] else ""))
+    write_latch(target[:8] + " " + channel
+                + ("\n" + carry if carry and carry.split()[0][:8] != target[:8] else ""))
 except OSError:
-    drop_intent(target[:8])                  # no latch will ever key this intent's retirement
     sys.exit(5)
 for mv in moves:
     if subprocess.run(["git", "-C", root] + mv).returncode:
@@ -421,16 +402,16 @@ for mv in moves:
                 sys.exit(12 if stuck_latch() else 13)
         try:
             if now and now != pre_head:
-                write_latch(now + ("\n" + carry if carry and carry != now else ""))
+                if carry and carry.split()[0][:8] == now:
+                    write_latch(carry if len(carry.split()) > 1 else now)
+                else:
+                    write_latch(now + ("\n" + carry if carry else ""))
             elif carry:
                 write_latch(carry)           # HEAD unmoved: the carried prior record returns
             else:
                 os.remove(latch)
         except OSError:
             pass                             # the armed target latch stays — fail closed
-        drop_intent(target[:8])              # THIS update failed: its channel is never published
-        #                                      (the publish leg above already spent it when the
-        #                                      target was genuinely reached and moved-to)
         sys.exit(6)
 # the CHANNEL marker is PUBLISHED here — INSIDE the lock (the user's audit, 2026-08-19: the
 # shell wrote it after the lock released, so two serial bootstraps could publish their markers
@@ -450,7 +431,6 @@ if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root, pass_fds
                   env=env).returncode:
     sys.exit(4)                        # latch stays armed: nothing runs this build until install passes
 os.remove(latch)
-drop_intent(target[:8])                # spent: this transaction already published the marker
 sys.exit(0)
 TXNPY
 case "$txn_rc" in

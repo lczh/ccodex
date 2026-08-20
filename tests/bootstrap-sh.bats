@@ -379,7 +379,9 @@ WRAP
     [ "$status" -ne 0 ]
     [[ "$output" == *"latch is armed"* ]]
     gd="$(git -C "$HOME/romp" rev-parse --absolute-git-dir)"
-    [ "$(cat "$gd/romp-install-failed")" = "$(git -C "$HOME/romp" rev-parse --short=8 HEAD | head -c 8)" ]
+    [ "$(sed -n 1p "$gd/romp-install-failed" | awk '{print $1}')" = "$(git -C "$HOME/romp" rev-parse --short=8 HEAD | head -c 8)" ]
+    [ "$(sed -n 1p "$gd/romp-install-failed" | awk '{print $2}')" = "stable" ]   # the channel
+    #                                                    rides IN the record (2026-08-20)
 }
 
 @test "bootstrap.sh: a held update lock refuses the re-run instead of racing the updater" {
@@ -455,7 +457,7 @@ HOLDPY
     [ "$status" -ne 0 ]
     new8="$(git -C "$HOME/romp" rev-parse --short=8 HEAD | head -c 8)"
     [ "$new8" != "$cur8" ]                              # forward progress: HEAD reached the new tag
-    [ "$(sed -n 1p "$gd/romp-install-failed")" = "$new8" ]   # the intent line
+    [ "$(sed -n 1p "$gd/romp-install-failed" | awk '{print $1}')" = "$new8" ]   # the intent line
     [ "$(sed -n 2p "$gd/romp-install-failed")" = "$cur8" ]   # the CARRIED prior — never orphaned
     # and when install is FIXED, a re-run heals everything and spends the latch entirely
     printf '#!/usr/bin/env bash\necho STUB_INSTALL_RAN\n' > "$HOME/romp/install.sh"
@@ -510,7 +512,6 @@ HOLDPY
     [ "$status" -eq 0 ]
     [ "$(cat "$gd/romp-update-channel")" = "stable" ]
     [ ! -e "$gd/romp-install-failed" ]
-    [ ! -e "$gd/romp-update-channel.intent.$(git -C "$root" rev-parse --short=8 HEAD)" ]   # spent
 }
 
 @test "bootstrap.sh: an unstageable channel marker refuses BEFORE anything moves (rc 11)" {
@@ -590,22 +591,19 @@ PYEOF
     run python3 "$TEST_DIR/die-at-publish.py" "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "stable" checkout --detach "$target"
     [ "$status" -eq 137 ]
     [ "$(git -C "$root" rev-parse HEAD)" = "$target" ]                     # HEAD moved
-    [ "$(cat "$gd/romp-install-failed")" = "$(git -C "$root" rev-parse --short=8 HEAD)" ]
-    [ "$(cat "$gd/romp-update-channel")" = "dev" ]                         # the audit's exact state
     t8="$(git -C "$root" rev-parse --short=8 HEAD)"
-    [ -e "$gd/romp-update-channel.intent.$t8" ]
+    [ "$(cat "$gd/romp-install-failed")" = "$t8 stable" ]   # sha AND channel, one atomic record
+    [ "$(cat "$gd/romp-update-channel")" = "dev" ]                         # the audit's exact state
     # now the gate revives it — and must publish the intent BEFORE spending the latch
     run python3 "$TEST_DIR/gate.py" "$root"
     [ "$status" -eq 0 ]
     [ "$(cat "$gd/romp-update-channel")" = "stable" ]
     [ ! -e "$gd/romp-install-failed" ]
-    [ ! -e "$gd/romp-update-channel.intent.$t8" ]
 }
 
-@test "bootstrap.sh: a hard death AT the checkout move still leaves the staged intent" {
-    # pins the ORDER (the adversarial review, 2026-08-20: the die-at-publish repro let a mutant
-    # that stages the intent after the moves pass): the process dies the instant the move lands,
-    # and the intent must ALREADY be on disk for the healer.
+@test "bootstrap.sh: a hard death AT the checkout move still leaves the armed channel record" {
+    # pins the ORDER (the adversarial review, 2026-08-20): the process dies the instant the move
+    # lands, and the record — sha AND channel, one atomic write — must ALREADY be on disk.
     sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
     sed -n "/<<'GATEPY'/,/^GATEPY\$/p" "$REPO_ROOT/bin/romp-serve" | sed '1d;$d' > "$TEST_DIR/gate.py"
     cat > "$TEST_DIR/die-at-move.py" <<'PYEOF'
@@ -639,17 +637,16 @@ PYEOF
     [ "$status" -eq 137 ]
     t8="$(git -C "$root" rev-parse --short=8 HEAD)"
     [ "$(git -C "$root" rev-parse HEAD)" = "$target" ]
-    [ -e "$gd/romp-update-channel.intent.$t8" ]     # staged BEFORE anything moved
+    [ "$(cat "$gd/romp-install-failed")" = "$t8 stable" ]   # armed BEFORE anything moved
     run python3 "$TEST_DIR/gate.py" "$root"
     [ "$status" -eq 0 ]
     [ "$(cat "$gd/romp-update-channel")" = "stable" ]
 }
 
-@test "bootstrap.sh: a crashed update's intent survives a LATER update's staging" {
-    # the adversarial review, 2026-08-20 (reproduced end-to-end): with a FIXED intent name,
-    # update B's staging destroyed crashed update A's record while A's latch line was carried —
-    # A's later heal then revived the stable build under the stale dev marker. Keyed by sha,
-    # B stages its own file and A's survives.
+@test "bootstrap.sh: a crashed update's channel record survives a LATER failed update" {
+    # the adversarial review, 2026-08-20 (reproduced end-to-end, twice, against two intent-file
+    # designs): crashed update A's channel record must survive failed update B. The channel now
+    # rides IN A's latch line, and B's carry preserves the FULL line.
     sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
     sed -n "/<<'GATEPY'/,/^GATEPY\$/p" "$REPO_ROOT/bin/romp-serve" | sed '1d;$d' > "$TEST_DIR/gate.py"
     cat > "$TEST_DIR/die-at-publish.py" <<'PYEOF'
@@ -683,14 +680,14 @@ PYEOF
     run python3 "$TEST_DIR/die-at-publish.py" "$TEST_DIR/txn.py" "$root" "$gd" "$X" "-" "stable" checkout --detach "$X"
     [ "$status" -eq 137 ]
     x8="$(git -C "$root" rev-parse --short=8 HEAD)"
-    [ -e "$gd/romp-update-channel.intent.$x8" ]
+    [ "$(cat "$gd/romp-install-failed")" = "$x8 stable" ]
     # update B (dev, target Y) runs before any healer, with a FAILING install: its settle-heal of
-    # A's latch fails (carry), it stages ITS OWN intent, and its move fails — B exits 6
+    # A's latch fails (carry rides the FULL line), and its move fails — B exits 6
     printf '#!/usr/bin/env bash\nexit 1\n' > "$root/install.sh"
     git -C "$root" branch rel
     run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$Y" "-" "dev" branch -f rel/14 "$Y"
     [ "$status" -eq 6 ]
-    [ -e "$gd/romp-update-channel.intent.$x8" ]     # A's record SURVIVES B (sha-keyed)
+    [ "$(cat "$gd/romp-install-failed")" = "$x8 stable" ]   # A's FULL record survives B
     # install recovers; the gate heals A's latch and must land A's intended channel
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     run python3 "$TEST_DIR/gate.py" "$root"
@@ -698,10 +695,11 @@ PYEOF
     [ "$(cat "$gd/romp-update-channel")" = "stable" ]
 }
 
-@test "bootstrap.sh: a failed move on an already-at-target checkout retires its OWN intent" {
-    # the adversarial review, 2026-08-20 (reproduced): the failed-move leg refused the marker
-    # flip but LEFT the intent — a later heal of an unrelated prior latch at the same commit then
-    # performed exactly the flip the failed bootstrap refused
+@test "bootstrap.sh: a failed move on an already-at-target checkout leaves NO channel record" {
+    # the adversarial review, 2026-08-20 (reproduced): a failed dev-switch's channel record must
+    # die with the failed transaction — a survivor was published by a later unrelated heal at
+    # the same commit, flipping a stable machine to dev. The record IS the latch line now, and
+    # the exit-6 leg removes it (no carry) or restores the prior line (carry)
     sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
     root="$TEST_DIR/clone"; mkdir -p "$root"
     git -C "$root" init -q -b main .
@@ -716,11 +714,12 @@ PYEOF
     run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "dev" branch -f rel/14 "$target"
     [ "$status" -eq 6 ]
     [ "$(cat "$gd/romp-update-channel")" = "stable" ]
-    [ ! -e "$gd/romp-update-channel.intent.$t8" ]   # the failed update's channel is dead with it
+    [ ! -e "$gd/romp-install-failed" ]              # the failed update's record is dead with it
 }
 
-@test "bootstrap.sh: the gate never publishes a FOREIGN intent" {
-    # sha-keyed lookup: an intent staged for another commit must not decide this heal's channel
+@test "bootstrap.sh: the gate publishes nothing for a PLAIN sha latch line" {
+    # in-channel updaters arm plain sha lines: healing one changes no marker, and there is no
+    # separate file for a stranger's record to poison (the adversarial review, 2026-08-20)
     sed -n "/<<'GATEPY'/,/^GATEPY\$/p" "$REPO_ROOT/bin/romp-serve" | sed '1d;$d' > "$TEST_DIR/gate.py"
     root="$TEST_DIR/clone"; mkdir -p "$root"
     git -C "$root" init -q -b main .
@@ -730,10 +729,9 @@ PYEOF
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
     git -C "$root" rev-parse --short=8 HEAD > "$gd/romp-install-failed"
     printf 'dev\n' > "$gd/romp-update-channel"
-    printf 'aaaaaaaa\nstable\n' > "$gd/romp-update-channel.intent.aaaaaaaa"
     run python3 "$TEST_DIR/gate.py" "$root"
     [ "$status" -eq 0 ]
-    [ "$(cat "$gd/romp-update-channel")" = "dev" ]  # someone else's intent is not ours
+    [ "$(cat "$gd/romp-update-channel")" = "dev" ]  # a plain line stages no channel
     [ ! -e "$gd/romp-install-failed" ]
 }
 
@@ -745,9 +743,7 @@ PYEOF
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
-    git -C "$root" rev-parse --short=8 HEAD > "$gd/romp-install-failed"
-    printf '%s\nstable\n' "$(git -C "$root" rev-parse --short=8 HEAD)" \
-        > "$gd/romp-update-channel.intent.$(git -C "$root" rev-parse --short=8 HEAD)"
+    printf '%s stable' "$(git -C "$root" rev-parse --short=8 HEAD)" > "$gd/romp-install-failed"
     mkdir "$gd/romp-update-channel"        # the marker cannot be written
     run python3 "$TEST_DIR/gate.py" "$root"
     [ "$status" -eq 70 ]                   # heal incomplete: not started under the OLD channel
@@ -829,7 +825,7 @@ PYEOF
     target="$(git -C "$root" rev-parse HEAD)"
     run python3 "$TEST_DIR/wrap.py" "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "stable"
     [ "$status" -eq 13 ]
-    [ "$(cat "$gd/romp-install-failed")" = "$(git -C "$root" rev-parse --short=8 HEAD)" ]
+    [ "$(cat "$gd/romp-install-failed")" = "$(git -C "$root" rev-parse --short=8 HEAD) stable" ]
     [ ! -e "$gd/romp-update-channel" ]
 }
 
