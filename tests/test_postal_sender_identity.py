@@ -57,7 +57,12 @@ class SendRefusal(unittest.TestCase):
 
     def test_mcp_and_cli_guards_precede_the_post(self):
         src = open(os.path.join(BIN, "romp-postal-service")).read()
-        self.assertEqual(src.count("identity did not resolve"), 2, "both sender surfaces guard")
+        self.assertIn("identity did not resolve", src, "the MCP surface guards (always in-session)")
+        self.assertIn("pass --from <label>", src,
+                      "the CLI surface guards AND names the non-session door (2026-08-19: the "
+                      "refusal broke launchd scripts that had been mailing as 'unknown')")
+        self.assertIn('mid = frm_label, "ext:" + frm_label', src,
+                      "--from mails placeable under a stable synthetic id, never anonymously")
 
 
 if __name__ == "__main__":

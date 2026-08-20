@@ -37,7 +37,11 @@ export function apiErrorReason(f: ApiErrorFacts): string {
   // session-specific fault from the outside, and it is far likelier to hit a LONG thread — a big request
   // needs more capacity at once, so a fresh session sails through the same minute a full one keeps bouncing.
   if (s === 529) return "the API was overloaded — server-side and temporary, not this session";
-  if (s === 429) return "rate limited — the account's quota, not this session";
+  // Account-WIDE, but not necessarily "quota": an API key hits per-minute org rate limits (keys are
+  // never unlimited — RPM/TPM by usage tier), a subscription hits its usage window. Both clear on
+  // their own; naming "quota" alone sent a key-billed user hunting for a cap that wasn't the cause
+  // (the user 2026-08-19). Parallel sessions sharing one key make the per-minute case the common one.
+  if (s === 429) return "rate limited account-wide (per-minute limits or the plan's usage window) — not this session, retries clear it";
   if (s === 401 || s === 403) return "the API rejected our credentials";
   if (s === 404) return "the API says that model does not exist";
   if (s >= 500) return "server-side and temporary";

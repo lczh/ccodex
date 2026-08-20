@@ -51,8 +51,9 @@ test("Submit DRAFTS one assembled message — it never sends, and never clobbers
   assert.match(body, /buildReviewMessage\(path, list\)/);
   assert.match(body, /commentSink!\(/);
   assert.doesNotMatch(body, /sendMessage/, "Submit drafts; the person sends");
-  // the composer side appends and remembers the draft
-  const sink = RENDER.slice(RENDER.indexOf("setCommentSink((text) => {"));
+  // the composer side appends and remembers the draft (sid-routed since 2026-08-19 —
+  // docreview.test.ts pins the routing + the preserve-on-failure contract)
+  const sink = RENDER.slice(RENDER.indexOf("setCommentSink((sid, text) => {"));
   const sinkBody = sink.slice(0, sink.indexOf("\n});"));
   assert.match(sinkBody, /ta\.value = ta\.value \+ sep \+ text;/);
   assert.match(sinkBody, /drafts\.set\(sid, ta\.value\);/);

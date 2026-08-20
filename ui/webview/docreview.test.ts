@@ -122,3 +122,30 @@ test("comments are keyed per session AND per file, so two open docs keep separat
   assert.notEqual(docKey("s1", "a.md"), docKey("s1", "b.md"));
   assert.notEqual(docKey("s1", "a.md"), docKey("s2", "a.md"));
 });
+
+// ── the submit handoff (2026-08-19): two user-data-loss bugs from one root, pinned at source ──
+import * as fs from "node:fs";
+import * as path from "node:path";
+const FV = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "file-view.ts"), "utf8");
+const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
+
+test("submit routes by the REVIEWED session's sid, never activeId-at-submit", () => {
+  assert.match(FV, /let commentSink: \(\(sid: string, text: string\) => boolean\) \| null = null;/,
+    "the sink contract carries the sid and reports whether the draft landed");
+  assert.match(FV, /const landed = commentSink!\(sid \|\| "",/, "the viewer passes ITS OWN sid");
+  assert.match(RENDER, /setCommentSink\(\(sid, text\) => \{/);
+  assert.match(RENDER, /if \(sid === activeId\) \{/, "active tab → the live textarea");
+  assert.match(RENDER, /const prev = drafts\.get\(sid\) \|\| "";/,
+    "any other sid → straight into that session's persisted draft");
+});
+
+test("a failed handoff PRESERVES the comments and says so — never a silent erase", () => {
+  assert.match(FV, /if \(!landed\) \{/);
+  assert.match(FV, /submitBtn\.textContent = "Couldn't draft it — comments kept, try again";/,
+    "visible, and the button re-arms for a retry");
+  const at = FV.indexOf("if (!landed) {");
+  const del = FV.indexOf("comments.delete(key);", at);
+  const ret = FV.indexOf("return;", at);
+  assert.ok(ret > 0 && (del < 0 || ret < del), "comments.delete is gated BEHIND the landed return");
+  assert.match(RENDER, /if \(!sid\) return false;/, "a sid-less viewer cannot land a draft — say so, keep the work");
+});

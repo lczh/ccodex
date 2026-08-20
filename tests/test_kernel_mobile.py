@@ -83,7 +83,14 @@ class LandingShell(unittest.TestCase):
         # bar itself was hidden behind the keyboard. Collapse the reservation to 0 when the keyboard is open
         # (visual viewport much shorter than the layout viewport), restore it when the keyboard closes.
         js = km._LANDING_MOBILE_JS
-        self.assertIn("function kbOpen(){var vv=window.visualViewport;return vv?(window.innerHeight-vv.height>120):false;}", js)
+        # scale-aware (the user 2026-08-19): a desktop pinch shrinks vv.height by the zoom factor; height*scale
+        # recovers the layout height, so a pinch never reads as "keyboard open" (or re-fits --app-h smaller)
+        self.assertIn("function kbOpen(){var vv=window.visualViewport;return vv?(window.innerHeight-vv.height*(vv.scale||1)>120):false;}", js)
+        # desktop (fine pointer) uses innerHeight outright — pinch-immune in every browser, no scale
+        # arithmetic (desktop Firefox does not reliably report vv.scale during a pinch); the visual
+        # viewport drives the fit only on coarse-pointer devices, where keyboards/toolbars live
+        self.assertIn("var coarse=window.matchMedia&&matchMedia('(pointer: coarse)').matches;", js)
+        self.assertIn("var h=(!coarse||!vv)?window.innerHeight:Math.round(vv.height*(vv.scale||1));", js)
         self.assertIn("--mtabs-h',(kbOpen()?0:(bar.offsetHeight||0))+'px'", js)
 
     def test_usage_modal_dismisses_via_a_real_backdrop_not_a_document_click(self):

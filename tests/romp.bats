@@ -168,6 +168,39 @@ MOCK
     grep '/send' "$MOCK_LOG" | grep 'ideabox' | grep -q 'look into the flaky test'
 }
 
+@test "fork: POST /fork with parent, new name and optional --at cut" {
+    _stub_curl
+    touch "$MOCK_LOG"
+    export ROMP_SERVE_TOKEN=testtok
+    run run_romp fork exp-web exp-web-stage2
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"branched from"* ]]
+    grep '/fork' "$MOCK_LOG" | grep -q '"parent": *"exp-web"'
+    grep '/fork' "$MOCK_LOG" | grep -q '"name": *"exp-web-stage2"'
+    # --at rides through as the cut record
+    run run_romp fork --at aaaabbbb-1111-2222-3333-444455556666 exp-web exp-web-fig
+    [ "$status" -eq 0 ]
+    grep '/fork' "$MOCK_LOG" | grep -q '"at": *"aaaabbbb-1111-2222-3333-444455556666"'
+}
+
+@test "fork: usage errors exit 2; no kernel token is a loud exit 1" {
+    touch "$MOCK_LOG"
+    run run_romp fork
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"usage: romp fork"* ]]
+    run run_romp fork only-parent
+    [ "$status" -eq 2 ]
+    run run_romp fork exp-web new-name extra-arg
+    [ "$status" -eq 2 ]
+    run run_romp fork --at "" exp-web new-name
+    [ "$status" -eq 2 ]
+    # hermetic env has no serve token: the failure names the kernel, and no API call is made
+    run run_romp fork exp-web new-name
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"kernel isn't running"* ]]
+    [ "$(grep -c '/fork' "$MOCK_LOG")" -eq 0 ]
+}
+
 @test "new --tag rides the /send tag field; needs -m; bad labels exit 2" {
     _stub_curl
     touch "$MOCK_LOG"

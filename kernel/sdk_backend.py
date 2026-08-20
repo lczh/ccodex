@@ -3014,7 +3014,16 @@ class SdkBackend:
                     if r.get("effortPending") or r.get("modelPending"):
                         self._update_reg(sid, effortPending=False, modelPending=False)
                     queued = [t for t in (r.get("queue") or []) if isinstance(t, str) and t]
-                    cut = last_state_value(self.state_dir, sid) == "working"
+                    # A cut turn is any MACHINE-ACTIVE last state, not just "working" (the user
+                    # 2026-08-19, whose figure session sat blocked-on-you after every restart that
+                    # landed mid-API-retry): "retrying" is a long-lived open-turn state — the CLI is
+                    # mid-turn waiting out an API error — and "compacting" likewise. A restart
+                    # during either cut the turn exactly as a working cut does, but the == "working"
+                    # test skipped the machineCut stamp AND the resume nudge, so the bare stop
+                    # record read as the user's Esc (INTERRUPT_BLOCK_WHY) and nothing ever resumed
+                    # the session. "permission"/"picker" stay excluded: those turns were already
+                    # waiting on the user, so blocked-on-you is the truth there.
+                    cut = last_state_value(self.state_dir, sid) in ("working", "retrying", "compacting")
                     # bg tasks the dead kernel's CLI took with it (the reg mirror, _on_task_event):
                     # the session must HEAR about them or it waits forever on a dead timer/watcher.
                     dead_tasks = [t for t in (r.get("bgTasks") or []) if isinstance(t, dict)]

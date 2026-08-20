@@ -73,6 +73,10 @@ test("the lightbox offers a download beside the close, saving the same bytes it 
   assert.ok(body.indexOf("dl.onclick = (ev) => ev.stopPropagation()") > 0,
     "saving must not also dismiss the lightbox");
   assert.ok(body.indexOf('bar.append(name, dl, close)') > 0, "between the filename and the ✕");
+  // an inline TRAY SVG, not a codepoint: "⭳" (U+2B73) has no coverage in the mac system fonts and
+  // rendered as a tofu box (the user 2026-08-19). Same stroke family as the composer's buttons.
+  assert.ok(body.indexOf('<polyline points="7 10 12 15 17 10"/>') > 0, "the arrow-into-tray glyph");
+  assert.ok(body.indexOf("\u2b73") < 0 && body.indexOf("⭳") < 0, "the uncovered codepoint is gone");
   const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "styles.css"), "utf8");
   assert.match(CSS, /\.romp-lightbox-dl \{ font: inherit; font-size: 0\.86em;/,
     "one control vocabulary — the same chip dress as the close beside it");

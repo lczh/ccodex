@@ -21,21 +21,28 @@ test("executed: the all-view minus hidden; a group exactly; membership beats hid
   assert.equal(viewVisible({ active: "gone", groups: [] }, "s1"), true, "an orphaned active fails open");
 });
 
-test("executed: hide adds the bit; reveal drops it and falls back to All when the group excludes it", () => {
+test("executed: hide leaves the default group (and the active group); reveal SWITCHES views", () => {
   const hid = hideIn({ active: "all", hidden: [] }, "s1");
-  assert.deepEqual(hid.hidden, ["s1"]);
+  assert.deepEqual(hid.hidden, ["s1"], "hiding = leaving the default group");
   assert.deepEqual(hideIn(hid, "s1").hidden, ["s1"], "idempotent");
   // hiding while a group that CONTAINS the session is active must also leave that group — membership
   // beats hidden, so without this the gesture is a silent no-op
   const g = hideIn({ active: "g1", hidden: [], groups: [{ id: "g1", members: ["s2", "s3"] }, { id: "g2", members: ["s2"] }] }, "s2");
   assert.deepEqual(g.hidden, ["s2"]);
   assert.deepEqual(g.groups![0].members, ["s3"], "dropped from the ACTIVE group");
-  assert.deepEqual(g.groups![1].members, ["s2"], "other groups keep it");
-  const rev = revealIn({ active: "g1", hidden: ["s1"], groups: [G] }, "s1");
-  assert.deepEqual(rev.hidden, []);
-  assert.equal(rev.active, "all", "the active group excludes it → fall back to All");
-  const rev2 = revealIn({ active: "g1", hidden: ["s2"], groups: [G] }, "s2");
-  assert.equal(rev2.active, "g1", "a member reveals in place — no view switch");
+  assert.deepEqual(g.groups![1].members, ["s2"], "other groups keep it — multi-membership");
+  // reveal never mutates membership (the user 2026-08-19: peeking at a pool worker must not drag it
+  // back into the default group) — it switches the active view to one that shows the session
+  const rev = revealIn({ active: "g1", hidden: [], groups: [G] }, "s1");
+  assert.equal(rev.active, "all", "still in the default group → switch to it");
+  assert.deepEqual(rev.hidden, [], "…and nothing edited");
+  const rev2 = revealIn({ active: "all", hidden: ["s2"], groups: [G] }, "s2");
+  assert.equal(rev2.active, "g1", "out of default but in a group → switch to that group");
+  assert.deepEqual(rev2.hidden, ["s2"], "membership untouched — the peek is temporary");
+  const rev3 = revealIn({ active: "all", hidden: ["sX"], groups: [G] }, "sX");
+  assert.deepEqual(rev3.hidden, [], "in NO view at all → re-added to the default group (the one edit)");
+  const rev4 = revealIn({ active: "g1", hidden: ["s2"], groups: [G] }, "s2");
+  assert.equal(rev4.active, "g1", "already visible in the active group → nothing changes");
 });
 
 test("executed: the canonical key ignores list order — the kernel normalizer re-sorts", () => {

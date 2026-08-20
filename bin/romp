@@ -656,6 +656,7 @@ For scripts / agents:
 EOF
     _romp_cmd "romp url"                   -            "Print ONLY the tokened dashboard URL (for scripts; humans just run \`romp\`)"
     _romp_cmd "romp sessions [--json]"     -            "List the fleet with each session's state, colours and backend"
+    _romp_cmd "romp fork <parent> <name>"  -            "Branch a session into a new parallel one (parent untouched; --at <uuid> picks the cut)"
     _romp_cmd "romp mail ..."              romp-postal-service  "Romp Postal Service: send <to> <text> | inbox | agents | remote"
     _romp_cmd "romp send <session> <text>" -            "Hand a session a message (kernel API, either backend)"
     _romp_cmd "romp interrupt <session>"   -            "Interrupt a session's current turn"
@@ -794,6 +795,47 @@ for r in rows:
                                      r.get("backend") or "", r.get("dir") or ""))
 '
     exit 0
+fi
+
+# Fork a session into a NEW parallel one (the user 2026-08-19, via the lab workflow: per-stage
+# experiment splits were hand-driving the kernel's WS forkSession op — websocket surgery nobody
+# should repeat). Rides the kernel's POST /fork, the WS op as a one-shot route beside /new and
+# /send: parent untouched, explicit new name, tip fork by default, --at <record-uuid> for a cut
+# point, and the fork is discoverable in `romp sessions` the moment this acks.
+if [[ "${1:-}" == "fork" ]]; then
+    shift
+    _fork_usage="usage: romp fork <parent> <new-name> [--at <record-uuid>]"
+    parent_arg=""; newname_arg=""; at_arg=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --at) shift
+                  if [[ $# -eq 0 || -z "$1" || "$1" == -* ]]; then echo "$_fork_usage" >&2; exit 2; fi
+                  at_arg="$1"; shift ;;
+            -*)   echo "$_fork_usage" >&2; exit 2 ;;
+            *)    if [[ -z "$parent_arg" ]]; then parent_arg="$1"
+                  elif [[ -z "$newname_arg" ]]; then newname_arg="$1"
+                  else echo "$_fork_usage" >&2; exit 2; fi
+                  shift ;;
+        esac
+    done
+    if [[ -z "$parent_arg" || -z "$newname_arg" ]]; then echo "$_fork_usage" >&2; exit 2; fi
+    _tok="$(_romp_token)"
+    _kport="${ROMP_KERNEL_PORT:-29855}"
+    if [[ -z "$_tok" ]]; then
+        echo "romp fork: the kernel isn't running (no serve token). Start romp (the login service, or \`romp up\`) first." >&2
+        exit 1
+    fi
+    _payload="$(python3 -c 'import json,sys; print(json.dumps({"parent": sys.argv[1], "name": sys.argv[2], "at": sys.argv[3]}))' "$parent_arg" "$newname_arg" "$at_arg")"
+    _resp="$(_romp_token_cfg | curl -sf -m 30 --config - -X POST "http://127.0.0.1:$_kport/fork" \
+                  -H 'Content-Type: application/json' -d "$_payload")" \
+        || { echo "romp fork: kernel not reachable on :$_kport (is romp running?)" >&2; exit 1; }
+    if [[ "$_resp" == *'"ok": true'* || "$_resp" == *'"ok":true'* ]]; then
+        echo "romp fork: \"$newname_arg\" branched from \"$parent_arg\" — both continue as separate sessions (see: romp sessions)"
+        exit 0
+    fi
+    _err="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("error") or sys.argv[1])' "$_resp" 2>/dev/null || printf '%s' "$_resp")"
+    echo "romp fork: refused — $_err" >&2
+    exit 1
 fi
 
 # Bare `romp` — THE front door (the user 2026-07-25: the shortest command does the most common

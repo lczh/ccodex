@@ -47,7 +47,7 @@ test("the bare overlay dims the deleted bubble itself, not just the tail", () =>
 test("the delete button dresses like edit, with a destructive armed state", () => {
   assert.match(CSS, /\.msg-acts \{ display: flex; gap: 4px; align-self: flex-end; \}/);
   // restore-files shares delete's dress (same reveal, same destructive armed red — the user 2026-08-04)
-  assert.match(CSS, /\.turn-user:hover \.msg-del, \.msg-del:focus-visible,\s*\n\.turn-user:hover \.msg-restorefiles, \.msg-restorefiles:focus-visible,\s*\n\.turn-user:hover \.msg-fork, \.msg-fork:focus-visible \{ opacity: 0\.9; \}/);
+  assert.match(CSS, /\.turn-user:hover \.msg-del, \.msg-del:focus-visible,\s*\n\.turn-user:hover \.msg-restorefiles, \.msg-restorefiles:focus-visible \{ opacity: 0\.9; \}/);
   assert.match(CSS, /\.msg-del\.armed, \.msg-restorefiles\.armed \{ color: #ff6a6a; border-color: #ff6a6a;/);
 });
 

@@ -33,7 +33,7 @@ test("the card shows the DISTILLER's line (summary/blockSummary) but NO why/gene
   // distiller-line.test.ts (completed→summary, blocked→blockSummary, hidden when empty). These pins just
   // confirm the card creates the element and routes through that single rule.
   assert.match(FEED, /const distill = el\("div", "fask-distill"\)/);
-  assert.match(FEED, /import \{ distillText, distillInputs, applyDistillLine, distillPending \} from "\.\/distiller-line"/);
+  assert.match(FEED, /import \{ distillText, distillInputs, applyDistillLine, distillPending, distillStaleNote \} from "\.\/distiller-line"/);
   // keyed on the GENUINE state (dCompleted/dBlocked from distillInputs), not the transient column, so a
   // still-blocked card keeps its brief through the recheck/rejudging Working flip (the user 2026-07-21)
   assert.match(FEED, /applyDistillLine\(a\._distill as HTMLElement, dCompleted, dBlocked,\s*\n?\s*it\.summary, it\.blockSummary\)/);

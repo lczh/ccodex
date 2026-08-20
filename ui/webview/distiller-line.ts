@@ -92,3 +92,13 @@ export function applyDistillLine(
   el.style.display = t ? "" : "none";   // hidden until the distiller produces — no stuck placeholder
   return t;
 }
+
+/** The STALE-takeaway note (the user 2026-08-19): shown above a COMPLETED card's takeaway when the user
+ *  followed up AFTER the summary they read (kernel summaryStale: followupAt postdates what distilledMt
+ *  covers) — an old takeaway must never present as current beside a newer reply. "" when there is
+ *  nothing to say: not stale, not completed, or no takeaway shown to annotate. Self-clearing by
+ *  construction: the re-distill stamps a newer distilledMt and the kernel stops sending the flag. */
+export function distillStaleNote(summaryStale: boolean, completed: boolean, shownText: string): string {
+  if (!summaryStale || !completed || !shownText.trim()) return "";
+  return "You followed up since this — it updates when the new work lands.";
+}

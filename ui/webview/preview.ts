@@ -147,8 +147,15 @@ export function openLightbox(path: string, sid?: string | null, pin?: string): v
   dl.className = "romp-lightbox-dl";
   dl.href = fileUrl(path, sid) + (pin ? "&pin=" + encodeURIComponent(pin) : "");
   dl.download = path.slice(path.lastIndexOf("/") + 1) || "image";
-  dl.textContent = "⭳";
+  // the tray icon every download control should wear (the composer buttons' stroke family) as an
+  // inline SVG: the old text glyph (U+2B73, arrow-to-bar) has no coverage in the mac system fonts
+  // and rendered as a tofu box instead of an icon (the user 2026-08-19). A literal — no sanitize.
+  dl.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"'
+    + ' stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    + '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>'
+    + '<polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
   dl.title = "download";
+  dl.setAttribute("aria-label", "download");
   dl.onclick = (ev) => ev.stopPropagation();               // saving must not also dismiss
   const close = document.createElement("button");
   close.className = "romp-lightbox-close";

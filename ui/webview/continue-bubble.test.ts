@@ -36,7 +36,9 @@ test("the canned Continue wears the Follow-up grammar: caret, → Continue, the 
 
 test("the row sheds the bubble, keeps the header when expanded, and the caret flips in CSS", () => {
   assert.match(CSS, /\.user-bubble\.nudge-collapsible \{ cursor: pointer; \}/);
-  assert.match(CSS, /\.user-bubble\.cont-row \{ max-width: none; background: none; border: none;/);
+  // the LIGHT BLUE box (the user 2026-08-18, superseding the bare row): blue = "from you", gray =
+  // "from romp" — pale blue says "your gesture, standardized words", never posing as typed prose
+  assert.match(CSS, /\.user-bubble\.cont-row \{\s*\n\s*max-width: 72%;\s*\n\s*background: rgba\(43, 108, 239, 0\.16\); border: 1px solid rgba\(43, 108, 239, 0\.42\);/);
   assert.match(CSS, /\.user-bubble\.cont-row \.cont-tri::before \{ content: "▸"; \}/);
   assert.match(CSS, /\.user-bubble\.cont-row\.expanded \.cont-tri::before \{ content: "▾"; \}/,
     "the same .expanded class the fold delegate flips also turns the caret");

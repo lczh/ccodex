@@ -520,6 +520,30 @@ class AgentTasksAreNeverServices(unittest.TestCase):
         self.assertEqual(rows[0]["type"], "local_agent", "the lifecycle set's type survives normalization")
 
 
+class AwaitedTaskIdsMirrorTheDescs(unittest.TestCase):
+    """_awaiting_task_ids (the user 2026-08-19): the chat's #bg-tasks box outlines exactly the rows the
+    await-green chip waits on, matched by the LAUNCH id both payloads carry. The ids come from the same
+    _bg_split set as _awaiting_task_descs, so the outline and the chip can never disagree about which
+    tasks are awaited — and a service row (placed, unstamped shell task) keeps its plain border."""
+    SID = "11111111-2222-3333-4444-555555555555"
+
+    def test_ids_track_the_awaited_split_and_skip_services(self):
+        saved = (km._tmux_sessions, km._bg_placed_tops, km._session_stamped_tops)
+        km._tmux_sessions = lambda: {self.SID: {"bgTasks": [
+            {"toolUseId": "t1", "desc": "suite run", "since": 5, "type": "local_shell"},
+            {"toolUseId": "t2", "desc": "mkdocs serve", "since": 6, "type": "local_shell"},
+        ]}}
+        km._bg_placed_tops = lambda sid, path, tids: {"t2": self.SID + ":g1"}  # placed, no stamp -> service
+        km._session_stamped_tops = lambda sid: frozenset()
+        try:
+            ids = km._awaiting_task_ids(self.SID, "/p")
+            descs = km._awaiting_task_descs(self.SID, "/p")
+        finally:
+            km._tmux_sessions, km._bg_placed_tops, km._session_stamped_tops = saved
+        self.assertEqual(ids, ["t1"], "pending t1 is awaited; the placed-unstamped service t2 is not")
+        self.assertEqual(descs, ["suite run"], "ids and descriptions describe the same awaited set")
+
+
 class TaskOutputsForCard(unittest.TestCase):
     """_task_outputs_for joins a completed background command's notification to its shell command (from the
     launch scan) and its output-file tail, so the inline completion card can EXPAND to real detail instead of

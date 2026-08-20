@@ -116,17 +116,25 @@ class TimelineViews(unittest.TestCase):
         self.assertIn("window.__rompTimelineSetViews=function(views)", src)
         self.assertIn('post({type:"setTimelineViews",views:views});', src)
 
-    def test_focus_reveals_a_hidden_session(self):
-        # the reveal rule: every gesture that focuses a session's chat (create/open/revive/deep link,
-        # all through _reveal_chat_for) reveals it first — a session created under an active group
-        # view must not be born invisible with its focus yanked away
-        km._set_timeline_views({"active": "g1", "hidden": ["s9"],
-                                "groups": [{"id": "g1", "name": "pool", "members": ["s2"]}]})
+    def test_focus_switches_to_a_view_that_shows_the_session(self):
+        # the reveal rule, default-group model (the user 2026-08-19): focusing switches the active
+        # view and never mutates membership — peeking at a pool worker must not drag it back into
+        # the default group. Order: the default group, else the first named group holding it, else
+        # (in no view at all) re-add to the default group.
+        G = {"id": "g1", "name": "pool", "members": ["s2"]}
+        km._set_timeline_views({"active": "g1", "hidden": [], "groups": [G]})
         km._reveal_chat_for({"wid": "w1"}, {"type": "focus", "id": "s9"})
         v = km._timeline_views()
-        self.assertNotIn("s9", v["hidden"], "the hidden bit drops")
-        self.assertEqual(v["active"], "all", "the excluding group yields to All")
-        km._set_timeline_views({"active": "g1", "hidden": [],
-                                "groups": [{"id": "g1", "name": "pool", "members": ["s2"]}]})
+        self.assertEqual(v["active"], "all", "still in the default group → switch to it")
+        km._set_timeline_views({"active": "all", "hidden": ["s2"], "groups": [G]})
+        km._reveal_chat_for({"wid": "w1"}, {"type": "focus", "id": "s2"})
+        v = km._timeline_views()
+        self.assertEqual(v["active"], "g1", "out of default but in a group → switch to that group")
+        self.assertEqual(v["hidden"], ["s2"], "membership untouched — the peek is temporary")
+        km._set_timeline_views({"active": "all", "hidden": ["sX"], "groups": [G]})
+        km._reveal_chat_for({"wid": "w1"}, {"type": "focus", "id": "sX"})
+        v = km._timeline_views()
+        self.assertEqual(v["hidden"], [], "in NO view at all → re-added to the default group")
+        km._set_timeline_views({"active": "g1", "hidden": [], "groups": [G]})
         km._reveal_chat_for({"wid": "w1"}, {"type": "focus", "id": "s2"})
         self.assertEqual(km._timeline_views()["active"], "g1", "a member's focus changes nothing")

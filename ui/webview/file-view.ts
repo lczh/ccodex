@@ -136,8 +136,12 @@ function saveComments(): void {
 
 // render.ts owns the composer, and it imports THIS module — so the finished message is handed back
 // through a sink it registers at startup rather than importing render.ts here (which would be a cycle).
-let commentSink: ((text: string) => void) | null = null;
-export function setCommentSink(fn: (text: string) => void): void { commentSink = fn; }
+// The sink takes THE REVIEWED SESSION'S sid and reports whether the draft LANDED (2026-08-19, two
+// user-data-loss bugs from one root): the old void sink read activeId at submit time, so switching
+// tabs drafted session A's review into session B — and Submit deleted the comments unconditionally,
+// so a closed tab or missing composer erased the whole review from memory and localStorage silently.
+let commentSink: ((sid: string, text: string) => boolean) | null = null;
+export function setCommentSink(fn: (sid: string, text: string) => boolean): void { commentSink = fn; }
 
 export function closeFileView(): void {
   const wrap = document.getElementById("romp-fileview");
@@ -409,10 +413,17 @@ export function openFileView(path: string, sid?: string | null): void {
       .catch(() => false)                                       // can't re-read → claim no staleness we didn't see
       .then((stale) => {
         const msg = buildReviewMessage(path, list);
-        if (!msg) return;
-        commentSink!(stale
+        if (!msg) { submitBtn.disabled = false; submitBtn.textContent = "Submit"; return; }
+        const landed = commentSink!(sid || "", stale
           ? msg + "\n(Heads up: the file changed while I was reading it, so the line numbers may have moved.)\n"
           : msg);
+        if (!landed) {
+          // the review is the user's WORK — never erased on a failed handoff. Say so, visibly,
+          // and keep every comment (memory + localStorage) for the next attempt.
+          submitBtn.disabled = false;
+          submitBtn.textContent = "Couldn't draft it — comments kept, try again";
+          return;
+        }
         comments.delete(key);
         saveComments();
         closeFileView();
@@ -555,7 +566,9 @@ function mdBlock(text: string): HTMLElement {
   const box = el("div", "fileview-md");
   try {
     const dirty = marked.parse(text) as string;
-    box.innerHTML = DOMPurify.sanitize(dirty, { USE_PROFILES: { html: true }, ADD_DATA_URI_TAGS: ["img"] });
+    // html + svg, in lockstep with the chat's md(): KaTeX draws stretchy glyphs (\sqrt radicals,
+    // wide accents) as inline <svg> even in html output, and the html-only profile ate them.
+    box.innerHTML = DOMPurify.sanitize(dirty, { USE_PROFILES: { html: true, svg: true }, ADD_DATA_URI_TAGS: ["img"] });
   } catch {
     box.textContent = text;                            // a marked bug must never cost the content
   }

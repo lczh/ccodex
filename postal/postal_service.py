@@ -3380,25 +3380,40 @@ def mcp():
 # ───────────────────────── CLI client modes ─────────────────────────
 
 def cli_send(argv):
-    kind = ""
-    if argv and argv[0] == "--kind":
-        kind = (argv[1].strip().lower() if len(argv) > 1 else "")
-        argv = argv[2:]
-        if kind not in ("delegate", "coordinate", "question"):
-            sys.stderr.write("[romp mail] --kind must be delegate, coordinate, or question\n"); return 2
+    kind = frm_label = ""
+    while argv and argv[0] in ("--kind", "--from"):
+        if argv[0] == "--kind":
+            kind = (argv[1].strip().lower() if len(argv) > 1 else "")
+            argv = argv[2:]
+            if kind not in ("delegate", "coordinate", "question"):
+                sys.stderr.write("[romp mail] --kind must be delegate, coordinate, or question\n"); return 2
+        else:
+            # --from <label>: an EXPLICIT identity for a non-session caller (a launchd/cron script, a
+            # bare shell — 2026-08-19, after the anonymous-send refusal broke a morning script that
+            # had been mailing as "unknown"). Not anonymity restored: the mail arrives placeable,
+            # from <label> with a stable synthetic id, and recipients can tell scripts apart.
+            frm_label = (argv[1].strip() if len(argv) > 1 else "")
+            argv = argv[2:]
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", frm_label or ""):
+                sys.stderr.write("[romp mail] --from must be one word (letters/digits/dash/underscore, <=32 chars)\n"); return 2
     if len(argv) < 2:
-        sys.stderr.write('usage: romp mail send [--kind delegate|coordinate|question] <session> <text>\n'); return 2
+        sys.stderr.write('usage: romp mail send [--kind delegate|coordinate|question] [--from <label>] <session> <text>\n'); return 2
     to, body = argv[0], " ".join(argv[1:])
     if not body.strip():
         sys.stderr.write("[romp mail] refusing to send an empty message\n"); return 2
     if not ensure():
         sys.stderr.write("[romp mail] %s\n" % _unreachable_hint()); return 1
     me, mid = my_name(), my_id()
+    if frm_label:
+        me, mid = frm_label, "ext:" + frm_label
     if not mid:
-        # the bus refuses anonymous sends; say it here with the actionable half
-        sys.stderr.write("[romp mail] cannot send: this session's own identity did not resolve "
-                         "(no session id), so the mail would arrive anonymously. Surface this to "
-                         "the user as a session-identity bug.\n")
+        # the bus refuses anonymous sends; say it here with BOTH actionable halves: a broken
+        # session identity is a bug to surface, and a deliberate non-session caller has a door
+        sys.stderr.write("[romp mail] cannot send: no session identity resolved, and anonymous "
+                         "mail is refused (it arrives as an unplaceable ghost). Inside a romp "
+                         "session, surface this to the user as a session-identity bug. From a "
+                         "script or bare shell, pass --from <label> to send under an explicit "
+                         "name.\n")
         return 1
     try:
         resp = _http("POST", "/send", {"to": to, "from": me or "unknown", "from_id": mid, "body": body,

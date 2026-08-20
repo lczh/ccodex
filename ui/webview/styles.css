@@ -485,6 +485,10 @@ body.tabbar-resizing { cursor: ns-resize; user-select: none; }
 .bg-task { --bgt: var(--st-working-bg); }
 .bg-task.bg-failed { --bgt: var(--st-blocked-bg); }
 .bg-task.bg-completed { --bgt: var(--st-ready-bg); }
+/* AWAITED (the user 2026-08-19): the session's await-green chip is waiting on THIS task — the box
+   border + the row's thin outline take the chip's green; the dot keeps meaning the task's own status */
+#bg-tasks.bg-awaited { border-color: var(--st-awaitbg-bg); }
+.bg-task.bg-awaited { box-shadow: inset 0 0 0 1px var(--st-awaitbg-bg); border-radius: 5px; }
 .bg-head { display: flex; align-items: center; gap: 8px; padding: 5px 9px; cursor: pointer; user-select: none; border-radius: 5px; }
 .bg-head:hover { background: rgba(255, 255, 255, 0.04); }
 /* SOLID status dot — no pulse (the user 2026-07-07: the pulsating yellow was distracting; a running dot is
@@ -1232,9 +1236,12 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
   transition: opacity 0.12s ease, color 0.12s ease, border-color 0.12s ease;
 }
 .turn-user:hover .msg-del, .msg-del:focus-visible,
-.turn-user:hover .msg-restorefiles, .msg-restorefiles:focus-visible,
-.turn-user:hover .msg-fork, .msg-fork:focus-visible { opacity: 0.9; }
+.turn-user:hover .msg-restorefiles, .msg-restorefiles:focus-visible { opacity: 0.9; }
 .msg-del:hover, .msg-restorefiles:hover { color: var(--fg); border-color: #ff6a6a; }
+/* fork lives BELOW the response it branches from (the user 2026-08-19) — .fork-spot rides the run's
+   LAST assistant turn (applyForkSpots), revealed by hovering that turn, left with the response column */
+.fork-spot { display: flex; margin-top: 3px; }
+.turn-assistant:hover .msg-fork, .msg-fork:focus-visible { opacity: 0.9; }
 .msg-fork:hover { color: var(--fg); border-color: var(--accent); }   /* non-destructive: accent, never the rewind red */
 /* armed = one click from rolling back: destructive red, holds until blur/pointerleave/re-render */
 .msg-del.armed, .msg-restorefiles.armed { color: #ff6a6a; border-color: #ff6a6a; opacity: 0.95; }
@@ -1277,12 +1284,17 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
 .user-bubble.cmd-row .nudge-gist, .user-bubble.cmd-row .nudge-caret { color: var(--dim); }
 .user-bubble.cmd-row .nudge-gist { margin-left: 8px; }
 .user-bubble.cmd-row .nudge-full { color: var(--dim); margin-top: 4px; max-width: 640px; }
-/* The Continue button's turn wears the FOLLOW-UP grammar (render.ts canned === "continue", the user
-   2026-08-17, superseding the 2026-08-15 ✦ + boxed-chip dress — one gesture grammar, fewer elements):
-   caret, "→ Continue" in the accent (the same dress "↩ Follow-up" wears), the sent text's own first
-   line dimmed beside it, the full words unfolding in place under the row. The caret glyph lives in CSS
-   so the same .expanded class the fold delegate flips also turns it. */
-.user-bubble.cont-row { max-width: none; background: none; border: none; border-radius: 0; padding: 2px 0; }
+/* The Continue button keeps the FOLLOW-UP grammar inside (caret, "→ Continue" in the accent, the
+   sent text's own first line dimmed beside it, the full words unfolding in place) but wears a LIGHT
+   BLUE box around it (the user 2026-08-18, superseding the 2026-08-17 bare row): in the transcript's
+   color grammar blue means "from you" and gray means "from romp", so a pale blue box says "your
+   gesture, standardized words" — user-side, but never posing as typed prose. Same right-aligned
+   spot and width cap as the bubbles it sits among; the ↩ Follow-up header itself is unchanged. */
+.user-bubble.cont-row {
+  max-width: 72%;
+  background: rgba(43, 108, 239, 0.16); border: 1px solid rgba(43, 108, 239, 0.42);
+  border-radius: 14px; padding: 7px 14px;
+}
 .user-bubble.cont-row .followup-tag { max-width: none; }
 .user-bubble.cont-row .cont-tri::before { content: "▸"; }
 .user-bubble.cont-row.expanded .cont-tri::before { content: "▾"; }
@@ -2409,7 +2421,8 @@ body.picker-lifted > #picker.kb-tight { align-items: flex-start; padding: 12px 1
 /* download: an anchor dressed exactly like the close button beside it (one control vocabulary —
    same chip, same hover cue), sitting between the filename and the ✕ */
 .romp-lightbox-dl { font: inherit; font-size: 0.86em; cursor: pointer; flex: 0 0 auto;
-  padding: 2px 9px; border-radius: 6px; background: rgba(255, 255, 255, 0.1); color: var(--fg);
+  display: inline-flex; align-items: center;   /* centers the inline tray SVG in the chip */
+  padding: 3px 9px; border-radius: 6px; background: rgba(255, 255, 255, 0.1); color: var(--fg);
   border: 1px solid rgba(255, 255, 255, 0.18); text-decoration: none; line-height: normal; }
 .romp-lightbox-dl:hover { border-color: var(--accent); }
 

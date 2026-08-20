@@ -12696,6 +12696,15 @@ def _awaiting_task_descs(sid, path):
     return [t["desc"] or "background task" for t in awaited]
 
 
+def _awaiting_task_ids(sid, path):
+    """The AWAITED live background-task launch IDS — the same _bg_split set as _awaiting_task_descs,
+    as tool_use ids, so the chat's #bg-tasks box can outline exactly the rows the await-green chip is
+    waiting on (the user 2026-08-19). The box rows carry the same launching id (_bg_tasks "id" / the
+    lifecycle set's toolUseId), so the match is exact — never a description-string guess."""
+    awaited, _ = _bg_split(sid, path, _bg_live_norm(sid, path))
+    return [t["tid"] for t in awaited if t.get("tid")]
+
+
 def _bg_service_descs(sid, path):
     """The live background-task descriptions the judge classified as SERVICES (_bg_split) — persistent
     processes the session keeps around, surfaced as the feed's neutral per-session chip (bgServices in
@@ -16559,6 +16568,9 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None):
                   "awaitingWhy": awaiting_why or None,
                   "awaitingKind": awaiting_kind,   # WHAT the wait is on (jd.AWAIT_KINDS; None = kindless)
                   "awaitingTasks": (_awaiting_task_descs(sid, sess["path"]) if awaiting_why else []),
+                  # …and the same tasks' launch ids, so the #bg-tasks box outlines exactly the awaited
+                  # rows in the chip's await-green (the user 2026-08-19)
+                  "awaitingTaskIds": (_awaiting_task_ids(sid, sess["path"]) if awaiting_why else []),
                   "apiTooLong": bool(aerr and aerr.get("tooLong")),
                   # a spend cap is on-you like tooLong (red tab, "raise your cap") AND never auto-retried:
                   # the client's apiRetryTick skips it, and the global pause it engages stops the loop too
@@ -18013,7 +18025,7 @@ def build_feed(now, tmux=None):
             _bcmemo[nid] = res
             return res
 
-        def flatten(nid, out, ancestor_done=False):  # AskTreeNode flat list, root first; nest via children ids
+        def flatten(nid, out, ancestor_done=False, boundary=None):  # AskTreeNode flat list, root first; nest via children ids
             nd = nodes[nid]
             kids = sorted(children.get(nid, []), key=_fsubmax, reverse=True)   # most-recent-first (matches the ledger)
             explicit = bool(nd.get("nodeComplete"))
@@ -18043,6 +18055,14 @@ def build_feed(now, tmux=None):
                         # user-cleared sub (nodeOverride op:clear) → renders struck-through + faded with a
                         # "cleared" chip; `status` above stays honest (box = done, the user 2026-07-26)
                         "cleared": bool(nd.get("cleared")),
+                        # this DONE sub's outcome was already REVIEWED: its done predates the top's
+                        # review boundary (jd.review_boundary — the same boundary the distiller scopes
+                        # the takeaway with, so the fold and the summary can never disagree). The card
+                        # collapses these behind one "N reviewed earlier" row instead of re-presenting
+                        # them on every re-completion (the user 2026-08-19). `out` is empty only for
+                        # the ROOT row, which is the card head, never a checklist row.
+                        "reviewedEarlier": bool(boundary and out and done
+                                                and jd._done_since(nd) <= boundary) or None,
                         # a rolled-UP question (the block lives in a descendant, not here) — the client's
                         # mark tooltip says "blocked inside", and the actual ask keeps its own ⏸ below
                         "qderived": st == "question" and not nd.get("blocked"),
@@ -18073,7 +18093,7 @@ def build_feed(now, tmux=None):
                         "log": _node_log_rows(nd, seg_uuid) if st != "done" else None,
                         "children": kids})
             for c in kids:
-                flatten(c, out, ancestor_done=done)
+                flatten(c, out, ancestor_done=done, boundary=boundary)
             return out
         # HARD blocked floor: a session stopped RIGHT NOW on a live permission prompt (tmux state)
         # floors its ACTIVE-FOCUS card under BLOCKED — the strongest signal, beats the goal's planner
@@ -18509,7 +18529,13 @@ def build_feed(now, tmux=None):
                 "distillState": distill_state,   # "completed" | "blocked" | null — the GENUINE state the distiller line keys on, so the brief/takeaway doesn't flicker off when recheck/rejudging drops `column` to working (the user 2026-07-21)
                 "blockSummary": nodes[nid].get("blockSummary"),    # the block-distiller's decision brief for a blocked goal (modal); null until produced — the user 2026-06-18
                 "briefParts": nodes[nid].get("briefParts") or None,   # MULTI-item brief: [{id, since}] one per paragraph IN ORDER (judge briefParts) → per-paragraph "Nm ago" stamps; null for single-item briefs, whose stamp is the card header's age (the user 2026-07-24)
-                "summaryParts": nodes[nid].get("summaryParts") or None,   # the DONE twin: [{id, since}] per takeaway paragraph when the distiller split by <completed-items>; done-event times (the user 2026-07-24)
+                "summaryParts": nodes[nid].get("summaryParts") or None,
+                # the user FOLLOWED UP after the takeaway they read (followupAt postdates what the
+                # summary covers) → the summary section says so instead of presenting the old takeaway
+                # as current; self-clears when the re-distill stamps a newer distilledMt (16 live cards
+                # measured reading stale, the user 2026-08-19)
+                "summaryStale": bool((nodes[nid].get("followupAt") or 0) > (nodes[nid].get("distilledMt") or 0)
+                                     and (nodes[nid].get("summary") or "").strip()) or None,   # the DONE twin: [{id, since}] per takeaway paragraph when the distiller split by <completed-items>; done-event times (the user 2026-07-24)
                 "background": nodes[nid].get("background"),    # the distiller's BACKGROUND section: re-orientation for a reader who forgot the thread — collapsed by default on the card (the user 2026-07-02)
                 "summaryAnchorUuid": _sa_u,    # click the summary line → the completion turn's wrap-up (completed pin), else the cited/latest prose (the user 2026-07-14)
                 "warns": nodes[nid].get("warns") or None,   # judge-stamped anomalies (judge _node_warn) → yellow "warning" chip; click shows each warn's what/why detail (the user 2026-07-02)
@@ -18566,7 +18592,7 @@ def build_feed(now, tmux=None):
                 "warnRows": (_card_warn_rows(dbg_rows, fsid, set(_subtree(nid)),
                                              store.get("placements") or {}) or None)
                             if dbg_rows is not None else None,   # debug mode only: the card's judge failures, modal "Warnings" section
-                "tree": flatten(nid, [])})
+                "tree": flatten(nid, [], boundary=jd.review_boundary(nodes[nid]))})
         # A session actively working a brand-new ask shows NO card until the planner classifies the held
         # segment at turn-end — surface a live-prompt placeholder so it isn't invisible. Only when nothing
         # already covers it (no working card); replaced by the real card once the planner places it.
@@ -20637,19 +20663,28 @@ def _reveal_chat_for(client, focus_msg):
     revealSelfPane) — which covers every kernel, local included, and makes the shell line a harmless
     duplicate rather than the only mover."""
     wid = (client or {}).get("wid") or ""
-    # The reveal rule (the user 2026-08-18): every gesture that focuses a session's chat — create,
-    # open, revive, a deep link, a feed chip — REVEALS it in the session views first, or the focus
-    # would land on a tab the strip doesn't show (a session created under an active group view was
-    # born invisible, with the focus yanked away by the strip's re-point). Drop its hidden bit; when
-    # the active group excludes it, fall back to All — the same one rule the chat picker applies.
+    # The reveal rule (the user 2026-08-18; reshaped 2026-08-19 with the DEFAULT-GROUP model): every
+    # gesture that focuses a session's chat — create, open, revive, a deep link, a feed chip — must
+    # land on a visible tab. Focusing now SWITCHES the active view to one that shows the session and
+    # never mutates membership: peeking at a pool worker must not permanently drag it back into the
+    # default group. Preference order: the default group (active "all" — "everything not removed"),
+    # else the first named group holding it; a session in NO view at all (removed from default,
+    # member of nothing) is re-added to the default group — the one case where visibility requires
+    # a membership edit.
     sid = focus_msg.get("id") if isinstance(focus_msg, dict) else None
     if sid:
         v = _timeline_views()
         if not _view_visible(v, sid):
             v = json.loads(json.dumps(v))
-            v["hidden"] = [x for x in v["hidden"] if x != sid]
-            if v["active"] != "all" and not any(g["id"] == v["active"] and sid in g["members"] for g in v["groups"]):
+            if sid not in v["hidden"]:
                 v["active"] = "all"
+            else:
+                holder = next((g["id"] for g in v["groups"] if sid in g["members"]), None)
+                if holder:
+                    v["active"] = holder
+                else:
+                    v["hidden"] = [x for x in v["hidden"] if x != sid]
+                    v["active"] = "all"
             _set_timeline_views(v)
             _mark_views_dirty()
     _send_to_view("chat", focus_msg, wid)
@@ -24624,7 +24659,18 @@ _LANDING_MOBILE_JS = """
 // Chat/Feed/Timeline bar on real Android Chrome — dvh didn't track the painted area (the user 2026-06-19).
 // visualViewport.height IS the live visible height (address-bar- AND keyboard-aware), so drive --app-h
 // off it and re-fit on every resize/orientation change. Runs even if #mtabs is missing.
-function fit(){try{var h=(window.visualViewport&&window.visualViewport.height)||window.innerHeight;
+// PINCH-AWARE (the user 2026-08-19): a trackpad reverse-pinch zooms the VISUAL viewport, which
+// SHRINKS vv.height by the zoom factor — and blindly re-fitting --app-h to it re-laid the whole shell
+// into the zoomed-in window, so the bottom bar climbed up over the very thing being zoomed (timeline
+// open or not; it is the shell's own layout var). On a DESKTOP (fine pointer) the layout height is
+// simply innerHeight — pinch-immune in every browser BY DEFINITION of the layout viewport, and
+// deliberately not vv.height*scale: desktop Firefox does not reliably report scale during a pinch
+// (the user 2026-08-19, in Firefox), so any scale arithmetic is a Chrome-ism there. The visual
+// viewport drives the fit only where its problems live — the coarse-pointer mobile world of soft
+// keyboards and collapsing toolbars — where height*scale keeps a mobile pinch from re-fitting too.
+function fit(){try{var vv=window.visualViewport;
+var coarse=window.matchMedia&&matchMedia('(pointer: coarse)').matches;
+var h=(!coarse||!vv)?window.innerHeight:Math.round(vv.height*(vv.scale||1));
 if(h)document.documentElement.style.setProperty('--app-h',h+'px');}catch(e){}}
 fit();window.addEventListener('resize',fit);window.addEventListener('orientationchange',fit);
 // iOS Safari collapses/expands its toolbars AS YOU SCROLL, and the visible height changes with them
@@ -24642,7 +24688,7 @@ var bar=document.getElementById('mtabs');if(!bar)return;
 // dead black band between the composer and the keyboard (the user 2026-07-22) — collapse the reservation
 // to 0 so the chat pane extends flush above the keyboard, and restore it when the keyboard closes. The
 // keyboard is open when the visual viewport is much shorter than the layout viewport (event: vv resize).
-function kbOpen(){var vv=window.visualViewport;return vv?(window.innerHeight-vv.height>120):false;}
+function kbOpen(){var vv=window.visualViewport;return vv?(window.innerHeight-vv.height*(vv.scale||1)>120):false;}
 function barfit(){try{document.documentElement.style.setProperty('--mtabs-h',(kbOpen()?0:(bar.offsetHeight||0))+'px');}catch(e){}}
 barfit();window.addEventListener('resize',barfit);window.addEventListener('orientationchange',barfit);
 if(window.visualViewport){window.visualViewport.addEventListener('resize',barfit);}
@@ -26863,6 +26909,45 @@ class Handler(BaseHTTPRequestHandler):
                                       "application/json")
                 threading.Thread(target=_spawn_session, args=(nm, cwd), daemon=True).start()
                 return self._send(200, json.dumps({"ok": True, "pending": True, "dir": cwd}),
+                                  "application/json")
+            if u.path == "/fork":
+                # Headless session fork (`romp fork`, the user 2026-08-19 via lab_manager): the WS
+                # forkSession op as a one-shot POST beside /new and /send, so a terminal or another
+                # machine's plugin can split a session — the first per-stage experiment split had to
+                # hand-drive the WS op with the dashboard token, which nobody should repeat. Body:
+                # {"parent": <live name or sid>, "name": <new-name>, "at": <record-uuid, optional>}
+                # ("at" empty = the whole conversation, the tip fork). Same contract as the op:
+                # parent untouched, explicit new name, and the fork discoverable the moment we ack
+                # (be.fork writes names/ synchronously inside _fork_session). Loud on refusal.
+                try:
+                    b = json.loads(raw_body or b"{}")
+                except Exception:
+                    b = {}
+                parent = str((b or {}).get("parent") or "").strip()
+                nm = str((b or {}).get("name") or "").strip()
+                if not parent or not nm:
+                    return self._send(400, json.dumps({"ok": False, "error": "parent and name required"}),
+                                      "application/json")
+                live = _live_names(_tmux_sessions())
+                if nm in live:
+                    # a second session under one name would poison every by-name surface (postal,
+                    # romp send, this very route's post-fork lookup) — refuse, never overload
+                    return self._send(200, json.dumps({"ok": False, "error":
+                        'a session named "%s" is already running — pick another name' % nm}),
+                                      "application/json")
+                psid = live.get(parent) or ""
+                if not psid and re.fullmatch(r"[0-9a-fA-F-]{32,36}", parent):
+                    psid = parent                 # a sid: _fork_session validates it owns a transcript
+                if not psid:
+                    return self._send(200, json.dumps({"ok": False, "error":
+                        'no live session named "%s" (a dormant one can be forked by sid)' % parent}),
+                                      "application/json")
+                err = _fork_session(psid, str((b or {}).get("at") or ""), nm)
+                if err:
+                    return self._send(200, json.dumps({"ok": False, "error": err}), "application/json")
+                # be.fork registered the name synchronously above, so the live store answers by ack time
+                fsid = _live_names(_tmux_sessions()).get(nm) or ""
+                return self._send(200, json.dumps({"ok": True, "id": fsid, "name": nm}),
                                   "application/json")
             if u.path == "/working":
                 # Publish/clear a session's working-note in the backend-agnostic store, so the postal bus's

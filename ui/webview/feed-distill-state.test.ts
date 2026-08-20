@@ -11,7 +11,7 @@ import * as path from "node:path";
 const FEED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.ts"), "utf8");
 
 test("the card routes the distiller line through distillInputs(distillState, column), not column directly", () => {
-  assert.match(FEED, /import \{ distillText, distillInputs, applyDistillLine, distillPending \}/);
+  assert.match(FEED, /import \{ distillText, distillInputs, applyDistillLine, distillPending, distillStaleNote \}/);
   // the card computes (completed, blocked) from the genuine state via the shared helper
   assert.match(FEED, /const \{ completed: dCompleted, blocked: dBlocked \} = distillInputs\(it\.distillState, it\.column\);/);
   // both the shown line AND the pending swirl read those, so the two can never disagree about the state

@@ -1,6 +1,6 @@
 // The timeline's corner control panel (the user 2026-08-18): "Show: <view> ▾ · N more" in the
 // bottom-left corner — the strip under the lane gutter, left of the time labels. The dropdown picks
-// the active VIEW (All sessions / named groups), holds New group… / Edit sessions…, and carries the
+// the active VIEW (the default group / named groups), holds New group… / Edit sessions…, and carries the
 // two timeline display toggles (collapse idle gaps, active only) so they finally work in every host.
 // The dialog is one checkbox per session: unchecked in the all-view = hidden from the timeline AND
 // the chat strip (a background session); checked in a group = member. House pattern: execute the
@@ -29,7 +29,9 @@ test("executed: the all-view hides the hidden set; a group shows exactly its mem
 });
 
 test("executed: the trigger label and the N-more cue (live sessions outside the view)", () => {
-  assert.equal(viewLabel(null), "All");
+  // the built-in view is the DEFAULT GROUP (the user 2026-08-19), not "All": every session joins it
+  // at birth, and hiding means leaving it
+  assert.equal(viewLabel(null), "default");
   assert.equal(viewLabel(V("g1")), "pool");
   const sessions = [{ id: "s1", live: true }, { id: "s2", live: true }, { id: "s4", live: false }];
   assert.equal(viewMoreCount(V("g1"), sessions), 1, "s1 is live and outside; dead s4 never counts");
@@ -74,6 +76,17 @@ test("the dropdown and dialog wear the shared menu vocabulary and adopt into the
   assert.match(SRC, /'position:fixed;inset:0;z-index:1002;background:rgba\(0,0,0,0\.55\);'/,
     "the one modal dim, over the topmost same-origin document");
   assert.match(SRC, /const h = this\._menuHost\(anchorEl\.getBoundingClientRect\(\)\);[\s\S]{0,400}this\._viewsMenu = menu;/);
+});
+
+test("the sessions dialog is the pool builder: each live row carries the lane gear's feed toggle", () => {
+  // the user 2026-08-19, from the manager/worker experiment: a background worker wants BOTH edits —
+  // out of the default group AND off the feed — in one visit. Reused machinery, never a new one;
+  // and deliberately NOT auto-coupled to membership (hideFromFeed seals goals + gates the planner).
+  assert.match(SRC, /const ft = LANE_TOGGLES\.find\(\(t\) => t\.flag === 'hideFromFeed'\);/);
+  assert.match(SRC, /\(this\._pendingFlags\[s\.id\] = this\._pendingFlags\[s\.id\] \|\| \{\}\)\.hideFromFeed = next;/,
+    "the same optimistic sticky flags the lane gear uses");
+  assert.match(SRC, /this\._setSessionFlag\(s, 'hideFromFeed', next\);\s*\n\s*this\._reconcilePendingFlags\(\);/);
+  assert.match(SRC, /e\.stopPropagation\(\);\s*\/\/ the row toggle is membership; this is the feed/);
 });
 
 test("the two display toggles write the host's own romp:settings — reachable in every host now", () => {

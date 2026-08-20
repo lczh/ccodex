@@ -90,6 +90,25 @@ test("the awaiting WHY lives in the background box, not the statusline (the user
   assert.match(STYLES, /\.bg-fold-head\.bg-await \{ --bgt: var\(--st-awaitbg-bg\); \}/);
 });
 
+test("the awaited tasks wear the chip's green outline — exact launch-id match; dots keep status meaning", () => {
+  // kernel: the awaited LAUNCH IDS ride the status payload beside the descriptions (the user
+  // 2026-08-19), from the same _bg_split set, so outline and chip can never disagree
+  assert.match(KERNEL, /"awaitingTaskIds": \(_awaiting_task_ids\(sid, sess\["path"\]\) if awaiting_why else \[\]\),/);
+  assert.match(KERNEL, /def _awaiting_task_ids\(sid, path\):/);
+  assert.match(KERNEL, /return \[t\["tid"\] for t in awaited if t\.get\("tid"\)\]/);
+  // client: rows are marked from awaitingTaskIds only while the chip is awaitingBg…
+  assert.match(RENDER, /awaitingTaskIds\?: string\[\];/);
+  assert.match(RENDER, /const awaited = new Set<string>\(\(s!\.status\.state === "awaitingBg" && s!\.status\.awaitingTaskIds\) \|\| \[\]\);/);
+  assert.match(RENDER, /host\.classList\.toggle\("bg-awaited", tasks\.some\(\(t\) => awaited\.has\(t\.id\)\)\);/);
+  assert.match(RENDER, /\(awaited\.has\(t\.id\) \? " bg-awaited" : ""\)/);
+  // …the untracked-wait box (renderAwaitWhy) IS the awaited thing, so it wears the border whole
+  assert.match(RENDER, /host\.classList\.add\("bg-awaited"\);/);
+  // the outline is the chip's await-green — the border/outline only; the status DOT rules are untouched
+  assert.match(STYLES, /#bg-tasks\.bg-awaited \{ border-color: var\(--st-awaitbg-bg\); \}/);
+  assert.match(STYLES, /\.bg-task\.bg-awaited \{ box-shadow: inset 0 0 0 1px var\(--st-awaitbg-bg\); border-radius: 5px; \}/);
+  assert.match(STYLES, /\.bg-task \{ --bgt: var\(--st-working-bg\); \}/);
+});
+
 test("the timeline lane's awaitingBg why reads the SAME working signal as its badge (same input, 2026-07-03 rule)", () => {
   // the skeleton build's raw-snapshot open_now fed _session_awaiting while the chip read the event
   // model — a lane badge could say Awaiting with a null why beside it (audited live 2026-08-13)

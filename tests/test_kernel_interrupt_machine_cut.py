@@ -655,3 +655,26 @@ class MachineCutBeforeItsNoticeLands(_FeedHarness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetryingCutIsAMachineCut(unittest.TestCase):
+    """A restart landing mid-API-retry (or mid-compaction) cuts the turn exactly as a working cut
+    does (the user 2026-08-19, whose figure session sat blocked-on-you — "you stopped this session
+    mid-turn" — after every restart that landed in its retry loop, with no machineCut stamp ever
+    written and no resume nudge queued). The boot reconcile's cut discriminator now reads every
+    MACHINE-ACTIVE last state; "permission"/"picker" stay excluded — those turns were already
+    waiting on the user, so blocked-on-you is the truth there."""
+
+    def test_machine_active_states_read_as_cut_and_user_wait_states_do_not(self):
+        import inspect
+        src = inspect.getsource(sb.SdkBackend)
+        self.assertIn('last_state_value(self.state_dir, sid) in ("working", "retrying", "compacting")', src)
+        self.assertNotIn('last_state_value(self.state_dir, sid) == "working"', src,
+                         "the narrow test is gone — a retrying cut got no stamp and no resume")
+
+    def test_last_state_value_reports_retrying(self):
+        with tempfile.TemporaryDirectory() as td:
+            sb.append_state(Path(td), SID, "working", T0)
+            sb.append_state(Path(td), SID, "retrying", T0 + 5)
+            self.assertEqual(sb.last_state_value(Path(td), SID), "retrying",
+                             "the discriminator sees the retry loop the restart landed in")

@@ -37,6 +37,15 @@ test("a dead network and a busy API are told apart", () => {
   assert.doesNotMatch(apiErrorReason({ status: 529, networkDown: true }), /overloaded/i);
 });
 
+test("a bare 429 names BOTH account-wide causes — a key's per-minute limits are not 'quota'", () => {
+  // the user 2026-08-19, on key billing, went hunting for a spent quota that wasn't the cause: keys
+  // are never unlimited (per-minute org limits by tier), subscriptions have usage windows — say both
+  const s = apiErrorReason({ status: 429 });
+  assert.match(s, /per-minute limits or the plan's usage window/);
+  assert.match(s, /not this session/);
+  assert.match(s, /retries clear it/);
+});
+
 test("a quota 429 names which limit it hit", () => {
   assert.match(apiErrorReason({ status: 429, rateLimitType: "output_tokens" }), /output_tokens/);
   assert.match(apiErrorReason({ status: 429 }), /rate limited/i);

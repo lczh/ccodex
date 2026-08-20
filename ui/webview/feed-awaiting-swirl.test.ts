@@ -24,7 +24,7 @@ test("the swirl is driven by spinFor's caption — shown when there is one, else
   assert.match(FEED, /import \{ spinFor, KIND_WORD \} from "\.\/spin-caption";/);
   assert.match(FEED, /const spin = spinFor\(it, distillPending\(dCompleted, dBlocked, it\.summary, it\.blockSummary, !!it\.blocked\),/);
   assert.match(FEED, /const spinCaption = spin\.caption, spinTip = spin\.tip, awaitingBg = spin\.awaitingBg;/);
-  assert.match(FEED, /import \{ distillText, distillInputs, applyDistillLine, distillPending \} from "\.\/distiller-line";/);
+  assert.match(FEED, /import \{ distillText, distillInputs, applyDistillLine, distillPending, distillStaleNote \} from "\.\/distiller-line";/);
   assert.match(FEED, /a\._awaitSpin\.style\.display = spinCaption \? "" : "none";/);
   assert.match(FEED, /a\._awaitWhy\.textContent = spinCaption; a\._awaitSpin\.title = spinTip \|\| spinCaption;/);
 });

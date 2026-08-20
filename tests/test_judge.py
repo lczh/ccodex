@@ -4482,6 +4482,88 @@ class DeltaScopedDistill(unittest.TestCase):
         self.assertNotIn("work", captured, "gate is idempotent at the event time — no re-distill loop")
         self.assertEqual(node["summary"], "the old whole-goal summary")
 
+    # ── the SUMMARY WATERMARK boundary (the user 2026-08-19) ────────────────────────────────────
+    # deltaSince is "the settle the latest reopen ended", but the summary shows at the DONE verdict —
+    # the fast read-then-reply flow reopens BEFORE any settle, leaving no boundary and a full-history
+    # recap (15 of 56 real re-completions). What the user was shown is what distilledMt covers.
+
+    def _run_watermark(self, deltaSince=None, distilledMt=None, reopen_at=None, kids=()):
+        # three stretches: A (T0+10), B (T0+60), C (T0+110) — enough to tell WHICH boundary spliced
+        records = [uline(T0, "first ask", "u1", ps="typed"),
+                   aline(T0 + 10, "did stretch A", "a1", "u1", stop="end_turn"),
+                   uline(T0 + 50, "second ask", "u2", "a1", ps="typed"),
+                   aline(T0 + 60, "did stretch B", "a2", "u2", stop="end_turn"),
+                   uline(T0 + 100, "follow-up ask", "u3", "a2", ps="typed"),
+                   aline(T0 + 110, "did stretch C", "a3", "u3", stop="end_turn")]
+        segs = [sg for turn in build_session(records)["turns"] for sg in em.segments(turn)]
+        path = Path(self._td) / (SID + ".jsonl")
+        path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+        g = SID + ":g1"
+        node = {"id": g, "text": "the goal", "parentId": None, "nodeComplete": True,
+                "blocked": False, "cleared": False, "settledDone": True,
+                "trail": [sg["id"] for sg in segs], "t": T0, "mt": T0 + 120,
+                "summary": "the old whole-goal summary", "doneWhy": "finished it",
+                "settledAt": T0 + 200,
+                "log": ([{"ev_t": reopen_at, "src": "user", "kind": "reopen", "why": "followed up"}]
+                        if reopen_at else [])}
+        if deltaSince is not None: node["deltaSince"] = deltaSince
+        if distilledMt is not None: node["distilledMt"] = distilledMt
+        nodes = {g: node}
+        for i, (dt, why) in enumerate(kids):
+            cid = SID + ":gk%d" % i
+            nodes[cid] = {"id": cid, "text": "sub outcome %d" % i, "parentId": g, "nodeComplete": True,
+                          "blocked": False, "cleared": False, "trail": [], "t": T0, "mt": dt,
+                          "doneWhy": why, "log": [{"ev_t": dt, "src": "closer", "kind": "done", "why": why}]}
+        store = {"rompUuid": SID, "seq": 1, "placementsV": jd.PLACEMENTS_V, "lastNode": g, "placements": {},
+                 "status": {g: "completed"}, "nodes": nodes}
+        jd.save_goals(SID, store)
+        captured = {}
+        jd.distill_llm = lambda goal_text, work_text, done_why="", prior_summary="", items=None: (
+            captured.update(work=work_text, prior=prior_summary, items=items)
+            or "BACKGROUND: b.\nTAKEAWAY: t3.\nSOURCE: m1")
+        jd._distill_session(SID, str(path), NOW)
+        return captured, jd.load_goals(SID)["nodes"][g]
+
+    def test_reopen_before_settle_scopes_at_the_summary_watermark(self):
+        # no deltaSince at all — the pre-settle reply shape. distilledMt covers A+B; reopen postdates it.
+        captured, node = self._run_watermark(distilledMt=T0 + 70, reopen_at=T0 + 90)
+        self.assertIn("did stretch C", captured["work"], "the post-reply stretch is the update's material")
+        self.assertNotIn("did stretch A", captured["work"],
+                         "everything the read summary covered is structurally absent")
+        self.assertNotIn("did stretch B", captured["work"], "the watermark is a boundary too")
+        self.assertEqual(captured["prior"], "the old whole-goal summary", "the update contract engages")
+
+    def test_a_stale_deltaSince_yields_to_the_newer_watermark(self):
+        # a PRIOR episode left deltaSince at T0+20; the user has since read a summary covering A+B
+        captured, node = self._run_watermark(deltaSince=T0 + 20, distilledMt=T0 + 70, reopen_at=T0 + 90)
+        self.assertIn("did stretch C", captured["work"])
+        self.assertNotIn("did stretch B", captured["work"],
+                         "the newer watermark wins: the stale settle boundary would have re-sent B "
+                         "as if unreviewed")
+
+    def test_no_reopen_after_the_watermark_means_no_synthetic_boundary(self):
+        captured, node = self._run_watermark(distilledMt=T0 + 70)
+        self.assertNotIn(jd.FOLLOWUP_DIVIDER, captured["work"],
+                         "without a reopen past the watermark there is nothing to scope")
+
+    def test_delta_redistill_filters_items_and_parts_to_post_boundary(self):
+        kids = [(T0 + 15, "old outcome one"), (T0 + 65, "old outcome two"),
+                (T0 + 115, "new outcome one"), (T0 + 118, "new outcome two")]
+        captured, node = self._run_watermark(distilledMt=T0 + 70, reopen_at=T0 + 90, kids=kids)
+        self.assertEqual([w for _, w in captured["items"]],
+                         ["new outcome one", "new outcome two"],
+                         "the reviewed outcomes live in <prior-summary>, never in <completed-items>")
+        self.assertEqual(len(node.get("summaryParts") or []), 2,
+                         "summaryParts stamps only what the update presents — the card stops re-aging "
+                         "every reviewed item")
+
+    def test_first_distill_keeps_the_full_items_list(self):
+        kids = [(T0 + 15, "outcome one"), (T0 + 65, "outcome two"), (T0 + 115, "outcome three")]
+        # no boundary engages (no reopen past a watermark, no deltaSince): the full-history distill
+        # keeps every completed outcome on the items list
+        captured, node = self._run_watermark(kids=kids)
+        self.assertEqual(len(captured["items"]), 3, "an unscoped distill offers every completed outcome")
+
     def test_distill_llm_prior_summary_note(self):
         from unittest import mock
         with mock.patch.object(jd, "_judge_run", return_value="x") as m:

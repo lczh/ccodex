@@ -1,5 +1,7 @@
-// Fork a session (the user 2026-08-13): a NEW parallel session branches from just before a chosen user
-// message (the bubble's hover "fork") or from the tip (the palette's "Fork this session…"); the parent
+// Fork a session (the user 2026-08-13): a NEW parallel session branches from a chosen point — the
+// hover "fork" BELOW each response run (the user 2026-08-19: forking conceptually cuts under the
+// response, so the button left the prompt's msg-acts row) or from the tip (the palette's "Fork this
+// session…", and the tip run's own spot); the parent
 // is untouched and both continue as separate threads. The modal asks the new name — default
 // "<session>-fork", editable — and the provisional tab is the instant acknowledgement, joined by NAME
 // exactly like a picker create. Source-level pins (no jsdom for the chat renderer), plus the kernel
@@ -15,11 +17,22 @@ const PALETTE = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview
 const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
 const BACKEND = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "sdk_backend.py"), "utf8");
 
-test("a fork button rides each editable bubble — non-destructive, accent hover, single click to the modal", () => {
-  assert.match(RENDER, /const fk = el\("button", "msg-fork"\) as HTMLButtonElement;/);
-  assert.match(RENDER, /fk\.addEventListener\("click", \(e\) => \{ e\.stopPropagation\(\); showForkPrompt\(editSid, uuid\); \}\);/);
-  assert.match(RENDER, /acts\.appendChild\(fk\);/);
-  // fork is not a rewind: no two-click arm (the modal is the confirmation), and never the destructive red
+test("the fork affordance rides BELOW each response run — delegated, with the cut the old bubble button passed", () => {
+  // the spot map: the FIRST genuine editable prompt after a run is its cut; the tip run forks everything
+  assert.match(RENDER, /function applyForkSpots\(sid: string, v: View\): void \{/);
+  assert.match(RENDER, /&& senderKind\(ev\) === "user" && editable\?\.has\(ev\.uuid\)/);
+  assert.match(RENDER, /if \(run && !spots\.has\(run\)\) spots\.set\(run, ""\);/);
+  assert.match(RENDER, /\.turn-assistant\[data-uuid="\$\{cssEscape\(anchor\)\}"\]/);
+  // …applied on the marks' hooks, like the branch chips (the transcript DOM rebuilds constantly)
+  assert.match(RENDER, /applyForkSpots\(sid, v\);/);
+  // the OLD home is gone: the prompt's msg-acts row no longer carries a fork (the user 2026-08-19)
+  assert.doesNotMatch(RENDER, /acts\.appendChild\(fk\);/);
+  // click-safe: the button is DELEGATED (data-act), landing in the shared modal with the spot's own cut
+  assert.match(RENDER, /fk\.dataset\.act = "forkspot";/);
+  assert.match(RENDER, /forkspot: \(elx\) => \{/);
+  assert.match(RENDER, /showForkPrompt\(activeId, cut\);/);
+  // hover the RESPONSE to reveal it; not a rewind: no two-click arm, and never the destructive red
+  assert.match(CSS, /\.turn-assistant:hover \.msg-fork, \.msg-fork:focus-visible \{ opacity: 0\.9; \}/);
   assert.match(CSS, /\.msg-fork:hover \{ color: var\(--fg\); border-color: var\(--accent\); \}/);
   assert.doesNotMatch(CSS, /\.msg-fork\.armed/);
 });
@@ -32,7 +45,7 @@ test("the modal defaults to <session>-fork and posts forkSession {id, uuid, name
   // the instant acknowledgement is the provisional tab, name-joined like a picker create
   assert.match(RENDER, /openProvisional\(\{ name, backend: "sdk", dir: "", host: hostOf\(sid\) \}\);/);
   // both cut semantics are said in the dialog itself
-  assert.match(RENDER, /continues from just before this message/);
+  assert.match(RENDER, /continues the conversation to just below this response/);
   assert.match(RENDER, /continues this whole conversation/);
   assert.match(CSS, /\.fork-name \{ display: block; width: 100%;/);
 });

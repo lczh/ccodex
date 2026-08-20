@@ -6,7 +6,7 @@
 // Rendering is KEYED + INCREMENTAL: cards are kept alive across the host's live
 // pushes and updated in place — never torn down — so hovering one doesn't flicker
 // when the fleet streams new deliverables in.
-import { distillText, distillInputs, applyDistillLine, distillPending } from "./distiller-line";
+import { distillText, distillInputs, applyDistillLine, distillPending, distillStaleNote } from "./distiller-line";
 import { spinFor, KIND_WORD } from "./spin-caption";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { hostNameNodes, hostPartsNodes, hostIsDown, hostDownNote, hostOf } from "./host-prefix";
@@ -47,6 +47,7 @@ interface AskTreeNode {
   blockSummary?: string | null;                                  // the BLOCK-distiller's decision brief for a blocked goal → the modal's auto-line for a BLOCKED node (kernel 466393c); null until produced
   trgb?: [number, number, number];                               // last-activity recency tint (timestamp)
   cleared?: boolean;                                             // user-cleared sub (nodeOverride op:clear) → struck-through faded row + "cleared" chip; the mark stays tied to status (box = done, the user 2026-07-26)
+  reviewedEarlier?: boolean;                                     // this done sub predates the top's review boundary (kernel flatten ↔ jd.review_boundary, the distiller's own scoping) → collapsed behind one "N reviewed earlier" row (the user 2026-08-19)
   log?: NodeLogRow[] | null;                                     // the node's newest verdict rows (kernel _node_log_rows, non-done only) → the modal's per-item story (the user 2026-07-20)
   children: string[];
 }
@@ -88,6 +89,7 @@ interface AskItem {
   blockSummary?: string | null;                    // block-distiller's decision brief for a BLOCKED goal → the blocked card's one auto-written line (kernel 466393c); null until produced
   briefParts?: { id?: string; since: number }[] | null;   // MULTI-item brief: one {id, since} per paragraph IN ORDER (judge briefParts) → per-paragraph "Nm ago" stamps; null/absent = single ask, the card header's age is the stamp (the user 2026-07-24)
   summaryParts?: { id?: string; since: number }[] | null;   // the DONE twin: per-paragraph done-event stamps for a takeaway the distiller split by <completed-items> (the user 2026-07-24)
+  summaryStale?: boolean;                          // the user followed up AFTER the shown takeaway (kernel: followupAt > distilledMt) → the summary section carries the stale note until the re-distill lands (the user 2026-08-19)
   background?: string | null;                      // distiller's BACKGROUND section: re-orientation for a reader who forgot the thread → the card's collapsed-by-default section above the takeaway (the user 2026-07-02)
   summaryAnchorUuid?: string | null;               // click the summary line → the completion turn's wrap-up block (kernel build_feed completed pin; cited/latest-prose fallbacks — the user 2026-07-14)
   warns?: { kind: string; t: number; msg: string; detail: string }[] | null;   // judge-stamped anomalies (judge _node_warn → kernel build_feed): yellow "warning" chip; click opens the detail modal (the user 2026-07-02)
@@ -1393,8 +1395,17 @@ function applySections(a: any, it: AskItem, distillShown: boolean): void {
       seen.add(n.id);
       for (const c of n.children || []) walk(c, depth + 1);
     };
-    for (const c of root.children || []) walk(c, 0);
-    for (const { node: s, depth, repeat, expandable, collapsed } of rows) {
+    // REVIEWED-EARLIER fold (the user 2026-08-19): direct children whose outcomes the user already
+    // reviewed (kernel reviewedEarlier, from the SAME boundary the distiller scopes the takeaway with)
+    // collapse behind one row, so a re-completed card presents only the new work — the old material is
+    // one click away, never gone. Fresh rows first; the fold row sits below them.
+    const revKids = (root.children || []).filter((c) => !!byId.get(c)?.reviewedEarlier);
+    const freshKids = (root.children || []).filter((c) => !byId.get(c)?.reviewedEarlier);
+    const revOpen = cardTreeExpanded.has(id + ":reviewed");
+    for (const c of freshKids) walk(c, 0);
+    const freshEnd = rows.length;
+    if (revOpen) for (const c of revKids) walk(c, 0);
+    const paintRow = ({ node: s, depth, repeat, expandable, collapsed }: typeof rows[number]) => {
       const row = el("div", "fcheck " + nodeStatusClass(s) + (s.auth ? " auth-" + s.auth : "") + (repeat ? " repeat" : ""));
       if (depth) row.style.paddingLeft = (depth * TREE_INDENT_EM) + "em";   // same per-level indent as the modal outline
       // disclosure triangle: ▶ collapsed / ▼ expanded; a non-expandable node gets a blank same-width spacer so
@@ -1423,7 +1434,27 @@ function applySections(a: any, it: AskItem, distillShown: boolean): void {
       // SAME wireNodeZones; a dim repeat is display-only (wire=false).
       wireNodeZones(it, s, mark, txt, null, !repeat);
       cl.appendChild(row);
+    };
+    rows.slice(0, freshEnd).forEach(paintRow);
+    if (revKids.length) {
+      // the fold row: same gesture grammar as a branch triangle — click toggles, state survives
+      // re-renders via cardTreeExpanded (keyed per card), and the label carries the count
+      const row = el("div", "fcheck freviewed" + (revOpen ? " open" : ""));
+      const tri = el("span", "fcheck-tri nav"); tri.textContent = revOpen ? "▼" : "▶";
+      const mark = el("span", "fcheck-mark"); mark.textContent = "✓";
+      const txt = el("span", "fcheck-text");
+      txt.textContent = revKids.length + " reviewed earlier";
+      row.title = "sub-goals you reviewed before your follow-up — the update above doesn't re-present them";
+      row.onclick = (ev: Event) => {
+        ev.stopPropagation();
+        const k = id + ":reviewed";
+        if (cardTreeExpanded.has(k)) cardTreeExpanded.delete(k); else cardTreeExpanded.add(k);
+        renderTree();
+      };
+      row.append(tri, mark, txt);
+      cl.appendChild(row);
     }
+    rows.slice(freshEnd).forEach(paintRow);
     cl.style.display = cl.children.length ? "" : "none";
   };
   renderTree();
@@ -1692,6 +1723,14 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
   // _seg_best_text). This was lost when the line was restored via applyDistillLine (which only sets text), so
   // the summary read like plain text with no affordance (the user 2026-06-29). stopPropagation so it doesn't
   // also open the modal (the card-body click). Falls back to non-clickable when there's no anchor.
+  // STALE-takeaway note (the user 2026-08-19): the rule lives in ./distiller-line so the test EXECUTES
+  // it. Prepended after the parts-split (which rewrites the element), so it survives either rendering.
+  const staleNote = distillStaleNote(!!it.summaryStale, dCompleted, distillShown);
+  if (staleNote) {
+    const sn = el("div", "fsum-stale");
+    sn.textContent = staleNote;
+    (a._distill as HTMLElement).prepend(sn);
+  }
   const dl = a._distill as HTMLElement;
   if (distillShown && it.summaryAnchorUuid) {
     dl.classList.add("fask-distill-link");

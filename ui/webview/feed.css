@@ -936,6 +936,12 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 /* a card sub-goal is clickable just like the modal tree node (the user 2026-06-17): the checkbox + text are
    separate links. Per-ZONE hover highlight (.lz-hl, JS-toggled) — a halo on the mark, a fill on the text. */
 .fcheck .lz-nav { cursor: pointer; }
+/* the REVIEWED-EARLIER fold row (the user 2026-08-19): sub-goals already reviewed before the follow-up
+   collapse behind this one dimmer row; whole-row click toggles (state in cardTreeExpanded) */
+.fcheck.freviewed { opacity: 0.6; cursor: pointer; }
+.fcheck.freviewed:hover { opacity: 0.85; }
+/* the STALE-takeaway note above a completed card's summary: the user followed up after reading it */
+.fsum-stale { font-style: italic; opacity: 0.62; font-size: 0.92em; margin-bottom: 3px; }
 .fcheck-text.lz-hl { background: rgba(255, 255, 255, 0.12); border-radius: 3px; box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.12); }
 .fcheck-mark.lz-hl { box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.16); }
 /* standalone-completion modal: same tree vocabulary as ask cards; pending
@@ -1155,8 +1161,15 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 .judge-limit-banner .jl-switch:hover { background: #3c3c3c; }
 .judge-limit-banner .jl-switch:disabled { opacity: 0.6; cursor: default; }
 
-/* the Stack toggle while the narrow container query FORCES stacking (2026-08-19): faded and inert —
-   unclicking it would change nothing at this width, and the tooltip names the way out (more width).
-   pointer-events stays on so the tooltip still shows on hover; the click handler no-ops instead. */
-#feed-stacked.forced { opacity: 0.4; cursor: default; }
-#feed-stacked.forced:hover { color: inherit; background: inherit; }
+/* the Stack toggle while the narrow container query FORCES stacking (2026-08-19): stacking IS on,
+   so the button keeps the pressed accent — grayed by opacity, never stripped of its on-state (the
+   user 2026-08-19, who wanted it grayed but still blue). Hover stays responsive (a gentle brighten,
+   not the action-blue that promises a click); the tooltip names the way out. The selector MUST tie
+   the .on rule's (1,2,0) specificity and sit LATER in this file: the first two cuts keyed the
+   rule on the button id alone at (1,1,0), so `.on { opacity: 1 }` silently won the cascade and the
+   fade never painted while the button was pressed — which forced stacking always implies (the user's
+   third report, 2026-08-19). */
+#feed-foot .feed-modetoggle.forced { opacity: 0.5; cursor: default;
+  color: var(--accent); border-color: var(--accent); }
+#feed-foot .feed-modetoggle.forced:hover { opacity: 0.75;
+  background: rgba(156, 210, 255, 0.12); }   /* keep the pressed wash — never the action hover's promise */

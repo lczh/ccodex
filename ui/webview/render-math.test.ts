@@ -98,8 +98,19 @@ test("render.ts wires the math extensions into marked", () => {
 });
 
 test("math.ts renders html-only output so md()'s DOMPurify profile passes it", () => {
-  // output: "html" means no MathML twin; the sanitizer keeps its narrow html profile.
+  // output: "html" means no MathML twin — but stretchy glyphs (\sqrt radicals, wide accents,
+  // extensible arrows) are still inline <svg> even in html mode, so the sanitizer allows
+  // DOMPurify's svg profile alongside html (the user 2026-08-19: $\sqrt{d}$ rendered as a bare
+  // serif "d" — the radical was sanitized away while its radicand survived).
   assert.match(UI("math.ts"), /output: "html"/);
+  assert.match(UI("render.ts"), /USE_PROFILES: \{ html: true, svg: true \}/);
+});
+
+test("executed: \\sqrt really does emit inline svg — the glyph the sanitizer must keep", () => {
+  const out = html("norm grows like $\\sqrt{d}$ here.");
+  assert.ok(hasMath(out));
+  assert.ok(out.includes("<svg"), "the radical is an inline svg even with output:html");
+  assert.ok(out.includes("sqrt"), "KaTeX marks the construct");
 });
 
 test("styles.css imports the KaTeX layout css", () => {

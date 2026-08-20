@@ -80,33 +80,28 @@ jobs:
         os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest","macos-latest"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install bats + tmux (Linux)
+      # bats comes from the pinned release tarball, NOT apt: an Azure apt-mirror outage hung
+      # `apt-get update` to the job timeout three runs in a row (2026-08-19, ~35 wasted minutes
+      # each). GitHub itself is already on the critical path (checkout), so this adds no new
+      # dependency — and no bats test needs a real tmux (every suite PATH-prepends its own mock),
+      # so nothing else is installed at all. The step timeout kills any residual network hang in
+      # minutes instead of letting it eat the job's budget.
+      - name: Install bats (Linux)
         if: runner.os == 'Linux'
-        timeout-minutes: 10
-        # bats comes from the PINNED release tarball, so apt is only needed for tmux — and the
-        # Ubuntu archive stalling must never eat the job's whole budget again (two release gates
-        # died at 35m inside apt-get update, 2026-08-19): bounded retries, then fail fast so the
-        # failure is visible and re-dispatchable instead of a silent 35-minute hang.
+        timeout-minutes: 5
         run: |
           curl -fsSL --retry 3 -o /tmp/bats.tar.gz \
-            https://github.com/bats-core/bats-core/archive/refs/tags/v1.11.0.tar.gz
-          # DIGEST-pinned (the v1.3.8 audit: a tag is mutable and the installer ran under sudo —
-          # a moved tag would have executed arbitrary code as root on the runner)
-          echo "aeff09fdc8b0c88b3087c99de00cf549356d7a2f6a69e3fcec5e0e861d2f9063  /tmp/bats.tar.gz" | sha256sum -c -
+            https://github.com/bats-core/bats-core/archive/refs/tags/v1.11.1.tar.gz
+          # DIGEST-pinned (the v1.3.8 audit: a tag is mutable, and running a mutable tarball's
+          # installer under sudo would hand a moved tag root on the runner) — and installed to
+          # $HOME with no sudo at all
+          echo "5c57ed9616b78f7fd8c553b9bae3c7c9870119edd727ec17dbd1185c599f79d9  /tmp/bats.tar.gz" | sha256sum -c -
           tar -xzf /tmp/bats.tar.gz -C /tmp
-          bash /tmp/bats-core-1.11.0/install.sh "$HOME/.local"
+          bash /tmp/bats-core-1.11.1/install.sh "$HOME/.local"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          for i in 1 2 3; do
-            if sudo timeout 150 apt-get update -o Acquire::Retries=2 \
-               && sudo timeout 150 apt-get install -y --no-install-recommends tmux; then
-              exit 0
-            fi
-            sleep 15
-          done
-          echo "apt could not install tmux after 3 bounded attempts" >&2
-          exit 1
       - name: Install bats + tmux (macOS)
         if: runner.os == 'macOS'
+        timeout-minutes: 15
         run: brew install bats-core tmux
       - name: Run bats (including bootstrap, installer, and release regressions)
         run: bats --print-output-on-failure tests/*.bats
