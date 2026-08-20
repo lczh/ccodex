@@ -664,8 +664,8 @@ state = {"latch": 0}
 
 def flaky_replace(src, dst):
     d = str(dst)
-    if "romp-update-channel" in d:
-        raise OSError(28, "No space left on device")     # the publish fails
+    if d.endswith("romp-update-channel"):                # the MARKER publish fails — the intent
+        raise OSError(28, "No space left on device")     # staging (…-channel.intent) still lands
     if d.endswith("romp-install-failed"):
         state["latch"] += 1
         if state["latch"] > 1:                           # the ARM landed; the fs then degraded
