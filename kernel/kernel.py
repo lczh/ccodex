@@ -2489,36 +2489,6 @@ def _publish_latch_channel(sha8):
                 return False
     return True
 
-
-def _publish_channel_intent(sha8):
-    """Publish a staged CHANNEL INTENT matching this commit to the marker, before the caller
-    spends the latch. Bootstrap records (target8, channel) durably BEFORE it moves HEAD; a build
-    revived by any healer must wear the channel its update intended — the v1.3.8 audit reproduced
-    a hard death right after the checkout moved: the gate healed the stable build while the
-    marker still said dev, restoring the exact stable-build-following-unsigned-main hole. Returns
-    False ONLY on a real failure (unreadable intent, unwritable marker) — the caller must then
-    KEEP the latch; no intent, or an intent for a different commit, is simply not ours."""
-    ip = _intent_path(str(sha8 or "")[:8])
-    if ip is None:
-        return True
-    try:
-        raw = ip.read_text().splitlines()
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False                              # an EXISTING intent we cannot read is unknown
-    want = raw[0].strip()[:8] if raw else ""
-    channel = raw[1].strip() if len(raw) > 1 else ""
-    if want != str(sha8 or "")[:8] or channel not in ("stable", "dev"):
-        return True                               # someone else's intent: not ours to publish
-    try:
-        _atomic_write(ip.parent / "romp-update-channel", channel)
-        ip.unlink(missing_ok=True)                # spent
-        return True
-    except OSError:
-        return False
-
-
 def _arm_latch(target8, prior8=""):
     """Arm the intent, CARRYING a prior record instead of overwriting it; True when persisted.
     Either argument may be a full "sha8 channel" line — dedup compares the sha halves only."""
@@ -3000,7 +2970,14 @@ def _converge_install(sha8, lock_fd=None):
     except Exception as e:
         ok, why = False, str(e)[:200]
     if not ok:
-        _set_install_failed(sha8)
+        # PRESERVE an existing record for this sha verbatim: rewriting it to the bare sha
+        # destroyed the in-line channel token and any carried second line, so the eventual
+        # successful heal published nothing and the build ran under the stale marker (the
+        # adversarial review, 2026-08-20, reproduced — a failed FIRST heal attempt was enough).
+        # Write only when no record for this sha exists yet; an unreadable latch is left alone.
+        lines = _install_latch_lines()
+        if lines is not None and str(sha8 or "")[:8] not in lines:
+            _set_install_failed(sha8)
         _converge_note("the checkout advanced to %s but install.sh failed: %s — nothing restarts "
                        "onto it until install passes; fix the cause, then Update again" % (sha8, why))
         return False

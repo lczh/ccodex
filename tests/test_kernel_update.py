@@ -555,6 +555,20 @@ class RunUpdate(Fresh):
         self.assertIsNone(self._latch)
         self.assertIsNone(self._latch, "the record and its channel are spent together")
 
+    def test_an_unpublishable_marker_keeps_the_tag_updates_latch(self):
+        # the tag script's two pub_line sites were the only healer legs with no unpublishable-
+        # marker coverage (the adversarial review, 2026-08-20): a reorder spending the latch
+        # before the publish would serve the build under the OLD marker unnoticed
+        rc, rows, report = self._execute_captured_updater(
+            0, pre_latch="deadbee1 stable",
+            pre_files={".git/romp-update-channel": "dev\n",
+                       ".git/romp-update-channel.pub": None})   # a DIRECTORY at the staging
+        #                                                         name: the printf fails
+        self.assertEqual(rc, 0)
+        self.assertFalse(report["ok"], "an unpublishable channel is an incomplete update")
+        self.assertIsNotNone(self._latch, "the latch survives for the retry")
+        self.assertIn("deadbee1", self._latch)
+
     def test_a_plain_sha_latch_line_publishes_no_channel(self):
         # in-channel updaters (this one included) arm plain sha lines: healing one changes no
         # marker, and there is no separate file for a stranger's record to poison (the

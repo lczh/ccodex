@@ -932,6 +932,77 @@ class IntentPublish(unittest.TestCase):
                 self.assertEqual(km._install_latch_lines(), ["abcd1234", "ffffeeee"],
                                  "every reader keeps matching on the sha half")
 
+    def test_a_failed_heal_preserves_the_record_verbatim(self):
+        # _converge_install's failure path used to rewrite the latch to the bare sha — destroying
+        # the in-line channel token and any carried second line, so the EVENTUAL successful heal
+        # published nothing and the build ran under the stale marker (the adversarial review,
+        # 2026-08-20, reproduced: one failed first heal attempt was enough)
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            (gd / "romp-update-channel").write_text("dev\n")
+            (gd / "romp-install-failed").write_text("abcd1234 stable\nffff9999")
+            self._heal(gd, install_rc=1)               # the first heal attempt FAILS
+            self.assertEqual((gd / "romp-install-failed").read_text(),
+                             "abcd1234 stable\nffff9999",
+                             "a failed heal must not rewrite the record it could not spend — "
+                             "the token and the carried line survive verbatim")
+            self._heal(gd)                             # install fixed: the heal completes
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
+                             "and the eventual heal still publishes the intended channel")
+            self.assertFalse((gd / "romp-install-failed").exists())
+
+    def test_arm_latch_keeps_the_token_on_a_same_sha_re_arm(self):
+        # 'a same-sha re-arm keeps whichever record carries a token' — executed, both directions
+        # (the adversarial review, 2026-08-20: the rule had no revert-detector)
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            with mock.patch.object(km, "_update_git_dir", return_value=gd):
+                self.assertTrue(km._arm_latch("abcd1234", "abcd1234 stable"))
+                self.assertEqual((gd / "romp-install-failed").read_text(), "abcd1234 stable",
+                                 "a plain re-arm over a token record keeps the token")
+                self.assertTrue(km._arm_latch("abcd1234 dev", "abcd1234 stable"))
+                self.assertEqual((gd / "romp-install-failed").read_text(), "abcd1234 dev",
+                                 "when both carry tokens, the NEW record wins")
+                self.assertTrue(km._arm_latch("eeee1111", "abcd1234 stable"))
+                self.assertEqual((gd / "romp-install-failed").read_text(),
+                                 "eeee1111\nabcd1234 stable",
+                                 "different shas: the carried record rides as line 2, verbatim")
+
+    def test_settle_carries_the_full_line_token_and_all(self):
+        # reverting the carry to sha-only dropped the crashed update's channel (the adversarial
+        # review, 2026-08-20: no executed revert-detector existed)
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            (gd / "romp-install-failed").write_text("abcd1234 stable")
+            with mock.patch.object(km, "_update_git_dir", return_value=gd):
+                with mock.patch.object(km, "_checkout_sha", return_value="abcd1234"):
+                    with mock.patch.object(km, "_converge_install", return_value=False):
+                        fd = km._update_flock()
+                        try:
+                            settle, carry = km._settle_prior_latch(fd)
+                        finally:
+                            km.os.close(fd)
+        self.assertEqual(settle, "")
+        self.assertEqual(carry, "abcd1234 stable",
+                         "the carry is the FULL line — a sha-only carry dropped the channel")
+
+    def test_a_two_line_heal_publishes_only_the_healed_lines_token(self):
+        # the 'published by a stranger' property, two-line form (the adversarial review,
+        # 2026-08-20): healing the plain intent line must not publish the CARRIED line's token
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            (gd / "romp-update-channel").write_text("dev\n")
+            (gd / "romp-install-failed").write_text("eeee1111\nabcd1234 stable")
+            self._heal(gd, cur="eeee1111")
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "dev",
+                             "the healed line is plain — the carried line's token is not ours")
+            self.assertFalse((gd / "romp-install-failed").exists(),
+                             "a passing install supersedes the carried record")
+
     def test_a_torn_single_nonhex_latch_line_is_never_moot(self):
         # the v1.3.8 audit: a one-byte-short quarantine write left a single non-hex line, and the
         # launcher moot-removed it and started the uninstalled build — a single line may be moot
