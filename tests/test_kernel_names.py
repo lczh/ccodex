@@ -208,6 +208,23 @@ class ForkRouteBody(unittest.TestCase):
         self.assertFalse(body.get("ok"), "the collision is the CALLER'S answer, not a stderr line")
         self.assertIn("already running or being created", body.get("error", ""))
 
+    def test_a_failed_thread_start_releases_the_claim(self):
+        # Thread.start() raising after the claim (thread/fd exhaustion) leaked the name FOREVER —
+        # the worker's releasing finally never ran, and every later create/fork/rename of that
+        # name got NAME_TAKEN until restart (the adversarial review, 2026-08-21)
+        real_thread = km.threading.Thread
+
+        class BoomThread(real_thread):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+        with mock.patch.object(km.threading, "Thread", BoomThread):
+            code, out = self._post("/new", json.dumps({"name": "web", "dir": "/tmp",
+                                                       "backend": "tmux"}).encode())
+        self.assertEqual(code, 500, "the launch failure is loud")
+        with km._name_claims_lock:
+            self.assertNotIn("web", km._NAME_CLAIMS,
+                             "a launch that never ran must not hold the name forever")
+
     def test_fork_requires_parent_and_name(self):
         code, out = self._post("/fork", b"{}")
         self.assertEqual(code, 400)

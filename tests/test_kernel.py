@@ -6669,8 +6669,12 @@ class NewSessionRoute(unittest.TestCase):
 
     def test_tmux_backend_threads_the_spawn(self):
         calls = []
-        saved_spawn, saved_live = km._spawn_session, km._live_names
-        km._spawn_session, km._live_names = (lambda nm, cwd=None: calls.append((nm, cwd))), (lambda t: {})
+        # the handler claims the name itself and threads the PRECLAIMED worker (the v1.3.10
+        # audit's claim-before-ack fix) — patching the old public seam let the REAL spawn run
+        # from the suite (the adversarial review, 2026-08-21)
+        saved_spawn, saved_live = km._spawn_session_preclaimed, km._live_names
+        km._spawn_session_preclaimed, km._live_names = (
+            lambda nm, cwd=None: calls.append((nm, cwd))), (lambda t: {})
         try:
             code, body = self._post({"name": "term1", "dir": tempfile.gettempdir(),
                                      "backend": "tmux"})
@@ -6679,7 +6683,8 @@ class NewSessionRoute(unittest.TestCase):
                     break
                 time.sleep(0.05)
         finally:
-            km._spawn_session, km._live_names = saved_spawn, saved_live
+            km._spawn_session_preclaimed, km._live_names = saved_spawn, saved_live
+            km._release_name("term1")            # the stub never runs the releasing finally
         self.assertEqual(code, 200)
         self.assertTrue(body["ok"] and body.get("pending"))
         self.assertEqual(len(calls), 1)

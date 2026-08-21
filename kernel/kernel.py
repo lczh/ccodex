@@ -27219,8 +27219,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not _claim_name(nm):
                     return self._send(200, json.dumps({"ok": False, "error": _NAME_TAKEN % nm}),
                                       "application/json")
-                threading.Thread(target=_spawn_session_preclaimed, args=(nm, cwd),
-                                 daemon=True).start()
+                try:
+                    threading.Thread(target=_spawn_session_preclaimed, args=(nm, cwd),
+                                     daemon=True).start()
+                except BaseException:
+                    _release_name(nm)          # the worker never ran, so its finally can never
+                    raise                      # release — a raise here leaked the name FOREVER
+                    #                            (the adversarial review, 2026-08-21)
                 return self._send(200, json.dumps({"ok": True, "pending": True, "dir": cwd}),
                                   "application/json")
             if u.path == "/fork":
@@ -27933,8 +27938,12 @@ class Handler(BaseHTTPRequestHandler):
                 elif not _claim_name(nm):
                     client["send"](json.dumps({"type": "warn", "text": _NAME_TAKEN % nm}))
                 else:
-                    threading.Thread(target=_spawn_session_preclaimed, args=(nm, cwd),
-                                     daemon=True).start()
+                    try:
+                        threading.Thread(target=_spawn_session_preclaimed, args=(nm, cwd),
+                                         daemon=True).start()
+                    except BaseException:
+                        _release_name(nm)      # same leak as the /new branch: release on a
+                        raise                  # failed launch (the adversarial review, 2026-08-21)
         elif msg and msg.get("type") == "cancelCreate" and msg.get("name"):
             # The webview's "Opening…" cue was cancelled (the ✕/Esc/backdrop — the spawn hung/failed, or the
             # user changed their mind). We only know the NAME (no id yet). Tear down a matching LOCAL session
