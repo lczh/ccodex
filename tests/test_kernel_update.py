@@ -574,7 +574,11 @@ class RunUpdate(Fresh):
         # through every [ -s ] branch and the update proceeded over it; a malformed channel token
         # ("sha8 sta") was healed as a legacy plain latch, spending the record with the channel
         # unpublished
-        for bad in ("", "deadbee1 sta", "deadbee1\nffff9999\neeee1111"):
+        for bad in ("", "deadbee1 sta", "deadbee1\nffff9999\neeee1111",
+                    "deadbee1\nquarantined", "quarantined\ndeadbee1"):
+            # the mixed sha+quarantined forms: per-line validation healed them and ERASED the
+            # quarantine record while every python reader refused (the adversarial review,
+            # 2026-08-21 — 'quarantined' is valid only as the exact pair)
             km._UPDATE_STATE[0] = ""       # each iteration is its own update episode
             rc, rows, report = self._execute_captured_updater(0, pre_latch=bad)
             self.assertEqual(rc, 0, "the reporter records the refusal")

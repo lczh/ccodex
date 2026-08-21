@@ -331,6 +331,53 @@ class UpdateRemote(unittest.TestCase):
             self.assertIn("DIRTYNOW", a.stdout, "the locked wrapper's own dirty check refuses")
             self.assertFalse((gd / "romp-install-failed").exists())
 
+    def test_the_wrapper_refuses_short_writes_executed(self):
+        # the write-count checks had zero coverage — deleting them passed the full suite (the
+        # adversarial review, 2026-08-21). A sitecustomize shim shortens the wrapper's first
+        # large os.write: the ARM write must refuse (RESETFAIL, nothing armed) instead of
+        # persisting a 5-byte truncated record.
+        import tempfile
+        from pathlib import Path
+        calls = self._wire(apply_out="SYNCED:abcdef0")
+        km._update_remote("TESTHOST")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        with tempfile.TemporaryDirectory() as td:
+            fix = Path(td) / "romp"
+            gd = fix / ".git"
+            gd.mkdir(parents=True)
+            fakebin = Path(td) / "bin"
+            fakebin.mkdir()
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "esac\nexit 0\n" % gd)
+            (fakebin / "git").chmod(0o755)
+            (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "install.sh").chmod(0o755)
+            shim = Path(td) / "shim"
+            shim.mkdir()
+            (shim / "sitecustomize.py").write_text(
+                "import os\n"
+                "_real = os.write\n"
+                "_state = {'done': False}\n"
+                "def _short(fd, data):\n"
+                "    if fd > 2 and len(data) > 6 and not _state['done']:\n"
+                "        _state['done'] = True\n"
+                "        return _real(fd, data[:5])\n"
+                "    return _real(fd, data)\n"
+                "os.write = _short\n")
+            env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")),
+                       PYTHONPATH=str(shim))
+            apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("RESETFAIL", a.stdout,
+                          "a truncated arm write must refuse — persisting 5 bytes of a record "
+                          "is the split-record class")
+            self.assertFalse((gd / "romp-install-failed").exists(),
+                             "nothing armed from a write that did not land whole")
+
     def test_the_wrapper_heal_publishes_a_staged_intent_and_nonhex_is_LATCHSTUCK(self):
         # the v1.3.8 audit's hard-death repro, p2p edition: the remote checkout carries a crashed
         # bootstrap's latch + intent — the wrapper's settle-heal must publish the intent before
@@ -388,7 +435,7 @@ class UpdateRemote(unittest.TestCase):
                              "the record and its channel survive for the retry")
             # torn, EMPTY, and malformed records are never moot — LATCHSTUCK, executed (the
             # v1.3.9 audit: strict grammar in every reader)
-            for bad in ("quarantin", "", "deadbee2 sta"):
+            for bad in ("quarantin", "", "deadbee2 sta", "abcd1234\nffff9999\neeee1111"):
                 (gd / "romp-install-failed").write_text(bad)
                 a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
                 self.assertIn("LATCHSTUCK", a.stdout, "%r must refuse" % bad)

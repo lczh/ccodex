@@ -2215,6 +2215,12 @@ def _run_update(tag):
         + "if [ -s %s ] && [ -r %s ] && [ \"$(grep -c . %s)\" -le 2 ]; then\n" % (latch, latch, latch)
         + "  if grep -q . %s && [ -n \"$(grep -vEx '([0-9a-f]{8}( (stable|dev))?|quarantined)' %s)\" ]; "
           "then SETTLED=0; fi\n" % (latch, latch)
+        # 'quarantined' is a valid LINE only as the exact two-line pair (matching every python
+        # reader): per-line alternation healed 'sha8\nquarantined' — spending the latch and
+        # ERASING the quarantine record while four other readers refused the same bytes (the
+        # adversarial review, 2026-08-21)
+        + "  Q=$(grep -cx quarantined %s 2>/dev/null); L=$(grep -c . %s 2>/dev/null)\n" % (latch, latch)
+        + "  if [ \"$Q\" -gt 0 ] && { [ \"$Q\" -ne 2 ] || [ \"$L\" -ne 2 ]; }; then SETTLED=0; fi\n"
         + "elif [ -s %s ] && [ -r %s ]; then SETTLED=0; fi\n" % (latch, latch)
         # SETTLE like every other arming path (the adversarial review, 2026-08-19: this was the
         # one updater still arming by overwrite): a latch line matching HEAD heals here, under the
@@ -6552,6 +6558,22 @@ def _comment_kill_all(parent_sid, be):
 
 
 def _comment_promote(parent_sid, tid, new_name, now=None, client=None):
+    nm = (new_name or "").strip()
+    if nm and NAME_RE.match(nm):
+        # the same atomic reservation create and fork take — promotion wrote names/ blindly, so
+        # promoting onto a live (or being-created) name produced two sessions under one name and
+        # one became unaddressable (the adversarial review, 2026-08-21: the _claim_name docstring
+        # claimed promotion coverage that was never implemented)
+        if not _claim_name(nm):
+            return _NAME_TAKEN % nm
+        try:
+            return _comment_promote_inner(parent_sid, tid, new_name, now=now, client=client)
+        finally:
+            _release_name(nm)
+    return _comment_promote_inner(parent_sid, tid, new_name, now=now, client=client)
+
+
+def _comment_promote_inner(parent_sid, tid, new_name, now=None, client=None):
     """Break a thread out into a FULL board session. Ordering contract (same as _fork_session):
     judge stores are seeded BEFORE promote_thread writes the names/ entry. The seeds run against
     the PARENT transcript at the ORIGINAL cut (the history the two transcripts share, verbatim),

@@ -42,6 +42,30 @@ class NameClaims(unittest.TestCase):
             self.assertTrue(km._claim_name("web"), "released names are claimable again")
             km._release_name("web")
 
+    def test_the_claim_lock_is_load_bearing_under_a_slow_live_check(self):
+        # removing _name_claims_lock passed every test (the adversarial review, 2026-08-21): with
+        # a deliberately slow live-store check, two unserialized claims BOTH pass the check and
+        # both win — the lock is what makes check+claim one step
+        import time as _t
+
+        def slow_live(tmux):
+            _t.sleep(0.05)
+            return {}
+        wins = []
+        gate = threading.Barrier(2)
+
+        def contender():
+            gate.wait(5)
+            wins.append(km._claim_name("web"))
+        with mock.patch.object(km, "_live_names", side_effect=slow_live):
+            with mock.patch.object(km, "_tmux_sessions", return_value={}):
+                t1 = threading.Thread(target=contender)
+                t2 = threading.Thread(target=contender)
+                t1.start(); t2.start()
+                t1.join(10); t2.join(10)
+        self.assertEqual(sorted(wins), [False, True],
+                         "exactly one winner even when the live check is slow")
+
     def test_a_live_name_is_never_claimable(self):
         with mock.patch.object(km, "_tmux_sessions", return_value={"sid1": {}}):
             with mock.patch.object(km, "_name_of", return_value="web"):
@@ -73,6 +97,17 @@ class NameClaims(unittest.TestCase):
                          "one winner (None), one refusal string")
         self.assertIn("already running or being created",
                       next(x for x in results if x is not None))
+
+    def test_promotion_refuses_a_claimed_name(self):
+        # promotion wrote names/ blindly (the adversarial review, 2026-08-21) — it now takes the
+        # same reservation as create and fork
+        with mock.patch.object(km, "_tmux_sessions", return_value={}):
+            self.assertTrue(km._claim_name("web"))
+            try:
+                err = km._comment_promote("sid1", "t1", "web")
+                self.assertIn("already running or being created", err or "")
+            finally:
+                km._release_name("web")
 
     def test_creators_refuse_a_claimed_name(self):
         with mock.patch.object(km, "_tmux_sessions", return_value={}):

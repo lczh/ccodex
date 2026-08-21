@@ -89,8 +89,14 @@ class PullRemote(unittest.TestCase):
         merged = self.merged = {"v": False}
         def fake_popen(argv, **kw):
             calls.append(argv)                       # install.sh spawns via Popen under
-            proc = mock.MagicMock()                  # _remotes_lock — a REAL Popen here executed
-            proc.communicate.return_value = (        # the repo's actual installer from the tests
+            if km._remotes_lock.acquire(blocking=False):
+                km._remotes_lock.release()           # a spawn OUTSIDE the hold is the exact P2
+                raise AssertionError(                # regression this seam exists to prevent —
+                    "install.sh spawned OUTSIDE the _remotes_lock hold")   # a mutant reverting to
+            #                                          check-then-launch passed every test (the
+            #                                          adversarial review, 2026-08-21)
+            proc = mock.MagicMock()                  # a REAL Popen here executed the repo's
+            proc.communicate.return_value = (        # actual installer from the tests
                 "boom" if install_rc else "", None)
             proc.returncode = install_rc
             return proc

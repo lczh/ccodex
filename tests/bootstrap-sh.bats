@@ -780,6 +780,9 @@ PYEOF
     run python3 "$TEST_DIR/gate.py" "$root"
     [ "$status" -eq 70 ]
     [ -e "$gd/romp-install-failed" ]
+    printf 'abcd1234\nffff9999\neeee1111' > "$gd/romp-install-failed"   # >2 lines: unknown
+    run python3 "$TEST_DIR/gate.py" "$root"
+    [ "$status" -eq 70 ]
 }
 
 @test "bootstrap.sh: TXNPY refuses empty and malformed latches too" {
@@ -798,6 +801,9 @@ PYEOF
     run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "stable"
     [ "$status" -eq 10 ]
     [ -s "$gd/romp-install-failed" ]
+    printf 'abcd1234\nffff9999\neeee1111' > "$gd/romp-install-failed"   # >2 lines: unknown
+    run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "stable"
+    [ "$status" -eq 10 ]
 }
 
 @test "bootstrap.sh: the gate never moot-removes a single NON-COMMIT latch line" {
