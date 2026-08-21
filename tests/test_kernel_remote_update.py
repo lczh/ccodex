@@ -422,14 +422,23 @@ class UpdateRemote(unittest.TestCase):
             self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
                              "the carried explicit choice publishes when the healed line "
                              "stages nothing")
-            # a failing heal MERGES the pending token onto the surviving carry (the adversarial
-            # review, 2026-08-21: the lossy carry destroyed the choice)
+            # a failing heal with a PENDING STABLE refuses outright — resetting the remote onto
+            # unsigned peer commits across that choice is the converge-gate rule (the
+            # adversarial review, 2026-08-21); the record survives untouched
             (gd / "romp-install-failed").write_text("deadbee2\n0ddba11d stable")
             (gd / "romp-update-channel").write_text("dev\n")
             (fix / "install.sh").write_text("#!/bin/sh\nexit 1\n")
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("PENDINGSTABLE", a.stdout)
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(),
+                             "deadbee2\n0ddba11d stable", "the pending record survives untouched")
+            # a failing heal with a pending DEV merges the token onto the surviving carry (the
+            # lossy carry destroyed the choice — same review)
+            (gd / "romp-install-failed").write_text("deadbee2\n0ddba11d dev")
+            (gd / "romp-update-channel").write_text("stable\n")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("INSTALLFAIL", a.stdout)
-            self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2 stable",
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2 dev",
                              "the pending choice rides the surviving line")
             # reversed direction: HEAD matches line 2, line 1 is an unlanded "sha dev" — the
             # failing heal must not launder the token (the adversarial review, 2026-08-21)
@@ -463,8 +472,9 @@ class UpdateRemote(unittest.TestCase):
             (gd / "romp-update-channel").unlink()
             (gd / "romp-update-channel").mkdir()       # os.replace onto a dir raises
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
-            self.assertIn("INSTALLFAIL", a.stdout,
-                          "an unpublishable channel is an incomplete heal — the latch stays")
+            self.assertIn("PENDINGSTABLE", a.stdout,
+                          "an unpublishable STABLE choice refuses the unsigned reset outright "
+                          "(the 2026-08-21 gate) — the latch stays")
             self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2 stable",
                              "the record and its channel survive for the retry")
             # torn, EMPTY, and malformed records are never moot — LATCHSTUCK, executed (the

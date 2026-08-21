@@ -425,10 +425,17 @@ for mv in moves:
                 sys.exit(12 if stuck_latch() else 13)
         try:
             if now and now != pre_head:
+                line1 = now
+                if now == target[:8]:
+                    # the marker for THIS channel was just published above — a PLAIN restored
+                    # line 1 let every later heal inherit the OLD line-2 token and flip the
+                    # just-published explicit choice back into the old token (the adversarial
+                    # review, 2026-08-21, executed: an explicit stable pin re-marked dev)
+                    line1 = now + " " + channel
                 if carry and carry.split()[0][:8] == now:
-                    write_latch(carry if len(carry.split()) > 1 else now)
+                    write_latch(carry if len(carry.split()) > 1 else line1)
                 else:
-                    write_latch(now + ("\n" + carry if carry else ""))
+                    write_latch(line1 + ("\n" + carry if carry else ""))
             elif carry:
                 write_latch(carry)           # HEAD unmoved: the carried prior record returns
             else:

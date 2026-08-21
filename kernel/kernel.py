@@ -10972,6 +10972,7 @@ def _update_remote(host):
         "        sys.exit(9)\n"
         "    if cur8 in lines:\n"
         '        curline=next((l.strip() for l in rawlines if l.strip().split() and l.strip().split()[0][:8]==cur8),cur8)\n'
+        '        pending=[l for l in rawlines if len(l.split())>1 and l.split()[1]=="stable"]\n'
         "        def merge_carry():\n"
         "            if len(curline.split())>1:\n"
         "                return curline\n"
@@ -10981,8 +10982,12 @@ def _update_remote(host):
         '            return curline+" "+o[1] if len(o)>1 and o[1] in ("stable","dev") else curline\n'
         '        if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
         "            carry=merge_carry()\n"
+        "            if pending:\n"
+        "                sys.exit(12)\n"
         "        elif not pub_line(pick_pub(curline,rawlines)):\n"
         "            carry=merge_carry()\n"
+        "            if pending:\n"
+        "                sys.exit(12)\n"
         "        else:\n"
         "            os.remove(lp)\n"
         "    elif len(lines)>1:\n"
@@ -11018,6 +11023,7 @@ def _update_remote(host):
         'if [ "$RRC" = 8 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYNOW; exit 0; fi; '
         'if [ "$RRC" = 9 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERR; exit 0; fi; '
         'if [ "$RRC" = 10 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo LATCHSTUCK; exit 0; fi; '
+        'if [ "$RRC" = 12 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo PENDINGSTABLE; exit 0; fi; '
         'if [ "$RRC" = 4 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo INSTALLFAIL; exit 0; fi; '
         'if [ "$RRC" != 0 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; fi; '
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; '
@@ -11045,7 +11051,7 @@ def _update_remote(host):
         'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null &  sleep 1; fi; '
         'echo "SYNCED:$NEW"'
     ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, lfull, _P2P_REF, _P2P_REF,
-         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
+         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -11090,6 +11096,10 @@ def _update_remote(host):
         return False, ("pushed, but %s's install latch names commits its HEAD doesn't match — an "
                        "update died there mid-move from a broken state; heal it by hand on that "
                        "machine (run install.sh, then remove the latch)" % host)
+    if tag == "PENDINGSTABLE":
+        return False, ("a switch to the STABLE channel is still pending on the remote checkout "
+                       "(its install has not passed yet) — not resetting it onto unsigned "
+                       "commits across that choice; fix its install first")
     if tag == "INSTALLFAIL":
         return False, ("pushed and reset %s, but its install.sh failed — the latch is armed, so "
                        "nothing restarts onto it until install passes there (its boot heal "
@@ -11229,6 +11239,14 @@ def _pull_remote(host, expected_sha=None):
             settle, carry = _settle_prior_latch(lock_fd)   # settled or carried, never overwritten
             if settle:
                 return False, settle
+            if len(str(carry or "").split()) > 1 and carry.split()[1] == "stable":
+                # the SAME gate the converge holds (the adversarial review, 2026-08-21: two
+                # update flows disagreed on one cell — the converge refused to cross a pending
+                # switch-to-stable while this pull checked out and installed unsigned peer
+                # commits right across it)
+                return False, ("a switch to the STABLE channel is still pending on this checkout "
+                               "(its install has not passed yet) — not pulling unsigned peer "
+                               "commits across that choice; fix install.sh first")
             # ancestry decided UNDER the lock: the pre-lock check raced a concurrent updater
             # moving HEAD (the user's audit, 2026-08-18)
             anc2 = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", "HEAD",
