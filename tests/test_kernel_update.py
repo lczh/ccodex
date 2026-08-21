@@ -623,6 +623,19 @@ class RunUpdate(Fresh):
                          "the pending choice rides the surviving line through the failed update")
         self.assertEqual(self._marker, "dev", "nothing published while the heal keeps failing")
 
+    def test_a_line2_heal_fail_never_launders_the_unlanded_token_in_the_tag_settle(self):
+        # reversed direction of the merge (the adversarial review, 2026-08-21): HEAD matches
+        # line 2; line 1 is a crashed bootstrap's unlanded "sha dev" — the failing heal must
+        # carry the PLAIN survivor, not steal the token
+        rc, rows, report = self._execute_captured_updater(
+            0, install_rc=1, pre_latch="aaaa1111 dev\ndeadbee1",
+            pre_files={".git/romp-update-channel": "stable\n"})
+        self.assertEqual(rc, 0)
+        self.assertFalse(report["ok"])
+        self.assertNotIn("dev", self._latch or "",
+                         "the unlanded token is never laundered onto the carry: %r" % self._latch)
+        self.assertEqual(self._marker, "stable")
+
     def test_a_plain_sha_latch_line_publishes_no_channel(self):
         # in-channel updaters (this one included) arm plain sha lines: healing one changes no
         # marker, and there is no separate file for a stranger's record to poison (the

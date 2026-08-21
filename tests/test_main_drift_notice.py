@@ -1099,6 +1099,27 @@ class IntentPublish(unittest.TestCase):
                          "the pending choice rides the surviving line — a sha-only carry "
                          "destroyed it and blinded the pull gate")
 
+    def test_a_line2_survivor_never_merges_the_unlanded_line1_token(self):
+        # the adversarial review, 2026-08-21 (second pass, executed): when HEAD matches line 2,
+        # the other line is an UNLANDED line-1 intent — merging its token laundered a crashed
+        # dev bootstrap's channel onto a landed sha and flipped a stable machine through the wash
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            (gd / "romp-install-failed").write_text("aaaa1111 dev\neeee1111")
+            with mock.patch.object(km, "_update_git_dir", return_value=gd):
+                with mock.patch.object(km, "_checkout_sha", return_value="eeee1111"):
+                    with mock.patch.object(km, "_converge_install", return_value=False):
+                        fd = km._update_flock()
+                        try:
+                            settle, carry = km._settle_prior_latch(fd)
+                        finally:
+                            km.os.close(fd)
+        self.assertEqual(settle, "")
+        self.assertEqual(carry, "eeee1111",
+                         "an unlanded intent's token dies with its line — never laundered onto "
+                         "the survivor")
+
     def test_the_pull_gate_fires_on_a_MERGED_carry(self):
         # the two-hop shape end to end: the settle returns the merged carry and the gate refuses
         import subprocess as sp

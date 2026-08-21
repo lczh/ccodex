@@ -431,6 +431,14 @@ class UpdateRemote(unittest.TestCase):
             self.assertIn("INSTALLFAIL", a.stdout)
             self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2 stable",
                              "the pending choice rides the surviving line")
+            # reversed direction: HEAD matches line 2, line 1 is an unlanded "sha dev" — the
+            # failing heal must not launder the token (the adversarial review, 2026-08-21)
+            (gd / "romp-install-failed").write_text("aaaa1111 dev\ndeadbee2")
+            (gd / "romp-update-channel").write_text("stable\n")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("INSTALLFAIL", a.stdout)
+            self.assertNotIn("dev", (gd / "romp-install-failed").read_text(),
+                             "the unlanded token dies with its line")
             (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
             # healing the CARRIED line never inherits the unlanded line-1 token (the v1.3.11
             # audit's P1)

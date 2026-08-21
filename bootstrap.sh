@@ -324,12 +324,13 @@ if lines:
         def merged_carry():
             if len(cur_line.split()) > 1:
                 return cur_line
-            ot = next((l.split()[1] for l in rawlines
-                       if l != cur_line and len(l.split()) > 1
-                       and l.split()[1] in ("stable", "dev")), "")
-            # a lossy carry destroyed the pending choice on the OTHER line and blinded every
-            # later gate (the adversarial review, 2026-08-21)
-            return cur_line + " " + ot if ot else cur_line
+            # DIRECTION-GUARDED like every inherit: only a line-1 survivor merges the carried
+            # line-2 token — when HEAD matches line 2, the other line is an UNLANDED line-1
+            # intent whose token must die with it (the adversarial reviews, 2026-08-21, both)
+            if cur_line != rawlines[0] or len(rawlines) < 2:
+                return cur_line
+            o = rawlines[1].split()
+            return cur_line + " " + o[1] if len(o) > 1 and o[1] in ("stable", "dev") else cur_line
         if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root,
                           pass_fds=(fd,)).returncode:
             carry = merged_carry()
