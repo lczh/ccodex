@@ -1039,6 +1039,44 @@ class IntentPublish(unittest.TestCase):
             self._heal(gd, cur="eeee1111")
             self.assertEqual((gd / "romp-update-channel").read_text().strip(), "dev")
 
+    def test_healing_the_carried_line_never_inherits_the_unlanded_intents_token(self):
+        # the v1.3.11 audit's P1: latch "NEW dev\nOLD" with HEAD=OLD — the crash happened BEFORE
+        # NEW's move landed, yet healing OLD inherited NEW's token and flipped a stable machine
+        # to dev on a move that never happened. Only a completing LINE 1 inherits from line 2.
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            (gd / "romp-update-channel").write_text("stable\n")
+            (gd / "romp-install-failed").write_text("eeee1111 dev\nabcd1234")
+            self._heal(gd, cur="abcd1234")             # HEAD is the CARRIED line
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
+                             "an unlanded intent's channel is never published")
+            self.assertFalse((gd / "romp-install-failed").exists())
+
+    def test_the_dev_pull_refuses_while_a_stable_switch_is_pending(self):
+        # the v1.3.11 audit's P1: the carried stable choice gated only AFTER a full origin/main
+        # checkout and install had executed across the signed-release boundary — the choice must
+        # gate BEFORE any unsigned code runs
+        import subprocess as sp
+
+        def fake_run(argv, **kw):
+            a = [str(x) for x in argv]
+            if "rev-parse" in a:
+                return sp.CompletedProcess(argv, 0, stdout="e" * 40 + "\n", stderr="")
+            return sp.CompletedProcess(argv, 0, stdout="", stderr="")
+        notes = []
+        with mock.patch.object(km, "_update_channel", return_value="dev"):
+            with mock.patch.object(km.subprocess, "run", side_effect=fake_run):
+                with mock.patch.object(km, "_settle_prior_latch",
+                                       return_value=("", "0ddba11d stable")):
+                    with mock.patch.object(km, "_arm_latch",
+                                           side_effect=AssertionError("must not arm past the pending choice")):
+                        with mock.patch.object(km, "_converge_note",
+                                               side_effect=lambda m: notes.append(m)):
+                            km._run_main_update_locked("pull", True, "e" * 40)
+        self.assertTrue(any("STABLE channel is still pending" in n for n in notes),
+                        "the pass says why it stopped: %r" % notes)
+
     def test_the_completing_lines_own_token_outranks_the_carried_one(self):
         from pathlib import Path
         with tempfile.TemporaryDirectory() as td:

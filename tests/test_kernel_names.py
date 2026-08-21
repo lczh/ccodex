@@ -137,6 +137,46 @@ class NameClaims(unittest.TestCase):
         with km._name_claims_lock:
             self.assertNotIn("web", km._NAME_CLAIMS, "the reservation is released after the write")
 
+    def test_revive_refuses_a_claimed_name_loudly(self):
+        # revive resumed a dead session under a name another live sid already owned (the v1.3.11
+        # audit's P2) — it now takes the same reservation and answers with reviveFailed
+        events = []
+        with mock.patch.object(km, "_name_of", return_value="web"):
+            with mock.patch.object(km, "_tmux_sessions", return_value={}):
+                with mock.patch.object(km, "_send_to_view",
+                                       side_effect=lambda *a, **kw: events.append(a)):
+                    with mock.patch.object(km, "_revive_session_claimed",
+                                           side_effect=AssertionError("must not revive past the claim")):
+                        with km._name_claims_lock:
+                            km._NAME_CLAIMS.add("web")
+                        try:
+                            km._revive_session("11111111-2222-3333-4444-555555555555")
+                        finally:
+                            with km._name_claims_lock:
+                                km._NAME_CLAIMS.discard("web")
+        self.assertTrue(any(a and a[1].get("type") == "reviveFailed" for a in events),
+                        "the asker hears the refusal: %r" % events)
+
+    def test_a_refused_tmux_rename_is_never_acked(self):
+        # tmux's nonzero rc was swallowed two layers deep, so the UI showed the new name while
+        # tmux kept the old one (the v1.3.11 audit's P2)
+        sent = []
+        client = {"send": sent.append}
+        be = mock.MagicMock()
+        be.rename.side_effect = lambda sid, new: km._rename_session(sid, new) is not None
+        with mock.patch.object(km, "_tmux_sessions", return_value={}):
+            with mock.patch.object(km, "_kernel_knows", return_value=True):
+                with mock.patch.object(km, "_tmux_name_of", return_value="old"):
+                    with mock.patch.object(km._TMUX, "rename_by_name", return_value=False):
+                        with mock.patch.object(km.Sessions, "backend_for", return_value=be):
+                            km._drive({"type": "renameSession",
+                                       "id": "11111111-2222-3333-4444-555555555555",
+                                       "name": "web"}, client)
+        self.assertFalse(any('"renamed"' in m for m in sent),
+                         "a rename tmux refused is never acked: %r" % sent)
+        self.assertTrue(any("did not take" in m for m in sent),
+                        "the asker hears the refusal instead of a 90s timeout: %r" % sent)
+
     def test_promotion_refuses_a_claimed_name(self):
         # promotion wrote names/ blindly (the adversarial review, 2026-08-21) — it now takes the
         # same reservation as create and fork

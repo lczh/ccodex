@@ -2205,8 +2205,13 @@ def _run_update(tag):
         # _publish_latch_channel; the channel lives in the latch since 2026-08-20)
         + "pick_pub() {\n"
         + "  if [ -n \"$(printf '%s' \"$1\" | awk '{print $2}')\" ]; then printf '%s' \"$1\"; return; fi\n"
-        + "  A=$(grep -Ex '[0-9a-f]{8} (stable|dev)' \"$2\" 2>/dev/null | head -1)\n"
-        + "  if [ -n \"$A\" ]; then printf '%s' \"$A\"; else printf '%s' \"$1\"; fi\n"
+        # only the completing LINE 1 inherits the carried line-2 token — healing line 2 while
+        # line 1 never landed published the unlanded intent's channel (the v1.3.11 audit's P1)
+        + "  if [ \"$1\" = \"$(sed -n 1p \"$2\" 2>/dev/null)\" ]; then\n"
+        + "    A=$(sed -n 2p \"$2\" 2>/dev/null | grep -Ex '[0-9a-f]{8} (stable|dev)')\n"
+        + "    if [ -n \"$A\" ]; then printf '%s' \"$A\"; return; fi\n"
+        + "  fi\n"
+        + "  printf '%s' \"$1\"\n"
         + "}\n"
         + "pub_line() {\n"
         + "  CH=$(printf '%s' \"$1\" | awk '{print $2}')\n"
@@ -2518,25 +2523,26 @@ def _publish_latch_channel(sha8):
         return False
     want = str(sha8 or "")[:8]
     lines = [ln.strip() for ln in raw if ln.strip()]
-    for ln in lines:
+    for idx, ln in enumerate(lines):
         toks = ln.split()
         if toks and toks[0][:8] == want:
             if len(toks) < 2 or toks[1] not in ("stable", "dev"):
-                # the completing line stages no channel — but a CARRIED line's token is an
-                # explicit user choice (a crashed channel switch) that must not evaporate when
-                # its tokenless successor spends the whole latch (the v1.3.10 audit's P1: a
-                # pending switch-to-stable was dropped and the machine kept following unsigned
-                # main). Publish the carried choice instead; a token on the completing line
-                # still wins as the newer decision.
-                for other in lines:
-                    otoks = other.split()
-                    if other != ln and len(otoks) > 1 and otoks[1] in ("stable", "dev"):
+                # the completing line stages no channel — a CARRIED line's token (line 2, an
+                # explicit crashed channel switch) must not evaporate when its tokenless
+                # successor spends the whole latch (the v1.3.10 audit). DIRECTION-AWARE: only
+                # the completing INTENT line inherits from the carried prior — healing the
+                # PRIOR while line 1's move never LANDED must never publish the unlanded
+                # intent's channel (the v1.3.11 audit's P1: "NEW dev\nOLD" with HEAD=OLD
+                # flipped a stable machine to dev on a move that never happened).
+                if idx == 0 and len(lines) > 1:
+                    otoks = lines[1].split()
+                    if len(otoks) > 1 and otoks[1] in ("stable", "dev"):
                         try:
                             _atomic_write(p.parent / "romp-update-channel", otoks[1])
                             return True
                         except OSError:
                             return False
-                return True                       # nothing staged anywhere
+                return True                       # nothing staged for THIS spend
             try:
                 _atomic_write(p.parent / "romp-update-channel", toks[1])
                 return True
@@ -2880,6 +2886,16 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
                 # labeled stable). The channel is re-decided on the marker the heal published.
                 _converge_note("this install's channel changed to stable while settling a prior "
                                "update — it updates only through signed release tags now.")
+                _MAIN_DRIFT[0] = ""
+                return
+            if len(str(carry or "").split()) > 1 and carry.split()[1] == "stable":
+                # a CARRIED pending stable switch gates this pass BEFORE any unsigned code runs:
+                # publishing the choice only at completion meant one full origin/main checkout
+                # and install executed across the stable-only signed-release boundary first (the
+                # v1.3.11 audit's P1 — the marker was repaired only afterwards)
+                _converge_note("a switch to the STABLE channel is still pending on this checkout "
+                               "(its install has not passed yet) — not converging on origin/main "
+                               "across that choice; fix install.sh, then update again.")
                 _MAIN_DRIFT[0] = ""
                 return
             if not _arm_latch(tip[:8], carry):
@@ -7640,10 +7656,19 @@ def _drive(msg, client):
         else:
             try:
                 renamed = be.rename(sid, new)             # live → tmux hook / SDK reg; dead → names file
+            except Exception as e:
+                renamed = False
+                sys.stderr.write("rename '%s': %s\n" % (sid, e))
             finally:
                 _release_name(new)
             if renamed:
                 client["send"](json.dumps({"type": "renamed", "id": sid, "name": new}))
+            else:
+                # a silent failure left the UI waiting on its 90s backstop while the old name
+                # stood (the v1.3.11 audit's P2) — the asker hears the refusal
+                client["send"](json.dumps({"type": "warn",
+                                           "text": "the rename did not take — the backend "
+                                                   "refused it; the session keeps its old name"}))
     else:
         return False    # recognized type but a required field is missing (e.g. sendMessage w/o text) → no-op
     return True
@@ -7852,6 +7877,20 @@ def _revive_session(sid, client=None):
     nothing for a week. Now the revive result is checked and a failure sends the chat a reviveFailed
     event (clears the client's revive loader, shows the reason) instead of pretending it worked."""
     name = _name_of(sid) or sid
+    if not _claim_name(name):
+        # revive brings a DEAD session live under its stored name — without the reservation it
+        # resumed while another live sid (or an in-flight create) owned that name, recreating
+        # duplicate live names (the v1.3.11 audit's P2)
+        _send_to_view("chat", {"type": "reviveFailed", "id": sid, "name": name,
+                               "text": _NAME_TAKEN % name}, (client or {}).get("wid") or "")
+        return
+    try:
+        return _revive_session_claimed(sid, client, name)
+    finally:
+        _release_name(name)
+
+
+def _revive_session_claimed(sid, client, name):
     be = _sdk()
     ok, detail = False, ""
     _commands_for_cwd(_cwd_of(sid))   # pre-warm the slash-command list — a revival predicts a composer (the user 2026-08-13)
@@ -8012,12 +8051,16 @@ class TmuxBackend(sb.SessionBackend):
 
     def rename_by_name(self, old, new, t=5):
         if not self.available():          # no tmux → nothing to rename; stay inert like every primitive above
-            return
+            return False
         try:
-            subprocess.run(self._tmux_argv(["rename-session", "-t", old, new]), timeout=t,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            r = subprocess.run(self._tmux_argv(["rename-session", "-t", old, new]), timeout=t,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return r.returncode == 0      # a swallowed nonzero rc acked renames tmux refused —
+            #                               the old name stayed while the UI showed the new one
+            #                               (the v1.3.11 audit's P2)
         except Exception:
             sys.stderr.write("tmux rename '%s': %s\n" % (old, traceback.format_exc()))
+            return False
 
     def record_permission_mode(self, name, mode):
         """Persist the permission mode we just cycled to in @claude-permission-mode — CC doesn't expose it in
@@ -8504,8 +8547,8 @@ def _rename_session(sid, name):
         return None
     live = _tmux_name_of(sid)
     if live:
-        if live != name:
-            _TMUX.rename_by_name(live, name)
+        if live != name and not _TMUX.rename_by_name(live, name):
+            return None                                # the rename did not LAND: never ack it
     else:
         _set_name(sid, name)                           # dead tab → names file directly
     return name
@@ -10867,8 +10910,9 @@ def _update_remote(host):
         "def pick_pub(healed,rawlines):\n"
         "    if len(healed.split())>1:\n"
         "        return healed\n"
-        "    for o in rawlines:\n"
-        '        if o!=healed and len(o.split())>1 and o.split()[1] in ("stable","dev"):\n'
+        "    if rawlines and healed==rawlines[0].strip() and len(rawlines)>1:\n"
+        "        o=rawlines[1].strip()\n"
+        '        if len(o.split())>1 and o.split()[1] in ("stable","dev"):\n'
         "            return o\n"
         "    return healed\n"
         "def pub_line(full):\n"
@@ -27943,7 +27987,12 @@ class Handler(BaseHTTPRequestHandler):
                                          daemon=True).start()
                     except BaseException:
                         _release_name(nm)      # same leak as the /new branch: release on a
-                        raise                  # failed launch (the adversarial review, 2026-08-21)
+                        #                        failed launch (the adversarial review, 2026-08-21)
+                        client["send"](json.dumps({"type": "warn",
+                                                   "text": "the session could not be launched — "
+                                                           "the kernel could not start a worker "
+                                                           "thread; try again"}))
+                        raise
         elif msg and msg.get("type") == "cancelCreate" and msg.get("name"):
             # The webview's "Opening…" cue was cancelled (the ✕/Esc/backdrop — the spawn hung/failed, or the
             # user changed their mind). We only know the NAME (no id yet). Tear down a matching LOCAL session

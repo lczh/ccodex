@@ -601,6 +601,16 @@ class RunUpdate(Fresh):
                          "the carried explicit choice survives the supersession")
         self.assertIsNone(self._latch)
 
+    def test_healing_the_carried_line_never_inherits_in_the_tag_settle(self):
+        # the v1.3.11 audit's P1, tag edition: HEAD matches the CARRIED line while line 1's move
+        # never landed — the unlanded intent's token must not publish
+        rc, rows, report = self._execute_captured_updater(
+            0, pre_latch="aaaa1111 dev\ndeadbee1",
+            pre_files={".git/romp-update-channel": "stable\n"})
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._marker, "stable",
+                         "an unlanded intent's channel is never published")
+
     def test_a_plain_sha_latch_line_publishes_no_channel(self):
         # in-channel updaters (this one included) arm plain sha lines: healing one changes no
         # marker, and there is no separate file for a stranger's record to poison (the

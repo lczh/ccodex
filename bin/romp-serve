@@ -207,6 +207,11 @@ sys.stderr.write("romp-serve: this checkout's last install never finished — ru
 if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root, pass_fds=(fd,)).returncode:
     sys.exit(70)                       # latch stays armed for the next retry
 cur_line = next(ln for ln in rawlines if ln.split()[0][:8] == cur8)
+if len(cur_line.split()) < 2 and cur_line == rawlines[0] and len(rawlines) > 1 \
+        and len(rawlines[1].split()) > 1:
+    cur_line = rawlines[1]             # the completing INTENT line inherits the carried choice —
+    #                                    but never the reverse (the v1.3.11 audit: this gate
+    #                                    erased a carried stable and served under dev)
 if not publish_line(cur_line):
     sys.stderr.write("romp-serve: healed the install but its update channel could not be "
                      "recorded — not starting this build under the OLD channel marker\n")

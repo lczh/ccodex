@@ -316,10 +316,15 @@ if lines:
         # all — into the new arm instead of blocking the very update that may fix install.sh
         # (the adversarial reviews, 2026-08-19/20)
         cur_line = next(ln for ln in rawlines if ln.split()[0][:8] == pre_head)
+        pub_pick = cur_line
+        if (len(cur_line.split()) < 2 and cur_line == rawlines[0] and len(rawlines) > 1
+                and len(rawlines[1].split()) > 1):
+            pub_pick = rawlines[1]           # a completing line 1 inherits the carried choice;
+            #                                  never the reverse (the v1.3.11 audit)
         if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root,
                           pass_fds=(fd,)).returncode:
             carry = cur_line
-        elif not publish_line(cur_line):
+        elif not publish_line(pub_pick):
             carry = cur_line                 # healed, but its channel could not be recorded: the
             #                                  record rides forward and a later heal retries
         else:
