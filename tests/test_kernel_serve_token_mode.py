@@ -203,6 +203,19 @@ class ServeTokenFileMode(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 km._load_token()
 
+    def test_a_short_token_write_refuses_and_persists_nothing(self):
+        # the v1.3.9 audit injected a 5-byte short write: the loader returned a 24-char token
+        # while persisting 5 characters — split-token behavior for every later reader
+        real_write = km.os.write
+
+        def short_write(fd, data):
+            return real_write(fd, data[:5])
+        with mock.patch.object(km.os, "write", side_effect=short_write):
+            with self.assertRaises(RuntimeError):
+                km._load_token()
+        self.assertFalse(self.f.exists(),
+                         "a token that did not land whole is never published")
+
     def test_the_env_override_never_writes_the_file(self):
         # Guards this test file's own premise: with ROMP_SERVE_TOKEN set there is nothing on disk to
         # have a mode, so the cases above would be vacuous if the pop in setUp ever stopped working.

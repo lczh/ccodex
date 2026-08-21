@@ -750,6 +750,56 @@ PYEOF
     [ -e "$gd/romp-install-failed" ]       # the latch survives for the next retry
 }
 
+@test "bootstrap.sh: the gate refuses an EMPTY latch instead of deleting it and serving" {
+    # the v1.3.9 audit reproduced exactly this: a zero-byte latch was removed by the gate, which
+    # then exited 0 and served — an existing-but-empty record is UNKNOWN, never absent
+    sed -n "/<<'GATEPY'/,/^GATEPY\$/p" "$REPO_ROOT/bin/romp-serve" | sed '1d;$d' > "$TEST_DIR/gate.py"
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    : > "$gd/romp-install-failed"
+    run python3 "$TEST_DIR/gate.py" "$root"
+    [ "$status" -eq 70 ]
+    [ -e "$gd/romp-install-failed" ]       # the unknown record survives, undeleted
+}
+
+@test "bootstrap.sh: the gate refuses a malformed channel token instead of healing past it" {
+    # "HEAD8 sta" healed as a legacy plain latch: install ran, the latch was spent, and the
+    # intended channel was silently lost (the v1.3.9 audit)
+    sed -n "/<<'GATEPY'/,/^GATEPY\$/p" "$REPO_ROOT/bin/romp-serve" | sed '1d;$d' > "$TEST_DIR/gate.py"
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    printf '%s sta' "$(git -C "$root" rev-parse --short=8 HEAD)" > "$gd/romp-install-failed"
+    run python3 "$TEST_DIR/gate.py" "$root"
+    [ "$status" -eq 70 ]
+    [ -e "$gd/romp-install-failed" ]
+}
+
+@test "bootstrap.sh: TXNPY refuses empty and malformed latches too" {
+    sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    target="$(git -C "$root" rev-parse HEAD)"
+    : > "$gd/romp-install-failed"
+    run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "stable"
+    [ "$status" -eq 10 ]
+    printf '%s sta' "$(git -C "$root" rev-parse --short=8 HEAD)" > "$gd/romp-install-failed"
+    run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "stable"
+    [ "$status" -eq 10 ]
+    [ -s "$gd/romp-install-failed" ]
+}
+
 @test "bootstrap.sh: the gate never moot-removes a single NON-COMMIT latch line" {
     # the v1.3.8 audit: a torn quarantine prefix parsed as one line, and the gate moot-removed
     # it and started the uninstalled checkout

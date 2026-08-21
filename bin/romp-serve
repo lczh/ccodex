@@ -101,7 +101,7 @@ PY="$(pick_python)"
 # into install.sh (pass_fds) so an orphaned installer keeps holding it.
 # Exit 0 = clear to start; 70 = refuse (latched and unhealed, lock held elsewhere, HEAD unreadable).
 if ! python3 - "$ROMP_DIR" <<'GATEPY'
-import errno, fcntl, os, subprocess, sys, time
+import errno, fcntl, os, re, subprocess, sys, time
 
 root = sys.argv[1]
 # INSIDE the install transaction (bootstrap's TXNPY runs install.sh, which starts the service,
@@ -171,10 +171,20 @@ except FileNotFoundError:
     sys.exit(0)                        # no latch: clear to start
 except OSError:
     sys.exit(70)                       # an EXISTING latch we cannot read is unknown, not absent
+# STRICT GRAMMAR (the v1.3.9 audit): 1-2 lines of "sha8" / "sha8 stable|dev", or the exact
+# quarantine form — anything ELSE that exists (an empty file this gate used to DELETE and then
+# serve, a torn "quarantin", a malformed "sha8 sta") is unknown: refuse, never moot.
+if not rawlines:
+    sys.stderr.write("romp-serve: the install latch exists but is EMPTY — an unknown record is "
+                     "never absent; heal by hand\n")
+    sys.exit(70)
+if rawlines != ["quarantined", "quarantined"] and (
+        len(rawlines) > 2
+        or any(not re.fullmatch(r"[0-9a-f]{8}( (stable|dev))?", ln) for ln in rawlines)):
+    sys.stderr.write("romp-serve: the install latch holds %r, which is not a valid record — "
+                     "corrupt or foreign state is never moot; heal by hand\n" % rawlines[:2])
+    sys.exit(70)
 lines = [ln.split()[0][:8] for ln in rawlines]
-if not lines:
-    os.remove(latch)
-    sys.exit(0)
 cur = subprocess.run(["git", "-C", root, "rev-parse", "--short=8", "HEAD"],
                      capture_output=True, text=True)
 cur8 = (cur.stdout or "").strip()[:8]

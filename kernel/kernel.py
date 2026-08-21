@@ -617,7 +617,10 @@ def _load_token():
             pass
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            os.write(fd, v.encode())
+            if os.write(fd, v.encode()) != len(v):
+                raise OSError("short token write")   # a 5-byte remnant of a 24-char token split
+                #                                      every later reader from this process (the
+                #                                      v1.3.9 audit, injected short write)
         finally:
             os.close(fd)
         os.replace(str(tmp), str(f))                 # atomic; 0600 by birth; the flock made us alone
@@ -2206,6 +2209,13 @@ def _run_update(tag):
         + "  printf '%s\\n' \"$CH\" > \"$MARKER.pub\" && mv -f \"$MARKER.pub\" \"$MARKER\"\n"
         + "}\n"
         + "SETTLED=1\n"
+        # STRICT GRAMMAR (the v1.3.9 audit): an EXISTING empty or malformed latch is unknown —
+        # refuse, never treat as absent or plain (an empty [ -s ] gate fell through every branch)
+        + "if [ -e %s ] && [ ! -s %s ]; then SETTLED=0; fi\n" % (latch, latch)
+        + "if [ -s %s ] && [ -r %s ] && [ \"$(grep -c . %s)\" -le 2 ]; then\n" % (latch, latch, latch)
+        + "  if grep -q . %s && [ -n \"$(grep -vEx '([0-9a-f]{8}( (stable|dev))?|quarantined)' %s)\" ]; "
+          "then SETTLED=0; fi\n" % (latch, latch)
+        + "elif [ -s %s ] && [ -r %s ]; then SETTLED=0; fi\n" % (latch, latch)
         # SETTLE like every other arming path (the adversarial review, 2026-08-19: this was the
         # one updater still arming by overwrite): a latch line matching HEAD heals here, under the
         # inherited flock; a heal that still fails CARRIES the sha into the new arm's second line.
@@ -2213,7 +2223,7 @@ def _run_update(tag):
         + "CUR=$(git rev-parse --short=8 HEAD 2>/dev/null | head -c 8)\n"
         + "if [ -s %s ] && [ ! -r %s ]; then\n" % (latch, latch)
         + "  SETTLED=0\n"
-        + "elif [ -s %s ] && [ -n \"$CUR\" ]; then\n" % latch
+        + "elif [ \"$SETTLED\" = 1 ] && [ -s %s ] && [ -n \"$CUR\" ]; then\n" % latch
         + "  if grep -q \"^$CUR\" %s 2>/dev/null; then\n" % latch
         + "    CURLINE=$(grep \"^$CUR\" %s | head -1)\n" % latch
         + "    if ./install.sh >> %s 2>&1 && pub_line \"$CURLINE\"; then rm -f %s; "
@@ -2421,23 +2431,41 @@ def _install_latch_path():
     return (gd / "romp-install-failed") if gd is not None else None
 
 
+_LATCH_LINE_RE = re.compile(r"[0-9a-f]{8}( (stable|dev))?")
+
+
 def _install_latch_lines():
     """Every sha8 the latch records, first line = the current INTENT, optional second = the PRIOR
     record it superseded. Two lines exist so moving FORWARD past a build whose install fails
     deterministically stays possible (heal-only wedged every path — the adversarial review,
     2026-08-19) while a crash between the new arm and the new move can no longer orphan the old
     protection: the gate heals whichever recorded sha HEAD matches, and fails closed when a prior
-    exists but HEAD matches nothing."""
+    exists but HEAD matches nothing.
+
+    STRICT GRAMMAR (the v1.3.9 audit): a latch holds ONLY 1-2 lines of "sha8" or
+    "sha8 stable|dev", or the exact quarantine form. Any OTHER content that EXISTS — an empty
+    file, a torn prefix like "quarantin", a malformed token like "sha8 sta" — returns None,
+    UNKNOWN, which every caller fails closed on. The healer preserved a torn record while the
+    serve gate's lenient parse read it as harmless, and the kernel served a build whose install
+    never finished (the audit's P1)."""
     p = _install_latch_path()
     for cand in ([p] if p is not None else []) + [jd.STATE / "converge-install-failed"]:
         try:
-            lines = [ln.strip()[:8] for ln in cand.read_text().splitlines() if ln.strip()]
+            raw = cand.read_text()
         except FileNotFoundError:
             continue
         except OSError:
             return None                               # an EXISTING record we cannot read is UNKNOWN,
-        if lines:                                     # never absent — absent let a writer overwrite
-            return lines                              # it (the user's audit, 2026-08-19)
+        #                                               never absent — absent lets a writer overwrite
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        if not lines:
+            return None                               # an EXISTING empty record is unknown too: the
+            #                                           launcher used to delete it and serve
+        if lines == ["quarantined", "quarantined"]:
+            return [ln[:8] for ln in lines]           # the stuck form: no sha matches, len>1 refuses
+        if len(lines) > 2 or any(not _LATCH_LINE_RE.fullmatch(ln) for ln in lines):
+            return None                               # malformed is unknown, never plain or absent
+        return [ln.split()[0] for ln in lines]
     return []
 
 
@@ -5354,6 +5382,31 @@ def _live_names(tmux):
     return {n: sid for sid in (tmux or {}) for n in [_name_of(sid)] if n}
 
 
+_NAME_CLAIMS = set()
+_name_claims_lock = threading.Lock()
+
+
+def _claim_name(nm):
+    """Atomically reserve a session name for ONE in-flight create/fork/promotion: the live-store
+    check and the claim are a single locked step, so two concurrent requests for one name can
+    never both pass a collision check (the v1.3.9 audit raced two same-name /fork POSTs — both
+    got 200 and one session became unaddressable by name). The caller MUST _release_name() once
+    its registration is durable in the live store, or on any failure."""
+    with _name_claims_lock:
+        if nm in _NAME_CLAIMS or nm in _live_names(_tmux_sessions()):
+            return False
+        _NAME_CLAIMS.add(nm)
+        return True
+
+
+def _release_name(nm):
+    with _name_claims_lock:
+        _NAME_CLAIMS.discard(nm)
+
+
+_NAME_TAKEN = 'a session named "%s" is already running or being created — pick another name'
+
+
 PICKER_WINDOW = 30 * 86400      # how far back the + picker reaches, vs jd.WINDOW's 48h CAPTION horizon (the
 PICKER_CAP = 600                # user 2026-07-24: scroll back through the last month, not just two days).
 #   The picker sends this whole list at once rather than paging it in. It can afford to because it asks
@@ -5611,6 +5664,16 @@ def _reap_if_cancelled(name):
 
 
 def _spawn_session(name, cwd=None):
+    if not _claim_name(str(name or "").strip()):
+        sys.stderr.write("romp-kernel: %s\n" % (_NAME_TAKEN % name))
+        return
+    try:
+        return _spawn_session_inner(name, cwd)
+    finally:
+        _release_name(str(name or "").strip())
+
+
+def _spawn_session_inner(name, cwd=None):
     """Create a detached romp session named `name` — the same launch the old TS backend ran
     (`romp new -t --detach <name>`, tmux-backend.ts). Threaded so the ~seconds-long launch never blocks the WS
     recv loop; the targeted push below then delivers the new tab. Scrub
@@ -5695,6 +5758,17 @@ def _apply_new_session_prefs(sid, body):
 
 
 def _create_sdk_session(nm, cwd, auth="", prefs=None, client=None):
+    if not _claim_name(nm):
+        if client:
+            client["send"](json.dumps({"type": "warn", "text": _NAME_TAKEN % nm}))
+        return "", {"error": _NAME_TAKEN % nm}
+    try:
+        return _create_sdk_session_inner(nm, cwd, auth=auth, prefs=prefs, client=client)
+    finally:
+        _release_name(nm)
+
+
+def _create_sdk_session_inner(nm, cwd, auth="", prefs=None, client=None):
     """Create + open a new SDK-backed session, ACK-FAST (the user 2026-07-14, who asked why it took so long
     to open a new SDK session). spawn() is file writes and connect() is threaded (~0.4s to a booting
     CLI) — the 7-10s the user waited was the handler's inline _push_all(): a new session invalidates the
@@ -5734,6 +5808,17 @@ def _create_sdk_session(nm, cwd, auth="", prefs=None, client=None):
 
 
 def _create_codex_session(nm, cwd, client=None):
+    if not _claim_name(nm):
+        if client:
+            client["send"](json.dumps({"type": "warn", "text": _NAME_TAKEN % nm}))
+        return ""
+    try:
+        return _create_codex_session_inner(nm, cwd, client=client)
+    finally:
+        _release_name(nm)
+
+
+def _create_codex_session_inner(nm, cwd, client=None):
     """Create + open a new Codex-backed session — the same ACK-FAST shape as _create_sdk_session
     (focus first, dirty-mark wake, one direct push; never a synchronous fleet build here). spawn()
     starts the app-server thread, touches the materialized transcript (so discover() lists it
@@ -5754,6 +5839,17 @@ def _create_codex_session(nm, cwd, client=None):
 
 
 def _fork_session(parent_sid, cut_msg_uuid, new_name, now=None, client=None):
+    nm = (new_name or "").strip()
+    if nm and not _claim_name(nm):
+        return _NAME_TAKEN % nm
+    try:
+        return _fork_session_inner(parent_sid, cut_msg_uuid, new_name, now=now, client=client)
+    finally:
+        if nm:
+            _release_name(nm)
+
+
+def _fork_session_inner(parent_sid, cut_msg_uuid, new_name, now=None, client=None):
     """Fork `parent_sid`'s conversation into a NEW parallel session named `new_name` — from just BEFORE
     user message `cut_msg_uuid` when given (the chat's fork button; same _rewind_target resolution and
     guards as the edit/delete rewind, so "before this message" means the same thing everywhere), the
@@ -10686,7 +10782,7 @@ def _update_remote(host):
         # ref, which any concurrent sender force-updates (the user's audit, 2026-08-18) — and the
         # ancestry check runs HERE, under the lock: outside it, HEAD could move between the check
         # and the reset and the reset would rewind it. Exit 7 = diverged under the lock.
-        "python3 -c 'import fcntl,os,subprocess,sys\n"
+        "python3 -c 'import fcntl,os,re,subprocess,sys\n"
         "lock,r,target=sys.argv[1],sys.argv[2],sys.argv[3]\n"
         "fd=os.open(lock,os.O_RDWR|os.O_CREAT,0o644)\n"
         "try:\n"
@@ -10713,7 +10809,8 @@ def _update_remote(host):
         "    try:\n"
         '        pfd=os.open(mk+".pub",os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o644)\n'
         "        try:\n"
-        '            os.write(pfd,(t[1]+"\\n").encode())\n'
+        '            if os.write(pfd,(t[1]+"\\n").encode())!=len(t[1])+1:\n'
+        '                raise OSError("short marker write")\n'
         "        finally:\n"
         "            os.close(pfd)\n"
         '        os.replace(mk+".pub",mk)\n'
@@ -10721,8 +10818,12 @@ def _update_remote(host):
         "    except OSError:\n"
         "        return False\n"
         "try:\n"
-        '    rawlines=open(lp).read().splitlines()\n'
-        '    lines=[l.strip().split()[0][:8] for l in rawlines if l.strip()]\n'
+        '    rawlines=[l.strip() for l in open(lp).read().splitlines() if l.strip()]\n'
+        '    if not rawlines:\n'
+        "        sys.exit(10)\n"
+        '    if rawlines!=["quarantined","quarantined"] and (len(rawlines)>2 or any(not re.fullmatch(r"[0-9a-f]{8}( (stable|dev))?",l) for l in rawlines)):\n'
+        "        sys.exit(10)\n"
+        '    lines=[l.split()[0][:8] for l in rawlines]\n'
         "except FileNotFoundError:\n"
         "    lines=[]\n"
         "except OSError:\n"
@@ -10756,7 +10857,8 @@ def _update_remote(host):
         "    body=sha8\n"
         'tfd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o644)\n'
         "try:\n"
-        "    os.write(tfd,body.encode())\n"
+        '    if os.write(tfd,body.encode())!=len(body.encode()):\n'
+        '        raise OSError("short latch write")\n'
         "finally:\n"
         "    os.close(tfd)\n"
         "os.replace(tmp,lp)\n"
@@ -11053,13 +11155,81 @@ def _pull_remote(host, expected_sha=None):
                                "until healed by hand: reset it to a commit you trust (e.g. git "
                                "reset --keep %s), then remove romp-install-failed from its git "
                                "dir" % (host, pre_head[:12] or "<the prior commit>"))
-            installed = _converge_install(_sha8(fetched_sha), lock_fd)
+            # install.sh SPAWNS inside the same _remotes_lock hold that re-checks trust: the
+            # check-then-converge shape left a scheduling gap where a downgrade landed after the
+            # check but before the process existed, and the peer's install.sh still ran (the
+            # v1.3.9 audit). Downgrades are WRITTEN under this lock, so one hold linearizes the
+            # decision with the launch; the lock is released the moment the child exists — never
+            # held across the install's runtime.
+            proc, spawn_err = None, ""
+            with _remotes_lock:
+                _cur4 = _remotes.get(host)
+                if bool(_cur4 and not _cur4.get("checkin_peer")
+                        and _cur4.get("trust") == "trusted"):
+                    try:
+                        proc = subprocess.Popen(["bash", str(ROOT / "install.sh")],
+                                                cwd=str(ROOT), stdout=subprocess.PIPE,
+                                                stderr=subprocess.STDOUT, text=True,
+                                                pass_fds=(lock_fd,) if lock_fd is not None else ())
+                    except Exception as e:
+                        spawn_err = str(e)[:200] or "spawn failed"
+            if proc is None and not spawn_err:
+                # the downgrade won the hold: nothing was launched — quarantine like every other
+                # post-merge downgrade (HEAD already moved)
+                if not _set_install_failed(_QUARANTINE_LATCH):
+                    lp = _install_latch_path()
+                    try:
+                        if lp is None:
+                            raise OSError("no resolvable git dir")
+                        qfd = os.open(str(lp), os.O_RDWR | os.O_CREAT, 0o644)
+                        try:
+                            _qb = _QUARANTINE_LATCH.encode()
+                            if os.pwrite(qfd, _qb, 0) != len(_qb):
+                                raise OSError("short quarantine write")
+                        finally:
+                            os.close(qfd)
+                    except OSError:
+                        return False, ("%s trust changed at the install launch AND the quarantine "
+                                       "record could not be written — assume this checkout can "
+                                       "REVIVE the merged build; heal by hand NOW: git reset "
+                                       "--keep %s, then remove romp-install-failed from its git "
+                                       "dir" % (host, pre_head[:12] or "<the prior commit>"))
+                return False, ("%s trust changed at the install launch — quarantined before "
+                               "install.sh ran; heal by hand: git reset --keep %s, then remove "
+                               "romp-install-failed from its git dir"
+                               % (host, pre_head[:12] or "<the prior commit>"))
+            if proc is None:
+                return False, "could not run install.sh: %s" % spawn_err   # latch stays armed
+            try:
+                out, _ = proc.communicate(timeout=600)
+                inst_ok = proc.returncode == 0
+                inst_why = "" if inst_ok else ((out or "").strip()[-200:]
+                                               or "exit %d with no output" % proc.returncode)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                inst_ok, inst_why = False, "timed out after 600s"
+            except Exception as e:
+                inst_ok, inst_why = False, str(e)[:200]
+            if not inst_ok:
+                # the armed latch (fetched sha, from _arm_latch above) is preserved verbatim —
+                # see _converge_install's preserve rule for why a rewrite here is destructive
+                _converge_note("the checkout advanced to %s but install.sh failed: %s — nothing "
+                               "restarts onto it until install passes; fix the cause, then "
+                               "Update again" % (_sha8(fetched_sha), inst_why))
+                installed = False
+            elif not _publish_latch_channel(_sha8(fetched_sha)):
+                _converge_note("installed %s, but the update channel intended for it could not "
+                               "be recorded — keeping the install latch so nothing runs this "
+                               "build under the OLD channel marker" % _sha8(fetched_sha))
+                installed = False
+            else:
+                _set_install_failed("")
+                installed = True
             # trust re-checked once more AFTER install.sh returns (the v1.3.8 audit: a downgrade
-            # landing while install ran — past the final pre-install check — still installed and
-            # would then serve the peer build): _pull_remote never restarts anything, so nothing
-            # has SERVED yet; a quarantine here still precedes any execution of the new build as
-            # romp. install.sh itself already ran under the pre-install approval — that window is
-            # bounded by the check directly above the converge call.
+            # landing while install ran still installed and would then serve the peer build):
+            # _pull_remote never restarts anything, so nothing has SERVED yet; a quarantine here
+            # still precedes any execution of the new build as romp.
             with _remotes_lock:
                 _cur3 = _remotes.get(host)
                 _still3 = bool(_cur3 and not _cur3.get("checkin_peer")
@@ -26930,6 +27100,10 @@ class Handler(BaseHTTPRequestHandler):
                     b = json.loads(raw_body or b"{}")
                 except Exception:
                     b = {}
+                if not isinstance(b, dict):
+                    return self._send(400, json.dumps({"ok": False,
+                                                       "error": "the body must be a JSON object"}),
+                                      "application/json")
                 nm = str((b or {}).get("name") or "").strip()
                 if not nm or not NAME_RE.match(nm):
                     return self._send(400, json.dumps({"ok": False, "error":
@@ -26953,6 +27127,10 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(200, json.dumps({"ok": False, "error": why}),
                                           "application/json")
                     sid = _create_codex_session(nm, cwd)
+                    if not sid:
+                        return self._send(200, json.dumps({"ok": False,
+                                                           "error": _NAME_TAKEN % nm}),
+                                          "application/json")
                     return self._send(200, json.dumps({"ok": True, "id": sid, "dir": cwd}),
                                       "application/json")
                 if be_req == "sdk":
@@ -26962,6 +27140,11 @@ class Handler(BaseHTTPRequestHandler):
                     a = (b or {}).get("auth")
                     sid, extra = _create_sdk_session(nm, cwd, auth=(a if a in ("login", "key") else ""),
                                                      prefs=b)   # pins ride the FIRST connect — see the def
+                    if not sid:
+                        return self._send(200, json.dumps({"ok": False,
+                                                           "error": (extra or {}).get("error")
+                                                           or (_NAME_TAKEN % nm)}),
+                                          "application/json")
                     return self._send(200, json.dumps({"ok": True, "id": sid, "dir": cwd, **extra}),
                                       "application/json")
                 threading.Thread(target=_spawn_session, args=(nm, cwd), daemon=True).start()
@@ -26980,6 +27163,11 @@ class Handler(BaseHTTPRequestHandler):
                     b = json.loads(raw_body or b"{}")
                 except Exception:
                     b = {}
+                if not isinstance(b, dict):
+                    # arrays/strings/numbers crashed .get() into a 500 traceback (the v1.3.9 audit)
+                    return self._send(400, json.dumps({"ok": False,
+                                                       "error": "the body must be a JSON object"}),
+                                      "application/json")
                 parent = str((b or {}).get("parent") or "").strip()
                 nm = str((b or {}).get("name") or "").strip()
                 if not parent or not nm:

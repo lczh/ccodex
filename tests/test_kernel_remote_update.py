@@ -386,12 +386,15 @@ class UpdateRemote(unittest.TestCase):
                           "an unpublishable channel is an incomplete heal — the latch stays")
             self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2 stable",
                              "the record and its channel survive for the retry")
-            # a torn NON-COMMIT single line is never moot — LATCHSTUCK, executed
-            (gd / "romp-install-failed").write_text("quarantin")
-            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
-            self.assertIn("LATCHSTUCK", a.stdout)
-            self.assertEqual((gd / "romp-install-failed").read_text(), "quarantin",
-                             "the unknown record survives, unerased")
+            # torn, EMPTY, and malformed records are never moot — LATCHSTUCK, executed (the
+            # v1.3.9 audit: strict grammar in every reader)
+            for bad in ("quarantin", "", "deadbee2 sta"):
+                (gd / "romp-install-failed").write_text(bad)
+                a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+                self.assertIn("LATCHSTUCK", a.stdout, "%r must refuse" % bad)
+                self.assertEqual((gd / "romp-install-failed").read_text(), bad,
+                                 "the unknown record survives, unerased")
+            (gd / "romp-install-failed").unlink()
 
     def test_the_wrapper_itself_recheck_dirt_heals_priors_and_carries_on_failure(self):
         # the wrapper's OWN under-lock legs, executed (the adversarial review, 2026-08-19: the
@@ -432,15 +435,15 @@ class UpdateRemote(unittest.TestCase):
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' merge-base '*) exit 0;;\n"
-                "  *' rev-parse --short=8 HEAD'*) echo 0ldbu1ld;;\n"
+                "  *' rev-parse --short=8 HEAD'*) echo 01dbd11d;;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "esac\nexit 0\n" % gd)
-            (gd / "romp-install-failed").write_text("0ldbu1ld")
+            (gd / "romp-install-failed").write_text("01dbd11d")
             (fix / "install.sh").write_text("#!/bin/sh\nexit 1\n")
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("INSTALLFAIL", a.stdout)
             self.assertEqual([l.strip() for l in (gd / "romp-install-failed").read_text().splitlines()],
-                             ["deadbee2", "0ldbu1ld"],
+                             ["deadbee2", "01dbd11d"],
                              "the arm names the new intent AND CARRIES the prior — never overwritten")
             (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)

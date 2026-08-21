@@ -191,9 +191,11 @@ through to `install.sh`:
   `vX.Y.Z` release tag. Tags are verified with `git verify-tag` — a hard stop on failure when a
   trust root is configured, a loud note otherwise (see below); no published release always stops.
   `ROMP_REF=main` is an explicit development-code opt-in: it also sets the install's **update
-  channel** to `dev` (`romp.updateChannel` in the clone's git config, so every kernel sharing the
-  checkout agrees), the only channel on which the in-app updater offers or follows new commits on
-  `main`. Everything else — release tags, feature branches, pinned commits — is `stable`, and a
+  channel** to `dev` — recorded on the armed install record during the update transaction and
+  published to the `romp-update-channel` marker in the checkout's own git dir (worktree-scoped,
+  so a dev worktree can never flip a stable sibling; the pre-v1.3.4 `romp.updateChannel` git
+  config is migrated once and then unset) — the only channel on which the in-app updater offers
+  or follows new commits on `main`. Everything else — release tags, feature branches, pinned commits — is `stable`, and a
   stable install updates **only** through signed release tags; re-running bootstrap follows the
   last explicit choice. The channel is independent of signature enforcement.
 - `ROMP_RELEASE_ALLOWED_SIGNERS=<absolute-path>` supplies Git's SSH allowed-signers file

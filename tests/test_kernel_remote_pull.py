@@ -87,6 +87,19 @@ class PullRemote(unittest.TestCase):
         calls = []
         latch_at_merge = self.latch_at_merge = []
         merged = self.merged = {"v": False}
+        def fake_popen(argv, **kw):
+            calls.append(argv)                       # install.sh spawns via Popen under
+            proc = mock.MagicMock()                  # _remotes_lock — a REAL Popen here executed
+            proc.communicate.return_value = (        # the repo's actual installer from the tests
+                "boom" if install_rc else "", None)
+            proc.returncode = install_rc
+            return proc
+        # EARLY-bound restore: a late-binding self._real_popen read the value at CLEANUP time,
+        # and a second _wire() in one test overwrote it — the stdlib Popen was never restored
+        # and every later test in the process got the MagicMock (km.subprocess IS the shared
+        # stdlib module)
+        self.addCleanup(lambda real=km.subprocess.Popen: setattr(km.subprocess, "Popen", real))
+        km.subprocess.Popen = fake_popen
 
         def fake(argv, **kw):
             calls.append(argv)
@@ -284,36 +297,80 @@ class PullRemote(unittest.TestCase):
                              "the quarantine survives the heal pass — human hands only")
 
     def test_a_trust_downgrade_during_install_quarantines_before_anything_serves(self):
-        # the v1.3.8 audit: a downgrade landing while install.sh ran — past the final pre-install
-        # check — installed and would then serve the peer build. _pull_remote never restarts, so
-        # a post-install quarantine still precedes any execution of the new build as romp.
+        # the v1.3.8 audit: a downgrade landing while install.sh RUNS still installed and would
+        # then serve the peer build. _pull_remote never restarts, so the post-install quarantine
+        # still precedes any execution of the new build as romp.
         self._wire()
 
-        def degrading_install(sha8, lock_fd=None):
-            km._remotes["TESTHOST"]["trust"] = "directed"   # lands while install.sh runs
-            return True
-        with mock.patch.object(km, "_converge_install", side_effect=degrading_install):
-            ok, detail = km._pull_remote("TESTHOST")
+        def popen_flip(argv, **kw):
+            proc = mock.MagicMock()
+
+            def communicate(timeout=None):
+                km._remotes["TESTHOST"]["trust"] = "directed"   # lands while install.sh runs
+                return ("", None)
+            proc.communicate.side_effect = communicate
+            proc.returncode = 0
+            return proc
+        km.subprocess.Popen = popen_flip
+        ok, detail = km._pull_remote("TESTHOST")
         self.assertFalse(ok)
         self.assertIn("while install.sh ran", detail)
         self.assertEqual(km._install_latch_lines(), ["quaranti", "quaranti"],
                          "quarantined before anything serves")
-        # and when the install FAILED with the downgrade landing mid-run, the armed single-line
-        # latch (the auto-heal trigger) must not survive either — the healer would run the
-        # now-untrusted commit's install.sh within one 300s pass
+        # and when the install FAILED with the downgrade landing mid-run, the armed latch (the
+        # auto-heal trigger) must not survive either
         km._remotes["TESTHOST"]["trust"] = "trusted"
         self._wire()
 
-        def degrading_failing_install(sha8, lock_fd=None):
-            km._remotes["TESTHOST"]["trust"] = "directed"
-            km._set_install_failed(sha8)                    # what the real converge does on failure
-            return False
-        with mock.patch.object(km, "_converge_install", side_effect=degrading_failing_install):
+        def popen_flip_fail(argv, **kw):
+            proc = mock.MagicMock()
+
+            def communicate(timeout=None):
+                km._remotes["TESTHOST"]["trust"] = "directed"
+                return ("boom", None)
+            proc.communicate.side_effect = communicate
+            proc.returncode = 1
+            return proc
+        km.subprocess.Popen = popen_flip_fail
+        with mock.patch.object(km, "_converge_note"):
             ok, detail = km._pull_remote("TESTHOST")
         self.assertFalse(ok)
         self.assertEqual(km._install_latch_lines(), ["quaranti", "quaranti"],
                          "a failed install plus a downgrade is still a quarantine, never the "
                          "auto-heal form")
+
+    def test_a_downgrade_at_the_install_launch_never_spawns(self):
+        # the v1.3.9 audit: the final trust check and the spawn were separate steps, and a
+        # downgrade in the scheduling gap still ran the peer's install.sh. The spawn now happens
+        # INSIDE the same _remotes_lock hold as the check — downgrades are written under that
+        # lock, so check+launch are linearized and the process is never created.
+        calls = self._wire()
+
+        merged = self.merged
+
+        class FlippingRemotes(dict):
+            """the downgrade lands exactly between the post-merge trust check (the FIRST read
+            after the merge ran) and the launch hold (the second) — keyed on the merge event,
+            not a brittle absolute count."""
+
+            def __init__(self, src):
+                super().__init__(src)
+                self.post = 0
+
+            def get(self, k, d=None):
+                v = super().get(k, d)
+                if k == "TESTHOST" and v and merged["v"]:
+                    self.post += 1
+                    if self.post >= 2:
+                        v = dict(v, trust="directed")
+                return v
+        with mock.patch.object(km, "_remotes", FlippingRemotes(km._remotes)):
+            ok, detail = km._pull_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("at the install launch", detail)
+        self.assertFalse(any("install.sh" in str(a) for c in calls for a in c),
+                         "the process was never created — that is the whole point")
+        self.assertEqual(km._install_latch_lines(), ["quaranti", "quaranti"])
 
     def test_a_failed_quarantine_write_falls_back_to_in_place_and_then_says_so(self):
         # the atomic quarantine write can fail on the same degraded fs (correlated); rewriting

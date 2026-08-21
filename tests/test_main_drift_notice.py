@@ -923,6 +923,35 @@ class IntentPublish(unittest.TestCase):
                         "settle would read dev and converge anyway (the adversarial review, "
                         "2026-08-20)")
 
+    def test_the_strict_latch_grammar_fails_closed_on_everything_else(self):
+        # the v1.3.9 audit's P1: the healer preserved a torn "quarantin" record while the SERVE
+        # GATE's lenient parse read it as harmless — _refuse_half_installed returned False and
+        # the kernel served a build whose install never finished. One grammar now: "sha8",
+        # "sha8 stable|dev", or the exact quarantine form; anything else that EXISTS is None,
+        # which every reader (the serve gate included) fails closed on.
+        from pathlib import Path
+        cases_bad = ["quarantin", "", "   \n", "abcd1234 sta", "abcd1234 stable extra",
+                     "abcd1234\nffff9999\neeee1111", "ABCD1234", "abcd1234\nquarantin"]
+        cases_good = {"abcd1234": ["abcd1234"],
+                      "abcd1234 stable": ["abcd1234"],
+                      "abcd1234 dev\nffff9999": ["abcd1234", "ffff9999"],
+                      "quarantined\nquarantined": ["quaranti", "quaranti"]}
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            with mock.patch.object(km, "_update_git_dir", return_value=gd):
+                for bad in cases_bad:
+                    (gd / "romp-install-failed").write_text(bad)
+                    self.assertIsNone(km._install_latch_lines(),
+                                      "%r must be UNKNOWN, never parsed leniently" % bad)
+                    with mock.patch.object(km, "_inside_update_txn", return_value=False):
+                        self.assertTrue(km._refuse_half_installed(),
+                                        "%r must refuse to serve — the audit's P1" % bad)
+                for good, want in cases_good.items():
+                    (gd / "romp-install-failed").write_text(good)
+                    self.assertEqual(km._install_latch_lines(), want)
+                (gd / "romp-install-failed").unlink()
+                self.assertEqual(km._install_latch_lines(), [], "absent stays absent")
+
     def test_latch_lines_parse_their_sha_half_with_tokens_present(self):
         from pathlib import Path
         with tempfile.TemporaryDirectory() as td:

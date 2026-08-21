@@ -569,6 +569,21 @@ class RunUpdate(Fresh):
         self.assertIsNotNone(self._latch, "the latch survives for the retry")
         self.assertIn("deadbee1", self._latch)
 
+    def test_the_tag_settle_refuses_empty_and_malformed_latches(self):
+        # the strict grammar, tag-script edition (the v1.3.9 audit): an EXISTING empty latch fell
+        # through every [ -s ] branch and the update proceeded over it; a malformed channel token
+        # ("sha8 sta") was healed as a legacy plain latch, spending the record with the channel
+        # unpublished
+        for bad in ("", "deadbee1 sta", "deadbee1\nffff9999\neeee1111"):
+            km._UPDATE_STATE[0] = ""       # each iteration is its own update episode
+            rc, rows, report = self._execute_captured_updater(0, pre_latch=bad)
+            self.assertEqual(rc, 0, "the reporter records the refusal")
+            self.assertFalse(report["ok"], "%r must refuse, never settle" % bad)
+            self.assertEqual(self._latch, bad.strip(),
+                             "the unknown record survives, unerased")
+            self.assertFalse(any(row.startswith("merge ") for row in rows),
+                             "nothing moved over %r" % bad)
+
     def test_a_plain_sha_latch_line_publishes_no_channel(self):
         # in-channel updaters (this one included) arm plain sha lines: healing one changes no
         # marker, and there is no separate file for a stranger's record to poison (the
