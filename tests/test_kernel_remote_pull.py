@@ -345,6 +345,18 @@ class PullRemote(unittest.TestCase):
                          "a failed install plus a downgrade is still a quarantine, never the "
                          "auto-heal form")
 
+    def test_the_pull_refuses_while_a_stable_switch_is_pending(self):
+        # the adversarial review, 2026-08-21: the converge refused to cross a pending
+        # switch-to-stable while this pull checked out unsigned peer commits right across it
+        calls = self._wire()
+        with mock.patch.object(km, "_settle_prior_latch", return_value=("", "0ddba11d stable")):
+            ok, detail = km._pull_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("STABLE channel is still pending", detail)
+        self.assertFalse(any(a[0] == "git" and "merge" in a and "merge-base" not in a
+                             for a in calls), "nothing merged across the pending choice")
+        self.assertFalse(any("install.sh" in str(a) for c in calls for a in c))
+
     def test_a_downgrade_at_the_install_launch_never_spawns(self):
         # the v1.3.9 audit: the final trust check and the spawn were separate steps, and a
         # downgrade in the scheduling gap still ran the peer's install.sh. The spawn now happens

@@ -742,6 +742,28 @@ PYEOF
     [ "$(cat "$gd/romp-update-channel")" = "stable" ]
 }
 
+@test "bootstrap.sh: the exit-6 restore keeps the token whose marker it just published" {
+    # the adversarial review, 2026-08-21: a PLAIN restored line 1 after the publish leg let every
+    # later heal inherit the OLD line-2 token and flip the just-published explicit choice back
+    sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm one
+    git -C "$root" -c user.email=t@t -c user.name=t commit -q --allow-empty -m two
+    T2="$(git -C "$root" rev-parse HEAD)"
+    git -C "$root" checkout -q -d HEAD~1
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    printf 'dev\n' > "$gd/romp-update-channel"
+    git -C "$root" branch rel
+    run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$T2" "-" "stable" checkout --detach "$T2" -- branch -f rel/14 "$T2"
+    [ "$status" -eq 6 ]
+    [ "$(cat "$gd/romp-update-channel")" = "stable" ]           # the publish leg ran
+    t28="$(git -C "$root" rev-parse --short=8 HEAD)"
+    [ "$(cat "$gd/romp-install-failed")" = "$t28 stable" ]      # and the restore KEEPS its token
+}
+
 @test "bootstrap.sh: TXNPY's failing settle merges the pending token into its carry" {
     # the adversarial review, 2026-08-21: a plain line-1 heal failing dropped line 2's pending
     # stable from the carry — the new arm then destroyed the choice
