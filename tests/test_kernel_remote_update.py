@@ -432,6 +432,21 @@ class UpdateRemote(unittest.TestCase):
             self.assertIn("PENDINGSTABLE", a.stdout)
             self.assertEqual((gd / "romp-install-failed").read_text().strip(),
                              "deadbee2\n0ddba11d stable", "the pending record survives untouched")
+            # a landed DEV choice over a superseded stable is NOT pending-stable: the gate keys
+            # on the direction-guarded CARRY like the converge, never any-line — an any-line
+            # predicate wedged the very push carrying the install fix (the adversarial review,
+            # 2026-08-21, third pass)
+            (gd / "romp-install-failed").write_text("deadbee2 dev\n0ddba11d stable")
+            (gd / "romp-update-channel").write_text("dev\n")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("INSTALLFAIL", a.stdout,
+                          "a landed dev choice proceeds — no false pending-stable wedge")
+            # and a reversed UNLANDED stable (line 1 never moved HEAD) does not gate either
+            (gd / "romp-install-failed").write_text("aaaa1111 stable\ndeadbee2")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("INSTALLFAIL", a.stdout)
+            self.assertNotIn("stable", (gd / "romp-install-failed").read_text(),
+                             "the unlanded token dies with its line")
             # a failing heal with a pending DEV merges the token onto the surviving carry (the
             # lossy carry destroyed the choice — same review)
             (gd / "romp-install-failed").write_text("deadbee2\n0ddba11d dev")

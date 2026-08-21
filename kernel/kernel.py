@@ -10972,7 +10972,7 @@ def _update_remote(host):
         "        sys.exit(9)\n"
         "    if cur8 in lines:\n"
         '        curline=next((l.strip() for l in rawlines if l.strip().split() and l.strip().split()[0][:8]==cur8),cur8)\n'
-        '        pending=[l for l in rawlines if len(l.split())>1 and l.split()[1]=="stable"]\n'
+
         "        def merge_carry():\n"
         "            if len(curline.split())>1:\n"
         "                return curline\n"
@@ -10982,11 +10982,11 @@ def _update_remote(host):
         '            return curline+" "+o[1] if len(o)>1 and o[1] in ("stable","dev") else curline\n'
         '        if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
         "            carry=merge_carry()\n"
-        "            if pending:\n"
+        '            if len(carry.split())>1 and carry.split()[1]=="stable":\n'
         "                sys.exit(12)\n"
         "        elif not pub_line(pick_pub(curline,rawlines)):\n"
         "            carry=merge_carry()\n"
-        "            if pending:\n"
+        '            if len(carry.split())>1 and carry.split()[1]=="stable":\n'
         "                sys.exit(12)\n"
         "        else:\n"
         "            os.remove(lp)\n"
