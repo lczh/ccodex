@@ -122,7 +122,7 @@ class SpawnPinsRideTheFirstConnect(unittest.TestCase):
     KERNEL = open(os.path.join(BIN, "romp-kernel")).read()
 
     def test_prefs_apply_before_the_eager_connect(self):
-        body = self.KERNEL[self.KERNEL.index("def _create_sdk_session"):]
+        body = self.KERNEL[self.KERNEL.index("def _create_sdk_session_inner"):]
         body = body[:body.index("\ndef ")]
         spawn_at = body.index("_sdk().spawn(")
         prefs_at = body.index("_apply_new_session_prefs(sid, prefs or {})")
