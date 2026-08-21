@@ -422,6 +422,16 @@ class UpdateRemote(unittest.TestCase):
             self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
                              "the carried explicit choice publishes when the healed line "
                              "stages nothing")
+            # a failing heal MERGES the pending token onto the surviving carry (the adversarial
+            # review, 2026-08-21: the lossy carry destroyed the choice)
+            (gd / "romp-install-failed").write_text("deadbee2\n0ddba11d stable")
+            (gd / "romp-update-channel").write_text("dev\n")
+            (fix / "install.sh").write_text("#!/bin/sh\nexit 1\n")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("INSTALLFAIL", a.stdout)
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2 stable",
+                             "the pending choice rides the surviving line")
+            (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
             # healing the CARRIED line never inherits the unlanded line-1 token (the v1.3.11
             # audit's P1)
             (gd / "romp-install-failed").write_text("aaaa1111 dev\ndeadbee2")

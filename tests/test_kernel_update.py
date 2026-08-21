@@ -611,6 +611,18 @@ class RunUpdate(Fresh):
         self.assertEqual(self._marker, "stable",
                          "an unlanded intent's channel is never published")
 
+    def test_a_failing_tag_update_carries_the_pending_token_forward(self):
+        # the adversarial review, 2026-08-21: the tag settle's lossy carry destroyed the pending
+        # stable on line 2 when line 1's heal failed — the re-armed latch must keep the choice
+        rc, rows, report = self._execute_captured_updater(
+            0, install_rc=1, pre_latch="deadbee1\n0ddba11d stable",
+            pre_files={".git/romp-update-channel": "dev\n"})
+        self.assertEqual(rc, 0)
+        self.assertFalse(report["ok"])
+        self.assertEqual(self._latch, "deadbee1 stable",
+                         "the pending choice rides the surviving line through the failed update")
+        self.assertEqual(self._marker, "dev", "nothing published while the heal keeps failing")
+
     def test_a_plain_sha_latch_line_publishes_no_channel(self):
         # in-channel updaters (this one included) arm plain sha lines: healing one changes no
         # marker, and there is no separate file for a stranger's record to poison (the

@@ -321,11 +321,20 @@ if lines:
                 and len(rawlines[1].split()) > 1):
             pub_pick = rawlines[1]           # a completing line 1 inherits the carried choice;
             #                                  never the reverse (the v1.3.11 audit)
+        def merged_carry():
+            if len(cur_line.split()) > 1:
+                return cur_line
+            ot = next((l.split()[1] for l in rawlines
+                       if l != cur_line and len(l.split()) > 1
+                       and l.split()[1] in ("stable", "dev")), "")
+            # a lossy carry destroyed the pending choice on the OTHER line and blinded every
+            # later gate (the adversarial review, 2026-08-21)
+            return cur_line + " " + ot if ot else cur_line
         if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root,
                           pass_fds=(fd,)).returncode:
-            carry = cur_line
+            carry = merged_carry()
         elif not publish_line(pub_pick):
-            carry = cur_line                 # healed, but its channel could not be recorded: the
+            carry = merged_carry()           # healed, but its channel could not be recorded: the
             #                                  record rides forward and a later heal retries
         else:
             os.remove(latch)

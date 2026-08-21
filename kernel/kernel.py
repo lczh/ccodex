@@ -2243,7 +2243,16 @@ def _run_update(tag):
         + "  if grep -q \"^$CUR\" %s 2>/dev/null; then\n" % latch
         + "    CURLINE=$(grep \"^$CUR\" %s | head -1)\n" % latch
         + "    if ./install.sh >> %s 2>&1 && pub_line \"$(pick_pub \"$CURLINE\" %s)\"; then rm -f %s; "
-          "else CARRY=\"$CURLINE\"; fi\n" % (log, latch, latch)
+          "else\n" % (log, latch, latch)
+        + "      CARRY=\"$CURLINE\"\n"
+        # a plain surviving line MERGES the other line's pending token — a lossy carry destroyed
+        # the pending stable and blinded the pull gate (the adversarial review, 2026-08-21)
+        + "      if [ -z \"$(printf '%s' \"$CARRY\" | awk '{print $2}')\" ]; then\n"
+        + "        OT=$(grep -vx \"$CURLINE\" %s 2>/dev/null | grep -Ex '[0-9a-f]{8} (stable|dev)' "
+          "| head -1 | awk '{print $2}')\n" % latch
+        + "        [ -n \"$OT\" ] && CARRY=\"$CUR $OT\"\n"
+        + "      fi\n"
+        + "    fi\n"
         + "  elif [ \"$(grep -c . %s 2>/dev/null)\" -gt 1 ]; then\n" % latch
         + "    SETTLED=0\n"
         + "  else\n"
@@ -2998,10 +3007,24 @@ def _settle_prior_latch(lock_fd):
         carry_line = cur
         try:
             p = _install_latch_path()
-            for ln in (p.read_text().splitlines() if p is not None else []):
-                if ln.strip().split() and ln.strip().split()[0][:8] == cur:
-                    carry_line = ln.strip()
+            raw = [ln.strip() for ln in (p.read_text().splitlines() if p is not None else [])
+                   if ln.strip()]
+            for ln in raw:
+                if ln.split()[0][:8] == cur:
+                    carry_line = ln
                     break
+            if len(carry_line.split()) < 2:
+                # the carry kept only the HEAD-matching line, so a pending choice on the OTHER
+                # line ("OLD stable" behind a failing plain heal) was destroyed by the next arm
+                # and invisible to the pull gate — one more unsigned main ran across a crashed
+                # stable switch (the adversarial review, 2026-08-21, executed two-hop repro).
+                # The token records the machine's pending CHANNEL CHOICE, so it rides the
+                # surviving line; only line-2 tokens exist here, and those moves always landed.
+                ot = next((l.split()[1] for l in raw
+                           if l != carry_line and len(l.split()) > 1
+                           and l.split()[1] in ("stable", "dev")), "")
+                if ot:
+                    carry_line = cur + " " + ot
         except OSError:
             pass
         return "", carry_line
@@ -10949,10 +10972,15 @@ def _update_remote(host):
         "        sys.exit(9)\n"
         "    if cur8 in lines:\n"
         '        curline=next((l.strip() for l in rawlines if l.strip().split() and l.strip().split()[0][:8]==cur8),cur8)\n'
+        "        def merge_carry():\n"
+        "            if len(curline.split())>1:\n"
+        "                return curline\n"
+        '            ot=next((l.split()[1] for l in rawlines if l.strip()!=curline and len(l.split())>1 and l.split()[1] in ("stable","dev")),"")\n'
+        '            return curline+" "+ot if ot else curline\n'
         '        if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
-        "            carry=curline\n"
+        "            carry=merge_carry()\n"
         "        elif not pub_line(pick_pub(curline,rawlines)):\n"
-        "            carry=curline\n"
+        "            carry=merge_carry()\n"
         "        else:\n"
         "            os.remove(lp)\n"
         "    elif len(lines)>1:\n"
