@@ -414,6 +414,14 @@ class UpdateRemote(unittest.TestCase):
             self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
                              "the healed build wears the channel its update intended")
             self.assertFalse((gd / "romp-install-failed").exists())
+            # a carried channel CHOICE survives a tokenless heal (the v1.3.10 audit's P1)
+            (gd / "romp-install-failed").write_text("deadbee2\n0ddba11d stable")
+            (gd / "romp-update-channel").write_text("dev\n")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertNotIn("LATCHSTUCK", a.stdout)
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
+                             "the carried explicit choice publishes when the healed line "
+                             "stages nothing")
             # a PLAIN sha line publishes nothing — in-channel heals change no marker
             (gd / "romp-install-failed").write_text("deadbee2")
             (gd / "romp-update-channel").write_text("dev\n")

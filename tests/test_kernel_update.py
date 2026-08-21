@@ -588,6 +588,19 @@ class RunUpdate(Fresh):
             self.assertFalse(any(row.startswith("merge ") for row in rows),
                              "nothing moved over %r" % bad)
 
+    def test_the_tag_success_leg_publishes_the_carried_token(self):
+        # the v1.3.10 audit's P1, tag edition: the latch holds "deadbee1\n0ddba11d stable" (the
+        # successor's arm carried a crashed stable switch); HEAD==deadbee1 heals, completes, and
+        # must publish the carried stable instead of deleting it with the spent latch
+        rc, rows, report = self._execute_captured_updater(
+            0, pre_latch="deadbee1\n0ddba11d stable",
+            pre_files={".git/romp-update-channel": "dev\n"})
+        self.assertEqual(rc, 0)
+        self.assertTrue(report["ok"])
+        self.assertEqual(self._marker, "stable",
+                         "the carried explicit choice survives the supersession")
+        self.assertIsNone(self._latch)
+
     def test_a_plain_sha_latch_line_publishes_no_channel(self):
         # in-channel updaters (this one included) arm plain sha lines: healing one changes no
         # marker, and there is no separate file for a stranger's record to poison (the

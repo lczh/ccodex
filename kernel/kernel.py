@@ -2203,6 +2203,11 @@ def _run_update(tag):
         # publish the channel token riding ON a latch line ("sha8 channel") before that line is
         # spent — a plain sha line stages no channel and publishes nothing (see
         # _publish_latch_channel; the channel lives in the latch since 2026-08-20)
+        + "pick_pub() {\n"
+        + "  if [ -n \"$(printf '%s' \"$1\" | awk '{print $2}')\" ]; then printf '%s' \"$1\"; return; fi\n"
+        + "  A=$(grep -Ex '[0-9a-f]{8} (stable|dev)' \"$2\" 2>/dev/null | head -1)\n"
+        + "  if [ -n \"$A\" ]; then printf '%s' \"$A\"; else printf '%s' \"$1\"; fi\n"
+        + "}\n"
         + "pub_line() {\n"
         + "  CH=$(printf '%s' \"$1\" | awk '{print $2}')\n"
         + "  case \"$CH\" in stable|dev) ;; *) return 0;; esac\n"
@@ -2232,8 +2237,8 @@ def _run_update(tag):
         + "elif [ \"$SETTLED\" = 1 ] && [ -s %s ] && [ -n \"$CUR\" ]; then\n" % latch
         + "  if grep -q \"^$CUR\" %s 2>/dev/null; then\n" % latch
         + "    CURLINE=$(grep \"^$CUR\" %s | head -1)\n" % latch
-        + "    if ./install.sh >> %s 2>&1 && pub_line \"$CURLINE\"; then rm -f %s; "
-          "else CARRY=\"$CURLINE\"; fi\n" % (log, latch)
+        + "    if ./install.sh >> %s 2>&1 && pub_line \"$(pick_pub \"$CURLINE\" %s)\"; then rm -f %s; "
+          "else CARRY=\"$CURLINE\"; fi\n" % (log, latch, latch)
         + "  elif [ \"$(grep -c . %s 2>/dev/null)\" -gt 1 ]; then\n" % latch
         + "    SETTLED=0\n"
         + "  else\n"
@@ -2259,7 +2264,8 @@ def _run_update(tag):
         + "    if [ \"$(sed -n 1p %s 2>/dev/null | awk '{print $1}' | head -c 8)\" = \"$NEW8\" ] "
           "&& git merge --ff-only %s >> %s 2>&1 && ./install.sh >> %s 2>&1; then\n"
           % (latch, tag, log, log)
-        + "      if pub_line \"$(sed -n 1p %s 2>/dev/null)\"; then rm -f %s; OK=1; fi\n" % (latch, latch)
+        + "      if pub_line \"$(pick_pub \"$(sed -n 1p %s 2>/dev/null)\" %s)\"; then rm -f %s; OK=1; fi\n"
+          % (latch, latch, latch)
         + "    fi\n"
         + "  fi\n"
         + "fi\n"
@@ -2511,11 +2517,26 @@ def _publish_latch_channel(sha8):
     except OSError:
         return False
     want = str(sha8 or "")[:8]
-    for ln in raw:
-        toks = ln.strip().split()
+    lines = [ln.strip() for ln in raw if ln.strip()]
+    for ln in lines:
+        toks = ln.split()
         if toks and toks[0][:8] == want:
             if len(toks) < 2 or toks[1] not in ("stable", "dev"):
-                return True                       # a plain sha line stages no channel
+                # the completing line stages no channel — but a CARRIED line's token is an
+                # explicit user choice (a crashed channel switch) that must not evaporate when
+                # its tokenless successor spends the whole latch (the v1.3.10 audit's P1: a
+                # pending switch-to-stable was dropped and the machine kept following unsigned
+                # main). Publish the carried choice instead; a token on the completing line
+                # still wins as the newer decision.
+                for other in lines:
+                    otoks = other.split()
+                    if other != ln and len(otoks) > 1 and otoks[1] in ("stable", "dev"):
+                        try:
+                            _atomic_write(p.parent / "romp-update-channel", otoks[1])
+                            return True
+                        except OSError:
+                            return False
+                return True                       # nothing staged anywhere
             try:
                 _atomic_write(p.parent / "romp-update-channel", toks[1])
                 return True
@@ -5673,6 +5694,13 @@ def _spawn_session(name, cwd=None):
     if not _claim_name(str(name or "").strip()):
         sys.stderr.write("romp-kernel: %s\n" % (_NAME_TAKEN % name))
         return
+    return _spawn_session_preclaimed(name, cwd)
+
+
+def _spawn_session_preclaimed(name, cwd=None):
+    """The caller already holds the name claim (so it could REFUSE before acking — a claim taken
+    inside the spawn thread reported success and logged the collision only to stderr; the
+    v1.3.10 audit's P2). Releases it once registration lands."""
     try:
         return _spawn_session_inner(name, cwd)
     finally:
@@ -7602,8 +7630,20 @@ def _drive(msg, client):
         new = str(msg["name"]).strip()
         if not NAME_RE.match(new):
             client["send"](json.dumps({"type": "warn", "text": "session names use letters, digits, . _ - only."}))
-        elif be.rename(sid, new):                         # live → tmux rename hook / SDK reg; dead → names file
-            client["send"](json.dumps({"type": "renamed", "id": sid, "name": new}))
+        elif _live_names(_tmux_sessions()).get(new) == sid:
+            client["send"](json.dumps({"type": "renamed", "id": sid, "name": new}))   # its own name
+        elif not _claim_name(new):
+            # the rename wrote registries BLINDLY: renaming onto a live or being-created name
+            # produced two sessions under one name and one became unaddressable (the v1.3.10
+            # audit's P2 — the same reservation create, fork, and promotion take)
+            client["send"](json.dumps({"type": "warn", "text": _NAME_TAKEN % new}))
+        else:
+            try:
+                renamed = be.rename(sid, new)             # live → tmux hook / SDK reg; dead → names file
+            finally:
+                _release_name(new)
+            if renamed:
+                client["send"](json.dumps({"type": "renamed", "id": sid, "name": new}))
     else:
         return False    # recognized type but a required field is missing (e.g. sendMessage w/o text) → no-op
     return True
@@ -10824,6 +10864,13 @@ def _update_remote(host):
         "    sys.exit(5)\n"
         'lp=os.path.join(os.path.dirname(lock),"romp-install-failed")\n'
         'mk=os.path.join(os.path.dirname(lock),"romp-update-channel")\n'
+        "def pick_pub(healed,rawlines):\n"
+        "    if len(healed.split())>1:\n"
+        "        return healed\n"
+        "    for o in rawlines:\n"
+        '        if o!=healed and len(o.split())>1 and o.split()[1] in ("stable","dev"):\n'
+        "            return o\n"
+        "    return healed\n"
         "def pub_line(full):\n"
         "    t=full.split()\n"
         '    if len(t)<2 or t[1] not in ("stable","dev"):\n'
@@ -10860,7 +10907,7 @@ def _update_remote(host):
         '        curline=next((l.strip() for l in rawlines if l.strip().split() and l.strip().split()[0][:8]==cur8),cur8)\n'
         '        if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
         "            carry=curline\n"
-        "        elif not pub_line(curline):\n"
+        "        elif not pub_line(pick_pub(curline,rawlines)):\n"
         "            carry=curline\n"
         "        else:\n"
         "            os.remove(lp)\n"
@@ -10888,7 +10935,7 @@ def _update_remote(host):
         "    sys.exit(6)\n"
         'if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
         "    sys.exit(4)\n"
-        "if not pub_line(body.splitlines()[0]):\n"
+        "if not pub_line(pick_pub(body.splitlines()[0],body.splitlines())):\n"
         "    sys.exit(4)\n"
         "os.remove(lp)' "
         '"$GD/romp-update.lock" "$R" %s >/dev/null 2>&1; RRC=$?; '
@@ -27169,7 +27216,11 @@ class Handler(BaseHTTPRequestHandler):
                                           "application/json")
                     return self._send(200, json.dumps({"ok": True, "id": sid, "dir": cwd, **extra}),
                                       "application/json")
-                threading.Thread(target=_spawn_session, args=(nm, cwd), daemon=True).start()
+                if not _claim_name(nm):
+                    return self._send(200, json.dumps({"ok": False, "error": _NAME_TAKEN % nm}),
+                                      "application/json")
+                threading.Thread(target=_spawn_session_preclaimed, args=(nm, cwd),
+                                 daemon=True).start()
                 return self._send(200, json.dumps({"ok": True, "pending": True, "dir": cwd}),
                                   "application/json")
             if u.path == "/fork":
@@ -27879,8 +27930,11 @@ class Handler(BaseHTTPRequestHandler):
                         be = _codex()
                         why = (getattr(be, "_client_err", "") or CODEX_SETUP_HINT) if be else CODEX_SETUP_HINT
                         client["send"](json.dumps({"type": "warn", "text": why}))
+                elif not _claim_name(nm):
+                    client["send"](json.dumps({"type": "warn", "text": _NAME_TAKEN % nm}))
                 else:
-                    threading.Thread(target=_spawn_session, args=(nm, cwd), daemon=True).start()
+                    threading.Thread(target=_spawn_session_preclaimed, args=(nm, cwd),
+                                     daemon=True).start()
         elif msg and msg.get("type") == "cancelCreate" and msg.get("name"):
             # The webview's "Opening…" cue was cancelled (the ✕/Esc/backdrop — the spawn hung/failed, or the
             # user changed their mind). We only know the NAME (no id yet). Tear down a matching LOCAL session

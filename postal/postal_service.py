@@ -1197,7 +1197,13 @@ class Handler(BaseHTTPRequestHandler):
         if (urllib.parse.urlparse(self.path).path == "/peer-exchange"
                 and n > PEER_EXCHANGE_MAX_BYTES):
             raise PeerExchangeTooLarge("exchange request exceeds the byte limit")
-        return json.loads(self.rfile.read(n)) if n else {}
+        body = json.loads(self.rfile.read(n)) if n else {}
+        if not isinstance(body, dict):
+            # arrays/null/numbers crashed .get() into a dropped connection on /send, /recall,
+            # /wake, /heartbeat, and /quarantine/act (the v1.3.10 audit) — the dispatcher maps
+            # this to the same JSON 400 every malformed envelope gets
+            raise PeerExchangeError("the body must be a JSON object")
+        return body
 
     def _authorized(self):
         """Serve-token gate, every route but /ping (see the SERVE_TOKEN block). Local clients send

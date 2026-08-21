@@ -232,6 +232,37 @@ class TokenBirth(unittest.TestCase):
             f.unlink(missing_ok=True)
 
 
+class BusBodyValidation(unittest.TestCase):
+    """Non-object JSON bodies (arrays, null, numbers) crashed .get() and dropped the connection
+    on /send, /recall, /wake, /heartbeat, and /quarantine/act (the v1.3.10 audit) — the shared
+    body parser now maps them to the same JSON 400 every malformed envelope gets."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), ps.Handler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def test_non_object_bodies_are_a_json_400(self):
+        for path in ("/send", "/recall", "/wake", "/heartbeat"):
+            for junk in (b"[]", b"null", b"7"):
+                req = urllib.request.Request(
+                    "http://127.0.0.1:%d%s" % (self.port, path), method="POST", data=junk,
+                    headers={"X-Romp-Token": TOK, "Content-Type": "application/json"})
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        code, body = r.status, r.read().decode()
+                except urllib.error.HTTPError as e:
+                    code, body = e.code, e.read().decode()
+                self.assertEqual(code, 400, "%s with %r must be a clean 400" % (path, junk))
+                self.assertIn("error", body)
+
+
 class PostalTokenFlock(unittest.TestCase):
     """The bus's loader shares the kernel's serve-token.lock — whichever daemon starts first mints,
     the other blocks and adopts. Same deterministic schedule as the kernel-side test: the test
@@ -348,6 +379,11 @@ print(ps._load_serve_token(), flush=True)
             if saved is not None:
                 f.write_text(saved)
         self.addCleanup(_restore)
+        f.unlink(missing_ok=True)                # force the MINT path: the module import already
+        #                                          minted a healthy 0600 token, and the read-only
+        #                                          grace then served it without ever calling
+        #                                          flock — this test failed standalone and was
+        #                                          masked in the full suite (the v1.3.10 audit)
         real = ps.fcntl.flock
 
         def no_locks(fd, op):

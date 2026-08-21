@@ -98,6 +98,45 @@ class NameClaims(unittest.TestCase):
         self.assertIn("already running or being created",
                       next(x for x in results if x is not None))
 
+    def test_rename_refuses_a_claimed_name_and_the_backend_never_writes(self):
+        # rename wrote registries blindly (the v1.3.10 audit's P2): it now takes the same
+        # reservation create, fork, and promotion hold
+        sent = []
+        client = {"send": sent.append}
+        be = mock.MagicMock()
+        be.rename.return_value = True
+        with mock.patch.object(km, "_tmux_sessions", return_value={}):
+            with mock.patch.object(km, "_kernel_knows", return_value=True):
+                with mock.patch.object(km.Sessions, "backend_for", return_value=be):
+                    with km._name_claims_lock:
+                        km._NAME_CLAIMS.add("web")
+                    try:
+                        km._drive({"type": "renameSession",
+                                   "id": "11111111-2222-3333-4444-555555555555",
+                                   "name": "web"}, client)
+                    finally:
+                        with km._name_claims_lock:
+                            km._NAME_CLAIMS.discard("web")
+        self.assertTrue(any("already running or being created" in m for m in sent),
+                        "renaming onto a claimed name warns instead of writing blindly: %r" % sent)
+        self.assertFalse(be.rename.called, "the backend never writes for a refused rename")
+
+    def test_a_permitted_rename_claims_then_releases(self):
+        sent = []
+        client = {"send": sent.append}
+        be = mock.MagicMock()
+        be.rename.return_value = True
+        with mock.patch.object(km, "_tmux_sessions", return_value={}):
+            with mock.patch.object(km, "_kernel_knows", return_value=True):
+                with mock.patch.object(km.Sessions, "backend_for", return_value=be):
+                    km._drive({"type": "renameSession",
+                               "id": "11111111-2222-3333-4444-555555555555",
+                               "name": "web"}, client)
+        self.assertTrue(be.rename.called)
+        self.assertTrue(any('"renamed"' in m for m in sent), sent)
+        with km._name_claims_lock:
+            self.assertNotIn("web", km._NAME_CLAIMS, "the reservation is released after the write")
+
     def test_promotion_refuses_a_claimed_name(self):
         # promotion wrote names/ blindly (the adversarial review, 2026-08-21) — it now takes the
         # same reservation as create and fork
@@ -151,6 +190,23 @@ class ForkRouteBody(unittest.TestCase):
                 code, out = self._post(path, junk)
                 self.assertEqual(code, 400, "%s with %r" % (path, junk))
                 self.assertIn("JSON object", out)
+
+    def test_a_tmux_new_with_a_claimed_name_refuses_BEFORE_the_ack(self):
+        # /new spawned the tmux worker and returned pending:true; the claim happened inside the
+        # thread, so a collision was reported only to stderr while the caller saw success (the
+        # v1.3.10 audit's P2)
+        with km._name_claims_lock:
+            km._NAME_CLAIMS.add("web")
+        try:
+            code, out = self._post("/new", json.dumps({"name": "web", "dir": "/tmp",
+                                                       "backend": "tmux"}).encode())
+        finally:
+            with km._name_claims_lock:
+                km._NAME_CLAIMS.discard("web")
+        self.assertEqual(code, 200)
+        body = json.loads(out)
+        self.assertFalse(body.get("ok"), "the collision is the CALLER'S answer, not a stderr line")
+        self.assertIn("already running or being created", body.get("error", ""))
 
     def test_fork_requires_parent_and_name(self):
         code, out = self._post("/fork", b"{}")

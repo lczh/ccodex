@@ -1018,19 +1018,36 @@ class IntentPublish(unittest.TestCase):
         self.assertEqual(carry, "abcd1234 stable",
                          "the carry is the FULL line — a sha-only carry dropped the channel")
 
-    def test_a_two_line_heal_publishes_only_the_healed_lines_token(self):
-        # the 'published by a stranger' property, two-line form (the adversarial review,
-        # 2026-08-20): healing the plain intent line must not publish the CARRIED line's token
+    def test_a_carried_channel_choice_survives_a_tokenless_successors_completion(self):
+        # the v1.3.10 audit's P1 (this test previously pinned the OPPOSITE): a carried line's
+        # token is an explicit user choice — a crashed switch-to-stable — and spending the whole
+        # latch through a tokenless successor silently dropped it, leaving the machine following
+        # unsigned main. The completing line's own token still wins as the newer decision.
         from pathlib import Path
         with tempfile.TemporaryDirectory() as td:
             gd = Path(td)
             (gd / "romp-update-channel").write_text("dev\n")
             (gd / "romp-install-failed").write_text("eeee1111\nabcd1234 stable")
             self._heal(gd, cur="eeee1111")
-            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "dev",
-                             "the healed line is plain — the carried line's token is not ours")
-            self.assertFalse((gd / "romp-install-failed").exists(),
-                             "a passing install supersedes the carried record")
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
+                             "the carried explicit choice publishes when the completing line "
+                             "stages nothing")
+            self.assertFalse((gd / "romp-install-failed").exists())
+            # and the inverse choice direction
+            (gd / "romp-update-channel").write_text("stable\n")
+            (gd / "romp-install-failed").write_text("eeee1111\nabcd1234 dev")
+            self._heal(gd, cur="eeee1111")
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "dev")
+
+    def test_the_completing_lines_own_token_outranks_the_carried_one(self):
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            (gd / "romp-update-channel").write_text("dev\n")
+            (gd / "romp-install-failed").write_text("eeee1111 stable\nabcd1234 dev")
+            self._heal(gd, cur="eeee1111")
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
+                             "the newer decision wins when both lines carry tokens")
 
     def test_a_torn_single_nonhex_latch_line_is_never_moot(self):
         # the v1.3.8 audit: a one-byte-short quarantine write left a single non-hex line, and the
