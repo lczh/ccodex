@@ -54,6 +54,10 @@ class ReviveSession(unittest.TestCase):
                       km._send_to_view, subprocess.run)
         self.sent, self.focused, self.runs = [], [], []
         km._name_of = lambda sid: "testsess"
+        self.saved_tmux = km._tmux_sessions
+        km._tmux_sessions = lambda: {}       # the claim's live-check must not shell tmux here
+        #                                      (revive takes the name reservation since the
+        #                                      v1.3.11 audit)
         km._cwd_of = lambda sid: "/nonexistent-dir-for-test"
         km._push_all = lambda: None
         km._reveal_chat_for = lambda client, msg: self.focused.append((client, msg))
@@ -62,6 +66,7 @@ class ReviveSession(unittest.TestCase):
     def tearDown(self):
         (km._sdk, km._name_of, km._cwd_of, km._push_all, km._reveal_chat_for,
          km._send_to_view, subprocess.run) = self.saved
+        km._tmux_sessions = self.saved_tmux
 
     def _stub_run(self, returncode=0, stderr=""):
         def run(cmd, **kw):
