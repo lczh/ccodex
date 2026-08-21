@@ -216,7 +216,10 @@ class ForkRouteBody(unittest.TestCase):
 
         class BoomThread(real_thread):
             def start(self):
-                raise RuntimeError("can't start new thread")
+                if getattr(self, "_target", None) is km._spawn_session_preclaimed:
+                    raise RuntimeError("can't start new thread")
+                return real_thread.start(self)       # the test server's own request threads
+                #                                      must keep working — threading is shared
         with mock.patch.object(km.threading, "Thread", BoomThread):
             code, out = self._post("/new", json.dumps({"name": "web", "dir": "/tmp",
                                                        "backend": "tmux"}).encode())
