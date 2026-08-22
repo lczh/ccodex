@@ -157,6 +157,8 @@ ensure_romp_node() {
     [[ -n "$src" ]] || return 0
     mkdir -p "$STATE"
     if [[ ! -x "$ROMP_NODE" ]] || ! cmp -s "$src" "$ROMP_NODE"; then
+        rm -f "$ROMP_NODE.tmp" 2>/dev/null || true   # never cp INTO a fixed staging name a plant
+        #                                              could have replaced (the r35 verification)
         if cp "$src" "$ROMP_NODE.tmp" 2>/dev/null && chmod +x "$ROMP_NODE.tmp"; then
             mv -f "$ROMP_NODE.tmp" "$ROMP_NODE"
         else

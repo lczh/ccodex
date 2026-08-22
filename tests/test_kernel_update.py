@@ -352,8 +352,20 @@ class RunUpdate(Fresh):
                         script.index('> "$MARKER.pub"'),
                         "the marker staging name is cleared of plants before the shell opens it "
                         "(the r34 verification: > on a planted FIFO blocks forever)")
-        self.assertIn("rm -f", script.split("mv -f")[0],
-                      "the latch staging name is cleared of plants before the shell opens it")
+        import re as _re
+        m = _re.search(r"rm -f (\S*romp-install-failed\.tmp)\n", script)
+        self.assertIsNotNone(m, "the latch staging name is cleared of plants before the shell "
+                                "opens it — the old prefix pin was satisfied by the MARKER.pub "
+                                "rm alone (the r35 verification's mutant)")
+        self.assertLess(script.index(m.group(0)), script.index("> " + m.group(1)),
+                        "and the rm sits BEFORE the redirect that would block on a plant")
+        rep_redirects = [mm.start() for mm in _re.finditer(r"> (\S*update-report\.json\S*\.tmp)", script)]
+        self.assertTrue(rep_redirects, "the report is staged at a fixed .tmp name")
+        for pos in rep_redirects:
+            head = script[max(0, pos - 250):pos]
+            self.assertIn("rm -f", head,
+                          "every report redirect clears a plant first — the fixed staging "
+                          "name blocked the detached updater otherwise (the r35 verification)")
         self.assertIn('rev-parse --short=8 HEAD | head -c 8)\" = \"$NEW8\"'.replace('\\"', '"'),
                       script,
                       "the move VERIFIES it landed before install: merge --ff-only exits 0 as a "

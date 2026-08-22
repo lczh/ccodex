@@ -65,11 +65,16 @@ class OtherStagingWriters(unittest.TestCase):
         self.assertLess(window.index("tmp.unlink(missing_ok=True)"),
                         window.index("tmp.write_text"))
 
-    def test_the_node_copy_stager_removes_the_plant_first(self):
-        src = open(os.path.join(ROOT, "bin", "romp-node-launch")).read()
-        i = src.index('cp "$sys_node" "$ROMP_NODE.tmp"')
-        self.assertIn('rm -f "$ROMP_NODE.tmp"', src[max(0, i - 300):i],
-                      "the copy target is a fixed staging name — rm the plant before cp")
+    def test_the_node_copy_stagers_remove_the_plant_first(self):
+        # BOTH node copiers: the login-time one (node-launch) and the install-time twin in
+        # romp-service, which r35 missed (the r35 verification — a plant hung `romp refresh`)
+        for fn, anchor in (("romp-node-launch", 'cp "$sys_node" "$ROMP_NODE.tmp"'),
+                           ("romp-service", 'cp "$src" "$ROMP_NODE.tmp"')):
+            src = open(os.path.join(ROOT, "bin", fn)).read()
+            i = src.index(anchor)
+            self.assertIn('rm -f "$ROMP_NODE.tmp"', src[max(0, i - 400):i],
+                          "%s: the copy target is a fixed staging name — rm the plant before "
+                          "cp" % fn)
 
 
 if __name__ == "__main__":

@@ -2177,16 +2177,19 @@ def _run_update(tag):
     ok_plain = {"ok": True, "tag": tag, "restarted": False}
     if mport.isdigit():
         restart = ("  if %s -c %s %d >/dev/null 2>&1; then\n"
+                   "    rm -f %s.tmp\n"
                    "    printf '%%s' %s > %s.tmp && mv -f %s.tmp %s\n"
                    "  else\n"
+                   "    rm -f %s.tmp\n"
                    "    printf '%%s' %s > %s.tmp && mv -f %s.tmp %s\n"
                    "  fi\n" % (q(sys.executable), q(manager_post), int(mport),
-                                q(json.dumps(ok_restarted)), rep, rep, rep,
-                                q(json.dumps(ok_plain)), rep, rep, rep))
+                                rep, q(json.dumps(ok_restarted)), rep, rep, rep,
+                                rep, q(json.dumps(ok_plain)), rep, rep, rep))
     else:
         restart = ("  : # no manager — the new code arms on the next romp start (the report says so)\n"
+                   "  rm -f %s.tmp\n"
                    "  printf '%%s' %s > %s.tmp && mv -f %s.tmp %s\n"
-                   % (q(json.dumps(ok_plain)), rep, rep, rep))
+                   % (rep, q(json.dumps(ok_plain)), rep, rep, rep))
     verify_sh = " ".join(q(x) for x in verify_argv)
     if not _release_verify_enforced():
         # best-effort: the attempt and its outcome land in the log either way, but an unsigned tag
@@ -2308,6 +2311,7 @@ def _run_update(tag):
         + "if [ \"$OK\" = 1 ]; then\n"
         + restart
         + "else\n"
+        + "  rm -f %s.tmp\n" % rep
         + "  printf '%%s' %s > %s.tmp && mv -f %s.tmp %s\n" % (q(json.dumps({"ok": False, "tag": tag,
                                                       "why": "the fetch, signature verification, "
                                                              "fast-forward or install failed"})),
