@@ -2293,7 +2293,9 @@ def _run_update(tag):
           "else printf '%%s' \"$NEW8\" > %s.tmp; fi\n" % (latch, latch, latch)
         + "    mv -f %s.tmp %s\n" % (latch, latch)
         + "    if [ \"$(sed -n 1p %s 2>/dev/null | awk '{print $1}' | head -c 8)\" = \"$NEW8\" ] "
-          "&& git merge --ff-only %s >> %s 2>&1 && ./install.sh >> %s 2>&1; then\n"
+          "&& git merge --ff-only %s >> %s 2>&1 "
+          "&& [ \"$(git rev-parse --short=8 HEAD | head -c 8)\" = \"$NEW8\" ] "
+          "&& ./install.sh >> %s 2>&1; then\n"
           % (latch, tag, log, log)
         + "      if pub_line \"$(pick_pub \"$(sed -n 1p %s 2>/dev/null)\" %s)\"; then rm -f %s; OK=1; fi\n"
           % (latch, latch, latch)
@@ -2548,6 +2550,10 @@ def _publish_latch_channel(sha8):
     if p is None:
         return True
     try:
+        if not stat.S_ISREG(os.stat(p).st_mode):
+            return False                           # a FIFO blocks open() forever — this runs
+        #                                            while HOLDING the update flock (the r31
+        #                                            verification, executed)
         raw = p.read_text().splitlines()
     except FileNotFoundError:
         return True
@@ -2613,6 +2619,10 @@ def _install_failed_sha():
     p = _install_latch_path()
     for cand in ([p] if p is not None else []) + [jd.STATE / "converge-install-failed"]:
         try:
+            if not stat.S_ISREG(os.stat(cand).st_mode):
+                continue                          # never open a FIFO: _boot_heal's contended
+            #                                       branch reads this on the MAIN thread and in
+            #                                       every check-loop pass (the r31 verification)
             v = cand.read_text().strip()[:8]
         except (OSError, UnicodeDecodeError):
             continue
@@ -2652,8 +2662,12 @@ def _update_git_dir():
     if g.is_dir():
         return g
     try:
+        if not stat.S_ISREG(os.stat(g).st_mode):
+            return None                           # a FIFO here hung every reader downstream of
+        #                                           this resolution, gates and all (the r31
+        #                                           verification, executed)
         line = g.read_text().strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     if not line.startswith("gitdir:"):
         return None
@@ -2958,16 +2972,31 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
                 _converge_note("could not record the install intent — not moving HEAD.")
                 _MAIN_DRIFT[0] = ""
                 return
-            r = subprocess.run(["git", "merge", "--ff-only", tip], cwd=str(ROOT),
+            r = subprocess.run(["git", "-c", "advice.diverging=false", "merge", "--ff-only",
+                                tip], cwd=str(ROOT),
                                capture_output=True, text=True, timeout=30)   # the MOVE enforces
             #                     ancestry itself, like the tag path's and _pull_remote's moves —
             #                     checkout --detach let a commit landing in the ff2→move seam be
-            #                     silently dropped from the tree (the r30 verification, executed)
+            #                     silently dropped from the tree (the r30 verification, executed).
+            #                     advice.diverging=false keeps the notice to git's fatal line
+            #                     instead of 200 chars of hint fragments (the r31 verification)
             if r.returncode != 0:
                 _set_install_failed(carry)            # HEAD did not move: the carried prior (if
                 #                                       any) is restored; a clean settle clears
                 _converge_note("main moved at origin, but advancing the checkout failed: %s"
                                % (r.stderr or r.stdout or "").strip()[-200:])
+                _MAIN_DRIFT[0] = ""
+                return
+            head2 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(ROOT),
+                                   capture_output=True, text=True, timeout=10).stdout.strip()
+            if head2 != tip:
+                # merge --ff-only exits 0 WITHOUT moving when HEAD already contains tip (a seam
+                # commit landing after ff2): install would then run at C while the latch names
+                # tip — and the restart leg clears a latch HEAD doesn't match as "intent-only",
+                # erasing the failed-install protection (the r31 verification, executed)
+                _set_install_failed(carry)
+                _converge_note("main moved at origin, but the checkout moved while updating — "
+                               "the move did not land on the offered commit; nothing installed.")
                 _MAIN_DRIFT[0] = ""
                 return
         except Exception as e:
@@ -3055,6 +3084,12 @@ def _settle_prior_latch(lock_fd):
         carry_line = cur
         try:
             p = _install_latch_path()
+            if p is not None and not stat.S_ISREG(os.stat(p).st_mode):
+                # a latch REPLACED by a FIFO during the minutes-long heal hangs open() forever
+                # while this holds the update flock (the r31 verification, executed) — the same
+                # unknown-record refusal the unreadable case gets
+                return ("an existing install latch cannot be re-read after its heal failed — "
+                        "settling nothing on a guess"), ""
             raw = [ln.strip() for ln in (p.read_text().splitlines() if p is not None else [])
                    if ln.strip()]
             for ln in raw:
@@ -11422,6 +11457,14 @@ def _pull_remote(host, expected_sha=None):
                 _set_install_failed(carry)         # HEAD did not move; the carried prior returns
                 return False, ("fast-forward failed: %s"
                                % ((m.stderr or m.stdout or "").strip()[:160] or "unknown"))
+            head2 = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                                   capture_output=True, text=True, timeout=10).stdout.strip()
+            if head2 != fetched_sha:
+                # a no-op ff (HEAD already contained the target via a seam commit) must not run
+                # install labeled with a sha HEAD is not on (the r31 verification)
+                _set_install_failed(carry)
+                return False, ("the move did not land on the validated commit — the checkout "
+                               "moved while updating; nothing installed")
             # trust COUPLED to the move (the user's audit, 2026-08-19: a downgrade landing during
             # the arm/merge still merged code from a now-directed peer): re-checked here, after
             # the merge and before the code-execution boundary — a downgrade ROLLS THE MOVE BACK

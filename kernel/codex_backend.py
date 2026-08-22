@@ -300,6 +300,8 @@ class CodexBackend:
         with self._sessions_lock:
             self._sessions[s.sid] = s
 
+    _names_lock = threading.Lock()   # serializes this backend's names/<sid> read-modify-writes
+
     @staticmethod
     def _legacy_queue_id(sid, index, text, repair=""):
         """A deterministic identity lets every overlapping loader agree on old string-only rows."""
@@ -802,16 +804,25 @@ class CodexBackend:
     def _write_name(self, s, bg="", fg=""):
         """The shared identity/discovery file names/<sid> (name, cwd, bg, fg) — the same four-field
         format both other backends write, so name/identity surfaces read Codex sessions for free.
-        Discovery itself finds Codex transcripts via the codex registry, not this file."""
+        Discovery itself finds Codex transcripts via the codex registry, not this file.
+        ATOMIC (tmp + os.replace, like sdk_backend.write_name): the old in-place write_text was
+        torn-readable mid-write and its crash residue armed a decode landmine every later reader
+        tripped on; the corrupt-read catch below also HEALS that residue by rewriting whole (the
+        r31 verification). The backend lock serializes backend writers — kernel-side writers
+        (_set_session_color, _set_palette) write atomically themselves, so cross-module races
+        degrade to last-writer-wins of a whole valid file, never a torn one."""
         d = self.state / "names"
         d.mkdir(parents=True, exist_ok=True)
-        try:
-            old = (d / s.sid).read_text().rstrip("\n").split("\t")
-        except OSError:
-            old = []
-        bg = bg or (old[2] if len(old) > 2 else "")
-        fg = fg or (old[3] if len(old) > 3 else "")
-        (d / s.sid).write_text("%s\t%s\t%s\t%s\n" % (s.name, s.cwd, bg, fg))
+        with self._names_lock:
+            try:
+                old = (d / s.sid).read_text().rstrip("\n").split("\t")
+            except (OSError, UnicodeDecodeError):
+                old = []
+            bg = bg or (old[2] if len(old) > 2 else "")
+            fg = fg or (old[3] if len(old) > 3 else "")
+            tmp = d / (s.sid + ".tmp")
+            tmp.write_text("%s\t%s\t%s\t%s\n" % (s.name, s.cwd, bg, fg))
+            os.replace(str(tmp), str(d / s.sid))
 
     def spawn(self, name, cwd, bg="", fg="", sid=None, auth=""):
         sid = sid or str(uuidlib.uuid4())
@@ -1051,20 +1062,27 @@ class CodexBackend:
                 old_line = None
             try:
                 self._write_name(s)
-            except OSError as e:
+            except (OSError, UnicodeDecodeError) as e:
                 # the thread is HEALTHY — failing the turn over a cosmetic identity write would
-                # be worse — but write_text TRUNCATES before it fails and NO later path rewrites
-                # this file (resume skips the create branch), so the truncation was permanent
-                # (the r30 verification). Restore the old line, or remove the partial file.
+                # be worse (a decode failure from crash residue sailed through an OSError-only
+                # catch and DID fail the turn, unhealed forever — the r31 verification) — but
+                # the write must not leave residue either. Restore the old line, or remove the
+                # partial file.
                 try:
                     if old_line is not None:
                         nf.write_bytes(old_line)
+                        self.log("codex: names/%s write failed after thread start (%s) — the "
+                                 "identity file was restored; it refreshes on the next rename"
+                                 % (s.sid, e))
                     else:
                         nf.unlink(missing_ok=True)
+                        self.log("codex: names/%s could not be published after thread start "
+                                 "(%s) — the session runs UNNAMED on shared surfaces until a "
+                                 "rename lands; a same-name create may collide meanwhile"
+                                 % (s.sid, e))
                 except OSError:
-                    pass
-                self.log("codex: names/%s write failed after thread start (%s) — the identity "
-                         "file was restored; it refreshes on the next rename" % (s.sid, e))
+                    self.log("codex: names/%s left in an unknown state by a failed write (%s)"
+                             % (s.sid, e))
             self.push()
             return True
         c.thread_resume(tid, {"cwd": cwd, **_execution_permissions(cwd, thread_start=True)})

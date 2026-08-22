@@ -137,14 +137,37 @@ class PullRemote(unittest.TestCase):
                 # STATEFUL: a plain `rev-parse HEAD` answers differently before and after the
                 # merge — a stateless answer let a mutant that records pre_head AFTER the merge
                 # pass the rollback tests while rolling back to the fetched commit itself (the
-                # adversarial review, 2026-08-19)
-                return _R(out="postmerg" if merged["v"] else "premerge")
+                # adversarial review, 2026-08-19). Post-merge it answers the FETCHED sha, as a
+                # real ff-merge would — the landed-verify (r32) refuses anything else.
+                return _R(out=fetched if merged["v"] else "premerge")
             cmd = argv[-1]                          # ssh: the clone discovery
             if "for d in" in cmd:
                 return _R(out="DIR:/home/u/romp\nHEAD:%s\nDIRTY:" % rhead)
             return _R()
         km.subprocess.run = fake
         return calls
+
+    def test_a_noop_ff_that_left_head_elsewhere_refuses_and_disarms(self):
+        # the r31 verification: merge --ff-only exits 0 WITHOUT moving when a seam commit
+        # already contains the target — install then ran at C while the latch named the target
+        calls = self._wire()
+        real = km.subprocess.run
+
+        def head_stays(argv, **kw):
+            r = real(argv, **kw)
+            if argv[0] == "git" and "rev-parse" in argv and "merge" not in argv \
+                    and not str(argv[-1]).endswith("^{commit}") and "FETCH_HEAD" not in argv \
+                    and self.merged["v"]:
+                return type(r)(out="c" * 40)       # HEAD sits on the seam commit, not the target
+            return r
+        km.subprocess.run = head_stays
+        ok, detail = km._pull_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("did not land", detail)
+        self.assertEqual(km._install_failed_sha(), "",
+                         "disarmed: the latch must not name a sha HEAD is not on")
+        self.assertFalse(any("install.sh" in str(a) for c in calls for a in c),
+                         "nothing installed at the seam commit")
 
     def test_no_host_is_a_no_op(self):
         self.assertEqual(km._pull_remote(""), (False, "no host"))

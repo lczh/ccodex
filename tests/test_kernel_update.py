@@ -348,6 +348,13 @@ class RunUpdate(Fresh):
         self.assertLess(script.index("verify-tag v0.7.0"), script.index("git merge --ff-only v0.7.0"),
                         "signature verification is the gate immediately before code moves")
         self.assertIn("git merge --ff-only v0.7.0", script)
+        self.assertIn('rev-parse --short=8 HEAD | head -c 8)\" = \"$NEW8\"'.replace('\\"', '"'),
+                      script,
+                      "the move VERIFIES it landed before install: merge --ff-only exits 0 as a "
+                      "no-op when a seam commit already contains the tag (the r31 verification)")
+        self.assertLess(script.index("merge --ff-only v0.7.0"),
+                        script.index('= "$NEW8" ] && ./install.sh'),
+                        "the landed-verify sits between the move and the install")
         self.assertNotIn("git pull", script, "a pull takes whatever the branch has gained past the tag")
         self.assertIn("./install.sh", script)
         self.assertIn("update-report.json", script)

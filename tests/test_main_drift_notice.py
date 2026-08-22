@@ -193,10 +193,16 @@ class DriftWiring(unittest.TestCase):
         self.assertIn("tip != target", src, "the move is bound to the sha the verdict advertised")
         self.assertIn('"merge-base", "--is-ancestor", "HEAD", tip', src,
                       "a diverged or rewound origin/main is refused, named")
-        self.assertIn('"merge", "--ff-only", tip', src,
+        self.assertIn('"merge", "--ff-only"', src,
                       "the MOVE itself enforces ancestry, like every sibling updater's — "
                       "checkout --detach let the ff2→move seam drop a landing commit (the r30 "
                       "verification)")
+        self.assertIn('advice.diverging=false', src,
+                      "the refusal notice is git's fatal line, not 200 chars of hint fragments "
+                      "(the r31 verification)")
+        self.assertIn("head2 != tip", src,
+                      "the move VERIFIES it landed: a no-op ff left install running at a seam "
+                      "commit under the target's latch (the r31 verification)")
         self.assertIn('install.sh', src, "new code with stale deps/build is not an update")
         self.assertIn('"X-Romp-Manager-Token"', src, "the restart request authenticates to the manager")
         self.assertIn('_MAIN_DRIFT[0] = ""', src, "every refusal re-arms the notice")
@@ -279,7 +285,8 @@ class ConvergeFunctional(unittest.TestCase):
         km._set_install_failed("")
 
     def _run(self, kind="pull", target=None, fail=(), tip=None, channel=None, restart_fails=False,
-             dirty_second_status=False, second_status_rc_fails=False, diverge_second_ancestry=False):
+             dirty_second_status=False, second_status_rc_fails=False, diverge_second_ancestry=False,
+             post_move_head=None):
         """Drive _run_main_update with every subprocess scripted. `fail` names steps that exit 1."""
         import subprocess as sp
         target = self.FULL if target is None else target
@@ -296,6 +303,9 @@ class ConvergeFunctional(unittest.TestCase):
             calls.append((step, list(argv)))
             rc = 1 if step in fail else 0
             out = tip + "\n" if step == "rev-parse" else ""
+            if step == "rev-parse" and post_move_head is not None \
+                    and any(s == "checkout" for s, _ in calls):
+                out = post_move_head + "\n"           # HEAD after the (no-op) move
             if step == "status" and dirty_second_status:
                 n = sum(1 for s, _ in calls if s == "status")
                 out = "" if n == 1 else " M raced-edit.py\n"   # clean at entry, dirty post-settle
@@ -342,9 +352,9 @@ class ConvergeFunctional(unittest.TestCase):
     def test_happy_path_runs_in_order_and_checks_out_the_bound_sha(self):
         steps, calls = self._run()
         self.assertEqual(steps, ["status", "fetch", "rev-parse", "merge-base", "status",
-                                 "merge-base", "checkout", "install"],
-                         "the SECOND status and SECOND merge-base are the post-settle rechecks — "
-                         "the entry checks are minutes stale after a settle heal (the r28/r29 "
+                                 "merge-base", "checkout", "rev-parse", "install"],
+                         "the SECOND status and SECOND merge-base are the post-settle rechecks, "
+                         "and the post-move rev-parse verifies the ff LANDED (the r28/r29/r31 "
                          "verifications)")
         checkout_argv = next(a for s, a in calls if s == "checkout")
         self.assertIn(self.FULL, checkout_argv, "the move lands on the resolved+bound sha")
@@ -420,6 +430,27 @@ class ConvergeFunctional(unittest.TestCase):
         self.assertEqual(mb[1][-2:], ["HEAD", self.FULL],
                          "ff2 asks the REAL question in the right order — reversed or vacuous "
                          "argv stayed green before this pin (the r30 mutant hunt)")
+
+    def test_a_noop_ff_that_left_head_elsewhere_refuses_the_converge(self):
+        # the r31 verification: merge --ff-only rc0 does NOT imply HEAD == tip — a seam commit
+        # containing tip made install run at C under tip's latch, and the restart leg then
+        # cleared that latch as intent-only, restarting everyone onto the failed build
+        import subprocess as sp
+        state = {"moved": False}
+
+        def run_with_stuck_head(argv, **kw):
+            if "merge" in argv and "merge-base" not in argv:
+                state["moved"] = True
+            if "rev-parse" in argv and state["moved"]:
+                return sp.CompletedProcess(argv, 0, stdout="c" * 40 + "\n", stderr="")
+            return None
+        steps, calls = self._run(post_move_head="c" * 40)
+        self.assertNotIn("install", steps, "nothing installs at the seam commit")
+        self.assertTrue(any("did not land on the offered commit" in n for n in self.notices),
+                        self.notices)
+        self.assertEqual(km._install_failed_sha(), "",
+                         "disarmed: the latch must not name a sha HEAD is not on")
+        self.assertEqual(self.requests, [])
 
     def test_the_stable_channel_stops_the_pull_before_any_subprocess(self):
         steps, _ = self._run(channel="stable")
@@ -1206,17 +1237,22 @@ class IntentPublish(unittest.TestCase):
         import subprocess as sp
         import sys as _sys
         code = (
-            "import os, tempfile\n"
+            "import os, shutil, tempfile\n"
             "from pathlib import Path\n"
             "from unittest import mock\n"
             "from importlib.machinery import SourceFileLoader\n"
-            "os.environ.setdefault('XDG_STATE_HOME', tempfile.mkdtemp())\n"
+            "st = tempfile.mkdtemp()\n"
+            "os.environ.setdefault('XDG_STATE_HOME', st)\n"
             "km = SourceFileLoader('km_fifo', %r).load_module()\n"
             "td = tempfile.mkdtemp()\n"
             "gd = Path(td)\n"
             "os.mkfifo(str(gd / 'romp-update-channel'))\n"
-            "with mock.patch.object(km, '_update_git_dir', return_value=gd):\n"
-            "    print(km._update_channel())\n"
+            "try:\n"
+            "    with mock.patch.object(km, '_update_git_dir', return_value=gd):\n"
+            "        print(km._update_channel())\n"
+            "finally:\n"
+            "    shutil.rmtree(td, ignore_errors=True)\n"
+            "    shutil.rmtree(st, ignore_errors=True)\n"
         ) % (str(km.__file__),)
         r = sp.run([_sys.executable, "-c", code],
                    capture_output=True, text=True, timeout=15)
@@ -1248,6 +1284,72 @@ class IntentPublish(unittest.TestCase):
                 with mock.patch.object(km, "_update_git_dir", return_value=gd):
                     self.assertIsNone(km._install_latch_lines(),
                                       "a FIFO latch is unknown, not an eternal hang")
+            finally:
+                signal.alarm(0)
+
+    def test_the_sibling_latch_readers_never_hang_on_a_fifo(self):
+        # the r31 verification's P2: the gate landed on _install_latch_lines but not its three
+        # siblings — _install_failed_sha (boot heal's contended branch, MAIN thread),
+        # _publish_latch_channel and the settle re-read (both run HOLDING the update flock)
+        from pathlib import Path
+        import signal
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            os.mkfifo(str(gd / "romp-install-failed"))
+            signal.alarm(10)                       # a revert HANGS — fail, don't wedge CI
+            try:
+                with mock.patch.object(km, "_update_git_dir", return_value=gd):
+                    self.assertEqual(km._install_failed_sha(), "",
+                                     "a FIFO latch is skipped, never opened")
+                    self.assertFalse(km._publish_latch_channel("deadbeef"),
+                                     "unpublishable — decided without opening the FIFO")
+            finally:
+                signal.alarm(0)
+
+    def test_a_latch_swapped_to_a_fifo_during_the_heal_refuses_the_settle(self):
+        # same P2, the settle's re-read leg: the latch is regular at the first read, a FIFO by
+        # the re-read (the heal runs install.sh for up to 600s)
+        from pathlib import Path
+        import signal
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            latch = gd / "romp-install-failed"
+            latch.write_text("eeee1111 stable")
+
+            def failing_heal_that_swaps_the_latch(cur, fd):
+                latch.unlink()
+                os.mkfifo(str(latch))
+                return False
+            signal.alarm(10)
+            try:
+                with mock.patch.object(km, "_update_git_dir", return_value=gd):
+                    with mock.patch.object(km, "_checkout_sha", return_value="eeee1111"):
+                        with mock.patch.object(km, "_converge_install",
+                                               side_effect=failing_heal_that_swaps_the_latch):
+                            fd = km._update_flock()
+                            try:
+                                settle, carry = km._settle_prior_latch(fd)
+                            finally:
+                                km.os.close(fd)
+            finally:
+                signal.alarm(0)
+        self.assertIn("cannot be re-read", settle)
+        self.assertEqual(carry, "")
+
+    def test_a_fifo_dot_git_file_never_hangs_the_gitdir_resolution(self):
+        # the r31 verification: _update_git_dir reads the linked-worktree .git FILE ungated —
+        # a FIFO there hung every gated reader one level up
+        from pathlib import Path
+        import signal
+        with tempfile.TemporaryDirectory() as td:
+            fix = Path(td) / "checkout"
+            fix.mkdir()
+            os.mkfifo(str(fix / ".git"))
+            signal.alarm(10)
+            try:
+                with mock.patch.object(km, "ROOT", fix):
+                    self.assertIsNone(km._update_git_dir(),
+                                      "a non-regular .git file is unresolvable, not a hang")
             finally:
                 signal.alarm(0)
 

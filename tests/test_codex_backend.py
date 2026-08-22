@@ -1071,12 +1071,12 @@ class RaisingRegistryTransactions(unittest.TestCase):
             be = cb.CodexBackend(td, client_factory=lambda: None)
             sid = be.spawn("webby", "/tmp")
             nf = os.path.join(td, "names", sid)
-            os.chmod(nf, 0o444)                    # the write raises at open; the file survives
-            try:
-                with self.assertRaises(Exception):
-                    be.rename(sid, "newname")
+            os.chmod(os.path.dirname(nf), 0o555)   # the ATOMIC write's tmp create raises; the
+            try:                                    # file survives untouched (r32 made the write
+                with self.assertRaises(Exception):  # tmp+replace, so a read-only FILE no longer
+                    be.rename(sid, "newname")       # fails it — only the dir does)
             finally:
-                os.chmod(nf, 0o644)
+                os.chmod(os.path.dirname(nf), 0o755)
             self.assertEqual(be._session(sid).name, "webby", "memory kept the old name")
             self.assertIn("webby", open(nf).read(), "the names file kept the old name")
             import json as _json
@@ -1151,6 +1151,58 @@ class RaisingRegistryTransactions(unittest.TestCase):
             self.assertEqual(open(nf).read(), old_line,
                              "the truncation cannot outlive the failure")
             self.assertTrue(s.loaded)
+
+    def test_a_corrupt_names_file_is_healed_by_the_next_write(self):
+        # the r31 verification: non-UTF-8 names bytes sailed through _write_name's OSError-only
+        # read catch, failed the turn with a wrong-subsystem error, and no path ever healed the
+        # file — the session's identity vanished from every kernel surface
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            fake = FakeClient()
+            be = cb.CodexBackend(td, client_factory=lambda: fake)
+            sid = be.spawn("webby", "/tmp")
+            s = be._session(sid)
+            nf = os.path.join(td, "names", sid)
+            with open(nf, "wb") as f:
+                f.write(b"\xff\xfe torn residue \x80")
+            s.tid = "pending-%s" % sid[:8]         # force the create path
+            s.loaded = False
+            ok = be._prepare_thread(s, fake)
+            self.assertTrue(ok)
+            self.assertIn("webby", open(nf).read(),
+                          "the corrupt residue is HEALED by the whole-file rewrite")
+
+    def test_the_names_write_is_atomic(self):
+        # the r31 verification: the in-place write_text was torn-readable mid-write and its
+        # crash residue armed the decode landmine — tmp+os.replace, like sdk_backend.write_name
+        import inspect
+        src = inspect.getsource(cb.CodexBackend._write_name)
+        self.assertIn("tmp.write_text", src, "the payload lands on a TMP file first")
+        self.assertIn("os.replace", src, "and moves into place atomically")
+
+    def test_an_unpublishable_name_after_thread_start_says_so(self):
+        # the r31 verification: the no-prior-file leg logged "was restored" when the partial
+        # file was actually unlinked — and the state it leaves (live row, no published name) is
+        # the duplicate-name hole, which the log must NAME
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            fake = FakeClient()
+            be = cb.CodexBackend(td, client_factory=lambda: fake)
+            sid = be.spawn("webby", "/tmp")
+            s = be._session(sid)
+            nf = os.path.join(td, "names", sid)
+            os.unlink(nf)                          # no prior file to restore
+            s.tid = "pending-%s" % sid[:8]
+            s.loaded = False
+            logs = []
+            with mock.patch.object(be, "log", side_effect=lambda m: logs.append(m)):
+                with mock.patch.object(be, "_write_name",
+                                       side_effect=OSError(28, "No space left on device")):
+                    ok = be._prepare_thread(s, fake)
+            self.assertTrue(ok, "the healthy turn still proceeds")
+            self.assertTrue(any("could not be published" in m for m in logs), logs)
+            self.assertFalse(any("was restored" in m for m in logs),
+                             "the log must not claim a restore that never happened")
 
     def test_a_raising_tid_save_rolls_the_thread_flip_back(self):
         # the r29 verification: with the real tid only in memory, every retry took the resume
