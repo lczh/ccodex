@@ -8597,16 +8597,19 @@ def _rename_session(sid, name):
             #                                            v1.3.12 audit's P2); the hook's later
             #                                            write is idempotent
     else:
-        _set_name(sid, name)                           # dead tab → names file directly
         cx = _codex()
         if cx is not None and cx._session(sid) is not None:
             try:
-                cx.rename(sid, name)                   # a dead Codex session's DURABLE registry
-                #                                        kept the old name while the shared file
-                #                                        moved (the v1.3.12 audit's P2)
+                cx.rename(sid, name)                   # the DURABLE registry commits FIRST: the
+                #                                        shared file published before a raising
+                #                                        registry write left every surface on a
+                #                                        name the backend then refused, under a
+                #                                        false "keeps its old name" message (the
+                #                                        adversarial review, 2026-08-21)
             except Exception as e:
                 sys.stderr.write("codex rename '%s': %s\n" % (sid, e))
                 return None
+        _set_name(sid, name)                           # dead tab → names file, after the registry
     return name
 
 
@@ -10963,6 +10966,11 @@ def _update_remote(host):
         "    sys.exit(5)\n"
         'lp=os.path.join(os.path.dirname(lock),"romp-install-failed")\n'
         'mk=os.path.join(os.path.dirname(lock),"romp-update-channel")\n'
+        "try:\n"
+        '    if open(mk).read().strip()=="stable":\n'
+        "        sys.exit(13)\n"
+        "except OSError:\n"
+        "    pass\n"
         "def pick_pub(healed,rawlines):\n"
         "    if len(healed.split())>1:\n"
         "        return healed\n"
@@ -11277,18 +11285,18 @@ def _pull_remote(host, expected_sha=None):
         if lock_fd is None:
             return False, "another update is already running on this checkout — try again when it finishes"
         try:
-            chan_before = _update_channel()
             settle, carry = _settle_prior_latch(lock_fd)   # settled or carried, never overwritten
             if settle:
                 return False, settle
-            if _update_channel() == "stable" and chan_before != "stable":
-                # the settle just COMPLETED a pending switch-to-stable (healed and published):
-                # this machine now updates only through signed release tags, and installing
-                # unsigned peer commits one line later crossed exactly that boundary (the
-                # v1.3.12 audit's P1 — the converge re-decides post-settle; this path did not)
-                return False, ("a switch to the STABLE channel just completed on this checkout — "
-                               "it updates only through signed release tags now; unsigned peer "
-                               "commits are not pulled onto it")
+            if _update_channel() == "stable":
+                # ABSOLUTE, not transition-keyed (the adversarial review, 2026-08-21: the common
+                # crashed-switch form has the marker ALREADY stable — bootstrap publishes it
+                # before install.sh — so a marker-change predicate certified a closure that
+                # never landed, and this pull disagreed with the push wrapper and the converge
+                # on the same trust cell). A stable-channel machine updates only through signed
+                # release tags; unsigned peer commits never land on it, in either direction.
+                return False, ("this checkout is on the STABLE channel — it updates only through "
+                               "signed release tags; unsigned peer commits are not pulled onto it")
             st3 = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain",
                                   "--untracked-files=no"],
                                  capture_output=True, text=True, timeout=10)

@@ -75,6 +75,11 @@ class PullRemote(unittest.TestCase):
         km._remotes.clear()
         km._remotes["TESTHOST"] = {"host": "TESTHOST", "trust": "trusted",
                                     "kernel_sha": REMOTE}
+        # the harness machine is a DEV-channel machine: the pull's absolute stable gate refuses
+        # unsigned peer commits on stable installs (which is _update_channel's default here)
+        self._chan_patch = mock.patch.object(km, "_update_channel", return_value="dev")
+        self._chan_patch.start()
+        self.addCleanup(self._chan_patch.stop)
 
     def tearDown(self):
         km.subprocess.run = self._run
@@ -357,10 +362,11 @@ class PullRemote(unittest.TestCase):
                              for a in calls), "nothing merged across the pending choice")
         self.assertFalse(any("install.sh" in str(a) for c in calls for a in c))
 
-    def test_the_pull_refuses_after_the_settle_completes_a_stable_switch(self):
-        # the v1.3.12 audit's P1: a SUCCESSFUL settle heal publishes the pending stable and
-        # returns an empty carry — the carry gate passed and unsigned peer code installed on a
-        # freshly stable machine. The channel is re-decided post-settle, like the converge.
+    def test_the_pull_refuses_on_a_stable_channel_absolutely(self):
+        # the v1.3.12 audit's P1, hardened by its own review: the common crashed-switch form has
+        # the marker ALREADY stable (bootstrap publishes before install.sh), so a transition
+        # predicate certified a closure that never landed. The rule is absolute — a stable
+        # machine never pulls unsigned peer commits — matching the wrapper and the converge.
         calls = self._wire()
         state = {"settled": False}
 
@@ -370,13 +376,26 @@ class PullRemote(unittest.TestCase):
         def settle(fd):
             state["settled"] = True                    # the heal just published the switch
             return "", ""
-        with mock.patch.object(km, "_update_channel", side_effect=channel):
-            with mock.patch.object(km, "_settle_prior_latch", side_effect=settle):
-                ok, detail = km._pull_remote("TESTHOST")
-        self.assertFalse(ok)
-        self.assertIn("just completed", detail)
+        self._chan_patch.stop()
+        try:
+            # form 1: the settle completes the switch mid-pull
+            with mock.patch.object(km, "_update_channel", side_effect=channel):
+                with mock.patch.object(km, "_settle_prior_latch", side_effect=settle):
+                    ok, detail = km._pull_remote("TESTHOST")
+            self.assertFalse(ok)
+            self.assertIn("STABLE channel", detail)
+            # form 2: the marker was ALREADY stable at entry (the common crash form)
+            self._wire()
+            with mock.patch.object(km, "_update_channel", return_value="stable"):
+                with mock.patch.object(km, "_settle_prior_latch", return_value=("", "")):
+                    ok, detail = km._pull_remote("TESTHOST")
+            self.assertFalse(ok)
+            self.assertIn("STABLE channel", detail)
+        finally:
+            self._chan_patch = mock.patch.object(km, "_update_channel", return_value="dev")
+            self._chan_patch.start()
         self.assertFalse(any(a[0] == "git" and "merge" in a and "merge-base" not in a
-                             for a in calls), "nothing merged onto the freshly stable machine")
+                             for a in calls), "nothing merged onto the stable machine")
         self.assertFalse(any("install.sh" in str(a) for c in calls for a in c))
 
     def test_the_pull_refuses_a_tree_dirtied_during_the_settle(self):

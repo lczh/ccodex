@@ -333,6 +333,38 @@ class UpdateRemote(unittest.TestCase):
             self.assertIn("DIRTYNOW", a.stdout, "the locked wrapper's own dirty check refuses")
             self.assertFalse((gd / "romp-install-failed").exists())
 
+    def test_a_stable_remote_marker_refuses_the_push_absolutely(self):
+        # the v1.3.12 audit's P1, hardened by its own review: the rule is absolute in both peer
+        # directions — a stable-channel remote never receives unsigned peer commits, whatever
+        # the latch says (the common crash form has the marker already stable with no latch)
+        import tempfile
+        from pathlib import Path
+        calls = self._wire(apply_out="SYNCED:abcdef0")
+        km._update_remote("TESTHOST")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        with tempfile.TemporaryDirectory() as td:
+            fix = Path(td) / "romp"
+            gd = fix / ".git"
+            gd.mkdir(parents=True)
+            fakebin = Path(td) / "bin"
+            fakebin.mkdir()
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "esac\nexit 0\n" % gd)
+            (fakebin / "git").chmod(0o755)
+            (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "install.sh").chmod(0o755)
+            env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
+            apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
+            (gd / "romp-update-channel").write_text("stable\n")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("STABLENOW", a.stdout)
+            self.assertFalse((gd / "romp-install-failed").exists(),
+                             "refused at entry: nothing armed, nothing moved")
+
     def test_a_settle_heal_that_publishes_stable_refuses_the_unsigned_reset(self):
         # the v1.3.12 audit's P1, remote edition: the heal published stable, removed the latch,
         # and the wrapper still moved HEAD and ran the peer installer — executed: it now stops
@@ -488,27 +520,28 @@ class UpdateRemote(unittest.TestCase):
             # a failing heal with a pending DEV merges the token onto the surviving carry (the
             # lossy carry destroyed the choice — same review)
             (gd / "romp-install-failed").write_text("deadbee2\n0ddba11d dev")
-            (gd / "romp-update-channel").write_text("stable\n")
+            (gd / "romp-update-channel").write_text("dev\n")
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("INSTALLFAIL", a.stdout)
             self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2 dev",
                              "the pending choice rides the surviving line")
             # reversed direction: HEAD matches line 2, line 1 is an unlanded "sha dev" — the
-            # failing heal must not launder the token (the adversarial review, 2026-08-21)
+            # failing heal must not launder the token (the adversarial review, 2026-08-21);
+            # the marker stays dev — a stable marker refuses at entry now (v1.3.12 P1)
             (gd / "romp-install-failed").write_text("aaaa1111 dev\ndeadbee2")
-            (gd / "romp-update-channel").write_text("stable\n")
+            (gd / "romp-update-channel").write_text("dev\n")
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("INSTALLFAIL", a.stdout)
             self.assertNotIn("dev", (gd / "romp-install-failed").read_text(),
                              "the unlanded token dies with its line")
             (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
             # healing the CARRIED line never inherits the unlanded line-1 token (the v1.3.11
-            # audit's P1)
-            (gd / "romp-install-failed").write_text("aaaa1111 dev\ndeadbee2")
-            (gd / "romp-update-channel").write_text("stable\n")
+            # audit's P1) — the remote is a dev machine; a wrongful inherit would flip it stable
+            (gd / "romp-install-failed").write_text("aaaa1111 stable\ndeadbee2")
+            (gd / "romp-update-channel").write_text("dev\n")
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertNotIn("LATCHSTUCK", a.stdout)
-            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "dev",
                              "an unlanded intent's channel is never published")
             # a PLAIN sha line publishes nothing — in-channel heals change no marker
             (gd / "romp-install-failed").write_text("deadbee2")

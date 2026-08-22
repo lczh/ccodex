@@ -191,6 +191,21 @@ class NameClaims(unittest.TestCase):
         cx.rename.assert_called_once_with("11111111-2222-3333-4444-555555555555", "webby")
         self.assertEqual(set_names, ["webby"])
 
+    def test_a_raising_codex_registry_rename_publishes_nothing(self):
+        # r28 ordering: the durable registry write goes FIRST — when it raises, the shared names
+        # file must not have moved, or the two stores disagree forever (the v1.3.12 audit's P2,
+        # atomicity half)
+        cx = mock.MagicMock()
+        cx._session.return_value = object()
+        cx.rename.side_effect = OSError("disk full")
+        set_names = []
+        with mock.patch.object(km, "_tmux_name_of", return_value=""):
+            with mock.patch.object(km, "_codex", return_value=cx):
+                with mock.patch.object(km, "_set_name", side_effect=lambda s, n2: set_names.append(n2)):
+                    out = km._rename_session("11111111-2222-3333-4444-555555555555", "webby")
+        self.assertIsNone(out, "a failed registry write is never acked")
+        self.assertEqual(set_names, [], "the shared file must not move when the registry raised")
+
     def test_a_live_tmux_rename_writes_the_names_file_before_returning(self):
         # the tmux hook publishes ASYNCHRONOUSLY, and the claim released before it ran — the
         # target name was briefly claimable by a rival (the v1.3.12 audit's P2)
