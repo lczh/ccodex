@@ -101,7 +101,7 @@ PY="$(pick_python)"
 # into install.sh (pass_fds) so an orphaned installer keeps holding it.
 # Exit 0 = clear to start; 70 = refuse (latched and unhealed, lock held elsewhere, HEAD unreadable).
 if ! python3 - "$ROMP_DIR" <<'GATEPY'
-import errno, fcntl, os, re, subprocess, sys, time
+import errno, fcntl, os, re, stat, subprocess, sys, time
 
 root = sys.argv[1]
 # INSIDE the install transaction (bootstrap's TXNPY runs install.sh, which starts the service,
@@ -166,11 +166,15 @@ while True:
 # matches; a prior present with HEAD matching nothing is an update that died mid-move from a
 # broken state — fail closed, never moot.
 try:
+    if not stat.S_ISREG(os.stat(latch).st_mode):
+        sys.exit(70)                   # a FIFO/device blocks open() forever — unknown, refuse
     rawlines = [ln.strip() for ln in open(latch).read().splitlines() if ln.strip()]
 except FileNotFoundError:
     sys.exit(0)                        # no latch: clear to start
-except OSError:
-    sys.exit(70)                       # an EXISTING latch we cannot read is unknown, not absent
+except (OSError, ValueError):
+    sys.exit(70)                       # an EXISTING latch we cannot read — or DECODE: non-UTF-8
+#                                        used to die as a raw traceback instead of this designed
+#                                        refusal (the r30 verification) — is unknown, not absent
 # STRICT GRAMMAR (the v1.3.9 audit): 1-2 lines of "sha8" / "sha8 stable|dev", or the exact
 # quarantine form — anything ELSE that exists (an empty file this gate used to DELETE and then
 # serve, a torn "quarantin", a malformed "sha8 sta") is unknown: refuse, never moot.

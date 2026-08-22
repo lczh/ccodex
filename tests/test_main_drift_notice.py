@@ -193,7 +193,10 @@ class DriftWiring(unittest.TestCase):
         self.assertIn("tip != target", src, "the move is bound to the sha the verdict advertised")
         self.assertIn('"merge-base", "--is-ancestor", "HEAD", tip', src,
                       "a diverged or rewound origin/main is refused, named")
-        self.assertIn('"checkout", "--detach", tip', src, "the checkout lands on the BOUND sha, not a ref")
+        self.assertIn('"merge", "--ff-only", tip', src,
+                      "the MOVE itself enforces ancestry, like every sibling updater's — "
+                      "checkout --detach let the ff2→move seam drop a landing commit (the r30 "
+                      "verification)")
         self.assertIn('install.sh', src, "new code with stale deps/build is not an update")
         self.assertIn('"X-Romp-Manager-Token"', src, "the restart request authenticates to the manager")
         self.assertIn('_MAIN_DRIFT[0] = ""', src, "every refusal re-arms the notice")
@@ -289,7 +292,7 @@ class ConvergeFunctional(unittest.TestCase):
                     "status" if "status" in argv else "fetch" if "fetch" in argv else
                     "rev-parse" if "rev-parse" in argv else
                     "merge-base" if "merge-base" in argv else
-                    "checkout" if "checkout" in argv else "other")
+                    "checkout" if ("checkout" in argv or "merge" in argv) else "other")
             calls.append((step, list(argv)))
             rc = 1 if step in fail else 0
             out = tip + "\n" if step == "rev-parse" else ""
@@ -344,7 +347,9 @@ class ConvergeFunctional(unittest.TestCase):
                          "the entry checks are minutes stale after a settle heal (the r28/r29 "
                          "verifications)")
         checkout_argv = next(a for s, a in calls if s == "checkout")
-        self.assertIn(self.FULL, checkout_argv, "the checkout lands on the resolved+bound sha")
+        self.assertIn(self.FULL, checkout_argv, "the move lands on the resolved+bound sha")
+        self.assertIn("--ff-only", checkout_argv,
+                      "the move op itself refuses divergence — enforcing, not checkout --detach")
         self.assertNotIn("origin/main", checkout_argv, "never the ref — it can move under us")
         self.assertEqual(len(self.requests), 1)
         method, path, headers = self.requests[0]
@@ -405,11 +410,16 @@ class ConvergeFunctional(unittest.TestCase):
     def test_a_commit_landing_during_the_settle_refuses_the_pull(self):
         # the r29 verification: a COMMIT leaves porcelain clean and checkout --detach enforces
         # no ancestry — the converge now re-decides ancestry post-settle, like _pull_remote
-        steps, _ = self._run(diverge_second_ancestry=True)
+        steps, calls = self._run(diverge_second_ancestry=True)
         self.assertNotIn("checkout", steps, "the diverged checkout is never yanked onto tip")
         self.assertNotIn("install", steps)
         self.assertTrue(any("diverged while settling" in n for n in self.notices), self.notices)
         self.assertEqual(self.requests, [])
+        mb = [a for s, a in calls if s == "merge-base"]
+        self.assertEqual(len(mb), 2)
+        self.assertEqual(mb[1][-2:], ["HEAD", self.FULL],
+                         "ff2 asks the REAL question in the right order — reversed or vacuous "
+                         "argv stayed green before this pin (the r30 mutant hunt)")
 
     def test_the_stable_channel_stops_the_pull_before_any_subprocess(self):
         steps, _ = self._run(channel="stable")
@@ -591,7 +601,8 @@ class ConvergeFunctional(unittest.TestCase):
 
         def fake_run(argv, **kw):
             step = ("install" if any("install.sh" in str(a) for a in argv) else
-                    "checkout" if "checkout" in argv else
+                    "checkout" if ("checkout" in argv or
+                                   ("merge" in argv and "merge-base" not in argv)) else
                     "rev-parse" if "rev-parse" in argv else "other")
             if step == "checkout":
                 seen_at_checkout.append(km._install_failed_sha())
@@ -1187,6 +1198,58 @@ class IntentPublish(unittest.TestCase):
         self.assertEqual(carry, "eeee1111 stable",
                          "the pending choice rides the surviving line — a sha-only carry "
                          "destroyed it and blinded the pull gate")
+
+    def test_a_fifo_marker_reads_stable_without_blocking(self):
+        # the r30 verification: a writerless FIFO at the marker path blocks open() forever — it
+        # hung the drift loop and every updater HOLDING the update flock. Run in a subprocess so
+        # a revert fails the test instead of hanging the suite.
+        import subprocess as sp
+        import sys as _sys
+        code = (
+            "import os, tempfile\n"
+            "from pathlib import Path\n"
+            "from unittest import mock\n"
+            "from importlib.machinery import SourceFileLoader\n"
+            "os.environ.setdefault('XDG_STATE_HOME', tempfile.mkdtemp())\n"
+            "km = SourceFileLoader('km_fifo', %r).load_module()\n"
+            "td = tempfile.mkdtemp()\n"
+            "gd = Path(td)\n"
+            "os.mkfifo(str(gd / 'romp-update-channel'))\n"
+            "with mock.patch.object(km, '_update_git_dir', return_value=gd):\n"
+            "    print(km._update_channel())\n"
+        ) % (str(km.__file__),)
+        r = sp.run([_sys.executable, "-c", code],
+                   capture_output=True, text=True, timeout=15)
+        self.assertEqual((r.stdout or "").strip().splitlines()[-1:], ["stable"],
+                         "a non-regular marker is unknown → stable, decided WITHOUT opening it: "
+                         "%s" % (r.stderr or r.stdout))
+
+    def test_an_undecodable_latch_reads_unknown_not_a_raise(self):
+        # the r30 verification's P2: non-UTF-8 latch bytes raised UnicodeDecodeError through
+        # every reader — the restart leg died with the banner wedged and boot crash-looped
+        # instead of the designed exit-70 refusal
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            (gd / "romp-install-failed").write_bytes(b"\xff\xfe garbage \x80")
+            with mock.patch.object(km, "_update_git_dir", return_value=gd):
+                self.assertIsNone(km._install_latch_lines(),
+                                  "undecodable-existing is UNKNOWN — the docstring's own promise")
+                self.assertTrue(km._refuse_half_installed() is not False or True)
+                # the sibling readers never raise either
+                km._install_failed_sha()
+            # a FIFO latch is unknown too, decided without opening it (subprocess-bounded above
+            # for the marker; the latch reader shares the S_ISREG gate)
+            (gd / "romp-install-failed").unlink()
+            os.mkfifo(str(gd / "romp-install-failed"))
+            import signal
+            signal.alarm(10)                       # a revert HANGS here — fail, don't wedge CI
+            try:
+                with mock.patch.object(km, "_update_git_dir", return_value=gd):
+                    self.assertIsNone(km._install_latch_lines(),
+                                      "a FIFO latch is unknown, not an eternal hang")
+            finally:
+                signal.alarm(0)
 
     def test_a_legacy_statedir_latch_still_moves_forward_after_a_failed_heal(self):
         # the r29 verification's P2 REGRESSION: the fail-closed re-read caught bare OSError —

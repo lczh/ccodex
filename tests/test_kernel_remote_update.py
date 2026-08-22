@@ -610,6 +610,26 @@ class UpdateRemote(unittest.TestCase):
             self.assertNotIn("RESETFAIL", a.stdout)
             self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2 stable")
             (gd / "romp-update-channel").write_text("dev\n")
+            # an UNDECODABLE latch is unknown too — it killed the wrapper uncaught (RESETFAIL,
+            # wrong subsystem) instead of the designed refusal (the r30 verification)
+            (gd / "romp-install-failed").write_bytes(b"\xff\xfe garbage \x80")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("LATCHSTUCK", a.stdout)
+            self.assertNotIn("RESETFAIL", a.stdout)
+            # a FIFO latch refuses WITHOUT blocking (open() on a writerless FIFO hangs forever,
+            # holding the remote's update lock — the r30 verification)
+            (gd / "romp-install-failed").unlink()
+            os.mkfifo(str(gd / "romp-install-failed"))
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=20)
+            self.assertIn("LATCHSTUCK", a.stdout)
+            (gd / "romp-install-failed").unlink()
+            # a FIFO MARKER refuses without blocking too, before the latch is even considered
+            os.mkfifo(str(gd / "romp-update-channel.fifo"))
+            os.replace(str(gd / "romp-update-channel.fifo"), str(gd / "romp-update-channel"))
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=20)
+            self.assertIn("CHANNELUNKNOWN", a.stdout)
+            (gd / "romp-update-channel").unlink()
+            (gd / "romp-update-channel").write_text("dev\n")
             # torn, EMPTY, and malformed records are never moot — LATCHSTUCK, executed (the
             # v1.3.9 audit: strict grammar in every reader)
             for bad in ("quarantin", "", "deadbee2 sta", "abcd1234\nffff9999\neeee1111"):

@@ -978,6 +978,14 @@ class CodexBackend:
                     except OSError as e2:
                         self.log("codex rename: names/%s left truncated by a failed write (%s)"
                                  % (s.sid, e2))
+                else:
+                    try:
+                        nf.unlink(missing_ok=True)  # _write_name may have CREATED a partial file
+                        #                             holding the NEW name — a failed rename must
+                        #                             not stay published (the r30 verification)
+                    except OSError as e2:
+                        self.log("codex rename: a partial names/%s could not be removed (%s)"
+                                 % (s.sid, e2))
                 try:
                     self._save_registry(s, fields=("name",))
                 except Exception as e2:
@@ -1036,7 +1044,27 @@ class CodexBackend:
                 s.norm = None
             self._ensure_norm(s)
             self.transcript_path(s.sid).touch()
-            self._write_name(s)
+            nf = self.state / "names" / s.sid
+            try:
+                old_line = nf.read_bytes()
+            except OSError:
+                old_line = None
+            try:
+                self._write_name(s)
+            except OSError as e:
+                # the thread is HEALTHY — failing the turn over a cosmetic identity write would
+                # be worse — but write_text TRUNCATES before it fails and NO later path rewrites
+                # this file (resume skips the create branch), so the truncation was permanent
+                # (the r30 verification). Restore the old line, or remove the partial file.
+                try:
+                    if old_line is not None:
+                        nf.write_bytes(old_line)
+                    else:
+                        nf.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                self.log("codex: names/%s write failed after thread start (%s) — the identity "
+                         "file was restored; it refreshes on the next rename" % (s.sid, e))
             self.push()
             return True
         c.thread_resume(tid, {"cwd": cwd, **_execution_permissions(cwd, thread_start=True)})

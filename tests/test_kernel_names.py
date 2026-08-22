@@ -234,6 +234,29 @@ class NameClaims(unittest.TestCase):
         self.assertTrue(any('"warn"' in m and "registry down" in m for m in sent),
                         "the failure reaches the asker, not just stderr: %r" % sent)
 
+    def test_a_raising_send_never_erases_the_create_error(self):
+        # the r30 verification: with the warn attempted FIRST, a raising send erased the
+        # creation error from every record — stderr goes first now
+        import io
+        err = io.StringIO()
+
+        def boom_send(_):
+            raise BrokenPipeError("client gone")
+        client = {"send": boom_send, "wid": "w1"}
+        with mock.patch.object(km, "_codex_ready", return_value=True):
+            with mock.patch.object(km, "_create_codex_session",
+                                   side_effect=RuntimeError("registry down")):
+                with mock.patch.object(km, "_resolve_create_dir", return_value=("/tmp", "")):
+                    with mock.patch.object(km, "_tmux_sessions", return_value={}):
+                        with mock.patch.object(km, "_live_names", return_value={}):
+                            with mock.patch.object(km.sys, "stderr", err):
+                                km.Handler._dispatch_ws(object.__new__(km.Handler),
+                                                        {"type": "createSession", "name": "webby",
+                                                         "backend": "codex", "dir": "/tmp"},
+                                                        client)
+        self.assertIn("registry down", err.getvalue(),
+                      "stderr keeps the error even when the send raises")
+
     def test_renames_are_serialized_under_one_lock(self):
         # two interleaved renames of one sid left the registry at one name and the shared file
         # at the other (the v1.3.12 audit's P2)

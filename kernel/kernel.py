@@ -11,7 +11,7 @@ zero protocol change at switchover. WS is hand-rolled on the stdlib socket (no d
 
 Run:  bin/romp-kernel   → opens http://127.0.0.1:29855
 """
-import json, os, queue, random, re, signal, socket, sys, time, threading, traceback, base64, bisect, errno, fcntl, hashlib, hmac, struct, subprocess, shutil, shlex, http.client, uuid
+import json, os, queue, random, re, signal, socket, stat, sys, time, threading, traceback, base64, bisect, errno, fcntl, hashlib, hmac, struct, subprocess, shutil, shlex, http.client, uuid
 from pathlib import Path
 from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
@@ -2012,6 +2012,11 @@ def _update_channel():
     gd = _update_git_dir()
     if gd is not None:
         try:
+            if not stat.S_ISREG(os.stat(gd / "romp-update-channel").st_mode):
+                return "stable"                      # a writerless FIFO blocks open() forever —
+            #                                          it hung the drift loop and every updater
+            #                                          HOLDING the update flock (the r30
+            #                                          verification, executed)
             v = (gd / "romp-update-channel").read_text().strip()
         except FileNotFoundError:
             v = None
@@ -2489,12 +2494,18 @@ def _install_latch_lines():
     p = _install_latch_path()
     for cand in ([p] if p is not None else []) + [jd.STATE / "converge-install-failed"]:
         try:
+            if not stat.S_ISREG(os.stat(cand).st_mode):
+                return None                           # a FIFO/device blocks open() forever — an
+            #                                           EXISTING non-regular record is unknown
             raw = cand.read_text()
         except FileNotFoundError:
             continue
-        except OSError:
-            return None                               # an EXISTING record we cannot read is UNKNOWN,
-        #                                               never absent — absent lets a writer overwrite
+        except (OSError, UnicodeDecodeError):
+            return None                               # an EXISTING record we cannot read (or
+        #                                               DECODE — that raise crashed the restart
+        #                                               leg and the boot heal straight past this
+        #                                               docstring's promise, the r30 verification)
+        #                                               is UNKNOWN, never absent
         lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
         if not lines:
             return None                               # an EXISTING empty record is unknown too: the
@@ -2540,7 +2551,7 @@ def _publish_latch_channel(sha8):
         raw = p.read_text().splitlines()
     except FileNotFoundError:
         return True
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return False
     want = str(sha8 or "")[:8]
     lines = [ln.strip() for ln in raw if ln.strip()]
@@ -2603,7 +2614,7 @@ def _install_failed_sha():
     for cand in ([p] if p is not None else []) + [jd.STATE / "converge-install-failed"]:
         try:
             v = cand.read_text().strip()[:8]
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             continue
         if v:
             return v
@@ -2947,8 +2958,11 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
                 _converge_note("could not record the install intent — not moving HEAD.")
                 _MAIN_DRIFT[0] = ""
                 return
-            r = subprocess.run(["git", "checkout", "--detach", tip], cwd=str(ROOT),
-                               capture_output=True, text=True, timeout=30)
+            r = subprocess.run(["git", "merge", "--ff-only", tip], cwd=str(ROOT),
+                               capture_output=True, text=True, timeout=30)   # the MOVE enforces
+            #                     ancestry itself, like the tag path's and _pull_remote's moves —
+            #                     checkout --detach let a commit landing in the ff2→move seam be
+            #                     silently dropped from the tree (the r30 verification, executed)
             if r.returncode != 0:
                 _set_install_failed(carry)            # HEAD did not move: the carried prior (if
                 #                                       any) is restored; a clean settle clears
@@ -3064,11 +3078,11 @@ def _settle_prior_latch(lock_fd):
             # r29's bare-OSError catch spuriously refused here forever, re-wedging the very
             # population the two-line carry design unwedged (the r29 verification, executed)
             pass
-        except OSError:
-            # fail-closed like the FIRST read: a latch that turns unreadable during the
-            # minutes-long heal silently degraded the carry from "sha8 stable" to a plain sha —
-            # exactly the token the pull's and converge's pending-stable gates key on (the r28
-            # verification, executed)
+        except (OSError, UnicodeDecodeError):
+            # fail-closed like the FIRST read: a latch that turns unreadable (or undecodable)
+            # during the minutes-long heal silently degraded the carry from "sha8 stable" to a
+            # plain sha — exactly the token the pull's and converge's pending-stable gates key
+            # on (the r28/r30 verifications, executed)
             return ("an existing install latch cannot be re-read after its heal failed — "
                     "settling nothing on a guess"), ""
         return "", carry_line
@@ -10990,7 +11004,7 @@ def _update_remote(host):
         # ref, which any concurrent sender force-updates (the user's audit, 2026-08-18) — and the
         # ancestry check runs HERE, under the lock: outside it, HEAD could move between the check
         # and the reset and the reset would rewind it. Exit 7 = diverged under the lock.
-        "python3 -c 'import fcntl,os,re,subprocess,sys\n"
+        "python3 -c 'import fcntl,os,re,stat,subprocess,sys\n"
         "lock,r,target=sys.argv[1],sys.argv[2],sys.argv[3]\n"
         "fd=os.open(lock,os.O_RDWR|os.O_CREAT,0o644)\n"
         "try:\n"
@@ -11017,6 +11031,8 @@ def _update_remote(host):
         # r28 verification, executed: a markerless legacy stable machine and a chmod-000 stable
         # marker both merged+installed unsigned commits the machine's own pull path refuses)
         "try:\n"
+        "    if not stat.S_ISREG(os.stat(mk).st_mode):\n"
+        "        sys.exit(14)\n"
         "    v=open(mk).read().strip()\n"
         "except FileNotFoundError:\n"
         "    v=None\n"
@@ -11055,6 +11071,8 @@ def _update_remote(host):
         "    except OSError:\n"
         "        return False\n"
         "try:\n"
+        "    if not stat.S_ISREG(os.stat(lp).st_mode):\n"
+        "        sys.exit(10)\n"
         '    rawlines=[l.strip() for l in open(lp).read().splitlines() if l.strip()]\n'
         '    if not rawlines:\n'
         "        sys.exit(10)\n"
@@ -11063,7 +11081,7 @@ def _update_remote(host):
         '    lines=[l.split()[0][:8] for l in rawlines]\n'
         "except FileNotFoundError:\n"
         "    lines=[]\n"
-        "except OSError:\n"
+        "except (OSError,ValueError):\n"
         "    sys.exit(10)\n"
         'carry=""\n'
         "if lines:\n"

@@ -228,7 +228,7 @@ gd="$(git -C "$DIR" rev-parse --absolute-git-dir)" || {
 echo "==> Checking out $ref + installing (one locked transaction)"
 txn_rc=0
 python3 - "$DIR" "$gd" "$target" "$precheck" "$channel" "$@" <<'TXNPY' || txn_rc=$?
-import fcntl, os, re, subprocess, sys, time
+import fcntl, os, re, stat, subprocess, sys, time
 
 root, gdir, target, precheck, channel = (sys.argv[1], sys.argv[2], sys.argv[3],
                                           sys.argv[4], sys.argv[5])
@@ -293,11 +293,14 @@ def publish_line(full):
 
 latch_exists = True
 try:
+    if not stat.S_ISREG(os.stat(latch).st_mode):
+        sys.exit(3)                          # a FIFO/device blocks open() forever — unknown, refuse
     rawlines = [ln.strip() for ln in open(latch).read().splitlines() if ln.strip()]
 except FileNotFoundError:
     rawlines, latch_exists = [], False
-except OSError:
-    sys.exit(3)                              # an EXISTING record we cannot read is UNKNOWN, never absent
+except (OSError, ValueError):
+    sys.exit(3)                              # an EXISTING record we cannot read — or decode — is
+#                                              UNKNOWN, never absent (the r30 verification)
 # STRICT GRAMMAR (the v1.3.9 audit): 1-2 lines of "sha8" / "sha8 stable|dev", or the exact
 # quarantine form — an EXISTING empty or malformed latch is unknown: heal by hand, never moot
 if latch_exists and (not rawlines or (

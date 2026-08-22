@@ -933,6 +933,47 @@ $t8 stable" ]                              # the new arm carries the MERGED pend
     [ "$(cat "$gd/romp-install-failed")" = "zzzzzzzz" ]
 }
 
+@test "bootstrap.sh: an UNDECODABLE latch refuses in both readers, never a raw traceback" {
+    # the r30 verification: non-UTF-8 latch bytes raised UnicodeDecodeError straight through
+    # the gate (a traceback exit, not the designed refusal) and TXNPY alike
+    sed -n "/<<'GATEPY'/,/^GATEPY\$/p" "$REPO_ROOT/bin/romp-serve" | sed '1d;$d' > "$TEST_DIR/gate.py"
+    sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    target="$(git -C "$root" rev-parse HEAD)"
+    printf '\xff\xfe garbage \x80' > "$gd/romp-install-failed"
+    run python3 "$TEST_DIR/gate.py" "$root"
+    [ "$status" -eq 70 ]
+    [[ "$output" != *Traceback* ]]
+    run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$target" "-" "stable"
+    [ "$status" -eq 3 ]
+    [[ "$output" != *Traceback* ]]
+}
+
+@test "bootstrap.sh: a FIFO latch refuses in both readers WITHOUT blocking" {
+    # the r30 verification: open() on a writerless FIFO blocks forever — the gate would hang
+    # the boot, TXNPY would hang the update holding its lock. signal.alarm bounds the run so a
+    # revert FAILS this test instead of hanging the suite.
+    sed -n "/<<'GATEPY'/,/^GATEPY\$/p" "$REPO_ROOT/bin/romp-serve" | sed '1d;$d' > "$TEST_DIR/gate.py"
+    sed -n "/<<'TXNPY'/,/^TXNPY\$/p" "$REPO_ROOT/bootstrap.sh" | sed '1d;$d' > "$TEST_DIR/txn.py"
+    root="$TEST_DIR/clone"; mkdir -p "$root"
+    git -C "$root" init -q -b main .
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    git -C "$root" add -A
+    git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+    gd="$(git -C "$root" rev-parse --absolute-git-dir)"
+    target="$(git -C "$root" rev-parse HEAD)"
+    mkfifo "$gd/romp-install-failed"
+    run python3 -c "import signal, sys, runpy; signal.alarm(10); sys.argv = ['gate.py', '$root']; runpy.run_path('$TEST_DIR/gate.py')"
+    [ "$status" -eq 70 ]
+    run python3 -c "import signal, sys, runpy; signal.alarm(10); sys.argv = ['txn.py', '$root', '$gd', '$target', '-', 'stable']; runpy.run_path('$TEST_DIR/txn.py')"
+    [ "$status" -eq 3 ]
+}
+
 @test "bootstrap.sh: a totally-failed quarantine write exits 13 with the ARMED latch intact" {
     # the fs degrades AFTER the arm: the marker publish fails, the atomic stuck write fails, and
     # the unbuffered pwrite fails too — the transaction must exit 13 (saying the quarantine could

@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from types import SimpleNamespace
@@ -1085,6 +1086,72 @@ class RaisingRegistryTransactions(unittest.TestCase):
                              "without it the registry alone holds the new name and applies the "
                              "'failed' rename at the next restart")
 
+    def test_a_truncating_names_write_in_rename_is_restored(self):
+        # the r30 mutant hunt: the chmod-0444 fixture fails AT OPEN without truncating, so
+        # deleting the bytes-restore stayed green — this drives the ENOSPC shape the fix names
+        # (write_text truncates, THEN fails)
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            be = cb.CodexBackend(td, client_factory=lambda: None)
+            sid = be.spawn("webby", "/tmp")
+            nf = os.path.join(td, "names", sid)
+            old_line = open(nf).read()
+
+            def truncating_write(s2, bg="", fg=""):
+                open(nf, "w").close()              # the open('w') truncation
+                raise OSError(28, "No space left on device")
+            with mock.patch.object(be, "_write_name", side_effect=truncating_write):
+                with self.assertRaises(OSError):
+                    be.rename(sid, "newname")
+            self.assertEqual(open(nf).read(), old_line,
+                             "the compensation restores the truncated identity line")
+            self.assertEqual(be._session(sid).name, "webby")
+
+    def test_a_failed_rename_of_an_absent_names_file_stays_unpublished(self):
+        # the r30 verification: with no file to snapshot, _write_name CREATED a partial file
+        # holding the NEW name — the failed rename stayed published, silently
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            be = cb.CodexBackend(td, client_factory=lambda: None)
+            sid = be.spawn("webby", "/tmp")
+            nf = os.path.join(td, "names", sid)
+            os.unlink(nf)                          # a legacy row predating the names write
+
+            def partial_write(s2, bg="", fg=""):
+                with open(nf, "w") as f:
+                    f.write("newname\t")           # partial line lands, then the write dies
+                raise OSError(28, "No space left on device")
+            with mock.patch.object(be, "_write_name", side_effect=partial_write):
+                with self.assertRaises(OSError):
+                    be.rename(sid, "newname")
+            self.assertFalse(os.path.exists(nf),
+                             "the partial NEW-name file is removed — a failed rename must not "
+                             "stay published")
+
+    def test_a_names_write_failure_after_thread_start_is_restored_not_fatal(self):
+        # the r30 verification: _prepare_thread's unguarded names write truncated the identity
+        # file permanently — no later path rewrites it (resume skips the create branch)
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            fake = FakeClient()
+            be = cb.CodexBackend(td, client_factory=lambda: fake)
+            sid = be.spawn("webby", "/tmp")
+            s = be._session(sid)
+            nf = os.path.join(td, "names", sid)
+            old_line = open(nf).read()
+            s.tid = "pending-%s" % sid[:8]         # force the create path
+            s.loaded = False
+
+            def truncating_write(s2, bg="", fg=""):
+                open(nf, "w").close()
+                raise OSError(28, "No space left on device")
+            with mock.patch.object(be, "_write_name", side_effect=truncating_write):
+                ok = be._prepare_thread(s, fake)
+            self.assertTrue(ok, "the thread is healthy — the turn proceeds")
+            self.assertEqual(open(nf).read(), old_line,
+                             "the truncation cannot outlive the failure")
+            self.assertTrue(s.loaded)
+
     def test_a_raising_tid_save_rolls_the_thread_flip_back(self):
         # the r29 verification: with the real tid only in memory, every retry took the resume
         # path and never re-saved it — the next restart loaded 'pending-…' and silently started
@@ -1097,12 +1164,21 @@ class RaisingRegistryTransactions(unittest.TestCase):
             s = be._session(sid)
             s.tid = "pending-%s" % sid[:8]         # force the create path
             s.loaded = False
+            prior_model = s.model
+
+            class OtherModel(type(fake)):
+                def thread_start(self2, params):
+                    resp = super().thread_start(params)
+                    resp.model = "gpt-other"       # a DIFFERENT answer, so the model half of
+                    return resp                    # the rollback is observable (the r30 hunt)
+            fake2 = OtherModel()
             self._corrupt(td)
             with self.assertRaises(RuntimeError):
-                be._prepare_thread(s, fake)
+                be._prepare_thread(s, fake2)
             self.assertTrue(s.tid.startswith("pending-"),
                             "the real tid is never published to memory alone")
             self.assertFalse(s.loaded)
+            self.assertEqual(s.model, prior_model, "all THREE rolled-back fields, not two")
 
     def test_a_raising_registry_thread_start_failure_spawn_leaves_no_phantom(self):
         import tempfile
