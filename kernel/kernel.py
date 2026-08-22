@@ -822,7 +822,8 @@ def _set_palette(name):
         return False
     new_bg, new_fg = pal.colors(name), pal.fgs(name)
     try:
-        sids = [f.name for f in NAMES.iterdir() if f.is_file()]
+        sids = [f.name for f in NAMES.iterdir()
+                if f.is_file() and not f.name.endswith(".tmp")]   # never a writer's staging file
     except OSError:
         sids = []
     for sid in sids:
@@ -2987,8 +2988,17 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
                                % (r.stderr or r.stdout or "").strip()[-200:])
                 _MAIN_DRIFT[0] = ""
                 return
-            head2 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(ROOT),
-                                   capture_output=True, text=True, timeout=10).stdout.strip()
+            hr = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(ROOT),
+                                 capture_output=True, text=True, timeout=10)
+            head2 = (hr.stdout or "").strip()
+            if hr.returncode != 0 or not head2:
+                # an UNREADABLE head is unknown, not "not landed": disarming here erased the
+                # failed-install protection when the move HAD landed (the r32 verification) —
+                # the latch stays armed; the boot heal settles it
+                _converge_note("main moved at origin, but HEAD cannot be read after the move — "
+                               "the install intent stays armed; the next update settles it.")
+                _MAIN_DRIFT[0] = ""
+                return
             if head2 != tip:
                 # merge --ff-only exits 0 WITHOUT moving when HEAD already contains tip (a seam
                 # commit landing after ff2): install would then run at C while the latch names
@@ -3192,8 +3202,13 @@ def _migrate_channel():
     try:
         old = jd.STATE / "update-channel"
         try:
-            v_state = old.read_text().strip()
-        except OSError:
+            if not stat.S_ISREG(os.stat(old).st_mode):
+                v_state = ""                          # a FIFO here hung every kernel BOOT (the
+            #                                           r32 verification, executed); the unlink
+            #                                           below still consumes the plant
+            else:
+                v_state = old.read_text().strip()
+        except (OSError, UnicodeDecodeError):
             v_state = ""
         have = subprocess.run(["git", "-C", str(ROOT), "config", "--get", "romp.updateChannel"],
                               capture_output=True, text=True, timeout=10)
@@ -11095,6 +11110,10 @@ def _update_remote(host):
         '    if len(t)<2 or t[1] not in ("stable","dev"):\n'
         "        return True\n"
         "    try:\n"
+        "        try:\n"
+        '            os.unlink(mk+".pub")\n'
+        "        except FileNotFoundError:\n"
+        "            pass\n"
         '        pfd=os.open(mk+".pub",os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o644)\n'
         "        try:\n"
         '            if os.write(pfd,(t[1]+"\\n").encode())!=len(t[1])+1:\n'
@@ -11160,6 +11179,10 @@ def _update_remote(host):
         '    body=sha8+"\\n"+carry\n'
         "else:\n"
         "    body=sha8\n"
+        "try:\n"
+        "    os.unlink(tmp)\n"
+        "except FileNotFoundError:\n"
+        "    pass\n"
         'tfd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o644)\n'
         "try:\n"
         '    if os.write(tfd,body.encode())!=len(body.encode()):\n'
@@ -11169,6 +11192,26 @@ def _update_remote(host):
         "os.replace(tmp,lp)\n"
         'if subprocess.run(["git","-C",r,"merge","--ff-only",target]).returncode:\n'
         "    sys.exit(6)\n"
+        'h=subprocess.run(["git","-C",r,"rev-parse","HEAD"],capture_output=True,text=True)\n'
+        'hs=(h.stdout or "").strip()\n'
+        "if h.returncode or not hs:\n"
+        "    sys.exit(16)\n"
+        "if hs!=target:\n"
+        "    if carry:\n"
+        "        try:\n"
+        "            os.unlink(tmp)\n"
+        "        except FileNotFoundError:\n"
+        "            pass\n"
+        '        cfd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o644)\n'
+        "        try:\n"
+        '            if os.write(cfd,carry.encode())!=len(carry.encode()):\n'
+        '                raise OSError("short restore write")\n'
+        "        finally:\n"
+        "            os.close(cfd)\n"
+        "        os.replace(tmp,lp)\n"
+        "    else:\n"
+        "        os.remove(lp)\n"
+        "    sys.exit(15)\n"
         'if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
         "    sys.exit(4)\n"
         "if not pub_line(pick_pub(body.splitlines()[0],body.splitlines())):\n"
@@ -11180,6 +11223,8 @@ def _update_remote(host):
         'if [ "$RRC" = 8 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYNOW; exit 0; fi; '
         'if [ "$RRC" = 9 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERR; exit 0; fi; '
         'if [ "$RRC" = 10 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo LATCHSTUCK; exit 0; fi; '
+        'if [ "$RRC" = 16 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo HEADUNKNOWN; exit 0; fi; '
+        'if [ "$RRC" = 15 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo NOTLANDED; exit 0; fi; '
         'if [ "$RRC" = 14 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo CHANNELUNKNOWN; exit 0; fi; '
         'if [ "$RRC" = 13 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STABLENOW; exit 0; fi; '
         'if [ "$RRC" = 12 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo PENDINGSTABLE; exit 0; fi; '
@@ -11211,7 +11256,7 @@ def _update_remote(host):
         'echo "SYNCED:$NEW"'
     ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, lfull, _P2P_REF, _P2P_REF,
          _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
-         _P2P_REF, kport)
+         _P2P_REF, _P2P_REF, _P2P_REF, kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -11256,6 +11301,12 @@ def _update_remote(host):
         return False, ("pushed, but %s's install latch names commits its HEAD doesn't match — an "
                        "update died there mid-move from a broken state; heal it by hand on that "
                        "machine (run install.sh, then remove the latch)" % host)
+    if tag == "NOTLANDED":
+        return False, ("the remote checkout moved while updating — the push did not land on the "
+                       "validated commit; nothing installed")
+    if tag == "HEADUNKNOWN":
+        return False, ("pushed and merged, but the remote's HEAD cannot be read — its install "
+                       "latch stays armed; its boot heal settles it")
     if tag == "CHANNELUNKNOWN":
         return False, ("the remote checkout's update-channel marker exists but cannot be read — "
                        "refusing to push unsigned commits onto an unknown channel; fix the marker "
@@ -11457,8 +11508,13 @@ def _pull_remote(host, expected_sha=None):
                 _set_install_failed(carry)         # HEAD did not move; the carried prior returns
                 return False, ("fast-forward failed: %s"
                                % ((m.stderr or m.stdout or "").strip()[:160] or "unknown"))
-            head2 = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
-                                   capture_output=True, text=True, timeout=10).stdout.strip()
+            hr = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                                 capture_output=True, text=True, timeout=10)
+            head2 = (hr.stdout or "").strip()
+            if hr.returncode != 0 or not head2:
+                # unknown is not "not landed" (the r32 verification): the latch stays armed
+                return False, ("pulled and merged, but HEAD cannot be read — the install latch "
+                               "stays armed; the boot heal settles it")
             if head2 != fetched_sha:
                 # a no-op ff (HEAD already contained the target via a seam commit) must not run
                 # install labeled with a sha HEAD is not on (the r31 verification)
@@ -12446,6 +12502,8 @@ def _death_boot_pass(now=None):
         sys.stderr.write("death-boot: liveness probe failed — tmux sids skipped this boot\n")
     n = 0
     for f in sorted(jd.NAMES.iterdir()):
+        if f.name.endswith(".tmp"):
+            continue                                  # a writer's staging file, never a session
         sid = f.name
         reg = jd.SDKDIR / (sid + ".json")
         if reg.exists():
@@ -14200,6 +14258,8 @@ def _name_color_by_name(name):
     sid). Scans the names registry. None if not found."""
     try:
         for f in NAMES.iterdir():
+            if f.name.endswith(".tmp"):
+                continue                              # a writer's staging file, never a session
             parts = f.read_text().rstrip("\n").split("\t")
             if parts and parts[0] == name and len(parts) > 2 and parts[2].startswith("#"):
                 return {"bg": parts[2], "fg": "#ffffff"}
@@ -15851,7 +15911,9 @@ def _git_head_file(cwd):
                 if not os.path.isabs(gd):
                     gd = os.path.normpath(os.path.join(cwd, gd))
                 hp = os.path.join(gd, "HEAD")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # one session cwd whose .git file holds crash residue aborted the WHOLE push cycle for
+        # every session, every 0.5-3s, forever (the r32 verification, executed)
         hp = ""
     if len(_head_path_cache) > 512:                  # bounded, like _tree_cache
         _head_path_cache.clear()
@@ -15873,7 +15935,7 @@ def _git_branch(cwd):
         hp = _git_head_file(cwd)
         if hp:
             mt = os.path.getmtime(hp)
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         pass
     hit = _branch_cache.get(cwd)
     if hit is not None and mt is not None and hit[1] == mt:
@@ -21960,7 +22022,7 @@ def _repo_file_index(cwd):
                     subs.append((e.name, e.stat().st_mtime))
         key = ((os.path.getmtime(os.path.join(os.path.dirname(gi), "index")) if gi else None),
                os.path.getmtime(tree), tuple(sorted(subs)))
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         key = None
     hit = _repo_index_cache.get(cwd)
     if hit is not None and key is not None and hit[0] == key:

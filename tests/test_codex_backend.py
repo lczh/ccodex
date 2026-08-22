@@ -1164,13 +1164,18 @@ class RaisingRegistryTransactions(unittest.TestCase):
             s = be._session(sid)
             nf = os.path.join(td, "names", sid)
             with open(nf, "wb") as f:
-                f.write(b"\xff\xfe torn residue \x80")
+                # tab-shaped residue: a mutant that decodes the corrupt parts leniently would
+                # CARRY the bad bg forward (the r33 mutant hunt) — exact-equality catches it
+                f.write(b"webby\t/tmp\t\xff\xfe\t\x80fg")
             s.tid = "pending-%s" % sid[:8]         # force the create path
             s.loaded = False
             ok = be._prepare_thread(s, fake)
             self.assertTrue(ok)
-            self.assertIn("webby", open(nf).read(),
-                          "the corrupt residue is HEALED by the whole-file rewrite")
+            healed = open(nf, "rb").read()
+            self.assertEqual(healed, b"webby\t/tmp\t\t\n",
+                             "healed means CLEAN and WHOLE — a heal that decoded the corrupt "
+                             "parts leniently carried the bad colours forward, re-arming the "
+                             "landmine (the r32/r33 mutant hunts)")
 
     def test_the_names_write_is_atomic(self):
         # the r31 verification: the in-place write_text was torn-readable mid-write and its
@@ -1179,6 +1184,27 @@ class RaisingRegistryTransactions(unittest.TestCase):
         src = inspect.getsource(cb.CodexBackend._write_name)
         self.assertIn("tmp.write_text", src, "the payload lands on a TMP file first")
         self.assertIn("os.replace", src, "and moves into place atomically")
+
+    def test_the_names_staging_file_never_leaks(self):
+        # the r32 verification: a failing replace left names/<sid>.tmp behind, and NAMES
+        # consumers read the stray as a phantom session forever
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            be = cb.CodexBackend(td, client_factory=lambda: None)
+            sid = be.spawn("webby", "/tmp")
+            s = be._session(sid)
+            names_dir = os.path.join(td, "names")
+            os.unlink(os.path.join(names_dir, sid))
+            os.mkdir(os.path.join(names_dir, sid))   # os.replace onto a non-empty dir raises
+            os.mkdir(os.path.join(names_dir, sid, "x"))
+            try:
+                with self.assertRaises(OSError):
+                    be._write_name(s)
+            finally:
+                os.rmdir(os.path.join(names_dir, sid, "x"))
+                os.rmdir(os.path.join(names_dir, sid))
+            self.assertEqual([n for n in os.listdir(names_dir) if n.endswith(".tmp")], [],
+                             "the staging file is unlinked on every path")
 
     def test_an_unpublishable_name_after_thread_start_says_so(self):
         # the r31 verification: the no-prior-file leg logged "was restored" when the partial

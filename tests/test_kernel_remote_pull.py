@@ -169,6 +169,24 @@ class PullRemote(unittest.TestCase):
         self.assertFalse(any("install.sh" in str(a) for c in calls for a in c),
                          "nothing installed at the seam commit")
 
+    def test_an_unreadable_head_after_the_pull_move_keeps_the_latch(self):
+        # the r32 verification: unknown is not "not landed" — disarming on an unreadable HEAD
+        # erased the protection when the move HAD landed
+        self._wire()
+        real = km.subprocess.run
+
+        def head_unreadable(argv, **kw):
+            if argv[0] == "git" and "rev-parse" in argv and "FETCH_HEAD" not in argv \
+                    and not str(argv[-1]).endswith("^{commit}") and self.merged["v"]:
+                return _R(rc=1, out="")
+            return real(argv, **kw)
+        km.subprocess.run = head_unreadable
+        ok, detail = km._pull_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("HEAD cannot be read", detail)
+        self.assertEqual(km._install_failed_sha(), "bbbbbbbb",
+                         "the latch STAYS armed — the boot heal settles it")
+
     def test_no_host_is_a_no_op(self):
         self.assertEqual(km._pull_remote(""), (False, "no host"))
 

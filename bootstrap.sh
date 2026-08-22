@@ -283,6 +283,10 @@ def publish_line(full):
         return True
     mk = os.path.join(gdir, "romp-update-channel")
     try:
+        try:
+            os.unlink(mk + ".pub")               # a planted FIFO at the fixed staging name
+        except FileNotFoundError:                # blocks open() under the lock (the r32
+            pass                                 # verification)
         with open(mk + ".pub", "w") as pf:
             pf.write(toks[1] + "\n")
         os.replace(mk + ".pub", mk)

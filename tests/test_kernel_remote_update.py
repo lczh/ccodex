@@ -391,6 +391,65 @@ class UpdateRemote(unittest.TestCase):
             self.assertNotIn("STABLENOW", a.stdout)
             self.assertTrue(ops.exists(), "a legacy config-dev machine still receives the push")
 
+    def test_the_wrapper_verifies_the_move_landed_before_install(self):
+        # the r32 verification's P1: the push wrapper was the ONE mover without the landed
+        # verify — merge --ff-only no-ops at rc0 when a seam commit contains the target, install
+        # ran at the seam under the target's latch, and the moot rule then ERASED the
+        # failed-install protection
+        import tempfile
+        from pathlib import Path
+        calls = self._wire(apply_out="SYNCED:abcdef0")
+        km._update_remote("TESTHOST")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        with tempfile.TemporaryDirectory() as td:
+            fix = Path(td) / "romp"
+            gd = fix / ".git"
+            gd.mkdir(parents=True)
+            (gd / "romp-update-channel").write_text("dev\n")
+            fakebin = Path(td) / "bin"
+            fakebin.mkdir()
+            ops = Path(td) / "ops.log"
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' rev-parse HEAD'*) echo cccccccccccccccccccccccccccccccccccccccc;;\n"
+                "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
+                "esac\nexit 0\n" % (gd, ops))          # HEAD sits on a SEAM commit post-merge
+            (fakebin / "git").chmod(0o755)
+            (fix / "install.sh").write_text("#!/bin/sh\necho INSTALLED >> '%s'\nexit 0\n" % ops)
+            (fix / "install.sh").chmod(0o755)
+            env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
+            apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("NOTLANDED", a.stdout)
+            self.assertFalse((gd / "romp-install-failed").exists(),
+                             "no carry: the armed latch is disarmed — it must not name a sha "
+                             "HEAD is not on")
+            self.assertNotIn("INSTALLED", ops.read_text() if ops.exists() else "",
+                             "nothing installs at the seam commit")
+            # with a CARRIED prior (a HEAD-matching record whose heal fails), the not-landed
+            # refusal restores it verbatim
+            (gd / "romp-install-failed").write_text("deadbee2 dev")
+            (fix / "install.sh").write_text("#!/bin/sh\nexit 1\n")   # the carried heal fails
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("NOTLANDED", a.stdout)
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2 dev",
+                             "the carried record survives the refusal verbatim")
+            (gd / "romp-install-failed").unlink()
+            # an UNREADABLE head is unknown, not "not landed": the latch stays ARMED
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' rev-parse HEAD'*) exit 1;;\n"
+                "esac\nexit 0\n" % gd)
+            (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("HEADUNKNOWN", a.stdout)
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2",
+                             "unknown beats erased: the armed latch stays for the boot heal")
+
     def test_a_settle_heal_that_publishes_stable_refuses_the_unsigned_reset(self):
         # the v1.3.12 audit's P1, remote edition: the heal published stable, removed the latch,
         # and the wrapper still moved HEAD and ran the peer installer — executed: it now stops
@@ -503,7 +562,10 @@ class UpdateRemote(unittest.TestCase):
             apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
             (gd / "romp-install-failed").write_text("deadbee2 stable")
             (gd / "romp-update-channel").write_text("dev\n")
-            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            os.mkfifo(str(gd / "romp-update-channel.pub"))   # a planted FIFO at the FIXED
+            #                                                  staging name blocked the publish
+            #                                                  open() (the r32 verification)
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=30)
             # the fixture has no bin/romp-serve, so a COMPLETED transaction reports NOLAUNCH;
             # the refusal verdicts are what must be absent
             self.assertNotIn("LATCHSTUCK", a.stdout)
@@ -682,6 +744,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' merge-base '*) exit 0;;\n"
                 "  *' rev-parse --short=8 HEAD'*) echo 01dbd11d;;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "esac\nexit 0\n" % gd)
             (gd / "romp-install-failed").write_text("01dbd11d")
             (fix / "install.sh").write_text("#!/bin/sh\nexit 1\n")

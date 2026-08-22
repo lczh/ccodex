@@ -286,7 +286,7 @@ class ConvergeFunctional(unittest.TestCase):
 
     def _run(self, kind="pull", target=None, fail=(), tip=None, channel=None, restart_fails=False,
              dirty_second_status=False, second_status_rc_fails=False, diverge_second_ancestry=False,
-             post_move_head=None):
+             post_move_head=None, post_move_head_rc_fails=False):
         """Drive _run_main_update with every subprocess scripted. `fail` names steps that exit 1."""
         import subprocess as sp
         target = self.FULL if target is None else target
@@ -306,6 +306,9 @@ class ConvergeFunctional(unittest.TestCase):
             if step == "rev-parse" and post_move_head is not None \
                     and any(s == "checkout" for s, _ in calls):
                 out = post_move_head + "\n"           # HEAD after the (no-op) move
+            if step == "rev-parse" and post_move_head_rc_fails \
+                    and any(s == "checkout" for s, _ in calls):
+                rc, out = 1, ""                        # HEAD unreadable after the move
             if step == "status" and dirty_second_status:
                 n = sum(1 for s, _ in calls if s == "status")
                 out = "" if n == 1 else " M raced-edit.py\n"   # clean at entry, dirty post-settle
@@ -435,21 +438,23 @@ class ConvergeFunctional(unittest.TestCase):
         # the r31 verification: merge --ff-only rc0 does NOT imply HEAD == tip — a seam commit
         # containing tip made install run at C under tip's latch, and the restart leg then
         # cleared that latch as intent-only, restarting everyone onto the failed build
-        import subprocess as sp
-        state = {"moved": False}
-
-        def run_with_stuck_head(argv, **kw):
-            if "merge" in argv and "merge-base" not in argv:
-                state["moved"] = True
-            if "rev-parse" in argv and state["moved"]:
-                return sp.CompletedProcess(argv, 0, stdout="c" * 40 + "\n", stderr="")
-            return None
         steps, calls = self._run(post_move_head="c" * 40)
         self.assertNotIn("install", steps, "nothing installs at the seam commit")
         self.assertTrue(any("did not land on the offered commit" in n for n in self.notices),
                         self.notices)
         self.assertEqual(km._install_failed_sha(), "",
                          "disarmed: the latch must not name a sha HEAD is not on")
+        self.assertEqual(self.requests, [])
+
+    def test_an_unreadable_head_after_the_move_keeps_the_latch_armed(self):
+        # the r32 verification: disarming on an UNREADABLE head erased the failed-install
+        # protection when the move HAD landed — unknown is not "not landed"
+        steps, _ = self._run(post_move_head_rc_fails=True)
+        self.assertNotIn("install", steps, "nothing installs on an unknown HEAD")
+        self.assertTrue(any("HEAD cannot be read after the move" in n for n in self.notices),
+                        self.notices)
+        self.assertEqual(km._install_failed_sha(), self.FULL[:8],
+                         "the latch STAYS armed — the boot heal settles it")
         self.assertEqual(self.requests, [])
 
     def test_the_stable_channel_stops_the_pull_before_any_subprocess(self):
@@ -1279,13 +1284,16 @@ class IntentPublish(unittest.TestCase):
             (gd / "romp-install-failed").unlink()
             os.mkfifo(str(gd / "romp-install-failed"))
             import signal
-            signal.alarm(10)                       # a revert HANGS here — fail, don't wedge CI
-            try:
+            prev = signal.signal(signal.SIGALRM,
+                                 lambda *a: (_ for _ in ()).throw(TimeoutError("hung")))
+            signal.alarm(10)                       # a revert HANGS here — RAISE, so the test
+            try:                                   # fails instead of SIGALRM killing pytest
                 with mock.patch.object(km, "_update_git_dir", return_value=gd):
                     self.assertIsNone(km._install_latch_lines(),
                                       "a FIFO latch is unknown, not an eternal hang")
             finally:
                 signal.alarm(0)
+                signal.signal(signal.SIGALRM, prev)
 
     def test_the_sibling_latch_readers_never_hang_on_a_fifo(self):
         # the r31 verification's P2: the gate landed on _install_latch_lines but not its three
@@ -1296,7 +1304,9 @@ class IntentPublish(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             gd = Path(td)
             os.mkfifo(str(gd / "romp-install-failed"))
-            signal.alarm(10)                       # a revert HANGS — fail, don't wedge CI
+            prev = signal.signal(signal.SIGALRM,
+                                 lambda *a: (_ for _ in ()).throw(TimeoutError("hung")))
+            signal.alarm(10)                       # a revert HANGS — RAISE, don't kill pytest
             try:
                 with mock.patch.object(km, "_update_git_dir", return_value=gd):
                     self.assertEqual(km._install_failed_sha(), "",
@@ -1305,6 +1315,7 @@ class IntentPublish(unittest.TestCase):
                                      "unpublishable — decided without opening the FIFO")
             finally:
                 signal.alarm(0)
+                signal.signal(signal.SIGALRM, prev)
 
     def test_a_latch_swapped_to_a_fifo_during_the_heal_refuses_the_settle(self):
         # same P2, the settle's re-read leg: the latch is regular at the first read, a FIFO by
@@ -1320,6 +1331,8 @@ class IntentPublish(unittest.TestCase):
                 latch.unlink()
                 os.mkfifo(str(latch))
                 return False
+            prev = signal.signal(signal.SIGALRM,
+                                 lambda *a: (_ for _ in ()).throw(TimeoutError("hung")))
             signal.alarm(10)
             try:
                 with mock.patch.object(km, "_update_git_dir", return_value=gd):
@@ -1333,6 +1346,7 @@ class IntentPublish(unittest.TestCase):
                                 km.os.close(fd)
             finally:
                 signal.alarm(0)
+                signal.signal(signal.SIGALRM, prev)
         self.assertIn("cannot be re-read", settle)
         self.assertEqual(carry, "")
 
@@ -1345,6 +1359,8 @@ class IntentPublish(unittest.TestCase):
             fix = Path(td) / "checkout"
             fix.mkdir()
             os.mkfifo(str(fix / ".git"))
+            prev = signal.signal(signal.SIGALRM,
+                                 lambda *a: (_ for _ in ()).throw(TimeoutError("hung")))
             signal.alarm(10)
             try:
                 with mock.patch.object(km, "ROOT", fix):
@@ -1352,6 +1368,53 @@ class IntentPublish(unittest.TestCase):
                                       "a non-regular .git file is unresolvable, not a hang")
             finally:
                 signal.alarm(0)
+                signal.signal(signal.SIGALRM, prev)
+
+    def test_a_corrupt_dot_git_file_never_aborts_the_branch_derivation(self):
+        # the r32 verification's P2: one session cwd whose .git file held non-UTF8 crash residue
+        # raised UnicodeDecodeError out of _git_branch inside _push's single try — chat, feed
+        # AND timeline updates stopped for ALL sessions, every cycle, forever
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            cwd = Path(td) / "work"
+            cwd.mkdir()
+            (cwd / ".git").write_bytes(b"gitdir: somewhere \xff\xfe torn")
+            self.assertEqual(km._git_branch(str(cwd)), "",
+                             "corrupt residue reads as no-repo, never a raise")
+
+    def test_a_fifo_legacy_channel_marker_never_hangs_the_boot_migration(self):
+        # the r32 verification's P2: _migrate_channel read the legacy STATE-dir marker ungated —
+        # a FIFO there hung every kernel BOOT
+        # SUBPROCESS-bounded: migrate wraps everything in a broad except, so an in-process
+        # alarm is swallowed as "migration failed" — only a wall-clock bound proves no hang
+        import subprocess as sp
+        import sys as _sys
+        code = (
+            "import os, shutil, tempfile\n"
+            "from pathlib import Path\n"
+            "from unittest import mock\n"
+            "from importlib.machinery import SourceFileLoader\n"
+            "st = tempfile.mkdtemp()\n"
+            "os.environ.setdefault('XDG_STATE_HOME', st)\n"
+            "km = SourceFileLoader('km_migfifo', %r).load_module()\n"
+            "td = tempfile.mkdtemp()\n"
+            "gd = Path(td) / 'gitdir'; gd.mkdir()\n"
+            "legacy = Path(td) / 'state'; legacy.mkdir()\n"
+            "os.mkfifo(str(legacy / 'update-channel'))\n"
+            "try:\n"
+            "    with mock.patch.object(km, '_update_git_dir', return_value=gd):\n"
+            "        with mock.patch.object(km.jd, 'STATE', legacy):\n"
+            "            with mock.patch.object(km, '_sync_notice', lambda *a, **k: None):\n"
+            "                km._migrate_channel()\n"
+            "    print('NOHANG', (gd / 'romp-update-channel').exists())\n"
+            "finally:\n"
+            "    shutil.rmtree(td, ignore_errors=True)\n"
+            "    shutil.rmtree(st, ignore_errors=True)\n"
+        ) % (str(km.__file__),)
+        r = sp.run([_sys.executable, "-c", code], capture_output=True, text=True, timeout=20)
+        self.assertIn("NOHANG False", r.stdout,
+                      "the boot migration decided without opening the FIFO, and invented no "
+                      "channel: %s" % (r.stderr or r.stdout))
 
     def test_a_legacy_statedir_latch_still_moves_forward_after_a_failed_heal(self):
         # the r29 verification's P2 REGRESSION: the fail-closed re-read caught bare OSError —
