@@ -806,6 +806,8 @@ class CodexBackend:
             with s.lock:
                 self._put_session(s)
                 self._save_registry(s, create=True)
+            self._write_name(s)            # a LIVE launch-error row without a shared name let a
+            #                                retry mint a duplicate live "web" (the v1.3.12 audit)
             return sid
         try:
             resp = c.thread_start({"cwd": cwd, "approvalPolicy": APPROVAL_POLICY,
@@ -819,6 +821,7 @@ class CodexBackend:
             with s.lock:
                 self._put_session(s)
                 self._save_registry(s, create=True)
+            self._write_name(s)            # same rule as the client-missing branch above
             return sid
         s = _Session(sid, tid, name, cwd, model=model, color=bg)
         s.loaded = True

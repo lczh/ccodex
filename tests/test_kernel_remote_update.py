@@ -134,7 +134,7 @@ class UpdateRemote(unittest.TestCase):
             cmd = argv[-1]                                                     # ssh: dispatch on the remote command
             if "for d in" in cmd:
                 return _R(out=disc_out)
-            if "merge-base" in cmd or "reset --hard" in cmd:
+            if "merge-base" in cmd or "merge --ff-only" in cmd:
                 return _R(out=apply_out)
             return _R()
         km.subprocess.run = fake
@@ -204,8 +204,8 @@ class UpdateRemote(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("state is unknown", detail)
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
-        self.assertIn("STATERR", apply.partition("reset --hard")[0],
-                      "the rc check sits before the reset, same shell")
+        self.assertIn("STATERR", apply.partition("merge --ff-only")[0],
+                      "the rc check sits before the move, same shell")
         disc = next(a[-1] for a in calls if isinstance(a[-1], str) and "for d in" in a[-1])
         self.assertIn("STATERR", disc, "the discover probe distinguishes error from clean too")
 
@@ -222,7 +222,7 @@ class UpdateRemote(unittest.TestCase):
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
         self.assertIn("install.sh", apply, "the apply transaction installs")
         self.assertIn("romp-install-failed", apply, "and arms the remote's latch before the reset")
-        self.assertLess(apply.index("romp-install-failed"), apply.index("reset"),
+        self.assertLess(apply.index("romp-install-failed"), apply.index('"merge","--ff-only"'),
                         "intent before the move, on the remote exactly as locally")
 
     def test_the_generated_shell_actually_emits_STATERR_when_status_dies(self):
@@ -262,7 +262,7 @@ class UpdateRemote(unittest.TestCase):
             self.assertIn("STATERR", a.stdout,
                           "the APPLY recheck, executed, refuses on a dead status")
             ops = log.read_text() if log.exists() else ""
-            self.assertNotIn("reset --hard", ops, "and the reset never ran")
+            self.assertNotIn("merge --ff-only", ops, "and the move never ran")
 
     def test_the_INSTALLFAIL_wrapper_executed_arms_the_latch_and_a_pass_spends_it(self):
         # string pins alone let the audited replant pass (this very file documents why); run the
@@ -303,8 +303,10 @@ class UpdateRemote(unittest.TestCase):
             # rides into the wrapper as its argv target, and the wrapper resets to that target.
             self.assertIn('"$R" %s' % ("1" * 40), apply_r,
                           "the wrapper's target argv is the pinned sha, never the mutable ref")
-            self.assertIn('"reset","--hard",target', apply_r.replace("'", '"'),
-                          "and the reset acts on exactly that target")
+            self.assertIn('"merge","--ff-only",target', apply_r.replace("'", '"'),
+                          "and the MOVE is a fast-forward that git itself refuses on conflicting "
+                          "local edits — a reset --hard erased edits saved during the prior heal "
+                          "(the v1.3.12 audit's P1)")
             # the ancestry check lives INSIDE the locked wrapper; a non-ancestor target must
             # refuse with DIVERGED, executed — make merge-base fail and rerun
             (fakebin / "git").write_text(
@@ -330,6 +332,42 @@ class UpdateRemote(unittest.TestCase):
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("DIRTYNOW", a.stdout, "the locked wrapper's own dirty check refuses")
             self.assertFalse((gd / "romp-install-failed").exists())
+
+    def test_a_settle_heal_that_publishes_stable_refuses_the_unsigned_reset(self):
+        # the v1.3.12 audit's P1, remote edition: the heal published stable, removed the latch,
+        # and the wrapper still moved HEAD and ran the peer installer — executed: it now stops
+        # with STABLENOW, the marker keeps the published choice, and nothing moves
+        import tempfile
+        from pathlib import Path
+        calls = self._wire(apply_out="SYNCED:abcdef0")
+        km._update_remote("TESTHOST")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        with tempfile.TemporaryDirectory() as td:
+            fix = Path(td) / "romp"
+            gd = fix / ".git"
+            gd.mkdir(parents=True)
+            fakebin = Path(td) / "bin"
+            fakebin.mkdir()
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge --ff-only '*) echo MOVED >> '%s/ops.log';;\n"
+                "esac\nexit 0\n" % (gd, td))
+            (fakebin / "git").chmod(0o755)
+            (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "install.sh").chmod(0o755)
+            env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
+            apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
+            (gd / "romp-install-failed").write_text("deadbee2 stable")
+            (gd / "romp-update-channel").write_text("dev\n")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("STABLENOW", a.stdout)
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "stable",
+                             "the completed switch keeps its published marker")
+            self.assertFalse((Path(td) / "ops.log").exists(),
+                             "nothing moved onto the freshly stable checkout")
 
     def test_the_wrapper_refuses_short_writes_executed(self):
         # the write-count checks had zero coverage — deleting them passed the full suite (the

@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
 
@@ -159,6 +160,54 @@ class SdkResumePreservesLastSid(unittest.TestCase):
     def test_empty_lastsid_falls_back_to_the_sid(self):
         reg = self._resume({"sid": SID, "name": "testsess", "cwd": "/tmp", "lastSid": "", "alive": False})
         self.assertEqual(reg["lastSid"], SID, "a never-relaunched session resumes from its own transcript")
+
+
+class CodexRevive(unittest.TestCase):
+    """A dead Codex session revives through CodexBackend.resume — owns() is live-only, so the
+    tmux fallback used to build `claude --resume` for it and the registry stayed dead (the
+    v1.3.12 audit's P1, real-backend probe)."""
+
+    def setUp(self):
+        self.saved = (km._sdk, km._codex, km._codex_ready, km._name_of, km._cwd_of,
+                      km._push_all, km._reveal_chat_for, km._send_to_view, km._tmux_sessions,
+                      km._commands_for_cwd)
+        self.sent, self.focused = [], []
+        km._sdk = lambda: None
+        km._name_of = lambda sid: "webby"
+        km._cwd_of = lambda sid: "/tmp"
+        km._push_all = lambda: None
+        km._commands_for_cwd = lambda cwd: None
+        km._tmux_sessions = lambda: {}
+        km._reveal_chat_for = lambda client, msg: self.focused.append(msg)
+        km._send_to_view = lambda app, msg, wid: self.sent.append(msg)
+
+    def tearDown(self):
+        (km._sdk, km._codex, km._codex_ready, km._name_of, km._cwd_of, km._push_all,
+         km._reveal_chat_for, km._send_to_view, km._tmux_sessions,
+         km._commands_for_cwd) = self.saved
+
+    def test_a_dead_codex_session_resumes_through_the_codex_backend(self):
+        cx = mock.MagicMock()
+        cx._session.return_value = object()            # the registry knows the dead row
+        cx.resume.return_value = True
+        km._codex = lambda: cx
+        km._codex_ready = lambda: True
+        km._revive_session("11111111-2222-3333-4444-555555555555", {"wid": "w1", "send": lambda m: None})
+        cx.resume.assert_called_once_with("webby", "11111111-2222-3333-4444-555555555555",
+                                          cwd="/tmp")
+        self.assertTrue(self.focused, "success focuses the asker's chat")
+        self.assertFalse(self.sent, "and no failure event fires")
+
+    def test_a_dead_codex_session_with_no_app_server_fails_loudly(self):
+        cx = mock.MagicMock()
+        cx._session.return_value = object()
+        cx._client_err = "codex app-server is not running"
+        km._codex = lambda: cx
+        km._codex_ready = lambda: False
+        km._revive_session("11111111-2222-3333-4444-555555555555", {"wid": "w1", "send": lambda m: None})
+        self.assertFalse(cx.resume.called, "nothing resumes without the app server")
+        self.assertTrue(any(m.get("type") == "reviveFailed" for m in self.sent),
+                        "the asker hears the refusal: %r" % self.sent)
 
 
 if __name__ == "__main__":

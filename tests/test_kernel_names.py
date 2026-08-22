@@ -177,6 +177,52 @@ class NameClaims(unittest.TestCase):
         self.assertTrue(any("did not take" in m for m in sent),
                         "the asker hears the refusal instead of a 90s timeout: %r" % sent)
 
+    def test_a_dead_codex_rename_reaches_the_codex_registry(self):
+        # the shared file moved while the durable Codex registry kept the old name (the v1.3.12
+        # audit's P2) — the dead-tab branch now renames the registry too
+        cx = mock.MagicMock()
+        cx._session.return_value = object()
+        set_names = []
+        with mock.patch.object(km, "_tmux_name_of", return_value=""):
+            with mock.patch.object(km, "_codex", return_value=cx):
+                with mock.patch.object(km, "_set_name", side_effect=lambda s, n2: set_names.append(n2)):
+                    out = km._rename_session("11111111-2222-3333-4444-555555555555", "webby")
+        self.assertEqual(out, "webby")
+        cx.rename.assert_called_once_with("11111111-2222-3333-4444-555555555555", "webby")
+        self.assertEqual(set_names, ["webby"])
+
+    def test_a_live_tmux_rename_writes_the_names_file_before_returning(self):
+        # the tmux hook publishes ASYNCHRONOUSLY, and the claim released before it ran — the
+        # target name was briefly claimable by a rival (the v1.3.12 audit's P2)
+        set_names = []
+        with mock.patch.object(km, "_tmux_name_of", return_value="old"):
+            with mock.patch.object(km._TMUX, "rename_by_name", return_value=True):
+                with mock.patch.object(km, "_set_name", side_effect=lambda s, n2: set_names.append(n2)):
+                    out = km._rename_session("11111111-2222-3333-4444-555555555555", "webby")
+        self.assertEqual(out, "webby")
+        self.assertEqual(set_names, ["webby"], "the names file lands synchronously")
+
+    def test_renames_are_serialized_under_one_lock(self):
+        # two interleaved renames of one sid left the registry at one name and the shared file
+        # at the other (the v1.3.12 audit's P2)
+        sent = []
+        client = {"send": sent.append}
+        be = mock.MagicMock()
+
+        def rename_asserting_serialized(sid, new):
+            self.assertTrue(km._rename_serial.locked(),
+                            "the backend write happens INSIDE the serializer")
+            return True
+        be.rename.side_effect = rename_asserting_serialized
+        with mock.patch.object(km, "_tmux_sessions", return_value={}):
+            with mock.patch.object(km, "_kernel_knows", return_value=True):
+                with mock.patch.object(km.Sessions, "backend_for", return_value=be):
+                    km._drive({"type": "renameSession",
+                               "id": "11111111-2222-3333-4444-555555555555",
+                               "name": "webby"}, client)
+        self.assertTrue(be.rename.called)
+        self.assertTrue(any('"renamed"' in m for m in sent), sent)
+
     def test_promotion_refuses_a_claimed_name(self):
         # promotion wrote names/ blindly (the adversarial review, 2026-08-21) — it now takes the
         # same reservation as create and fork

@@ -357,6 +357,49 @@ class PullRemote(unittest.TestCase):
                              for a in calls), "nothing merged across the pending choice")
         self.assertFalse(any("install.sh" in str(a) for c in calls for a in c))
 
+    def test_the_pull_refuses_after_the_settle_completes_a_stable_switch(self):
+        # the v1.3.12 audit's P1: a SUCCESSFUL settle heal publishes the pending stable and
+        # returns an empty carry — the carry gate passed and unsigned peer code installed on a
+        # freshly stable machine. The channel is re-decided post-settle, like the converge.
+        calls = self._wire()
+        state = {"settled": False}
+
+        def channel():
+            return "stable" if state["settled"] else "dev"
+
+        def settle(fd):
+            state["settled"] = True                    # the heal just published the switch
+            return "", ""
+        with mock.patch.object(km, "_update_channel", side_effect=channel):
+            with mock.patch.object(km, "_settle_prior_latch", side_effect=settle):
+                ok, detail = km._pull_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("just completed", detail)
+        self.assertFalse(any(a[0] == "git" and "merge" in a and "merge-base" not in a
+                             for a in calls), "nothing merged onto the freshly stable machine")
+        self.assertFalse(any("install.sh" in str(a) for c in calls for a in c))
+
+    def test_the_pull_refuses_a_tree_dirtied_during_the_settle(self):
+        # the v1.3.12 audit's P2: the entry clean-check is minutes stale after a long prior
+        # heal — edits saved meanwhile get the same refusal the entry gives them
+        self._wire()
+        state = {"settled": False}
+        orig = km.subprocess.run
+
+        def dirty_after_settle(argv, **kw):
+            if argv[0] == "git" and "status" in argv and state["settled"]:
+                return _R(out=" M kernel/edited-during-heal.py")
+            return orig(argv, **kw)
+
+        def settle(fd):
+            state["settled"] = True
+            return "", ""
+        km.subprocess.run = dirty_after_settle
+        with mock.patch.object(km, "_settle_prior_latch", side_effect=settle):
+            ok, detail = km._pull_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("changed while settling", detail)
+
     def test_a_downgrade_at_the_install_launch_never_spawns(self):
         # the v1.3.9 audit: the final trust check and the spawn were separate steps, and a
         # downgrade in the scheduling gap still ran the peer's install.sh. The spawn now happens

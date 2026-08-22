@@ -951,5 +951,34 @@ for i in range(20):
         self.assertTrue(be.kill(sid))   # kill's held-final drain notifies too — same reentry
 
 
+class LaunchErrorNames(unittest.TestCase):
+    """A LIVE launch-error row without a shared name let a retry mint a duplicate live session
+    under the same name (the v1.3.12 audit's P2) — both failure branches now write names/."""
+
+    def test_a_clientless_spawn_writes_its_shared_name(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            be = cb.CodexBackend(td, client_factory=lambda: None)
+            sid = be.spawn("webby", "/tmp")
+            name_file = os.path.join(td, "names", sid)
+            self.assertTrue(os.path.exists(name_file),
+                            "the launch-error session claims its name slot")
+            self.assertIn("webby", open(name_file).read())
+
+    def test_a_thread_start_failure_writes_its_shared_name(self):
+        import tempfile
+
+        class BoomClient(FakeClient):
+            def thread_start(self, params):
+                raise RuntimeError("no threads today")
+        with tempfile.TemporaryDirectory() as td:
+            fake = BoomClient()
+            be = cb.CodexBackend(td, client_factory=lambda: fake)
+            sid = be.spawn("webby", "/tmp")
+            name_file = os.path.join(td, "names", sid)
+            self.assertTrue(os.path.exists(name_file))
+            self.assertIn("webby", open(name_file).read())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

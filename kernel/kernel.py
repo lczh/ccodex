@@ -7678,7 +7678,8 @@ def _drive(msg, client):
             client["send"](json.dumps({"type": "warn", "text": _NAME_TAKEN % new}))
         else:
             try:
-                renamed = be.rename(sid, new)             # live → tmux hook / SDK reg; dead → names file
+                with _rename_serial:
+                    renamed = be.rename(sid, new)         # live → tmux hook / SDK reg; dead → names file
             except Exception as e:
                 renamed = False
                 sys.stderr.write("rename '%s': %s\n" % (sid, e))
@@ -7917,10 +7918,21 @@ def _revive_session_claimed(sid, client, name):
     be = _sdk()
     ok, detail = False, ""
     _commands_for_cwd(_cwd_of(sid))   # pre-warm the slash-command list — a revival predicts a composer (the user 2026-08-13)
+    cx = _codex()
     try:
         if be and be.owns(sid):
             ok = bool(be.resume(name, sid) and be.connect(sid))
             detail = "" if ok else "the SDK backend could not resume it (see the kernel log)"
+        elif cx is not None and cx._session(sid) is not None:
+            # a DEAD Codex session: owns() is live-only by design, so the tmux fallback used to
+            # build `claude --resume` for it — no Codex resume ever ran and the registry stayed
+            # dead (the v1.3.12 audit's P1, real-backend probe)
+            if not _codex_ready():
+                _cxbe = _codex()
+                detail = (getattr(_cxbe, "_client_err", "") or CODEX_SETUP_HINT) if _cxbe else CODEX_SETUP_HINT
+            else:
+                ok = bool(cx.resume(name, sid, cwd=_cwd_of(sid)))
+                detail = "" if ok else "the Codex backend could not resume it (see the kernel log)"
         else:
             cwd = _cwd_of(sid)
             workdir = cwd if cwd and os.path.isdir(cwd) else os.path.expanduser("~")
@@ -8558,6 +8570,11 @@ def _set_name(sid, name):
     _atomic_write(NAMES / sid, "\t".join(parts[:4]) + "\n")   # atomic publish
 
 
+_rename_serial = threading.Lock()   # two interleaved renames of one sid left the registry at
+#                                     one name and the shared file at the other (the v1.3.12
+#                                     audit's P2) — renames are rare; one lock serializes all
+
+
 def _rename_session(sid, name):
     """Apply a renameSession from the chat tab strip (the browser's host is THIS kernel — VS Code's host
     is the extension, so this path only existed there before; the browser's rename silently no-op'd).
@@ -8570,10 +8587,26 @@ def _rename_session(sid, name):
         return None
     live = _tmux_name_of(sid)
     if live:
-        if live != name and not _TMUX.rename_by_name(live, name):
-            return None                                # the rename did not LAND: never ack it
+        if live != name:
+            if not _TMUX.rename_by_name(live, name):
+                return None                            # the rename did not LAND: never ack it
+            _set_name(sid, name)                       # SYNCHRONOUS names-file write: the tmux
+            #                                            hook publishes asynchronously, and the
+            #                                            claim released before it ran — the name
+            #                                            was briefly claimable by a rival (the
+            #                                            v1.3.12 audit's P2); the hook's later
+            #                                            write is idempotent
     else:
         _set_name(sid, name)                           # dead tab → names file directly
+        cx = _codex()
+        if cx is not None and cx._session(sid) is not None:
+            try:
+                cx.rename(sid, name)                   # a dead Codex session's DURABLE registry
+                #                                        kept the old name while the shared file
+                #                                        moved (the v1.3.12 audit's P2)
+            except Exception as e:
+                sys.stderr.write("codex rename '%s': %s\n" % (sid, e))
+                return None
     return name
 
 
@@ -10990,6 +11023,9 @@ def _update_remote(host):
         "                sys.exit(12)\n"
         "        else:\n"
         "            os.remove(lp)\n"
+        '            pp=pick_pub(curline,rawlines).split()\n'
+        '            if len(pp)>1 and pp[1]=="stable":\n'
+        "                sys.exit(13)\n"
         "    elif len(lines)>1:\n"
         "        sys.exit(10)\n"
         '    elif len(lines[0])!=8 or any(c not in "0123456789abcdef" for c in lines[0]):\n'
@@ -11010,7 +11046,7 @@ def _update_remote(host):
         "finally:\n"
         "    os.close(tfd)\n"
         "os.replace(tmp,lp)\n"
-        'if subprocess.run(["git","-C",r,"reset","--hard",target]).returncode:\n'
+        'if subprocess.run(["git","-C",r,"merge","--ff-only",target]).returncode:\n'
         "    sys.exit(6)\n"
         'if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
         "    sys.exit(4)\n"
@@ -11023,6 +11059,7 @@ def _update_remote(host):
         'if [ "$RRC" = 8 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYNOW; exit 0; fi; '
         'if [ "$RRC" = 9 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERR; exit 0; fi; '
         'if [ "$RRC" = 10 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo LATCHSTUCK; exit 0; fi; '
+        'if [ "$RRC" = 13 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STABLENOW; exit 0; fi; '
         'if [ "$RRC" = 12 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo PENDINGSTABLE; exit 0; fi; '
         'if [ "$RRC" = 4 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo INSTALLFAIL; exit 0; fi; '
         'if [ "$RRC" != 0 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; fi; '
@@ -11051,7 +11088,7 @@ def _update_remote(host):
         'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null &  sleep 1; fi; '
         'echo "SYNCED:$NEW"'
     ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, lfull, _P2P_REF, _P2P_REF,
-         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
+         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -11096,6 +11133,10 @@ def _update_remote(host):
         return False, ("pushed, but %s's install latch names commits its HEAD doesn't match — an "
                        "update died there mid-move from a broken state; heal it by hand on that "
                        "machine (run install.sh, then remove the latch)" % host)
+    if tag == "STABLENOW":
+        return False, ("the remote checkout just completed a switch to the STABLE channel — it "
+                       "updates only through signed release tags now; unsigned commits were not "
+                       "pushed onto it")
     if tag == "PENDINGSTABLE":
         return False, ("a switch to the STABLE channel is still pending on the remote checkout "
                        "(its install has not passed yet) — not resetting it onto unsigned "
@@ -11236,9 +11277,28 @@ def _pull_remote(host, expected_sha=None):
         if lock_fd is None:
             return False, "another update is already running on this checkout — try again when it finishes"
         try:
+            chan_before = _update_channel()
             settle, carry = _settle_prior_latch(lock_fd)   # settled or carried, never overwritten
             if settle:
                 return False, settle
+            if _update_channel() == "stable" and chan_before != "stable":
+                # the settle just COMPLETED a pending switch-to-stable (healed and published):
+                # this machine now updates only through signed release tags, and installing
+                # unsigned peer commits one line later crossed exactly that boundary (the
+                # v1.3.12 audit's P1 — the converge re-decides post-settle; this path did not)
+                return False, ("a switch to the STABLE channel just completed on this checkout — "
+                               "it updates only through signed release tags now; unsigned peer "
+                               "commits are not pulled onto it")
+            st3 = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain",
+                                  "--untracked-files=no"],
+                                 capture_output=True, text=True, timeout=10)
+            if st3.returncode != 0 or (st3.stdout or "").strip():
+                # the entry clean-check is minutes stale by here — the settle can run the prior
+                # install.sh that long, and edits saved meanwhile deserve the same refusal the
+                # entry gives them (the v1.3.12 audit's P2; git itself still refuses conflicting
+                # edits at the merge, so this is the documented precondition catching up)
+                return False, ("this machine's tree changed while settling a prior install — "
+                               "commit or stash the new edits, then pull again")
             if len(str(carry or "").split()) > 1 and carry.split()[1] == "stable":
                 # the SAME gate the converge holds (the adversarial review, 2026-08-21: two
                 # update flows disagreed on one cell — the converge refused to cross a pending
@@ -28104,7 +28164,16 @@ class Handler(BaseHTTPRequestHandler):
         elif msg and msg.get("type") == "reviveSession" and msg.get("id"):
             # confirmRevive → "Revive": resume the dead session in the background (the kernel had
             # no handler, so the modal's Revive silently did nothing — the user 2026-06-16)
-            threading.Thread(target=_revive_session, args=(msg["id"], client), daemon=True).start()
+            try:
+                threading.Thread(target=_revive_session, args=(msg["id"], client), daemon=True).start()
+            except BaseException:
+                # a start() that raises left the asker waiting forever with only a log line
+                # (the v1.3.12 audit's P3)
+                _send_to_view("chat", {"type": "reviveFailed", "id": str(msg["id"]),
+                                       "name": _name_of(str(msg["id"])) or str(msg["id"]),
+                                       "text": "the kernel could not start a revive worker — "
+                                               "try again"}, (client or {}).get("wid") or "")
+                raise
         elif msg and msg.get("type") == "viewReadOnly" and msg.get("id"):
             _kept_open.add(msg["id"])            # confirmRevive → "View read-only": this dead session
             #                                      gets a (struck) read-only tab now, without resuming it
