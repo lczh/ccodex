@@ -2013,8 +2013,13 @@ def _update_channel():
     if gd is not None:
         try:
             v = (gd / "romp-update-channel").read_text().strip()
-        except OSError:
+        except FileNotFoundError:
             v = ""
+        except OSError:
+            # an EXISTING marker we cannot read is UNKNOWN — read STABLE, never fall through to
+            # the legacy repo-scoped key, which a stale dev opt-in could still hold (the r28
+            # verification, executed: chmod-000 stable marker + romp.updateChannel=dev read dev)
+            return "stable"
         if v:
             return "dev" if v == "dev" else "stable"
     # Legacy fallback (v1.3.3 wrote git config --local): that key is REPOSITORY-scoped, and a dev
@@ -2908,6 +2913,17 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
                                "across that choice; fix install.sh, then update again.")
                 _MAIN_DRIFT[0] = ""
                 return
+            st2 = subprocess.run(["git", "status", "--porcelain"], cwd=str(ROOT),
+                                 capture_output=True, text=True, timeout=10)
+            if st2.returncode != 0 or (st2.stdout or "").strip():
+                # the entry clean-check is minutes stale by here — the settle can run the prior
+                # install.sh that long, and edits saved meanwhile deserve the same refusal the
+                # entry gives them (_pull_remote grew this recheck in r27; this leg kept the
+                # stale shape — the r28 verification, executed)
+                _converge_note("main moved at origin, but the tree changed while settling a "
+                               "prior install — commit or stash the new edits, then update again.")
+                _MAIN_DRIFT[0] = ""
+                return
             if not _arm_latch(tip[:8], carry):
                 # an intent that cannot PERSIST blocks the move outright — an unwritable git dir
                 # must never mean "proceed unrecorded" (the user's audit, 2026-08-17)
@@ -3026,7 +3042,12 @@ def _settle_prior_latch(lock_fd):
                 if len(otoks) > 1 and otoks[1] in ("stable", "dev"):
                     carry_line = cur + " " + otoks[1]
         except OSError:
-            pass
+            # fail-closed like the FIRST read: a latch that turns unreadable during the
+            # minutes-long heal silently degraded the carry from "sha8 stable" to a plain sha —
+            # exactly the token the pull's and converge's pending-stable gates key on (the r28
+            # verification, executed)
+            return ("an existing install latch cannot be re-read after its heal failed — "
+                    "settling nothing on a guess"), ""
         return "", carry_line
     if len(lines) > 1:
         return ("this checkout's install latch names %s and a prior %s but HEAD is %s — an update "
@@ -10966,11 +10987,27 @@ def _update_remote(host):
         "    sys.exit(5)\n"
         'lp=os.path.join(os.path.dirname(lock),"romp-install-failed")\n'
         'mk=os.path.join(os.path.dirname(lock),"romp-update-channel")\n'
+        # the remote's channel decision MIRRORS _update_channel: only an exact "dev" (marker, or
+        # the legacy repo-config key on the MAIN checkout) receives unsigned peer commits —
+        # absent/garbage reads STABLE, and an EXISTING marker that cannot be read is UNKNOWN and
+        # refuses (exit 14), the same fail-closed rule the latch gets fifteen lines down (the
+        # r28 verification, executed: a markerless legacy stable machine and a chmod-000 stable
+        # marker both merged+installed unsigned commits the machine's own pull path refuses)
         "try:\n"
-        '    if open(mk).read().strip()=="stable":\n'
-        "        sys.exit(13)\n"
+        "    v=open(mk).read().strip()\n"
+        "except FileNotFoundError:\n"
+        "    v=None\n"
         "except OSError:\n"
-        "    pass\n"
+        "    sys.exit(14)\n"
+        "if v is not None:\n"
+        '    if v!="dev":\n'
+        "        sys.exit(13)\n"
+        'elif not os.path.isdir(os.path.join(r,".git")):\n'
+        "    sys.exit(13)\n"
+        "else:\n"
+        '    lc=subprocess.run(["git","-C",r,"config","--get","romp.updateChannel"],capture_output=True,text=True)\n'
+        '    if lc.returncode or (lc.stdout or "").strip()!="dev":\n'
+        "        sys.exit(13)\n"
         "def pick_pub(healed,rawlines):\n"
         "    if len(healed.split())>1:\n"
         "        return healed\n"
@@ -11067,6 +11104,7 @@ def _update_remote(host):
         'if [ "$RRC" = 8 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYNOW; exit 0; fi; '
         'if [ "$RRC" = 9 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERR; exit 0; fi; '
         'if [ "$RRC" = 10 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo LATCHSTUCK; exit 0; fi; '
+        'if [ "$RRC" = 14 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo CHANNELUNKNOWN; exit 0; fi; '
         'if [ "$RRC" = 13 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STABLENOW; exit 0; fi; '
         'if [ "$RRC" = 12 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo PENDINGSTABLE; exit 0; fi; '
         'if [ "$RRC" = 4 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo INSTALLFAIL; exit 0; fi; '
@@ -11096,7 +11134,8 @@ def _update_remote(host):
         'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null &  sleep 1; fi; '
         'echo "SYNCED:$NEW"'
     ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, lfull, _P2P_REF, _P2P_REF,
-         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
+         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
+         _P2P_REF, kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -11141,10 +11180,13 @@ def _update_remote(host):
         return False, ("pushed, but %s's install latch names commits its HEAD doesn't match — an "
                        "update died there mid-move from a broken state; heal it by hand on that "
                        "machine (run install.sh, then remove the latch)" % host)
+    if tag == "CHANNELUNKNOWN":
+        return False, ("the remote checkout's update-channel marker exists but cannot be read — "
+                       "refusing to push unsigned commits onto an unknown channel; fix the marker "
+                       "(or its permissions) on the remote")
     if tag == "STABLENOW":
-        return False, ("the remote checkout just completed a switch to the STABLE channel — it "
-                       "updates only through signed release tags now; unsigned commits were not "
-                       "pushed onto it")
+        return False, ("the remote checkout is on the STABLE channel — it updates only through "
+                       "signed release tags; unsigned commits were not pushed onto it")
     if tag == "PENDINGSTABLE":
         return False, ("a switch to the STABLE channel is still pending on the remote checkout "
                        "(its install has not passed yet) — not resetting it onto unsigned "
@@ -28087,7 +28129,14 @@ class Handler(BaseHTTPRequestHandler):
                         client["send"](json.dumps({"type": "warn", "text": SDK_SETUP_HINT}))
                 elif msg.get("backend") == "codex":   # an OpenAI Codex thread (plans/codex-backend.md)
                     if _codex_ready():
-                        _create_codex_session(nm, cwd, client=client)
+                        try:
+                            _create_codex_session(nm, cwd, client=client)
+                        except Exception as e:
+                            # the generic dispatcher handler logs to stderr only — the picker's
+                            # "Opening…" cue got no answer (the r28 verification)
+                            client["send"](json.dumps({"type": "warn",
+                                                       "text": "creating the Codex session "
+                                                               "failed: %s" % e}))
                     else:
                         # same rule as SDK: the user asked for Codex — refuse loudly, never a
                         # mystery tmux session. _codex_ready is False for a missing dep, a dead

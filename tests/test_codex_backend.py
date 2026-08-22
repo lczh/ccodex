@@ -980,5 +980,71 @@ class LaunchErrorNames(unittest.TestCase):
             self.assertIn("webby", open(name_file).read())
 
 
+class RaisingRegistryTransactions(unittest.TestCase):
+    """The r28 verification, executed on the real backend: every durable-write failure must
+    publish NOTHING — no moved names file, no in-memory lifecycle flip, no phantom row."""
+
+    def _corrupt(self, td):
+        os.makedirs(os.path.join(td, "codex"), exist_ok=True)
+        with open(os.path.join(td, "codex", "registry.json"), "w") as f:
+            f.write("{ not json")
+
+    def test_a_raising_registry_rename_moves_no_store(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            be = cb.CodexBackend(td, client_factory=lambda: None)
+            sid = be.spawn("webby", "/tmp")
+            self._corrupt(td)
+            with self.assertRaises(RuntimeError):
+                be.rename(sid, "newname")
+            s = be._session(sid)
+            self.assertEqual(s.name, "webby", "the in-memory name never moved")
+            self.assertIn("webby", open(os.path.join(td, "names", sid)).read(),
+                          "the shared names file never moved — three stores stay agreed")
+
+    def test_a_raising_registry_resume_rolls_the_flip_back(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            be = cb.CodexBackend(td, client_factory=lambda: None)
+            sid = be.spawn("webby", "/tmp")
+            s = be._session(sid)
+            s.dead = True
+            prior_state = s.state
+            self._corrupt(td)
+            with self.assertRaises(RuntimeError):
+                be.resume("webby", sid)
+            self.assertTrue(s.dead,
+                            "a FAILED revive must not come up as a live lane beside its own "
+                            "failure message")
+            self.assertEqual(s.state, prior_state)
+
+    def test_a_raising_registry_spawn_leaves_no_phantom(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            self._corrupt(td)
+            be = cb.CodexBackend(td, client_factory=lambda: None)
+            with self.assertRaises(RuntimeError):
+                be.spawn("webby", "/tmp")
+            self.assertEqual(len(be._sessions), 0,
+                             "no durable row means no in-memory row — a phantom live lane with "
+                             "no names file re-opened the duplicate-name hole")
+            self.assertFalse(os.path.exists(os.path.join(td, "names")) and
+                             os.listdir(os.path.join(td, "names")))
+
+    def test_a_raising_registry_thread_start_failure_spawn_leaves_no_phantom(self):
+        import tempfile
+
+        class BoomClient(FakeClient):
+            def thread_start(self, params):
+                raise RuntimeError("no threads today")
+        with tempfile.TemporaryDirectory() as td:
+            self._corrupt(td)
+            fake = BoomClient()
+            be = cb.CodexBackend(td, client_factory=lambda: fake)
+            with self.assertRaises(RuntimeError):
+                be.spawn("webby", "/tmp")
+            self.assertEqual(len(be._sessions), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

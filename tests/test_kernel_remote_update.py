@@ -276,6 +276,7 @@ class UpdateRemote(unittest.TestCase):
             fix = Path(td) / "romp"
             gd = fix / ".git"
             gd.mkdir(parents=True)
+            (gd / "romp-update-channel").write_text("dev\n")   # a dev remote: mechanics under test
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
             (fakebin / "git").write_text(
@@ -348,14 +349,16 @@ class UpdateRemote(unittest.TestCase):
             gd.mkdir(parents=True)
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
+            ops = Path(td) / "ops.log"
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
-                "esac\nexit 0\n" % gd)
+                "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
+                "esac\nexit 0\n" % (gd, ops))
             (fakebin / "git").chmod(0o755)
-            (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "install.sh").write_text("#!/bin/sh\necho INSTALLED >> '%s'\nexit 0\n" % ops)
             (fix / "install.sh").chmod(0o755)
             env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
             apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
@@ -364,6 +367,29 @@ class UpdateRemote(unittest.TestCase):
             self.assertIn("STABLENOW", a.stdout)
             self.assertFalse((gd / "romp-install-failed").exists(),
                              "refused at entry: nothing armed, nothing moved")
+            self.assertFalse(ops.exists(),
+                             "PLACEMENT is the point: a gate moved after the merge+install kept "
+                             "STABLENOW in stdout while unsigned code landed (the r28 "
+                             "verification's mutant) — neither op may have run")
+            # a MARKERLESS remote reads STABLE too (_update_channel's default) — the legacy
+            # repo-config key is the only other dev opt-in, and this fixture sets neither
+            (gd / "romp-update-channel").unlink()
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("STABLENOW", a.stdout)
+            self.assertFalse(ops.exists(), "a markerless machine is a stable machine")
+            # the legacy MAIN-checkout git-config dev opt-in still proceeds (pre-marker dev
+            # machines must not wedge): the fake git answers the config probe with dev
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' config --get romp.updateChannel'*) echo dev;;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
+                "esac\nexit 0\n" % (gd, ops))
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertNotIn("STABLENOW", a.stdout)
+            self.assertTrue(ops.exists(), "a legacy config-dev machine still receives the push")
 
     def test_a_settle_heal_that_publishes_stable_refuses_the_unsigned_reset(self):
         # the v1.3.12 audit's P1, remote edition: the heal published stable, removed the latch,
@@ -426,6 +452,7 @@ class UpdateRemote(unittest.TestCase):
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
             (fix / "install.sh").chmod(0o755)
+            (gd / "romp-update-channel").write_text("dev\n")   # a dev remote: mechanics under test
             shim = Path(td) / "shim"
             shim.mkdir()
             (shim / "sitecustomize.py").write_text(
@@ -555,14 +582,25 @@ class UpdateRemote(unittest.TestCase):
             # installing a 0-byte marker over 'dev' with the latch spent (the adversarial
             # review, 2026-08-20, reproduced with an LD_PRELOAD write shim)
             (gd / "romp-install-failed").write_text("deadbee2 stable")
-            (gd / "romp-update-channel").unlink()
-            (gd / "romp-update-channel").mkdir()       # os.replace onto a dir raises
+            (gd / "romp-update-channel").write_text("dev\n")   # readable — the entry gate passes
+            (gd / "romp-update-channel.pub").mkdir()   # os.open O_WRONLY on a dir raises: the
+            #                                            staged publish cannot land
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("PENDINGSTABLE", a.stdout,
                           "an unpublishable STABLE choice refuses the unsigned reset outright "
                           "(the 2026-08-21 gate) — the latch stays")
             self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2 stable",
                              "the record and its channel survive for the retry")
+            (gd / "romp-update-channel.pub").rmdir()
+            # an EXISTING marker the wrapper cannot READ is UNKNOWN — refuse at entry, latch
+            # untouched (the r28 verification: an unreadable 'stable' marker fell open while an
+            # unreadable latch three lines later failed closed)
+            (gd / "romp-update-channel").chmod(0o000)
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("CHANNELUNKNOWN", a.stdout)
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2 stable",
+                             "nothing spent, nothing moved on an unknown channel")
+            (gd / "romp-update-channel").chmod(0o644)
             # torn, EMPTY, and malformed records are never moot — LATCHSTUCK, executed (the
             # v1.3.9 audit: strict grammar in every reader)
             for bad in ("quarantin", "", "deadbee2 sta", "abcd1234\nffff9999\neeee1111"):
@@ -587,6 +625,7 @@ class UpdateRemote(unittest.TestCase):
             gd.mkdir(parents=True)
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
+            (gd / "romp-update-channel").write_text("dev\n")   # a dev remote: mechanics under test
             marker = Path(td) / "status-called"
             # exit-8: the OUTER status probe (call 1) reports clean; the wrapper's under-lock
             # status (call 2) sees the edit that landed in the gap
@@ -639,11 +678,14 @@ class UpdateRemote(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("uncommitted work between the check and the apply", detail)
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
-        pre, _, post = apply.partition("reset --hard")
+        self.assertNotIn("reset --hard", apply,
+                         "the move is ff-only everywhere (the v1.3.12 audit's P1)")
+        pre, sep, post = apply.partition('"merge","--ff-only",target')
+        self.assertTrue(sep, "the ff-only move must exist in the wrapper")
         self.assertIn("status --porcelain", pre,
-                      "the recheck sits between the ancestry gate and the reset, same shell")
+                      "the recheck sits between the ancestry gate and the move, same shell")
         self.assertIn("DIRTYNOW", pre)
-        self.assertNotIn("status --porcelain", post, "and never after the reset, where it is moot")
+        self.assertNotIn("status --porcelain", post, "and never after the move, where it is moot")
 
     def test_no_romp_clone_fails_loudly(self):
         self._wire(disc_out="NOROMP")

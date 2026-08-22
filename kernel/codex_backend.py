@@ -805,7 +805,15 @@ class CodexBackend:
                               "limit": False}
             with s.lock:
                 self._put_session(s)
-                self._save_registry(s, create=True)
+                try:
+                    self._save_registry(s, create=True)
+                except BaseException:
+                    # no durable row → no in-memory row: the phantom rendered as a live lane
+                    # with NO names file, so a retry of the same name minted a duplicate — the
+                    # r27 hole re-opened on exactly the raising path (the r28 verification)
+                    with self._sessions_lock:
+                        self._sessions.pop(sid, None)
+                    raise
             self._write_name(s)            # a LIVE launch-error row without a shared name let a
             #                                retry mint a duplicate live "web" (the v1.3.12 audit)
             return sid
@@ -820,14 +828,24 @@ class CodexBackend:
                               "limit": False}
             with s.lock:
                 self._put_session(s)
-                self._save_registry(s, create=True)
+                try:
+                    self._save_registry(s, create=True)
+                except BaseException:
+                    with self._sessions_lock:
+                        self._sessions.pop(sid, None)
+                    raise
             self._write_name(s)            # same rule as the client-missing branch above
             return sid
         s = _Session(sid, tid, name, cwd, model=model, color=bg)
         s.loaded = True
         with s.lock:
             self._put_session(s)
-            self._save_registry(s, create=True)
+            try:
+                self._save_registry(s, create=True)
+            except BaseException:
+                with self._sessions_lock:
+                    self._sessions.pop(sid, None)
+                raise
         self._ensure_norm(s)
         # touch the materialized transcript NOW: discovery lists real files, and an empty jsonl
         # parses to an empty session — the tab opens immediately instead of waiting for turn one
@@ -841,6 +859,7 @@ class CodexBackend:
         if not s:
             return False
         with s.lock:
+            prior = (s.dead, s.loaded, s.name, s.cwd, s.state, s.since, s.change_generation)
             s.dead = False
             s.loaded = False               # the worker thread/resumes before the next turn
             s.name = name or s.name
@@ -850,7 +869,15 @@ class CodexBackend:
             s.since = time.time()
             s.change_generation += 1
             queued = bool(s.queue)
-            self._save_registry(s, fields=("dead", "name", "cwd"))
+            try:
+                self._save_registry(s, fields=("dead", "name", "cwd"))
+            except BaseException:
+                # roll the flip back: with dead=False already published in memory, a FAILED
+                # revive rendered a live lane beside its own reviveFailed message, and the next
+                # kernel restart silently killed it again (the r28 verification, executed)
+                (s.dead, s.loaded, s.name, s.cwd, s.state, s.since,
+                 s.change_generation) = prior
+                raise
         if queued:
             self._ensure_worker(s)
             s.kick.set()
@@ -901,10 +928,27 @@ class CodexBackend:
         if not s:
             return False
         with s.lock:
+            old_name = s.name
             s.name = new_name
             tid = s.tid
-            self._write_name(s)           # keep the shared identity file in sync (colours preserved)
-            self._save_registry(s, fields=("name",))
+            try:
+                self._save_registry(s, fields=("name",))
+            except BaseException:
+                # durable registry FIRST, and a raising write publishes NOTHING: the old order
+                # moved the shared names file and the in-memory name before the raise, so three
+                # stores disagreed under a false "keeps its old name" message (the r28
+                # verification — the r28 kernel-layer reorder missed this layer)
+                s.name = old_name
+                raise
+            try:
+                self._write_name(s)       # keep the shared identity file in sync (colours preserved)
+            except BaseException:
+                s.name = old_name         # compensate: the registry write above is re-run with
+                try:                      # the old name so the stores stay agreed; the raise
+                    self._save_registry(s, fields=("name",))   # still reaches the caller (loud)
+                except Exception:
+                    pass
+                raise
         c = self._client
         if c is not None:
             try:

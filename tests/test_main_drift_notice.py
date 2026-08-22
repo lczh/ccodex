@@ -80,6 +80,24 @@ class DriftWiring(unittest.TestCase):
                     self.assertEqual(km._update_channel(), "stable", "garbage → stable")
                     marker.write_text("stable\n")
                     self.assertEqual(km._update_channel(), "stable")
+                    # an EXISTING marker that cannot be read is UNKNOWN — stable, and NEVER the
+                    # legacy repo key, which a stale dev opt-in could still hold (the r28
+                    # verification: chmod-000 stable marker + romp.updateChannel=dev read dev).
+                    # The failure shape needs a MAIN checkout (.git a dir) whose legacy key says
+                    # dev: only then does the fall-through actually flip the answer.
+                    marker.chmod(0o000)
+                    mainroot = Path(td) / "mainroot"
+                    (mainroot / ".git").mkdir(parents=True)
+                    import subprocess as sp
+                    legacy_dev = mock.Mock(return_value=sp.CompletedProcess(
+                        [], 0, stdout="dev\n", stderr=""))
+                    with mock.patch.object(km, "ROOT", mainroot), \
+                         mock.patch.object(km.subprocess, "run", legacy_dev):
+                        self.assertEqual(km._update_channel(), "stable",
+                                         "unreadable-existing is unknown → stable, never the "
+                                         "stale legacy dev key")
+                        legacy_dev.assert_not_called()
+                    marker.chmod(0o644)
                 marker.unlink()
                 # absent marker, LINKED worktree (.git is a file): never the shared legacy key
                 wt = Path(td) / "wt"; wt.mkdir(); (wt / ".git").write_text("gitdir: /elsewhere\n")
@@ -243,7 +261,8 @@ class ConvergeFunctional(unittest.TestCase):
          km._LAST_AUTO_CONVERGE[0]) = self._saved
         km._set_install_failed("")
 
-    def _run(self, kind="pull", target=None, fail=(), tip=None, channel=None, restart_fails=False):
+    def _run(self, kind="pull", target=None, fail=(), tip=None, channel=None, restart_fails=False,
+             dirty_second_status=False):
         """Drive _run_main_update with every subprocess scripted. `fail` names steps that exit 1."""
         import subprocess as sp
         target = self.FULL if target is None else target
@@ -260,6 +279,9 @@ class ConvergeFunctional(unittest.TestCase):
             calls.append((step, list(argv)))
             rc = 1 if step in fail else 0
             out = tip + "\n" if step == "rev-parse" else ""
+            if step == "status" and dirty_second_status:
+                n = sum(1 for s, _ in calls if s == "status")
+                out = "" if n == 1 else " M raced-edit.py\n"   # clean at entry, dirty post-settle
             if step == "status" and step in fail:
                 rc, out = 0, "M peer-session-edit.py\n"   # "failing" status = a DIRTY tree answer
             return sp.CompletedProcess(argv, rc, stdout=out, stderr="boom" if rc else "")
@@ -294,7 +316,10 @@ class ConvergeFunctional(unittest.TestCase):
 
     def test_happy_path_runs_in_order_and_checks_out_the_bound_sha(self):
         steps, calls = self._run()
-        self.assertEqual(steps, ["status", "fetch", "rev-parse", "merge-base", "checkout", "install"])
+        self.assertEqual(steps, ["status", "fetch", "rev-parse", "merge-base", "status",
+                                 "checkout", "install"],
+                         "the SECOND status is the post-settle recheck — the entry check is "
+                         "minutes stale after a settle heal (the r28 verification)")
         checkout_argv = next(a for s, a in calls if s == "checkout")
         self.assertIn(self.FULL, checkout_argv, "the checkout lands on the resolved+bound sha")
         self.assertNotIn("origin/main", checkout_argv, "never the ref — it can move under us")
@@ -321,6 +346,28 @@ class ConvergeFunctional(unittest.TestCase):
         steps, _ = self._run(target="")               # binding is mandatory, not optional-by-default
         self.assertNotIn("checkout", steps)
         self.assertEqual(self.requests, [])
+
+    def test_an_edit_landing_during_the_settle_refuses_the_pull(self):
+        # the r28 verification: the entry clean-check is minutes stale after a settle heal —
+        # the converge's pull leg now re-reads the tree post-settle, like _pull_remote's st3
+        import subprocess as sp
+        seen = {"status": 0}
+        orig = None
+
+        def staged_status(argv, **kw):
+            step = ("status" if "status" in argv else "other")
+            if step == "status":
+                seen["status"] += 1
+                out = "" if seen["status"] == 1 else " M raced-edit.py\n"
+                return sp.CompletedProcess(argv, 0, stdout=out, stderr="")
+            return orig(argv, **kw)
+        # ride the existing harness, overriding only status staging
+        steps, _ = self._run(dirty_second_status=True)
+        self.assertNotIn("checkout", steps, "the recheck refuses before the move")
+        self.assertNotIn("install", steps)
+        self.assertTrue(any("tree changed while settling" in n for n in self.notices),
+                        self.notices)
+        self.assertEqual(self.requests, [], "a refused pull restarts nothing")
 
     def test_the_stable_channel_stops_the_pull_before_any_subprocess(self):
         steps, _ = self._run(channel="stable")
@@ -1098,6 +1145,33 @@ class IntentPublish(unittest.TestCase):
         self.assertEqual(carry, "eeee1111 stable",
                          "the pending choice rides the surviving line — a sha-only carry "
                          "destroyed it and blinded the pull gate")
+
+    def test_a_latch_turning_unreadable_during_the_heal_refuses_the_settle(self):
+        # the r28 verification, executed: the re-read after a FAILED heal ended in "except
+        # OSError: pass", silently degrading the carry from "sha8 stable" to a plain sha —
+        # exactly the token the pull's and converge's pending-stable gates key on
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            gd = Path(td)
+            latch = gd / "romp-install-failed"
+            latch.write_text("eeee1111 stable")
+
+            def failing_heal_that_breaks_the_latch(cur, fd):
+                latch.chmod(0o000)                    # the fs degrades inside the 600s heal
+                return False
+            with mock.patch.object(km, "_update_git_dir", return_value=gd):
+                with mock.patch.object(km, "_checkout_sha", return_value="eeee1111"):
+                    with mock.patch.object(km, "_converge_install",
+                                           side_effect=failing_heal_that_breaks_the_latch):
+                        fd = km._update_flock()
+                        try:
+                            settle, carry = km._settle_prior_latch(fd)
+                        finally:
+                            km.os.close(fd)
+                            latch.chmod(0o644)
+        self.assertIn("cannot be re-read", settle,
+                      "fail-closed like the FIRST read — never a token silently dropped")
+        self.assertEqual(carry, "")
 
     def test_a_line2_survivor_never_merges_the_unlanded_line1_token(self):
         # the adversarial review, 2026-08-21 (second pass, executed): when HEAD matches line 2,

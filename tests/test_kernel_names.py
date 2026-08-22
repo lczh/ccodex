@@ -217,6 +217,23 @@ class NameClaims(unittest.TestCase):
         self.assertEqual(out, "webby")
         self.assertEqual(set_names, ["webby"], "the names file lands synchronously")
 
+    def test_a_raising_codex_create_answers_the_picker(self):
+        # the r28 verification: the generic dispatcher handler logged the raise to stderr only —
+        # the picker's "Opening…" cue got no answer
+        sent = []
+        client = {"send": sent.append, "wid": "w1"}
+        with mock.patch.object(km, "_codex_ready", return_value=True):
+            with mock.patch.object(km, "_create_codex_session",
+                                   side_effect=RuntimeError("registry down")):
+                with mock.patch.object(km, "_resolve_create_dir", return_value=("/tmp", "")):
+                    with mock.patch.object(km, "_tmux_sessions", return_value={}):
+                        with mock.patch.object(km, "_live_names", return_value={}):
+                            km.Handler._dispatch_ws(object.__new__(km.Handler),
+                                                    {"type": "createSession", "name": "webby",
+                                                     "backend": "codex", "dir": "/tmp"}, client)
+        self.assertTrue(any('"warn"' in m and "registry down" in m for m in sent),
+                        "the failure reaches the asker, not just stderr: %r" % sent)
+
     def test_renames_are_serialized_under_one_lock(self):
         # two interleaved renames of one sid left the registry at one name and the shared file
         # at the other (the v1.3.12 audit's P2)

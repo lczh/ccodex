@@ -79,7 +79,8 @@ class PullRemote(unittest.TestCase):
         # unsigned peer commits on stable installs (which is _update_channel's default here)
         self._chan_patch = mock.patch.object(km, "_update_channel", return_value="dev")
         self._chan_patch.start()
-        self.addCleanup(self._chan_patch.stop)
+        self.addCleanup(lambda: self._chan_patch.stop())   # late-bound: the absolute-refusal
+        #                                                    test swaps the patcher object
 
     def tearDown(self):
         km.subprocess.run = self._run
@@ -385,7 +386,7 @@ class PullRemote(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("STABLE channel", detail)
             # form 2: the marker was ALREADY stable at entry (the common crash form)
-            self._wire()
+            calls2 = self._wire()
             with mock.patch.object(km, "_update_channel", return_value="stable"):
                 with mock.patch.object(km, "_settle_prior_latch", return_value=("", "")):
                     ok, detail = km._pull_remote("TESTHOST")
@@ -394,9 +395,10 @@ class PullRemote(unittest.TestCase):
         finally:
             self._chan_patch = mock.patch.object(km, "_update_channel", return_value="dev")
             self._chan_patch.start()
-        self.assertFalse(any(a[0] == "git" and "merge" in a and "merge-base" not in a
-                             for a in calls), "nothing merged onto the stable machine")
-        self.assertFalse(any("install.sh" in str(a) for c in calls for a in c))
+        for got in (calls, calls2):
+            self.assertFalse(any(a[0] == "git" and "merge" in a and "merge-base" not in a
+                                 for a in got), "nothing merged onto the stable machine")
+            self.assertFalse(any("install.sh" in str(a) for c in got for a in c))
 
     def test_the_pull_refuses_a_tree_dirtied_during_the_settle(self):
         # the v1.3.12 audit's P2: the entry clean-check is minutes stale after a long prior
