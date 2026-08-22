@@ -37,6 +37,8 @@ sys_node="$(command -v node 2>/dev/null || true)"
 if [ -n "$sys_node" ]; then
     if [ ! -x "$ROMP_NODE" ] || ! cmp -s "$sys_node" "$ROMP_NODE"; then
         mkdir -p "$STATE" 2>/dev/null || true
+        rm -f "$ROMP_NODE.tmp" 2>/dev/null || true   # never cp INTO a fixed staging name a plant
+        #                                              could have replaced (the r34 verification)
         if cp "$sys_node" "$ROMP_NODE.tmp" 2>/dev/null && chmod +x "$ROMP_NODE.tmp" 2>/dev/null; then
             mv -f "$ROMP_NODE.tmp" "$ROMP_NODE" 2>/dev/null || rm -f "$ROMP_NODE.tmp" 2>/dev/null || true
         else

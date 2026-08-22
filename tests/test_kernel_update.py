@@ -348,6 +348,12 @@ class RunUpdate(Fresh):
         self.assertLess(script.index("verify-tag v0.7.0"), script.index("git merge --ff-only v0.7.0"),
                         "signature verification is the gate immediately before code moves")
         self.assertIn("git merge --ff-only v0.7.0", script)
+        self.assertLess(script.index('rm -f "$MARKER.pub"'),
+                        script.index('> "$MARKER.pub"'),
+                        "the marker staging name is cleared of plants before the shell opens it "
+                        "(the r34 verification: > on a planted FIFO blocks forever)")
+        self.assertIn("rm -f", script.split("mv -f")[0],
+                      "the latch staging name is cleared of plants before the shell opens it")
         self.assertIn('rev-parse --short=8 HEAD | head -c 8)\" = \"$NEW8\"'.replace('\\"', '"'),
                       script,
                       "the move VERIFIES it landed before install: merge --ff-only exits 0 as a "

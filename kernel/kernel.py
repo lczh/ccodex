@@ -2233,6 +2233,7 @@ def _run_update(tag):
         + "pub_line() {\n"
         + "  CH=$(printf '%s' \"$1\" | awk '{print $2}')\n"
         + "  case \"$CH\" in stable|dev) ;; *) return 0;; esac\n"
+        + "  rm -f \"$MARKER.pub\"\n"
         + "  printf '%s\\n' \"$CH\" > \"$MARKER.pub\" && mv -f \"$MARKER.pub\" \"$MARKER\"\n"
         + "}\n"
         + "SETTLED=1\n"
@@ -2289,6 +2290,7 @@ def _run_update(tag):
         + "  NEW8=$(git rev-parse --short=8 'refs/tags/%s^{commit}' 2>> %s | head -c 8)\n" % (tag, log)
         + "  if [ -n \"$NEW8\" ]; then\n"
         + "    C1=$(printf '%s' \"$CARRY\" | awk '{print $1}')\n"
+        + "    rm -f %s.tmp\n" % latch
         + "    if [ -n \"$CARRY\" ] && [ \"$C1\" = \"$NEW8\" ]; then printf '%%s' \"$CARRY\" > %s.tmp; "
           "elif [ -n \"$CARRY\" ]; then printf '%%s\\n%%s' \"$NEW8\" \"$CARRY\" > %s.tmp; "
           "else printf '%%s' \"$NEW8\" > %s.tmp; fi\n" % (latch, latch, latch)

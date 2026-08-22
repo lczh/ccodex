@@ -267,6 +267,10 @@ def head8():
 
 def write_latch(sha8):
     tmp = latch + ".tmp"
+    try:
+        os.unlink(tmp)                           # a planted FIFO here blocked open() WHILE the
+    except FileNotFoundError:                    # update flock was held — boot and every update
+        pass                                     # wedged (the r34 verification, executed)
     with open(tmp, "w") as f:
         f.write(sha8)
     os.replace(tmp, latch)
@@ -360,6 +364,10 @@ if lines:
 # HEAD is unmoved, no latch is armed, the old marker still matches the old HEAD (rc 11).
 ctmp = os.path.join(gdir, "romp-update-channel.tmp")
 try:
+    try:
+        os.unlink(ctmp)                          # same rule: never open a fixed staging name
+    except FileNotFoundError:                    # a plant could have replaced (the r34
+        pass                                     # verification)
     with open(ctmp, "w") as cf:
         cf.write(channel + "\n")
 except OSError:

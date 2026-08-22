@@ -93,13 +93,28 @@ class StagingStraysNeverDiscovered(unittest.TestCase):
 
     def test_a_leaked_names_tmp_is_not_a_session(self):
         # the r33 verification: discover() is THE primary NAMES consumer and read a leaked
-        # staging stray as a phantom session — it even stole a live session's fork lane
+        # staging stray as a phantom session — it even stole a live session's fork lane. The
+        # stray is RESOLVABLE here (its transcript exists on disk): with the filter removed —
+        # or filtering the wrong variable, f.stem, which strips the suffix (the r34 mutant
+        # hunt) — discover returns the phantom and this test fails
+        stray = "99999999-8888-7777-6666-555555555555.tmp"
         (jd.NAMES / "11111111-2222-3333-4444-555555555555").write_text("web\t/TESTDIR\t\t\n")
-        (jd.NAMES / "99999999-8888-7777-6666-555555555555.tmp").write_text(
-            "phantom\t/TESTDIR\t\t\n")
-        found = jd.discover(NOW)
+        (jd.NAMES / stray).write_text("phantom\t/TESTDIR\t\t\n")
+        import re as _re
+        with tempfile.TemporaryDirectory() as pd:
+            proj = Path(pd) / _re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath("/TESTDIR"))
+            proj.mkdir(parents=True)
+            tr = proj / (stray + ".jsonl")
+            tr.write_text(json.dumps({"type": "user", "uuid": "u1", "parentUuid": None,
+                                      "timestamp": "2026-06-10T14:00:00.000Z",
+                                      "message": {"role": "user",
+                                                  "content": "synthetic prompt"}}) + "\n")
+            os.utime(tr, (NOW, NOW))
+            from unittest import mock
+            with mock.patch.object(jd, "PROJECTS", Path(pd)):
+                found = jd.discover(NOW)
         sids = [t[2] for t in found]
-        self.assertNotIn("99999999-8888-7777-6666-555555555555.tmp", sids)
+        self.assertNotIn(stray, sids)
         self.assertFalse(any(str(s).endswith(".tmp") for s in sids), sids)
         # and the fingerprint ignores it too: a stray appearing must not invalidate caches
         fp1 = jd._discover_fingerprint()

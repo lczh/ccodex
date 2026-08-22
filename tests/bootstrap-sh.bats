@@ -972,6 +972,14 @@ $t8 stable" ]                              # the new arm carries the MERGED pend
     [ "$status" -eq 70 ]
     run python3 -c "import signal, sys, runpy; signal.alarm(10); sys.argv = ['txn.py', '$root', '$gd', '$target', '-', 'stable']; runpy.run_path('$TEST_DIR/txn.py')"
     [ "$status" -eq 3 ]
+    rm -f "$gd/romp-install-failed"
+    # plants at the STAGING names (latch.tmp / channel.tmp) must not wedge the transaction
+    # either — these writes run HOLDING the update flock (the r34 verification)
+    mkfifo "$gd/romp-install-failed.tmp"
+    mkfifo "$gd/romp-update-channel.tmp"
+    run python3 -c "import signal, sys, runpy; signal.alarm(20); sys.argv = ['txn.py', '$root', '$gd', '$target', '-', 'stable']; runpy.run_path('$TEST_DIR/txn.py')"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$gd/romp-update-channel")" = "stable" ]
 }
 
 @test "bootstrap.sh: a totally-failed quarantine write exits 13 with the ARMED latch intact" {

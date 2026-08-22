@@ -746,6 +746,7 @@ def _prune_usage_log():
         floor = max((t for t, _ in parsed), default=0) - _USAGE_RETAIN_S
         keep = [ln for t, ln in parsed if t >= floor]
         tmp = USAGE.with_name(USAGE.name + ".tmp")
+        tmp.unlink(missing_ok=True)   # unlink a planted FIFO at the fixed staging name before opening (the r34 verification)
         tmp.write_text("\n".join(keep) + ("\n" if keep else ""))
         os.replace(tmp, USAGE)
         sys.stderr.write("romp-judge: judge-usage.jsonl outgrew %dMB — pruned to the newest 31 days "
@@ -844,6 +845,7 @@ def _auth_write_locked(d):
     means a stale latch, and the next mark/clear retries it."""
     try:
         tmp = JUDGE_AUTH.with_suffix(".tmp")
+        tmp.unlink(missing_ok=True)   # unlink a planted FIFO at the fixed staging name before opening (the r34 verification)
         tmp.write_text(json.dumps(d))
         os.replace(tmp, JUDGE_AUTH)
     except Exception:
@@ -919,6 +921,7 @@ def _limit_mark(bucket, pct, resets_at, model):
         if cur.get("bucket") == bucket and cur.get("resets_at") == resets_at:
             return
         tmp = JUDGE_LIMIT.with_suffix(".tmp")
+        tmp.unlink(missing_ok=True)   # unlink a planted FIFO at the fixed staging name before opening (the r34 verification)
         tmp.write_text(json.dumps({"t": int(time.time()), "bucket": bucket, "pct": pct,
                                    "resets_at": resets_at, "model": str(model or "")}))
         os.replace(tmp, JUDGE_LIMIT)
@@ -7766,6 +7769,9 @@ def _write_death_marker(fsid, m):
     try:
         GONEDIR.mkdir(parents=True, exist_ok=True)
         tmp = GONEDIR / (fsid + ".json.tmp")
+        tmp.unlink(missing_ok=True)   # a planted FIFO here wedged the whole triage pass — the
+        #                               SAME gone/ staging name kernel._record_death got in r34;
+        #                               this is that file's other writer (the r34 verification)
         tmp.write_text(json.dumps(m))
         os.replace(tmp, GONEDIR / (fsid + ".json"))
         _gone_memo.pop(fsid, None)
