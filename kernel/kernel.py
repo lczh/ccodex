@@ -4648,14 +4648,16 @@ def _launch_error(sid):
 
 
 def _backend_queued(sid):
-    """True if the session's backend holds queued-but-unstarted user turns (the SDK keeps them in _pending;
+    """True if the session's backend holds queued-but-unstarted USER turns (the SDK keeps them in _pending;
     tmux folds them from the transcript's queue-op records). Composer sends now go straight to that queue
     while a turn runs (_send_or_park), so 'the user has messages waiting' — the nudge-suppression guard —
-    must consult it, not just the kernel FIFO. Guarded: a backend hiccup reads as 'nothing queued' rather
-    than crashing the nudge check."""
+    must consult it, not just the kernel FIFO. Genuine entries only: the idle-queue drive parks harness
+    wrappers in the same SDK _pending, and a wrapper is not the user having said something (the tmux fold
+    already filters via _pending_queued). Guarded: a backend hiccup reads as 'nothing queued' rather than
+    crashing the nudge check."""
     try:
         be = Sessions.backend_for(str(sid))
-        return bool(be and be.pending_queued(str(sid)))
+        return bool(be) and any(_genuine_queued(t) for t in be.pending_queued(str(sid)))
     except Exception:
         return False
 
@@ -6911,6 +6913,16 @@ def _sdk_locked():
             # ends, so an idle fleet's usage.json goes stale — measured ~15h — and the rate gate is
             # only as good as that file); the backend picks any live login session to ask
             jd._USAGE_REFRESH_FN = getattr(_sdk_backend, "refresh_usage", None)   # best-effort hook (judge guards None)
+            # The judge parses the SAME cut world the display parse does (jd._PENDING_CUT_FN): during
+            # an armed bare rollback the planner must not see — and mint from — the deleted tail.
+            # getattr-guarded like every other backend probe (a test fake without the affordance
+            # must still construct — the singleton contract outranks the wire).
+            _cut_fn = getattr(_sdk_backend, "pending_cut", None)
+            if _cut_fn:
+                jd.set_pending_cut_provider(_cut_fn)
+            # The backend's flag-consumption events resolve held rewinds (two-phase goal cleanup:
+            # archive at the branch-take, restore on failure — _on_rewind_resolved).
+            _sdk_backend.rewind_resolved_cb = _on_rewind_resolved
         except Exception:
             sys.stderr.write("sdk-backend unavailable: %s\n" % traceback.format_exc())
             _sdk_problem("the SDK backend could not be built: %s" % traceback.format_exc())
@@ -7281,10 +7293,16 @@ def _fire_api_retry(sid, be, manual=False):
             return                                        # not api-blocked right now → nothing to retry
         # ON-YOU classes are never auto-retried (server-side twin of the client tick's skip, and the
         # kernel driver's own guard): a retry cannot compact a too-long prompt, raise a spend cap, refill
-        # a model allowance, or mend a credential — the card names the real fix. Manual keeps firing:
-        # the button is only rendered where a retry can work, and an explicit click is the user's call.
+        # a model allowance, or mend a credential — the card names the real fix. A safeguards REFUSAL is
+        # the starkest of them (the user 2026-08-15): it's deterministic on the same input, so a retry
+        # re-sends the same prompt and manufactures the same refusal — measured 12/12 in one ~6-minute
+        # storm, where each refusal's NEW error record minted a new episode and the once-per-episode
+        # gate below never terminated — and in fallback configurations each retry manufactures another
+        # model downgrade. Manual keeps firing: the button is only rendered where a retry can work, and
+        # an explicit click is the user's call (they may have rewritten or dropped the thread since).
         if _rerr and (_rerr.get("tooLong") or _rerr.get("spendLimit")
-                      or _rerr.get("modelLimit") or _rerr.get("authErr")):
+                      or _rerr.get("modelLimit") or _rerr.get("authErr")
+                      or _rerr.get("refusal")):
             return
         if _auto_retried.get(sid) == _rk:
             return                                        # this episode already got its retry
@@ -7327,6 +7345,72 @@ def _auto_retry_tick(now, tmux):
                 _fire_api_retry(sid, be)
         except Exception:
             sys.stderr.write("auto-retry (session %s): %s\n" % (sid or "?", traceback.format_exc()))
+
+
+def _idle_queue_drive_tick(now, tmux):
+    """KERNEL-side driver for self-scheduled wake signals stuck in an idle SDK session's CLI queue
+    (the user 2026-08-18 — the full story on _undelivered_wake_tail). In the CLI's STUCK regime it
+    only enqueues; romp drives the turn that delivers, the way boot reconcile already does for its
+    own persisted queues — the same recovery for a queue that lives in the CLI instead of the reg.
+    In the CLI's DELIVERING regime (most sessions — see the measurement on the comment block above
+    _undelivered_wake_tail) the CLI starts that turn itself within milliseconds, and romp must stay
+    out of its way. Kernel-side gates:
+      * the AGE FLOOR, PER ENTRY: an entry qualifies once IT is _WAKE_DRIVE_FLOOR_S old, and only
+        the aged subset drives — a younger entry may still be racing the CLI's own delivery, so it
+        waits out its own floor and drives on a later parse. (Keyed on the NEWEST entry, the floor
+        never expired under any sub-floor wake cadence — a 30s monitor reset the clock on every
+        enqueue, and two simulated hours stranded 240 pending entries with zero drives, silently:
+        the exact pathology this drive exists to end.) No aged wake signal → stand down WITHOUT
+        latching, the next parse re-checks. The floor is a documented exception to the
+        no-time-windows rule (the armStale shape): the event it approximates — the CLI deciding
+        NOT to deliver — emits no record, so only its delivery window passing proves the stuck
+        regime, and a drive-time re-parse alone cannot close the race (the CLI can deliver between
+        the re-check and romp's enqueue landing). The delivering regime's own user record clears an
+        entry long before its floor expires; the stuck regime's entries age past it and drive.
+      * the GLOBAL retry pause stands everything down (the user paused romp's self-driving);
+      * a retry-SUPPRESSED session stands down (the user interrupted that thread's storm — a clean
+        user turn re-arms it, _auto_resume_session_retry);
+      * an API-error-BLOCKED session stands down (the auto-retry tick owns that recovery; driving
+        into the error would just burn the wake on a turn that cannot run);
+      * a tail with no wake signal in it does not drive — a bare queued user message (and a
+        background-agent completion notice, which the CLI delivers itself in EVERY regime) is the
+        CLI's own to deliver, and romp re-sending it would double-deliver.
+    The backend owns the rest (open turn, compaction, ended/cut sessions, the per-watermark latch,
+    the dormant-spawn stagger) — see SdkBackend.drive_idle_queue. tmux sessions are skipped by
+    ownership: their CLI is interactive and delivers its own queue."""
+    be = _sdk()
+    if be is None or not hasattr(be, "drive_idle_queue"):
+        return
+    if _retry_paused_on():
+        return
+    cands = []
+    for s in _alive_sessions(now, tmux):
+        sid = str(s.get("sid") or "")
+        path = s.get("path")
+        try:
+            if not sid or not path or not be.owns(sid):
+                continue
+            entries, mark = _undelivered_wake_tail(path)
+            if mark is None or not any(e["wrapper"] for e in entries):
+                continue
+            aged = [e for e in entries if now - _wake_ts_epoch(e["ts"]) >= _WAKE_DRIVE_FLOOR_S]
+            wa = [e for e in aged if e["wrapper"]]
+            if not wa:
+                continue                   # no wake signal past its own delivery window — stand down
+            #                                WITHOUT latching; the next parse re-checks (see docstring)
+            if _session_retry_suppressed(sid):
+                continue
+            if _api_error(path):
+                continue
+            cands.append({"sid": sid, "path": str(path), "entries": aged,
+                          "mark": (wa[-1]["pos"], wa[-1]["ts"])})
+            #              ^ the newest DRIVEN wrapper, never the newest pending entry: latching past
+            #                the still-young entries would make the backend's prev-filter skip them
+            #                forever once they age — they must exceed the mark on a later parse
+        except Exception:
+            sys.stderr.write("idle-queue-drive (%s): %s\n" % (sid or "?", traceback.format_exc()))
+    if cands:
+        be.drive_idle_queue(cands)
 
 
 def _predict_working(flavor, ids=None, sid=None):
@@ -13040,6 +13124,159 @@ def _pending_queued(path):
     return out
 
 
+# ── Idle-queue drive: wake signals stuck in an idle SDK CLI's queue (the user 2026-08-18) ──
+# Under the SDK backend a session's own scheduled work — a recurring Monitor, a cron firing, a
+# background task's completion notice — lands as a queue-operation enqueue in the CLI's queue. What
+# happens next has TWO regimes (measured across this machine's live SDK transcripts, 2026-08-18: of
+# 1311 monitor/cron/bash-class task-notification enqueues, 602 were delivered by the CLI itself
+# straight from idle at median 46ms, p90 126ms, across 25 sessions — the delivery writes NO dequeue
+# record; the non-meta user record carrying the text IS the evidence — and the rest were discarded
+# by content-addressed removes or stranded):
+#   * the DELIVERING regime — most sessions, most of the time: the CLI auto-starts the turn itself
+#     within milliseconds, and romp must stay out of its way or the model hears the same
+#     notification twice and acts on it twice;
+#   * the STUCK regime — the pathology this drive exists for: the CLI never starts that turn and the
+#     backlog only grows. Hit twice in one day: an overnight 15-minute Monitor stacked 33 on-time
+#     <task-notification> enqueues with ZERO turns for eight hours, and a recurring cron behaved the
+#     same with the CLI process alive (that transcript: 123 enqueues, 0 delivered, 66 removes =
+#     discards). There, the driven turn must carry the queued texts itself.
+# The CLI writes no record of DECIDING not to deliver, so the regimes are indistinguishable at
+# enqueue time — only the delivery window passing proves the stuck one. Hence _WAKE_DRIVE_FLOOR_S in
+# _idle_queue_drive_tick, applied PER ENTRY — each enqueue waits out its own floor, so a fast-cadence
+# stream cannot keep resetting the clock (a documented exception to the no-time-windows rule;
+# rationale on the tick's docstring). Background-AGENT completion notices (a-prefixed 17-hex task
+# ids) are the CLI's own to deliver in EVERY regime — verified even in the stuck session — so they
+# are never wake signals
+# (carve-out below). Event-based otherwise, no new polling: these records are the same
+# queue-operations _pending_queued folds for the chat's queued chip (whose _genuine_queued filter the
+# SDK queued-bubble build now applies too, so a driven wrapper never shows as the USER'S queued
+# input); the parse below rides the normal push cadence, and the parse IS the event.
+_WAKE_DRIVE_FLOOR_S = 60.0    # ~400x the delivering regime's p90 (0.126s); a rounding error against
+#                               the 8-hour stuck-regime pathology it exists to end
+_AGENT_TASK_ID_RE = re.compile(r"<task-id>([^<]*)</task-id>")
+_AGENT_ID_SHAPE_RE = re.compile(r"a[0-9a-f]{16}")   # background-agent ids; monitor/cron/bash ids are
+#                                                     9-char base36, so the classes cannot collide
+_wake_tail_cache = {}         # path -> ((mtime, size), (entries, mark))
+
+
+def _wake_ts_epoch(ts):
+    """A queue-operation timestamp as epoch seconds, for the drive's age floor. Unparseable reads as
+    ANCIENT (0.0): failing toward driving matches the bug being fixed — a silent strand — while the
+    floor's only job is to not race a CLI that stamps its records correctly."""
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _undelivered_wake_tail(path):
+    """The transcript's still-pending queue-operation enqueues, resolved PER ENTRY on the evidence the
+    CLI actually writes (measured live 2026-08-18 — the comment block above):
+      * a `remove` carrying content discards exactly the entry with that text (the CLI's removes are
+        content-addressed single-item discards, routinely of a NON-oldest entry while others stay
+        pending); a content-less remove discards the oldest, matching _pending_queued's FIFO fold;
+      * a `dequeue` alone clears NOTHING — the CLI's idle deliveries write no dequeue at all, and an
+        agent notification's instant dequeue must not wipe an older undriven signal; the delivery
+        evidence is the user record it produces;
+      * a later non-isMeta USER record clears exactly the entries whose text it CONTAINS — the CLI's
+        idle auto-delivery, its bare-message delivery at a turn start, and romp's own driven turn
+        (whose user record carries the wrapper texts verbatim) all resolve this way. ONE entry per
+        carried occurrence, oldest first: a varianceless recurring monitor enqueues byte-identical
+        firings (live census: 6 of 1373 enqueues are exact repeats), and a record carrying that
+        text once delivered exactly one of them — an identical firing enqueued mid-flight is a
+        distinct signal still owed a turn, not already-heard news. The driven turn joins k
+        delivered copies "\\n\\n"-separated, k non-overlapping occurrences, so it still clears
+        exactly what it carried and no re-drive loop opens;
+      * assistant records and isMeta user records clear NOTHING: a turn merely running is not
+        evidence any particular queued signal was delivered — in the stuck regime, mid-turn arrivals
+        are never folded into the open turn, and the old whole-tail clear silently dropped them.
+    Returns ([{pos, ts, text, wrapper}], (pos, ts) of the newest one) or ([], None). `wrapper` marks
+    the wake-signal class — harness system wrappers (<task-notification>/<system-reminder>) EXCEPT
+    background-agent completion notices (a-prefixed 17-hex <task-id>), which the CLI delivers itself
+    in every regime and which therefore behave like bare user/postal enqueues: they ride along for
+    the drive's log count only, never qualify candidacy, and are never re-sent. A missing or
+    otherwise-shaped id keeps wrapper=True — under-delivering is the original bug; the carve-out is
+    only for the one class the CLI provably owns. Cached by (mtime, size) like _pending_queued,
+    since the drive tick asks every push cycle."""
+    try:
+        st = os.stat(path)
+        key = (st.st_mtime, st.st_size)
+    except OSError:
+        return [], None
+    hit = _wake_tail_cache.get(path)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    tail = []
+    try:
+        with open(path, errors="replace") as f:
+            for pos, line in enumerate(f):
+                if '"queue-operation"' in line:              # cheap prefilter; the parse verifies
+                    try:
+                        o = json.loads(line)
+                    except Exception:
+                        continue
+                    if o.get("type") != "queue-operation":
+                        continue
+                    op = o.get("operation")
+                    if op == "enqueue":
+                        text = o.get("content") if isinstance(o.get("content"), str) else ""
+                        w = bool(em.SYSTEM_WRAPPER_RE.match(text))
+                        if w:
+                            m = _AGENT_TASK_ID_RE.search(text)
+                            if m and _AGENT_ID_SHAPE_RE.fullmatch(m.group(1)):
+                                w = False                    # an agent completion notice — the CLI's own
+                        #                                      to deliver, in every regime (see docstring)
+                        tail.append({"pos": pos, "ts": str(o.get("timestamp") or ""), "text": text,
+                                     "wrapper": w})
+                    elif op == "remove":
+                        c = o.get("content") if isinstance(o.get("content"), str) else None
+                        if c is not None:
+                            i = next((i for i, e in enumerate(tail) if e["text"] == c), None)
+                            if i is not None:                # content-addressed single-item discard —
+                                del tail[i]                  # the CLI's call on THAT entry only
+                        elif tail:
+                            del tail[0]                      # content-less: the oldest, as _pending_queued folds
+                    #      a `dequeue` clears nothing — its delivery evidence is the user record it produces
+                    continue
+                if not tail:
+                    continue                                 # nothing pending → nothing to resolve (fast path)
+                if '"user"' not in line:
+                    continue                                 # cheap prefilter for delivery-evidence records
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get("type") == "user" and not o.get("isMeta"):
+                    mc = (o.get("message") or {}).get("content")
+                    if isinstance(mc, str):
+                        utext = mc
+                    elif isinstance(mc, list):
+                        utext = "\n".join(str(b.get("text") or "") for b in mc
+                                          if isinstance(b, dict) and b.get("type") == "text")
+                    else:
+                        utext = ""
+                    if utext:                                # delivered = the record CARRIES the text
+                        budget = {}
+                        kept = []
+                        for e in tail:
+                            t = e["text"]
+                            if t and t in utext:
+                                if t not in budget:
+                                    budget[t] = utext.count(t)
+                                if budget[t] > 0:
+                                    budget[t] -= 1
+                                    continue                 # cleared: one entry per carried copy
+                            kept.append(e)
+                        tail = kept
+    except OSError:
+        return [], None
+    out = (tail, (tail[-1]["pos"], tail[-1]["ts"]) if tail else None)
+    if len(_wake_tail_cache) > 256:                          # bounded by the session count; never unbounded
+        _wake_tail_cache.clear()
+    _wake_tail_cache[path] = (key, out)
+    return out
+
+
 _api_err_cache = {}           # path -> ((mtime, size), err|None)
 
 
@@ -13960,6 +14197,21 @@ def _is_auth_error(text):
             or "authentication_error" in low)
 
 
+# A safeguards REFUSAL — the model's classifier refused the prompt itself ("<Model>'s safeguards
+# flagged this message (https://www.anthropic.com/legal/aup)…"). DETERMINISTIC on the same input, so
+# it's on YOU like the limit classes, only more so: a retry re-sends the same prompt and manufactures
+# the same refusal (measured 12/12 in one storm — each refusal wrote a NEW error record, new uuid →
+# new episode, so the once-per-episode gate never terminated), and in a fallback configuration each
+# retry manufactures another model downgrade. The real fix is rewriting the ask or dropping the
+# thread. This wording check is CO-EQUAL with the event path in _api_error (the system
+# model_refusal_* record), not a legacy fallback: the CLI omits the system record for some refusal
+# errors (observed in the same storm that produced linked ones), and at a transcript's tail the error
+# record can land a beat before its system record — the signature rides the error record itself.
+def _is_refusal_text(text):
+    low = (text or "").lower()
+    return "safeguards flagged" in low or "anthropic.com/legal/aup" in low
+
+
 def _spend_dialog_showing(pane):
     """Is the CLI's spend-cap MODAL currently up in this pane capture? When a tmux session hits the
     monthly cap MID-TURN the CLI drops into an interactive menu ("What do you want to do? / Adjust
@@ -14024,7 +14276,15 @@ def _api_error(path):
                                "modelLimit": _is_model_limit(text),
                                # a dead credential (no login / refused key) — on YOU, never auto-retried;
                                # see _is_auth_error (per-session auth, the user 2026-08-08)
-                               "authErr": _is_auth_error(text)}
+                               "authErr": _is_auth_error(text),
+                               # the error's parent = the refused/failed USER message — kept so the
+                               # system model_refusal_* record below can link itself to THIS episode
+                               "parentUuid": o.get("parentUuid"),
+                               # a safeguards refusal is deterministic on the same input — on YOU
+                               # (rewrite the ask or drop the thread), never auto-retried; see
+                               # _is_refusal_text, and the system-record event path below (the user
+                               # 2026-08-15, after one refused prompt drew 12 auto-retries in ~6min)
+                               "refusal": _is_refusal_text(text)}
                     elif (isinstance(c, list) and any(isinstance(b, dict)
                             and b.get("type") in ("text", "tool_use", "thinking") for b in c)) \
                             or (isinstance(c, str) and c.strip()):
@@ -14035,6 +14295,19 @@ def _api_error(path):
                         isinstance(b, dict) and b.get("type") == "tool_result" for b in c)
                     if not is_tool_result:                    # a genuine prompt (e.g. a retry) clears it
                         err = None
+                elif t == "system" and o.get("subtype") in ("model_refusal_no_fallback",
+                                                            "model_refusal_fallback"):
+                    # The CLI's structured refusal record — the EXACT event behind _is_refusal_text's
+                    # wording check (so a future CLI rephrase still classifies). It lands a few records
+                    # AFTER the assistant error it explains (queue-operation / file-history-snapshot
+                    # lines sit between; none of those clears err), linked by parentUuid: the refusal
+                    # record and the error BOTH carry the refused user message's uuid as parentUuid.
+                    # Deliberately NOT refusedUserMessageUuid — observed diverging from the episode's
+                    # parent in 2 of 13 refusal records of one storm — and deliberately not
+                    # record-alone: the CLI also omits this record for some refusal errors, which is
+                    # why the text signature above stays co-equal rather than a legacy fallback.
+                    if err is not None and o.get("parentUuid") == err.get("parentUuid"):
+                        err["refusal"] = True
     except OSError:
         return None
     if key is not None:
@@ -14724,8 +14997,9 @@ def _feed_goals(sid):
                     #                                    card for the whole pass (the user 2026-07-23)
                 except Exception:
                     sys.stderr.write("feed-goals: user-override replay: %s\n" % traceback.format_exc())
-            return store
-    return jd.load_goals(sid)                          # no pass in flight → live read, outside the lock
+            return _apply_rewind_hold(sid, store)      # a pending rewind's cards are hidden NOW (latched
+            #                                            at the gesture; archive lands at the branch-take)
+    return _apply_rewind_hold(sid, jd.load_goals(sid))   # no pass in flight → live read, outside the lock
 
 # Delta-send (the user 2026-06-25, who wanted to stop re-sending what didn't change): the chat pusher used to send the
 # FULL events array (~8MB for a 34MB transcript) on every change, even when one event was appended. Keep the
@@ -14926,13 +15200,16 @@ def _rewind_send(sid, user_uuid, text, now=None):
     if err:
         return err
     # Same as delete: the edited message + its tail are abandoned; read its time before be.rewind arms the
-    # cut, then archive the cards those now-gone turns spawned. The edited text lands as a NEW turn (a later
-    # timestamp), minted AFTER this runs, so its fresh card is never caught by the cut.
+    # cut. The gesture HIDES the cards those turns spawned (a latched hold); the ARCHIVE waits for the
+    # branch-take event and a refused rewind restores them — see _on_rewind_resolved. The edited text lands
+    # as a NEW turn with a LATER timestamp, and the judge's prompt-run mints its card DURING that open turn
+    # (by design, before the take settles) — so the sweep is NOT bare t-keyed: both the hide and the take
+    # thread the kept-chain exemption (_rewind_kept_uuids → jd.swept_ids), which spares any node whose
+    # promptUuid is provably on the live chain. Identity, not time, is what saves the fresh card.
     cut_t = _atom_epoch(sess["path"], sid, str(user_uuid), now)
     ok, berr = be.rewind(sid, target, str(text))
-    if ok and cut_t is not None:
-        _drop_goals_after(sid, cut_t)
-        _mark_views_dirty()
+    if ok:
+        _arm_rewind_hold(be, sid, cut_t)
     return None if ok else (berr or "the rewind could not be applied")
 
 
@@ -14969,22 +15246,379 @@ def _rewind_rollback(sid, user_uuid, now=None):
         return err
     # The DELETED message is user_uuid (target is its surviving ancestor); everything at/after it is
     # abandoned. Read its time NOW, before be.rollback arms the pending_cut that would hide it from _parse.
+    # The gesture HIDES the affected cards; the archive waits for the branch-take (_on_rewind_resolved).
     cut_t = _atom_epoch(sess["path"], sid, str(user_uuid), now)
     ok, berr = be.rollback(sid, target)
-    if ok and cut_t is not None:
-        _drop_goals_after(sid, cut_t)                    # archive cards minted from the now-abandoned turn(s)
-        _mark_views_dirty()
+    if ok:
+        _arm_rewind_hold(be, sid, cut_t)
     return None if ok else (berr or "the rollback could not be applied")
 
 
-def _drop_goals_after(sid, cut_t):
-    """Archive goal cards born in a rewind/delete's abandoned range (jd.drop_goals_after). Best-effort: a
-    failure here must never undo the cut the user already got, so log and move on (fail loud, not silent)."""
+def _arm_rewind_hold(be, sid, cut_t):
+    """The gesture half of the two-phase rewind cleanup: latch the card hold (hide now, archive at
+    the take). cut_t=None — the edited/deleted record's time could not be resolved from the parse —
+    is LOUD, never a silent no-cleanup (the repo rule): the rewind itself already succeeded, the
+    dead-branch reconciliation will still catch any orphans, but the user must be able to see why
+    nothing hid."""
+    if cut_t is None:
+        jd._log_judge_error("romp", sid, "revert-skipped",
+                            note="rewind cut time unresolved (the record is not among the parsed "
+                                 "atoms) — no cards hidden or archived for this rewind; the "
+                                 "dead-branch reconciliation will catch any orphans")
+        return
+    leaf = ""
     try:
-        jd.drop_goals_after(sid, cut_t)
+        fn = getattr(be, "rewind_flags", None)
+        if fn:
+            leaf = (fn(sid) or ("", "", False))[1]     # the transcript leaf recorded at arm time —
+            #                                            the spent discriminator's graph anchor
+    except Exception as e:
+        sys.stderr.write("rewind-hold: could not read the armed leaf: %s\n" % e)
+    _rewind_hold_set(sid, cut_t, leaf)
+    _mark_views_dirty()
+
+
+def _drop_goals_after(sid, cut_t, kept=None):
+    """Archive goal cards born in a rewind/delete's abandoned range (jd.drop_goals_after). `kept` is the
+    kept-chain exemption (see _rewind_kept_uuids). Best-effort: a failure here must never undo the cut
+    the user already got, so log and move on (fail loud, not silent)."""
+    try:
+        jd.drop_goals_after(sid, cut_t, kept=kept)
     except Exception as e:
         jd._log_judge_error("romp", sid, "revert-failed",
                             note="goal cleanup after a rewind/delete failed: %r" % e)
+
+
+# ── two-phase rewind timing (2026-08-17): HIDE at the gesture, ARCHIVE at the branch-take ──
+# The old shape archived at ARM time, which is wrong in both directions: the arm is not the rewind
+# (apply is async and conditional — a CLI refusal or a spent flag leaves the conversation intact,
+# yet its goals were already archived), and archiving once at arm misses every mint that lands in
+# the window after it. The user's gesture IS new information — their cards should vanish at once —
+# so the gesture latches a HOLD (cards hide from the feed, nothing moves in the store) and the
+# store-side archive waits for the event that makes "abandoned" true: the branch-take (the backend's
+# flag-consumption sites). A failed/refused rewind RESTORES the hidden cards loudly. The hold is
+# latched until exactly one of those events — never re-derived per build — and file-backed so a
+# kernel restart mid-window neither drops the hide nor forgets to resolve it (the boot pass below).
+_rewind_holds = [None]                             # lazily loaded {sid: {"cutT": int, "leaf": str, "at": int}}
+_rewind_holds_lock = threading.Lock()
+
+
+def _rewind_holds_file():
+    return jd.STATE / "rewind-holds.json"
+
+
+def _rewind_holds_map():
+    with _rewind_holds_lock:
+        if _rewind_holds[0] is None:
+            try:
+                _rewind_holds[0] = {str(k): v for k, v in
+                                    json.loads(_rewind_holds_file().read_text()).items()
+                                    if isinstance(v, dict)}
+            except Exception:
+                _rewind_holds[0] = {}
+        return _rewind_holds[0]
+
+
+def _rewind_holds_save():
+    try:
+        tmp = _rewind_holds_file().with_suffix(".json.tmp.%d" % os.getpid())
+        tmp.write_text(json.dumps(_rewind_holds[0] or {}))
+        tmp.rename(_rewind_holds_file())
+    except Exception as e:
+        sys.stderr.write("rewind-hold: persist failed: %s\n" % e)
+
+
+def _rewind_hold_set(sid, cut_t, leaf):
+    m = _rewind_holds_map()
+    with _rewind_holds_lock:
+        m[str(sid)] = {"cutT": int(cut_t), "leaf": str(leaf or ""), "at": int(time.time())}
+        _rewind_holds_save()
+
+
+def _rewind_hold_get(sid):
+    return _rewind_holds_map().get(str(sid))
+
+
+def _rewind_hold_clear(sid):
+    m = _rewind_holds_map()
+    _rewind_kept_memo.pop(str(sid), None)              # the memo and the once-per-hold error latch
+    _rewind_kept_err.pop(str(sid), None)               # live exactly as long as the hold does
+    with _rewind_holds_lock:
+        if m.pop(str(sid), None) is not None:
+            _rewind_holds_save()
+
+
+_rewind_kept_memo = {}   # sid -> (input key, kept set) — see _rewind_kept_uuids
+_rewind_kept_err = {}    # sid -> the armed hold's `at` already complained about: the loud degrade
+#                          is once per HOLD, not once per build (a >48h bare hold used to append
+#                          one judge-errors row per ~5s feed rebuild, unbounded, with no dedup)
+_REWIND_ERR_MISS = object()
+
+
+def _rewind_kept_complain(sid, note):
+    """One 'rewind-kept' row per armed hold: the view rebuilds every few seconds for the whole
+    armed window (unbounded on a bare delete), and a lookup that fails once fails every build —
+    the degrade must stay LOUD without judge-errors.jsonl growing by ~17k rows/day. Keyed on the
+    hold's arm time so a NEW hold complains anew; no hold (the one-shot take path) always logs."""
+    hold = _rewind_hold_get(sid)
+    at = (hold or {}).get("at")
+    if hold is not None and _rewind_kept_err.get(str(sid), _REWIND_ERR_MISS) == at:
+        return
+    _rewind_kept_err[str(sid)] = at
+    jd._log_judge_error("romp", sid, "rewind-kept", note=note)
+
+
+def _rewind_kept_uuids(sid):
+    """The session's KEPT-chain uuid set (em.chain_membership over the same inputs the display parse
+    uses, including the backend's pending cut) — the identity exemption threaded through the rewind
+    sweep (jd.swept_ids / jd.drop_goals_after) so the replacement ask's own fresh card, minted by the
+    judge's prompt-run DURING the open rewind turn, is never hidden or archived as if it were part of
+    the abandoned tail. Returns None on ANY failure, LOUDLY: the sweep then degrades to the pure
+    t-keyed selection (the pre-fix behavior) — visible in the log (once per armed hold, see
+    _rewind_kept_complain), never a silent widening.
+
+    The session resolves through the 48h set first, then discover's cached wide walk — the exact
+    fallback _alive_sessions uses: liveness owns visibility, age owns nothing (2026-08-13). A hold
+    outlives the caption window on any bare delete left sitting (its defining property is that NO
+    record lands, freezing the transcript's mtime at arm time), and the 48h miss used to fail this
+    lookup on every build of a still-live session: a deterministic, silent widening to the bare
+    t-keyed hide, plus one error row per rebuild.
+
+    Memoized per sid on the exact inputs that can change the answer — each candidate file's
+    (mtime, size), the states file's stat (a resumeFork row lands there), and the pending cut —
+    because the hold view re-asks on EVERY feed/chat build for the whole armed window, re-walking
+    a provably unchanged transcript (~0.1s warm at tens of MB, partly inside _goals_snap_lock on
+    the mid-pass path). The branch-take busts it by construction: the take's own record moves the
+    transcript stat and consumes the cut, so the archive never sweeps against a stale kept set.
+    A FAILURE is never memoized — the loud degrade retries next build. The memo dies with the
+    hold (_rewind_hold_clear).
+
+    EDIT-REWIND CAVEAT (accepted residual): pending_cut is bare-only, so for the first seconds of
+    an EDIT rewind — until the fork record lands on disk — the kept set here is the full OLD
+    chain: promptUuid-carrying doomed cards are spared by the hold for that window (consistent
+    with the chat, which renders the same doomed tail from the same bare-only cut), and only
+    promptUuid-less mints take the t-keyed hide. The fork record landing self-heals both, and the
+    take-time archive always runs post-fork."""
+    try:
+        sess = next((s for s in _sessions(time.time()) if s["sid"] == sid), None)
+        if not sess:
+            ent = next((f for f in jd.discover(time.time(), window=jd.DEATH_BACKFILL_WINDOW)
+                        if f[0] == sid), None)         # the same cached wide walk _alive_sessions pays for
+            sess = {"sid": ent[0], "path": str(ent[1])} if ent else None
+        if not sess:
+            _rewind_kept_complain(sid, "no transcript to read the kept chain from — the rewind sweep "
+                                       "degrades to the pure t-keyed selection (pre-fix behavior)")
+            return None
+        cands = [sess["path"]]
+        anchor = os.path.join(os.path.dirname(sess["path"]), sid + ".jsonl")
+        if os.path.basename(sess["path"]) != sid + ".jsonl" and os.path.exists(anchor):
+            cands.append(anchor)
+        states = jd.STATESDIR / (sid + ".jsonl")
+        cut = ""
+        be = _sdk()
+        if be:
+            fn = getattr(be, "pending_cut", None)
+            if fn:
+                cut = fn(sid) or ""
+        key = None
+        try:
+            fstats = []
+            for f in cands:
+                st = os.stat(f)
+                fstats.append((f, st.st_mtime, st.st_size))
+            try:
+                sst = os.stat(states)
+                skey = (sst.st_mtime, sst.st_size)
+            except OSError:
+                skey = None
+            key = (tuple(fstats), skey, cut)
+        except OSError:
+            key = None                                 # unstat-able inputs → compute, never cache
+        memo = _rewind_kept_memo.get(str(sid))
+        if key is not None and memo and memo[0] == key:
+            return memo[1]
+        mem = em.chain_membership(sess["path"], candidate_files=cands,
+                                  states=str(states) if states.exists() else None,
+                                  leaf_override=cut or None)
+        if key is not None:
+            _rewind_kept_memo[str(sid)] = (key, mem["kept"])
+        return mem["kept"]
+    except Exception as e:
+        _rewind_kept_complain(sid, "kept-chain lookup failed: %r — the rewind sweep degrades to the "
+                                   "pure t-keyed selection (pre-fix behavior) this time" % e)
+        return None
+
+
+def _apply_rewind_hold(sid, store):
+    """The feed's view of a held session's store: the nodes the pending rewind will archive are
+    hidden NOW (the gesture is the new information; jd.swept_ids is the sweep's own selection —
+    including the kept-chain exemption — so what hides is exactly what the take archives). The
+    live store is never mutated (a filtered shallow copy; re-parents are copy-on-write and the
+    column re-roll runs on a throwaway deep copy), so a failed rewind restores by simply dropping
+    the hold. The view mirrors the world the take will produce, not just its node set:
+    - lastNode re-points at the newest survivor (archive_goal_nodes' own move) — build_feed's
+      perm/api-error/judge-auth floors walk from the focus and silently no-op on a hidden id,
+      the exact frozen-board shape the jauth floor exists to prevent;
+    - spared children of hidden parents re-parent at the nearest surviving ancestor, or the
+      walks that start at the roots would lose them;
+    - the columns RE-ROLL: a pre-cut top whose only blocker is a hidden post-cut sub must not
+      sit in needs-you — presenting an ask the user just deleted — for the whole window
+      (unbounded on a bare delete). The take re-rolls for exactly this reason; the view must too."""
+    hold = _rewind_hold_get(sid)
+    if not hold:
+        return store
+    try:
+        hide = jd.swept_ids(store, hold["cutT"], kept=_rewind_kept_uuids(sid))
+    except Exception:
+        return store
+    if not hide:
+        return store
+    nodes0 = store.get("nodes") or {}
+    out = dict(store)
+    out["nodes"] = {k: v for k, v in nodes0.items() if k not in hide}
+    out["status"] = {k: v for k, v in (store.get("status") or {}).items() if k not in hide}
+    for nid, nd in list(out["nodes"].items()):         # spared survivors of hidden parents stay
+        p = nd.get("parentId")                         # reachable (copy-on-write — never mutate
+        if p in hide:                                  # the live store's node dicts)
+            while p is not None and p in hide:
+                p = (nodes0.get(p) or {}).get("parentId")
+            out["nodes"][nid] = dict(nd, parentId=p)
+    if out.get("lastNode") in hide:
+        nn = out["nodes"]
+        out["lastNode"] = (max(nn, key=lambda n: int(nn[n].get("t") or 0)) if nn else None)
+    try:
+        # rollup_status mutates node dicts and appends diary events, so it runs on a throwaway
+        # DEEP copy and only its derived maps are served. A re-roll failure serves the filtered
+        # columns unchanged — degraded, never no view.
+        tmp = json.loads(json.dumps({"rompUuid": store.get("rompUuid", sid),
+                                     "nodes": out["nodes"], "status": {},
+                                     "lastNode": out.get("lastNode")}))
+        jd.rollup_status(tmp, session_closed=False)
+        out["status"] = tmp["status"]
+        out["confirming"] = tmp.get("confirming") or []
+    except Exception:
+        pass
+    return out
+
+
+def _hold_leaf_still_active(sid, leaf):
+    """The spent-flag discriminator: is the leaf recorded at gesture time still on the active
+    chain? A consumed rewind abandons it (the new branch's ancestry bypasses it), so provably
+    REWOUND means the branch took — archive; provably KEPT means the conversation moved past the
+    arm on the OLD branch (the rewind dissolved without applying) — restore. Discriminated via
+    em.chain_membership — the one exported predicate — so recorded resume-fork lineage (states/
+    resumeFork rows) and multi-hop file lineages read exactly as the display parse does: a
+    lineage-blind hand-rolled walk here read an unreachable-but-live leaf as \"taken\" and archived
+    live cards on a guess (2026-08-17). Anything unprovable (clear/broken/unknown) is None —
+    the caller restores, because a card move needs proof. Resolves the session through the 48h
+    set, then discover's cached wide walk (as _rewind_kept_uuids does): a hold outliving the
+    caption window — a bare delete's freezing of the mtime guarantees exactly that — must not
+    turn 'the transcript exists but is old' into 'unprovable'."""
+    sess = next((s for s in _sessions(time.time()) if s["sid"] == sid), None)
+    if not sess:
+        ent = next((f for f in jd.discover(time.time(), window=jd.DEATH_BACKFILL_WINDOW)
+                    if f[0] == sid), None)
+        sess = {"sid": ent[0], "path": str(ent[1])} if ent else None
+    if not sess or not leaf:
+        return None                                    # no transcript to consult → unprovable
+    try:
+        cands = [sess["path"]]
+        anchor = os.path.join(os.path.dirname(sess["path"]), sid + ".jsonl")
+        if os.path.basename(sess["path"]) != sid + ".jsonl" and os.path.exists(anchor):
+            cands.append(anchor)
+        states = jd.STATESDIR / (sid + ".jsonl")
+        mem = em.chain_membership(sess["path"], candidate_files=cands,
+                                  states=str(states) if states.exists() else None)
+        if leaf in mem["rewind"]:
+            return False                               # provably rewound away → the branch took
+        if leaf in mem["kept"]:
+            return True                                # provably live → the rollback dissolved
+        return None                                    # clear/broken/unknown → unprovable
+    except Exception:
+        return None
+
+
+def _on_rewind_resolved(sid, outcome):
+    """The backend's flag-consumption events, resolving a held rewind (wired in _sdk_locked):
+    "taken"  — the branch took (the rewind/rollback turn's ResultMessage settled) → ARCHIVE the
+               held cards at the recorded cut (drop_goals_after now runs at the event that makes
+               "abandoned" true, and catches any mint that landed during the window).
+    "failed" — the CLI refused the rewind; the conversation is unchanged → RESTORE loudly.
+    "spent"  — the flag was dropped at connect because the leaf moved: either the take already
+               landed (a crash-heal resume mid-rewind-turn) or the conversation moved on the OLD
+               branch without applying — the recorded leaf's chain membership discriminates.
+               Unprovable (no transcript) restores: a card move needs proof, not a guess."""
+    hold = _rewind_hold_get(sid)
+    if not hold:
+        return
+    if outcome == "spent":
+        on_chain = _hold_leaf_still_active(sid, hold.get("leaf"))
+        outcome = "taken" if on_chain is False else "failed"
+        if on_chain is None:
+            jd._log_judge_error("romp", sid, "rewind-restore",
+                                note="spent rewind flag with no transcript to discriminate — "
+                                     "restoring the held cards (never archive on a guess)")
+    if outcome == "taken":
+        _drop_goals_after(sid, hold["cutT"], kept=_rewind_kept_uuids(sid))
+    else:
+        jd._log_judge_error("romp", sid, "rewind-restore",
+                            note="the rewind did not happen — the cards it hid are back on the feed")
+    _rewind_hold_clear(sid)
+    _mark_views_dirty()
+    _pusher_wake.set()
+
+
+def _rewind_migration_bg():
+    """ONE-TIME boot migration (marker-gated): the ongoing dead-branch reconciliation only rides the
+    triage cadence over recently-touched sessions, so the residue that accumulated BEFORE it shipped
+    (85 dead-branch nodes across 8 sessions at audit time, 28 in live stores, 5 resident in live and
+    archive at once) would sit forever on dormant sessions. Run the same check once over every
+    discoverable session regardless of age, then write the marker — only on a ZERO-FAILURE pass:
+    "returned" is not "succeeded" (per-session errors are swallowed loudly inside the pass), and a
+    marker written over a failed dormant session skips its orphans forever. A crash or a dirty pass
+    retries next boot (reconciliation is idempotent: archive-by-identity re-run is a no-op). The
+    marker name is v2: the v1 predicate was blind to dead branches inside pre-/clear episode files
+    (10 of the 28 audited live orphans, all 5 dual-residents), so the widened pass must run once
+    even where a v1 marker exists. Cards archive (recoverable), never delete."""
+    marker = jd.STATE / "rewind-reconcile-migration-v2.done"
+    if marker.exists():
+        return
+    try:
+        n, fails = jd.run_rewound_reconcile(now=int(time.time()), sessions_cap=100000,
+                                            window=10 * 365 * 86400)
+        if fails:
+            sys.stderr.write("romp-kernel: rewind migration left %d session(s) unreconciled — "
+                             "no marker written, retrying next boot\n" % fails)
+        else:
+            marker.write_text(json.dumps({"t": int(time.time()), "archived": n}))
+        if n:
+            sys.stderr.write("romp-kernel: rewind migration archived %d dead-branch goal node(s)\n" % n)
+    except Exception:
+        sys.stderr.write("rewind migration: %s\n" % traceback.format_exc())
+
+
+def _rewind_holds_boot():
+    """Boot pass over persisted holds: a kernel restart mid-window must neither drop a hide (the
+    file survives; reads keep filtering) nor leave one latched forever after its resolving event
+    fired while no kernel was up. A hold stays latched only while the backend's LEAF-VERIFIED
+    probe (rewind_pending — rewind_disposition against the transcript's current leaf, the same
+    verification pending_cut and the connect path use) still reads the rewind as applicable; raw
+    flag presence is not that: an out-of-band CLI-native continuation grows the transcript past
+    the recorded leaf without ever consuming the reg flag, and the raw check kept the cards hidden
+    with NO future resolving event while the chat rendered the full un-cut tail. Anything not
+    verified-pending resolves through the same spent discriminator (restore on-chain/unprovable,
+    archive off-chain)."""
+    be = _sdk()
+    for sid in list(_rewind_holds_map()):
+        try:
+            reg_pending = False
+            if be:
+                fn = getattr(be, "rewind_pending", None)
+                reg_pending = bool(fn(sid)) if fn else False
+            if not reg_pending:
+                _on_rewind_resolved(sid, "spent")
+        except Exception:
+            sys.stderr.write("rewind-hold boot: %s\n" % traceback.format_exc())
 
 
 def _parse_cached(path):
@@ -16936,6 +17570,14 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None):
         cancelable = hasattr(_cbe, "unqueue") and _queue_recallable(_cbe, sid)
         qmsgs = []
         for i, t in enumerate(queued):
+            if not _genuine_queued(t):
+                # A harness wrapper in the SDK queue — the idle-queue drive enqueues <task-notification>
+                # texts through the same _pending the user's messages ride — must not render as the
+                # user's queued input (the 2026-06-30 regression, till now guarded only on the tmux
+                # transcript fold at _pending_queued). Skipped, not filtered upstream: `queued` doubles
+                # as shown_texts for echo suppression, and a surviving bubble's idx must keep naming its
+                # backend _pending position for cancelQueued.
+                continue
             goal, body, fu, ctx = _split_followup(t)
             m = {"md": body, "idx": i, "cancelable": cancelable}   # idx ↔ the backend's _pending position (cancelQueued)
             if fu:
@@ -17042,7 +17684,12 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None):
     # LEAF: its descendants are hidden even if open. Skip cleared nodes. `current` marks the focus node
     # being worked on (the graph's lastNode) so render can point a line at it; done nodes carry their
     # time for a recency-coloured "(Xm ago)" on the right.
-    gstore = jd.load_goals(sid)
+    gstore = _apply_rewind_hold(sid, jd.load_goals(sid))   # a pending rewind's cards hide on EVERY
+    #                                            surface — this ledger tree (and the tab-hover
+    #                                            recents derived from it) used to keep showing the
+    #                                            doomed asks for the whole armed window while the
+    #                                            feed hid them (the "one chokepoint" premise was
+    #                                            false; the window is unbounded on a bare delete)
     gnodes, gstatus, gcleared = gstore.get("nodes", {}), gstore.get("status", {}), _cleared_ids()
     gkids = {}
     for _gid, _gn in gnodes.items():
@@ -17238,6 +17885,11 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None):
                   # service.env) — and with per-session auth it's how a session that landed on a broken
                   # side gets seen at all instead of idling as an invisible transient (the user 2026-08-08)
                   "apiAuthErr": bool(aerr and aerr.get("authErr")),
+                  # the model's safeguards refused the prompt itself — on-you like the four above (red
+                  # tab), and never auto-retried: a refusal is deterministic on the same input, so a
+                  # retry re-sends the same prompt and manufactures the same refusal (12/12 in the
+                  # audited storm) — rewrite the ask or drop the thread (the user 2026-08-15)
+                  "apiRefusal": bool(aerr and aerr.get("refusal")),
                   # user interrupted this thread's retry/API-error storm → romp's auto-retry stays OFF for it
                   # until a successful turn re-arms (the user 2026-07-06); the card + retry loop read this
                   "retrySuppressed": _session_retry_suppressed(sid),
@@ -17835,21 +18487,17 @@ def _compact_goal_store(fsid):
                 stack.extend(children.get(x, []))
     if not move:
         return 0
-    move_nodes = {nid: nodes[nid] for nid in move}
-    move_status = {nid: status[nid] for nid in move if nid in status}
-
-    def _archive_compacted(arch):
-        arch.setdefault("nodes", {}).update(move_nodes)
-        arch.setdefault("status", {}).update(move_status)
+    with jd._GOAL_ARCH_LOCK:                            # the archive is a blind RMW — see the lock's note
+        arch = jd.load_goal_archive(fsid)
+        a_nodes = arch.setdefault("nodes", {})
+        a_status = arch.setdefault("status", {})
+        for nid in move:
+            a_nodes[nid] = nodes.pop(nid)
+            if nid in status:
+                a_status[nid] = status.pop(nid)
         arch["rompUuid"] = store.get("rompUuid", fsid)
-
-    # Archive first and atomically merge with any simultaneous undo/revert mutation. A crash before
-    # the live save leaves a duplicate, which is recoverable; reversing the order could lose nodes.
-    jd.mutate_goal_archive(fsid, _archive_compacted)
-    for nid in move:
-        nodes.pop(nid, None)
-        status.pop(nid, None)
-    jd.save_goals(fsid, store)                          # placements/seq/lastNode stay → judge dedup intact
+        jd.save_goal_archive(fsid, arch)
+        jd.save_goals(fsid, store)                      # placements/seq/lastNode stay → judge dedup intact
     return len(move)
 
 
@@ -17889,49 +18537,59 @@ def _restore_goal_archive(item_ids):
     for iid in item_ids:
         by_sid.setdefault(iid.rsplit(":", 1)[0], []).append(iid)
     for sid, ids in by_sid.items():
-        store = jd.load_goals(sid)
-
-        def _restore(arch):
+        with jd._GOAL_ARCH_LOCK:                       # the archive is a blind RMW — see the lock's note
+            arch = jd.load_goal_archive(sid)
             a_nodes = arch.get("nodes", {})
             if not a_nodes:
-                return 0
+                continue
             a_status = arch.get("status", {})
             a_children = {}
             for nid, nd in a_nodes.items():
                 a_children.setdefault(nd.get("parentId"), []).append(nid)
-            move, seen = [], set()
+            move = []
             for iid in ids:
                 if iid in a_nodes:
                     stack = [iid]
                     while stack:
                         x = stack.pop()
-                        if x in a_nodes and x not in seen:
-                            seen.add(x)
+                        if x in a_nodes:
                             move.append(x)
                             stack.extend(a_children.get(x, []))
             if not move:
-                return 0
-            payload = {nid: a_nodes[nid] for nid in move}
-            payload_status = {nid: a_status[nid] for nid in move if nid in a_status}
-            # Journal FIRST (the user 2026-07-10), while the archive transaction still owns the
-            # exact payload it will remove. If either journal/live publish fails, the callback raises
-            # and mutate_goal_archive leaves these nodes safely archived. A stale triage save can
-            # then be repaired by load_goals replay (which defers if the user re-clears later).
-            jd.append_restore(sid, payload, payload_status, int(time.time()))
+                continue
+            store = jd.load_goals(sid)
             nodes = store.setdefault("nodes", {})
             status = store.setdefault("status", {})
-            nodes.update(payload)
-            status.update(payload_status)
-            # Sticky completion restore lives in _mark_nodes_cleared; its settle must land after
-            # the undo reopen it records, or the fold consumes it and the card returns to Working.
-            jd.save_goals(sid, store)
+            # Journal the payload FIRST (the user 2026-07-10): once the archive save below lands, these nodes
+            # exist only in the live store's save — a stale triage-pass save racing it would drop them from
+            # BOTH files, permanently. The journal carries the node payloads; jd.load_goals re-inserts any
+            # that end up in neither file (and defers to the archive if the user re-clears later).
+            rt = int(time.time())
+            jd.append_restore(sid, {nid: a_nodes[nid] for nid in move},
+                              {nid: a_status[nid] for nid in move if nid in a_status}, rt)
             for nid in move:
-                a_nodes.pop(nid, None)
-                a_status.pop(nid, None)
-            return len(move)
-
-        if jd.mutate_goal_archive(sid, _restore):
-            _compact_seen.pop(sid, None)               # live file changed → force a re-stat next sweep
+                nodes[nid] = a_nodes.pop(nid)
+                if nid in a_status:
+                    status[nid] = a_status.pop(nid)
+                sv = (store.get("rewindSwept") or {}).pop(nid, None)
+                if sv is not None:
+                    # the user's restore outranks a rewind tombstone — pop AND stamp: the pop keeps
+                    # jd._rebase_onto_disk from re-deleting the node on the next rebase, the durable
+                    # stamp survives a stale writer re-unioning its old marker AND stands the node
+                    # down from the identity-keyed reconciliation (boot memo resets, later sig
+                    # changes) for good — the branch's death can never be new information again.
+                    # Stamped max(rt, marker), never bare rt: a superseding re-sweep stamps its
+                    # tombstone STRICTLY past the restore it popped (jd.archive_goal_nodes), so the
+                    # marker this restore pops can lead wall clock by a second — and the rebase
+                    # gives ties to the restore, so at-or-above the popped value is exactly "this
+                    # restore wins against the marker it popped". The journal row still carries the
+                    # gesture's own rt; its replay derives the same stamp from the same popped value.
+                    store.setdefault("rewindRestored", {})[nid] = max(rt, int(sv))
+            # (Sticky completion restore lives in _mark_nodes_cleared now — 2026-07-07: the settle event must
+            # land AFTER the undo reopen it records, or the fold consumes it and the card returns to Working.)
+            jd.save_goals(sid, store)
+            jd.save_goal_archive(sid, arch)
+            _compact_seen.pop(sid, None)               # force a re-stat next sweep (we just changed the live file)
 
 
 def _resolve_node(sid, node_id):
@@ -19010,8 +19668,12 @@ def build_feed(now, tmux=None):
             # turn until you switch model or top up, so leaving the card in Working left a working card on
             # a session nothing could move — not nudged (the api-error gate suppresses it), not blocked,
             # not awaiting, for 80 minutes.
+            # A safeguards REFUSAL joins them (the user 2026-08-15): deterministic on the same input,
+            # never auto-retried, so a Working card would sit on a session nothing can move — the
+            # human rewriting or dropping the ask IS the only unblock.
             api_block = (nid == api_top and bool(aerr and (aerr.get("tooLong") or aerr.get("spendLimit")
-                                                          or aerr.get("modelLimit") or aerr.get("authErr"))))
+                                                          or aerr.get("modelLimit")
+                                                          or aerr.get("authErr") or aerr.get("refusal"))))
             # NUDGE FAILED (plans/stalled-open-todos-nudge.md, the user 2026-07-01): the tick stamped
             # `failed` on this goal's nudge record — the nudge-response turn completed (judged) and the goal
             # was still working-stalled; per the anti-loop rule it is never re-nudged, so the card carries
@@ -19202,6 +19864,7 @@ def build_feed(now, tmux=None):
                              "spendLimit": bool(aerr.get("spendLimit")),
                              "modelLimit": bool(aerr.get("modelLimit")),
                              "authErr": bool(aerr.get("authErr")),
+                             "refusal": bool(aerr.get("refusal")),
                              "what": ("this account hit its monthly spend limit — raise it at claude.ai/settings/usage to continue" if aerr.get("spendLimit")
                                       else "this session's prompt is too long — compact it to continue" if aerr.get("tooLong")
                                       # the CLI's own text names the model and the two remedies; the card
@@ -19210,6 +19873,9 @@ def build_feed(now, tmux=None):
                                       # a dead credential: retrying re-presents it forever — name the fix
                                       # (per-session auth, the user 2026-08-08)
                                       else "this session's sign-in or API key isn't working — fix the login (claude /login) or the key, or switch which one it bills" if aerr.get("authErr")
+                                      # a refusal is deterministic: retrying re-sends the same prompt and
+                                      # collects the same refusal — name the real fix (the user 2026-08-15)
+                                      else "the model's safeguards refused this prompt — rewrite it or drop this thread" if aerr.get("refusal")
                                       else "this session stopped on an API error — Retry to resume")} if nid == api_top
                             # the session itself is fine — it's romp's ANALYSIS of it whose credential is
                             # refused, so the copy blames the judges, not the session (the user 2026-08-12)
@@ -23339,6 +24005,10 @@ def _pusher_cycle_jobs(now, tmux, any_client):
         _auto_retry_tick(now, tmux)       # the dashboard tick is just the countdown + a redundant asker)
     except Exception:
         sys.stderr.write("auto-retry-tick: %s\n" % traceback.format_exc())
+    try:                                  # self-scheduled wake signals queued in an idle SDK CLI get their
+        _idle_queue_drive_tick(now, tmux)  # turn driven (crons/monitors/task notices — see the tick)
+    except Exception:
+        sys.stderr.write("idle-queue-drive: %s\n" % traceback.format_exc())
     try:                                  # expire stale set_working notes once a session goes idle + done (cheap when no notes)
         _clear_done_working_notes(now, tmux)
     except Exception:
@@ -29013,6 +29683,11 @@ def main():
     threading.Thread(target=_sdk, daemon=True).start()        # construct the SDK backend NOW so its boot
     #                                                           reconcile (cut turns, queues, orphans) runs at
     #                                                           boot, not on the first lazy touch
+    threading.Thread(target=_rewind_holds_boot, daemon=True).start()   # resolve holds whose take/fail
+    #                                                           event fired while no kernel was up (it
+    #                                                           builds the backend itself if it wins the race)
+    threading.Thread(target=_rewind_migration_bg, daemon=True).start()   # one-time dead-branch cleanup
+    #                                                           of pre-fix residue, marker-gated
     threading.Thread(target=_producer, daemon=True).start()
     threading.Thread(target=_pusher, daemon=True).start()
     threading.Thread(target=_heartbeat, daemon=True).start()  # WS keepalive on its own thread (see _heartbeat)

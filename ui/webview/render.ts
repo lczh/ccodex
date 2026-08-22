@@ -218,7 +218,7 @@ type ChatEvent = (
 interface TodoTask { id: string; subject: string; activeForm?: string; status: string }
 
 type ChipState = "working" | "ready" | "needsInput" | "awaiting" | "awaitingBg" | "idle" | "closed" | "compacting" | "clearing" | "blocked" | "retrying" | "interrupting" | "opening";   // needsInput = a live permission/picker prompt (on YOU) — renamed from the legacy "awaiting" (2026-08-15), which stays accepted for OLDER REMOTE KERNELS across federation; awaitingBg = idle main thread waiting on background work it dispatched (the user 2026-07-13)
-interface Status { state: ChipState; sinceEpoch: number | null; awaitingWhy?: string | null; awaitingKind?: string | null; awaitingTasks?: string[]; awaitingTaskIds?: string[]; effort?: string; model?: string; modelPending?: boolean; effortPending?: boolean; mode?: string; fast?: string; auth?: string; authPending?: boolean; authBoth?: boolean; authAcct?: string; ctx?: string; ctxColor?: number[]; modelColor?: number[]; effortColor?: number[]; faded?: boolean; backend?: string; apiTooLong?: boolean; apiSpendLimit?: boolean; apiModelLimit?: boolean; apiAuthErr?: boolean; retrySuppressed?: boolean; retryNextAt?: number | null; retryTries?: number | null; }   // awaitingWhy/awaitingTasks = what an awaitingBg session is waiting on (kernel _session_awaiting's phrasing + the live awaited task descriptions) — the #bg-tasks box renders it when no tracked tasks claim the box (renderAwaitWhy; the user 2026-08-13, who moved it out of the statusline the same day PR #350 put it there)   // retrySuppressed = the user interrupted this thread's API-error storm → romp's auto-retry stays OFF for it until a successful turn re-arms (the user 2026-07-06). backend = "tmux" | "sdk"; apiTooLong = the "blocked" is a "prompt is too long" error (on you → red tab) vs a transient API error (amber/retrying); apiSpendLimit = a monthly spend cap (on you → raise it; NEVER auto-retried — retrying can't fix it, the user 2026-07-14); apiModelLimit = this session's MODEL is out of allowance (on you → switch model or add credits; not auto-retried either, the user 2026-08-01); ctxColor = the GLOBAL colormap's RGB for the context%, computed server-side; modelColor/effortColor = the same map's RGB tint for the model name + effort (by capability/effort rank), server-computed; modelPending = a /model switch is resolving → the badge shows switching-dots until the new name lands (server-driven, event-based, the user 2026-07-03); fast = the CLI's fast-mode state ("on"/"off"/"cooldown", from the SDK init's fast_mode_state; absent = unknown/unavailable → no fast badge)
+interface Status { state: ChipState; sinceEpoch: number | null; awaitingWhy?: string | null; awaitingKind?: string | null; awaitingTasks?: string[]; awaitingTaskIds?: string[]; effort?: string; model?: string; modelPending?: boolean; effortPending?: boolean; mode?: string; fast?: string; auth?: string; authPending?: boolean; authBoth?: boolean; authAcct?: string; ctx?: string; ctxColor?: number[]; modelColor?: number[]; effortColor?: number[]; faded?: boolean; backend?: string; apiTooLong?: boolean; apiSpendLimit?: boolean; apiModelLimit?: boolean; apiAuthErr?: boolean; apiRefusal?: boolean; retrySuppressed?: boolean; retryNextAt?: number | null; retryTries?: number | null; }   // awaitingWhy/awaitingTasks = what an awaitingBg session is waiting on (kernel _session_awaiting's phrasing + the live awaited task descriptions) — the #bg-tasks box renders it when no tracked tasks claim the box (renderAwaitWhy; the user 2026-08-13, who moved it out of the statusline the same day PR #350 put it there)   // retrySuppressed = the user interrupted this thread's API-error storm → romp's auto-retry stays OFF for it until a successful turn re-arms (the user 2026-07-06). backend = "tmux" | "sdk"; apiTooLong = the "blocked" is a "prompt is too long" error (on you → red tab) vs a transient API error (amber/retrying); apiSpendLimit = a monthly spend cap (on you → raise it; NEVER auto-retried — retrying can't fix it, the user 2026-07-14); apiModelLimit = this session's MODEL is out of allowance (on you → switch model or add credits; not auto-retried either, the user 2026-08-01); apiRefusal = the model's safeguards refused the prompt itself (on you → rewrite it or drop the thread; never auto-retried — a refusal is deterministic on the same input, so a retry just manufactures the same refusal, the user 2026-08-15); ctxColor = the GLOBAL colormap's RGB for the context%, computed server-side; modelColor/effortColor = the same map's RGB tint for the model name + effort (by capability/effort rank), server-computed; modelPending = a /model switch is resolving → the badge shows switching-dots until the new name lands (server-driven, event-based, the user 2026-07-03); fast = the CLI's fast-mode state ("on"/"off"/"cooldown", from the SDK init's fast_mode_state; absent = unknown/unavailable → no fast badge)
 interface Color { bg: string; fg: string; }
 // A run_in_background task surfaced in the #bg-tasks box (the kernel's _bg_tasks): a one-line summary +
 // status, expandable to the command + its output. status = running | completed | failed. For a dispatched
@@ -1911,8 +1911,10 @@ function paintRailSticky(): void {
     // pane's left edge: "2 days ago" at 0.68em is wider than the 47px gutter, and a box pinned to
     // the gutter clipped its leading digit at the pane edge (the user 2026-08-18, with a
     // screenshot). When it doesn't fit, the label slides right just enough to stay whole.
-    day.style.left = Math.max(2, gRect!.right - dayW) + "px";
-    day.style.top = Math.max(cTop + 1, slotTop - dayH - 1) + "px";
+    // +1 right / -3 up from the geometric position (the user 2026-08-22): a hair of breathing room
+    // between the label, the pane edge, and the stamp below it
+    day.style.left = Math.max(3, gRect!.right - dayW + 1) + "px";
+    day.style.top = Math.max(cTop + 1, slotTop - dayH - 4) + "px";
     day.style.display = "";
   };
   // The tracked turn's OWN stamp leads the top slot while it is at or below the slot line — it scrolls up
@@ -3150,6 +3152,10 @@ function restoreToComposer(text: string) {
 // never touched — the toast alone covers it.
 const pendingCancelRestores = new Map<string, { before: string; after: string }>();
 
+// The refusal card's remedy line, ONE string: renderApiError's initial write and apiRetryTick's
+// per-second re-assert both read it, so the card and the tick can never drift into different words.
+const REFUSAL_REMEDY = "the model's safeguards refused this prompt — rewrite it or drop this thread";
+
 // The turn stopped on an API error — the session is BLOCKED until retried. A red-dot card at the bottom
 // (so it stands out, the user 2026-06-16) carrying the error text + a red "API error" badge and a Retry
 // button that pastes "retry" into the session to resume the stalled turn.
@@ -3176,7 +3182,11 @@ function renderApiError(ev: Extract<ChatEvent, { kind: "apiError" }>): HTMLEleme
   // changes or its own window resets, so the card names the fix instead of offering a button that cannot work.
   // A dead CREDENTIAL is the same shape (the user 2026-08-08, per-session auth): retrying re-presents the
   // broken login/key forever — the fix is /login, the key, or switching which one the session bills.
-  const spendCap = !!st?.apiSpendLimit || !!st?.apiModelLimit || !!st?.apiAuthErr;
+  // A safeguards REFUSAL too (the user 2026-08-15): a refusal is deterministic on the same input — a
+  // retry re-sends the same prompt and manufactures the same refusal — so no button; the line below
+  // names the real fix (rewrite the ask, or drop this thread).
+  const refusal = !!st?.apiRefusal;
+  const spendCap = !!st?.apiSpendLimit || !!st?.apiModelLimit || !!st?.apiAuthErr || refusal;
   if (!spendCap) {
     const retry = el("button", "apierror-retry") as HTMLButtonElement;
     retry.textContent = "Retry now";
@@ -3193,7 +3203,8 @@ function renderApiError(ev: Extract<ChatEvent, { kind: "apiError" }>): HTMLEleme
       setTimeout(() => { if (retry.isConnected) { retry.disabled = false; retry.textContent = "Retry now"; } }, 2500);
     });
     head.appendChild(retry);
-  } else if (st?.backend === "tmux") {
+  } else if (st?.backend === "tmux" && !refusal) {
+    // (a refusal parks no menu — the Esc-sender below is for the CLI's spend-limit dialog only)
     const dismiss = el("button", "apierror-retry") as HTMLButtonElement;   // same button chrome, different verb
     dismiss.textContent = "Dismiss dialog";
     dismiss.title = "the terminal is showing the spend-limit menu — send Esc to close it (cancels; changes no billing setting)";
@@ -3210,7 +3221,8 @@ function renderApiError(ev: Extract<ChatEvent, { kind: "apiError" }>): HTMLEleme
   // Per-thread suppression (the user 2026-07-06): the user interrupted THIS thread's storm → its auto-retry is
   // held off until a successful turn re-arms it. Distinct from the global pause; "Retry now" + a message still work.
   const suppressed = activeId ? !!sessions.get(activeId)?.status.retrySuppressed : false;
-  if (spendCap) countdown.textContent = "spend limit reached — raise it at claude.ai/settings/usage";   // never "retrying soon…": the tick skips spend-capped threads
+  if (refusal) countdown.textContent = REFUSAL_REMEDY;   // never "retrying soon…": a refusal is deterministic, and the tick RE-ASSERTS this line every second
+  else if (spendCap) countdown.textContent = "spend limit reached — raise it at claude.ai/settings/usage";   // never "retrying soon…": the tick skips spend-capped threads
   else if (paused) countdown.textContent = retryPausedText();   // a usage-limit pause counts down to the window reset
   else if (suppressed) countdown.textContent = "auto-retry stopped for this session — send a message to resume";
   const stop = el("button", "apierror-stop") as HTMLButtonElement;
@@ -3272,7 +3284,9 @@ function apiRetryTick(): void {
     // never auto-retried — the card asks you to raise it instead (the global pause it engages also gates this).
     // A spent MODEL allowance (apiModelLimit) is out for the same reason: every retry re-fails until the
     // user switches model or tops up, and the card says exactly that (the user 2026-08-01).
-    sessions.forEach((s, id) => { if (s.status.state === "blocked" && !s.status.retrySuppressed && !s.status.apiSpendLimit && !s.status.apiModelLimit && !s.status.apiAuthErr) blocked.add(id); });
+    // A safeguards REFUSAL (apiRefusal) is out too (the user 2026-08-15): a refusal is deterministic on
+    // the same input, so every retry re-sends the same prompt and manufactures the same refusal.
+    sessions.forEach((s, id) => { if (s.status.state === "blocked" && !s.status.retrySuppressed && !s.status.apiSpendLimit && !s.status.apiModelLimit && !s.status.apiAuthErr && !s.status.apiRefusal) blocked.add(id); });
     apiRetryNext.forEach((_, id) => { if (!blocked.has(id)) apiRetryNext.delete(id); });   // recovered / suppressed → stop
     blocked.forEach((id) => {
       // The kernel owns the cadence now (the user 2026-07-29): it backs each outage's attempts off up to
@@ -3301,7 +3315,13 @@ function apiRetryTick(): void {
   const cd = cds.length ? (cds[cds.length - 1] as HTMLElement) : null;
   if (cd) {
     const active = activeId ? sessions.get(activeId) : null;
-    if (globalRetryPaused) {
+    if (active?.status.apiRefusal) {
+      // A refusal is never auto-retried, so there is no countdown to show — hold the remedy line.
+      // FIRST in the ladder: the global pause is about auto-retry, which a refusal never gets. Writing
+      // (not skipping) each tick also heals the Stop/Resume-all handler's blanket countdown rewrite
+      // within a second, without that handler needing per-session context.
+      cd.textContent = REFUSAL_REMEDY;
+    } else if (globalRetryPaused) {
       cd.textContent = retryPausedText();
     } else if (active?.status.retrySuppressed) {
       cd.textContent = "auto-retry stopped for this session — send a message to resume";
@@ -4072,9 +4092,10 @@ function renderTabs() {
     const st = s.status.state;
     if (st === "working") tab.classList.add("tab-working");
     // "blocked" is an API error. An on-YOU one — "prompt is too long" (compact), a monthly spend cap (raise it,
-    // the user 2026-07-14), or a spent model allowance (switch model, the user 2026-08-01) — is alarm-red dashed; a TRANSIENT API error is auto-retrying and needs no attention → the
+    // the user 2026-07-14), a spent model allowance (switch model, the user 2026-08-01), or a safeguards
+    // refusal (rewrite the ask, the user 2026-08-15) — is alarm-red dashed; a TRANSIENT API error is auto-retrying and needs no attention → the
     // amber retrying treatment, not red (the user 2026-06-29).
-    else if (st === "blocked") tab.classList.add((s.status.apiTooLong || s.status.apiSpendLimit || s.status.apiModelLimit || s.status.apiAuthErr) ? "tab-blocked" : "tab-retrying");
+    else if (st === "blocked") tab.classList.add((s.status.apiTooLong || s.status.apiSpendLimit || s.status.apiModelLimit || s.status.apiAuthErr || s.status.apiRefusal) ? "tab-blocked" : "tab-retrying");
     else if (st === "needsInput" || st === "awaiting") tab.classList.add("tab-awaiting");   // legacy name = an older remote kernel
     else if (st === "retrying") tab.classList.add("tab-retrying");       // amber: soft-blocked on an API auto-retry
     else if (st === "compacting" || st === "clearing") tab.classList.add("tab-compacting");   // both: a context op in flight

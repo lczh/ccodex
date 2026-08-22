@@ -2155,6 +2155,8 @@ class SdkSession:
                  % ((": " + dropped) if dropped else ""))})
         except Exception as e:
             self.backend._log("rewind (%s): could not tell the chat the rewind failed: %s" % (self.name, e))
+        # the conversation is unchanged → the kernel RESTORES the cards its gesture-time hold hid
+        self.backend._rewind_resolved(self.sid, "failed")
         self.backend._poke()
 
     def _learn_model(self, pm):
@@ -2450,6 +2452,9 @@ class SdkSession:
                     self.backend._update_reg(self.sid, rewindTo="", rewindLeaf="", rewindBare=False)
                 except Exception as e:
                     self.backend._log("rewind (%s): registry clear failed after the turn landed: %s" % (self.name, e))
+                # the BRANCH-TAKE event: the settled turn is the new branch's first landed record —
+                # the kernel's held goal cleanup archives on exactly this (two-phase rewind timing)
+                self.backend._rewind_resolved(self.sid, "taken")
             self.backend._turn_completed(self.sid)   # a landed result re-arms the crash-resume budget
             self._mark("waiting")
             self.backend.retire_live_work(self.sid)   # turn over → a work atom that never landed never will
@@ -2922,6 +2927,20 @@ class SdkBackend:
         self._heal_attempts: dict[str, int] = {}  # sid -> crash-resume attempts since its last COMPLETED turn
         #                                           (bounds _heal_cut_session to one resume per cut; a completed
         #                                           turn resets it, so a crash LOOP can't respawn forever)
+        self._drive_marks: dict[str, tuple] = {}  # sid -> (path, pos, ts) of the last idle-queue drive's newest
+        #                                           DRIVEN wrapper — the in-memory face of the reg's driveMark
+        #                                           (the per-watermark latch; see drive_idle_queue)
+        self._drive_inflight: set[str] = set()    # sids a drive worker currently carries: acceptance stands
+        #                                           down on these WITHOUT latching, so two workers can never
+        #                                           overlap on one sid — an overlap let a stand-down's mark
+        #                                           restore clobber the newer worker's watermark and the model
+        #                                           heard the same notifications twice (2026-08-18 review)
+        self._spawn_sem = threading.Semaphore(BOOT_RESUME_CONCURRENCY)   # the ONE machine-wide spawn-stagger
+        #                                           budget: boot reconcile's resume sweep AND the idle-queue
+        #                                           drive's dormant spawns draw slots from this same semaphore
+        #                                           (as two same-sized budgets they burst to 2x the cap after
+        #                                           a restart — 2026-08-18 review); a spawn holds its slot
+        #                                           until the CLI proves up or its thread dies
         # Kernel-restart heal: nothing is running yet, so any alive session still reading awaiting:true is stale
         # — its background tasks (and the Stop hook that clears the overlay) died with the previous kernel. Left
         # uncleared it reads working/awaiting forever, climbing a ghost work-timer (reorder_bug 2026-06-24).
@@ -3069,9 +3088,13 @@ class SdkBackend:
                 self._poke()
             # STAGGERED spawn (see BOOT_RESUME_CONCURRENCY): every reg above is already fixed —
             # queues persisted, heals applied — so even a death mid-stagger loses nothing (the next
-            # boot's sweep picks the rest up). Spawns hold a semaphore slot until the session's CLI
-            # is past its catch-up burst (init message) or its thread dies (_fire_boot_settled);
-            # the acquire timeout is a loud BACKSTOP for a pre-init wedge, never the pacing itself.
+            # boot's sweep picks the rest up). Spawns hold a slot on the backend-wide _spawn_sem —
+            # SHARED with the idle-queue drive, whose first ticks run inside this very stagger
+            # window, so the two together never exceed the one machine-wide budget — until the
+            # session's CLI is past its catch-up burst (init message) or its thread dies
+            # (_fire_boot_settled); the acquire timeout is a loud BACKSTOP for a pre-init wedge,
+            # never the pacing itself (and an expired backstop holds NO slot, so nothing releases —
+            # a stray release would permanently inflate the process-lifetime budget).
             # NO resume gate (the user 2026-07-22). The high-context hold used to divert these sessions
             # behind a Proceed / Compact on resume / Skip card; that card is cut. It went stale the moment
             # anything else resumed the session (nothing ever retired it), and its premise did not hold
@@ -3079,19 +3102,196 @@ class SdkBackend:
             # Compact each paid in full the reload the gate existed to avoid, leaving Skip as the only
             # option that did what the card said. Context is managed by hand for now. Every cut/queued
             # session resumes here, exactly as it did before the gate.
-            sem = threading.Semaphore(BOOT_RESUME_CONCURRENCY)
             for sid in to_start:
-                if not sem.acquire(timeout=BOOT_RESUME_SLOT_S):
+                slot = self._spawn_sem.acquire(timeout=BOOT_RESUME_SLOT_S)
+                if not slot:
                     self._log("boot reconcile: resume slot backstop expired (a CLI is wedged "
                               "pre-init?) — continuing the sweep anyway")
                 try:   # same per-session isolation as above: one bad spawn must not strand the rest
-                    self._ensure(sid, on_boot_settled=sem.release)
+                    self._ensure(sid, on_boot_settled=(self._spawn_sem.release if slot else None))
                 except Exception:
-                    sem.release()   # the parked release never got attached — free the slot here
+                    if slot:
+                        self._spawn_sem.release()   # the parked release never got attached — free the slot here
                     self._log("boot reconcile: spawn %s failed (sweep continues): %s"
                               % (sid, traceback.format_exc()))
         except Exception:
             self._log("boot reconcile failed: %s" % traceback.format_exc())
+
+    def drive_idle_queue(self, cands, wait: bool = False) -> None:
+        """Deliver wake signals stuck in a STUCK-regime session's CLI queue (the user 2026-08-18; the
+        two-regime story — in MOST sessions the CLI delivers this class itself from idle, and the
+        kernel tick's age floor keeps those out of here — lives on kernel._undelivered_wake_tail's
+        comment block). Each candidate is {sid, path, entries, mark} from the kernel's tick: the
+        transcript's still-pending enqueues and the newest one's (pos, ts) watermark. The same
+        recovery boot reconcile performs for romp's persisted queues, for the queue that lives in the
+        CLI: reconnect if dormant, then deliver — via enqueue(), the exact channel restored queues
+        ride, carrying the CLI's OWN queued texts verbatim (joined in queue order), never a synthetic
+        prompt. Gates, each an exact event, checked at acceptance AND re-checked at the send moment
+        in _drive_deliver (acceptance alone was a TOCTOU hole — a turn could open while earlier
+        candidates in the batch spawned their CLIs):
+          * an OPEN turn / compaction / clearing / a pending rewind stands down WITHOUT latching —
+            the next parse re-checks once the operation settles. Mid-turn arrivals SURVIVE the parse
+            (a turn's records clear only the entries whose text they carry — see
+            _undelivered_wake_tail) and drive once the turn settles;
+          * an ENDED session (reg alive=False) never revives for housekeeping, and a CUT turn (any
+            machine-active state tail — 'working'/'retrying'/'compacting', boot reconcile's own cut
+            discriminator) belongs to the boot/crash resume machinery;
+          * a recorded launchError stands down (the usage-limit queue hold owns that session until a
+            connect proves the CLI up again);
+          * ONE DRIVE PER WATERMARK: the newest driven wrapper's (path, pos, ts) — the tick marks
+            the aged subset it hands over, so a still-young entry stays past the mark and drives
+            once aged — is latched IN MEMORY the moment a drive is accepted — that alone stops the
+            next tick's re-parse re-firing while the worker is in flight — and persisted to the reg
+            (driveMark) only AFTER the enqueue lands, in _drive_deliver: a kernel death between
+            acceptance and delivery leaves the reg unlatched, so the next boot's tick re-produces
+            the candidate and drives it, instead of a persisted-at-acceptance mark silently
+            discarding the never-delivered backlog forever. Only a NEWER enqueue re-arms, and a
+            re-armed drive delivers only the entries past the previous mark. A drive that fails
+            AFTER the enqueue stays latched on purpose — the failure is problem-ring loud, and a
+            recurring signal's next enqueue re-arms — never a silent retry storm.
+          * ONE WORKER PER SID (_drive_inflight): while a worker carries a sid, acceptance stands
+            down WITHOUT latching even for a strictly newer enqueue — the next parse re-checks,
+            like every other gate. Overlapping workers double-delivered: the first one's send-moment
+            stand-down restored its pre-acceptance mark over the second's newer latch, the restored
+            mark re-drove the whole backlog, and the second worker then delivered its slice again.
+            Acceptance runs only on the pusher tick thread, so check-then-add cannot race another
+            acceptor; a worker's discard racing the check at worst defers one tick.
+        Delivery runs on a worker thread (`wait=True` runs it inline, the test seam); see
+        _drive_deliver for the send-moment re-resolve/re-check and the spawn stagger, which draws on
+        the SAME _spawn_sem budget as boot reconcile — one machine-wide BOOT_RESUME_CONCURRENCY cap,
+        not two."""
+        todo = []
+        for c in cands:
+            sid = str(c.get("sid") or "")
+            try:
+                if sid in self._drive_inflight:
+                    continue               # a worker already carries this sid — stand down WITHOUT
+                #                            latching (even for a newer enqueue); the next parse
+                #                            re-checks, and overlap is double delivery (docstring)
+                path = str(c.get("path") or "")
+                pos, ts = c["mark"]
+                prev = self._drive_marks.get(sid)
+                if prev is None:
+                    pm = (read_reg(self.state_dir, sid) or {}).get("driveMark")
+                    prev = ((str(pm.get("path") or ""), pm.get("pos", -1), str(pm.get("ts") or ""))
+                            if isinstance(pm, dict) else ("", -1, ""))
+                    self._drive_marks[sid] = prev
+                fresh = prev[0] != path or pos > prev[1] or ts > prev[2]
+                if not fresh:
+                    continue                       # this backlog was already driven; a newer enqueue re-arms
+                with self._lock:
+                    s = self.sessions.get(sid)
+                s = s if (s and s.thread.is_alive()) else None
+                if s is not None:
+                    if s.ended or s.inflight > 0 or s._compacting or s._clearing \
+                            or (s._rewind_to and not s._rewind_armed):
+                        continue                   # mid-operation → stand down, no latch: re-check next parse
+                else:
+                    reg = read_reg(self.state_dir, sid)
+                    if not reg or not reg.get("alive"):
+                        continue                   # the user ended this session — never revive it for housekeeping
+                    if reg.get("launchError"):
+                        continue                   # can't even start (usage limit etc.) — that hold owns it
+                    if last_state_value(self.state_dir, sid) in ("working", "retrying", "compacting"):
+                        continue                   # a CUT turn — any MACHINE-ACTIVE last state, the same
+                    #                                discriminator boot reconcile uses (a restart mid-retry or
+                    #                                mid-compact cuts the turn exactly as a working cut does) —
+                    #                                is the boot/crash resume machinery's recovery, not the drive's
+                texts = [e["text"] for e in c["entries"]
+                         if e.get("wrapper") and e.get("text")
+                         and (prev[0] != path or e["pos"] > prev[1] or e["ts"] > prev[2])]
+                if not texts:
+                    continue                       # every wake signal here was already driven
+                others = sum(1 for e in c["entries"] if e.get("text") and not e.get("wrapper"))
+                # LATCH in memory only: one drive per watermark within this process. The reg's
+                # driveMark is written by _drive_deliver AFTER the enqueue lands — persisting here
+                # made a kernel death in the latch→delivery window (seconds to minutes behind the
+                # spawn stagger) discard the backlog forever, silently (2026-08-18 review).
+                self._drive_marks[sid] = (path, pos, ts)
+                self._drive_inflight.add(sid)     # released in _drive_deliver's finally, whatever path
+                todo.append((sid, texts, others, (path, pos, ts), prev))
+            except Exception:
+                self._log("idle-queue drive (%s): %s" % (sid[:8] or "?", traceback.format_exc()))
+        if not todo:
+            return
+        if wait:
+            self._drive_deliver(todo)
+        else:
+            threading.Thread(target=self._drive_deliver, args=(todo,),
+                             name="sdk-idle-queue-drive", daemon=True).start()
+
+    def _drive_deliver(self, todo) -> None:
+        """The idle-queue drive's delivery half (worker thread): re-resolve each session and re-check
+        the stand-down gates at the SEND moment, reconnect dormant candidates under the shared spawn
+        stagger, then enqueue each backlog as one turn and persist its watermark. Loud both ways:
+        every drive logs one kernel-log line naming the session and the queued count (normal
+        operation, not a problem); every failure — a refused reconnect, a failed send — lands in the
+        problem ring, never silent."""
+        for sid, texts, others, mark, prev in todo:
+            try:
+                # Re-resolve at the send moment, never the acceptance-time snapshot: earlier
+                # candidates' spawns can hold this delivery back for minutes, and a session that died
+                # and respawned in that window must get its LIVE object — enqueueing into the stale
+                # one mirrored the dead queue over reg['queue'] and the texts evaporated with the
+                # object, latched against any re-drive (2026-08-18 review, repro-verified).
+                with self._lock:
+                    s = self.sessions.get(sid)
+                s = s if (s and s.thread.is_alive()) else None
+                if s is not None:
+                    if s.ended or s.inflight > 0 or s._compacting or s._clearing \
+                            or (s._rewind_to and not s._rewind_armed):
+                        # The acceptance gates, re-checked at the send moment: a turn that opened
+                        # while earlier candidates spawned must not have stale pings injected into
+                        # it. Stand down WITHOUT latching — restore the pre-acceptance mark (the reg
+                        # was never written); the next parse re-checks once the operation settles,
+                        # and the surviving tail re-drives then. Unconditional restore is safe ONLY
+                        # because _drive_inflight bars a second worker for this sid: with overlap,
+                        # this write clobbered a newer drive's watermark and double-delivered.
+                        self._drive_marks[sid] = prev
+                        self._log("idle-queue drive (%s): a turn opened between acceptance and "
+                                  "delivery — standing down; the next parse re-checks" % sid[:8])
+                        continue
+                else:
+                    slot = self._spawn_sem.acquire(timeout=BOOT_RESUME_SLOT_S)
+                    if not slot:
+                        self._log("idle-queue drive: stagger slot backstop expired (a CLI is wedged "
+                                  "pre-init?) — driving %s anyway" % sid[:8], problem=True)
+                    try:
+                        s = self._ensure(sid, on_boot_settled=(self._spawn_sem.release if slot else None))
+                    except Exception:
+                        if slot:
+                            self._spawn_sem.release()   # the parked release never got attached (or can
+                            #                             never fire: an unstarted thread runs no finally)
+                            #                             — free the slot, then fail loud below
+                        raise
+                    if s is None:
+                        self._log("idle-queue drive (%s): the session could not be started (reconnect "
+                                  "refused) — %d queued notification(s) stay undelivered"
+                                  % (sid[:8], len(texts)), problem=True)
+                        continue
+                    # No gate re-check on this arm: a just-spawned session's only possible open turn
+                    # is its persisted-queue seed, and riding behind that in queue order IS correct
+                    # delivery — standing down here would strand the backlog instead.
+                s.enqueue("\n\n".join(texts))
+                try:
+                    # Persist the watermark only now the texts are in the queue (and its reg mirror,
+                    # via enqueue's _persist_queue): a death BEFORE this line re-drives on the next
+                    # boot; a death after enqueue but before this write means at worst one re-drive —
+                    # the same degraded semantics the except below already accepts.
+                    self._update_reg(sid, driveMark={"path": mark[0], "pos": mark[1], "ts": mark[2]})
+                except Exception:
+                    self._log("idle-queue drive (%s): drive mark not persisted (a kernel restart may "
+                              "re-drive this backlog once): %s" % (sid[:8], traceback.format_exc()))
+                self._log("idle-queue drive (%s): waking the session for %d queued notification(s)%s"
+                          % (s.name, len(texts),
+                             " (+%d other queued item(s))" % others if others else ""))
+                self._poke()
+            except Exception:
+                self._log("idle-queue drive (%s): delivery failed: %s" % (sid[:8], traceback.format_exc()))
+            finally:
+                self._drive_inflight.discard(sid)   # every exit — delivery, stand-down, refused
+                #                                     reconnect, raise — frees the sid for the next
+                #                                     parse's acceptance
 
     def drain(self, timeout: float = 2.0, kill=os.kill) -> dict:
         """Graceful-shutdown drain (the kernel's SIGTERM handler): stop every running session cleanly
@@ -3613,6 +3813,10 @@ class SdkBackend:
                 self._log("rewind (%s): registry clear failed: %s" % (sess.name, e))
             self._log("rewind (%s): conversation moved since the request — flag spent, resuming plainly"
                       % sess.name)
+            # ambiguous consumption: the leaf moved either because the take landed pre-crash or
+            # because the old branch grew — the kernel discriminates by the recorded leaf's chain
+            # membership and archives or restores the held cards accordingly
+            self._rewind_resolved(sess.sid, "spent")
         if self.mcp_config:
             kw["mcp_servers"] = self.mcp_config
         # The flag-settings layer carries the two keys the SDK has no typed field for — ultracode
@@ -4067,6 +4271,54 @@ class SdkBackend:
         s.request_reconnect()   # idle → reconnects now; a fresh thread's FIRST connect applies the flag
         self._poke()
         return True, ""
+
+    def rewind_flags(self, sid: str) -> "tuple[str, str, bool]":
+        """The session's armed rewind flags (rewindTo, rewindLeaf, rewindBare) — live session first,
+        registry fallback (a kernel restart mid-window). ("", "", False) when nothing is armed. The
+        kernel's two-phase goal cleanup reads the recorded LEAF here at gesture time: it is the graph
+        anchor its spent-flag discriminator later checks chain membership of."""
+        s = self.sessions.get(sid)
+        if s is not None and not s.ended:
+            return (s._rewind_to or "", s._rewind_leaf or "", bool(getattr(s, "_rewind_bare", False)))
+        reg = read_reg(self.state_dir, sid)
+        if not reg:
+            return ("", "", False)
+        return (reg.get("rewindTo") or "", reg.get("rewindLeaf") or "", bool(reg.get("rewindBare")))
+
+    def rewind_pending(self, sid: str) -> bool:
+        """A rewind flag still APPLICABLE — leaf-verified like the connect path (rewind_disposition
+        against the transcript's CURRENT leaf), never raw flag presence. The kernel's boot pass
+        latches a hold only on this: a flag the transcript already moved past is spent, and its
+        consumption event may never fire (an out-of-band CLI-native continuation while no kernel
+        was up leaves the reg armed indefinitely) — raw presence kept those cards hidden with no
+        resolving event while the leaf-verified pending_cut let the chat render the full tail."""
+        s = self.sessions.get(sid)
+        if s is not None and not s.ended:
+            to, leaf = s._rewind_to or "", s._rewind_leaf or ""
+            cwd, fsid = s.cwd, s.resume_sid or s.sid
+        else:
+            reg = read_reg(self.state_dir, sid)
+            if not reg:
+                return False
+            to, leaf = reg.get("rewindTo") or "", reg.get("rewindLeaf") or ""
+            cwd, fsid = reg.get("cwd") or "~", reg.get("lastSid") or sid
+        if not to:
+            return False
+        return rewind_disposition(to, leaf, last_record_uuid(transcript_path(cwd, fsid))) == "apply"
+
+    def _rewind_resolved(self, sid: str, outcome: str):
+        """Tell the kernel a pending rewind RESOLVED (outcome: "taken" — the branch took; "failed" —
+        the CLI refused, conversation intact; "spent" — the flag was dropped at connect because the
+        leaf moved, ambiguous between a crash-heal take and a dissolved rollback). These are the
+        exact flag-consumption events the kernel's two-phase goal cleanup keys its archive/restore
+        on (rewind-holds); no callback wired (tests, standalone) → no-op."""
+        cb = getattr(self, "rewind_resolved_cb", None)
+        if not cb:
+            return
+        try:
+            cb(sid, outcome)
+        except Exception as e:
+            self._log("rewind (%s): resolve callback failed: %s" % (sid, e))
 
     def pending_cut(self, sid: str) -> str:
         """The uuid a PENDING bare rollback (rollback(), no replacement turn) truncates the conversation

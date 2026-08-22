@@ -395,7 +395,7 @@ class AuthErrorClass(unittest.TestCase):
         self.assertIn('"authErr": _is_auth_error(text)', inspect.getsource(km._api_error))
         self.assertIn('"apiAuthErr": bool(aerr and aerr.get("authErr"))', inspect.getsource(km.build_session))
         feed = inspect.getsource(km.build_feed)
-        self.assertIn('aerr.get("authErr"))))', feed, "the card floors to needs-you")
+        self.assertIn('aerr.get("authErr") or aerr.get("refusal"))))', feed, "the card floors to needs-you")
         self.assertIn("sign-in or API key isn't working", feed, "the card names the real remedy")
 
 

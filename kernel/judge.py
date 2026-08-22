@@ -1463,6 +1463,100 @@ def _fileset_key(files):
         out.append([st.st_mtime, st.st_size])
     return out
 _PARSE_CACHE = {}          # fsid -> (fileset_key, parsed_session)
+
+# ── the pending-cut wire (the rewind goal-cleanup fix, 2026-08-17) ──
+# A PENDING bare rollback (chat delete) writes NOTHING to the transcript, so for its whole armed
+# window — unbounded; the user's next message may never come — the file leaf IS the abandoned tail.
+# The kernel's display parse has honored the cut since 2026-07-16 (leaf_override=pending_cut), but
+# the judge parse never did: every judge pass walked the deleted tail as the ACTIVE chain and the
+# planner's hard mint floors ("a user message never silently vanishes") GUARANTEED orphan goals from
+# it, which the one-shot t>=cut_t sweep — already run at gesture time — never re-caught, and the
+# auto-nudge then quoted back into a conversation with no memory of the ask (the g44 shape, proven
+# live 2026-08-16). The cut lives on the backend (sdk pending_cut); the kernel wires it in here so
+# parsed_session can pass the same leaf_override the display parse uses. No provider (standalone
+# romp-judge runs, tests that don't care) → "" — the pre-fix behavior.
+_PENDING_CUT_FN = None
+
+
+def set_pending_cut_provider(fn):
+    """Kernel wiring: fn(fsid) -> the armed bare rollback's cut uuid, or ''. See the note above."""
+    global _PENDING_CUT_FN
+    _PENDING_CUT_FN = fn
+
+
+def _pending_cut(fsid):
+    if _PENDING_CUT_FN is None:
+        return ""
+    try:
+        return str(_PENDING_CUT_FN(fsid) or "")
+    except Exception as e:
+        # fail LOUDLY, then degrade to the pre-fix behavior (parse the un-cut world) — a broken
+        # provider must not silently hide the conversation, but it must be visible in the log
+        _log_judge_error("romp", fsid, "pending-cut",
+                         note="pending-cut provider failed: %r — judging the un-cut world this pass" % e)
+        return ""
+
+
+def _judge_candidates(fsid, files):
+    """The judge parse's candidate transcript set: the leaf plus the session's anchor <fsid>.jsonl
+    when the leaf is a fork (SDK /clear: discover hands the lastSid file under the stable romp sid).
+    Shared by parsed_session and the write-moment chain checks so both walk the same graph."""
+    leaf = Path(files[0])
+    anchor = leaf.with_name(fsid + ".jsonl")
+    if anchor.name != leaf.name and anchor.exists():
+        return list(files) + [str(anchor)]
+    return list(files)
+
+
+def _rewound_away(fsid, path, uuid):
+    """WRITE-MOMENT chain check: does `uuid` PROVABLY sit on a rewound-away branch RIGHT NOW?
+
+    Deliberately frame-independent: inside a producer pass parsed_session returns the frame-pinned
+    parse — precisely the stale world in which a mid-pass rewind's dead branch still reads active —
+    so this builds a FRESH FileAdapter (cheap: the jsonl reads are append-incremental) over the same
+    inputs the display parse uses, including the backend's pending cut. The one-shot t>=cut_t sweep
+    runs at gesture time and never again; a mint applied after it from a pass framed before it was
+    the primary observed leak (the g44 shape), and this is the stand-down that closes it
+    (CLAUDE.md: a writer whose evidence predates the diary stands down).
+
+    Only "rewind" answers non-False. None/unknown uuids (umbrellas, legacy nodes, synthetic
+    orphan:<t> salvage ids, cross-file uuids outside the lineage) answer False — abandonment can't
+    be proven, and a false stand-down silently drops a real ask. "clear" is /clear jurisdiction;
+    "broken" is kept by design. A check that itself fails logs loudly and answers False (the
+    pre-fix behavior), never silently blocks a mint.
+
+    The verdict is TWO-VALUED because the evidence comes in two strengths (2026-08-17):
+    "durable" — the branch-take is ON DISK; the rewind happened and can never un-happen, so a
+                caller may act irreversibly (retire the placement key).
+    "pending" — the uuid is abandoned only under the backend's ARMED, unconsumed cut (a bare
+                rollback's window). That rewind can still fail or dissolve, and a placements[key]
+                = None retirement is permanent (_placed_key reads bare membership; nothing ever
+                pops a None key) — so callers must DEFER (skip without writing) and let the next
+                pass re-decide from whichever world the cut resolves into. Retiring here silently
+                dropped a live ask forever when the rollback dissolved: the restore leg brings
+                back hidden CARDS, but an ask retired before its card existed had nothing to
+                restore."""
+    if not uuid:
+        return False
+    try:
+        states = STATESDIR / (fsid + ".jsonl")
+        cut = _pending_cut(fsid)
+        mem = em.chain_membership(path, candidate_files=_judge_candidates(fsid, [str(path)]),
+                                  states=str(states) if states.exists() else None,
+                                  leaf_override=cut or None)
+        if uuid not in mem["rewind"]:
+            return False
+        if not cut:
+            return "durable"                           # proven from the on-disk graph alone
+        on_disk = em.chain_membership(path, candidate_files=_judge_candidates(fsid, [str(path)]),
+                                      states=str(states) if states.exists() else None)
+        return "durable" if uuid in on_disk["rewind"] else "pending"
+    except Exception as e:
+        _log_judge_error("romp", fsid, "chain-check",
+                         note="write-moment chain check failed: %r — minting anyway (pre-fix behavior)" % e)
+        return False
+
+
 def _sdk_owned(fsid):
     """True if FSID is an SDK-backed session — mirrors the SDK backend's owns() (a registry file under
     STATE/sdk/<fsid>.json, written when the SDK session is created). The judge MUST know this so it can author
@@ -1543,13 +1637,19 @@ def parsed_session(fsid, files, now):
     # the session's anchor transcript among the candidates, so a fork whose chain back-links across files
     # (a resume-style fork) keeps its history — the FileAdapter walk crosses files by design, and a /clear
     # fork (parentUuid null at the head) still drops pre-clear history naturally.
-    leaf = Path(files[0])
-    anchor = leaf.with_name(fsid + ".jsonl")
-    if anchor.name != leaf.name and anchor.exists():
-        files = list(files) + [str(anchor)]
+    files = _judge_candidates(fsid, files)
+    # A PENDING bare rollback truncates the judge's world exactly as it truncates the display parse
+    # (leaf_override — the wire note at _PENDING_CUT_FN): during the armed window plan_units never
+    # yields the abandoned turns at all, so the orphan-goal source is closed where it opens instead of
+    # being caught mint-by-mint. The cut rides the CACHE KEY (the kernel _parse's own lesson): arming
+    # and clearing both change the parse with NO file change. No PLACEMENTS_V bump: the override only
+    # SHRINKS the atom set, transiently, while a cut is armed — segment identity for everything kept is
+    # unchanged, and no previously-invisible atom ever becomes a fresh plannable segment (the two drift
+    # shapes the version exists for).
+    cut = _pending_cut(fsid)
     key_files = list(files) + ([str(states)] if states.exists() else [])
     try:
-        key = _fileset_key(key_files)
+        key = (_fileset_key(key_files), cut)
     except OSError:
         key = None
     hit = _PARSE_CACHE.get(fsid)
@@ -1557,7 +1657,8 @@ def parsed_session(fsid, files, now):
         return hit[1]
     session = em.parse_session(files[0], rompuuid=fsid, candidate_files=list(files),
                                states=str(states), postal_log=str(MESSAGES), now=now,
-                               sdk_human=_sdk_owned(fsid))   # SDK session → composer input is promptSource "sdk" = the human (mirrors the kernel)
+                               sdk_human=_sdk_owned(fsid),   # SDK session → composer input is promptSource "sdk" = the human (mirrors the kernel)
+                               leaf_override=cut or None)
     if key is not None:
         if len(_PARSE_CACHE) > 256:        # bounded by fleet size; a wholesale clear on overflow is fine
             _PARSE_CACHE.clear()
@@ -2273,6 +2374,44 @@ def _rebase_onto_disk(fsid, store):
             for rec in (snd.get("mergedFrom") or []):
                 if rec.get("id"):
                     tomb[rec["id"]] = sid_
+    # REWIND TOMBSTONES (2026-08-17): same presence-is-not-truth rule for rewind-swept nodes, which
+    # have no surviving twin to hang a mergedFrom on — the sweep records store-level rewindSwept
+    # markers instead. An id named there on EITHER side is deleted (its archive copy is the durable
+    # record; unseen diary rows on a stale twin drop with it — the pre-sweep archive copy is the
+    # kept truth). Both orderings need this: a pre-sweep loader saving post-sweep reads the marker
+    # from DISK; the sweep's own save rebasing over a mid-flight publish reads its OWN. The union
+    # is folded back so the marker itself survives the rebase.
+    #
+    # A user restore does NOT merely pop the marker (a pop is not durable: a writer whose snapshot
+    # predates the restore re-unions its stale marker right back and re-kills the node the user just
+    # brought back — proven by the review). Both restore sites pop AND stamp store-level
+    # rewindRestored[nid]; both maps union max-per-nid here, and a marker whose restore stamp is
+    # at/after its sweep stamp is NEUTRALIZED (restore wins ties: the user gesture outranks a
+    # same-second sweep). Both maps persist — ordered durable events — and because a pop can always
+    # be re-unioned back by a stale writer, every superseding event STAMPS PAST the marker it pops
+    # so the max-union converges on the right winner regardless of writer order: a re-sweep that
+    # popped a restore stamps its tombstone strictly after it (archive_goal_nodes, +1 — a bare
+    # equal second would hand its own tombstone to this tie rule), and a restore that popped a
+    # marker stamps at-or-above it (max(rt, marker) — winning the tie is the designed outcome).
+    # The one tie left is a sweep that never OBSERVED the restore it collided with (a pre-cycle
+    # snapshot: nothing to pop, no bump); the restore wins it here, and archive_goal_nodes'
+    # post-save backstop un-archives whatever this rebase hands back, so the node is never
+    # live and archived at once.
+    swept = dict(disk.get("rewindSwept") or {})
+    for k, v in (store.get("rewindSwept") or {}).items():
+        swept[k] = max(int(v or 0), int(swept.get(k) or 0))
+    restored = dict(disk.get("rewindRestored") or {})
+    for k, v in (store.get("rewindRestored") or {}).items():
+        restored[k] = max(int(v or 0), int(restored.get(k) or 0))
+    eff = {k for k, v in swept.items() if int(restored.get(k) or -1) < int(v)}   # the markers in force
+    if swept:
+        store["rewindSwept"] = swept
+    if restored:
+        store["rewindRestored"] = restored
+    for nid in [n for n in list(m_nodes) if n in eff]:
+        m_nodes.pop(nid)
+        store.get("status", {}).pop(nid, None)
+
     def _fold_log(dead, surv):
         seen = {(e.get("ev_t"), e.get("src"), e.get("kind")) for e in (surv.get("log") or [])}
         add = [e for e in (dead.get("log") or [])
@@ -2288,6 +2427,8 @@ def _rebase_onto_disk(fsid, store):
             _fold_log(dead, surv)
         store.get("status", {}).pop(nid, None)
     for nid, dnd in d_nodes.items():
+        if nid in eff:                               # rewind-swept (and not since restored) → never re-adopted
+            continue
         mnd = m_nodes.get(nid)
         if mnd is None:
             if nid in tomb:                          # deleted by a merge, not minted by the other writer
@@ -2325,6 +2466,11 @@ def _rebase_onto_disk(fsid, store):
         store["lastNode"] = tomb[store["lastNode"]]
     if store.get("lastNode") not in (store.get("nodes") or {}):
         store["lastNode"] = disk.get("lastNode") or store.get("lastNode")
+    if store.get("lastNode") not in (store.get("nodes") or {}):
+        # both writers' focus was rewind-swept → re-point at the newest survivor, exactly as the
+        # sweep itself does (a dangling focus would prematurely settle the pre-cut focus card)
+        nn = store.get("nodes") or {}
+        store["lastNode"] = (max(nn, key=lambda n: int(nn[n].get("t") or 0)) if nn else None)
     rollup_status(store, session_closed=False)       # re-derive every flag + the status map from the merged logs
 def _overrides_dir():
     """The user-override journal's home, derived from GOALDIR at CALL time (not import time): the
@@ -2415,6 +2561,20 @@ def _replay_overrides(fsid, store):
                 if nid in store.get("nodes", {}) or nid in arch_nodes:
                     continue                           # alive, or re-cleared into the archive → nothing lost
                 store.setdefault("nodes", {})[nid] = GuardedNode(dict(nddata))
+                sv = (store.get("rewindSwept") or {}).pop(nid, None)
+                if sv is not None:
+                    # a user restore outranks the rewind tombstone — pop AND stamp: the pop keeps the
+                    # next save-rebase from re-deleting what the journal just re-inserted, and the
+                    # stamp makes the restore durable against a stale writer re-unioning its old
+                    # marker, and stands the node down from the identity-keyed reconciliation for
+                    # good (its branch's death can never be new information again). Stamped at or
+                    # ABOVE the popped marker (a superseding re-sweep stamps strictly past the
+                    # restore it popped, so the marker can lead wall clock by a second): the rebase
+                    # gives ties to the restore, so max(t, marker) is exactly "this restore wins
+                    # against the marker it popped" — and it is derived from the row's t plus the
+                    # store's own popped value, so every replay of the same row over the same store
+                    # state derives the same stamp.
+                    store.setdefault("rewindRestored", {})[nid] = max(t, int(sv))
                 applied = True
                 st = (ev.get("status") or {}).get(nid)
                 if st is not None:
@@ -2589,39 +2749,74 @@ def load_goal_archive(fsid):
         raw = _read_store_json(path, quarantine=True)
     return _guard_nodes(raw) if raw is not None else {"rompUuid": fsid, "nodes": {}, "status": {}}
 def save_goal_archive(fsid, store):
-    """Replace an archive wholesale.
-    Production read-modify-write callers must use :func:`mutate_goal_archive`; this replacement
-    helper remains for imports/tests that already hold the complete desired value.
-    """
-    path = GOALARCHDIR / (fsid + ".json")
-    with _store_file_lock(path):
-        # Refuse to replace a store we cannot parse. The normal recovery path is load_goal_archive,
-        # which quarantines the bad bytes first and returns a fresh archive to its caller.
-        _read_store_json(path)
-        _atomic_json(path, store)
-def mutate_goal_archive(fsid, mutate):
-    """Run ``mutate(archive)`` and publish its edits in one archive-lock transaction.
-    Atomic rename prevents torn JSON, but archive movers also need the READ and WRITE protected by
-    the same lock: otherwise a compactor adding one node and undo-clear removing another can each
-    publish a stale snapshot and silently erase the other's edit.  The callback's return value is
-    passed through.  An exception publishes nothing, which lets restore journal/live-store failures
-    leave the archive as the durable fallback.
-    Callbacks must not call load_goal_archive/save_goal_archive for this fsid (that would attempt a
-    nested flock on a new fd).  They may save the distinct LIVE goal store: load_goals releases its
-    file lock before archive-aware override replay, so the production restore path has no inverse
-    live-lock -> archive-lock nesting.
-    """
-    path = GOALARCHDIR / (fsid + ".json")
-    with _store_file_lock(path):
-        raw = _read_store_json(path, quarantine=True)
-        archive = (_guard_nodes(raw) if raw is not None
-                   else {"rompUuid": fsid, "nodes": {}, "status": {}})
-        before = json.dumps(archive, sort_keys=True, separators=(",", ":"))
-        result = mutate(archive)
-        if json.dumps(archive, sort_keys=True, separators=(",", ":")) != before:
-            _atomic_json(path, archive)
-        return result
-def drop_goals_after(fsid, cut_t):
+    GOALARCHDIR.mkdir(parents=True, exist_ok=True)
+    tmp = GOALARCHDIR / (fsid + ".json.tmp.%d" % os.getpid())
+    tmp.write_text(json.dumps(store))
+    tmp.rename(GOALARCHDIR / (fsid + ".json"))        # atomic publish
+
+
+# The goals-archive has NONE of save_goals' rev/rebase discipline — save_goal_archive is a blind
+# overwrite — so every load→mutate→save of it must hold this lock (2026-08-17). The rewind work made
+# concurrent same-fsid archivers ROUTINE (the triage-tier reconciler, the backend settle thread's
+# drop_goals_after, the two boot daemons, the WS-thread undo-restore and the compaction sweep), with
+# systematically DIFFERENT move sets — and a lost archive write is no longer a mere live-store
+# resurrection: the rewindSwept tombstone union keeps the dropped node out of the live store too, so
+# the clobber became silent PERMANENT loss (node in NEITHER file), reproduced by the review. All
+# archive mutators live in this one kernel process, so an in-process lock is sufficient; the second
+# writer reloads a base that already holds the first writer's nodes, making its re-archive an
+# idempotent overwrite. Deliberately NOT a save_goals-style union-rebase: undo-clear restores REMOVE
+# nodes from the archive, and a union would resurrect them (the exact node-in-both-files state the
+# audit proved five times).
+_GOAL_ARCH_LOCK = threading.Lock()
+
+
+def swept_ids(store, cut_t, kept=None):
+    """The node ids a rewind at cut_t sweeps: every node BORN at/after cut_t plus its whole subtree
+    (node[\"t\"] is frozen at birth and a child is always born after its parent). ONE definition,
+    shared by drop_goals_after and the kernel's gesture-time card hide, so what the user sees
+    disappear at the delete gesture is exactly what the branch-take archives.
+
+    `kept` (optional): chain_membership's kept-chain uuid set. A node whose promptUuid is provably
+    on the KEPT chain is never selected — not as a seed, and the subtree drag neither adds nor
+    descends through it (its subtree survives unless independently in range) — because the judge's
+    prompt-run mints the replacement ask's card DURING the open rewind turn, with t > cut_t: a bare
+    t-key hid that fresh live-branch card all turn and archived it at the take (2026-08-17). A node
+    with no promptUuid keeps the t-keyed fate (the sweep's whole purpose for unprovable orphans),
+    and kept=None (the caller's lookup failed, loudly) degrades to the pure t-keyed selection.
+
+    A node carrying a rewindRestored stamp is never selected either — the kept exemption's shape,
+    on USER authority instead of chain identity: the user already pulled that card back out of a
+    rewind sweep's archive, its minting branch's death strictly predates the restore gesture, and
+    a LATER rewind whose cut range merely time-overlaps it proves nothing about it — re-archiving
+    would move a card on zero new information, silently overriding an explicit user gesture (and
+    the take's archive would pop the durable stamp, erasing even the reconciler's shield). Only
+    the user's own gesture re-kills a restored card. Mirrors _dead_branch_ids' USER-RESTORED
+    exemption, and holds on the degraded kept=None path too."""
+    cut_t = int(cut_t)
+    nodes = store.get("nodes") or {}
+    kept = kept or frozenset()
+    restored = store.get("rewindRestored") or {}
+
+    def _spared(nid):
+        if nid in restored:                             # user-restored: only their gesture re-kills
+            return True
+        pu = (nodes.get(nid) or {}).get("promptUuid")
+        return bool(pu) and pu in kept
+    children = {}
+    for nid, nd in nodes.items():
+        children.setdefault(nd.get("parentId"), []).append(nid)
+    move, stack = set(), [nid for nid, nd in nodes.items()
+                          if int(nd.get("t") or 0) >= cut_t and not _spared(nid)]
+    while stack:                                        # a born-in-range node drags its whole subtree
+        x = stack.pop()
+        if x in move:
+            continue
+        move.add(x)
+        stack.extend(c for c in children.get(x, []) if not _spared(c))
+    return move
+
+
+def drop_goals_after(fsid, cut_t, kept=None):
     """Roll a session's GOAL STORE back to just before cut_t: archive every goal node BORN at/after cut_t
     (node["t"] >= cut_t), whole subtrees, to goals-archive/. A chat delete/edit abandons every turn at/after
     cut_t, so a card MINTED from one of those now-gone turns is an orphan and goes with them (the user
@@ -2631,48 +2826,317 @@ def drop_goals_after(fsid, cut_t):
     those would mean surgically truncating the append-only diary AND the durable override journal that
     re-applies user actions on every load — far more machinery than the case is worth (the user chose this
     simpler shape over a full verdict revert). node["t"] is frozen at birth and a child is always born after
-    its parent, so a born-in-range top drags its whole subtree.
+    its parent, so a born-in-range top drags its whole subtree. `kept` threads through to swept_ids
+    (the kept-chain exemption — the replacement ask's own fresh card is minted DURING the rewind
+    turn and must survive the take).
+
     Returns the number of nodes archived. No-op-safe (absent/empty store, or nothing in range → 0)."""
     cut_t = int(cut_t)
     store = load_goals(fsid)
     nodes = store.get("nodes") or {}
     if not nodes:
         return 0
-    children = {}
-    for nid, nd in nodes.items():
-        children.setdefault(nd.get("parentId"), []).append(nid)
-    move, stack = set(), [nid for nid, nd in nodes.items() if int(nd.get("t") or 0) >= cut_t]
-    while stack:                                        # a born-in-range node drags its whole subtree
-        x = stack.pop()
-        if x in move:
-            continue
-        move.add(x)
-        stack.extend(children.get(x, []))
+    move = swept_ids(store, cut_t, kept=kept)
     if not move:
         return 0
-    status = store.get("status") or {}
-    move_nodes = {nid: nodes[nid] for nid in move if nid in nodes}
-    move_status = {nid: status[nid] for nid in move if nid in status}
-    def _archive_drop(arch):
-        arch.setdefault("nodes", {}).update(move_nodes)
-        arch.setdefault("status", {}).update(move_status)
-        arch["rompUuid"] = store.get("rompUuid", fsid)
-    # Archive FIRST: a crash before the live publish leaves duplicates, never lost nodes.  The
-    # transaction retains unrelated simultaneous compaction/restore edits instead of replacing a
-    # stale archive snapshot.
-    mutate_goal_archive(fsid, _archive_drop)
-    for nid in move:
-        nodes.pop(nid, None)                           # whole-node delete is not a protected-key write
-        status.pop(nid, None)
-    # a dangling lastNode is tolerated (focus→None), but that would prematurely settle the pre-cut focus card;
-    # re-point it at the newest SURVIVING node so rollup_status keeps a sane focus.
-    if store.get("lastNode") not in nodes:
-        store["lastNode"] = (max(nodes, key=lambda n: int(nodes[n].get("t") or 0)) if nodes else None)
-    # removing a born-in-range SUB can change its surviving parent's rolled-up status (a blocked child now
-    # gone), so re-roll the status map from the (unchanged) surviving logs.
-    rollup_status(store, session_closed=False)
-    save_goals(fsid, store)
+    archive_goal_nodes(fsid, store, move, int(time.time()))   # stamp = the SWEEP event's time, never
+    #                                       cut_t: the tombstone-vs-restore ordering compares event
+    #                                       stamps, and the cut record's time predates everything
     return len(move)
+
+
+def archive_goal_nodes(fsid, store, move, tomb_t):
+    """Move `move` (node ids) + their status rows out of the LIVE store into goals-archive/, leaving a
+    rewindSwept tombstone per id so no concurrent save-rebase republishes them (the mergedFrom lesson,
+    2026-08-13, applied to rewinds 2026-08-17: presence-in-a-snapshot is not truth — proven five times
+    in live stores, nodes resident in live AND archive at once). `tomb_t` is the SWEEP EVENT's time
+    (the rebase orders it against rewindRestored stamps — a user restore neutralizes an older-or-tied
+    marker; a sweep superseding a restore pops the stamp and tombstones STRICTLY after it, so no
+    stale re-union of the popped stamp can neutralize the fresh tombstone). Tombstones
+    are never pruned: entries are rare and an undo-clear restore pops its own. Re-points lastNode at
+    the newest survivor (a dangling focus would prematurely settle the pre-cut focus card), re-rolls
+    status (removing a
+    blocked SUB changes its surviving parent's rollup), re-parents any spared child of an archived
+    node at its nearest unmoved ancestor (both selections spare provably live-branch children now,
+    and a dangling parentId loses the node from every walk that starts at the roots), saves both
+    files. The shared primitive of drop_goals_after (t-keyed, at the branch-take) and
+    reconcile_rewound_goals (identity-keyed, when the abandoned-branch set changes). The whole
+    read-modify-write — archive load through both saves — holds _GOAL_ARCH_LOCK so a concurrent
+    sweep pair serializes entirely (see the lock's note: a lost archive write under the tombstones
+    is permanent loss, not resurrection)."""
+    with _GOAL_ARCH_LOCK:
+        nodes = store.get("nodes") or {}
+        status = store.get("status") or {}
+        parent0 = {nid: nd.get("parentId") for nid, nd in nodes.items()}   # pre-pop parents, for the re-parent
+        arch = load_goal_archive(fsid)
+        a_nodes = arch.setdefault("nodes", {}); a_status = arch.setdefault("status", {})
+        swept = store.setdefault("rewindSwept", {})
+        for nid in move:
+            if nid in nodes:
+                a_nodes[nid] = nodes.pop(nid)          # a whole-node dict delete is UNGUARDED (not a PROTECTED key)
+            if nid in status:
+                a_status[nid] = status.pop(nid)
+            # A sweep that OBSERVED a restore stamp supersedes it — pop the stamp and order the
+            # tombstone STRICTLY after it. The rebase gives same-second ties to the restore, and
+            # both stamps are whole seconds, so a bare equal stamp let any stale writer max-union
+            # the popped restore stamp back from disk and neutralize the tombstone this sweep just
+            # wrote (its own save-rebase included, under a mid-flight publish); the +1 encodes the
+            # restore-then-sweep order actually witnessed here under _GOAL_ARCH_LOCK. Both sweep
+            # selections (swept_ids, _dead_branch_ids) spare restored-stamped nodes now, so a
+            # stamped id reaches this pop only in a move set the selections did not vet: a caller
+            # whose snapshot predates the restore (the blind-writer shape the post-save backstop
+            # below resolves) or an explicit user gesture — the one authority above a restore.
+            prev_rt = (store.get("rewindRestored") or {}).pop(nid, None)
+            swept[nid] = max(int(tomb_t), int(prev_rt) + 1) if prev_rt is not None else int(tomb_t)
+        arch["rompUuid"] = store.get("rompUuid", fsid)
+        save_goal_archive(fsid, arch)
+        for nid, nd in nodes.items():                  # spared survivors of archived parents stay reachable
+            p = nd.get("parentId")
+            if p in move:
+                while p is not None and p in move:
+                    p = parent0.get(p)
+                nd["parentId"] = p                     # nearest unmoved ancestor; None → it becomes a top
+        if store.get("lastNode") not in nodes:
+            store["lastNode"] = (max(nodes, key=lambda n: int(nodes[n].get("t") or 0)) if nodes else None)
+        rollup_status(store, session_closed=False)
+        save_goals(fsid, store)
+        # SINGLE-RESIDENCY BACKSTOP: the save's rebase can hand a moved id BACK — a restore this
+        # sweep never observed (its snapshot was loaded before the sweep/restore cycle, so it holds
+        # the node live with no stamp to pop and bump past) can out-stamp the tombstone written
+        # above, and the adopt-wholesale branch then re-adopts the node from disk while its fresh
+        # archive copy sits here — the exact live+archive dual residency the audit named. An id
+        # that came back is provably the restore-won set (re-adoption requires the tombstone this
+        # sweep just stamped to be out of force), so finish what the restore itself would have done
+        # had the copy existed then: un-archive it. Still inside _GOAL_ARCH_LOCK, so the corrective
+        # RMW is race-free against every other archiver.
+        back = [nid for nid in move if nid in (store.get("nodes") or {})]
+        if back:
+            arch = load_goal_archive(fsid)
+            for nid in back:
+                arch.get("nodes", {}).pop(nid, None)
+                arch.get("status", {}).pop(nid, None)
+            save_goal_archive(fsid, arch)
+
+
+def _dead_branch_ids(store, rewind_set, kept_set=frozenset()):
+    """The node ids the reconciliation archives, given the predicate's `rewind` uuid set:
+    - DIRECT: promptUuid provably rewound away — except a node carrying mergedFrom, whose promptUuid
+      may be a merge TRANSPLANT from a dead twin onto a kept-origin survivor (_merge_nodes grafts the
+      dupe's uuid onto a survivor lacking one): mixed provenance proves nothing, keep.
+    - SUBTREE DRAG downward, as drop_goals_after has always done — but NEVER through a child whose
+      OWN promptUuid is in `kept_set` (the active chain): the reconciliation fires days after the
+      rewind, when a zombie top has accumulated real live-branch descendants (the grouper files new
+      work under existing tops — ~90 live goals, 8 open, sat under one dead top on live data). A
+      spared child's subtree survives with it unless independently picked; archive_goal_nodes
+      re-parents survivors at their nearest unmoved ancestor so they stay reachable.
+    - UMBRELLA DRAG upward: a container with NO promptUuid of its own whose every child is going is
+      an empty shell over dead work (the inverted subtree-drag direction a pu-keyed pick misses).
+    - AUTHORITATIVE-OPEN EXEMPTION: a node whose agentTask is open — and its ancestors, so nothing
+      dangles — stays: the live task store pins that card working (Path E is left as-is by decision;
+      the agent may genuinely still hold the to-do, and archiving it would just re-mint a fresh
+      mirror next pass while losing the diary).
+    - USER-RESTORED EXEMPTION: a node carrying a rewindRestored stamp (the user pulled it back out
+      of a rewind sweep's archive) is never re-taken — not directly, not by the drag, not as an
+      umbrella. Its branch's death strictly predates the restore gesture, so re-archiving it moves
+      a card on ZERO new information (the boot memo reset and any later sig change both replayed
+      exactly that, per the review). The t-keyed sweep (swept_ids) spares the stamp the same way,
+      so a restored card is re-killed only by the user's own gesture — a re-clear parks it back in
+      the archive through the compaction path, and the journal replay defers to that."""
+    nodes = store.get("nodes") or {}
+    restored = store.get("rewindRestored") or {}
+    kids = {}
+    for nid, nd in nodes.items():
+        kids.setdefault(nd.get("parentId"), []).append(nid)
+    move = set()
+    for nid, nd in nodes.items():
+        pu = nd.get("promptUuid")
+        if pu and pu in rewind_set and not nd.get("mergedFrom") and nid not in restored:
+            move.add(nid)
+    stack = list(move)
+    while stack:                                       # subtree drag, stopping at kept/restored children
+        for c in kids.get(stack.pop(), []):
+            cpu = (nodes.get(c) or {}).get("promptUuid")
+            if (cpu and cpu in kept_set) or c in restored:
+                continue                               # provably live / user-restored → survives the drag
+            if c not in move:
+                move.add(c)
+                stack.append(c)
+    changed = True
+    while changed:                                     # umbrella drag, to a fixpoint (nested shells)
+        changed = False
+        for nid, nd in nodes.items():
+            if nid in move or nd.get("promptUuid") or nd.get("mergedFrom") or nid in restored:
+                continue
+            ch = kids.get(nid) or []
+            if ch and all(c in move for c in ch):
+                move.add(nid)
+                changed = True
+    protected = set()
+    for nid, nd in nodes.items():
+        if (nd.get("agentTask") or {}).get("status") == "open":
+            x = nid
+            while x is not None and x not in protected:
+                protected.add(x)
+                x = (nodes.get(x) or {}).get("parentId")
+    return move - protected
+
+
+_RECON_MEMO = {}   # fsid -> (fileset key, rewound frozenset, kept frozenset, goal-store key) — the
+#                    reconciliation's event gate, watching BOTH sides of the join: the transcripts
+#                    (the abandoned set can only change with them) AND the goal store (a mint that
+#                    slips past a fail-open guard onto an already-known-dead branch changes only the
+#                    store — the write IS the new information, or the orphan is never re-caught)
+
+
+def _per_file_rewound(fsid, files):
+    """Uuids provably rewound away inside ONE transcript file's OWN walk — the incident scan's
+    per-file discriminator. A rewind that happened before a /clear lives entirely in a dead
+    episode's file: the CURRENT graph classifies that whole file "clear" (or unknown, when the file
+    sits outside the lineage closure), so the whole-graph walk can never call its interior dead
+    branch "rewind" — yet those goals were exactly the audited residue (10 of the 28 live orphans,
+    all 5 live+archive dual-residents). Within one file, a branch that rejoins the file's own
+    active spine is a rewind no matter where the graph later went. Scans the candidate files plus
+    every episode-log-recorded transcript (EPIDIR rows are the durable enumeration of dead episode
+    files); dead files are frozen, so the incremental reader keeps this cheap.
+
+    Returns (rewound uuid set, failure count). A per-file failure is a loud row — its own
+    "rewound-reconcile-file" category, distinguishable from a counted whole-session failure —
+    never a stalled scan, and it is COUNTED: the returned set is PARTIAL on any failure, and the
+    caller must not let a partial set become a memoized baseline or a zero-failure migration pass
+    (dead files never change, so a swallowed miss here would never re-open)."""
+    out, seen, fails = set(), set(), 0
+    leaf = Path(files[0])
+    cands = [Path(f) for f in files]
+    for row in episode_rows(fsid):
+        fs = str(row.get("fsid") or "")
+        if fs:
+            cands.append(leaf.with_name(fs + ".jsonl"))
+    for fp in cands:
+        if fp.name in seen:
+            continue
+        seen.add(fp.name)
+        if not fp.exists():
+            continue
+        try:
+            ad = em.FileAdapter([str(fp)], str(fp))
+            if not ad.by_uuid and fp.stat().st_size > 0:
+                # the incremental reader swallows OSError into an empty record list with no row of
+                # its own (a permissions break, say) — a non-empty transcript that yields ZERO
+                # records is a failed read, not an empty file, and must count like one
+                raise OSError("transcript read yielded no records")
+            for u, v in ad.chain_verdicts().items():
+                if v == "rewind":
+                    out.add(u)
+        except Exception as e:
+            fails += 1
+            _log_judge_error("romp", fsid, "rewound-reconcile-file",
+                             note="per-file rewind scan failed on one transcript: %r" % e)
+    return out, fails
+
+
+def reconcile_rewound_goals(fsid, path, now):
+    """EVENT-KEYED dead-branch reconciliation, riding the triage cadence: when a parse-relevant file
+    changes AND the transcript's abandoned-branch set actually CHANGED, archive live goals whose
+    anchor lies on a dead branch. The predicate is em.chain_membership's "rewind" UNIONED with the
+    per-file discriminator (_per_file_rewound, minus the current graph's kept set — a resume-stitched
+    survivor is never swept): "rewind" is the only sweepable verdict, "clear" is /clear jurisdiction
+    and "broken"/unknown prove nothing — and a dead branch INSIDE a pre-/clear episode file, which
+    the whole-graph walk can only ever call "clear", is caught by its own file's walk, exactly the
+    incident scan's dead-episode-vs-dead-branch discriminator. This is the only cover for the
+    rewinds romp never sees: CLI-native Esc-Esc in a tmux terminal, the SDK forkAt resume, a cut the
+    gesture path could not resolve, and a crash between arm and take — every one applies
+    --resume-session-at with no sweep, and 28 live orphans existed when this shipped (one still
+    being actively judged a day after its conversation stopped existing). Cards ARCHIVE
+    (recoverable, and the override journal stays safe because node-keyed ops skip absent ids and
+    restore defers to the archive) — never delete.
+
+    Deliberately blind to a PENDING (unconsumed) cut: the two-phase hold owns that window (hide at
+    gesture, archive at take, restore on failure) — reconciling it would archive cards for a rewind
+    that can still fail. Only branches dead ON DISK count, so no leaf_override here.
+
+    The gate watches both sides of the join (the memo's note): on a store-only event the memoized
+    sig is REUSED (the abandoned set cannot change without a transcript change), so the adapter-walk
+    economy holds — the store-side check (_dead_branch_ids) is pure dict work and runs whenever
+    either side moved, archiving only on a hit (one-way, identity-keyed, tombstone-idempotent: no
+    flap, no store re-publish on a miss)."""
+    files = _judge_candidates(fsid, [str(path)])
+    states = STATESDIR / (fsid + ".jsonl")
+    epi = EPIDIR / (fsid + ".jsonl")
+    key_files = (list(files) + ([str(states)] if states.exists() else [])
+                 + ([str(epi)] if epi.exists() else []))
+    try:
+        key = _fileset_key(key_files)
+    except OSError:
+        key = None
+    gpath = GOALDIR / (fsid + ".json")
+
+    def _store_key():
+        try:
+            return _fileset_key([str(gpath)]) if gpath.exists() else None
+        except OSError:
+            return None
+
+    skey = _store_key()
+    memo = _RECON_MEMO.get(fsid)
+    if key is not None and memo and memo[0] == key and memo[3] == skey:
+        return 0                       # neither the transcripts nor the goal store moved → not an event
+    pf_fails = 0
+    if key is not None and memo and memo[0] == key:
+        sig, kept = memo[1], memo[2]   # store-only event → reuse the memoized abandoned set, no walk
+    else:
+        mem = em.chain_membership(path, candidate_files=files,
+                                  states=str(states) if states.exists() else None)
+        kept = frozenset(mem["kept"])
+        pf, pf_fails = _per_file_rewound(fsid, files)
+        sig = frozenset(mem["rewind"] | (pf - kept))
+    n = 0
+    if sig:
+        store = load_goals(fsid)
+        move = _dead_branch_ids(store, sig, kept_set=kept)
+        if move:
+            archive_goal_nodes(fsid, store, move, now)
+            _log_judge_error("romp", fsid, "rewound-archived", goal=sorted(move),
+                             note="%d goal node(s) anchored on a rewound-away branch archived by "
+                                  "the reconciliation (recoverable in goals-archive)" % len(move))
+            n = len(move)
+            skey = _store_key()        # our own write moved the store — never self-trigger next pass
+    if pf_fails:
+        # AFTER the archive block on purpose (archiving a partial set is idempotent and safe —
+        # every proven hit lands), BEFORE the memo on purpose: a partial sig must never become the
+        # event gate's baseline (the EPIDIR-enumerated dead files it missed are excluded from the
+        # fileset key and never change, so the memo would seal the miss for the process lifetime).
+        # The raise makes run_rewound_reconcile count this session FAILED, which blocks the
+        # migration's zero-failure marker (kernel _rewind_migration_bg) and retries next boot —
+        # the marker's own contract: "returned" is not "succeeded".
+        raise RuntimeError("%d per-file rewind scan(s) failed — abandoned set is partial" % pf_fails)
+    _RECON_MEMO[fsid] = (key, sig, kept, skey)
+    return n
+
+
+def run_rewound_reconcile(now=None, sessions_cap=PLAN_SESSIONS, window=None, verbose=False):
+    """One reconciliation pass over the discovered sessions (run_triage runs it first, so the same
+    pass's planner/closer/nudge see a store already clean of dead-branch orphans). `window` widens
+    discovery for the one-time boot migration (the kernel passes years; the 85-node residue spans
+    sessions long outside the 48h caption horizon). Per-session failures are loud rows, never a
+    stalled pass — and they are COUNTED: returns (archived, failures), because the migration's
+    done-marker written over a swallowed failure permanently skips that session (dormant sessions
+    are exactly the ones steady-state discovery never revisits)."""
+    if now is None:
+        now = int(time.time())
+    sessions = discover(now, window=window) if window else discover(now)
+    n, fails = 0, 0
+    for fsid, path, anchor, name in sessions[:sessions_cap]:
+        try:
+            n += reconcile_rewound_goals(fsid, str(path), now)
+        except Exception as e:
+            fails += 1
+            _log_judge_error("romp", fsid, "rewound-reconcile",
+                             note="dead-branch reconciliation failed: %r" % e)
+    if verbose:
+        sys.stderr.write("romp-judge: reconciliation archived %d dead-branch goal node(s)\n" % n)
+    return n, fails
+
+
 def open_menu(store, cap=20):
     """The session's open nodes, numbered oldest-first, capped — the planner's candidate menu. A node is
     open only if NEITHER it NOR any ancestor is complete/cleared/settled-done: a completed (or cleared)
@@ -3293,6 +3757,46 @@ def apply_plan(store, seg_id, seg_t, ops, menu, place_key=None, prompt_uuid=None
     placements[place_key] = focus if focus is not None else touched   # key presence marks the phase processed
     if focus is not None:
         store["lastNode"] = focus                     # the active focus = top-goal of the latest placement
+
+
+def apply_plan_guarded(fsid, path, store, seg_id, seg_t, ops, menu, place_key=None,
+                       prompt_uuid=None, quote=None, clear_wrap=False):
+    """apply_plan behind the write-moment rewind stand-down (_rewound_away). Every planner mint site
+    routes through here: a unit whose prompt PROVABLY sits on a rewound-away branch at the write
+    moment is RETIRED — placements[key]=None, the seeder/pre-episode idiom — and nothing is applied.
+    Retire, never skip: a bare skip leaves the key ABSENT, and auto-nudge's `_unplanned` gate asks
+    _placed_key of every unit plan_units yields, so an un-retired unit silences nudges for the whole
+    session forever (the documented 2026-07-27 failure). A None prompt_uuid mints unguarded —
+    abandonment can't be proven, and the hard floor ("a user message never silently vanishes")
+    outranks an unprovable suspicion. Returns True when the plan applied, False when it stood down
+    (callers skip their placed-count/regroup on False, and still save — the retirement must
+    persist). If the branch is later stitched active again by a recorded resume fork (a hypothesis
+    shape, no corpus instance), the retired key stays retired — acceptable, and the loud row below
+    is the trail.
+
+    A "pending" verdict — abandoned only under an ARMED, unconsumed cut — DEFERS instead (no
+    placements write, nothing applied): the rewind can still fail/dissolve, and a retirement here
+    was permanent while the dissolve restored only already-minted cards — the ask itself could
+    never mint again (_rewound_away's docstring has the full shape). The key stays absent, so the
+    next pass re-collects the unit and re-decides from the resolved world; during the armed window
+    fresh parses carry the leaf_override, so the deferred unit never reaches the nudge gate."""
+    away = _rewound_away(fsid, path, prompt_uuid) if prompt_uuid else False
+    if away == "pending":
+        _log_judge_error("planner", fsid, "rewind-stand-down-pending", seg=seg_id,
+                         note="the unit's prompt is abandoned only under a still-pending cut — "
+                              "deferred, not retired (the rewind can still fail)")
+        return False
+    if away:
+        key = place_key if place_key is not None else seg_id
+        store["placements"][key] = None
+        _log_judge_error("planner", fsid, "rewind-stand-down", seg=seg_id,
+                         note="the unit's prompt sits on a rewound-away branch — retired, nothing minted")
+        return False
+    apply_plan(store, seg_id, seg_t, ops, menu, place_key=place_key,
+               prompt_uuid=prompt_uuid, quote=quote, clear_wrap=clear_wrap)
+    return True
+
+
 SEAM_CAP = 32                             # live seam points kept per store (oldest drop; a seam only
 #                                           matters while its segment can still grow, so the cap is safe)
 def _stamp_seam(store, top, now):
@@ -5920,6 +6424,27 @@ def _plan_session(fsid, path, now):
             continue                                  # placed while THIS pass applied an earlier unit — the
         #                                               apply loop must uphold the same idempotence the
         #                                               collection loop checked at pass START (2026-07-06)
+        away = _rewound_away(fsid, path, trig) if trig else False
+        if away == "pending":
+            # abandoned only under an ARMED, unconsumed cut: DEFER without writing — a retirement
+            # is permanent, and this rewind can still fail/dissolve (the apply_plan_guarded
+            # contract's pending leg). The next pass re-decides from the resolved world.
+            _log_judge_error("planner", fsid, "rewind-stand-down-pending", seg=seg_id,
+                             note="the unit's prompt is abandoned only under a still-pending cut — "
+                                  "deferred, not retired (the rewind can still fail)")
+            continue
+        if away:
+            # WRITE-MOMENT stand-down, checked BEFORE any model call: this pass's frame pinned a
+            # world in which the unit's prompt still looked active, but a rewind has since abandoned
+            # its branch — planning it would mint an orphan (and the nudge/followup/pivot branches
+            # would file verdicts from evidence the user just deleted). RETIRE (the apply_plan_guarded
+            # contract), never skip. The apply sites below re-check through apply_plan_guarded for a
+            # rewind landing DURING this unit's own model call.
+            store["placements"][_unit_key(seg_id, phase)] = None
+            _log_judge_error("planner", fsid, "rewind-stand-down", seg=seg_id,
+                             note="the unit's prompt sits on a rewound-away branch — retired before planning")
+            save_goals(fsid, store)
+            continue
         menu = open_menu(store)
         if phase == "prompt":                         # PROMPT-run: place the ask NOW (mint-or-amend), before the work
             sib = _queued_sibling(store, seg_by_id, seg_id)   # a rapid-fire fragment may EXTEND the node the
@@ -5938,9 +6463,10 @@ def _plan_session(fsid, path, now):
                 #                                       prompted goal never stays unplaced
             ops = _card_route_subs(store, ops, menu, placer=False)   # card-level only: placing the ask is
             #                                           latency-sensitive; the work-run refines depth later
-            apply_plan(store, seg_id, seg_t, ops, menu, place_key=seg_id + "#p", prompt_uuid=trig, quote=vq)
-            placed += 1
-            _group_store(store, fsid, now)
+            if apply_plan_guarded(fsid, path, store, seg_id, seg_t, ops, menu,
+                                  place_key=seg_id + "#p", prompt_uuid=trig, quote=vq):
+                placed += 1
+                _group_store(store, fsid, now)
             save_goals(fsid, store)
             continue
         if phase == "live":                           # LIVE re-plan: the user cleared this OPEN segment's card
@@ -5960,9 +6486,10 @@ def _plan_session(fsid, path, now):
                 ops = _coerce_place(menu, text, title=_prompt_gist(fsid, seg_id) or None)   # invariant: a
                 #                                       WORKING session always shows a card
             ops = _card_route_subs(store, ops, menu, placer=False)   # card-level only, like the prompt-run
-            apply_plan(store, seg_id, seg_t, ops, menu, place_key=seg_id + "#live", prompt_uuid=trig, quote=vq)
-            placed += 1
-            _group_store(store, fsid, now)
+            if apply_plan_guarded(fsid, path, store, seg_id, seg_t, ops, menu,
+                                  place_key=seg_id + "#live", prompt_uuid=trig, quote=vq):
+                placed += 1
+                _group_store(store, fsid, now)
             save_goals(fsid, store)
             continue
         if phase == "delegation":                     # POSTAL delegation → file the recipient's work UNDER the courier's goal G
@@ -5995,9 +6522,10 @@ def _plan_session(fsid, path, now):
             ops = _restrict_retitle(ops, 1)              # goal_num=1 above → retitle is only valid on #1
             if not ops:
                 ops = [{"do": "sub", "under": 1, "text": _seg_label(text), "why": "work handed off from a peer"}]
-            apply_plan(store, seg_id, seg_t, ops, sub, place_key=seg_id + "#d", prompt_uuid=trig, quote=vq)
-            placed += 1
-            _group_store(store, fsid, now)
+            if apply_plan_guarded(fsid, path, store, seg_id, seg_t, ops, sub,
+                                  place_key=seg_id + "#d", prompt_uuid=trig, quote=vq):
+                placed += 1
+                _group_store(store, fsid, now)
             save_goals(fsid, store)
             continue
         if phase == "nudge":                          # romp NUDGE → RESOLVE the goal (done/block over a plain step)
@@ -6076,9 +6604,10 @@ def _plan_session(fsid, path, now):
                 ops = _strip_unevidenced_dones(ops, _tseg, fsid, seg_id)   # a nudge spliced mid-turn reads the
                 #                                           interrupted turn's work as its reply — resolve
                 #                                           nothing; the goal stays open and re-nudgeable
-                apply_plan(store, seg_id, seg_t, ops, sub, place_key=_pkey, prompt_uuid=trig, quote=vq)
-                placed += 1
-                _group_store(store, fsid, now)
+                if apply_plan_guarded(fsid, path, store, seg_id, seg_t, ops, sub,
+                                      place_key=_pkey, prompt_uuid=trig, quote=vq):
+                    placed += 1
+                    _group_store(store, fsid, now)
                 save_goals(fsid, store)
             continue
         if followup and followup in store["nodes"]:   # tagged follow-up: file under the target — a STRONG
@@ -6129,24 +6658,25 @@ def _plan_session(fsid, path, now):
                                        why="the reply started its own thread — this goal is unchanged")
                     ops = _restrict_retitle([o for o in ops if o["do"] != "skip"], gi)
                     ops = _card_route_subs(store, ops, menu)
-                    apply_plan(store, seg_id, seg_t, ops, menu, prompt_uuid=trig, quote=vq)
-                    if any(o.get("do") == "done" for o in ops):   # same post-closure re-look as the main work-run
-                        _invalidate_closure(store, session, seg_t)
-                    pv = store["placements"].get(seg_id)
-                    if isinstance(pv, str) and pv in store["nodes"]:   # provenance: the minted top remembers
-                        ytop = _top_ancestor(store["nodes"], pv)
-                        store["nodes"][ytop]["pivotFrom"] = followup
-                        _tie_pivot(store, ytop, followup, seg_t)   # ...and stays GROUPED with the cited card
-                    # a PIVOT rules the reply answered NOTHING on this card — mechanically restore the
-                    # blocks THIS gesture's send just lifted ("this goal is unchanged" must include its
-                    # pending asks, the user 2026-07-20). Older gestures' leftovers stay for a reply
-                    # that actually engages the card to rule on.
-                    floor_now = store["nodes"].get(followup, {}).get("followupAt") or 0
-                    _reassert_blocks(store, seg_id, seg_t,
-                                     [(nid, ask) for (nid, ask, lt) in lifted
-                                      if lt and floor_now and lt >= floor_now])
-                    placed += 1
-                    _group_store(store, fsid, now)
+                    if apply_plan_guarded(fsid, path, store, seg_id, seg_t, ops, menu,
+                                          prompt_uuid=trig, quote=vq):
+                        if any(o.get("do") == "done" for o in ops):   # same post-closure re-look as the main work-run
+                            _invalidate_closure(store, session, seg_t)
+                        pv = store["placements"].get(seg_id)
+                        if isinstance(pv, str) and pv in store["nodes"]:   # provenance: the minted top remembers
+                            ytop = _top_ancestor(store["nodes"], pv)
+                            store["nodes"][ytop]["pivotFrom"] = followup
+                            _tie_pivot(store, ytop, followup, seg_t)   # ...and stays GROUPED with the cited card
+                        # a PIVOT rules the reply answered NOTHING on this card — mechanically restore the
+                        # blocks THIS gesture's send just lifted ("this goal is unchanged" must include its
+                        # pending asks, the user 2026-07-20). Older gestures' leftovers stay for a reply
+                        # that actually engages the card to rule on.
+                        floor_now = store["nodes"].get(followup, {}).get("followupAt") or 0
+                        _reassert_blocks(store, seg_id, seg_t,
+                                         [(nid, ask) for (nid, ask, lt) in lifted
+                                          if lt and floor_now and lt >= floor_now])
+                        placed += 1
+                        _group_store(store, fsid, now)
                     save_goals(fsid, store)
                     continue
                 # CONTINUATION (the strong default): reopen the target, force the work UNDER it,
@@ -6180,16 +6710,17 @@ def _plan_session(fsid, path, now):
                     if retitle:
                         forced.append(dict(retitle, goal=gi2))   # the model may ALSO retitle the target itself
                         #                                          (re-pointed at the rebuilt menu's index)
-                    apply_plan(store, seg_id, seg_t, forced, menu, prompt_uuid=trig, quote=vq)
-                    # the model's per-lifted-ask rulings (the leak, the user 2026-07-20): a block op
-                    # aimed at a lifted item's OLD menu number re-asserts that ask — the reply did not
-                    # answer it — with the reply segment as its fresh evidence. Applied by node id, so
-                    # the post-reopen menu rebuild can't misroute it.
-                    _reassert_blocks(store, seg_id, seg_t,
-                                     [(lifted_by_num[o["goal"]][0], (o.get("why") or lifted_by_num[o["goal"]][1]))
-                                      for o in ops if o.get("do") == "block" and o.get("goal") in lifted_by_num])
-                    placed += 1
-                    _group_store(store, fsid, now)
+                    if apply_plan_guarded(fsid, path, store, seg_id, seg_t, forced, menu,
+                                          prompt_uuid=trig, quote=vq):
+                        # the model's per-lifted-ask rulings (the leak, the user 2026-07-20): a block op
+                        # aimed at a lifted item's OLD menu number re-asserts that ask — the reply did not
+                        # answer it — with the reply segment as its fresh evidence. Applied by node id, so
+                        # the post-reopen menu rebuild can't misroute it.
+                        _reassert_blocks(store, seg_id, seg_t,
+                                         [(lifted_by_num[o["goal"]][0], (o.get("why") or lifted_by_num[o["goal"]][1]))
+                                          for o in ops if o.get("do") == "block" and o.get("goal") in lifted_by_num])
+                        placed += 1
+                        _group_store(store, fsid, now)
                     save_goals(fsid, store)
                     continue                           # forced placement done; skip the free-placement path
         # The WORK-run may correct its OWN earlier PROMPT-run guess (the user 2026-07-01): if this exact
@@ -6245,20 +6776,30 @@ def _plan_session(fsid, path, now):
             ops = _coerce_place(menu, text, title=_prompt_gist(fsid, seg_id) or None)
         ops = _restrict_retitle(ops, pgi)              # only the segment's own prompt-run node is retitle-eligible
         ops = _card_route_subs(store, ops, menu)       # card-first: route subs to the card, then the placer
-        apply_plan(store, seg_id, seg_t, ops, menu, prompt_uuid=trig, quote=vq,
-                   clear_wrap=_seg_clearwrap(seg_by_id.get(seg_id) or {}))   # a wrap-up's decision card is terminal (2026-07-24)
-        if any(o.get("do") == "done" for o in ops):    # a post-closure done → the closer re-looks before any nudge
-            _invalidate_closure(store, session, seg_t)
-        placed += 1
-        _group_store(store, fsid, now)                # regroup the forest after this placement (event-gated, no-op if tops unchanged)
+        if apply_plan_guarded(fsid, path, store, seg_id, seg_t, ops, menu, prompt_uuid=trig, quote=vq,
+                              clear_wrap=_seg_clearwrap(seg_by_id.get(seg_id) or {})):   # a wrap-up's decision card is terminal (2026-07-24)
+            if any(o.get("do") == "done" for o in ops):    # a post-closure done → the closer re-looks before any nudge
+                _invalidate_closure(store, session, seg_t)
+            placed += 1
+            _group_store(store, fsid, now)            # regroup the forest after this placement (event-gated, no-op if tops unchanged)
         save_goals(fsid, store)                       # crash-safe: persist plan + group together
     # AUTHORITATIVE plan-sync (the user 2026-07-01): mirror the agent's live to-do list into the graph as
     # agentTask nodes BEFORE the roll-up, so an open to-do item holds its goal 'working' and a crossed-off
     # one reads authoritative-done. Deterministic (no LLM); regroup if it minted/changed anything so a
     # freshly-minted to-do top gets placed/merged this pass instead of lingering as a bare top.
     latest_seg = max(seg_by_id.values(), key=lambda s: s.get("t") or 0, default=None)
-    if _sync_declared_plan(store, session, (latest_seg or {}).get("id"), (latest_seg or {}).get("t") or now,
-                           prompt_uuid=(latest_seg or {}).get("trigger")):
+    _ls_trig = (latest_seg or {}).get("trigger")
+    if _ls_trig and _rewound_away(fsid, path, _ls_trig):
+        # This pass's frame pinned a pre-rewind world: the "latest" segment was just rewound away, so
+        # a mirror minted now would carry a provably-dead anchor and a dead trail. Skip the sync THIS
+        # pass — it is deterministic and runs every pass, so the next pass re-mints from the fresh
+        # parse with an on-chain anchor. (Task-store mirrors of abandoned-turn to-dos are otherwise
+        # LEFT AS-IS by decision: the task store is the authoritative source and a rewind does not
+        # roll it back — the agent may genuinely still hold those to-dos.)
+        _log_judge_error("planner", fsid, "rewind-stand-down",
+                         note="plan-sync skipped this pass: the latest segment was rewound away mid-pass")
+    elif _sync_declared_plan(store, session, (latest_seg or {}).get("id"), (latest_seg or {}).get("t") or now,
+                             prompt_uuid=_ls_trig):
         _group_store(store, fsid, now)
         save_goals(fsid, store)
     rollup_status(store, _session_settled(fsid, path, session, store))
@@ -9245,6 +9786,11 @@ def run_triage(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, ve
         now = int(time.time())
     own = begin_pass_frame()
     try:
+        # dead-branch reconciliation FIRST: when a rewind romp never saw (native Esc-Esc, forkAt, a
+        # missed sweep) changed the abandoned-branch set, its orphans leave the store before this
+        # same pass's planner reads the menu and the nudge tick walks the tops. Event-keyed inside
+        # (fileset + abandoned-set change), so an idle pass costs stats, not adapter walks.
+        run_rewound_reconcile(now=now, sessions_cap=sessions_cap, verbose=verbose)
         placed = run_plan(now=now, sessions_cap=sessions_cap, concurrency=concurrency, verbose=verbose)
         if CLOSER_ON:
             run_close(now=now, sessions_cap=sessions_cap, concurrency=concurrency, verbose=verbose)
@@ -9629,10 +10175,10 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
                     #                                    wedges auto-nudge's placement gate, 2026-08-16).
                     continue
                 pending.append((seg["t"], fsid, seg["id"], _unit_text(seg["atoms"]), pm[1], pm[0],
-                                _seg_peer_kind(seg), _seg_anchor(seg)))
+                                _seg_peer_kind(seg), _seg_anchor(seg), str(path)))
     pending.sort(key=lambda x: x[0])                  # global cross-session oldest-first
     placed = 0
-    for seg_t, fsid, seg_id, text, mid, sender, declared, anchor_uuid in pending:
+    for seg_t, fsid, seg_id, text, mid, sender, declared, anchor_uuid, path in pending:
         store = load_goals(fsid)
         if _placed_key(store["placements"], seg_id):  # drift-safe: never re-plant a t-shifted duplicate
             continue
@@ -9704,6 +10250,26 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
             store.get("courierFails", {}).pop(seg_id, None)   # a clean reply clears the strike count
         store.get("courierDeferred", {}).pop(seg_id, None)    # landed (clean reply or parse give-up) → deferral over
         if edit["delegating"]:
+            away = _rewound_away(fsid, path, anchor_uuid) if anchor_uuid else False
+            if away == "pending":
+                # abandoned only under an ARMED, unconsumed cut: DEFER (no placements write) — the
+                # rewind can still fail, and a None retirement is permanent (the apply_plan_guarded
+                # contract's pending leg). The next courier pass re-judges from the resolved world.
+                _log_judge_error("courier", fsid, "rewind-stand-down-pending", seg=seg_id,
+                                 note="the peer segment is abandoned only under a still-pending cut — "
+                                      "deferred, not retired (the rewind can still fail)")
+                continue
+            if away:
+                # WRITE-MOMENT stand-down (same contract as apply_plan_guarded): the peer segment's
+                # branch was rewound away while this pass held it — planting now mints an orphan the
+                # one-shot sweep already ran past. RETIRE (None reads as courier-final downstream, so
+                # the #d delegation phase retires with it); the loud row is the trail.
+                store["placements"][seg_id] = None
+                _log_judge_error("courier", fsid, "rewind-stand-down", seg=seg_id,
+                                 note="the peer segment sits on a rewound-away branch — retired, nothing planted")
+                rollup_status(store, closed.get(fsid, False))
+                save_goals(fsid, store)
+                continue
             link_id = menu[edit["n"] - 1]["id"] if edit["n"] else None   # sender's related open goal (or None)
             # Mint the sender's precise '↪ delegated to <recipient>' tracking node (the user 2026-06-22) and
             # point B's goal at IT — so run_propagate checks off only the handed-off piece, never the sender's

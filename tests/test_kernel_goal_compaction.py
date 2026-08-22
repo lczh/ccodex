@@ -137,19 +137,23 @@ class GoalCompactionTest(unittest.TestCase):
         release_remover = threading.Event()
         adder_done = threading.Event()
 
-        def remove_one(arch):
-            remover_entered.set()
-            self.assertTrue(release_remover.wait(2))
-            arch["nodes"].pop(old)
+        def remove_one():
+            with jd._GOAL_ARCH_LOCK:                   # upstream's blind-RMW discipline
+                arch = jd.load_goal_archive(SID)
+                remover_entered.set()
+                self.assertTrue(release_remover.wait(2))
+                arch["nodes"].pop(old)
+                jd.save_goal_archive(SID, arch)
 
-        def add_one(arch):
-            arch["nodes"][added] = _node(added, None)
-            adder_done.set()
+        def add_one():
+            with jd._GOAL_ARCH_LOCK:
+                arch = jd.load_goal_archive(SID)
+                arch["nodes"][added] = _node(added, None)
+                jd.save_goal_archive(SID, arch)
+                adder_done.set()
 
-        remove_thread = threading.Thread(target=jd.mutate_goal_archive,
-                                         args=(SID, remove_one))
-        add_thread = threading.Thread(target=jd.mutate_goal_archive,
-                                      args=(SID, add_one))
+        remove_thread = threading.Thread(target=remove_one)
+        add_thread = threading.Thread(target=add_one)
         remove_thread.start()
         self.assertTrue(remover_entered.wait(1))
         add_thread.start()

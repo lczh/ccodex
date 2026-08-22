@@ -341,9 +341,12 @@ body.tabbar-resizing { cursor: ns-resize; user-select: none; }
 #content::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.36); }
 /* The rail time-markers (.time-marker) hang ~45px LEFT of each turn. The column fills the pane
    (var(--chat-col)), so we ALWAYS reserve that left gutter as real padding — otherwise the HH:MM
-   timestamps overflow left and get clipped by overflow-x:hidden. Tightened 54→44px (the user 2026-07-05)
+   timestamps overflow left and get clipped by overflow-x:hidden. Tightened 54→44px (the user 2026-07-05),
+   then widened 44→56px (the user 2026-08-22): the day-context label now lives in this gutter, and at
+   44px its widest forms ran into the rail dots as turns scrolled past — the whole rail assembly (line,
+   dots, stamps, prose) shifts right so the label owns its column and never clamps.
    so the times sit nearer the left margin and the prose column gains width. */
-.thread { max-width: var(--chat-col); margin: 0 auto; padding: 0 24px 0 44px; position: relative; }   /* .rail-band anchors here */
+.thread { max-width: var(--chat-col); margin: 0 auto; padding: 0 24px 0 56px; position: relative; }   /* .rail-band anchors here */
 /* the transcript "No session open" placeholder (#empty-state). Scoped to its OWN class — a bare
    `.empty` selector here used to bleed `padding: 40px` onto every leaf-row tree spacer (the ledger's
    `ledger-tri empty` + the feed's `ftree-tri empty`, both zero-content spans), blowing them up to
@@ -529,7 +532,7 @@ body.tabbar-resizing { cursor: ns-resize; user-select: none; }
 #composer-resize:hover::after, #composer-resize.dragging::after { background: var(--accent); width: 52px; }
 body.composer-resizing { cursor: ns-resize; user-select: none; }
 .statusline {
-  max-width: var(--chat-col); margin: 0 auto; padding: 7px 24px 0 44px;   /* left matches .thread's 44px gutter so the controls align with the transcript column */
+  max-width: var(--chat-col); margin: 0 auto; padding: 7px 24px 0 56px;   /* left matches .thread's 56px gutter so the controls align with the transcript column */
   display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px;   /* a narrow pane wraps the controls onto extra rows — every control stays visible (the user 2026-08-10, whose branch/model/mode badges vanished as the pane shrank) */
 }
 /* Signal-style compose ROW (the user 2026-07-30): paperclip · pill input · round send — the layout every
@@ -1136,7 +1139,7 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
 .turn-tool .time-marker, .turn-thinking .time-marker { top: 10px; }
 /* DAY DIVIDER (the user 2026-08-01) — the date on a hairline rule across the prose column,
    above the first turn of a new day. The date used to stack inside the rail marker, but the
-   gutter is 47px wide and "Yesterday" measures 52.6px bold, so its "Y" fell off the left edge
+   gutter is 59px wide and "Yesterday" measures 52.6px bold, so its "Y" fell off the left edge
    of the pane; anything sized to FIT that gutter re-clips the moment --vscode-chat-font-size
    grows. Out here the label has the whole column, so no date string can ever be cut off.
    Left-aligned with the prose (turns pad 24px); the rule fills the rest of the line. */

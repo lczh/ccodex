@@ -32,8 +32,10 @@ def _run_undo(archive):
     jd = km.jd
     jd.migrate_store(archive)                          # archives are legacy-shaped: adopt their diaries
     live = {"rompUuid": SID, "nodes": {}, "placements": {}, "status": {}}
-    orig = {n: getattr(jd, n) for n in ("mutate_goal_archive", "load_goals", "save_goals")}
-    jd.mutate_goal_archive = lambda sid, mutate: mutate(archive)
+    orig = {n: getattr(jd, n) for n in ("load_goal_archive", "save_goal_archive",
+                                        "load_goals", "save_goals")}
+    jd.load_goal_archive = lambda sid: archive
+    jd.save_goal_archive = lambda sid, s: None
     jd.load_goals = lambda sid: live
     jd.save_goals = lambda sid, s: None
     try:

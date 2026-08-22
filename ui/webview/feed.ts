@@ -81,6 +81,7 @@ interface AskItem {
               tooLong?: boolean;   // apiError: a "prompt is too long" error (on you → compact) vs a transient API error
               spendLimit?: boolean;   // apiError: a monthly spend cap (on you → raise it, never auto-retried; the user 2026-07-14)
               modelLimit?: boolean;   // apiError: this session's MODEL is out of allowance (on you → switch model or add credits; the user 2026-08-01)
+              refusal?: boolean;   // apiError: the model's safeguards refused the prompt itself (on you → rewrite it or drop the thread; never auto-retried — deterministic on the same input, the user 2026-08-15)
               mode?: string; since?: number;   // judgeAuth adds these: which billing its judges ride ('key'|'login') + the first refusal time — romp can't analyze the session until the credential is fixed (the user 2026-08-12)
               toName?: string; toSid?: string;    // parkedHandoff adds to*
               mid?: string; frm?: string; to?: string; origin?: string; body?: string; gist?: string };   // quarantine (held peer mail) adds these; gist = the bus's 90-char collapse for the compact card line
@@ -1768,12 +1769,15 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
   // a transient stall, not a block — so this badge + Retry are the only API-error cue; no column move.
   const spendLimit = !!(it.blocked && it.blocked.spendLimit);
   const modelLimit = !!(it.blocked && it.blocked.modelLimit);
+  const refusal = !!(it.blocked && it.blocked.refusal);
   a._apiBadge.style.display = isApiErr ? "" : "none";
   // Retry pastes "retry" to resume a stalled turn — useless against a monthly spend cap (retrying can't lift a
   // billing limit), so hide it there and let the badge tell you to raise the cap (the user 2026-07-14).
   // A spent MODEL allowance is the same shape: Retry re-fails until you switch model or top up, and the
   // badge says so (the user 2026-08-01). Its window does reset on its own, which the badge title carries.
-  a._apiRetry.style.display = (isApiErr && !spendLimit && !modelLimit) ? "" : "none";
+  // A safeguards REFUSAL is the same shape again (the user 2026-08-15): deterministic on the same input,
+  // so Retry re-collects the same refusal — the badge names the real fix (rewrite it or drop the thread).
+  a._apiRetry.style.display = (isApiErr && !spendLimit && !modelLimit && !refusal) ? "" : "none";
   // "Continue" shows on a LIVE needs-you card with no live ask attached: the gesture claims "you're not
   // waiting on me", which means nothing in Working/Completed, can't answer a real permission prompt or
   // picker (it.blocked — text sent there would just queue behind the ask), and has no one to tell on a
@@ -1791,8 +1795,10 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
     a._apiBadge.textContent = spendLimit ? "⚠ Spend limit"
       : it.blocked.tooLong ? "⚠ Prompt too long"
       : modelLimit ? "⚠ Model limit"
+      : refusal ? "⚠ Safeguards refused"
       : it.blocked.status ? `⚠ API error · ${it.blocked.status}` : "⚠ API error";
-    a._apiBadge.title = spendLimit ? it.blocked.what : (it.blocked.text || it.blocked.what);
+    // a refusal's raw CLI text buries the remedy — the kernel's `what` states it plainly, so title with that
+    a._apiBadge.title = (spendLimit || refusal) ? it.blocked.what : (it.blocked.text || it.blocked.what);
     a._apiRetry.disabled = false; a._apiRetry.textContent = "Retry";
     a._apiRetry.onclick = (ev: Event) => {
       ev.stopPropagation();

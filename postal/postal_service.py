@@ -2510,6 +2510,8 @@ def _quarantine_put(origin, m, to_id, via=""):
     try:
         QUARANTINE.mkdir(parents=True, exist_ok=True)
         tmp = QUARANTINE / (mid + ".tmp")
+        tmp.unlink(missing_ok=True)   # the staging name derives from the SENDER's mid — a
+        #                               planted FIFO hung the bus thread (the r34 verification)
         tmp.write_text(json.dumps(rec))
         tmp.rename(QUARANTINE / (mid + ".json"))      # atomic publish (the kernel may be reading the dir)
         _log("quarantine: held %s from %s -> %s (directed)" % (mid, origin, rec["to"]))
