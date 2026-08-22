@@ -12,7 +12,8 @@ from unittest import mock
 HERE = os.path.dirname(os.path.realpath(__file__))
 ROOT = os.path.dirname(HERE)
 
-os.environ.setdefault("XDG_STATE_HOME", tempfile.mkdtemp())
+os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp()
+os.environ.pop("ROMP_STATE_DIR", None)  # a live kernel's export outranks the XDG floor
 jd = SourceFileLoader("romp_judge_staging", os.path.join(ROOT, "bin", "romp-judge")).load_module()
 
 
