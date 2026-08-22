@@ -4139,7 +4139,7 @@ def _discover_fingerprint():
     MTIME is re-stat'd every call without exception: that is the fork signal this whole fingerprint exists to
     catch, and caching it would blind discover() to new forks."""
     try:
-        entries = sorted(NAMES.iterdir())
+        entries = sorted(e for e in NAMES.iterdir() if not e.name.endswith(".tmp"))
     except OSError:
         return None
     fp = []
@@ -4246,6 +4246,10 @@ def _discover_impl(now, window=None, forks=True):
         return cached
     for f in sorted(NAMES.iterdir()):
         sid = f.name
+        if sid.endswith(".tmp"):
+            continue                      # a writer's staging file, never a session (the r33
+        #                                   verification: a leaked stray became a phantom row
+        #                                   and stole a live session's fork lane)
         try:
             parts = f.read_text().rstrip("\n").split("\t")
         except Exception:

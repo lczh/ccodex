@@ -85,5 +85,28 @@ class CodexDiscovery(unittest.TestCase):
         self.assertEqual(jd._codex_rows(0, set()), [])
 
 
+class StagingStraysNeverDiscovered(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        jd._rebind_state(self.tmp)
+        jd.NAMES.mkdir(parents=True, exist_ok=True)
+
+    def test_a_leaked_names_tmp_is_not_a_session(self):
+        # the r33 verification: discover() is THE primary NAMES consumer and read a leaked
+        # staging stray as a phantom session — it even stole a live session's fork lane
+        (jd.NAMES / "11111111-2222-3333-4444-555555555555").write_text("web\t/TESTDIR\t\t\n")
+        (jd.NAMES / "99999999-8888-7777-6666-555555555555.tmp").write_text(
+            "phantom\t/TESTDIR\t\t\n")
+        found = jd.discover(NOW)
+        sids = [t[2] for t in found]
+        self.assertNotIn("99999999-8888-7777-6666-555555555555.tmp", sids)
+        self.assertFalse(any(str(s).endswith(".tmp") for s in sids), sids)
+        # and the fingerprint ignores it too: a stray appearing must not invalidate caches
+        fp1 = jd._discover_fingerprint()
+        (jd.NAMES / "99999999-8888-7777-6666-555555555555.tmp").write_text("changed\t/x\t\t\n")
+        self.assertEqual(fp1, jd._discover_fingerprint(),
+                         "staging churn is invisible to the discovery fingerprint")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -3049,5 +3049,44 @@ class PushSessionCallback(unittest.TestCase):
                         "the failure is reported, not swallowed: %r" % logs)
 
 
+class WriteNameStaging(unittest.TestCase):
+    """The r33 verification: the codex twin's staging hardening cited THIS function as its
+    model but the model itself had neither half — a planted FIFO at names/<sid>.tmp hung
+    spawn/rename/set-color forever, and a failed replace leaked the stray."""
+
+    def test_a_planted_fifo_at_the_staging_name_never_hangs(self):
+        import signal
+        with tempfile.TemporaryDirectory() as td:
+            sid = "11111111-2222-3333-4444-555555555555"
+            names = Path(td) / "names"
+            names.mkdir()
+            os.mkfifo(str(names / (sid + ".tmp")))
+            prev = signal.signal(signal.SIGALRM,
+                                 lambda *a: (_ for _ in ()).throw(TimeoutError("hung")))
+            signal.alarm(10)
+            try:
+                sb.write_name(Path(td), sid, "webby", "/tmp")
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, prev)
+            self.assertIn("webby", (names / sid).read_text())
+
+    def test_a_failed_replace_never_leaks_the_staging_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            sid = "11111111-2222-3333-4444-555555555555"
+            names = Path(td) / "names"
+            (names / sid).mkdir(parents=True)          # os.replace onto a non-empty dir raises
+            (names / sid / "x").mkdir()
+            try:
+                with self.assertRaises(OSError):
+                    sb.write_name(Path(td), sid, "webby", "/tmp")
+            finally:
+                (names / sid / "x").rmdir()
+                (names / sid).rmdir()
+            self.assertEqual([n for n in os.listdir(names) if n.endswith(".tmp")], [],
+                             "the staging file is unlinked on every path — a leaked stray "
+                             "rendered as a phantom session (the r32/r33 verifications)")
+
+
 if __name__ == "__main__":
     unittest.main()

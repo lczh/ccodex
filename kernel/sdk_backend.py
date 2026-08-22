@@ -762,8 +762,15 @@ def write_name(state_dir: Path, sid: str, name: str, cwd: str, bg: str = "", fg:
     p = Path(state_dir) / "names" / sid
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".tmp")
-    tmp.write_text("\t".join([name, cwd, bg, fg]) + "\n")
-    os.replace(tmp, p)
+    try:
+        tmp.unlink(missing_ok=True)   # a planted FIFO at the fixed staging name blocks
+    except OSError:                   # write_text forever — spawn/rename/set-color all wedge
+        pass                          # (the r33 verification, executed)
+    try:
+        tmp.write_text("\t".join([name, cwd, bg, fg]) + "\n")
+        os.replace(tmp, p)
+    finally:
+        tmp.unlink(missing_ok=True)   # never LEAK the staging file (the codex twin's rule)
 
 
 # ---------------------------------------------------------------------------
@@ -3237,6 +3244,7 @@ class SdkBackend:
             _fold(hours, hour, 192)   # hour buckets, 8 days — the rolling 5h/7d windows read these
             try:
                 tmp = self.state_dir / "spend.json.tmp"
+                tmp.unlink(missing_ok=True)          # fixed staging name: a planted FIFO blocks
                 tmp.write_text(json.dumps({"days": days, "hours": hours}))
                 os.replace(tmp, p)
             except Exception as ex:
@@ -3330,6 +3338,7 @@ class SdkBackend:
                 return                                # no change → keep t honest
             try:
                 tmp = self.state_dir / "usage.json.tmp"
+                tmp.unlink(missing_ok=True)          # fixed staging name: a planted FIFO blocks
                 tmp.write_text(json.dumps(data))
                 os.replace(tmp, self.state_dir / "usage.json")
             except Exception:
@@ -3370,6 +3379,7 @@ class SdkBackend:
             hours.pop(k, None)
         try:
             tmp = self.state_dir / "usage-history.json.tmp"
+            tmp.unlink(missing_ok=True)              # fixed staging name: a planted FIFO blocks
             tmp.write_text(json.dumps({"hours": hours}))
             os.replace(tmp, p)
         except Exception:
@@ -3461,6 +3471,7 @@ class SdkBackend:
                     "seven_day": cur.get("seven_day"), "fable": cur.get("fable")}
             try:
                 tmp = self.state_dir / "usage.json.tmp"
+                tmp.unlink(missing_ok=True)          # fixed staging name: a planted FIFO blocks
                 tmp.write_text(json.dumps(data))
                 os.replace(tmp, self.state_dir / "usage.json")
             except Exception:

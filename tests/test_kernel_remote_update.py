@@ -209,6 +209,25 @@ class UpdateRemote(unittest.TestCase):
         disc = next(a[-1] for a in calls if isinstance(a[-1], str) and "for d in" in a[-1])
         self.assertIn("STATERR", disc, "the discover probe distinguishes error from clean too")
 
+    def test_the_landed_verify_tags_map_to_their_own_messages(self):
+        # the r33 mutant hunt: swapping the NOTLANDED and HEADUNKNOWN branches stayed green —
+        # inverted guidance for the two states the landed-verify exists to distinguish
+        self._wire(apply_out="NOTLANDED")
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("did not land", detail)
+        self.assertNotIn("HEAD cannot be read", detail)
+        self._wire(apply_out="HEADUNKNOWN")
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("HEAD cannot be read", detail)
+        self.assertIn("stays armed", detail)
+        self._wire(apply_out="RESTOREFAIL")
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("restoring the prior install record failed", detail)
+        self.assertIn("armed latch stays", detail)
+
     def test_an_install_failure_on_the_remote_is_its_own_verdict(self):
         # the apply used to lock the reset alone and never install at all (the user's audit,
         # 2026-08-17); a failed install now leaves the remote's latch armed and says so
@@ -429,13 +448,43 @@ class UpdateRemote(unittest.TestCase):
             self.assertNotIn("INSTALLED", ops.read_text() if ops.exists() else "",
                              "nothing installs at the seam commit")
             # with a CARRIED prior (a HEAD-matching record whose heal fails), the not-landed
-            # refusal restores it verbatim
+            # refusal restores it verbatim. DISTINCT target/HEAD shorts: with both echoing the
+            # same sha, a mutant restoring the two-line BODY instead of the carry was
+            # byte-identical and stayed green (the r33 mutant hunt)
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' rev-parse --short=8 HEAD'*) echo deadbee2;;\n"
+                "  *' rev-parse --short=8 '*) echo 1c432642;;\n"
+                "  *' rev-parse HEAD'*) echo cccccccccccccccccccccccccccccccccccccccc;;\n"
+                "esac\nexit 0\n" % gd)
             (gd / "romp-install-failed").write_text("deadbee2 dev")
             (fix / "install.sh").write_text("#!/bin/sh\nexit 1\n")   # the carried heal fails
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("NOTLANDED", a.stdout)
             self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2 dev",
-                             "the carried record survives the refusal verbatim")
+                             "the carried record survives the refusal verbatim — never the "
+                             "two-line armed body")
+            # a restore that FAILS reports its actual state (armed latch, boot heal settles it),
+            # not RESETFAIL's "couldn't check out the new code" (the r33 verification)
+            (gd / "romp-install-failed").write_text("deadbee2 dev")
+            shim2 = Path(td) / "shim2"
+            shim2.mkdir(exist_ok=True)
+            (shim2 / "sitecustomize.py").write_text(
+                "import os\n"
+                "_real = os.write\n"
+                "_state = {'n': 0}\n"
+                "def _short(fd, data):\n"
+                "    if fd > 2 and len(data) > 6:\n"
+                "        _state['n'] += 1\n"
+                "        if _state['n'] == 2:\n"          # the ARM is write 1; the RESTORE is 2
+                "            return _real(fd, data[:5])\n"
+                "    return _real(fd, data)\n"
+                "os.write = _short\n")
+            env2 = dict(env, PYTHONPATH=str(shim2))
+            a = self._run(["bash", "-c", apply_r], env=env2, capture_output=True, text=True, timeout=60)
+            self.assertIn("RESTOREFAIL", a.stdout)
+            self.assertNotIn("RESETFAIL", a.stdout)
             (gd / "romp-install-failed").unlink()
             # an UNREADABLE head is unknown, not "not landed": the latch stays ARMED
             (fakebin / "git").write_text(

@@ -11199,16 +11199,19 @@ def _update_remote(host):
         "if hs!=target:\n"
         "    if carry:\n"
         "        try:\n"
-        "            os.unlink(tmp)\n"
-        "        except FileNotFoundError:\n"
-        "            pass\n"
-        '        cfd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o644)\n'
-        "        try:\n"
-        '            if os.write(cfd,carry.encode())!=len(carry.encode()):\n'
-        '                raise OSError("short restore write")\n'
-        "        finally:\n"
-        "            os.close(cfd)\n"
-        "        os.replace(tmp,lp)\n"
+        "            try:\n"
+        "                os.unlink(tmp)\n"
+        "            except FileNotFoundError:\n"
+        "                pass\n"
+        '            cfd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o644)\n'
+        "            try:\n"
+        '                if os.write(cfd,carry.encode())!=len(carry.encode()):\n'
+        '                    raise OSError("short restore write")\n'
+        "            finally:\n"
+        "                os.close(cfd)\n"
+        "            os.replace(tmp,lp)\n"
+        "        except OSError:\n"
+        "            sys.exit(17)\n"
         "    else:\n"
         "        os.remove(lp)\n"
         "    sys.exit(15)\n"
@@ -11223,6 +11226,7 @@ def _update_remote(host):
         'if [ "$RRC" = 8 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYNOW; exit 0; fi; '
         'if [ "$RRC" = 9 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERR; exit 0; fi; '
         'if [ "$RRC" = 10 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo LATCHSTUCK; exit 0; fi; '
+        'if [ "$RRC" = 17 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESTOREFAIL; exit 0; fi; '
         'if [ "$RRC" = 16 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo HEADUNKNOWN; exit 0; fi; '
         'if [ "$RRC" = 15 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo NOTLANDED; exit 0; fi; '
         'if [ "$RRC" = 14 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo CHANNELUNKNOWN; exit 0; fi; '
@@ -11256,7 +11260,7 @@ def _update_remote(host):
         'echo "SYNCED:$NEW"'
     ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, lfull, _P2P_REF, _P2P_REF,
          _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
-         _P2P_REF, _P2P_REF, _P2P_REF, kport)
+         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -11301,6 +11305,9 @@ def _update_remote(host):
         return False, ("pushed, but %s's install latch names commits its HEAD doesn't match — an "
                        "update died there mid-move from a broken state; heal it by hand on that "
                        "machine (run install.sh, then remove the latch)" % host)
+    if tag == "RESTOREFAIL":
+        return False, ("the push did not land, and restoring the prior install record failed — "
+                       "the armed latch stays; the remote's boot heal settles it")
     if tag == "NOTLANDED":
         return False, ("the remote checkout moved while updating — the push did not land on the "
                        "validated commit; nothing installed")
@@ -12620,6 +12627,7 @@ def _record_death(sid, now, by):
         gd = jd.STATE / "gone"
         gd.mkdir(parents=True, exist_ok=True)
         tmp = gd / (sid + ".json.tmp")
+        tmp.unlink(missing_ok=True)              # fixed staging name: a planted FIFO blocks
         tmp.write_text(json.dumps({"t": int(now) - 1, "by": by}))
         os.replace(tmp, gd / (sid + ".json"))
     except Exception:
