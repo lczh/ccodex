@@ -1031,6 +1031,79 @@ class RaisingRegistryTransactions(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(td, "names")) and
                              os.listdir(os.path.join(td, "names")))
 
+    def test_a_raising_registry_success_path_spawn_leaves_no_phantom(self):
+        # the r29 verification: only the two ERROR branches were pinned — a wrong-key mutant in
+        # the success branch's rollback survived every test
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            self._corrupt(td)
+            fake = FakeClient()
+            be = cb.CodexBackend(td, client_factory=lambda: fake)
+            with self.assertRaises(RuntimeError):
+                be.spawn("webby", "/tmp")
+            self.assertEqual(len(be._sessions), 0,
+                             "the success branch rolls back like its two siblings")
+
+    def test_a_names_write_failure_retires_the_spawned_row(self):
+        # the r29 verification: the durable row landed, then the UNGUARDED names write raised —
+        # a live row holding no name is the duplicate-name hole (the v1.3.12 audit) re-opened
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "names"), "w") as f:
+                f.write("not a dir")               # names/ is uncreatable: mkdir raises
+            be = cb.CodexBackend(td, client_factory=lambda: None)
+            with self.assertRaises(Exception):
+                be.spawn("webby", "/tmp")
+            self.assertEqual(len(be._sessions), 0,
+                             "no live row without a shared name — the row is retired, loudly")
+            import json as _json
+            rows = _json.loads(open(os.path.join(td, "codex", "registry.json")).read())
+            self.assertTrue(all(r.get("dead") for r in rows.values()),
+                            "the durable row is retired too: %r" % rows)
+
+    def test_a_names_write_failure_in_rename_keeps_all_three_stores_agreed(self):
+        # the r29 verification: the compensation branch was unpinned — deleting it entirely
+        # stayed green while the registry alone moved to the new name under a false
+        # "keeps its old name" message
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            be = cb.CodexBackend(td, client_factory=lambda: None)
+            sid = be.spawn("webby", "/tmp")
+            nf = os.path.join(td, "names", sid)
+            os.chmod(nf, 0o444)                    # the write raises at open; the file survives
+            try:
+                with self.assertRaises(Exception):
+                    be.rename(sid, "newname")
+            finally:
+                os.chmod(nf, 0o644)
+            self.assertEqual(be._session(sid).name, "webby", "memory kept the old name")
+            self.assertIn("webby", open(nf).read(), "the names file kept the old name")
+            import json as _json
+            rows = _json.loads(open(os.path.join(td, "codex", "registry.json")).read())
+            self.assertEqual(rows[sid]["name"], "webby",
+                             "the COMPENSATION re-ran the registry write with the old name — "
+                             "without it the registry alone holds the new name and applies the "
+                             "'failed' rename at the next restart")
+
+    def test_a_raising_tid_save_rolls_the_thread_flip_back(self):
+        # the r29 verification: with the real tid only in memory, every retry took the resume
+        # path and never re-saved it — the next restart loaded 'pending-…' and silently started
+        # a FRESH Codex thread (server-side context lost, nothing looking wrong)
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            fake = FakeClient()
+            be = cb.CodexBackend(td, client_factory=lambda: fake)
+            sid = be.spawn("webby", "/tmp")
+            s = be._session(sid)
+            s.tid = "pending-%s" % sid[:8]         # force the create path
+            s.loaded = False
+            self._corrupt(td)
+            with self.assertRaises(RuntimeError):
+                be._prepare_thread(s, fake)
+            self.assertTrue(s.tid.startswith("pending-"),
+                            "the real tid is never published to memory alone")
+            self.assertFalse(s.loaded)
+
     def test_a_raising_registry_thread_start_failure_spawn_leaves_no_phantom(self):
         import tempfile
 

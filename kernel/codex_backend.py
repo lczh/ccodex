@@ -780,6 +780,25 @@ class CodexBackend:
         return False   # no Codex equivalent
 
     # ── lifecycle ────────────────────────────────────────────────────────────────────────────────
+    def _publish_spawn_name(self, s, bg="", fg=""):
+        """spawn's names/ write, transactional: the durable row already landed, so a raising
+        names write would leave a live row that holds no name — a retry of the same name then
+        mints a duplicate live session (the v1.3.12 audit's hole, re-opened on exactly this
+        raising path — the r29 verification). Retire the row, loudly."""
+        try:
+            self._write_name(s, bg, fg)
+        except BaseException:
+            with s.lock:
+                s.dead = True
+                try:
+                    self._save_registry(s, fields=("dead",))
+                except Exception as e2:
+                    self.log("codex spawn: could not retire %s after its name write failed (%s)"
+                             % (s.sid, e2))
+            with self._sessions_lock:
+                self._sessions.pop(s.sid, None)
+            raise
+
     def _write_name(self, s, bg="", fg=""):
         """The shared identity/discovery file names/<sid> (name, cwd, bg, fg) — the same four-field
         format both other backends write, so name/identity surfaces read Codex sessions for free.
@@ -814,7 +833,7 @@ class CodexBackend:
                     with self._sessions_lock:
                         self._sessions.pop(sid, None)
                     raise
-            self._write_name(s)            # a LIVE launch-error row without a shared name let a
+            self._publish_spawn_name(s)    # a LIVE launch-error row without a shared name let a
             #                                retry mint a duplicate live "web" (the v1.3.12 audit)
             return sid
         try:
@@ -834,7 +853,7 @@ class CodexBackend:
                     with self._sessions_lock:
                         self._sessions.pop(sid, None)
                     raise
-            self._write_name(s)            # same rule as the client-missing branch above
+            self._publish_spawn_name(s)    # same rule as the client-missing branch above
             return sid
         s = _Session(sid, tid, name, cwd, model=model, color=bg)
         s.loaded = True
@@ -850,7 +869,7 @@ class CodexBackend:
         # touch the materialized transcript NOW: discovery lists real files, and an empty jsonl
         # parses to an empty session — the tab opens immediately instead of waiting for turn one
         self.transcript_path(sid).touch()
-        self._write_name(s, bg, fg)
+        self._publish_spawn_name(s, bg, fg)
         self.push()
         return sid
 
@@ -940,14 +959,34 @@ class CodexBackend:
                 # verification — the r28 kernel-layer reorder missed this layer)
                 s.name = old_name
                 raise
+            nf = self.state / "names" / s.sid
+            try:
+                old_line = nf.read_bytes()
+            except OSError:
+                old_line = None
             try:
                 self._write_name(s)       # keep the shared identity file in sync (colours preserved)
             except BaseException:
                 s.name = old_name         # compensate: the registry write above is re-run with
-                try:                      # the old name so the stores stay agreed; the raise
-                    self._save_registry(s, fields=("name",))   # still reaches the caller (loud)
-                except Exception:
-                    pass
+                #                           the old name so the stores stay agreed; the raise
+                #                           still reaches the caller (loud)
+                if old_line is not None:
+                    try:
+                        nf.write_bytes(old_line)   # write_text TRUNCATES before it fails — an
+                        #                            ENOSPC left the identity file (and its
+                        #                            colours) empty (the r29 verification)
+                    except OSError as e2:
+                        self.log("codex rename: names/%s left truncated by a failed write (%s)"
+                                 % (s.sid, e2))
+                try:
+                    self._save_registry(s, fields=("name",))
+                except Exception as e2:
+                    # a silent pass here hid the ONE moment the code knows the stores disagree:
+                    # the durable registry alone holds the NEW name and will apply the rename
+                    # the caller was told failed at the next restart (the r29 verification)
+                    self.log("codex rename compensation failed for %s: the registry alone holds "
+                             "the new name and will apply it at the next restart (%s)"
+                             % (s.sid, e2))
                 raise
         c = self._client
         if c is not None:
@@ -979,10 +1018,20 @@ class CodexBackend:
             with s.lock:
                 if s.dead:
                     return False
+                prior = (s.tid, s.model, s.loaded)
                 s.tid = resp.thread.id
                 s.model = getattr(resp, "model", "") or s.model
                 s.loaded = True
-                self._save_registry(s, fields=("tid", "model"))
+                try:
+                    self._save_registry(s, fields=("tid", "model"))
+                except BaseException:
+                    # publish NOTHING on a raise: with the real tid only in memory, every retry
+                    # took the resume path and never re-saved it — the next kernel restart
+                    # loaded 'pending-…' and silently started a FRESH Codex thread (the r29
+                    # verification). Rolled back, the loud retry re-runs thread_start; an
+                    # orphaned server-side thread beats a silently forked conversation.
+                    (s.tid, s.model, s.loaded) = prior
+                    raise
             with s.norm_lock:
                 s.norm = None
             self._ensure_norm(s)

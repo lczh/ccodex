@@ -2014,13 +2014,19 @@ def _update_channel():
         try:
             v = (gd / "romp-update-channel").read_text().strip()
         except FileNotFoundError:
-            v = ""
-        except OSError:
-            # an EXISTING marker we cannot read is UNKNOWN — read STABLE, never fall through to
-            # the legacy repo-scoped key, which a stale dev opt-in could still hold (the r28
-            # verification, executed: chmod-000 stable marker + romp.updateChannel=dev read dev)
+            v = None
+        except (OSError, UnicodeDecodeError):
+            # an EXISTING marker we cannot read (or decode — that raise crashed the drift loop
+            # right past the documented garbage→stable rule) is UNKNOWN: STABLE, never a
+            # fall-through to the legacy repo-scoped key, which a stale dev opt-in could still
+            # hold (the r28+r29 verifications, executed)
             return "stable"
-        if v:
+        if v is not None:
+            # an EXISTING marker decides ALONE — empty/whitespace reads STABLE like any other
+            # garbage. Falling through to the legacy key on an empty read made this reader and
+            # the peer-push wrapper disagree on the same trust cell (the r29 verification,
+            # executed: a torn-migration zero-length marker + stale config-dev read dev here,
+            # STABLENOW there)
             return "dev" if v == "dev" else "stable"
     # Legacy fallback (v1.3.3 wrote git config --local): that key is REPOSITORY-scoped, and a dev
     # worktree could flip a release worktree's channel through it (the user's audit, 2026-08-17)
@@ -2924,6 +2930,17 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
                                "prior install — commit or stash the new edits, then update again.")
                 _MAIN_DRIFT[0] = ""
                 return
+            ff2 = subprocess.run(["git", "merge-base", "--is-ancestor", "HEAD", tip],
+                                 cwd=str(ROOT), capture_output=True, text=True, timeout=10)
+            if ff2.returncode != 0:
+                # ancestry re-decided post-settle, like _pull_remote's anc2: a COMMIT landing
+                # during the heal leaves porcelain clean, and checkout --detach enforces no
+                # ancestry at the move — the entry refusal's promise was bypassed (the r29
+                # verification, executed)
+                _converge_note("main moved at origin, but the checkout diverged while settling "
+                               "a prior install — not moving. Reconcile the clone yourself.")
+                _MAIN_DRIFT[0] = ""
+                return
             if not _arm_latch(tip[:8], carry):
                 # an intent that cannot PERSIST blocks the move outright — an unwritable git dir
                 # must never mean "proceed unrecorded" (the user's audit, 2026-08-17)
@@ -3041,6 +3058,12 @@ def _settle_prior_latch(lock_fd):
                 otoks = raw[1].split()
                 if len(otoks) > 1 and otoks[1] in ("stable", "dev"):
                     carry_line = cur + " " + otoks[1]
+        except FileNotFoundError:
+            # the git-dir file never existed: the first read served the LEGACY state-dir latch
+            # (pre-v1.3.3), which is token-free by construction — the plain carry is exact.
+            # r29's bare-OSError catch spuriously refused here forever, re-wedging the very
+            # population the two-line carry design unwedged (the r29 verification, executed)
+            pass
         except OSError:
             # fail-closed like the FIRST read: a latch that turns unreadable during the
             # minutes-long heal silently degraded the carry from "sha8 stable" to a plain sha —
@@ -10997,7 +11020,7 @@ def _update_remote(host):
         "    v=open(mk).read().strip()\n"
         "except FileNotFoundError:\n"
         "    v=None\n"
-        "except OSError:\n"
+        "except (OSError,ValueError):\n"
         "    sys.exit(14)\n"
         "if v is not None:\n"
         '    if v!="dev":\n'
@@ -28133,10 +28156,15 @@ class Handler(BaseHTTPRequestHandler):
                             _create_codex_session(nm, cwd, client=client)
                         except Exception as e:
                             # the generic dispatcher handler logs to stderr only — the picker's
-                            # "Opening…" cue got no answer (the r28 verification)
-                            client["send"](json.dumps({"type": "warn",
-                                                       "text": "creating the Codex session "
-                                                               "failed: %s" % e}))
+                            # "Opening…" cue got no answer (the r28 verification). stderr FIRST:
+                            # a raising send must not erase the error from every record.
+                            sys.stderr.write("codex create '%s' failed: %s\n" % (nm, e))
+                            try:
+                                client["send"](json.dumps({"type": "warn",
+                                                           "text": "creating the Codex session "
+                                                                   "failed: %s" % e}))
+                            except Exception:
+                                pass
                     else:
                         # same rule as SDK: the user asked for Codex — refuse loudly, never a
                         # mystery tmux session. _codex_ready is False for a missing dep, a dead

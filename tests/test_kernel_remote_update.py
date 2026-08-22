@@ -601,6 +601,15 @@ class UpdateRemote(unittest.TestCase):
             self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2 stable",
                              "nothing spent, nothing moved on an unknown channel")
             (gd / "romp-update-channel").chmod(0o644)
+            # an UNDECODABLE marker is unknown too — it killed the wrapper uncaught and
+            # surfaced as RESETFAIL, pointing the operator at the wrong subsystem (the r29
+            # verification)
+            (gd / "romp-update-channel").write_bytes(b"\xff\xfe garbage")
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("CHANNELUNKNOWN", a.stdout)
+            self.assertNotIn("RESETFAIL", a.stdout)
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2 stable")
+            (gd / "romp-update-channel").write_text("dev\n")
             # torn, EMPTY, and malformed records are never moot — LATCHSTUCK, executed (the
             # v1.3.9 audit: strict grammar in every reader)
             for bad in ("quarantin", "", "deadbee2 sta", "abcd1234\nffff9999\neeee1111"):
