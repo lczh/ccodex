@@ -130,5 +130,41 @@ class StagingStraysNeverDiscovered(unittest.TestCase):
                          "staging churn is invisible to the discovery fingerprint")
 
 
+class SpawnToReviveIntegration(unittest.TestCase):
+    def test_the_stable_sid_is_the_identity_from_spawn_through_revive(self):
+        # the v1.3.13 audit's asked-for integration: spawn → discovery → the liveness join →
+        # stop → revive, all on the REAL backend and REAL discovery — the TID-as-identity split
+        # was invisible to every unit test because each side was exercised alone
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(ROOT, "kernel"))
+        import codex_backend as cb
+        tmp = Path(tempfile.mkdtemp())
+        jd._rebind_state(tmp)
+        jd.NAMES.mkdir(parents=True, exist_ok=True)
+        be = cb.CodexBackend(str(tmp), client_factory=lambda: None)
+        sid = be.spawn("webby", "/TESTDIR")
+        # the transcript materializes where discovery looks (registry tid)
+        p = be.transcript_path(sid)
+        p.write_text(json.dumps({"type": "user", "uuid": "u1", "parentUuid": None,
+                                 "timestamp": "2026-06-10T14:00:00.000Z",
+                                 "message": {"role": "user", "content": "x"}}) + "\n")
+        os.utime(p, (NOW, NOW))
+        os.utime(jd.CODEXDIR / "registry.json", (NOW, NOW))
+        rows = [r for r in jd._discover_impl(NOW) if r[2] == sid]
+        self.assertEqual(len(rows), 1, "spawned session discovered")
+        self.assertEqual(rows[0][0], sid,
+                         "discovery identity == the liveness key: the join that broke")
+        self.assertIn(rows[0][0], be.live_sessions(),
+                      "a live session's row joins the alive set by its own identity")
+        be.kill(sid)
+        self.assertNotIn(sid, be.live_sessions(), "stopped: out of the live set")
+        rows2 = [r for r in jd._discover_impl(NOW) if r[2] == sid]
+        self.assertEqual(len(rows2), 1, "dead sessions keep discovering — history stays browsable")
+        self.assertIsNotNone(be._session(sid),
+                             "the registry probe a revive routes on still knows it")
+        self.assertTrue(be.resume("webby", sid), "the revive lands on the Codex backend")
+        self.assertIn(sid, be.live_sessions(), "revived: back in the live set under the SAME sid")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
