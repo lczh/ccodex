@@ -536,6 +536,20 @@ class UpdateRemote(unittest.TestCase):
             self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2",
                              "the latch stays armed on ANY uncertainty (the audit's requirement)")
 
+    def test_both_install_entries_inherit_the_update_flock(self):
+        # the r43 mutant hunt: dropping pass_fds from the rewritten bash -s calls stayed
+        # suite-green — the inherited locked fd is what keeps the update flock alive when the
+        # ssh wrapper dies mid-install (the 2026-08-17 double-install class)
+        calls = self._wire(apply_out="SYNCED:abcdef0")
+        km._update_remote("TESTHOST")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        self.assertEqual(apply.count('["bash","-s"],cwd=r,stdin=open('), 2,
+                         "both entries (heal + main) run over stdin")
+        for frag in ('stdin=open(ie,"rb"),pass_fds=(fd,)',
+                     'stdin=open(ie2,"rb"),pass_fds=(fd,)'):
+            self.assertIn(frag, apply,
+                          "the installer subtree INHERITS the locked fd: %s" % frag)
+
     def test_an_empty_committed_install_refuses_and_never_falls_to_the_tree(self):
         # the r42 mutant hunt's M5: a git show that SUCCEEDS with empty output must refuse
         # (exit 4, latch armed) — a fallback to the tree's install.sh re-opens the exact
