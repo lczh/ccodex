@@ -4797,101 +4797,217 @@ def _discover_impl(now, window=None, forks=True):
                 seen.add(path_str); out.append((stem, Path(path_str), sid, name))
     out.extend(_codex_rows(cutoff, seen))
     return out
+def _mig_atomic(path, text):
+    """Unlink-first staged publish for the migration's own records (plants + strays)."""
+    tmp = path.with_name(path.name + ".mig")
+    tmp.unlink(missing_ok=True)
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def _reid(x, tid, sid):
+    """Rewrite tid-identity prefixes anywhere in a JSON tree — keys and string values."""
+    if isinstance(x, str):
+        if x == tid:
+            return sid
+        if x.startswith(tid + ":"):
+            return sid + x[len(tid):]
+        return x
+    if isinstance(x, list):
+        return [_reid(v, tid, sid) for v in x]
+    if isinstance(x, dict):
+        return {_reid(k, tid, sid): _reid(v, tid, sid) for k, v in x.items()}
+    return x
+
+
 def migrate_codex_identity():
-    """One-time tid→sid rescue of every fsid-keyed store a codex session wrote BEFORE the
-    identity fix (the v1.3.13 audit's P1 made the stable SID the public identity; the r37
-    verification executed the fallout of leaving the old stores behind: board cards vanished,
-    the captioner re-billed every in-window unit, and the planner re-minted cards for finished
-    work because placement keys embed the fsid). For each registry row whose TID-keyed store
-    exists and SID-keyed one does not: captions/goals/goals-archive move to the SID name, with
-    every tid-identity reference rewritten inside the goal stores AND the user-override journal
-    that replays over them. Node ids are minted "<rompUuid>:gN" and every gesture derives the
-    owning session from that prefix (Clear, citations, delegation links, the nudge veto, card
-    replies) — so the rewrite is WHOLE-TREE: keys and string values both (the r38 verification
-    executed both halves failing: rescued cards whose gestures died against the deleted TID
-    store, and journaled blocks that vanished from the loaded store). Idempotent (the move's
-    precondition dies with the move); a partial crash re-runs cleanly at the next boot; a SID
-    store that already exists always wins."""
+    """The tid→sid identity rescue as a DURABLE PER-SESSION TRANSACTION (the v1.3.14 audit: every
+    file-presence inference failed an executed crash test — a crash between the sid publish and
+    the tid unlink left both files and the sid-wins skip stranded the journal forever; an
+    archive-only session merged the journal onto a future store's numbering; captions renamed
+    without their row ids re-billed everything).
+
+    Per session: a .done marker skips settled sessions outright; otherwise an .intent record is
+    published FIRST (before anything moves) and carries a per-namespace ledger. With an intent
+    standing, old-and-new-both-exist means OUR OWN crash — the old file is authoritative and is
+    re-published over the partial (no legitimate sid writer can interleave: this migration runs
+    before the judge loop in every entry point). With NO intent standing, both-exist is a relic
+    of the pre-transactional migration's crash — the sid store may hold real post-upgrade work,
+    so the sid wins, the relic is left inert, and the session still settles to .done.
+
+    Namespace transforms are SCHEMA-SPECIFIC (same audit): caption rows and the fail ledger
+    rewrite their unit ids (a bare rename re-billed every caption); goals/goals-archive rewrite
+    whole-tree; the archive headline and the EPISODE LOG move by filename with contents
+    untouched — an episode row's fsid legitimately names the PHYSICAL tid transcript. The
+    override journal merges only when the ledger records the goal stores' own moves (numbering
+    continuity — the r39/r40 aliasing class). Everything idempotent; every boundary crash
+    re-runs cleanly at the next entry."""
     try:
         reg = json.loads((CODEXDIR / "registry.json").read_text())
     except Exception:
         return
     if not isinstance(reg, dict):
         return
-
-    def _reid(x, tid, sid):
-        """Rewrite tid-identity prefixes anywhere in a JSON tree — keys and string values."""
-        if isinstance(x, str):
-            if x == tid:
-                return sid
-            if x.startswith(tid + ":"):
-                return sid + x[len(tid):]
-            return x
-        if isinstance(x, list):
-            return [_reid(v, tid, sid) for v in x]
-        if isinstance(x, dict):
-            return {_reid(k, tid, sid): _reid(v, tid, sid) for k, v in x.items()}
-        return x
-
+    migdir = CODEXDIR / "migrated"
+    tid_to_sid = {}
     for sid, r in reg.items():
         if not isinstance(r, dict):
             continue                                  # a corrupt row must not crash the BOOT
         tid = r.get("tid") or ""
         if not tid or tid == sid:
             continue
-        goal_stores_present, goal_stores_moved = 0, 0
-        for d, suff, rewrite in ((CAPDIR, ".jsonl", False), (ARCHDIR, ".json", False),
-                                 (GOALDIR, ".json", True), (GOALARCHDIR, ".json", True)):
-            old_p, new_p = d / (tid + suff), d / (sid + suff)
-            try:
-                if rewrite and old_p.exists():
-                    goal_stores_present += 1
-                if not old_p.exists() or new_p.exists():
-                    continue
-                if rewrite:
-                    store = _reid(json.loads(old_p.read_text()), tid, sid)
-                    store["rompUuid"] = sid
-                    _atomic_json(new_p, store)
-                    old_p.unlink(missing_ok=True)
-                    goal_stores_moved += 1
-                else:
-                    os.replace(old_p, new_p)
-            except Exception as e:
-                sys.stderr.write("codex identity migration %s->%s (%s): %s\n"
-                                 % (tid[:8], sid[:8], d.name, e))
-        # the override journal replays over the store on every load — its node references move
-        # with the store, and pre-upgrade entries PREPEND any post-upgrade sid entries so the
-        # replay order stays chronological. The merge rides the move EVENT, never file
-        # absence/presence: absence is producible without the move (a corrupt tid store
-        # quarantined by any goals walk, a fresh sid store minted by the next judge pass), and
-        # the absence-inferred gate then merged pre-upgrade verdicts onto cards born LATER — a
-        # fresh card completed by a resolve stamped before its birth (the r39+r40
-        # verifications, both executed). The journal merges only in the run where EVERY
-        # tid-keyed goal store (live and archive — restore rows replay against the archive too)
-        # moved; a crash in the store→journal window leaves the tid journal an orphaned relic —
-        # verdicts LOST are recoverable by hand, verdicts FABRICATED are not.
+        tid_to_sid[tid] = sid
+        done_p, intent_p = migdir / (sid + ".done"), migdir / (sid + ".intent")
         try:
-            ov = _overrides_dir()
-            old_j, new_j = ov / (tid + ".jsonl"), ov / (sid + ".jsonl")
-            goal_settled = goal_stores_present > 0 and goal_stores_moved == goal_stores_present
-            if old_j.exists() and goal_settled:
-                moved = []
-                for ln in old_j.read_text().splitlines():
+            if done_p.exists():
+                continue
+            # (namespace key, dir, old name, new name, transform)
+            plan = (("captions", CAPDIR, tid + ".jsonl", sid + ".jsonl", "rows"),
+                    ("capfails", CAPDIR, tid + ".fails.json", sid + ".fails.json", "tree"),
+                    ("arch", ARCHDIR, tid + ".json", sid + ".json", "copy"),
+                    ("goals", GOALDIR, tid + ".json", sid + ".json", "tree"),
+                    ("goalsarch", GOALARCHDIR, tid + ".json", sid + ".json", "tree"),
+                    ("episodes", EPIDIR, tid + ".jsonl", sid + ".jsonl", "copy"),
+                    ("journal", _overrides_dir(), tid + ".jsonl", sid + ".jsonl", "journal"))
+            resumed = intent_p.exists()
+            if resumed:
+                try:
+                    intent = json.loads(intent_p.read_text())
+                    assert isinstance(intent, dict) and isinstance(intent.get("moved"), dict)
+                except Exception:
+                    intent = {"tid": tid, "moved": {}, "present": {}}
+            else:
+                present = {ns: (d / old).exists() for ns, d, old, _n, _t in plan}
+                if not any(present.values()):
+                    migdir.mkdir(parents=True, exist_ok=True)
+                    _mig_atomic(done_p, json.dumps({"tid": tid, "moved": {}}))
+                    continue                          # nothing ever to migrate: settled
+                intent = {"tid": tid, "moved": {}, "present": present}
+                migdir.mkdir(parents=True, exist_ok=True)
+                _mig_atomic(intent_p, json.dumps(intent))   # the INTENT lands before anything moves
+            moved = intent.setdefault("moved", {})
+            failed = False
+            for ns, d, old_name, new_name, kind in plan:
+                old_p, new_p = d / old_name, d / new_name
+                try:
+                    if not old_p.exists():
+                        continue                      # absent: moved on a prior run, or never was
+                    if kind == "journal":
+                        # numbering continuity: the journal's node ids only mean anything on the
+                        # store THIS transaction moved (the r39/r40 aliasing class, executed) —
+                        # goals must have moved, and the goal-archive must be settled by our own
+                        # move or by never having existed
+                        pres = intent.get("present") or {}
+                        ok = (moved.get("goals")
+                              and (moved.get("goalsarch") or not pres.get("goalsarch")))
+                        if not ok:
+                            continue                  # orphaned relic: verdicts LOST are
+                        #                               recoverable by hand; FABRICATED are not
+                        rows = []
+                        for ln in old_p.read_text().splitlines():
+                            if not ln.strip():
+                                continue
+                            try:
+                                rows.append(json.dumps(_reid(json.loads(ln), tid, sid)))
+                            except Exception:
+                                rows.append(ln)       # an unparseable row rides verbatim
+                        tail = new_p.read_text() if new_p.exists() else ""
+                        _mig_atomic(new_p, "\n".join(rows) + ("\n" if rows else "") + tail)
+                        old_p.unlink(missing_ok=True)
+                        moved[ns] = True
+                        continue
+                    if new_p.exists() and not resumed:
+                        # a pre-transactional crash's relic: the sid file may hold real
+                        # post-upgrade work — sid wins, loudly, and the relic stays inert
+                        sys.stderr.write("codex identity migration %s->%s: %s/%s exists on both "
+                                         "identities with no standing intent — keeping the sid "
+                                         "file; the tid relic is yours to reconcile\n"
+                                         % (tid[:8], sid[:8], d.name, new_name))
+                        continue
+                    # ours to (re-)publish: with a standing intent, the OLD file is authoritative
+                    if kind == "copy":
+                        data = old_p.read_bytes()
+                        tmp = new_p.with_name(new_p.name + ".mig")
+                        tmp.unlink(missing_ok=True)
+                        tmp.write_bytes(data)
+                        os.replace(tmp, new_p)
+                    elif kind == "rows":
+                        out = []
+                        for ln in old_p.read_text().splitlines():
+                            if not ln.strip():
+                                continue
+                            try:
+                                out.append(json.dumps(_reid(json.loads(ln), tid, sid)))
+                            except Exception:
+                                out.append(ln)
+                        _mig_atomic(new_p, "\n".join(out) + ("\n" if out else ""))
+                    else:                             # "tree"
+                        store = _reid(json.loads(old_p.read_text()), tid, sid)
+                        if isinstance(store, dict) and ns in ("goals", "goalsarch"):
+                            store["rompUuid"] = sid
+                        _mig_atomic(new_p, json.dumps(store))
+                    old_p.unlink(missing_ok=True)
+                    moved[ns] = True
+                except Exception as e:
+                    failed = True
+                    sys.stderr.write("codex identity migration %s->%s (%s): %s\n"
+                                     % (tid[:8], sid[:8], d.name, e))
+                # the ledger is durable after EVERY namespace: a crash resumes knowing which
+                # moves were OURS (the v1.3.14 audit's crash-ordering requirement)
+                try:
+                    _mig_atomic(intent_p, json.dumps(intent))
+                except Exception:
+                    pass
+            if not failed:
+                _mig_atomic(done_p, json.dumps(intent))
+                intent_p.unlink(missing_ok=True)
+        except Exception as e:
+            sys.stderr.write("codex identity migration %s->%s: %s\n" % (tid[:8], sid[:8], e))
+    _migrate_shared_identity_files(tid_to_sid)
+
+
+def _migrate_shared_identity_files(tid_to_sid):
+    """The SHARED identity-keyed files (one file, many sessions): cleared.jsonl rows,
+    notify-cards keys, auto-nudge state, nudge-events rows, the judge-auth latch, and the
+    timeline views — each held tid references that detached from the migrated session (the
+    v1.3.14 audit's P2 cluster). Idempotent: after one pass no tid strings remain, and an
+    unchanged file is never rewritten."""
+    if not tid_to_sid:
+        return
+
+    def _reid_all(x):
+        for tid, sid in tid_to_sid.items():
+            x = _reid(x, tid, sid)
+        return x
+
+    for name, jsonl in (("cleared.jsonl", True), ("nudge-events.jsonl", True),
+                        ("notify-cards.json", False), ("auto-nudge.json", False),
+                        ("judge-auth.json", False), ("timeline-views.json", False)):
+        p = STATE / name
+        try:
+            if not p.exists() or not p.is_file():
+                continue
+            if jsonl:
+                out, changed = [], False
+                for ln in p.read_text().splitlines():
                     if not ln.strip():
                         continue
                     try:
-                        moved.append(json.dumps(_reid(json.loads(ln), tid, sid)))
+                        new = json.dumps(_reid_all(json.loads(ln)))
+                        changed = changed or (new != ln)
+                        out.append(new)
                     except Exception:
-                        moved.append(ln)              # an unparseable row rides verbatim
-                tail = new_j.read_text() if new_j.exists() else ""
-                tmp = ov / (sid + ".jsonl.mig")
-                tmp.unlink(missing_ok=True)
-                tmp.write_text("\n".join(moved) + ("\n" if moved else "") + tail)
-                os.replace(tmp, new_j)
-                old_j.unlink(missing_ok=True)
+                        out.append(ln)
+                if changed:
+                    _mig_atomic(p, "\n".join(out) + ("\n" if out else ""))
+            else:
+                raw = p.read_text()
+                cur = json.loads(raw)
+                new = _reid_all(cur)
+                if new != cur:
+                    _mig_atomic(p, json.dumps(new, sort_keys=True))
         except Exception as e:
-            sys.stderr.write("codex identity migration %s->%s (overrides): %s\n"
-                             % (tid[:8], sid[:8], e))
+            sys.stderr.write("codex identity migration (%s): %s\n" % (name, e))
 
 
 def _codex_rows(cutoff, seen):

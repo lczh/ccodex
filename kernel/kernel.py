@@ -11482,7 +11482,25 @@ def _update_remote(host):
         "                return curline\n"
         "            o=rawlines[1].strip().split()\n"
         '            return curline+" "+o[1] if len(o)>1 and o[1] in ("stable","dev") else curline\n'
-        '        if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
+        '        ie=os.path.join(os.path.dirname(lock),"romp-install-entry.sh")\n'
+        "        try:\n"
+        "            os.unlink(ie)\n"
+        "        except FileNotFoundError:\n"
+        "            pass\n"
+        "        heal_fail=False\n"
+        '        ge=subprocess.run(["git","-C",r,"show","HEAD:install.sh"],capture_output=True,text=True)\n'
+        "        if ge.returncode or not ge.stdout:\n"
+        "            heal_fail=True\n"
+        "        else:\n"
+        '            efd=os.open(ie,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o755)\n'
+        "            try:\n"
+        "                if os.write(efd,ge.stdout.encode())!=len(ge.stdout.encode()):\n"
+        '                    raise OSError("short entry write")\n'
+        "            finally:\n"
+        "                os.close(efd)\n"
+        '            if subprocess.run(["bash",ie],cwd=r,pass_fds=(fd,)).returncode:\n'
+        "                heal_fail=True\n"
+        "        if heal_fail:\n"
         "            carry=merge_carry()\n"
         '            if len(carry.split())>1 and carry.split()[1]=="stable":\n'
         "                sys.exit(12)\n"
@@ -11554,8 +11572,26 @@ def _update_remote(host):
         "    sys.exit(19)\n"
         'if (st3.stdout or "").strip():\n'
         "    sys.exit(18)\n"
-        'if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
+        'ie2=os.path.join(os.path.dirname(lock),"romp-install-entry.sh")\n'
+        "try:\n"
+        "    os.unlink(ie2)\n"
+        "except FileNotFoundError:\n"
+        "    pass\n"
+        'ge2=subprocess.run(["git","-C",r,"show",target+":install.sh"],capture_output=True,text=True)\n'
+        "if ge2.returncode or not ge2.stdout:\n"
         "    sys.exit(4)\n"
+        'efd2=os.open(ie2,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o755)\n'
+        "try:\n"
+        "    if os.write(efd2,ge2.stdout.encode())!=len(ge2.stdout.encode()):\n"
+        '        raise OSError("short entry write")\n'
+        "finally:\n"
+        "    os.close(efd2)\n"
+        'if subprocess.run(["bash",ie2],cwd=r,pass_fds=(fd,)).returncode:\n'
+        "    sys.exit(4)\n"
+        'st4=subprocess.run(["git","-C",r,"status","--porcelain"],capture_output=True,text=True)\n'
+        'h3=subprocess.run(["git","-C",r,"rev-parse","HEAD"],capture_output=True,text=True)\n'
+        'if st4.returncode or (st4.stdout or "").strip() or h3.returncode or (h3.stdout or "").strip()!=target:\n'
+        "    sys.exit(20)\n"
         "if not pub_line(pick_pub(body.splitlines()[0],body.splitlines())):\n"
         "    sys.exit(4)\n"
         "os.remove(lp)' "
@@ -11565,6 +11601,7 @@ def _update_remote(host):
         'if [ "$RRC" = 8 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYNOW; exit 0; fi; '
         'if [ "$RRC" = 9 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERR; exit 0; fi; '
         'if [ "$RRC" = 10 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo LATCHSTUCK; exit 0; fi; '
+        'if [ "$RRC" = 20 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo TAMPEREDPOSTINSTALL; exit 0; fi; '
         'if [ "$RRC" = 19 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERRPOSTMOVE; exit 0; fi; '
         'if [ "$RRC" = 18 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYPOSTMOVE; exit 0; fi; '
         'if [ "$RRC" = 17 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESTOREFAIL; exit 0; fi; '
@@ -11601,7 +11638,7 @@ def _update_remote(host):
         'echo "SYNCED:$NEW"'
     ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, lfull, _P2P_REF, _P2P_REF,
          _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
-         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
+         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -11646,6 +11683,10 @@ def _update_remote(host):
         return False, ("pushed, but %s's install latch names commits its HEAD doesn't match — an "
                        "update died there mid-move from a broken state; heal it by hand on that "
                        "machine (run install.sh, then remove the latch)" % host)
+    if tag == "TAMPEREDPOSTINSTALL":
+        return False, ("pushed and installed, but the remote's tree changed during the install — "
+                       "success was NOT reported and its install latch stays armed; inspect the "
+                       "remote before trusting this build")
     if tag == "STATERRPOSTMOVE":
         return False, ("pushed and merged, but reading the remote's tree state failed — nothing "
                        "installed; its install latch stays armed; its boot heal settles it")

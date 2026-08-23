@@ -237,6 +237,11 @@ class UpdateRemote(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("reading the remote's tree state failed", detail)
         self.assertNotIn("tree changed", detail)
+        self._wire(apply_out="TAMPEREDPOSTINSTALL")
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("changed during the install", detail)
+        self.assertIn("NOT reported", detail)
 
     def test_an_install_failure_on_the_remote_is_its_own_verdict(self):
         # the apply used to lock the reset alone and never install at all (the user's audit,
@@ -275,6 +280,7 @@ class UpdateRemote(unittest.TestCase):
                 "#!/bin/sh\necho \"$*\" >> '%s'\ncase \" $* \" in\n"
                 "  *' status '*) echo 'fatal: index corrupt' >&2; exit 128;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % log)
             (fakebin / "git").chmod(0o755)
             env = dict(os.environ, HOME=str(home),
@@ -313,6 +319,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % gd)
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\nexit 1\n")
@@ -344,6 +351,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' merge-base '*) exit 1;;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % gd)
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("DIVERGED", a.stdout, "divergence is decided UNDER the lock, executed")
@@ -358,6 +366,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' merge-base '*) exit 0;;\n"
                 "  *' status '*) echo ' M peer-edit.py';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % gd)
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("DIRTYNOW", a.stdout, "the locked wrapper's own dirty check refuses")
@@ -393,6 +402,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % (gd, nstat, nstat, ops))
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\necho INSTALLED >> '%s'\nexit 0\n" % ops)
@@ -418,6 +428,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % (gd, nstat, nstat, ops))
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("DIRTYPOSTMOVE", a.stdout)
@@ -438,6 +449,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' status '*) echo x >> '%s'; [ $(wc -l < '%s') -ge 4 ] && exit 1;;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % (gd, nstat, nstat))
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("STATERRPOSTMOVE", a.stdout)
@@ -450,6 +462,69 @@ class UpdateRemote(unittest.TestCase):
                             "st2 sits AFTER the settle-heal block")
             self.assertLess(apply_r.index("st2="), apply_r.index('tmp=lp+".tmp"'),
                             "and BEFORE the arm")
+
+    def test_a_writer_racing_the_install_never_executes_and_never_reports_success(self):
+        # the v1.3.14 audit's P1, executed there: install.sh was replaced after the final clean
+        # snapshot and the wrapper EXECUTED the replacement and reported SYNCED. The install
+        # entry is the TARGET COMMIT's committed bytes now (git show), and success is reported
+        # only after a post-install verify — changed bytes neither execute nor produce SYNCED.
+        import tempfile
+        from pathlib import Path
+        calls = self._wire(apply_out="SYNCED:abcdef0")
+        km._update_remote("TESTHOST")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        with tempfile.TemporaryDirectory() as td:
+            fix = Path(td) / "romp"
+            gd = fix / ".git"
+            gd.mkdir(parents=True)
+            (gd / "romp-update-channel").write_text("dev\n")
+            fakebin = Path(td) / "bin"
+            fakebin.mkdir()
+            ops = Path(td) / "ops.log"
+            committed = Path(td) / "committed-install.sh"
+            committed.write_text("#!/bin/sh\necho COMMITTED >> '%s'\nexit 0\n" % ops)
+            # the COMMITTED bytes come from `git show`; the TREE's install.sh is the racing
+            # writer's replacement
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' merge-base '*) exit 0;;\n"
+                "  *' show '*) cat '%s';;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "esac\nexit 0\n" % (gd, committed))
+            (fakebin / "git").chmod(0o755)
+            (fix / "install.sh").write_text("#!/bin/sh\necho RACED >> '%s'\nexit 0\n" % ops)
+            (fix / "install.sh").chmod(0o755)
+            env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
+            apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            log = ops.read_text() if ops.exists() else ""
+            self.assertIn("COMMITTED", log, "the TARGET's committed install bytes executed")
+            self.assertNotIn("RACED", log,
+                             "the racing writer's replacement NEVER executes — the entry is "
+                             "immutable (the v1.3.14 audit's executed repro)")
+            # and a tree that turns dirty DURING the install yields no success: the committed
+            # install itself dirties the tree, standing in for any mid-install writer
+            ops.unlink(missing_ok=True)
+            committed.write_text(
+                "#!/bin/sh\necho COMMITTED >> '%s'\necho tampered > '%s'\nexit 0\n"
+                % (ops, fix / "mid-install-edit"))
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' merge-base '*) exit 0;;\n"
+                "  *' show '*) cat '%s';;\n"
+                "  *' status '*) [ -e '%s' ] && echo ' M mid-install-edit';;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "esac\nexit 0\n" % (gd, committed, fix / "mid-install-edit"))
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("TAMPEREDPOSTINSTALL", a.stdout)
+            self.assertNotIn("SYNCED", a.stdout,
+                             "no success report from a tree that changed during the install")
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2",
+                             "the latch stays armed on ANY uncertainty (the audit's requirement)")
 
     def test_a_stable_remote_marker_refuses_the_push_absolutely(self):
         # the v1.3.12 audit's P1, hardened by its own review: the rule is absolute in both peer
@@ -473,6 +548,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % (gd, ops))
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\necho INSTALLED >> '%s'\nexit 0\n" % ops)
@@ -503,6 +579,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % (gd, ops))
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertNotIn("STABLENOW", a.stdout)
@@ -532,6 +609,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo cccccccccccccccccccccccccccccccccccccccc;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % (gd, ops))          # HEAD sits on a SEAM commit post-merge
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\necho INSTALLED >> '%s'\nexit 0\n" % ops)
@@ -555,6 +633,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --short=8 HEAD'*) echo deadbee2;;\n"
                 "  *' rev-parse --short=8 '*) echo 1c432642;;\n"
                 "  *' rev-parse HEAD'*) echo cccccccccccccccccccccccccccccccccccccccc;;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % gd)
             (gd / "romp-install-failed").write_text("deadbee2 dev")
             (fix / "install.sh").write_text("#!/bin/sh\nexit 1\n")   # the carried heal fails
@@ -575,7 +654,9 @@ class UpdateRemote(unittest.TestCase):
                 "def _short(fd, data):\n"
                 "    if fd > 2 and len(data) > 6:\n"
                 "        _state['n'] += 1\n"
-                "        if _state['n'] == 2:\n"          # the ARM is write 1; the RESTORE is 2
+                "        if _state['n'] == 3:\n"          # the heal ENTRY is write 1 (immutable
+                #                                             install bytes, r42), the ARM is 2,
+                #                                             the RESTORE is 3
                 "            return _real(fd, data[:5])\n"
                 "    return _real(fd, data)\n"
                 "os.write = _short\n")
@@ -590,6 +671,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) exit 1;;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % gd)
             (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
@@ -618,6 +700,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s/ops.log';;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % (gd, td))
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
@@ -654,6 +737,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % gd)
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
@@ -701,6 +785,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % gd)
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
@@ -873,6 +958,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' merge-base '*) exit 0;;\n"
                 "  *' status '*) if [ -e '%s' ]; then echo ' M raced-edit.py'; else touch '%s'; fi;;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % (gd, marker, marker))
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
@@ -892,6 +978,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --short=8 HEAD'*) echo 01dbd11d;;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
                 "esac\nexit 0\n" % gd)
             (gd / "romp-install-failed").write_text("01dbd11d")
             (fix / "install.sh").write_text("#!/bin/sh\nexit 1\n")
