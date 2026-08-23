@@ -373,6 +373,32 @@ class NameClaims(unittest.TestCase):
                                                      "webby"),
                                   "and a publish that fails again is still never acked")
 
+    def test_mute_flags_and_order_slots_migrate_with_the_identity(self):
+        # the r38 mutant hunt: _migrate_codex_flags_order had zero coverage — deleting it
+        # entirely stayed green (a muted codex session unmuted at upgrade; its lane lost its slot)
+        import json as _json
+        import tempfile
+        from pathlib import Path
+        sid = "11111111-2222-3333-4444-555555555555"
+        tid = "01911111-2222-7333-8444-555555555555"
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td)
+            (state / "codex").mkdir()
+            (state / "codex" / "registry.json").write_text(_json.dumps(
+                {sid: {"tid": tid, "name": "cx", "cwd": "/x"}, "bad": 7}))
+            (state / "session-flags.json").write_text(_json.dumps({tid: {"mute": True}}))
+            (state / "session-order.json").write_text(_json.dumps([tid, "zzz", sid]))
+            with mock.patch.object(km.jd, "STATE", state):
+                with mock.patch.object(km.jd, "CODEXDIR", state / "codex"):
+                    km._migrate_codex_flags_order()
+            flags = _json.loads((state / "session-flags.json").read_text())
+            self.assertEqual(flags.get(sid), {"mute": True}, "the mute survives the identity")
+            self.assertNotIn(tid, flags)
+            order = _json.loads((state / "session-order.json").read_text())
+            self.assertEqual(order, [sid, "zzz"],
+                             "the slot maps tid→sid, and the sid's own later slot dedups — "
+                             "never two rows for one session")
+
     def test_renames_are_serialized_under_one_lock(self):
         # two interleaved renames of one sid left the registry at one name and the shared file
         # at the other (the v1.3.12 audit's P2)

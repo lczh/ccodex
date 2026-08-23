@@ -147,8 +147,18 @@ class TidToSidMigration(unittest.TestCase):
         (jd.CAPDIR / (TID + ".jsonl")).write_text('{"unit": "turn:u1"}\n')
         (jd.ARCHDIR / (TID + ".json")).write_text(json.dumps({"headline": "did things"}))
         (jd.GOALDIR / (TID + ".json")).write_text(json.dumps(
-            {"rompUuid": TID, "nodes": {"g1": {"t": 1}}, "status": {},
-             "placements": {TID + ":123:abc": "g1", "other:1:x": None}}))
+            {"rompUuid": TID,
+             "nodes": {TID + ":g1": {"t": 1, "parentId": None},
+                       TID + ":g2": {"t": 2, "parentId": TID + ":g1"}},
+             "status": {TID + ":g1": "working"},
+             "lastNode": TID + ":g2",
+             "placements": {TID + ":123:abc": TID + ":g1", "other:1:x": None}}))
+        ov = jd._overrides_dir()
+        ov.mkdir(parents=True, exist_ok=True)
+        (ov / (TID + ".jsonl")).write_text(json.dumps(
+            {"kind": "block", "nid": TID + ":g1", "ev_t": 5}) + "\n")
+        (ov / (SID + ".jsonl")).write_text(json.dumps(
+            {"kind": "resolve", "nid": SID + ":g9", "ev_t": 9}) + "\n")
         (jd.GOALARCHDIR / (TID + ".json")).write_text(json.dumps(
             {"rompUuid": TID, "nodes": {}, "status": {}}))
         jd.migrate_codex_identity()
@@ -163,11 +173,42 @@ class TidToSidMigration(unittest.TestCase):
                       "the planner under the new identity")
         self.assertIn("other:1:x", g["placements"], "foreign keys ride untouched")
         self.assertNotIn(TID + ":123:abc", g["placements"])
+        self.assertIn(SID + ":g1", g["nodes"],
+                      "NODE IDS rewrite too — every gesture derives the owning session from "
+                      "the id prefix, so a TID-keyed node's Clear died against the deleted "
+                      "store (the r38 verification, executed)")
+        self.assertEqual(g["nodes"][SID + ":g2"]["parentId"], SID + ":g1",
+                         "parent references move with their nodes")
+        self.assertEqual(g["placements"][SID + ":123:abc"], SID + ":g1",
+                         "placement VALUES name node ids — they move too")
+        self.assertEqual(g["lastNode"], SID + ":g2")
+        self.assertIn(SID + ":g1", g["status"])
+        self.assertNotIn(TID, json.dumps(g), "no tid identity survives anywhere in the store")
         self.assertTrue((jd.GOALARCHDIR / (SID + ".json")).exists())
+        self.assertFalse((jd.GOALDIR / (TID + ".json")).exists(),
+                         "no TID relic: stale stores double-counted the failure banner and "
+                         "burned judge retries (the r38 mutant hunt)")
+        self.assertFalse((jd.GOALARCHDIR / (TID + ".json")).exists())
+        jlines = (ov / (SID + ".jsonl")).read_text().splitlines()
+        self.assertEqual(len(jlines), 2, "the override journal MERGES: tid rows then sid rows")
+        self.assertEqual(json.loads(jlines[0])["nid"], SID + ":g1",
+                         "journal node references move with the store they replay over")
+        self.assertEqual(json.loads(jlines[1])["nid"], SID + ":g9")
+        self.assertFalse((ov / (TID + ".jsonl")).exists())
         # idempotent: a second boot moves nothing and destroys nothing
         jd.migrate_codex_identity()
         self.assertIn(SID + ":123:abc",
                       json.loads((jd.GOALDIR / (SID + ".json")).read_text())["placements"])
+
+    def test_a_corrupt_registry_row_never_crashes_the_boot(self):
+        # the r38 verification: a truthy non-dict row hit .get() outside every guard, and
+        # main() calls the migrations bare — the kernel crash-looped
+        tmp = Path(tempfile.mkdtemp())
+        jd._rebind_state(tmp)
+        jd.CODEXDIR.mkdir(parents=True, exist_ok=True)
+        (jd.CODEXDIR / "registry.json").write_text(json.dumps(
+            {SID: "not a dict", "x": 7, TID: {"tid": "t2", "cwd": "/y"}}))
+        jd.migrate_codex_identity()                   # must simply not raise
 
     def test_an_existing_sid_store_is_never_clobbered(self):
         tmp = Path(tempfile.mkdtemp())

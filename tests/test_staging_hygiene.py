@@ -91,6 +91,11 @@ class ElectronStagingWriters(unittest.TestCase):
                           "good state file instead and left the plant in place (the r37 mutant "
                           "hunt)" % anchor)
             self.assertLess(window.index(target), window.index("fs.writeFileSync"), anchor)
+        # and the STAGING BINDING itself is pinned: rebinding tmp to the real file made the
+        # unlink delete the good state before rewriting it (the r38 mutant hunt)
+        i = src.index("'session-order.json'")
+        self.assertIn("tmp = f + '.tmp'", src[i:i + 300],
+                      "_persistOrder's staging name derives from the target + .tmp")
 
 
 if __name__ == "__main__":

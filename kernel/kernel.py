@@ -3229,8 +3229,8 @@ def _migrate_codex_flags_order():
         return
     if not isinstance(reg, dict):
         return
-    tid_to_sid = {(r or {}).get("tid") or "": sid for sid, r in reg.items()
-                  if (r or {}).get("tid") and (r or {}).get("tid") != sid}
+    tid_to_sid = {r.get("tid") or "": sid for sid, r in reg.items()
+                  if isinstance(r, dict) and r.get("tid") and r.get("tid") != sid}
     if not tid_to_sid:
         return
     try:
@@ -3249,7 +3249,12 @@ def _migrate_codex_flags_order():
         p = jd.STATE / "session-order.json"
         order = json.loads(p.read_text())
         if isinstance(order, list):
-            new = [tid_to_sid.get(x, x) for x in order]
+            new, seen = [], set()
+            for x in order:
+                y = tid_to_sid.get(x, x)
+                if y not in seen:                     # both identities present → the sid's own
+                    seen.add(y)                       # slot wins, the mapped duplicate drops
+                    new.append(y)
             if new != order:
                 _atomic_write(p, json.dumps(new))
     except Exception:

@@ -1245,6 +1245,20 @@ class RaisingRegistryTransactions(unittest.TestCase):
             self.assertEqual(be._session(sid).name, "api",
                              "the registry's fresher name survives the stale echo")
 
+    def test_resume_adopts_the_echo_only_for_a_nameless_row(self):
+        # the r38 mutant hunt: only the negative leg was pinned — deleting the adoption
+        # entirely stayed green (the SDK twin pins both directions)
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            be = cb.CodexBackend(td, client_factory=lambda: None)
+            sid = be.spawn("web", "/tmp")
+            s = be._session(sid)
+            s.dead = True
+            s.name = ""                                # a nameless registry row (legacy load)
+            self.assertTrue(be.resume("adopted", sid))
+            self.assertEqual(be._session(sid).name, "adopted",
+                             "a nameless row ADOPTS the caller's echo — that half must hold too")
+
     def test_a_raising_tid_save_rolls_the_thread_flip_back(self):
         # the r29 verification: with the real tid only in memory, every retry took the resume
         # path and never re-saved it — the next restart loaded 'pending-…' and silently started

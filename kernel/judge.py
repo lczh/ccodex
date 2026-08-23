@@ -4804,16 +4804,39 @@ def migrate_codex_identity():
     the captioner re-billed every in-window unit, and the planner re-minted cards for finished
     work because placement keys embed the fsid). For each registry row whose TID-keyed store
     exists and SID-keyed one does not: captions/goals/goals-archive move to the SID name, with
-    fsid-prefixed placement keys rewritten inside the goal stores. Idempotent (the move's
-    precondition dies with the move); a partial crash re-runs cleanly at the next boot."""
+    every tid-identity reference rewritten inside the goal stores AND the user-override journal
+    that replays over them. Node ids are minted "<rompUuid>:gN" and every gesture derives the
+    owning session from that prefix (Clear, citations, delegation links, the nudge veto, card
+    replies) — so the rewrite is WHOLE-TREE: keys and string values both (the r38 verification
+    executed both halves failing: rescued cards whose gestures died against the deleted TID
+    store, and journaled blocks that vanished from the loaded store). Idempotent (the move's
+    precondition dies with the move); a partial crash re-runs cleanly at the next boot; a SID
+    store that already exists always wins."""
     try:
         reg = json.loads((CODEXDIR / "registry.json").read_text())
     except Exception:
         return
     if not isinstance(reg, dict):
         return
+
+    def _reid(x, tid, sid):
+        """Rewrite tid-identity prefixes anywhere in a JSON tree — keys and string values."""
+        if isinstance(x, str):
+            if x == tid:
+                return sid
+            if x.startswith(tid + ":"):
+                return sid + x[len(tid):]
+            return x
+        if isinstance(x, list):
+            return [_reid(v, tid, sid) for v in x]
+        if isinstance(x, dict):
+            return {_reid(k, tid, sid): _reid(v, tid, sid) for k, v in x.items()}
+        return x
+
     for sid, r in reg.items():
-        tid = (r or {}).get("tid") or ""
+        if not isinstance(r, dict):
+            continue                                  # a corrupt row must not crash the BOOT
+        tid = r.get("tid") or ""
         if not tid or tid == sid:
             continue
         for d, suff, rewrite in ((CAPDIR, ".jsonl", False), (ARCHDIR, ".json", False),
@@ -4823,12 +4846,7 @@ def migrate_codex_identity():
                 if not old_p.exists() or new_p.exists():
                     continue
                 if rewrite:
-                    store = json.loads(old_p.read_text())
-                    pl = store.get("placements")
-                    if isinstance(pl, dict):
-                        store["placements"] = {
-                            (sid + k[len(tid):] if k.startswith(tid) else k): v
-                            for k, v in pl.items()}
+                    store = _reid(json.loads(old_p.read_text()), tid, sid)
                     store["rompUuid"] = sid
                     _atomic_json(new_p, store)
                     old_p.unlink(missing_ok=True)
@@ -4837,6 +4855,30 @@ def migrate_codex_identity():
             except Exception as e:
                 sys.stderr.write("codex identity migration %s->%s (%s): %s\n"
                                  % (tid[:8], sid[:8], d.name, e))
+        # the override journal replays over the store on every load — its node references move
+        # with the store, and pre-upgrade entries PREPEND any post-upgrade sid entries so the
+        # replay order stays chronological
+        try:
+            ov = _overrides_dir()
+            old_j, new_j = ov / (tid + ".jsonl"), ov / (sid + ".jsonl")
+            if old_j.exists():
+                moved = []
+                for ln in old_j.read_text().splitlines():
+                    if not ln.strip():
+                        continue
+                    try:
+                        moved.append(json.dumps(_reid(json.loads(ln), tid, sid)))
+                    except Exception:
+                        moved.append(ln)              # an unparseable row rides verbatim
+                tail = new_j.read_text() if new_j.exists() else ""
+                tmp = ov / (sid + ".jsonl.mig")
+                tmp.unlink(missing_ok=True)
+                tmp.write_text("\n".join(moved) + ("\n" if moved else "") + tail)
+                os.replace(tmp, new_j)
+                old_j.unlink(missing_ok=True)
+        except Exception as e:
+            sys.stderr.write("codex identity migration %s->%s (overrides): %s\n"
+                             % (tid[:8], sid[:8], e))
 
 
 def _codex_rows(cutoff, seen):
@@ -10418,6 +10460,8 @@ def _dump_goals():
         print()
 def main():
     args = sys.argv[1:]
+    migrate_codex_identity()   # idempotent; a standalone pass before the kernel's first boot
+    #                            used to re-bill captions AND block the move (sid-store-wins)
     if args and args[0] == "--once":
         r = run_index(verbose=True)
         sys.stderr.write("romp-judge: wrote %d captions, %d archives\n" % (r["captions"], r["archives"]))
