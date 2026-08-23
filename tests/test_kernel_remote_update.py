@@ -507,10 +507,12 @@ class UpdateRemote(unittest.TestCase):
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             log = ops.read_text() if ops.exists() else ""
             self.assertIn("COMMITTED", log, "the TARGET's committed install bytes executed")
-            self.assertIn("DIR=%s\n" % fix, log,
+            self.assertIn("DIR=%s\n" % os.path.realpath(fix), log,
                           "the entry self-locates to the CHECKOUT, not .git — install.sh's "
-                          "dirname-$0 guard exited otherwise (the r42 verification's P1); "
-                          "got: %r" % log)
+                          "dirname-$0 guard exited otherwise (the r42 verification's P1). "
+                          "REALPATH both sides: macOS mounts /var as a symlink to /private/var, "
+                          "so the entry's cd+pwd resolves differently from the fixture string "
+                          "(the v1.3.15 first gate attempt); got: %r" % log)
             self.assertNotIn("RACED", log,
                              "the racing writer's replacement NEVER executes — the entry is "
                              "immutable (the v1.3.14 audit's executed repro)")
