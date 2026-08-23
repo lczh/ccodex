@@ -1230,6 +1230,21 @@ class RaisingRegistryTransactions(unittest.TestCase):
             self.assertFalse(any("was restored" in m for m in logs),
                              "the log must not claim a restore that never happened")
 
+    def test_resume_never_overwrites_a_fresher_registry_name(self):
+        # the r37 verification: a rename landing during an in-flight revive was silently
+        # reverted in the durable registry by resume's adoption of the caller's stale echo
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            be = cb.CodexBackend(td, client_factory=lambda: None)
+            sid = be.spawn("web", "/tmp")
+            s = be._session(sid)
+            s.dead = True
+            be.rename(sid, "api")                      # the rename that landed mid-revive
+            self.assertTrue(be.resume("web", sid),
+                            "the revive resolved its name BEFORE the rename")
+            self.assertEqual(be._session(sid).name, "api",
+                             "the registry's fresher name survives the stale echo")
+
     def test_a_raising_tid_save_rolls_the_thread_flip_back(self):
         # the r29 verification: with the real tid only in memory, every retry took the resume
         # path and never re-saved it — the next restart loaded 'pending-…' and silently started

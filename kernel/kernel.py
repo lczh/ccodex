@@ -3219,6 +3219,43 @@ def _converge_install(sha8, lock_fd=None):
     return True
 
 
+def _migrate_codex_flags_order():
+    """The kernel-side half of jd.migrate_codex_identity: session-flags mute entries and
+    session-order slots written under the OLD tid identity move to the sid (the r37
+    verification: a muted codex session unmuted at upgrade and its lane lost its slot)."""
+    try:
+        reg = json.loads((jd.CODEXDIR / "registry.json").read_text())
+    except Exception:
+        return
+    if not isinstance(reg, dict):
+        return
+    tid_to_sid = {(r or {}).get("tid") or "": sid for sid, r in reg.items()
+                  if (r or {}).get("tid") and (r or {}).get("tid") != sid}
+    if not tid_to_sid:
+        return
+    try:
+        p = jd.STATE / "session-flags.json"
+        cur = json.loads(p.read_text())
+        moved = False
+        for tid, sid in tid_to_sid.items():
+            if tid in cur and sid not in cur:
+                cur[sid] = cur.pop(tid)
+                moved = True
+        if moved:
+            _atomic_write(p, json.dumps(cur, sort_keys=True))
+    except Exception:
+        pass
+    try:
+        p = jd.STATE / "session-order.json"
+        order = json.loads(p.read_text())
+        if isinstance(order, list):
+            new = [tid_to_sid.get(x, x) for x in order]
+            if new != order:
+                _atomic_write(p, json.dumps(new))
+    except Exception:
+        pass
+
+
 def _migrate_channel():
     """One-time move of the older channel spellings into the WORKTREE's marker file: v1.3.2 wrote
     a STATE file (kernels sharing a checkout disagreed), v1.3.3 wrote git config --local (linked
@@ -8981,13 +9018,14 @@ def _rename_session(sid, name):
         if live != name:
             if not _TMUX.rename_by_name(live, name):
                 return None                            # the rename did not LAND: never ack it
-            if not _set_name(sid, name):               # SYNCHRONOUS names-file write: the tmux
-                return None                            # hook publishes asynchronously, and the
-            #                                            claim released before it ran — the name
-            #                                            was briefly claimable by a rival (the
-            #                                            v1.3.12 audit's P2); the hook's later
-            #                                            write is idempotent. A FAILED publish is
-            #                                            never acked (the v1.3.13 audit's P2)
+        if not _set_name(sid, name):                   # SYNCHRONOUS names-file write, EVEN when
+            return None                                # tmux already holds the target: a retry
+        #                                                after a failed publish short-circuited
+        #                                                on live==name and acked the stale file
+        #                                                forever (the r37 verification). The tmux
+        #                                                hook's later write is idempotent, and a
+        #                                                FAILED publish is never acked (the
+        #                                                v1.3.12/13 audits).
     else:
         cx = _codex()
         if cx is not None and cx._session(sid) is not None:
@@ -11507,7 +11545,9 @@ def _update_remote(host):
         "        os.remove(lp)\n"
         "    sys.exit(15)\n"
         'st3=subprocess.run(["git","-C",r,"status","--porcelain"],capture_output=True,text=True)\n'
-        'if st3.returncode or (st3.stdout or "").strip():\n'
+        "if st3.returncode:\n"
+        "    sys.exit(19)\n"
+        'if (st3.stdout or "").strip():\n'
         "    sys.exit(18)\n"
         'if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
         "    sys.exit(4)\n"
@@ -11520,6 +11560,7 @@ def _update_remote(host):
         'if [ "$RRC" = 8 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYNOW; exit 0; fi; '
         'if [ "$RRC" = 9 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERR; exit 0; fi; '
         'if [ "$RRC" = 10 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo LATCHSTUCK; exit 0; fi; '
+        'if [ "$RRC" = 19 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERRPOSTMOVE; exit 0; fi; '
         'if [ "$RRC" = 18 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYPOSTMOVE; exit 0; fi; '
         'if [ "$RRC" = 17 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESTOREFAIL; exit 0; fi; '
         'if [ "$RRC" = 16 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo HEADUNKNOWN; exit 0; fi; '
@@ -11555,7 +11596,7 @@ def _update_remote(host):
         'echo "SYNCED:$NEW"'
     ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, lfull, _P2P_REF, _P2P_REF,
          _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
-         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
+         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -11600,6 +11641,9 @@ def _update_remote(host):
         return False, ("pushed, but %s's install latch names commits its HEAD doesn't match — an "
                        "update died there mid-move from a broken state; heal it by hand on that "
                        "machine (run install.sh, then remove the latch)" % host)
+    if tag == "STATERRPOSTMOVE":
+        return False, ("pushed and merged, but reading the remote's tree state failed — nothing "
+                       "installed; its install latch stays armed; its boot heal settles it")
     if tag == "DIRTYPOSTMOVE":
         return False, ("pushed and merged, but the remote's tree changed while updating — "
                        "nothing installed; its install latch stays armed (clean the remote's "
@@ -30146,6 +30190,8 @@ def main():
     os.environ.setdefault("ROMP_CLAUDE_BIN", _claude_bin())
     signal.signal(signal.SIGTERM, _graceful_term)             # drain, don't die mid-flight (see _graceful_term)
     _migrate_channel()                                        # one-time: older channel spellings move into the worktree marker
+    jd.migrate_codex_identity()                               # one-time: pre-identity-fix codex stores move tid→sid (the r37 verification)
+    _migrate_codex_flags_order()                              # …and their mute flags + order slots
     _boot_heal(wait_s=90)                                     # a latched half-installed checkout heals FIRST — before
     #                                                           _ensure_bundles builds on it, before any subsystem
     if _refuse_half_installed():

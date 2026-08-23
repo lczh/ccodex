@@ -68,7 +68,10 @@ class CodexDiscovery(unittest.TestCase):
     def test_window_ages_out(self):
         self._mint(mtime=NOW - 10 * 24 * 3600)
         rows = jd._discover_impl(NOW)          # default window is far shorter than 10 days
-        self.assertEqual([r for r in rows if r[0] == TID], [])
+        self.assertEqual([r for r in rows if r[2] == SID], [],
+                         "aged out by the window — the old filter-by-TID was unsatisfiable by "
+                         "construction after the identity fix and passed with age-out broken "
+                         "(the r37 mutant hunt)")
 
     def test_registry_change_invalidates_discover_cache(self):
         self._mint()
@@ -128,6 +131,57 @@ class StagingStraysNeverDiscovered(unittest.TestCase):
         (jd.NAMES / "99999999-8888-7777-6666-555555555555.tmp").write_text("changed\t/x\t\t\n")
         self.assertEqual(fp1, jd._discover_fingerprint(),
                          "staging churn is invisible to the discovery fingerprint")
+
+
+class TidToSidMigration(unittest.TestCase):
+    def test_pre_identity_stores_move_to_the_sid_and_placements_rewrite(self):
+        # the r37 verification's P2, executed there: every store written under the old TID
+        # identity orphaned at upgrade — cards vanished, captions re-billed, and the planner
+        # re-minted finished work because placement keys embed the fsid
+        tmp = Path(tempfile.mkdtemp())
+        jd._rebind_state(tmp)
+        for d in (jd.CAPDIR, jd.ARCHDIR, jd.GOALDIR, jd.GOALARCHDIR, jd.CODEXDIR):
+            d.mkdir(parents=True, exist_ok=True)
+        (jd.CODEXDIR / "registry.json").write_text(json.dumps(
+            {SID: {"tid": TID, "name": "cx", "cwd": "/TESTDIR", "dead": False}}))
+        (jd.CAPDIR / (TID + ".jsonl")).write_text('{"unit": "turn:u1"}\n')
+        (jd.ARCHDIR / (TID + ".json")).write_text(json.dumps({"headline": "did things"}))
+        (jd.GOALDIR / (TID + ".json")).write_text(json.dumps(
+            {"rompUuid": TID, "nodes": {"g1": {"t": 1}}, "status": {},
+             "placements": {TID + ":123:abc": "g1", "other:1:x": None}}))
+        (jd.GOALARCHDIR / (TID + ".json")).write_text(json.dumps(
+            {"rompUuid": TID, "nodes": {}, "status": {}}))
+        jd.migrate_codex_identity()
+        self.assertTrue((jd.CAPDIR / (SID + ".jsonl")).exists())
+        self.assertFalse((jd.CAPDIR / (TID + ".jsonl")).exists())
+        self.assertEqual(json.loads((jd.ARCHDIR / (SID + ".json")).read_text())["headline"],
+                         "did things")
+        g = json.loads((jd.GOALDIR / (SID + ".json")).read_text())
+        self.assertEqual(g["rompUuid"], SID)
+        self.assertIn(SID + ":123:abc", g["placements"],
+                      "fsid-prefixed placement keys rewrite — sealed work must keep gating "
+                      "the planner under the new identity")
+        self.assertIn("other:1:x", g["placements"], "foreign keys ride untouched")
+        self.assertNotIn(TID + ":123:abc", g["placements"])
+        self.assertTrue((jd.GOALARCHDIR / (SID + ".json")).exists())
+        # idempotent: a second boot moves nothing and destroys nothing
+        jd.migrate_codex_identity()
+        self.assertIn(SID + ":123:abc",
+                      json.loads((jd.GOALDIR / (SID + ".json")).read_text())["placements"])
+
+    def test_an_existing_sid_store_is_never_clobbered(self):
+        tmp = Path(tempfile.mkdtemp())
+        jd._rebind_state(tmp)
+        for d in (jd.GOALDIR, jd.CODEXDIR):
+            d.mkdir(parents=True, exist_ok=True)
+        (jd.CODEXDIR / "registry.json").write_text(json.dumps(
+            {SID: {"tid": TID, "name": "cx", "cwd": "/TESTDIR", "dead": False}}))
+        (jd.GOALDIR / (TID + ".json")).write_text(json.dumps({"rompUuid": TID, "nodes": {}}))
+        (jd.GOALDIR / (SID + ".json")).write_text(json.dumps(
+            {"rompUuid": SID, "nodes": {"fresh": {"t": 2}}}))
+        jd.migrate_codex_identity()
+        self.assertIn("fresh", json.loads((jd.GOALDIR / (SID + ".json")).read_text())["nodes"],
+                      "post-fix work under the SID always wins; the TID relic stays a dead file")
 
 
 class SpawnToReviveIntegration(unittest.TestCase):

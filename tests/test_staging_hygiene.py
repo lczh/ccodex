@@ -82,13 +82,15 @@ class ElectronStagingWriters(unittest.TestCase):
         # the v1.3.13 audit's P2: _persistOrder and _setViews open fixed .tmp names
         # synchronously — a writerless FIFO froze the renderer
         src = open(os.path.join(ROOT, "ui", "romp-timeline-view.js")).read()
-        for anchor in ("'session-order.json'", "'timeline-views.json'"):
+        for anchor, target in (("'session-order.json'", "fs.unlinkSync(tmp)"),
+                               ("'timeline-views.json'", "fs.unlinkSync(fp + '.tmp')")):
             i = src.index(anchor)
             window = src[i:i + 500]
-            self.assertIn("fs.unlinkSync", window,
-                          "%s stages at a fixed name without unlinking a plant first" % anchor)
-            self.assertLess(window.index("fs.unlinkSync"), window.index("fs.writeFileSync"),
-                            anchor)
+            self.assertIn(target, window,
+                          "%s must unlink the STAGING path — a wrong-path unlink deleted the "
+                          "good state file instead and left the plant in place (the r37 mutant "
+                          "hunt)" % anchor)
+            self.assertLess(window.index(target), window.index("fs.writeFileSync"), anchor)
 
 
 if __name__ == "__main__":

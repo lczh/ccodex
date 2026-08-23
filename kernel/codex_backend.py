@@ -901,7 +901,12 @@ class CodexBackend:
             prior = (s.dead, s.loaded, s.name, s.cwd, s.state, s.since, s.change_generation)
             s.dead = False
             s.loaded = False               # the worker thread/resumes before the next turn
-            s.name = name or s.name
+            if name and not s.name:
+                s.name = name              # ADVISORY only: adopting the caller's echo overwrote
+            #                                a rename that landed while the revive was in flight,
+            #                                silently reverting the acked new name in the durable
+            #                                registry (the r37 verification); the registry's own
+            #                                name is fresher by construction
             if cwd:
                 s.cwd = cwd
             s.state = "waiting"

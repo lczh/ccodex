@@ -232,6 +232,11 @@ class UpdateRemote(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("tree changed while updating", detail)
         self.assertIn("latch stays armed", detail)
+        self._wire(apply_out="STATERRPOSTMOVE")
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("reading the remote's tree state failed", detail)
+        self.assertNotIn("tree changed", detail)
 
     def test_an_install_failure_on_the_remote_is_its_own_verdict(self):
         # the apply used to lock the reset alone and never install at all (the user's audit,
@@ -420,6 +425,31 @@ class UpdateRemote(unittest.TestCase):
                              "nothing installs on a tree that changed after the move")
             self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2",
                              "the armed latch stays for the boot heal")
+            # a status COMMAND FAILURE post-move is not "tree changed" — it has its own verdict
+            # (the r37 verification: st3 folded rc!=0 into DIRTYPOSTMOVE, telling the user to
+            # clean a tree that never changed)
+            nstat.unlink()
+            ops.unlink(missing_ok=True)
+            (gd / "romp-install-failed").unlink(missing_ok=True)
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' merge-base '*) exit 0;;\n"
+                "  *' status '*) echo x >> '%s'; [ $(wc -l < '%s') -ge 4 ] && exit 1;;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "esac\nexit 0\n" % (gd, nstat, nstat))
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("STATERRPOSTMOVE", a.stdout)
+            self.assertNotIn("DIRTYPOSTMOVE", a.stdout)
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2")
+            # the POST-SETTLE recheck's POSITION is pinned in the generated text: hoisting it
+            # above the settle heal re-opened the P1 while every executed leg stayed green (the
+            # r37 mutant hunt — the fake models the heal as a read counter, not a real install)
+            self.assertLess(apply_r.index("merge_carry"), apply_r.index("st2="),
+                            "st2 sits AFTER the settle-heal block")
+            self.assertLess(apply_r.index("st2="), apply_r.index('tmp=lp+".tmp"'),
+                            "and BEFORE the arm")
 
     def test_a_stable_remote_marker_refuses_the_push_absolutely(self):
         # the v1.3.12 audit's P1, hardened by its own review: the rule is absolute in both peer

@@ -355,6 +355,24 @@ class NameClaims(unittest.TestCase):
         self.assertTrue(any(m.get("type") == "reviveFailed" for m in sent),
                         "the asker's loader is cleared with a reason, not left forever: %r" % sent)
 
+    def test_a_rename_retry_with_tmux_already_at_the_target_still_publishes(self):
+        # the r37 verification: after a failed publish, the retry short-circuited on live==name
+        # — skipping BOTH writes — and acked the stale names file forever
+        set_names = []
+        with mock.patch.object(km, "_tmux_name_of", return_value="webby"):
+            with mock.patch.object(km._TMUX, "rename_by_name") as rn:
+                with mock.patch.object(km, "_set_name",
+                                       side_effect=lambda s, n2: (set_names.append(n2), True)[1]):
+                    out = km._rename_session("11111111-2222-3333-4444-555555555555", "webby")
+        self.assertEqual(out, "webby")
+        self.assertFalse(rn.called, "tmux already holds the target — no rename issued")
+        self.assertEqual(set_names, ["webby"], "but the names file is STILL published")
+        with mock.patch.object(km, "_tmux_name_of", return_value="webby"):
+            with mock.patch.object(km, "_set_name", return_value=False):
+                self.assertIsNone(km._rename_session("11111111-2222-3333-4444-555555555555",
+                                                     "webby"),
+                                  "and a publish that fails again is still never acked")
+
     def test_renames_are_serialized_under_one_lock(self):
         # two interleaved renames of one sid left the registry at one name and the shared file
         # at the other (the v1.3.12 audit's P2)

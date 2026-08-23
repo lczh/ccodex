@@ -4797,6 +4797,48 @@ def _discover_impl(now, window=None, forks=True):
                 seen.add(path_str); out.append((stem, Path(path_str), sid, name))
     out.extend(_codex_rows(cutoff, seen))
     return out
+def migrate_codex_identity():
+    """One-time tid→sid rescue of every fsid-keyed store a codex session wrote BEFORE the
+    identity fix (the v1.3.13 audit's P1 made the stable SID the public identity; the r37
+    verification executed the fallout of leaving the old stores behind: board cards vanished,
+    the captioner re-billed every in-window unit, and the planner re-minted cards for finished
+    work because placement keys embed the fsid). For each registry row whose TID-keyed store
+    exists and SID-keyed one does not: captions/goals/goals-archive move to the SID name, with
+    fsid-prefixed placement keys rewritten inside the goal stores. Idempotent (the move's
+    precondition dies with the move); a partial crash re-runs cleanly at the next boot."""
+    try:
+        reg = json.loads((CODEXDIR / "registry.json").read_text())
+    except Exception:
+        return
+    if not isinstance(reg, dict):
+        return
+    for sid, r in reg.items():
+        tid = (r or {}).get("tid") or ""
+        if not tid or tid == sid:
+            continue
+        for d, suff, rewrite in ((CAPDIR, ".jsonl", False), (ARCHDIR, ".json", False),
+                                 (GOALDIR, ".json", True), (GOALARCHDIR, ".json", True)):
+            old_p, new_p = d / (tid + suff), d / (sid + suff)
+            try:
+                if not old_p.exists() or new_p.exists():
+                    continue
+                if rewrite:
+                    store = json.loads(old_p.read_text())
+                    pl = store.get("placements")
+                    if isinstance(pl, dict):
+                        store["placements"] = {
+                            (sid + k[len(tid):] if k.startswith(tid) else k): v
+                            for k, v in pl.items()}
+                    store["rompUuid"] = sid
+                    _atomic_json(new_p, store)
+                    old_p.unlink(missing_ok=True)
+                else:
+                    os.replace(old_p, new_p)
+            except Exception as e:
+                sys.stderr.write("codex identity migration %s->%s (%s): %s\n"
+                                 % (tid[:8], sid[:8], d.name, e))
+
+
 def _codex_rows(cutoff, seen):
     """Discovery rows for Codex sessions — (fsid=STABLE SID, materialized path, anchor sid, name),
     read from the Codex backend's registry (plans/codex-backend.md). The names/ loop above skips
