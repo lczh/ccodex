@@ -4839,10 +4839,13 @@ def migrate_codex_identity():
         tid = r.get("tid") or ""
         if not tid or tid == sid:
             continue
+        goal_stores_present, goal_stores_moved = 0, 0
         for d, suff, rewrite in ((CAPDIR, ".jsonl", False), (ARCHDIR, ".json", False),
                                  (GOALDIR, ".json", True), (GOALARCHDIR, ".json", True)):
             old_p, new_p = d / (tid + suff), d / (sid + suff)
             try:
+                if rewrite and old_p.exists():
+                    goal_stores_present += 1
                 if not old_p.exists() or new_p.exists():
                     continue
                 if rewrite:
@@ -4850,6 +4853,7 @@ def migrate_codex_identity():
                     store["rompUuid"] = sid
                     _atomic_json(new_p, store)
                     old_p.unlink(missing_ok=True)
+                    goal_stores_moved += 1
                 else:
                     os.replace(old_p, new_p)
             except Exception as e:
@@ -4857,16 +4861,19 @@ def migrate_codex_identity():
                                  % (tid[:8], sid[:8], d.name, e))
         # the override journal replays over the store on every load — its node references move
         # with the store, and pre-upgrade entries PREPEND any post-upgrade sid entries so the
-        # replay order stays chronological. The merge rides the GOAL STORE's own settlement:
-        # merging while the tid store still lingers (a failed move, or sid-store-won skew)
-        # aliased user verdicts by bare g-number onto whatever the sid store minted later — a
-        # fresh card born completed from a resolve stamped before its birth (the r39
-        # verification, executed)
+        # replay order stays chronological. The merge rides the move EVENT, never file
+        # absence/presence: absence is producible without the move (a corrupt tid store
+        # quarantined by any goals walk, a fresh sid store minted by the next judge pass), and
+        # the absence-inferred gate then merged pre-upgrade verdicts onto cards born LATER — a
+        # fresh card completed by a resolve stamped before its birth (the r39+r40
+        # verifications, both executed). The journal merges only in the run where EVERY
+        # tid-keyed goal store (live and archive — restore rows replay against the archive too)
+        # moved; a crash in the store→journal window leaves the tid journal an orphaned relic —
+        # verdicts LOST are recoverable by hand, verdicts FABRICATED are not.
         try:
             ov = _overrides_dir()
             old_j, new_j = ov / (tid + ".jsonl"), ov / (sid + ".jsonl")
-            goal_settled = (not (GOALDIR / (tid + ".json")).exists()
-                            and (GOALDIR / (sid + ".json")).exists())
+            goal_settled = goal_stores_present > 0 and goal_stores_moved == goal_stores_present
             if old_j.exists() and goal_settled:
                 moved = []
                 for ln in old_j.read_text().splitlines():

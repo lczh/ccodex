@@ -229,6 +229,51 @@ class TidToSidMigration(unittest.TestCase):
                         "the journal rides the STORE's settlement — never merged ahead of it")
         self.assertFalse((ov / (SID + ".jsonl")).exists())
 
+    def test_a_quarantined_tid_store_never_lets_the_journal_merge(self):
+        # the r40 verification, executed there: a corrupt tid store quarantined by any goals
+        # walk left the tid file ABSENT and the next judge pass minted a fresh sid store — the
+        # absence-inferred gate read that as "settled" and merged pre-upgrade verdicts onto a
+        # card born later. The merge rides the move EVENT now.
+        tmp = Path(tempfile.mkdtemp())
+        jd._rebind_state(tmp)
+        for d in (jd.GOALDIR, jd.CODEXDIR):
+            d.mkdir(parents=True, exist_ok=True)
+        (jd.CODEXDIR / "registry.json").write_text(json.dumps(
+            {SID: {"tid": TID, "name": "cx", "cwd": "/TESTDIR", "dead": False}}))
+        # the tid store is GONE (quarantined last boot); a fresh sid store exists (minted by
+        # the first post-upgrade judge pass, numbering restarted)
+        (jd.GOALDIR / (SID + ".json")).write_text(json.dumps(
+            {"rompUuid": SID, "nodes": {SID + ":g1": {"t": 1000}}, "status": {}}))
+        ov = jd._overrides_dir()
+        ov.mkdir(parents=True, exist_ok=True)
+        (ov / (TID + ".jsonl")).write_text(json.dumps(
+            {"op": "resolve", "node": TID + ":g1", "t": 5}) + "\n")
+        jd.migrate_codex_identity()
+        self.assertTrue((ov / (TID + ".jsonl")).exists(),
+                        "absence is not the move: a pre-birth resolve must never complete a "
+                        "card minted later")
+        self.assertFalse((ov / (SID + ".jsonl")).exists())
+
+    def test_a_lingering_archive_holds_the_journal_too(self):
+        # the r40 verification's P3: restore rows replay against the ARCHIVE — a dismissed
+        # card resurrected when the live store moved but the archive lingered
+        tmp = Path(tempfile.mkdtemp())
+        jd._rebind_state(tmp)
+        for d in (jd.GOALDIR, jd.GOALARCHDIR, jd.CODEXDIR):
+            d.mkdir(parents=True, exist_ok=True)
+        (jd.CODEXDIR / "registry.json").write_text(json.dumps(
+            {SID: {"tid": TID, "name": "cx", "cwd": "/TESTDIR", "dead": False}}))
+        (jd.GOALDIR / (TID + ".json")).write_text(json.dumps(
+            {"rompUuid": TID, "nodes": {TID + ":g1": {"t": 1}}, "status": {}}))
+        (jd.GOALARCHDIR / (TID + ".json")).write_text("{ corrupt")   # the archive move FAILS
+        ov = jd._overrides_dir()
+        ov.mkdir(parents=True, exist_ok=True)
+        (ov / (TID + ".jsonl")).write_text(json.dumps(
+            {"op": "restore", "t": 6, "nodes": {TID + ":g2": {}}, "status": {}}) + "\n")
+        jd.migrate_codex_identity()
+        self.assertTrue((ov / (TID + ".jsonl")).exists(),
+                        "EVERY tid-keyed goal store must move before the journal does")
+
     def test_a_corrupt_registry_row_never_crashes_the_boot(self):
         # the r38 verification: a truthy non-dict row hit .get() outside every guard, and
         # main() calls the migrations bare — the kernel crash-looped
@@ -253,9 +298,18 @@ class TidToSidMigration(unittest.TestCase):
         (jd.GOALDIR / (TID + ".json")).write_text(json.dumps({"rompUuid": TID, "nodes": {}}))
         (jd.GOALDIR / (SID + ".json")).write_text(json.dumps(
             {"rompUuid": SID, "nodes": {"fresh": {"t": 2}}}))
+        ov = jd._overrides_dir()
+        ov.mkdir(parents=True, exist_ok=True)
+        (ov / (TID + ".jsonl")).write_text(json.dumps(
+            {"op": "resolve", "node": TID + ":g1", "t": 5}) + "\n")
         jd.migrate_codex_identity()
         self.assertIn("fresh", json.loads((jd.GOALDIR / (SID + ".json")).read_text())["nodes"],
                       "post-fix work under the SID always wins; the TID relic stays a dead file")
+        self.assertTrue((ov / (TID + ".jsonl")).exists(),
+                        "sid-store-won SKEW: no store moved this run, so the journal never "
+                        "merges — its verdicts reference the tid store's numbering, not the "
+                        "sid's (the r40 verification's unpinned half)")
+        self.assertFalse((ov / (SID + ".jsonl")).exists())
 
 
 class JudgeEntryMigration(unittest.TestCase):
