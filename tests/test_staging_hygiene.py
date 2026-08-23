@@ -45,6 +45,7 @@ class JudgeStagingWriters(unittest.TestCase):
         for anchor in ('tmp = USAGE.with_name(USAGE.name + ".tmp")',
                        'tmp = JUDGE_AUTH.with_suffix(".tmp")',
                        'tmp = JUDGE_LIMIT.with_suffix(".tmp")',
+                       'tmp = ov / (sid + ".jsonl.mig")',
                        'tmp = GONEDIR / (fsid + ".json.tmp")'):
             i = src.index(anchor)
             window = src[i:i + 420]

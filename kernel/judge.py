@@ -4857,11 +4857,17 @@ def migrate_codex_identity():
                                  % (tid[:8], sid[:8], d.name, e))
         # the override journal replays over the store on every load — its node references move
         # with the store, and pre-upgrade entries PREPEND any post-upgrade sid entries so the
-        # replay order stays chronological
+        # replay order stays chronological. The merge rides the GOAL STORE's own settlement:
+        # merging while the tid store still lingers (a failed move, or sid-store-won skew)
+        # aliased user verdicts by bare g-number onto whatever the sid store minted later — a
+        # fresh card born completed from a resolve stamped before its birth (the r39
+        # verification, executed)
         try:
             ov = _overrides_dir()
             old_j, new_j = ov / (tid + ".jsonl"), ov / (sid + ".jsonl")
-            if old_j.exists():
+            goal_settled = (not (GOALDIR / (tid + ".json")).exists()
+                            and (GOALDIR / (sid + ".json")).exists())
+            if old_j.exists() and goal_settled:
                 moved = []
                 for ln in old_j.read_text().splitlines():
                     if not ln.strip():
@@ -4899,6 +4905,11 @@ def _codex_rows(cutoff, seen):
         return []
     rows = []
     for sid, r in sorted(reg.items()):
+        if not isinstance(r, dict):
+            continue                      # the corrupt-row shape the migrations survive must
+        #                                   not kill every cold discover() one call later (the
+        #                                   r39 verification, executed: feed/picker/judge all
+        #                                   share this walk)
         tid, cwd = r.get("tid"), r.get("cwd") or ""
         if not tid or not cwd:
             continue

@@ -394,6 +394,16 @@ class NameClaims(unittest.TestCase):
             flags = _json.loads((state / "session-flags.json").read_text())
             self.assertEqual(flags.get(sid), {"mute": True}, "the mute survives the identity")
             self.assertNotIn(tid, flags)
+            # sid-wins with BOTH rows present: a stale tid relic must never clobber the live
+            # sid row (the r39 mutant hunt — the guard's removal survived every fixture)
+            (state / "session-flags.json").write_text(_json.dumps(
+                {tid: {}, sid: {"mute": True}}))
+            with mock.patch.object(km.jd, "STATE", state):
+                with mock.patch.object(km.jd, "CODEXDIR", state / "codex"):
+                    km._migrate_codex_flags_order()
+            flags2 = _json.loads((state / "session-flags.json").read_text())
+            self.assertEqual(flags2.get(sid), {"mute": True},
+                             "the live sid row survives untouched beside a tid relic")
             order = _json.loads((state / "session-order.json").read_text())
             self.assertEqual(order, [sid, "zzz"],
                              "the slot maps tid→sid, and the sid's own later slot dedups — "

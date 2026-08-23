@@ -155,10 +155,13 @@ class TidToSidMigration(unittest.TestCase):
              "placements": {TID + ":123:abc": TID + ":g1", "other:1:x": None}}))
         ov = jd._overrides_dir()
         ov.mkdir(parents=True, exist_ok=True)
-        (ov / (TID + ".jsonl")).write_text(json.dumps(
-            {"kind": "block", "nid": TID + ":g1", "ev_t": 5}) + "\n")
+        (ov / (TID + ".jsonl")).write_text(
+            json.dumps({"op": "block", "node": TID + ":g1", "t": 5}) + "\n"
+            + json.dumps({"op": "restore", "t": 6,
+                          "nodes": {TID + ":g2": {"parentId": TID + ":g1"}},
+                          "status": {TID + ":g2": "working"}}) + "\n")
         (ov / (SID + ".jsonl")).write_text(json.dumps(
-            {"kind": "resolve", "nid": SID + ":g9", "ev_t": 9}) + "\n")
+            {"op": "resolve", "node": SID + ":g9", "t": 9}) + "\n")
         (jd.GOALARCHDIR / (TID + ".json")).write_text(json.dumps(
             {"rompUuid": TID, "nodes": {}, "status": {}}))
         jd.migrate_codex_identity()
@@ -190,25 +193,55 @@ class TidToSidMigration(unittest.TestCase):
                          "burned judge retries (the r38 mutant hunt)")
         self.assertFalse((jd.GOALARCHDIR / (TID + ".json")).exists())
         jlines = (ov / (SID + ".jsonl")).read_text().splitlines()
-        self.assertEqual(len(jlines), 2, "the override journal MERGES: tid rows then sid rows")
-        self.assertEqual(json.loads(jlines[0])["nid"], SID + ":g1",
+        self.assertEqual(len(jlines), 3, "the override journal MERGES: tid rows then sid rows")
+        self.assertEqual(json.loads(jlines[0])["node"], SID + ":g1",
                          "journal node references move with the store they replay over")
-        self.assertEqual(json.loads(jlines[1])["nid"], SID + ":g9")
+        restore = json.loads(jlines[1])
+        self.assertIn(SID + ":g2", restore["nodes"],
+                      "restore payloads carry node ids as nested dict KEYS — a values-only "
+                      "rewrite resurrected TID nodes into the SID store (the r39 mutant hunt)")
+        self.assertEqual(restore["nodes"][SID + ":g2"]["parentId"], SID + ":g1")
+        self.assertIn(SID + ":g2", restore["status"])
+        self.assertEqual(json.loads(jlines[2])["node"], SID + ":g9")
         self.assertFalse((ov / (TID + ".jsonl")).exists())
         # idempotent: a second boot moves nothing and destroys nothing
         jd.migrate_codex_identity()
         self.assertIn(SID + ":123:abc",
                       json.loads((jd.GOALDIR / (SID + ".json")).read_text())["placements"])
 
+    def test_the_journal_never_merges_while_the_tid_store_lingers(self):
+        # the r39 verification, executed there: merging while the goal store stayed behind
+        # aliased user verdicts by bare g-number onto cards the sid store minted LATER — a
+        # fresh card born completed from a resolve stamped before its birth
+        tmp = Path(tempfile.mkdtemp())
+        jd._rebind_state(tmp)
+        for d in (jd.GOALDIR, jd.CODEXDIR):
+            d.mkdir(parents=True, exist_ok=True)
+        (jd.CODEXDIR / "registry.json").write_text(json.dumps(
+            {SID: {"tid": TID, "name": "cx", "cwd": "/TESTDIR", "dead": False}}))
+        (jd.GOALDIR / (TID + ".json")).write_text("{ not json")   # the move FAILS this run
+        ov = jd._overrides_dir()
+        ov.mkdir(parents=True, exist_ok=True)
+        (ov / (TID + ".jsonl")).write_text(json.dumps(
+            {"op": "resolve", "node": TID + ":g1", "t": 5}) + "\n")
+        jd.migrate_codex_identity()
+        self.assertTrue((ov / (TID + ".jsonl")).exists(),
+                        "the journal rides the STORE's settlement — never merged ahead of it")
+        self.assertFalse((ov / (SID + ".jsonl")).exists())
+
     def test_a_corrupt_registry_row_never_crashes_the_boot(self):
         # the r38 verification: a truthy non-dict row hit .get() outside every guard, and
         # main() calls the migrations bare — the kernel crash-looped
         tmp = Path(tempfile.mkdtemp())
         jd._rebind_state(tmp)
+        jd.NAMES.mkdir(parents=True, exist_ok=True)   # discovery must get PAST its names walk
         jd.CODEXDIR.mkdir(parents=True, exist_ok=True)
         (jd.CODEXDIR / "registry.json").write_text(json.dumps(
             {SID: "not a dict", "x": 7, TID: {"tid": "t2", "cwd": "/y"}}))
         jd.migrate_codex_identity()                   # must simply not raise
+        rows = jd._discover_impl(NOW)                 # and DISCOVERY survives the same shape —
+        self.assertIsInstance(rows, list)             # it killed every cold feed/picker build
+        #                                               one call later (the r39 verification)
 
     def test_an_existing_sid_store_is_never_clobbered(self):
         tmp = Path(tempfile.mkdtemp())
@@ -223,6 +256,18 @@ class TidToSidMigration(unittest.TestCase):
         jd.migrate_codex_identity()
         self.assertIn("fresh", json.loads((jd.GOALDIR / (SID + ".json")).read_text())["nodes"],
                       "post-fix work under the SID always wins; the TID relic stays a dead file")
+
+
+class JudgeEntryMigration(unittest.TestCase):
+    def test_the_standalone_entry_migrates_before_dispatch(self):
+        # the r39 mutant hunt: deleting main()'s migration call stayed green suite-wide — a
+        # standalone `romp-judge --once` between install and first kernel boot re-billed
+        # captions and then blocked the caption move forever under sid-store-wins
+        import inspect
+        src = inspect.getsource(jd.main)
+        self.assertIn("migrate_codex_identity()", src)
+        self.assertLess(src.index("migrate_codex_identity()"), src.index('"--once"'),
+                        "the migration runs before any dispatch touches the stores")
 
 
 class SpawnToReviveIntegration(unittest.TestCase):
