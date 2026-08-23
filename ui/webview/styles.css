@@ -2517,17 +2517,31 @@ mark.cmt-hl {
   color: inherit;
   border-radius: 0;
   cursor: pointer;
+  position: relative;   /* anchors the unread dot on the run's last segment */
 }
 mark.cmt-hl.unread { background: color-mix(in srgb, var(--cmt-hl) 45%, transparent); }
+/* NEW-here dot (the user 2026-08-23): the 45% unread tint alone was too subtle to read as "something
+   new since you last looked". A thread with messages you haven't seen — it replied while the box was
+   closed, and you haven't opened it since — wears a solid full-strength dot on the top-right corner
+   of its run's LAST segment (one dot per thread), ringed in the page bg so it reads over any text.
+   It clears with the unread flag the moment the popover opens (optimistic + kernel watermark). */
+mark.cmt-hl.unread.hl-last::after {
+  content: ""; position: absolute; top: -4px; right: -4px; width: 7px; height: 7px;
+  border-radius: 50%; background: var(--cmt-hl); box-shadow: 0 0 0 1.5px var(--bg);
+}
 mark.cmt-hl:hover { background: color-mix(in srgb, var(--cmt-hl) 58%, transparent); }
 mark.cmt-hl.resolved { background: rgba(255, 255, 255, 0.08); }
-/* WRITING (the user 2026-08-17): while the thread is mid-reply the region wears MARCHING ANTS —
-   a dashed outline whose dashes crawl slowly around the box — and turns into the solid highlight
-   the moment the reply lands (the busy class drops with the thread's working state). Four gradient
-   strips with an animated offset, never a border: an inline border would shift the text it wraps.
-   This rule must stay AFTER :hover — its shorthand would otherwise wipe the strips mid-hover. */
+/* WRITING (the user 2026-08-17; reshaped 2026-08-23): while the thread is mid-reply the region
+   wears MARCHING ANTS — a dashed outline whose dashes crawl slowly around the box — ON TOP of the
+   solid highlight, which never turns off. (It used to: the busy state blanked the tint and showed
+   only the ants, and the equation host flipped on a different rule than the text marks, so a
+   comment spanning text + math passed through a mixed phase — half dashed, half highlighted —
+   before settling. Keeping the tint underneath removes the phase by construction: the only state
+   change is the ants appearing.) Four gradient strips with an animated offset, never a border: an
+   inline border would shift the text it wraps. This rule must stay AFTER :hover — its shorthand
+   would otherwise wipe the strips mid-hover. */
 mark.cmt-hl.busy {
-  background-color: transparent;
+  background-color: color-mix(in srgb, var(--cmt-hl) 30%, transparent);
   background-image:
     repeating-linear-gradient(90deg, color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
     repeating-linear-gradient(90deg, color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
@@ -2536,7 +2550,7 @@ mark.cmt-hl.busy {
   background-size: calc(100% + 12px) 1.5px, calc(100% + 12px) 1.5px, 1.5px calc(100% + 12px), 1.5px calc(100% + 12px);
   background-position: -12px 0, 0 100%, 0 0, 100% -12px;
   background-repeat: no-repeat;
-  animation: cmt-ants 1.2s linear infinite;
+  animation: cmt-ants 3.6s linear infinite;   /* 3× slower (the user 2026-08-23) */
 }
 mark.cmt-hl.hl-first { border-top-left-radius: 2px; border-bottom-left-radius: 2px; }
 mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 2px; }
@@ -2552,7 +2566,7 @@ mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 
    stay solid and defeat the outline-then-fill cue */
 .md :not(pre) > code.cmt-hl-host:has(mark.cmt-hl.busy),
 .md .katex.cmt-hl-host:has(mark.cmt-hl.busy) {
-  background-color: transparent;
+  background-color: color-mix(in srgb, var(--cmt-hl) 30%, transparent);
   background-image:
     repeating-linear-gradient(90deg, color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
     repeating-linear-gradient(90deg, color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
@@ -2561,9 +2575,9 @@ mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 
   background-size: calc(100% + 12px) 1.5px, calc(100% + 12px) 1.5px, 1.5px calc(100% + 12px), 1.5px calc(100% + 12px);
   background-position: -12px 0, 0 100%, 0 0, 100% -12px;
   background-repeat: no-repeat;
-  animation: cmt-ants 1.2s linear infinite;
+  animation: cmt-ants 3.6s linear infinite;   /* 3× slower (the user 2026-08-23) */
 }
-.md :not(pre) > code.cmt-hl-host:has(mark.cmt-hl.busy) { background-color: var(--code-bg); }
+.md :not(pre) > code.cmt-hl-host:has(mark.cmt-hl.busy) { background-color: color-mix(in srgb, var(--cmt-hl) 30%, var(--code-bg)); }
 .md :not(pre) > code.cmt-hl-host { background: color-mix(in srgb, var(--cmt-hl) 30%, var(--code-bg)); }
 .md :not(pre) > code.cmt-hl-host > mark.cmt-hl { background: transparent; }
 .md :not(pre) > code.cmt-hl-host:hover { background: color-mix(in srgb, var(--cmt-hl) 58%, var(--code-bg)); }
@@ -2707,7 +2721,10 @@ mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 
 }
 .cmt-tick:hover { opacity: 1; }
 .cmt-tick.resolved { opacity: 0.3; }
-.cmt-tick.unread { box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--cmt-hl) 60%, transparent); opacity: 1; }
+/* an UNREAD thread's tick shouts (the user 2026-08-23): full width, taller, double-ringed — the old
+   faint glow read as a rendering artifact, not as "new here" */
+.cmt-tick.unread { width: 10px; height: 6px; right: 0; opacity: 1;
+  box-shadow: 0 0 0 1.5px var(--bg), 0 0 0 3px color-mix(in srgb, var(--cmt-hl) 85%, transparent); }
 
 /* a fully-covered KaTeX block tints at the ELEMENT (cmt-hl-host, same contract as inline code):
    a mark inside it cannot paint the glyph boxes' spacing, which punched gaps through highlighted

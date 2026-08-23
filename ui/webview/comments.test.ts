@@ -80,6 +80,32 @@ test("threadsByAnchor groups threads per turn", () => {
   assert.equal(by.get("a1")!.length, 2);
 });
 
+test("the popover keeps the chat renderer but sheds its transcript-coupled hover chrome", () => {
+  // the user 2026-08-23, with a recording: hovering inside the comment box appended glow bands into
+  // .cmt-msgs (the band math expects the transcript's host), posted dotHover/dotOpen with the MAIN
+  // session's id and the THREAD's uuids (cross-lighting the timeline wrongly), and rail time-markers
+  // painted 45px left of gutterless turns — a clipped sliver at the popover edge.
+  assert.match(UI, /let renderingIntoThread = false;/);
+  assert.match(UI, /renderingIntoThread = true;\s*\/\/ same renderer, minus the transcript-coupled hover chrome/);
+  assert.match(UI, /renderingIntoThread = false;\s*\n\s*renderingSid = saved;/, "cleared before the fill returns");
+  assert.match(UI, /if \(\(anchorUuid \|\| epoch != null\) && !renderingIntoThread\) wireTurnHover/,
+    "no glow bands, no cross-pane posts, no dot-nav promises inside the thread");
+  assert.match(UI, /epoch != null && !renderingIntoThread && turn\.querySelector/,
+    "no rail time-markers on gutterless popover turns");
+});
+
+test("an unread thread wears a NEW-here dot on its last segment and a shouting rail tick", () => {
+  // the user 2026-08-23: the 45% unread tint alone was too subtle — a thread that replied while the
+  // box was closed needs a visible element. One dot per thread (the run's hl-last segment), ringed
+  // in the page bg; the rail tick grows and double-rings. Both clear with the unread flag on open.
+  assert.match(CSS, /mark\.cmt-hl\.unread\.hl-last::after \{\s*\n\s*content: ""; position: absolute; top: -4px; right: -4px; width: 7px; height: 7px;/);
+  assert.match(CSS, /border-radius: 50%; background: var\(--cmt-hl\); box-shadow: 0 0 0 1\.5px var\(--bg\);/);
+  assert.match(CSS, /mark\.cmt-hl \{[^}]*position: relative;/s, "the mark anchors its own dot");
+  assert.match(CSS, /\.cmt-tick\.unread \{ width: 10px; height: 6px; right: 0; opacity: 1;/);
+  // the clearing story is the existing machinery, untouched: optimistic on open + kernel watermark
+  assert.match(UI, /if \(th\) th\.unread = false;\s*\/\/ optimistic; the kernel's watermark reconciles/);
+});
+
 test("busy and stuck are disjoint state families", () => {
   for (const s of ["working", "retrying", "compacting"]) assert.ok(threadBusy(s) && !threadStuck(s));
   for (const s of ["permission", "picker"]) assert.ok(threadStuck(s) && !threadBusy(s));
@@ -329,11 +355,14 @@ test("ticks and message notches share ONE scrollbar frame, so they can never dis
   assert.match(UI, /kids\[i\]\.style\.top = t\.y \+ "px";/);
 });
 
-test("while the thread is WRITING the region wears marching ants; the fill lands with the reply", () => {
+test("while the thread is WRITING the region wears marching ants ON TOP of the solid fill", () => {
   assert.match(UI, /m\.classList\.toggle\("busy", threadBusy\(th\.state\) && th\.status === "open"\)/);
   // a dashed outline whose dashes crawl around the box — four gradient strips, animated offsets,
-  // no fill, never a border (it would shift the inline text); solid returns when busy drops
-  assert.match(CSS, /mark\.cmt-hl\.busy \{\s*\n\s*background-color: transparent;\s*\n\s*background-image:\s*\n\s*repeating-linear-gradient/);
+  // the solid tint STAYS under the ants (the user 2026-08-23: no more mixed half-dashed phase, the
+  // only state change is the ants appearing); never a border (it would shift the inline text)
+  assert.match(CSS, /mark\.cmt-hl\.busy \{\s*\n\s*background-color: color-mix\(in srgb, var\(--cmt-hl\) 30%, transparent\);\s*\n\s*background-image:\s*\n\s*repeating-linear-gradient/);
+  assert.match(CSS, /animation: cmt-ants 3\.6s linear infinite;/, "3× slower than the original 1.2s march");
+  assert.doesNotMatch(CSS, /cmt-ants 1\.2s/, "no fast march survives anywhere");
   // each no-repeat strip is oversized by one 12px dash period along its travel axis and starts a
   // period back, and the keyframe travels exactly that period — a strip sized to its edge slid open
   // a gap that snapped shut every cycle, a visible lurch on text-height vertical edges (2026-08-19)

@@ -478,6 +478,13 @@ fetch(kernelUrl("/palette"), { cache: "no-store" }).then((r) => r.json())
 const mru: string[] = [];             // recency stack, front = most-recently-active (close → return to previous)
 let activeId: string | null = null;
 let renderingSid: string | null = null;   // the session id syncView is currently building (for per-session fold keys)
+// TRUE while fillCommentMsgs renders into the comment popover (the user 2026-08-23): the thread uses
+// the chat's own renderer deliberately — but the transcript-COUPLED hover machinery must stay out.
+// wireTurnHover's glow band appends to turn.parentElement (the .cmt-msgs list, positioned nowhere the
+// band math expects), its dotHover/dotOpen posts carry the MAIN session's id with the THREAD's uuids
+// (cross-lighting the timeline wrongly, and a dot click "jumps" somewhere false), and the rail
+// time-markers paint 45px left of a turn that has no gutter — a clipped sliver at the popover edge.
+let renderingIntoThread = false;
 // restore the last-active tab on refresh (persisted via setState); one-shot, applied when its session arrives
 let wantActive: string | null = (() => { try { return ((vscodeApi?.getState?.() || {}) as any).activeId || null; } catch { return null; } })();
 let pendingAnchor: string | null = null; // deep-link target waiting to be scrolled to
@@ -1228,14 +1235,14 @@ function renderEvent(ev: ChatEvent, prevEpoch?: number | null, worked?: number |
   // event instead of stamping the time inside its own card). Prompts ride this rail too instead
   // of an in-bubble stamp (the human via debugger, 2026-06-12). The date shows only on the first
   // turn of a new (non-today) day.
-  if (epoch != null && turn.querySelector(".dot")) turn.insertBefore(timeMarker(epoch, prevEpoch ?? null), turn.firstChild);
+  if (epoch != null && !renderingIntoThread && turn.querySelector(".dot")) turn.insertBefore(timeMarker(epoch, prevEpoch ?? null), turn.firstChild);
   // rail-dot fleet links: hover anywhere on the turn → white-highlight this turn's
   // event on the timeline AND outline its feed card(s); click the DOT → open that
   // card's modal in the feed (the host resolves turn → event → cards). The whole
   // turn is the hover target (the user 2026-06-12) — hovering the MESSAGE bubble or
   // the WORK/reply body must light the timeline, not only the rail dot.
   const railDot = turn.querySelector(".dot") as HTMLElement | null;
-  if (anchorUuid || epoch != null) wireTurnHover(turn, railDot, anchorUuid ?? null, epoch ?? 0, ev.tlId ?? null);
+  if ((anchorUuid || epoch != null) && !renderingIntoThread) wireTurnHover(turn, railDot, anchorUuid ?? null, epoch ?? 0, ev.tlId ?? null);
   // a finished prompt's last reply carries a small "worked 2m 14s" tick in the rail
   // gutter (left, by the time-markers) — how long the session ran on that prompt.
   if (worked != null) turn.appendChild(elapsedFooter(worked));
@@ -4268,14 +4275,18 @@ function showSelectionMenu(e: MouseEvent) {
     item.addEventListener("click", (ev) => { ev.stopPropagation(); dismissTabMenu(); fn(); });
     menu.appendChild(item);
   };
-  mk("Reply", () => quoteSelectionIntoComposer(text));
-  // Comment (the user 2026-08-13): open a side thread anchored to this passage. Only when the
-  // selection sits in a real transcript turn (transcriptSelection's uuid) on a real session.
+  // Comment first, Quote second (the user 2026-08-23): Comment is the primary act — a side thread
+  // about the passage — and Quote is the lighter one. Comment only when the selection sits in a real
+  // transcript turn (transcriptSelection's uuid) on a real session.
   const q = transcriptSelection();
   if (q?.uuid && activeId && !isProvisionalId(activeId) && sessions.get(activeId)) {
     const sid = activeId, uuid = q.uuid, qtext = q.text;
     mk("Comment", () => openCommentComposer(sid, uuid, qtext, e.clientX, e.clientY));
   }
+  // "Quote" (renamed from "Quote in message", the user 2026-08-23): drops the passage INTO the box
+  // as an editable markdown blockquote — the automatic selection chip already covers select-and-type,
+  // and the handler below de-duplicates the chip the same selection seeded.
+  mk("Quote", () => quoteSelectionIntoComposer(text));
   mk("Copy", () => copyToClipboard(text));
   document.body.appendChild(menu);
   ctxMenuEl = menu;
@@ -5976,12 +5987,14 @@ function fillCommentMsgs(list: HTMLElement, th: CommentThread): void {
     // the folds per thread, exactly as a chat tab would.
     const saved = renderingSid;
     renderingSid = th.tid;
+    renderingIntoThread = true;   // same renderer, minus the transcript-coupled hover chrome (see the flag)
     let prev: number | null = null;
     for (const ev of evs) {
       list.appendChild(renderEvent(ev, prev, null));
       const ep = eventEpoch(ev);
       if (ep != null) prev = ep;
     }
+    renderingIntoThread = false;
     renderingSid = saved;
   } else for (const m of th.msgs) list.appendChild(commentMsgEl(m.who, m.text));
   for (const p of pend) {
