@@ -60,12 +60,14 @@ const OBJ_ID = ["tabs"]; //                       an array of objects keyed by `
 // that misses the change keeps handling new releases under the old policy (ask/auto/off). The distilling
 // pair rides like the other judge tiers (the user 2026-08-14: everything kernel-side stays in sync; the
 // gear's mixed marks surface any machine that disagrees rather than overwriting it silently). Broadcast in
-// routeOutbound rather than routed. Deliberately NOT here: setDefaultDir (a path on one machine,
-// meaningless on another) and setColormap/setPalette (the viewer's display prefs, which the local kernel
-// persists for this browser).
+// routeOutbound rather than routed. setFileEditing is the viewer's edit opt-in (the user 2026-08-22:
+// one consent popup answers for the mesh — every kernel's save route gates on its own copy, so the
+// broadcast is what makes the one yes reach them all). Deliberately NOT here: setDefaultDir (a path on
+// one machine, meaningless on another) and setColormap/setPalette (the viewer's display prefs, which the
+// local kernel persists for this browser).
 const KERNEL_SETTING = new Set(["setAutoNudge", "setJudgeModel", "setIndexModel",
                                 "setJudgeEffort", "setIndexEffort", "setUpdateMode",
-                                "setDistillModel", "setDistillEffort"]);
+                                "setDistillModel", "setDistillEffort", "setFileEditing"]);
 
 /** Return a COPY of an inbound message with every session-id field prefixed by `host`. The local host
  *  ("") is the identity transform, so local messages are untouched. Unknown fields pass through. */

@@ -11,7 +11,7 @@ zero protocol change at switchover. WS is hand-rolled on the stdlib socket (no d
 
 Run:  bin/romp-kernel   → opens http://127.0.0.1:29855
 """
-import json, os, queue, random, re, signal, socket, stat, sys, time, threading, traceback, base64, bisect, errno, fcntl, hashlib, hmac, struct, subprocess, shutil, shlex, http.client, uuid
+import json, os, queue, random, re, signal, socket, stat, sys, time, threading, traceback, base64, bisect, errno, fcntl, hashlib, hmac, struct, subprocess, shutil, shlex, http.client, uuid, tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
@@ -526,6 +526,7 @@ def _version_info():
             "boot": _BOOT_ID,   # lets a page retire update offers from a previous kernel life (2026-08-15)
             "uptime_s": int(time.time() - _STARTED), "dist_ver": _dist_ver(), "bundles": bundles,
             "autoNudge": _auto_nudge_on(),   # server-side toggle state → the gear checkbox reflects the kernel
+            "fileEditing": _file_editing_on(),   # dashboard raw-mode editing opt-in → gates the viewer's Edit
             "updateMode": _update_mode(),    # ask|auto|off (the boot release check) → the gear dropdown
             "updateAvail": _UPDATE_AVAIL[0],   # newer release the boot check found ("" = none/unknown)
             "judgeModel": jd._triage_model(), "indexModel": jd._index_model(),      # current per-tier judge models → the gear dropdowns
@@ -536,6 +537,7 @@ def _version_info():
             # /tunnels row so its gear can mark controls where machines disagree (the user 2026-08-14).
             # The top-level fields above stay: this tab's own gear and older kernels read those.
             "settings": {"autoNudge": _auto_nudge_on(), "updateMode": _update_mode(),
+                         "fileEditing": _file_editing_on(),
                          "judgeModel": jd._triage_model(), "judgeEffort": jd._triage_effort(),
                          "indexModel": jd._index_model(), "indexEffort": jd._index_effort(),
                          "distillModel": jd._state_str("distill-model", "triage"),
@@ -1960,6 +1962,25 @@ def _set_auto_nudge(enabled):
     d = dict(_auto_nudge_data())
     d["enabled"] = bool(enabled)
     _write_auto_nudge(d)
+
+
+def _file_editing_on():
+    """Dashboard raw-mode file editing is OFF until the user says yes once (the user 2026-08-22: the
+    viewer's Edit asks with a popup the first time). The flag is a SERVER-side boundary, not
+    cosmetics: _save_file refuses while it is off, so the write-any-text-file capability the save op
+    represents exists only after the explicit opt-in — hiding the button alone would leave every
+    token-holder the write path. Kernel-side setting like Auto Nudge: it broadcasts to every attached
+    kernel (federation.ts KERNEL_SETTING) so the mesh answers with one voice, and /version +
+    the tunnel settings dict report it so disagreement is surfaced, never hidden. Default OFF —
+    absent file, unreadable file, or malformed JSON all refuse: the opt-in must be provable."""
+    try:
+        return bool(json.loads((jd.STATE / "file-editing.json").read_text()).get("enabled"))
+    except Exception:
+        return False
+
+
+def _set_file_editing(enabled):
+    _atomic_write(jd.STATE / "file-editing.json", json.dumps({"enabled": bool(enabled)}))
 
 
 # ── automatic updates of THIS machine (the user 2026-08-09) ───────────────────────────────────────
@@ -4262,6 +4283,7 @@ def _auto_nudge_tick(now, tmux):
                              % (s.get("sid") or "?", traceback.format_exc()))
     try:
         _debt_backstop_tick(now)                       # reminder outcomes for debtors the walk can't reach
+        _dead_wait_sweep(alive_ids, nudged, now)       # dormant owners' stamped cards → procedural block
     except Exception:
         sys.stderr.write("debt-backstop: %s\n" % traceback.format_exc())
     try:
@@ -4513,6 +4535,89 @@ def _lift_spent_awaiting(now, tmux):
             sys.stderr.write("awaiting-lift (session %s): %s\n" % (sid or "?", traceback.format_exc()))
 
 
+_PREV_ALIVE = None                       # last tick's alive sids — a sid LEAVING is the death event
+
+
+def _dead_wait_sweep(alive_ids, nudged, now):
+    """Find DORMANT sessions whose Working cards still hold a judged awaiting stamp and convert each to
+    a procedural block (_dead_wait_block). Event-triggered, never a per-tick poll of every store: the
+    trigger is the DEATH TRANSITION (a sid leaving the alive set between ticks), plus one catch-up
+    sweep of all dormant stores on the first tick after boot — the same boot-re-audit pattern the
+    awaiting stamps already use — for sessions that died under a previous kernel (the two measured
+    cards had been dead 79 hours across many restarts)."""
+    global _PREV_ALIVE
+    prev, _PREV_ALIVE = _PREV_ALIVE, set(alive_ids)
+    if prev is None:
+        try:
+            cands = {f.stem for f in (jd.STATE / "goals").glob("*.json")} - set(alive_ids)
+        except OSError:
+            return
+    else:
+        cands = prev - set(alive_ids)
+    for sid in cands:
+        try:
+            store = jd.load_goals(sid)
+            nodes = store.get("nodes", {})
+            kids = {}
+            for nid, nd in nodes.items():
+                if nd.get("parentId"):
+                    kids.setdefault(nd["parentId"], []).append(nid)
+            answered = _peer_answered_at(sid)
+            for gid, st in (store.get("status") or {}).items():
+                if st != "working":
+                    continue
+                stamp = _goal_awaiting_stamp_full(nodes, gid, kids, answered_at=answered)
+                if stamp:
+                    _dead_wait_block(sid, gid, stamp[0], stamp[1], nudged, now)
+        except Exception:
+            sys.stderr.write("dead-wait sweep (%s): %s\n" % (sid, traceback.format_exc()))
+
+
+def _dead_wait_block(sid, gid, at, why, nudged, now):
+    """Convert a DORMANT session's stamped-awaiting Working card to a procedural block, once per stamp
+    episode (the user 2026-08-22, who expected every Working card nudged until it lands in Completed or
+    Blocked). Once-only rides the shared nudge ledger ({deadWait, anchor}; a genuinely NEW stamp episode
+    — newer anchor — re-arms, exactly the wake's own rule). Two stand-downs before writing, both keyed
+    on recorded events, never the clock:
+      - the session's last recorded STATE must be a genuine stop: an open-turn state (working/retrying/
+        compacting) means a restart CUT, and the resume machinery owns that card — blocking it would
+        race the resume nudge it is about to get;
+      - the stamp must still stand on a FRESH store read with the card still Working (the judges run
+        concurrently; record_verdict's own gate then refuses anything a newer user floor outranks).
+    The block's evidence time is the newest of the stamp anchor and the last state transition — the
+    settle the session actually recorded — never wall-clock (the diary is an evidence-time ledger).
+    Returns True when the block landed (the tick pushes once at the end)."""
+    rec = nudged.get(gid) or {}
+    if rec.get("deadWait") and (rec.get("anchor") or 0) >= at:
+        return False                                  # this stamp episode already converted
+    last, last_t = _last_state(sid)
+    if last in _PROGRESSING_STATES:
+        return False                                  # a cut mid-turn, not a settled death — resume owns it
+    try:
+        store = jd.load_goals(sid)
+        nd = store.get("nodes", {}).get(gid)
+        if (not nd or store.get("status", {}).get(gid, "working") != "working"
+                or not _goal_awaiting_stamp(store.get("nodes", {}), gid,
+                                            answered_at=_peer_answered_at(sid))):
+            return False                              # lifted or resolved since the walk read its snapshot
+        blkwhy = jd.dead_wait_block_why(nd.get("awaitingWhy") or why or "")
+        _ev = int(max(at or 0, last_t or 0) or now)
+        if jd.record_verdict(store, nd, "nudge", "block", _ev, why=blkwhy):
+            nd["mt"] = _ev                            # the event materialized blocked + blockWhy
+            jd.append_block(sid, gid, "nudge", blkwhy, _ev)   # journal before the save it protects (a judge
+            #                                           pass holding this store across its model call erases
+            #                                           the row on save; replay re-records it)
+            jd.rollup_status(store, False)
+            jd.save_goals(sid, store)
+            _mark_views_dirty()
+            nudged[gid] = {"deadWait": True, "anchor": at, "at": int(now)}
+            _put_nudged(gid, nudged[gid])
+            return True
+    except Exception:
+        sys.stderr.write("dead-wait block: %s\n" % traceback.format_exc())
+    return False
+
+
 def _wake_goal(sid, gid, stamp, nudged, turns, store, now, lt, tmux):
     """The AWAITING branch of _auto_nudge_session's goal walk — one stamped top goal. The stamp is a
     judged wait, so the plain status nudge stays off; but a wait is not an exemption from the ladder
@@ -4533,8 +4638,14 @@ def _wake_goal(sid, gid, stamp, nudged, turns, store, now, lt, tmux):
                 genuinely NEW stamp episode (anchor newer than the one that failed)."""
     at, why = stamp[0], stamp[1]
     if tmux.get(sid) is None:
-        return False                                 # dormant CLI → its work died with it; the death notice
-        #                                              owns that story, not a wake (same rule as the lifts)
+        # DORMANT owner (the user 2026-08-22): the CLI died while this judged wait still stood — and a
+        # stamped Working card on a dead session was exempt from the WHOLE ladder (this wake, the plain
+        # nudge, the staller), so it sat "paused" forever (two live cards measured at 79 hours). The
+        # death notice tells the CHAT what happened; nothing ever moved the CARD. Nothing that could
+        # answer the wait is running, so convert ONCE per stamp episode to a procedural block naming
+        # the dead wait — the same terminal an unanswered wake reaches — and let a revival's reply
+        # lift it like any block.
+        return _dead_wait_block(sid, gid, at, why, nudged, now)
     rec = nudged.get(gid) or {}
     if not rec.get("wake"):
         rec = {}                                     # a REGULAR nudge record (predates the stamp): the wake
@@ -5790,6 +5901,67 @@ def _dir_completions(raw, limit=DIR_COMPLETE_MAX):
     return {"base": _tilde(base or "/"),
             "items": [{"name": n, "path": _tilde(os.path.join(base, n))} for n in names[:limit]],
             "truncated": len(names) > limit}
+
+
+DIR_LIST_MAX = 500               # listing rows per reply — bounded like DIR_COMPLETE_MAX, sized for a browse
+
+
+def _list_dir(raw, sid=None, hidden=False, limit=DIR_LIST_MAX):
+    """One directory's entries for the dashboard's file browser: files AND directories with
+    sizes/mtimes, plus a server-side `viewable` verdict per file — the same _PREVIEW_MIME +
+    _is_text_path tables /file's view half applies — so the client can mark download-only rows up
+    front instead of letting every click fail into a 415.
+
+    Resolution is _resolve_open_path semantics (~ expanded, a relative path against the sid's session
+    cwd) — the SAME rules /file uses, so every listed path can be handed straight to the /file URL
+    builder. Deliberately a SIBLING of _dir_completions, not a widening: the completer's dirs-only /
+    50-row / dot-gated semantics are the picker's, pinned by its tests. Hidden entries only when
+    asked; symlinks are shown and marked, is_dir() following them for typing like the completer.
+    Errors are LOUD and name the resolved path (fail loudly — never a silent empty list). One bounded
+    JSON frame: capped with `truncated` + `total` so the client can say what was left out."""
+    p = _resolve_open_path(str(raw or ""), sid)
+    if not os.path.isabs(p):
+        return {"error": "cannot list %s: not an absolute path (no session cwd to resolve against)" % _tilde(p)}
+    p = os.path.normpath(p)     # "." from a card menu resolves to "<cwd>/." — lexical only, never realpath
+    # Error replies carry base/parent too, so the client can build a WALKABLE crumb trail over the
+    # failure — a first open that errors with no trail was a dead end (review, 2026-08-14).
+    err_ctx = {"base": _tilde(p),
+               "parent": None if p == "/" else _tilde(os.path.dirname(p.rstrip("/")) or "/")}
+    if not os.path.isdir(p):
+        return dict(err_ctx, error="cannot list %s: not a directory" % _tilde(p))
+    dirs, files = [], []
+    try:
+        with os.scandir(p) as it:
+            for e in it:
+                if e.name.startswith(".") and not hidden:
+                    continue
+                try:
+                    is_dir = e.is_dir()                 # follows symlinks: a symlinked repo browses as one
+                except OSError:
+                    is_dir = False
+                size = mtime = 0
+                is_link = False
+                try:
+                    is_link = e.is_symlink()
+                    st = e.stat()                       # follows too; a dangling link keeps the zeros
+                    size, mtime = int(st.st_size), int(st.st_mtime)
+                except OSError:
+                    pass
+                row = {"name": e.name, "isDir": is_dir, "isLink": is_link,
+                       "size": 0 if is_dir else size, "mtime": mtime}
+                if not is_dir:
+                    row["viewable"] = bool(_PREVIEW_MIME.get(os.path.splitext(e.name)[1].lower())) \
+                        or _is_text_path(e.name)
+                (dirs if is_dir else files).append(row)
+    except OSError as ex:
+        return dict(err_ctx,
+                    error="cannot list %s: %s" % (_tilde(p), getattr(ex, "strerror", None) or str(ex)))
+    dirs.sort(key=lambda r: (r["name"].lower(), r["name"]))
+    files.sort(key=lambda r: (r["name"].lower(), r["name"]))
+    rows = dirs + files
+    parent = os.path.dirname(p.rstrip("/")) or "/"
+    return {"base": _tilde(p), "parent": None if p == "/" else _tilde(parent),
+            "entries": rows[:limit], "total": len(rows), "truncated": len(rows) > limit}
 
 
 def _session_has_history(sid):
@@ -22592,6 +22764,202 @@ def _resolve_open_path(p, sid=None):
     return p
 
 
+def _httpdate(t):
+    """Epoch → the RFC 7231 form a Last-Modified header wears (the viewer's Date.parse reads it)."""
+    from email.utils import formatdate
+    return formatdate(t, usegmt=True)
+
+
+def _save_file(raw, sid, content, base_mtime_ns):
+    """The viewer's raw-mode SAVE (the file browser's slice 2, the user 2026-08-14): write `content`
+    over an existing text file, atomically, refusing when the disk moved on. Returns (mtime_ns, None)
+    on success, (None, error) on refusal — every refusal names the resolved path (fail loudly).
+
+    THE guard is optimistic concurrency: agents edit these same trees while a human has the viewer
+    open, and a silent last-writer-wins would eat one side's work. The client sends the mtime_ns it
+    LOADED at (/file's X-Romp-Mtime-Ns — NANOSECONDS, because an HTTP date's whole seconds let an
+    agent write landing in the same second slip the guard, the review's finding); a moved disk
+    refuses with reload-and-say-so — never a merge, never an overwrite.
+
+    Scope is exactly what raw mode can faithfully round-trip: _is_text_path names within
+    _TEXT_MAX_BYTES, existing files only (no create in this slice), and UTF-8 ONLY — /file's latin-1
+    fallback means a non-UTF-8 file reaches the textarea re-decoded, and writing it back as UTF-8
+    silently rewrote every non-ASCII byte (review, executed repro), so the save refuses instead.
+    A symlinked path writes THROUGH the link (realpath) — os.replace on the link itself destroyed it
+    while the viewer showed and guarded the target. The write is temp-file + os.replace in the same
+    directory, mode preserved — a full disk or a kill mid-write leaves the original intact."""
+    p = _resolve_open_path(str(raw or ""), sid)
+    if not os.path.isabs(p):
+        return None, "cannot save %s: not an absolute path (no session cwd to resolve against)" % _tilde(p)
+    p = os.path.normpath(p)
+    if not _file_editing_on():
+        # THE boundary, server-side (the user 2026-08-22): editing is opt-in per an explicit yes, and a
+        # kernel that never got one refuses the write here — the UI's gating is convenience, this is
+        # the wall. Refusing FIRST (before content checks) keeps the answer honest for any caller.
+        return None, ("cannot save %s: dashboard file editing is off on this machine — the viewer's "
+                      "Edit button asks to turn it on" % _tilde(p))
+    if not isinstance(content, str):
+        # a malformed frame must refuse, not truncate: str(None or "") wrote ZERO bytes with a
+        # success ack before this check (review)
+        return None, "cannot save %s: the request carried no text" % _tilde(p)
+    if not _is_text_path(p):
+        return None, "cannot save %s: not a text file the viewer edits" % _tilde(p)
+    if not os.path.isfile(p):
+        return None, "cannot save %s: no such file (creating files is not a viewer edit)" % _tilde(p)
+    try:
+        data = content.encode("utf-8")
+    except UnicodeError:
+        # a lone surrogate raised OUTSIDE the OSError net and the client never got a reply (review)
+        return None, "cannot save %s: the text contains bytes UTF-8 cannot encode" % _tilde(p)
+    if len(data) > _TEXT_MAX_BYTES:
+        return None, ("cannot save %s: %s exceeds the %s text cap"
+                      % (_tilde(p), _human_bytes(len(data)), _human_bytes(_TEXT_MAX_BYTES)))
+    try:
+        base_ns = int(base_mtime_ns or 0)
+    except (TypeError, ValueError):
+        return None, "cannot save %s: the request carried no load-time anchor" % _tilde(p)
+    try:
+        wp = os.path.realpath(p)                # write THROUGH a symlink, never over it
+        st = os.stat(wp)
+        if st.st_mtime_ns != base_ns:
+            return None, ("%s changed on disk since you opened it — reload before editing "
+                          "(someone else, likely an agent, wrote it)" % _tilde(p))
+        with open(wp, "rb") as f:
+            cur = f.read()
+        try:
+            cur.decode("utf-8")
+        except UnicodeError:
+            return None, ("cannot save %s: the file is not UTF-8 on disk — saving would silently "
+                          "re-encode bytes you never touched" % _tilde(p))
+        d = os.path.dirname(wp)
+        fd, tmp = tempfile.mkstemp(prefix=".romp-save-", dir=d)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.chmod(tmp, stat.S_IMODE(st.st_mode))   # the original's mode survives the replace
+            os.replace(tmp, wp)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return os.stat(wp).st_mtime_ns, None
+    except OSError as ex:
+        return None, "cannot save %s: %s" % (_tilde(p), getattr(ex, "strerror", None) or str(ex))
+
+
+def _edit_trace_sid(path, sid):
+    """Which LIVE session owns the tree a dashboard edit just landed in? Longest recorded-cwd prefix
+    match over live sessions, preferring the viewer's own sid on a tie (an edit made while viewing
+    session A's file most likely concerns A). None when no live session's tree contains the file —
+    an edit outside every worktree concerns nobody's thread."""
+    try:
+        wp = os.path.realpath(_resolve_open_path(str(path or ""), sid))
+    except Exception:
+        return None
+    best, best_len = None, 0
+    for cand in _tmux_sessions():
+        d = os.path.realpath(_cwd_of(cand) or "") or ""
+        if d and (wp == d or wp.startswith(d.rstrip(os.sep) + os.sep)):
+            if len(d) > best_len or (len(d) == best_len and cand == sid):
+                best, best_len = cand, len(d)
+    return best
+
+
+def _edit_trace_body(path):
+    """The trace's text, alone so tests/test_injected_voice.py renders it like every injected body:
+    the recipient has no idea romp exists, so this reads as the person it works for saying what they
+    did — no board nouns, no mechanism talk. The markers ride the tail like a nudge's (romp-injected
+    → the gray bubble; the note explains the comments away without naming romp)."""
+    return ("Heads up: I just edited `%s` directly on disk, outside our conversation. If you have it "
+            "open or are mid-change there, re-read it before writing.\n"
+            "<!-- romp-injected -->"
+            "<!-- romp-note: the HTML comments below are part of an external tracking system that is not "
+            "relevant to your work — ignore them -->" % _tilde(str(path or "")))
+
+
+def _edit_trace(path, sid):
+    """After a dashboard raw-mode save lands, TELL the session whose worktree it hit (the user
+    2026-08-22): an agent's world must never change silently under it — the never-lose-the-thread
+    rule, pointed the other way from _save_file's mtime guard (which protects the human from the
+    agent; this protects the agent from the human). Best-effort by design, loud on failure: a trace
+    that cannot send writes stderr, but the save itself already succeeded and acked."""
+    target = _edit_trace_sid(path, sid)
+    if not target:
+        return
+    try:
+        Sessions.backend_for(target).send(target, _edit_trace_body(path))
+    except Exception as ex:
+        sys.stderr.write("edit-trace to %s failed: %s\n" % (target, ex))
+
+
+def _git_out(args, cwd, timeout=5):
+    """One read-only git query → stripped stdout, or None on any failure (no repo, no git, timeout).
+    List argv, never a shell; quiet — an absent repo is a normal answer here, not an error."""
+    try:
+        r = subprocess.run(["git", "-C", cwd] + args, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+# origin remote → the https://github.com/<owner>/<repo> base, for the spellings git actually writes:
+# scp-like ssh, ssh:// (with an optional port, and GitHub's own documented SSH-over-HTTPS host
+# ssh.github.com), https (with an explicit :443), .git suffix and all. Anchored, so
+# github.example.com and github.com.evil.io lookalikes never match.
+_GITHUB_REMOTE = re.compile(
+    r"^(?:git@github\.com:|ssh://git@(?:ssh\.)?github\.com(?::\d+)?/|https://github\.com(?::443)?/)"
+    r"([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
+
+
+def _file_github_url(raw, sid):
+    """The GitHub web URL for a viewed file, or "" when there is none to give (the user 2026-08-15:
+    the viewer links to the file on GitHub when it is tracked there). Answered by the kernel that
+    OWNS the file — git on ITS disk is the authoritative source — and lazily, per viewer open, never
+    on the /file byte path (thumbnails must not pay three subprocesses each).
+
+    "" is a VERDICT, not an error: an untracked file, a non-repo path, or a non-GitHub origin all
+    honestly have no link, and the viewer simply never shows the button. The ref is the current
+    branch (what a human expects to read on GitHub), or the commit sha when HEAD is detached; a
+    branch that was never pushed 404s on GitHub's end, which is the truthful outcome for a file
+    that is not there yet."""
+    p = _resolve_open_path(str(raw or ""), sid)
+    if not os.path.isabs(p):
+        return ""
+    # realpath, not normpath (two executed repros): a lexical '..' collapse built a URL for a
+    # DIFFERENT file than the bytes the viewer shows when the '..' followed a symlink — a wrong link,
+    # strictly worse than none — and a symlinked path PREFIX made relpath escape the PHYSICAL toplevel
+    # git reports, silently un-linking every tracked file behind a symlink (macOS /tmp, a linked ~/code).
+    p = os.path.realpath(p)
+    d = os.path.dirname(p)
+    top = _git_out(["rev-parse", "--show-toplevel"], d)
+    if not top:
+        return ""
+    rel = os.path.relpath(p, top)
+    if rel == ".." or rel.startswith(".." + os.sep):
+        return ""                                   # escaped the repo — NOT a name-prefix test: a root
+    #                                                 file literally named ..cfg is inside and links fine
+    if _git_out(["ls-files", "--error-unmatch", "--", rel], top) is None:
+        return ""                                   # exists but untracked — no link to a thing not there
+    remote = _git_out(["remote", "get-url", "origin"], top)
+    m = _GITHUB_REMOTE.match(remote or "")
+    if not m:
+        return ""
+    ref = _git_out(["rev-parse", "--abbrev-ref", "HEAD"], top)
+    if not ref:
+        return ""
+    if ref == "HEAD":                               # detached — the sha is the only honest ref
+        ref = _git_out(["rev-parse", "HEAD"], top) or ""
+        if not ref:
+            return ""
+    return "https://github.com/%s/%s/blob/%s/%s" % (
+        # safe="/" keeps a slashed branch name (feat/x) literal — the form GitHub's own UI writes;
+        # GitHub resolves the ref/path ambiguity by longest match, exactly as it does for its users
+        m.group(1), m.group(2), quote(ref, safe="/"),
+        "/".join(quote(seg) for seg in rel.split(os.sep)))
+
+
 # Inline-code spans that name an EXISTING file despite containing spaces (the user 2026-08-04: a note
 # titled `Moving from correlation to causal components.md` linkified only its last word). The client's
 # token linkifier can never span a space — in prose that boundary is exactly what keeps ordinary text
@@ -25277,10 +25645,20 @@ _LANDING_SETTINGS_JS = """
 (function(){window.addEventListener('message',function(e){var m=e.data;if(!m)return;
 if(m.romp==='settings')document.body.classList.toggle('settings-open',!!m.on);
 // the /chat iframe's new-session picker asks the shell to lift it full-window (see body.picker-open CSS)
-if(m.romp==='picker')document.body.classList.toggle('picker-open',!!m.on);});
-// (The viewFile relay is gone: the file viewer opens as a modal over the CHAT pane itself —
-// file-view.ts lives in the chat bundle now (the user 2026-08-15) — so no cross-pane forwarding
-// and no feed-pane bring-forward/put-back.)
+if(m.romp==='picker')document.body.classList.toggle('picker-open',!!m.on);
+// "Browse files" from any pane surfaces the FILE BROWSER in the FEED pane, which is a different
+// document — so the shell relays it. If the feed pane is toggled off we turn it on for the duration
+// and remember to put it back, so the browser never costs the user their layout. (File VIEWS need
+// none of this since 2026-08-15: the viewer is a modal over whatever document clicked, so it never
+// touches the panes and has nothing to restore.)
+if(m.romp==='browseFiles'){var bf=document.getElementById('f-feed');
+  if(!document.body.classList.contains('po-feed')){window.__rompFeedWasOff=true;
+    try{window.__rompPaneToggle&&window.__rompPaneToggle('feed',true);}catch(e){}}
+  try{window.__rompMobileTab&&window.__rompMobileTab('feed');}catch(e){}   // phone: one pane at a time
+  try{bf&&bf.contentWindow&&bf.contentWindow.postMessage({romp:'browseFiles',path:m.path,sid:m.sid},'*');}catch(e){}}
+// the browser owns the restore: browseClosed alone puts a brought-forward feed back the way it was
+if(m.romp==='browseClosed'&&window.__rompFeedWasOff){window.__rompFeedWasOff=false;
+  try{window.__rompPaneToggle&&window.__rompPaneToggle('feed',false);}catch(e){}}});
 // One id per dashboard (per browser tab/window), minted here so every pane in it reports the same one.
 // sessionStorage, deliberately: it survives a reload (the panes keep their identity) and a second window
 // gets its own, which is what makes "the dashboard that asked" a thing the kernel can address.
@@ -27400,10 +27778,19 @@ class Handler(BaseHTTPRequestHandler):
                               "too large to show: %s (%s, limit %s)"
                               % (_tilde(fp), _human_bytes(size), _human_bytes(cap)),
                               "text/plain")
+        # The file's mtime rides every success twice: Last-Modified (the standard form) and
+        # X-Romp-Mtime-Ns — NANOSECONDS, the anchor saveFile's conflict floor actually compares,
+        # because the HTTP date's whole seconds let an agent write landing in the same second slip
+        # the guard (the raw-mode edit slice; the granularity hole was the review's finding).
+        fst = os.stat(fp)
+        lastmod = _httpdate(fst.st_mtime)
+        mtime_ns = str(fst.st_mtime_ns)
         if head:
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_header("Content-Length", str(size))   # the real length, no body (HEAD semantics)
+            self.send_header("Last-Modified", lastmod)
+            self.send_header("X-Romp-Mtime-Ns", mtime_ns)
             self.send_header("X-Content-Type-Options", "nosniff")   # _send's guarantee, restated on the HEAD path
             self.send_header("Cache-Control", "no-cache")
             if getattr(self, "_cors_origin", None):         # the chat's fetch-HEAD probe rides CORS too
@@ -27447,8 +27834,20 @@ class Handler(BaseHTTPRequestHandler):
             body = _decode_text(raw)
             if body is None:                     # named like text, isn't — say so rather than serve garbage
                 return self._send(415, "not a text file: %s" % _tilde(fp), "text/plain")
-            return self._send(200, body, mime, cache="no-cache")
-        return self._send(200, raw, mime, cache="no-cache")
+            # Which decode branch produced the text travels WITH it: _decode_text's latin-1 fallback
+            # re-decodes a non-UTF-8 file, and an Edit armed on that text would re-encode every
+            # non-ASCII byte on save (the review's executed repro) — so Edit arms only on "1", and
+            # _save_file refuses the "0" case server-side regardless.
+            try:
+                raw.decode("utf-8")
+                u8 = "1"
+            except UnicodeError:
+                u8 = "0"
+            return self._send(200, body, mime, cache="no-cache",
+                              headers={"Last-Modified": lastmod, "X-Romp-Mtime-Ns": mtime_ns,
+                                       "X-Romp-Text-Utf8": u8})
+        return self._send(200, raw, mime, cache="no-cache",
+                          headers={"Last-Modified": lastmod, "X-Romp-Mtime-Ns": mtime_ns})
 
     def _file_download(self, fp, head=False):
         """GET/HEAD /file?download=1 — the SAVE half of the route (the user 2026-08-09): any file that
@@ -28778,6 +29177,10 @@ class Handler(BaseHTTPRequestHandler):
             _auto_nudge_tick(int(time.time()), _tmux_sessions())   # act immediately on turn-on (don't wait 4s)
         elif msg and msg.get("type") == "setUpdateMode" and msg.get("mode") in _UPDATE_MODES:
             _set_update_mode(str(msg["mode"]))      # feed gear → how romp handles new releases at boot
+        elif msg and msg.get("type") == "setFileEditing" and msg.get("enabled") is not None:
+            # The viewer's Edit consent popup (the user 2026-08-22) — a kernel-side setting like
+            # setAutoNudge, broadcast by federation.ts KERNEL_SETTING so one yes answers the mesh.
+            _set_file_editing(bool(msg["enabled"]))
         elif msg and msg.get("type") == "askClear" and msg.get("itemId"):
             # a cleared card drops any composer citation chip pointing INTO it (the user 2026-07-01) — the
             # goal is gone, so following up on it makes no sense. Chips can cite a SUB-goal of the card
@@ -29189,6 +29592,45 @@ class Handler(BaseHTTPRequestHandler):
             _reply(client, dict({"type": "dirCompletions", "reqId": msg.get("reqId"), "host": "",
                                  "value": _val, "status": _dir_status(_val)},
                                 **_dir_completions(_val)))
+        elif msg and msg.get("type") == "listDir":
+            # The dashboard's file browser. Answered by the kernel that OWNS the sid's session —
+            # federation routes by the sid field, so browsing a remote session lists THAT machine's
+            # disk over the existing splice, no relay clause needed. reqId echoes back so a slow
+            # reply landing after a newer navigation is dropped by the client, never rendered (the
+            # dirComplete protocol); `host` rides for the same stale-drop. Resolution is /file's own
+            # (_resolve_open_path), so every listed path feeds the /file URL builder as-is.
+            _reply(client, dict({"type": "dirListing", "reqId": msg.get("reqId"), "host": "",
+                                 "sid": msg.get("sid") or ""},
+                                **_list_dir(msg.get("path"), msg.get("sid") or None,
+                                            hidden=bool(msg.get("hidden")))))
+        elif msg and msg.get("type") == "saveFile":
+            # The viewer's raw-mode save (the file browser's slice 2). Routed by sid to the
+            # session-OWNING kernel like listDir, so a remote session's file saves on ITS machine.
+            # The reply is the ACK the client's Save button waits on; a refusal (the mtime conflict
+            # above all) rides back verbatim for the viewer to present — never a silent drop.
+            mt, err = _save_file(msg.get("path"), msg.get("sid") or None,
+                                 msg.get("content"), msg.get("baseMtimeNs"))
+            if err:
+                _reply(client, {"type": "fileSaveFailed", "reqId": msg.get("reqId"), "error": err})
+            else:
+                # mtimeNs travels as a STRING: ~1.7e18 exceeds JS's safe-integer range, so a JSON
+                # number would round in the browser and every next save would falsely conflict
+                _reply(client, {"type": "fileSaved", "reqId": msg.get("reqId"),
+                                "path": str(msg.get("path") or ""), "mtimeNs": str(mt)})
+                _edit_trace(msg.get("path"), msg.get("sid") or None)   # the owning session is TOLD (never edited under silently)
+
+
+        elif msg and msg.get("type") == "fileGitLink":
+            # The viewer's GitHub link (the user 2026-08-15), asked lazily per open. Answered by the
+            # kernel that OWNS the file — git on ITS disk is the authority, and a remote page's WS
+            # already terminates on the owning kernel (the /remote/<host>/ws splice), so no relay
+            # clause is needed; sid only resolves a relative path against that session's cwd. reqId
+            # is echoed for the stale-drop; an empty url is the no-link verdict and the viewer just
+            # never shows the button. Threaded: three git subprocesses must not block the recv loop.
+            def _gl(c=client, m=msg):
+                _reply(c, {"type": "fileGitLink", "reqId": m.get("reqId"),
+                           "url": _file_github_url(m.get("path"), m.get("sid") or None)})
+            threading.Thread(target=_gl, daemon=True).start()
         elif msg and msg.get("type") == "browseDir":
             tgt = str(msg.get("target") or "picker")          # which dir field to fill: the new-session picker or the gear
             if not _native_dialogs():
@@ -29435,6 +29877,13 @@ class Handler(BaseHTTPRequestHandler):
             body = b"" if head else resp.read(_PREVIEW_MAX_BYTES + 1)
             status, ctype = resp.status, mime          # OUR mime, never resp.getheader("Content-Type")
             clen = resp.getheader("Content-Length")
+            # These three are MIRRORED, unlike Content-Type: they are data about the remote's file
+            # (the save-conflict floor and the Edit gate ride on them), not instructions to this
+            # browser — nothing executes off a date or a flag, and deriving them locally would be a
+            # lie about a remote disk.
+            lastmod = resp.getheader("Last-Modified")
+            r_ns = resp.getheader("X-Romp-Mtime-Ns")
+            r_u8 = resp.getheader("X-Romp-Text-Utf8")
             crange = resp.getheader("Content-Range") or ""
         except (OSError, http.client.HTTPException) as e:
             _demand_redial(host, "refused" if isinstance(e, ConnectionRefusedError) else "timeout")
@@ -29453,6 +29902,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", ctype)
             if clen is not None:
                 self.send_header("Content-Length", clen)
+            if lastmod:
+                self.send_header("Last-Modified", lastmod)
+            if r_ns:
+                self.send_header("X-Romp-Mtime-Ns", r_ns)
             self.send_header("X-Content-Type-Options", "nosniff")   # _send's guarantee, restated on the HEAD path
             self.send_header("Cache-Control", "no-cache")
             if getattr(self, "_cors_origin", None):
@@ -29478,7 +29931,11 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        return self._send(status, body, ctype, cache="no-cache")
+        # These three are MIRRORED for the same reason they were read above: the save-conflict floor
+        # and the Edit gate ride on them, and deriving them locally would lie about a remote disk.
+        mirrored = {k: v for k, v in (("Last-Modified", lastmod), ("X-Romp-Mtime-Ns", r_ns),
+                                      ("X-Romp-Text-Utf8", r_u8)) if v}
+        return self._send(status, body, ctype, cache="no-cache", headers=mirrored or None)
 
     def _relay_download(self, host, port, rtok, q, head=False):
         """GET/HEAD /remote/<host>/file?download=1 — the download half of the relay. Forwards the one

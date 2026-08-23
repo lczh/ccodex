@@ -130,6 +130,9 @@ class InjectedBodiesSpeakAsTheUser(unittest.TestCase):
             # the user's own words; the quoting frame around them is romp-authored and scanned here
             "comment thread opener": km._comment_first_message(
                 "Cap the retry delay at two minutes.", "Why two minutes and not five?"),
+            # the dashboard-edit trace (the user 2026-08-22): the file viewer saved over a file in this
+            # session's tree, and the session is told in the person's voice — never edited under silently
+            "edit trace": km._edit_trace_body("/TESTDIR/notes-api/README.md"),
         }
         # every repeat-nudge variant wears the same voice as the first fire (the user 2026-08-11): the
         # rotation exists so a re-ask doesn't read canned, so a variant that broke the voice rule would
@@ -179,9 +182,11 @@ class InjectedBodiesSpeakAsTheUser(unittest.TestCase):
             # words as its body, so there is no romp-authored ask in it to check; the DEBT reminder
             # asks for a reply to a PEER, not a progress report to the user; a comment thread's
             # opener is the user's own comment on a quoted passage — a conversation, never a nudge
+            # …and the edit trace is an FYI about something the user already DID (a file changed under
+            # the session) — telling, not asking; a status question bolted on would be noise
             if name in ("clear wrap-up", "clear wrap-up (batch)", "typed follow-up on a summary",
                         "debt reminder (question)", "debt reminder (handoff)",
-                        "debt reminder (several)", "comment thread opener"):
+                        "debt reminder (several)", "comment thread opener", "edit trace"):
                 continue
             text = prose(body).lower()
             with self.subTest(message=name):

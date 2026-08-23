@@ -8960,13 +8960,32 @@ def debt_block_why(peer):
     decision brief is written."""
     return ("%s%s despite a reminder — your message to them is still unanswered. "
             "Ping them again, take the work back, or drop the wait." % (DEBT_BLOCK_WHY_PREFIX, peer))
+
+
+DEAD_WAIT_WHY_PREFIX = "This session ended while still waiting on "
+
+
+def dead_wait_block_why(why):
+    """The block why for a judged wait whose OWNING session died with the stamp standing (the user
+    2026-08-22): nothing that could answer the wait is running, so more patience is a lie — the card
+    needs the user's call (revive, or drop the wait). The tail quotes the stamp's own why (what the
+    wait was on), a wait description, never user-question text — the same exact-shape rationale as
+    the debt block above."""
+    tail = (why or "").strip().rstrip(".")
+    return ("%s%s. Reviving the session picks the thread back up; replying here or clearing the "
+            "card drops the wait." % (DEAD_WAIT_WHY_PREFIX, tail or "background work"))
+
+
 def procedural_block_why(why):
     """True if `why` is romp's own procedural block bookkeeping rather than a decision the user was asked
-    for. EXACT match on the kernel-authored constants — plus the ONE prefix-recognized shape above (its
-    tail is a peer name, not question text): a real question that merely resembles one of these is still
-    a real question, so nothing fuzzy belongs here."""
+    for. EXACT match on the kernel-authored constants — plus the TWO prefix-recognized shapes above (their
+    tails are a peer name / a wait description, not question text): a real question that merely resembles
+    one of these is still a real question, so nothing fuzzy belongs here."""
     w = (why or "").strip()
-    return w in _PROCEDURAL_BLOCK_WHYS or w.startswith(DEBT_BLOCK_WHY_PREFIX)
+    return (w in _PROCEDURAL_BLOCK_WHYS or w.startswith(DEBT_BLOCK_WHY_PREFIX)
+            or w.startswith(DEAD_WAIT_WHY_PREFIX))
+
+
 # The BLOCK-DISTILLER (the user 2026-06-18, via business): the done-distiller's twin for a BLOCKED top.
 # It reads the same whole-goal work history PLUS the owed question (blockWhy) and writes a true DECISION
 # BRIEF — what the user must decide, the options, only the context needed — stored as node["blockSummary"]
