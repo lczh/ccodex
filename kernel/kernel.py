@@ -11498,7 +11498,7 @@ def _update_remote(host):
         '                    raise OSError("short entry write")\n'
         "            finally:\n"
         "                os.close(efd)\n"
-        '            if subprocess.run(["bash",ie],cwd=r,pass_fds=(fd,)).returncode:\n'
+        '            if subprocess.run(["bash","-s"],cwd=r,stdin=open(ie,"rb"),pass_fds=(fd,)).returncode:\n'
         "                heal_fail=True\n"
         "        if heal_fail:\n"
         "            carry=merge_carry()\n"
@@ -11586,7 +11586,7 @@ def _update_remote(host):
         '        raise OSError("short entry write")\n'
         "finally:\n"
         "    os.close(efd2)\n"
-        'if subprocess.run(["bash",ie2],cwd=r,pass_fds=(fd,)).returncode:\n'
+        'if subprocess.run(["bash","-s"],cwd=r,stdin=open(ie2,"rb"),pass_fds=(fd,)).returncode:\n'
         "    sys.exit(4)\n"
         'st4=subprocess.run(["git","-C",r,"status","--porcelain"],capture_output=True,text=True)\n'
         'h3=subprocess.run(["git","-C",r,"rev-parse","HEAD"],capture_output=True,text=True)\n'

@@ -482,7 +482,13 @@ class UpdateRemote(unittest.TestCase):
             fakebin.mkdir()
             ops = Path(td) / "ops.log"
             committed = Path(td) / "committed-install.sh"
-            committed.write_text("#!/bin/sh\necho COMMITTED >> '%s'\nexit 0\n" % ops)
+            # the committed bytes self-locate the way the REAL install.sh does: running the
+            # entry as `bash $GD/entry` resolved ROMP_DIR to .git and its sanity guard exited —
+            # every real p2p update INSTALLFAILed (the r42 verification). Fed over stdin with
+            # cwd=$R, $0 is "bash" and dirname resolves to the checkout.
+            committed.write_text(
+                "#!/bin/sh\nD=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n"
+                "echo \"COMMITTED DIR=$D\" >> '%s'\nexit 0\n" % ops)
             # the COMMITTED bytes come from `git show`; the TREE's install.sh is the racing
             # writer's replacement
             (fakebin / "git").write_text(
@@ -501,6 +507,10 @@ class UpdateRemote(unittest.TestCase):
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             log = ops.read_text() if ops.exists() else ""
             self.assertIn("COMMITTED", log, "the TARGET's committed install bytes executed")
+            self.assertIn("DIR=%s\n" % fix, log,
+                          "the entry self-locates to the CHECKOUT, not .git — install.sh's "
+                          "dirname-$0 guard exited otherwise (the r42 verification's P1); "
+                          "got: %r" % log)
             self.assertNotIn("RACED", log,
                              "the racing writer's replacement NEVER executes — the entry is "
                              "immutable (the v1.3.14 audit's executed repro)")
@@ -525,6 +535,44 @@ class UpdateRemote(unittest.TestCase):
                              "no success report from a tree that changed during the install")
             self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2",
                              "the latch stays armed on ANY uncertainty (the audit's requirement)")
+
+    def test_an_empty_committed_install_refuses_and_never_falls_to_the_tree(self):
+        # the r42 mutant hunt's M5: a git show that SUCCEEDS with empty output must refuse
+        # (exit 4, latch armed) — a fallback to the tree's install.sh re-opens the exact
+        # mutable-entry hole the commit closes
+        import tempfile
+        from pathlib import Path
+        calls = self._wire(apply_out="SYNCED:abcdef0")
+        km._update_remote("TESTHOST")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        with tempfile.TemporaryDirectory() as td:
+            fix = Path(td) / "romp"
+            gd = fix / ".git"
+            gd.mkdir(parents=True)
+            (gd / "romp-update-channel").write_text("dev\n")
+            fakebin = Path(td) / "bin"
+            fakebin.mkdir()
+            ops = Path(td) / "ops.log"
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' merge-base '*) exit 0;;\n"
+                "  *' show '*) exit 0;;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "esac\nexit 0\n" % gd)
+            (fakebin / "git").chmod(0o755)
+            (fix / "install.sh").write_text("#!/bin/sh\necho TREE_RAN >> '%s'\nexit 0\n" % ops)
+            (fix / "install.sh").chmod(0o755)
+            env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
+            apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("INSTALLFAIL", a.stdout)
+            self.assertFalse(ops.exists(),
+                             "the TREE's install.sh never executes when the committed entry "
+                             "is empty (the r42 mutant hunt's M5)")
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2",
+                             "the latch stays armed")
 
     def test_a_stable_remote_marker_refuses_the_push_absolutely(self):
         # the v1.3.12 audit's P1, hardened by its own review: the rule is absolute in both peer

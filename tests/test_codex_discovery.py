@@ -470,6 +470,110 @@ class MigrationTransaction(unittest.TestCase):
                              "%s rewritten with no change — churn on every boot" % n)
 
 
+class MigrationResumeSafety(unittest.TestCase):
+    """The r42 verification's P1 pair: the sid-wins protection was gated on the in-process
+    `resumed` flag — any persisted intent turned the retry into a clobber that re-published the
+    tid relic over real post-upgrade work and unlinked the evidence."""
+
+    def _state(self):
+        tmp = Path(tempfile.mkdtemp())
+        jd._rebind_state(tmp)
+        for d in (jd.GOALDIR, jd.CAPDIR, jd.CODEXDIR):
+            d.mkdir(parents=True, exist_ok=True)
+        (jd.CODEXDIR / "registry.json").write_text(json.dumps(
+            {SID: {"tid": TID, "name": "cx", "cwd": "/TESTDIR", "dead": False}}))
+        (jd.GOALDIR / (TID + ".json")).write_text(json.dumps(
+            {"rompUuid": TID, "nodes": {TID + ":g1": {"t": 1}}, "status": {}}))
+        (jd.GOALDIR / (SID + ".json")).write_text(json.dumps(
+            {"rompUuid": SID, "nodes": {SID + ":g2": {"t": 999, "fresh": True}}}))
+        return tmp
+
+    def test_a_retry_never_clobbers_a_preexisting_sid_store(self):
+        # arming path 1 (executed by the verifier): a crash right after the intent lands
+        self._state()
+        real = jd._mig_atomic
+
+        def crash_after_intent(path, text):
+            real(path, text)
+            if path.name.endswith(".intent"):
+                raise SystemExit("crash: intent persisted, nothing moved yet")
+        with mock.patch.object(jd, "_mig_atomic", side_effect=crash_after_intent):
+            with self.assertRaises(SystemExit):
+                jd.migrate_codex_identity()
+        self.assertTrue((jd.CODEXDIR / "migrated" / (SID + ".intent")).exists())
+        jd.migrate_codex_identity()                   # the RETRY
+        g = json.loads((jd.GOALDIR / (SID + ".json")).read_text())
+        self.assertIn(SID + ":g2", g["nodes"],
+                      "the PRE-EXISTING sid store survives every retry — the decision is "
+                      "durable in the intent, never the in-process resumed flag")
+        self.assertTrue(g["nodes"][SID + ":g2"].get("fresh"))
+        self.assertTrue((jd.GOALDIR / (TID + ".json")).exists(), "the relic stays inert")
+
+    def test_a_corrupt_sibling_namespace_never_arms_the_clobber(self):
+        # arming path 2 (executed by the verifier): no crash injection at all — a corrupt
+        # sibling namespace persisted the intent and the next boot's retry did the damage
+        self._state()
+        (jd.CAPDIR / (TID + ".fails.json")).write_text("{ corrupt")
+        jd.migrate_codex_identity()                   # run 1: capfails fails, intent persists
+        jd.migrate_codex_identity()                   # run 2: the old retry clobbered here
+        g = json.loads((jd.GOALDIR / (SID + ".json")).read_text())
+        self.assertIn(SID + ":g2", g["nodes"])
+        self.assertTrue((jd.GOALDIR / (TID + ".json")).exists())
+
+    def test_the_ledger_lands_before_the_unlink(self):
+        # the r42 verification's P3: publish→unlink→persist was write-BEHIND — a crash in the
+        # unlink gap left the store moved with an empty ledger, the retry skipped the
+        # namespace, and .done sealed the journal orphaned though the merge was safe
+        tmp = Path(tempfile.mkdtemp())
+        jd._rebind_state(tmp)
+        for d in (jd.GOALDIR, jd.CODEXDIR):
+            d.mkdir(parents=True, exist_ok=True)
+        (jd.CODEXDIR / "registry.json").write_text(json.dumps(
+            {SID: {"tid": TID, "name": "cx", "cwd": "/TESTDIR", "dead": False}}))
+        (jd.GOALDIR / (TID + ".json")).write_text(json.dumps(
+            {"rompUuid": TID, "nodes": {TID + ":g1": {"t": 1}}, "status": {}}))
+        ov = jd._overrides_dir()
+        ov.mkdir(parents=True, exist_ok=True)
+        (ov / (TID + ".jsonl")).write_text(json.dumps(
+            {"op": "resolve", "node": TID + ":g1", "t": 5}) + "\n")
+        real_unlink = Path.unlink
+
+        def crash_at_goals_unlink(p, *a, **kw):
+            if p.name == TID + ".json" and p.parent == jd.GOALDIR:
+                raise SystemExit("crash: store published + ledger persisted, unlink not yet")
+            return real_unlink(p, *a, **kw)
+        with mock.patch.object(Path, "unlink", crash_at_goals_unlink):
+            with self.assertRaises(SystemExit):
+                jd.migrate_codex_identity()
+        intent = json.loads((jd.CODEXDIR / "migrated" / (SID + ".intent")).read_text())
+        self.assertTrue(intent["moved"].get("goals"),
+                        "the ledger is write-AHEAD of the unlink — the retry knows the move "
+                        "was OURS (the r42 verification's orphaned-journal gap)")
+        jd.migrate_codex_identity()                   # the retry completes and merges
+        self.assertTrue((ov / (SID + ".jsonl")).exists(),
+                        "the journal reaches the store that DID move")
+        self.assertFalse((ov / (TID + ".jsonl")).exists())
+
+    def test_the_intent_lands_before_the_first_move(self):
+        # the r42 mutant hunt's M1: intent-after-first-move survived because the crash
+        # injection was a caught Exception — SystemExit models the real kill
+        self._state()
+        (jd.GOALDIR / (SID + ".json")).unlink()       # single-store shape: the move runs
+        real = jd._mig_atomic
+        seen = []
+
+        def crash_at_first_store_publish(path, text):
+            seen.append(path.name)
+            if path.parent in (jd.GOALDIR, jd.CAPDIR):
+                raise SystemExit("crash: first store publish")
+            real(path, text)
+        with mock.patch.object(jd, "_mig_atomic", side_effect=crash_at_first_store_publish):
+            with self.assertRaises(SystemExit):
+                jd.migrate_codex_identity()
+        self.assertTrue((jd.CODEXDIR / "migrated" / (SID + ".intent")).exists(),
+                        "the intent is DURABLE before anything moves: %r" % seen)
+
+
 class JudgeEntryMigration(unittest.TestCase):
     def test_the_standalone_entry_migrates_before_dispatch(self):
         # the r39 mutant hunt: deleting main()'s migration call stayed green suite-wide — a

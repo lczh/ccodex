@@ -4875,14 +4875,20 @@ def migrate_codex_identity():
                     intent = json.loads(intent_p.read_text())
                     assert isinstance(intent, dict) and isinstance(intent.get("moved"), dict)
                 except Exception:
-                    intent = {"tid": tid, "moved": {}, "present": {}}
+                    intent = {"tid": tid, "moved": {}, "present": {}, "preexist": {}}
             else:
                 present = {ns: (d / old).exists() for ns, d, old, _n, _t in plan}
                 if not any(present.values()):
                     migdir.mkdir(parents=True, exist_ok=True)
                     _mig_atomic(done_p, json.dumps({"tid": tid, "moved": {}}))
                     continue                          # nothing ever to migrate: settled
-                intent = {"tid": tid, "moved": {}, "present": present}
+                # which SID files already exist BEFORE anything moves: the sid-wins decision
+                # keys on this DURABLE record — gating it on the in-process `resumed` flag
+                # turned the protection off at the first retry, and the tid relic re-published
+                # over real post-upgrade work and unlinked the evidence (the r42 verification,
+                # executed twice: an injected crash, and a plain corrupt sibling namespace)
+                preexist = {ns: (d / new).exists() for ns, d, _o, new, _t in plan}
+                intent = {"tid": tid, "moved": {}, "present": present, "preexist": preexist}
                 migdir.mkdir(parents=True, exist_ok=True)
                 _mig_atomic(intent_p, json.dumps(intent))   # the INTENT lands before anything moves
             moved = intent.setdefault("moved", {})
@@ -4916,12 +4922,13 @@ def migrate_codex_identity():
                         old_p.unlink(missing_ok=True)
                         moved[ns] = True
                         continue
-                    if new_p.exists() and not resumed:
-                        # a pre-transactional crash's relic: the sid file may hold real
-                        # post-upgrade work — sid wins, loudly, and the relic stays inert
-                        sys.stderr.write("codex identity migration %s->%s: %s/%s exists on both "
-                                         "identities with no standing intent — keeping the sid "
-                                         "file; the tid relic is yours to reconcile\n"
+                    if new_p.exists() and (intent.get("preexist") or {}).get(ns):
+                        # a PRE-TRANSACTIONAL relic (the sid file predates our intent): it may
+                        # hold real post-upgrade work — sid wins, loudly, the relic stays
+                        # inert, and the decision is durable across every retry
+                        sys.stderr.write("codex identity migration %s->%s: %s/%s pre-existed "
+                                         "the transaction — keeping the sid file; the tid "
+                                         "relic is yours to reconcile\n"
                                          % (tid[:8], sid[:8], d.name, new_name))
                         continue
                     # ours to (re-)publish: with a standing intent, the OLD file is authoritative
@@ -4931,7 +4938,11 @@ def migrate_codex_identity():
                         tmp.unlink(missing_ok=True)
                         tmp.write_bytes(data)
                         os.replace(tmp, new_p)
-                    elif kind == "rows":
+                        moved[ns] = True
+                        _mig_atomic(intent_p, json.dumps(intent))   # write-AHEAD of the unlink
+                        old_p.unlink(missing_ok=True)
+                        continue
+                    if kind == "rows":
                         out = []
                         for ln in old_p.read_text().splitlines():
                             if not ln.strip():
@@ -4946,8 +4957,13 @@ def migrate_codex_identity():
                         if isinstance(store, dict) and ns in ("goals", "goalsarch"):
                             store["rompUuid"] = sid
                         _mig_atomic(new_p, json.dumps(store))
-                    old_p.unlink(missing_ok=True)
                     moved[ns] = True
+                    _mig_atomic(intent_p, json.dumps(intent))       # write-AHEAD of the unlink:
+                    #                                   a crash in the unlink gap used to leave
+                    #                                   the store moved with the ledger empty —
+                    #                                   the retry skipped it and sealed the
+                    #                                   journal orphaned (the r42 verification)
+                    old_p.unlink(missing_ok=True)
                 except Exception as e:
                     failed = True
                     sys.stderr.write("codex identity migration %s->%s (%s): %s\n"
