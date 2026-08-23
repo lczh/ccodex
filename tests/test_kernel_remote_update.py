@@ -227,6 +227,11 @@ class UpdateRemote(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("restoring the prior install record failed", detail)
         self.assertIn("armed latch stays", detail)
+        self._wire(apply_out="DIRTYPOSTMOVE")
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("tree changed while updating", detail)
+        self.assertIn("latch stays armed", detail)
 
     def test_an_install_failure_on_the_remote_is_its_own_verdict(self):
         # the apply used to lock the reset alone and never install at all (the user's audit,
@@ -352,6 +357,69 @@ class UpdateRemote(unittest.TestCase):
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("DIRTYNOW", a.stdout, "the locked wrapper's own dirty check refuses")
             self.assertFalse((gd / "romp-install-failed").exists())
+
+    def test_edits_landing_during_the_heal_or_after_the_move_never_ride_into_the_install(self):
+        # the v1.3.13 audit's P1, executed there: the only clean check ran BEFORE the settle
+        # heal (minutes of install.sh) — nonconflicting edits landing meanwhile rode into the
+        # install while the wrapper reported the target sha (merge --ff-only protects only
+        # CONFLICTING edits)
+        import tempfile
+        from pathlib import Path
+        calls = self._wire(apply_out="SYNCED:abcdef0")
+        km._update_remote("TESTHOST")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        with tempfile.TemporaryDirectory() as td:
+            fix = Path(td) / "romp"
+            gd = fix / ".git"
+            gd.mkdir(parents=True)
+            (gd / "romp-update-channel").write_text("dev\n")
+            fakebin = Path(td) / "bin"
+            fakebin.mkdir()
+            nstat = Path(td) / "status-count"
+            ops = Path(td) / "ops.log"
+            # the tree turns dirty at the THIRD status read — the shell prefix probes once, the
+            # wrapper's entry check is read 2, and the POST-SETTLE recheck (this fix) is read 3:
+            # the heal (a full install.sh) dirtied the tree after both earlier checks
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' merge-base '*) exit 0;;\n"
+                "  *' status '*) echo x >> '%s'; [ $(wc -l < '%s') -ge 3 ] && echo ' M raced.py';;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
+                "esac\nexit 0\n" % (gd, nstat, nstat, ops))
+            (fakebin / "git").chmod(0o755)
+            (fix / "install.sh").write_text("#!/bin/sh\necho INSTALLED >> '%s'\nexit 0\n" % ops)
+            (fix / "install.sh").chmod(0o755)
+            env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
+            apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
+            (gd / "romp-install-failed").write_text("deadbee2 dev")   # a prior to settle-heal
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("DIRTYNOW", a.stdout,
+                          "the post-settle recheck refuses — the entry check is minutes stale")
+            self.assertNotIn("MOVED", ops.read_text() if ops.exists() else "")
+            # and dirty at the FOURTH read (post-move st3): HEAD moved, install must NOT run —
+            # the armed latch stays for the boot heal
+            nstat.unlink()
+            ops.unlink(missing_ok=True)
+            (gd / "romp-install-failed").unlink(missing_ok=True)   # the heal SPENT it before
+            #                                                        the post-settle refusal
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' merge-base '*) exit 0;;\n"
+                "  *' status '*) echo x >> '%s'; [ $(wc -l < '%s') -ge 4 ] && echo ' M raced.py';;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
+                "esac\nexit 0\n" % (gd, nstat, nstat, ops))
+            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn("DIRTYPOSTMOVE", a.stdout)
+            self.assertNotIn("INSTALLED", ops.read_text() if ops.exists() else "",
+                             "nothing installs on a tree that changed after the move")
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2",
+                             "the armed latch stays for the boot heal")
 
     def test_a_stable_remote_marker_refuses_the_push_absolutely(self):
         # the v1.3.12 audit's P1, hardened by its own review: the rule is absolute in both peer

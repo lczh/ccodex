@@ -4460,14 +4460,25 @@ class SdkBackend:
         reg = read_reg(self.state_dir, sid)
         if not reg:
             return False
+        old_name = reg.get("name", "")
         self._update_reg(sid, name=new_name)   # locked RMW — see set_effort's race note
         # keep the shared names/ identity file in sync (preserve colours)
         try:
             parts = (Path(self.state_dir) / "names" / sid).read_text().rstrip("\n").split("\t")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             parts = [new_name, reg.get("cwd", "")]
         parts += ["", "", ""]
-        write_name(self.state_dir, sid, new_name, parts[1], parts[2], parts[3])
+        try:
+            write_name(self.state_dir, sid, new_name, parts[1], parts[2], parts[3])
+        except BaseException:
+            # the codex twin's rule (the v1.3.13 audit's P2): a raising names publish rolls the
+            # registry back so the stores stay agreed under the caller's "keeps its old name"
+            try:
+                self._update_reg(sid, name=old_name)
+            except Exception:
+                self._log("sdk rename compensation failed for %s: the registry alone holds the "
+                          "new name and will apply it at the next load" % sid)
+            raise
         s = self.sessions.get(sid)
         if s:
             s.name = new_name

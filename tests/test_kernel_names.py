@@ -185,7 +185,8 @@ class NameClaims(unittest.TestCase):
         set_names = []
         with mock.patch.object(km, "_tmux_name_of", return_value=""):
             with mock.patch.object(km, "_codex", return_value=cx):
-                with mock.patch.object(km, "_set_name", side_effect=lambda s, n2: set_names.append(n2)):
+                with mock.patch.object(km, "_set_name",
+                                       side_effect=lambda s, n2: (set_names.append(n2), True)[1]):
                     out = km._rename_session("11111111-2222-3333-4444-555555555555", "webby")
         self.assertEqual(out, "webby")
         cx.rename.assert_called_once_with("11111111-2222-3333-4444-555555555555", "webby")
@@ -212,7 +213,8 @@ class NameClaims(unittest.TestCase):
         set_names = []
         with mock.patch.object(km, "_tmux_name_of", return_value="old"):
             with mock.patch.object(km._TMUX, "rename_by_name", return_value=True):
-                with mock.patch.object(km, "_set_name", side_effect=lambda s, n2: set_names.append(n2)):
+                with mock.patch.object(km, "_set_name",
+                                       side_effect=lambda s, n2: (set_names.append(n2), True)[1]):
                     out = km._rename_session("11111111-2222-3333-4444-555555555555", "webby")
         self.assertEqual(out, "webby")
         self.assertEqual(set_names, ["webby"], "the names file lands synchronously")
@@ -256,6 +258,102 @@ class NameClaims(unittest.TestCase):
                                                         client)
         self.assertIn("registry down", err.getvalue(),
                       "stderr keeps the error even when the send raises")
+
+    def test_a_live_codex_session_joins_the_alive_set_by_its_stable_sid(self):
+        # the v1.3.13 audit's P1, the kernel half: liveness keys on the SID while discovery used
+        # to emit the app-server TID as identity — live Codex rows never joined the alive set,
+        # so lanes vanished and the picker offered a not-running row
+        sid = "11111111-2222-3333-4444-555555555555"
+        row = (sid, __import__("pathlib").Path("/tmp/x.jsonl"), sid, "webby")
+        with mock.patch.object(km.jd, "discover", return_value=[row]):
+            alive = km._alive_sessions(1781100000, {sid: {"backend": "codex"}})
+        self.assertEqual([a["sid"] for a in alive], [sid],
+                         "the discovery identity slot must equal the liveness key")
+
+    def test_a_dead_codex_session_labels_itself_codex(self):
+        # the v1.3.13 audit's P3: the live-only owns() probe read every STOPPED Codex session
+        # as "tmux", and every label-keyed surface mis-described it
+        cx = mock.MagicMock()
+        cx.owns.return_value = False               # dead: live-only ownership says no
+        cx._session.return_value = object()        # but the durable registry knows it
+        with mock.patch.object(km, "_sdk", return_value=None):
+            with mock.patch.object(km, "_codex", return_value=cx):
+                self.assertEqual(km._session_backend("11111111-2222-3333-4444-555555555555",
+                                                     None), "codex")
+
+    def test_a_dead_codex_revive_falls_back_to_the_registry_name_not_the_sid(self):
+        # the v1.3.13 audit's P2, executed there: with the names file missing, the bare
+        # `_name_of(sid) or sid` fallback flowed into CodexBackend.resume, which PERSISTED the
+        # sid over the durable name "history" and freed "history" for a rival claim
+        sid = "11111111-2222-3333-4444-555555555555"
+        cx = mock.MagicMock()
+        cx._session.return_value = mock.MagicMock(name="row")
+        cx._session.return_value.name = "history"
+        cx.resume.return_value = True
+        with mock.patch.object(km, "_name_of", return_value=""):
+            with mock.patch.object(km, "_codex", return_value=cx):
+                with mock.patch.object(km, "_codex_ready", return_value=True):
+                    with mock.patch.object(km, "_sdk", return_value=None):
+                        with mock.patch.object(km, "_commands_for_cwd", return_value=None):
+                            with mock.patch.object(km, "_cwd_of", return_value="/tmp"):
+                                with mock.patch.object(km, "_reveal_chat_for"):
+                                    with mock.patch.object(km, "_mark_views_dirty"):
+                                        with mock.patch.object(km, "_push_session_now"):
+                                            km._revive_session(sid, None)
+        self.assertTrue(cx.resume.called)
+        self.assertEqual(cx.resume.call_args[0][0], "history",
+                         "the registry's own name, never the sid, reaches resume")
+
+    def test_a_dead_rename_over_corrupt_identity_bytes_heals_and_publishes(self):
+        # the v1.3.13 audit's P2: _set_name silently swallowed the read failure, tmux renamed,
+        # the shared bytes stayed corrupt, and the "reserved" target stayed claimable
+        import tempfile
+        from pathlib import Path
+        sid = "11111111-2222-3333-4444-555555555555"
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(km, "NAMES", Path(td)):
+                (Path(td) / sid).write_bytes(b"\xff\xfe corrupt \x80")
+                self.assertTrue(km._set_name(sid, "webby"),
+                                "corrupt residue heals by whole rewrite, like the codex twin")
+                self.assertEqual((Path(td) / sid).read_bytes(), b"webby\t\t\t\n")
+
+    def test_a_failed_name_publish_is_never_acked(self):
+        import tempfile
+        from pathlib import Path
+        sid = "11111111-2222-3333-4444-555555555555"
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(km, "NAMES", Path(td)):
+                with mock.patch.object(km, "_atomic_write", side_effect=OSError(28, "full")):
+                    self.assertFalse(km._set_name(sid, "webby"))
+        with mock.patch.object(km, "_tmux_name_of", return_value="old"):
+            with mock.patch.object(km._TMUX, "rename_by_name", return_value=True):
+                with mock.patch.object(km, "_set_name", return_value=False):
+                    self.assertIsNone(km._rename_session(sid, "webby"),
+                                      "tmux moved but the shared name did not — never acked")
+
+    def test_a_raising_revive_thread_start_answers_the_asker(self):
+        # the v1.3.13 audit: the reviveFailed branch had no committed regression test, contrary
+        # to the round's own every-fix-has-a-detector rule
+        sid = "11111111-2222-3333-4444-555555555555"
+        sent = []
+
+        class BoomThread(km.threading.Thread):
+            def start(self2):
+                if self2._target is km._revive_session:
+                    raise RuntimeError("no threads today")
+                return super().start()
+        with mock.patch.object(km.threading, "Thread", BoomThread):
+            with mock.patch.object(km, "_send_to_view",
+                                   side_effect=lambda v, m, wid: sent.append(m)):
+                with mock.patch.object(km, "_name_of", return_value="webby"):
+                    try:
+                        km.Handler._dispatch_ws(object.__new__(km.Handler),
+                                                {"type": "reviveSession", "id": sid},
+                                                {"send": lambda m: None, "wid": "w1"})
+                    except RuntimeError:
+                        pass                       # the raise still propagates after the answer
+        self.assertTrue(any(m.get("type") == "reviveFailed" for m in sent),
+                        "the asker's loader is cleared with a reason, not left forever: %r" % sent)
 
     def test_renames_are_serialized_under_one_lock(self):
         # two interleaved renames of one sid left the registry at one name and the shared file

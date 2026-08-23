@@ -16,6 +16,7 @@ import threading
 import time
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
 
@@ -3047,6 +3048,24 @@ class PushSessionCallback(unittest.TestCase):
             time.sleep(0.01)
         self.assertTrue(any("session push" in str(m) for m in logs),
                         "the failure is reported, not swallowed: %r" % logs)
+
+
+class RenameCompensation(unittest.TestCase):
+    def test_a_raising_names_publish_rolls_the_registry_back(self):
+        # the v1.3.13 audit's P2, executed there with ENOSPC: the registry committed the new
+        # name while the shared file kept the old one, under a false "keeps its old name"
+        with tempfile.TemporaryDirectory() as td:
+            be = sb.SdkBackend(td, "/bin/true", lambda *a, **k: None)
+            sid = "11111111-2222-3333-4444-555555555555"
+            sb.write_reg(Path(td), sid, {"name": "old", "cwd": "/tmp"})
+            sb.write_name(Path(td), sid, "old", "/tmp")
+            with mock.patch.object(sb, "write_name",
+                                   side_effect=OSError(28, "No space left on device")):
+                with self.assertRaises(OSError):
+                    be.rename(sid, "splitname")
+            self.assertEqual(sb.read_reg(Path(td), sid).get("name"), "old",
+                             "the compensation rolls the registry back — the stores stay agreed")
+            self.assertIn("old", (Path(td) / "names" / sid).read_text())
 
 
 class WriteNameStaging(unittest.TestCase):

@@ -4798,11 +4798,17 @@ def _discover_impl(now, window=None, forks=True):
     out.extend(_codex_rows(cutoff, seen))
     return out
 def _codex_rows(cutoff, seen):
-    """Discovery rows for Codex sessions — (fsid=thread-id, materialized path, anchor sid, name),
+    """Discovery rows for Codex sessions — (fsid=STABLE SID, materialized path, anchor sid, name),
     read from the Codex backend's registry (plans/codex-backend.md). The names/ loop above skips
     these naturally (no <sid>.jsonl under the Claude roots); this is the ONE extra fact the read
     side needs. Dead sessions keep discovering like dead tmux/SDK ones do — history stays browsable;
-    the WINDOW cutoff is what ages them out. No forks: a Codex thread id is stable across resumes."""
+    the WINDOW cutoff is what ages them out. No forks: a Codex thread id is stable across resumes.
+
+    The identity slot is the STABLE SID, never the app-server thread id: liveness
+    (CodexBackend.live_sessions) keys on the SID, so a TID here meant live Codex rows never joined
+    the alive set, the picker offered a not-running TID row, and reviving it shelled
+    `romp resume <TID>` through the tmux path — the TID rides only in the transcript PATH, which
+    is the one place it means anything to a reader (the v1.3.13 audit's P1, executed)."""
     try:
         reg = json.loads((CODEXDIR / "registry.json").read_text())
     except Exception:
@@ -4820,7 +4826,7 @@ def _codex_rows(cutoff, seen):
             continue
         if mt >= cutoff and ps not in seen:
             seen.add(ps)
-            rows.append((tid, p, sid, r.get("name", "")))
+            rows.append((sid, p, sid, r.get("name", "")))
     return rows
 # ───────────────────────── the pass ─────────────────────────
 def _caption_call(task):

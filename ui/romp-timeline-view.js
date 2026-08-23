@@ -1725,6 +1725,8 @@ class TimelinePanel {
       const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
       const root = process.env.ROMP_STATE_DIR || path.join(base, 'romp');   // per-kernel state root (plans/multi-kernel.md)
       const f = path.join(root, 'session-order.json'), tmp = f + '.tmp';
+      try { fs.unlinkSync(tmp); } catch (e) { /* absent is fine */ }   // a planted FIFO at the
+      //                                     fixed staging name froze the renderer (v1.3.13 audit)
       fs.writeFileSync(tmp, JSON.stringify(order));
       fs.renameSync(tmp, f);
     } catch (e) { /* no host hook + no Node → can't persist; the drag still reordered visually until next poll */ }
@@ -2367,6 +2369,8 @@ class TimelinePanel {
           || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'romp');
         fs.mkdirSync(root, { recursive: true });
         const fp = path.join(root, 'timeline-views.json');
+        try { fs.unlinkSync(fp + '.tmp'); } catch (e) { /* absent is fine */ }   // same rule as
+        //                                                    _persistOrder (v1.3.13 audit)
         fs.writeFileSync(fp + '.tmp', JSON.stringify(v));
         fs.renameSync(fp + '.tmp', fp);
       }

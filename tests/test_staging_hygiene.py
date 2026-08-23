@@ -77,5 +77,19 @@ class OtherStagingWriters(unittest.TestCase):
                           "cp" % fn)
 
 
+class ElectronStagingWriters(unittest.TestCase):
+    def test_the_timeline_writers_unlink_the_plant_first(self):
+        # the v1.3.13 audit's P2: _persistOrder and _setViews open fixed .tmp names
+        # synchronously — a writerless FIFO froze the renderer
+        src = open(os.path.join(ROOT, "ui", "romp-timeline-view.js")).read()
+        for anchor in ("'session-order.json'", "'timeline-views.json'"):
+            i = src.index(anchor)
+            window = src[i:i + 500]
+            self.assertIn("fs.unlinkSync", window,
+                          "%s stages at a fixed name without unlinking a plant first" % anchor)
+            self.assertLess(window.index("fs.unlinkSync"), window.index("fs.writeFileSync"),
+                            anchor)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

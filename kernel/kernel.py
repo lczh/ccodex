@@ -887,7 +887,11 @@ def _session_backend(sid, tm):
     if be and be.owns(sid):
         return "sdk"
     cx = _codex()
-    return "codex" if (cx and cx.owns(sid)) else "tmux"
+    if cx is not None and cx._session(sid) is not None:
+        # the REGISTRY probe, not live-only owns(): a stopped Codex session read as "tmux",
+        # and every label-keyed surface mis-described it (the v1.3.13 audit's P3)
+        return "codex"
+    return "tmux"
 
 
 def _open_leaf_bullets(nodes, subs, cap=12, indent="  "):
@@ -8270,7 +8274,16 @@ def _revive_session(sid, client=None):
     DEVNULL'd, and the code below focused a still-dead session, so the picker's Revive silently did
     nothing for a week. Now the revive result is checked and a failure sends the chat a reviveFailed
     event (clears the client's revive loader, shows the reason) instead of pretending it worked."""
-    name = _name_of(sid) or sid
+    name = _name_of(sid)
+    if not name:
+        _cx0 = _codex()
+        _row = _cx0._session(sid) if _cx0 is not None else None
+        if _row is not None:
+            # the registry's own durable name — the bare `or sid` fallback below flowed into
+            # CodexBackend.resume, which PERSISTED the sid over the real name and freed it for
+            # a rival claim (the v1.3.13 audit's P2, executed)
+            name = getattr(_row, "name", "") or ""
+    name = name or sid
     if not _claim_name(name):
         # revive brings a DEAD session live under its stored name — without the reservation it
         # resumed while another live sid (or an in-flight create) owned that name, recreating
@@ -8930,14 +8943,22 @@ def _tmux_name_of(sid):
 
 def _set_name(sid, name):
     """Rewrite a session's names-registry DISPLAY name (1st tab field), preserving its dir + identity
-    color. Used for a DEAD (read-only) tab, which has no tmux session for the rename hook to sync."""
+    color. Used for a DEAD (read-only) tab, which has no tmux session for the rename hook to sync.
+    Returns True only when the new name is PUBLISHED: the old silent-return on a read failure let
+    non-UTF-8 identity bytes no-op the write while the rename acked success — the target name
+    stayed claimable (the v1.3.13 audit's P2). Corrupt residue heals by whole rewrite, like the
+    codex twin; absent (a dead session with no file) writes fresh."""
     try:
         parts = (NAMES / sid).read_text().rstrip("\n").split("\t")
-    except Exception:
-        return
+    except (OSError, UnicodeDecodeError):
+        parts = []
     parts += [""] * (4 - len(parts))
     parts[0] = name
-    _atomic_write(NAMES / sid, "\t".join(parts[:4]) + "\n")   # atomic publish
+    try:
+        _atomic_write(NAMES / sid, "\t".join(parts[:4]) + "\n")   # atomic publish
+    except OSError:
+        return False
+    return True
 
 
 _rename_serial = threading.Lock()   # two interleaved renames of one sid left the registry at
@@ -8960,12 +8981,13 @@ def _rename_session(sid, name):
         if live != name:
             if not _TMUX.rename_by_name(live, name):
                 return None                            # the rename did not LAND: never ack it
-            _set_name(sid, name)                       # SYNCHRONOUS names-file write: the tmux
-            #                                            hook publishes asynchronously, and the
+            if not _set_name(sid, name):               # SYNCHRONOUS names-file write: the tmux
+                return None                            # hook publishes asynchronously, and the
             #                                            claim released before it ran — the name
             #                                            was briefly claimable by a rival (the
             #                                            v1.3.12 audit's P2); the hook's later
-            #                                            write is idempotent
+            #                                            write is idempotent. A FAILED publish is
+            #                                            never acked (the v1.3.13 audit's P2)
     else:
         cx = _codex()
         if cx is not None and cx._session(sid) is not None:
@@ -8979,7 +9001,9 @@ def _rename_session(sid, name):
             except Exception as e:
                 sys.stderr.write("codex rename '%s': %s\n" % (sid, e))
                 return None
-        _set_name(sid, name)                           # dead tab → names file, after the registry
+        if not _set_name(sid, name):                   # dead tab → names file, after the registry;
+            return None                                # a failed publish is never acked (the
+        #                                                v1.3.13 audit's P2)
     return name
 
 
@@ -11434,6 +11458,11 @@ def _update_remote(host):
         "        sys.exit(10)\n"
         "    else:\n"
         "        os.remove(lp)\n"
+        'st2=subprocess.run(["git","-C",r,"status","--porcelain"],capture_output=True,text=True)\n'
+        "if st2.returncode:\n"
+        "    sys.exit(9)\n"
+        'if (st2.stdout or "").strip():\n'
+        "    sys.exit(8)\n"
         'tmp=lp+".tmp"\n'
         "if carry and carry.split()[0][:8]==sha8:\n"
         "    body=carry if len(carry.split())>1 else sha8\n"
@@ -11477,6 +11506,9 @@ def _update_remote(host):
         "    else:\n"
         "        os.remove(lp)\n"
         "    sys.exit(15)\n"
+        'st3=subprocess.run(["git","-C",r,"status","--porcelain"],capture_output=True,text=True)\n'
+        'if st3.returncode or (st3.stdout or "").strip():\n'
+        "    sys.exit(18)\n"
         'if subprocess.run(["bash",os.path.join(r,"install.sh")],cwd=r,pass_fds=(fd,)).returncode:\n'
         "    sys.exit(4)\n"
         "if not pub_line(pick_pub(body.splitlines()[0],body.splitlines())):\n"
@@ -11488,6 +11520,7 @@ def _update_remote(host):
         'if [ "$RRC" = 8 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYNOW; exit 0; fi; '
         'if [ "$RRC" = 9 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERR; exit 0; fi; '
         'if [ "$RRC" = 10 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo LATCHSTUCK; exit 0; fi; '
+        'if [ "$RRC" = 18 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYPOSTMOVE; exit 0; fi; '
         'if [ "$RRC" = 17 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESTOREFAIL; exit 0; fi; '
         'if [ "$RRC" = 16 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo HEADUNKNOWN; exit 0; fi; '
         'if [ "$RRC" = 15 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo NOTLANDED; exit 0; fi; '
@@ -11522,7 +11555,7 @@ def _update_remote(host):
         'echo "SYNCED:$NEW"'
     ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, lfull, _P2P_REF, _P2P_REF,
          _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
-         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
+         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -11567,6 +11600,10 @@ def _update_remote(host):
         return False, ("pushed, but %s's install latch names commits its HEAD doesn't match — an "
                        "update died there mid-move from a broken state; heal it by hand on that "
                        "machine (run install.sh, then remove the latch)" % host)
+    if tag == "DIRTYPOSTMOVE":
+        return False, ("pushed and merged, but the remote's tree changed while updating — "
+                       "nothing installed; its install latch stays armed (clean the remote's "
+                       "tree; its boot heal settles it)")
     if tag == "RESTOREFAIL":
         return False, ("the push did not land, and restoring the prior install record failed — "
                        "the armed latch stays; the remote's boot heal settles it")

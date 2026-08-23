@@ -52,12 +52,18 @@ class CodexDiscovery(unittest.TestCase):
         return p
 
     def test_codex_session_discovered_with_tuple_contract(self):
+        # the STABLE SID is the identity slot (the v1.3.13 audit's P1: the app-server TID there
+        # meant live rows never joined liveness — keyed on SID — the picker offered a not-running
+        # TID row, and reviving it shelled `romp resume <TID>` through the tmux path); the TID
+        # rides only in the transcript PATH
         p = self._mint()
         rows = jd._discover_impl(NOW)
-        cx = [r for r in rows if r[0] == TID]
+        cx = [r for r in rows if r[0] == SID]
         self.assertEqual(len(cx), 1)
         fsid, path, anchor, name = cx[0]
-        self.assertEqual((fsid, str(path), anchor, name), (TID, str(p), SID, "cx"))
+        self.assertEqual((fsid, str(path), anchor, name), (SID, str(p), SID, "cx"))
+        self.assertFalse(any(r[0] == TID for r in rows),
+                         "the thread id is transcript metadata, never a session identity")
 
     def test_window_ages_out(self):
         self._mint(mtime=NOW - 10 * 24 * 3600)
@@ -67,15 +73,16 @@ class CodexDiscovery(unittest.TestCase):
     def test_registry_change_invalidates_discover_cache(self):
         self._mint()
         first = jd.discover(NOW)
-        self.assertEqual(len([r for r in first if r[0] == TID]), 1)
+        self.assertEqual(len([r for r in first if r[0] == SID]), 1)
         # a second session lands: only the registry + a new file change — the fingerprint must move
         time.sleep(0.02)
         tid2 = TID.replace("01911111", "01922222")
-        self._mint(name="cx2", sid=SID.replace("1111", "2222", 1), tid=tid2)
+        sid2 = SID.replace("1111", "2222", 1)
+        self._mint(name="cx2", sid=sid2, tid=tid2)
         # bump the registry mtime past same-second granularity for the stat-based signature
         os.utime(jd.CODEXDIR / "registry.json", (NOW + 5, NOW + 5))
         second = jd.discover(NOW)
-        self.assertEqual(len([r for r in second if r[0] == tid2]), 1,
+        self.assertEqual(len([r for r in second if r[0] == sid2]), 1,
                          "new codex session invisible — fingerprint missed the registry change")
 
     def test_missing_or_broken_registry_is_harmless(self):
