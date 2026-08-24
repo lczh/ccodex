@@ -77,7 +77,14 @@ test("setSessionFlag still posts via the web host hook, with a Node-fs fallback 
   assert.match(SRC, /window\.__rompTimelineSetFlag === 'function'/);
   assert.match(SRC, /window\.__rompTimelineSetFlag\(s\.id, flag, value\)/);
   assert.match(SRC, /session-flags\.json/, "Obsidian/headless writes the same file the kernel reads");
-  assert.match(SRC, /process\.versions\.electron/, "plain node can never write real user state");
+  {
+    // anchored INSIDE the _setSessionFlag fallback: the file-wide match was satisfied by the
+    // order/views guards with this one deleted (the r43 mutant hunt)
+    const at = SRC.indexOf("'session-flags.json'");
+    assert.ok(at > 0, "the fallback names its file");
+    assert.match(SRC.slice(Math.max(0, at - 900), at), /process\.versions\.electron/,
+      "plain node can never write real user state — THIS writer carries its own guard");
+  }
   assert.match(SRC, /process\.env\.ROMP_STATE_DIR \|\| path\.join\(base, 'romp'\)/,
     "the fallback honors the selected kernel state root");
   assert.match(SRC, /tmp = fp \+ '\.tmp'/);

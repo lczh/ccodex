@@ -4927,6 +4927,12 @@ _MIG_NAMESPACES = frozenset(("captions", "capfails", "arch", "goals", "goalsarch
                              "episodes", "journal"))
 
 
+class _MigAmbiguous(RuntimeError):
+    """A namespace whose ownership can never be re-proven (an interleaved writer, a sid-wins
+    verdict, a hashless v1.3.15 ledger): retrying is pure churn, so the verdict is recorded
+    durably as `stranded` and both files stay for hand reconciliation."""
+
+
 def _mig_record(path, tid, intent=False):
     """Read and validate one durable migration record; FileNotFoundError means absent."""
     rec = json.loads(_mig_read_text(path))
@@ -4946,6 +4952,11 @@ def _mig_record(path, tid, intent=False):
         if (not isinstance(value, dict) or set(value) != _MIG_NAMESPACES
                 or any(type(v) is not bool for v in value.values())):
             raise ValueError("invalid migration %s ledger %s" % (field, path))
+    stranded = rec.get("stranded")
+    if stranded is not None and (
+            not isinstance(stranded, dict) or not set(stranded).issubset(_MIG_NAMESPACES)
+            or any(type(v) is not bool for v in stranded.values())):
+        raise ValueError("invalid migration stranded ledger %s" % path)
     present = rec.get("present")
     if isinstance(present, dict) and any(
             did_move and not present.get(ns) for ns, did_move in moved.items()):
@@ -4953,15 +4964,20 @@ def _mig_record(path, tid, intent=False):
         # Accepting that contradiction lets a forged/corrupt completion record manufacture goal
         # numbering continuity and attach old shared state to unrelated SID cards.
         raise ValueError("migration moved absent namespace in %s" % path)
+    if isinstance(present, dict) and any(
+            v and not present.get(ns) for ns, v in (stranded or {}).items()):
+        raise ValueError("migration stranded absent namespace in %s" % path)
     targets = rec.get("targets", {})
     if not isinstance(targets, dict) or not set(targets).issubset(_MIG_NAMESPACES):
         raise ValueError("invalid migration target ledger %s" % path)
     if not intent:
         present = rec.get("present") or {}
-        # A completion claim is valid only when every source observed at intent time was settled.
-        # Old v1.3.15 records could mark an ambiguous SID-wins skip done while leaving the TID file
-        # active forever; rejecting that shape makes the residue visible and retryable.
-        if any(was_present and moved.get(ns) is not True
+        # A completion claim is valid only when every source observed at intent time was settled
+        # — MOVED, or durably STRANDED with both files preserved. Old v1.3.15 records could mark
+        # an ambiguous SID-wins skip done with neither verdict while leaving the TID file active
+        # forever; rejecting that shape makes the residue visible and re-adjudicated.
+        strand = rec.get("stranded") or {}
+        if any(was_present and moved.get(ns) is not True and strand.get(ns) is not True
                for ns, was_present in present.items()):
             raise ValueError("incomplete migration done record %s" % path)
     return rec
@@ -5547,7 +5563,8 @@ def _migrate_codex_identity_locked():
                 sys.stderr.write("codex identity migration %s->%s: ignoring invalid done record: %s\n"
                                  % (tid[:8], sid[:8], e))
             if done is not None:
-                late = [ns for ns, d, old, _new, _kind in plan if _mig_exists(d / old)]
+                late = [ns for ns, d, old, _new, _kind in plan
+                        if _mig_exists(d / old) and not (done.get("stranded") or {}).get(ns)]
                 if not late:
                     if _mig_goal_continuity(done):
                         goal_tid_to_sid[tid] = sid
@@ -5618,7 +5635,11 @@ def _migrate_codex_identity_locked():
             targets = intent.setdefault("targets", {})
             if not isinstance(targets, dict):
                 raise ValueError("invalid migration target ledger")
+            stranded = intent.setdefault("stranded", {})
+            if not isinstance(stranded, dict):
+                raise ValueError("invalid migration stranded ledger")
             failed = False
+            late_seen = False
             for ns, d, old_name, new_name, kind in plan:
                 old_p, new_p = d / old_name, d / new_name
                 ns_lock = _store_file_locks(old_p, new_p)
@@ -5632,19 +5653,40 @@ def _migrate_codex_identity_locked():
                 try:
                     if not _mig_exists(old_p):
                         continue                      # absent: moved on a prior run, or never was
+                    if stranded.get(ns):
+                        continue                      # durably ambiguous: both files stay, no retry
                     if not (intent.get("present") or {}).get(ns):
                         # A legacy writer appeared after the durable ownership snapshot. Folding
-                        # it into this transaction would create moved=true/present=false and, more
-                        # importantly, guess that the late bytes belong before the SID's current
-                        # state. Preserve the source and keep the transaction visibly unsettled.
-                        failed = True
+                        # it into THIS transaction would guess that the late bytes belong before
+                        # the SID's current state — so the source is preserved, the settled
+                        # remainder still closes to .done, and the next entry's reopen-on-late-
+                        # writer path re-snapshots ownership fresh and migrates it under the
+                        # ordinary preexist rules (the r43 verification: holding the whole
+                        # transaction open froze the late file AND re-ran the migration under
+                        # the exclusive boot flock forever).
+                        late_seen = True
                         sys.stderr.write("codex identity migration %s->%s: late %s source; "
-                                         "leaving it untouched\n" % (tid[:8], sid[:8], ns))
+                                         "reopening at the next entry\n" % (tid[:8], sid[:8], ns))
                         continue
                     if moved.get(ns):
                         # The write-ahead moved bit proves the SID publish completed. Never publish
                         # the old bytes again: a writer may have advanced the SID store since then.
-                        _mig_read_bytes(new_p)         # missing/special target: preserve both, fail
+                        # And never UNLINK bytes the ledger can't vouch for: a v1.3.15-era writer
+                        # could extend the source in the publish->unlink gap, and a hashless
+                        # v1.3.15 ledger can't prove it didn't (the r43 verification) — those
+                        # sources strand, preserved, instead of being destroyed.
+                        try:
+                            _mig_read_bytes(new_p)
+                        except FileNotFoundError:
+                            raise _MigAmbiguous("%s target vanished after its move — an explicit "
+                                                "delete is not undone" % ns)
+                        meta = targets.get(ns) if isinstance(targets.get(ns), dict) else {}
+                        src_sha = meta.get("source")
+                        if not isinstance(src_sha, str):
+                            raise _MigAmbiguous("%s moved without a source hash (a v1.3.15 "
+                                                "ledger); the survivor may hold later writes" % ns)
+                        if _mig_sha(_mig_read_bytes(old_p)) != src_sha:
+                            raise _MigAmbiguous("%s source advanced after its move" % ns)
                         if _mig_goal_continuity(intent):
                             goal_tid_to_sid[tid] = sid
                             _CODEX_GOAL_IDENTITY_MAP[tid] = sid
@@ -5656,9 +5698,18 @@ def _migrate_codex_identity_locked():
                         # goals must have moved, and the goal-archive must be settled by our own
                         # move or by never having existed
                         if not _mig_goal_continuity(intent):
+                            pres = intent.get("present") or {}
+                            # continuity can be PERMANENTLY unprovable: no goals store ever
+                            # existed to move, or a goal store stranded — then the orphaned
+                            # journal is the same durable verdict (LOST is recoverable by hand;
+                            # FABRICATED is not). Transiently unproven (a goal store that merely
+                            # failed this run) keeps the transaction open to retry with it.
+                            if ((not pres.get("goals")) or stranded.get("goals")
+                                    or (pres.get("goalsarch") and stranded.get("goalsarch"))):
+                                raise _MigAmbiguous("journal orphaned: goal numbering continuity "
+                                                    "is permanently unprovable")
                             failed = True
-                            continue                  # orphaned relic: verdicts LOST are
-                        #                               recoverable by hand; FABRICATED are not
+                            continue
                         rows = []
                         old_raw = _mig_read_text(old_p)
                         for ln in old_raw.splitlines():
@@ -5675,6 +5726,16 @@ def _migrate_codex_identity_locked():
                         except FileNotFoundError:
                             tail = ""
                         meta = targets.get(ns)
+                        if (isinstance(meta, dict)
+                                and all(isinstance(meta.get(k), str)
+                                        for k in ("source", "base", "target"))
+                                and meta["source"] != _mig_sha(old_raw)):
+                            # the SOURCE grew since the plan was pinned
+                            if _mig_sha(tail) == meta["target"]:
+                                raise _MigAmbiguous("journal source advanced after its rows were "
+                                                    "already merged; the extra rows' order is "
+                                                    "unknowable")
+                            meta = None               # nothing published: replan from live bytes
                         if meta is None:
                             # A v1.3.15 crash may already have published the prefix before this
                             # target ledger existed. Recognize that exact legacy survivor rather
@@ -5687,17 +5748,17 @@ def _migrate_codex_identity_locked():
                         if (not isinstance(meta, dict) or meta.get("source") != _mig_sha(old_raw)
                                 or not all(isinstance(meta.get(k), str)
                                            for k in ("base", "target"))):
-                            raise RuntimeError("journal source changed during migration")
+                            raise _MigAmbiguous("journal ledger no longer matches its source")
                         cur_sha = _mig_sha(tail)
                         if cur_sha == meta["target"]:
                             pass                       # prior publish completed
                         elif cur_sha == meta["base"]:
                             body = prefix + tail
                             if _mig_sha(body) != meta["target"]:
-                                raise RuntimeError("journal merge plan no longer matches")
+                                raise _MigAmbiguous("journal merge plan no longer matches")
                             _mig_atomic(new_p, body)
                         else:
-                            raise RuntimeError("journal target changed during migration")
+                            raise _MigAmbiguous("journal target changed during migration")
                         moved[ns] = True
                         _mig_atomic(intent_p, json.dumps(intent))
                         old_p.unlink(missing_ok=True)
@@ -5708,20 +5769,18 @@ def _migrate_codex_identity_locked():
                         new_raw = _mig_read_bytes(new_p)
                         payload = _mig_merge_preexisting(ns, old_raw, new_raw, tid, sid)
                         if payload is not None:
-                            meta = targets.get(ns)
+                            # The merge is a content dedup / strike-count max — idempotent and
+                            # MONOTONE — so a plan that no longer matches (either file advanced
+                            # since it was pinned) is simply REPLANNED from the live bytes:
+                            # re-merging can only re-include the old rows, never destroy a
+                            # writer's (the r43 verification: the strict raise here wedged the
+                            # transaction permanently on any interleaved append).
                             expected = {"source": _mig_sha(old_raw), "base": _mig_sha(new_raw),
                                         "target": _mig_sha(payload)}
-                            if meta is None:
-                                targets[ns] = meta = expected
+                            if targets.get(ns) != expected:
+                                targets[ns] = expected
                                 _mig_atomic(intent_p, json.dumps(intent))
-                            if meta != expected:
-                                # A prior publish changes `new_raw` from base to target. Accept that
-                                # exact survivor; anything else is a real intervening SID writer.
-                                if (not isinstance(meta, dict)
-                                        or meta.get("source") != _mig_sha(old_raw)
-                                        or _mig_sha(new_raw) != meta.get("target")):
-                                    raise RuntimeError("%s merge state changed" % ns)
-                            elif _mig_sha(new_raw) == meta["base"]:
+                            if _mig_sha(new_raw) != expected["target"]:
                                 if kind == "copy":
                                     _mig_atomic_bytes(new_p, payload)
                                 else:
@@ -5733,14 +5792,13 @@ def _migrate_codex_identity_locked():
                                 _CODEX_GOAL_IDENTITY_MAP[tid] = sid
                             old_p.unlink(missing_ok=True)
                             continue
-                        # The SID won at intent time. That decision is permanent even if its file is
-                        # later removed; resurrecting the TID relic would undo an explicit delete.
-                        failed = True
-                        sys.stderr.write("codex identity migration %s->%s: %s/%s pre-existed "
-                                         "the transaction — keeping the sid file; the tid "
-                                         "relic is yours to reconcile\n"
-                                         % (tid[:8], sid[:8], d.name, new_name))
-                        continue
+                        # The SID won at intent time. That decision is permanent even if its file
+                        # is later removed; resurrecting the TID relic would undo an explicit
+                        # delete. Permanent verdicts settle as STRANDED, not as an eternally
+                        # re-run failure.
+                        raise _MigAmbiguous("%s/%s pre-existed the transaction — keeping the sid "
+                                            "file; the tid relic is yours to reconcile"
+                                            % (d.name, new_name))
 
                     # Persist the exact source/target hashes BEFORE publishing. A caught failure
                     # returns to normal service, so a later SID file may be a legitimate writer —
@@ -5770,17 +5828,27 @@ def _migrate_codex_identity_locked():
                         payload = json.dumps(store).encode()
                     meta = targets.get(ns)
                     expected = {"source": _mig_sha(source), "target": _mig_sha(payload)}
-                    if meta is None:
-                        targets[ns] = meta = expected
-                        _mig_atomic(intent_p, json.dumps(intent))
-                    if meta != expected:
-                        raise RuntimeError("%s source changed during migration" % ns)
                     try:
                         current = _mig_read_bytes(new_p)
                     except FileNotFoundError:
                         current = None
+                    if meta is None:
+                        targets[ns] = meta = expected
+                        _mig_atomic(intent_p, json.dumps(intent))
+                    if meta != expected:
+                        if (isinstance(meta, dict) and current is not None
+                                and _mig_sha(current) == meta.get("target")):
+                            raise _MigAmbiguous("%s source advanced after its bytes were "
+                                                "already published" % ns)
+                        if current is None:
+                            # nothing published yet: the intent owns the NAMESPACE, not one
+                            # snapshot of its bytes — replan from the live source
+                            targets[ns] = meta = expected
+                            _mig_atomic(intent_p, json.dumps(intent))
+                        else:
+                            raise _MigAmbiguous("%s target changed during migration" % ns)
                     if current is not None and _mig_sha(current) != meta["target"]:
-                        raise RuntimeError("%s target changed during migration" % ns)
+                        raise _MigAmbiguous("%s target changed during migration" % ns)
                     if current is None:
                         if kind == "copy":
                             _mig_atomic_bytes(new_p, payload)
@@ -5796,6 +5864,17 @@ def _migrate_codex_identity_locked():
                     #                                   the retry skipped it and sealed the
                     #                                   journal orphaned (the r42 verification)
                     old_p.unlink(missing_ok=True)
+                except _MigAmbiguous as e:
+                    try:
+                        stranded[ns] = True
+                        _mig_atomic(intent_p, json.dumps(intent))
+                        sys.stderr.write("codex identity migration %s->%s: %s — keeping both "
+                                         "files; reconcile by hand, then remove %s to retry\n"
+                                         % (tid[:8], sid[:8], e, done_p))
+                    except Exception as e2:
+                        failed = True                 # the verdict itself must be durable
+                        sys.stderr.write("codex identity migration %s->%s (%s strand): %s\n"
+                                         % (tid[:8], sid[:8], d.name, e2))
                 except Exception as e:
                     failed = True
                     sys.stderr.write("codex identity migration %s->%s (%s): %s\n"
@@ -5809,7 +5888,8 @@ def _migrate_codex_identity_locked():
                 except Exception:
                     pass
             unsettled = [ns for ns, was_present in (intent.get("present") or {}).items()
-                         if was_present and moved.get(ns) is not True]
+                         if was_present and moved.get(ns) is not True
+                         and stranded.get(ns) is not True]
             if unsettled:
                 failed = True
                 sys.stderr.write("codex identity migration %s->%s: unsettled namespaces: %s\n"

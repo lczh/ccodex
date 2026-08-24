@@ -11379,8 +11379,10 @@ def _discover_remote_clone(host):
     repo-root file its kernel persists at boot (_persist_repo_root; ROMP_REPO_ROOT on the target
     overrides) — then a romp-serve found on PATH (non-login, then login shell) resolved to the repo
     that holds it, then conventional dirs. KEEP the source order IN SYNC with _start_remote_kernel.
-    Returns (dir, head, dirty, error) — error set (and the rest blank) on any failure, naming
-    everything tried. Shared by the push (_update_remote) and pull (_pull_remote) directions."""
+    Returns (dir, head, dirty, latch, error) — error set (and the rest blank) on any failure,
+    naming everything tried. `latch` is "1"/"0" for an armed/clear install latch, "UNKNOWN" when
+    the git dir could not be resolved. Shared by the push (_update_remote) and pull
+    (_pull_remote) directions."""
     disc = (
         'R=""; SR="${ROMP_REPO_ROOT:-$(cat "${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}/repo-root" 2>/dev/null)}"; '
         'if [ -n "$SR" ] && [ -d "$SR/.git" ]; then R="$SR"; fi; '
@@ -11394,21 +11396,27 @@ def _discover_remote_clone(host):
         # a FAILED status must never read as a clean tree — that answer green-lights a reset of
         # code the command could not actually see (the user's audit, 2026-08-17)
         'if ds=$(git -C "$R" status --porcelain 2>/dev/null); then '
-        'echo "DIRTY:$(printf %s "$ds" | head -c 1)"; else echo "DIRTY:STATERR"; fi')
+        'echo "DIRTY:$(printf %s "$ds" | head -c 1)"; else echo "DIRTY:STATERR"; fi; '
+        # the install latch decides whether an equal-heads push may no-op: only an affirmative
+        # CLEAR ("0") allows the short-circuit — armed or unreadable runs the settle transaction
+        'GDL="$(git -C "$R" rev-parse --absolute-git-dir 2>/dev/null)"; '
+        'if [ -z "$GDL" ]; then echo "LATCH:UNKNOWN"; '
+        'elif [ -e "$GDL/romp-install-failed" ]; then echo "LATCH:1"; else echo "LATCH:0"; fi')
     try:
         d = subprocess.run([SSH_BIN] + _SSH_OPTS + ["--", host, disc], capture_output=True, text=True, timeout=25)
     except Exception as e:
-        return "", "", "", str(e)[:200]
+        return "", "", "", "", str(e)[:200]
     out = d.stdout or ""
     if "NOROMP" in out:
-        return "", "", "", ("romp not installed on %s (no repo-root state file, no romp-serve on "
-                            "PATH — login shell included — and no clone in ~/projects/romp, "
-                            "~/GitRepos/romp, ~/romp, ~/code/romp, ~/src/romp)" % host)
+        return "", "", "", "", ("romp not installed on %s (no repo-root state file, no romp-serve on "
+                                "PATH — login shell included — and no clone in ~/projects/romp, "
+                                "~/GitRepos/romp, ~/romp, ~/code/romp, ~/src/romp)" % host)
     info = dict((l.split(":", 1) + [""])[:2] for l in out.splitlines() if ":" in l)
     rdir, rhead, rdirty = info.get("DIR", "").strip(), info.get("HEAD", "").strip(), info.get("DIRTY", "").strip()
+    rlatch = info.get("LATCH", "UNKNOWN").strip() or "UNKNOWN"
     if not rdir:
-        return "", "", "", (_ssh_err(d.stderr) or "couldn't locate the remote romp clone on %s" % host).strip()[:200]
-    return rdir, rhead, rdirty, ""
+        return "", "", "", "", (_ssh_err(d.stderr) or "couldn't locate the remote romp clone on %s" % host).strip()[:200]
+    return rdir, rhead, rdirty, rlatch, ""
 
 
 def _update_remote(host):
@@ -11444,7 +11452,7 @@ def _update_remote(host):
     # We push the committed HEAD; uncommitted local edits are not sent ("just take what is committed on local"
     # — the user 2026-07-04). A dirty local tree is NOT refused: it just means HEAD, not the working tree.
     # (1) discover the remote clone + pre-check it's clean
-    rdir, rhead, rdirty, derr = _discover_remote_clone(host)
+    rdir, rhead, rdirty, rlatch, derr = _discover_remote_clone(host)
     if derr:
         return False, derr
     if rdirty == "STATERR":
@@ -11452,6 +11460,13 @@ def _update_remote(host):
                        "state is unknown" % host)
     if rdirty:
         return False, "remote %s has uncommitted changes — commit or discard them there first (won't clobber)" % host
+    if rhead and rhead == lfull and rlatch == "0":
+        # A clean tree at the exact pushed commit with an affirmatively CLEAR install latch is a
+        # true no-op: nothing to move, nothing to heal. Running the full transaction here
+        # restarted a healthy kernel for nothing and, on a stable-channel host, turned Start into
+        # a STABLENOW refusal that left a downed up-to-date kernel unbootable (the r43
+        # verification's P1). Any OTHER latch answer still runs the settle transaction.
+        return True, "already up to date (%s)" % (_local_head(short=True) or lfull[:8])
     # (2) push local HEAD to a scratch ref on the remote (non-checked-out → no denyCurrentBranch issue)
     env = dict(os.environ, GIT_SSH_COMMAND="%s %s" % (SSH_BIN, " ".join(_SSH_OPTS)))
     push_url = "%s:%s" % (host, rdir)
@@ -11755,7 +11770,7 @@ def _update_remote(host):
         "probe(){ python3 -c \"import json,sys,urllib.request; j=json.load(urllib.request.urlopen('http://127.0.0.1:'+sys.argv[1]+'/version',timeout=2)); print(str(j.get('kernel_sha') or '')+' '+str(j.get('boot') or ''))\" \"$PORT\" 2>/dev/null; }; "
         'OLD="$(probe || true)"; OLD_BOOT="${OLD#* }"; [ "$OLD_BOOT" = "$OLD" ] && OLD_BOOT=""; '
         'healthy(){ INFO="$(probe)" || return 1; KS="${INFO%%%% *}"; BID="${INFO#* }"; '
-        '[ -n "$KS" ] && [ "${#KS}" -ge 7 ] && [ "$BID" != "$INFO" ] || return 1; '
+        '[ -n "$KS" ] && [ "${#KS}" -ge 7 ] && [ -n "$BID" ] && [ "$BID" != "$INFO" ] || return 1; '
         'case "$EXPECT" in "$KS"*) ;; *) return 1;; esac; '
         '[ -z "$OLD_BOOT" ] || [ "$BID" != "$OLD_BOOT" ]; }; '
         # RESTART the kernel THROUGH THE MANAGER (the user 2026-07-04: the manager is romp's durable supervisor —
@@ -11777,9 +11792,9 @@ def _update_remote(host):
         # this script's own text (romp-kern[e]l), so pkill can no longer take itself down.
         'pkill -f "bin/romp-kern[e]l" 2>/dev/null; '
         'if command -v node >/dev/null 2>&1 && [ -x "$R/bin/romp-manager" ]; then "$R/bin/romp-manager" ensure >>"$LOGDIR/update.log" 2>&1 || true; fi; '
-        'UP=0; for i in 1 2 3 4 5 6 7 8; do sleep 1; if healthy; then UP=1; break; fi; done; '
+        'UP=0; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 1; if healthy; then UP=1; break; fi; done; '
         'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null & '
-        'for i in 1 2 3 4 5 6 7 8; do sleep 1; if healthy; then UP=1; break; fi; done; fi; '
+        'for i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 1; if healthy; then UP=1; break; fi; done; fi; '
         'if [ "$UP" = 0 ]; then echo "RESTARTFAIL:$NEW"; exit 0; fi; '
         'echo "SYNCED:$NEW"'
     ) % (shlex.quote(rdir), shlex.quote(lfull), kport,
@@ -11974,7 +11989,7 @@ def _pull_remote(host, expected_sha=None):
     if not expected:
         return False, ("refusing to pull executable code from %s without an exact, unambiguous "
                        "expected commit — refresh its build first" % host)
-    rdir, rhead, _rdirty, derr = _discover_remote_clone(host)   # a DIRTY remote is fine: we take its COMMITS
+    rdir, rhead, _rdirty, _rlatch, derr = _discover_remote_clone(host)   # a DIRTY remote is fine: we take its COMMITS
     if derr:
         return False, derr
     rhead = str(rhead or "").strip().lower()
@@ -12385,7 +12400,7 @@ def _restart_remote_kernel(host):
     if r.get("checkin_peer"):
         return False, "no ssh path from this machine (it checked in over its own tunnel)"
     kport = int(r.get("kernel_port") or _REMOTE_KERNEL_PORT)
-    rdir, _rhead, _rdirty, derr = _discover_remote_clone(host)
+    rdir, _rhead, _rdirty, _rlatch, derr = _discover_remote_clone(host)
     if derr:
         return False, derr
     apply_cmd = (
@@ -16346,15 +16361,16 @@ def _mutate_dismissed_lanes(add=(), remove=()):
         with jd._identity_file_lock():
             # More than one kernel can share STATE. Disk is authoritative for both additions and
             # removals; unioning this process's import-time set resurrected a sibling's undismissal.
-            mapped = set(jd.canonicalize_session_identity(
-                sorted(_load_dismissed_lanes())))
+            disk = sorted(_load_dismissed_lanes())
+            mapped = set(jd.canonicalize_session_identity(disk))
             mapped.update(jd.canonicalize_session_identity([str(s) for s in add]))
             mapped.difference_update(
                 jd.canonicalize_session_identity([str(s) for s in remove]))
             _dismissed_lanes.clear()
             _dismissed_lanes.update(mapped)
-            _dismissed_lanes_file().parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write(_dismissed_lanes_file(), json.dumps(sorted(_dismissed_lanes)))
+            if sorted(mapped) != disk:                # a no-op tick must not churn the file
+                _dismissed_lanes_file().parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write(_dismissed_lanes_file(), json.dumps(sorted(_dismissed_lanes)))
     except OSError as e:
         sys.stderr.write("romp-kernel: could not persist timeline dismissals: %s\n" % e)
 
@@ -19099,6 +19115,15 @@ def _resolve_node(sid, node_id):
     new state. We do NOT reuse the view-level `cleared` path: that only hides the card, leaving the
     rollup's block (and a card that was the last open work stuck on 'working'). Recomputes the rolled-up
     status right here so the BLOCKED chip clears now, not on the next judge pass. (the user 2026-06-17.)"""
+    sid = jd.canonicalize_session_identity(sid)
+    node_id = jd.canonicalize_goal_identity(node_id)
+    now = int(time.time())
+    try:                                              # session_closed gate for the rollup, same as
+        path = next((s["path"] for s in _sessions(now)  # run_plan — OUTSIDE the identity lock: a
+                     if s["sid"] == sid), None)       # full transcript parse under the global
+        closed = jd._session_closed(_parse(path, sid, now)) if path else False   # flock stalled
+    except Exception:                                 # every writer for its duration (r43)
+        closed = False
     with jd._identity_file_lock():
         sid = jd.canonicalize_session_identity(sid)
         node_id = jd.canonicalize_goal_identity(node_id)
@@ -19106,7 +19131,6 @@ def _resolve_node(sid, node_id):
         nd = store.get("nodes", {}).get(node_id)
         if not nd or nd.get("nodeComplete"):
             return False
-        now = int(time.time())
     # Journal FIRST (the user 2026-07-10): this handler races a triage pass that may hold this same
     # store in memory across a model call — whichever save lands last wins the whole file, so the
     # pass's stale save could erase the resolve, flag and diary event alike. The journal is the
@@ -19118,11 +19142,6 @@ def _resolve_node(sid, node_id):
         jd.record_verdict(store, nd, "user", "done", now,
                           why=nd.get("doneWhy") or "Resolved by the user.")
         nd["mt"] = now                                # deep-link / recency land on the resolution moment
-        try:                                          # session_closed gate for the rollup, same as run_plan
-            path = next((s["path"] for s in _sessions(now) if s["sid"] == sid), None)
-            closed = jd._session_closed(_parse(path, sid, now)) if path else False
-        except Exception:
-            closed = False
         jd.rollup_status(store, closed)
         jd.save_goals(sid, store)
         _note_user_goal_write(sid)                    # crossing a node off shows mid-pass too (_feed_goals)

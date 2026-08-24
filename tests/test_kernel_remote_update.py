@@ -173,13 +173,43 @@ class UpdateRemote(unittest.TestCase):
         self.assertIn('"$GD/romp-update.lock" "$R" ' + self.LFULL, apply,
                       "the transaction applies the same SHA the push transported")
 
-    def test_equal_heads_still_run_the_settle_transaction(self):
-        calls = self._wire(rhead=self.LFULL)  # an armed failed-install latch may still need healing
+    def test_equal_heads_with_an_armed_latch_still_run_the_settle_transaction(self):
+        calls = self._wire(disc_out="DIR:/home/u/romp\nHEAD:%s\nDIRTY:\nLATCH:1" % self.LFULL)
         ok, detail = km._update_remote("TESTHOST")
         self.assertTrue(ok)
         self.assertIn("synced", detail)
         self.assertTrue(any(a[0] == "git" and "push" in a for a in calls),
                         "HEAD equality alone cannot bypass the remote recovery record")
+
+    def test_equal_heads_with_an_unreadable_latch_still_run_the_settle_transaction(self):
+        calls = self._wire(rhead=self.LFULL)  # no LATCH line at all -> UNKNOWN
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertTrue(ok)
+        self.assertIn("synced", detail)
+        self.assertTrue(any(a[0] == "git" and "push" in a for a in calls),
+                        "an unreadable latch is never presumed clear")
+
+    def test_equal_heads_with_a_clear_latch_are_a_true_no_op(self):
+        # the r43 verification's P1: the unconditional settle transaction turned Start into a
+        # STABLENOW refusal on an up-to-date stable-channel host (and restarted a healthy kernel
+        # for nothing). With the latch affirmatively CLEAR, nothing needs healing: answer
+        # "already up to date" and leave the remote alone.
+        calls = self._wire(disc_out="DIR:/home/u/romp\nHEAD:%s\nDIRTY:\nLATCH:0" % self.LFULL)
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertTrue(ok)
+        self.assertIn("already up to date", detail)
+        self.assertFalse(any(a[0] == "git" and "push" in a for a in calls),
+                         "a no-op never force-pushes")
+        self.assertFalse(any(isinstance(a[-1], str) and "merge-base" in a[-1] for a in calls),
+                         "a no-op never runs the apply transaction (no install, no restart)")
+
+    def test_the_discover_step_reports_the_latch_state(self):
+        calls = self._wire()
+        km._update_remote("TESTHOST")
+        disc = next(a[-1] for a in calls if isinstance(a[-1], str) and "for d in" in a[-1])
+        self.assertIn('romp-install-failed', disc, "the discover step stats the install latch")
+        self.assertIn('echo "LATCH:UNKNOWN"', disc,
+                      "an unresolvable git dir reports UNKNOWN, never a presumed-clear 0")
 
     def test_a_dirty_local_is_not_refused_it_pushes_committed_head(self):
         # "just take what is committed on local" (the user 2026-07-04): a dirty working tree is NOT a blocker —
@@ -1214,6 +1244,12 @@ class UpdateRemote(unittest.TestCase):
         self.assertIn('case "$EXPECT" in "$KS"*', apply,
                       "the restarted kernel must report the exact pushed commit")
         self.assertIn('OLD_BOOT=', apply, "a surviving old kernel process cannot satisfy the restart")
+        self.assertIn('[ -n "$BID" ]', apply,
+                      "a /version with no boot id must fail healthy(): the empty-BID parse left "
+                      "BID != INFO true via the trailing space, so the guard was vacuous (r43)")
+        self.assertEqual(apply.count("for i in 1 2 3 4 5 6 7 8 9 10 11 12"), 2,
+                         "both restart waits fit a real (~17s) manager boot — 8s read a landed "
+                         "install as RESTARTFAIL (r43)")
         self.assertIn('if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve"', apply, "bare romp-serve only as a last resort")
         self.assertNotIn("--refresh", apply, "does NOT rely on `romp --refresh` (needs a manager) — the stuck bug")
 

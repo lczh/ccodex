@@ -612,6 +612,37 @@ class NameClaims(unittest.TestCase):
             finally:
                 km._dismissed_lanes.clear(); km._dismissed_lanes.update(old)
 
+    def test_resolve_node_parses_the_transcript_outside_the_identity_lock(self):
+        # the r43 verification: the closed-gate's full transcript _parse ran INSIDE the global
+        # identity flock, stalling every store writer and _drive dispatch for its duration.
+        # Source-ordering pin: the parse block precedes the lock acquisition in _resolve_node.
+        import inspect
+        src = inspect.getsource(km._resolve_node)
+        self.assertIn("_parse(path, sid, now)", src)
+        self.assertLess(src.index("_parse(path, sid, now)"),
+                        src.index("_identity_file_lock"),
+                        "the transcript parse must leave the identity lock")
+
+    def test_a_no_op_dismiss_tick_never_rewrites_the_file(self):
+        from pathlib import Path
+        old = set(km._dismissed_lanes)
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td); codex = state / "codex"; codex.mkdir()
+            (state / "timeline-dismissed.json").write_text(json.dumps(["a"]))
+            km._dismissed_lanes.clear(); km._dismissed_lanes.add("a")
+            try:
+                with mock.patch.object(km.jd, "STATE", state):
+                    with mock.patch.object(km.jd, "CODEXDIR", codex):
+                        mt = (state / "timeline-dismissed.json").stat().st_mtime_ns
+                        km._undismiss_lanes(["zzz"])   # the supervisor tick: nothing dismissed came alive
+                        self.assertEqual((state / "timeline-dismissed.json").stat().st_mtime_ns,
+                                         mt, "a no-op tick must not churn the file (r43)")
+                        km._undismiss_lanes(["a"])     # a real un-dismissal still writes
+                        self.assertEqual(json.loads(
+                            (state / "timeline-dismissed.json").read_text()), [])
+            finally:
+                km._dismissed_lanes.clear(); km._dismissed_lanes.update(old)
+
     def test_reveal_cannot_overwrite_a_concurrent_timeline_view_heal(self):
         from pathlib import Path
         entered, release = threading.Event(), threading.Event()

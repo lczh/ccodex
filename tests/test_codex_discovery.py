@@ -431,8 +431,15 @@ class MigrationTransaction(unittest.TestCase):
                         "stays an orphaned relic")
         self.assertFalse((ov / (SID + ".jsonl")).exists())
         self.assertTrue((jd.GOALARCHDIR / (SID + ".json")).exists(), "the archive itself moves")
-        self.assertFalse((jd.CODEXDIR / "migrated" / (SID + ".done")).exists(),
-                         "the explicitly orphaned journal keeps the transaction visible")
+        done = json.loads((jd.CODEXDIR / "migrated" / (SID + ".done")).read_text())
+        self.assertTrue(done["stranded"]["journal"],
+                        "the orphaned journal is a DURABLE verdict — visible in the record, both "
+                        "files preserved, and the transaction settles instead of re-running the "
+                        "same failure at every boot (the r43 verification)")
+        before = (ov / (TID + ".jsonl")).read_bytes()
+        jd.migrate_codex_identity()
+        self.assertEqual((ov / (TID + ".jsonl")).read_bytes(), before,
+                         "a settled strand is not retried")
 
     def test_caption_rows_and_the_fail_ledger_rewrite_their_unit_ids(self):
         # the v1.3.14 audit's P1: a bare file rename left every row id TID-prefixed — the
@@ -490,10 +497,14 @@ class MigrationTransaction(unittest.TestCase):
         (jd.GOALDIR / (SID + ".json")).write_text(json.dumps(
             {"rompUuid": SID, "nodes": {SID + ":g9": {"fresh": True}}, "status": {}}))
         jd.migrate_codex_identity()
-        self.assertFalse(done.exists(), "completion is not a permanent blind skip")
-        self.assertTrue((jd.GOALDIR / (TID + ".json")).exists())
+        self.assertTrue((jd.GOALDIR / (TID + ".json")).exists(),
+                        "the relic is preserved — completion was not a permanent blind skip")
         self.assertIn(SID + ":g9", json.loads(
-            (jd.GOALDIR / (SID + ".json")).read_text())["nodes"])
+            (jd.GOALDIR / (SID + ".json")).read_text())["nodes"],
+                      "the fresh SID work survives the reopen")
+        rec = json.loads(done.read_text())
+        self.assertTrue(rec["stranded"]["goals"],
+                        "the reopened sid-wins verdict is durable: re-adjudicated, then settled")
 
     def test_a_late_non_goal_writer_preserves_completed_goal_continuity(self):
         self._state(goals=True)
@@ -604,13 +615,23 @@ class MigrationTransaction(unittest.TestCase):
         (jd.STATE / "cleared.jsonl").write_text(json.dumps(
             {"id": TID + ":g1", "t": 1, "op": "clear"}) + "\n")
         jd.migrate_codex_identity()
-        jd.migrate_codex_identity()
+        # WITHIN the standing transaction the late source is untouchable: ownership of bytes
+        # born after the durable snapshot is unknown, so this run settles WITHOUT it
         self.assertTrue(late.exists(), "ownership of a post-intent source is unknown")
         self.assertFalse((jd.GOALDIR / (SID + ".json")).exists())
-        self.assertFalse((mig / (SID + ".done")).exists())
-        intent = json.loads((mig / (SID + ".intent")).read_text())
-        self.assertNotIn("goals", intent["moved"])
-        self.assertIn(TID + ":g1", (jd.STATE / "cleared.jsonl").read_text())
+        done_rec = json.loads((mig / (SID + ".done")).read_text())
+        self.assertNotIn("goals", done_rec["moved"])
+        self.assertIn(TID + ":g1", (jd.STATE / "cleared.jsonl").read_text(),
+                      "no continuity was granted, so shared goal state stayed put")
+        # the NEXT entry reopens from the done with a FRESH ownership snapshot — now the file
+        # predates the new intent and migrates under the ordinary rules (convergence, not a
+        # transaction frozen open forever — the r43 verification)
+        jd.migrate_codex_identity()
+        self.assertFalse(late.exists())
+        self.assertIn(SID + ":g1", json.loads(
+            (jd.GOALDIR / (SID + ".json")).read_text())["nodes"])
+        self.assertIn(SID + ":g1", (jd.STATE / "cleared.jsonl").read_text(),
+                      "continuity granted by the completed move carries the shared state along")
 
     def test_duplicate_or_overlapping_registry_identities_leave_evidence_untouched(self):
         tmp = Path(tempfile.mkdtemp())
@@ -696,7 +717,7 @@ class MigrationTransaction(unittest.TestCase):
         self.assertTrue((jd._overrides_dir() / (TID + ".jsonl")).exists(),
                         "and the journal held with it")
 
-    def test_both_goal_files_with_no_intent_preserve_both_and_stay_open(self):
+    def test_both_goal_files_with_no_intent_preserve_both_and_settle_stranded(self):
         # a pre-transactional (v1.3.14) crash relic: the sid file may hold real post-upgrade
         # work — it wins, the relic stays inert, and the session settles
         self._state(goals=True)
@@ -706,8 +727,14 @@ class MigrationTransaction(unittest.TestCase):
         g = json.loads((jd.GOALDIR / (SID + ".json")).read_text())
         self.assertTrue(g["nodes"][SID + ":g1"].get("fresh"), "the sid store's work survives")
         self.assertTrue((jd.GOALDIR / (TID + ".json")).exists(), "the relic stays, inert")
-        self.assertFalse((jd.CODEXDIR / "migrated" / (SID + ".done")).exists(),
-                         "an ambiguous relic is preserved and never hidden behind a permanent skip")
+        rec = json.loads((jd.CODEXDIR / "migrated" / (SID + ".done")).read_text())
+        self.assertTrue(rec["stranded"]["goals"],
+                        "the ambiguity is a durable, visible verdict — never a silent skip, and "
+                        "never an eternally re-run failure (the r43 verification)")
+        mt = (jd.GOALDIR / (TID + ".json")).stat().st_mtime_ns
+        jd.migrate_codex_identity()
+        self.assertEqual((jd.GOALDIR / (TID + ".json")).stat().st_mtime_ns, mt,
+                         "a settled strand is not retried at the next entry")
 
     def test_the_shared_identity_files_rewrite_and_stay_stable(self):
         # the v1.3.14 audit's P2 cluster
@@ -827,6 +854,127 @@ class MigrationTransaction(unittest.TestCase):
         self.assertEqual(block["node"], SID + ":g1")
         self.assertEqual(block["why"], TID + ":g6")
 
+    def test_a_real_v1315_sid_wins_done_record_converges_to_a_stranded_settle(self):
+        # the exact record shape v1.3.15 left behind: a done whose present says goals existed
+        # but whose moved never claimed them (the sid-wins skip) — with both files still on
+        # disk. The upgrade must re-adjudicate it into the durable stranded verdict, and a
+        # further entry must not touch anything again.
+        self._state(goals=True)
+        (jd.GOALDIR / (SID + ".json")).write_text(json.dumps(
+            {"rompUuid": SID, "nodes": {SID + ":g9": {"fresh": True}}, "status": {}}))
+        mig = jd.CODEXDIR / "migrated"
+        mig.mkdir(parents=True, exist_ok=True)
+        present = {ns: ns == "goals" for ns in jd._MIG_NAMESPACES}
+        (mig / (SID + ".done")).write_text(json.dumps(
+            {"tid": TID, "moved": {}, "present": present, "preexist": dict(present)}))
+        jd.migrate_codex_identity()
+        self.assertTrue((jd.GOALDIR / (TID + ".json")).exists(), "the relic is preserved")
+        self.assertTrue(json.loads((jd.GOALDIR / (SID + ".json")).read_text())
+                        ["nodes"][SID + ":g9"]["fresh"], "the sid store's work survives")
+        rec = json.loads((mig / (SID + ".done")).read_text())
+        self.assertTrue(rec["stranded"]["goals"], "the residue is a durable, visible verdict")
+        mt = (jd.GOALDIR / (TID + ".json")).stat().st_mtime_ns
+        jd.migrate_codex_identity()
+        self.assertEqual((jd.GOALDIR / (TID + ".json")).stat().st_mtime_ns, mt,
+                         "settled: no per-boot re-run of the failed transaction (r43)")
+
+    def test_a_journal_crash_between_publish_and_ledger_never_duplicates_on_retry(self):
+        # the r43 mutant hunt: the targets-hash pass branch (cur == target -> already published)
+        # only earns its keep in the crash window between the journal body landing and the
+        # moved bit persisting — no test crashed there, and disabling the branch stayed green
+        self._state(goals=True, journal=True)
+        ov = jd._overrides_dir()
+        real = jd._mig_atomic
+        state = {"armed": False}
+
+        def die_before_moved_persists(path, text):
+            if path == ov / (SID + ".jsonl"):
+                state["armed"] = True                 # the journal body just published
+                return real(path, text)
+            if state["armed"] and path == jd.CODEXDIR / "migrated" / (SID + ".intent"):
+                raise SystemExit("crash: journal published, moved bit not yet durable")
+            return real(path, text)
+
+        with mock.patch.object(jd, "_mig_atomic", side_effect=die_before_moved_persists):
+            with self.assertRaises(SystemExit):
+                jd.migrate_codex_identity()
+        self.assertTrue((ov / (TID + ".jsonl")).exists(), "the crash left the source in place")
+        jd.migrate_codex_identity()
+        rows = [json.loads(ln) for ln in (ov / (SID + ".jsonl")).read_text().splitlines()]
+        self.assertEqual(len(rows), 1,
+                         "the retry recognized its own published target by hash and did not "
+                         "prepend the same verdict a second time")
+        self.assertEqual(rows[0]["node"], SID + ":g1")
+        self.assertFalse((ov / (TID + ".jsonl")).exists())
+
+    def test_runtime_writers_canonicalize_a_stale_tid_address(self):
+        # the r43 mutant hunt: dropping append_caption's canonicalization stayed green — yet a
+        # TID-addressed append after the migration is exactly how a moved store gets recreated
+        self._state(goals=False, captions=True)
+        jd.migrate_codex_identity()
+        self.assertFalse((jd.CAPDIR / (TID + ".jsonl")).exists())
+        jd.append_caption(TID, TID + ":300:zzz", "turn", 300, "a late caption")
+        self.assertFalse((jd.CAPDIR / (TID + ".jsonl")).exists(),
+                         "a stale TID address must not recreate the moved store")
+        rows = [json.loads(ln) for ln in
+                (jd.CAPDIR / (SID + ".jsonl")).read_text().splitlines()]
+        self.assertEqual(rows[-1]["id"], SID + ":300:zzz")
+        jd._write_caption_fails(TID, {TID + ":300:zzz": 2})
+        self.assertFalse((jd.CAPDIR / (TID + ".fails.json")).exists())
+        self.assertEqual(json.loads((jd.CAPDIR / (SID + ".fails.json")).read_text()),
+                         {SID + ":300:zzz": 2})
+
+    def test_a_moved_source_that_later_grew_is_preserved_not_unlinked(self):
+        # the r43 verification: the moved-bit resume unlinked the source unverified — bytes a
+        # v1.3.15-era writer appended in the publish->unlink gap were destroyed
+        self._state(goals=False, captions=True)
+        cap_old = jd.CAPDIR / (TID + ".jsonl")
+        original = cap_old.read_bytes()
+        payload = b""
+        for ln in original.decode().splitlines():
+            row = json.loads(ln)
+            row["id"] = SID + row["id"][len(TID):]
+            payload += (json.dumps(row) + "\n").encode()
+        (jd.CAPDIR / (SID + ".jsonl")).write_bytes(payload)
+        mig = jd.CODEXDIR / "migrated"
+        mig.mkdir(parents=True, exist_ok=True)
+        present = {ns: ns in ("captions", "capfails") for ns in jd._MIG_NAMESPACES}
+        intent = {"tid": TID, "moved": {"captions": True}, "present": present,
+                  "preexist": {ns: False for ns in jd._MIG_NAMESPACES},
+                  "targets": {"captions": {"source": jd._mig_sha(original),
+                                           "target": jd._mig_sha(payload)}}}
+        with cap_old.open("a") as fh:                 # the gap write the ledger can't vouch for
+            fh.write(json.dumps({"id": TID + ":150:gap", "caption": "late"}) + "\n")
+        (mig / (SID + ".intent")).write_text(json.dumps(intent))
+        jd.migrate_codex_identity()
+        self.assertTrue(cap_old.exists(), "grown source bytes are preserved, never destroyed")
+        self.assertIn(TID + ":150:gap", cap_old.read_text())
+        rec = json.loads((mig / (SID + ".done")).read_text())
+        self.assertTrue(rec["stranded"]["captions"])
+        # the clean twin: an exact source-hash match IS our own crash residue — it unlinks
+        (mig / (SID + ".done")).unlink()
+        cap_old.write_bytes(original)
+        (mig / (SID + ".intent")).write_text(json.dumps(intent))
+        jd.migrate_codex_identity()
+        self.assertFalse(cap_old.exists(), "the verified residue settles clean")
+
+    def test_a_moved_namespace_with_a_hashless_ledger_strands_instead_of_unlinking(self):
+        # a mid-crash v1.3.15 intent has moved=true and NO targets: nothing can vouch that the
+        # surviving source holds no later writes — preserve it
+        self._state(goals=False, captions=True)
+        (jd.CAPDIR / (SID + ".jsonl")).write_text(
+            json.dumps({"id": SID + ":100:aaa", "caption": "published"}) + "\n")
+        mig = jd.CODEXDIR / "migrated"
+        mig.mkdir(parents=True, exist_ok=True)
+        present = {ns: ns in ("captions", "capfails") for ns in jd._MIG_NAMESPACES}
+        (mig / (SID + ".intent")).write_text(json.dumps(
+            {"tid": TID, "moved": {"captions": True}, "present": present,
+             "preexist": {ns: False for ns in jd._MIG_NAMESPACES}}))
+        jd.migrate_codex_identity()
+        self.assertTrue((jd.CAPDIR / (TID + ".jsonl")).exists())
+        rec = json.loads((mig / (SID + ".done")).read_text())
+        self.assertTrue(rec["stranded"]["captions"])
+
     def test_canonicalizing_a_loaded_goal_store_preserves_guarded_nodes(self):
         self._state(goals=True)
         jd.migrate_codex_identity()
@@ -931,7 +1079,10 @@ class MigrationResumeSafety(unittest.TestCase):
         self.assertIn(SID + ":g9", g["nodes"],
                       "a post-failure SID writer is legitimate, not our partial publish")
         self.assertTrue((jd.GOALDIR / (TID + ".json")).exists())
-        self.assertFalse((jd.CODEXDIR / "migrated" / (SID + ".done")).exists())
+        rec = json.loads((jd.CODEXDIR / "migrated" / (SID + ".done")).read_text())
+        self.assertTrue(rec["stranded"]["goals"],
+                        "hashes pinned before the failure can never re-align with the foreign "
+                        "target — the verdict is durable and the transaction settles")
 
     def test_the_ledger_lands_before_the_unlink(self):
         # the r42 verification's P3: publish→unlink→persist was write-BEHIND — a crash in the
