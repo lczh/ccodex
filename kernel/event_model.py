@@ -41,6 +41,12 @@ MESSAGES_LOG = STATE / "timeline" / "messages.jsonl"
 # A turn ends when the model hands the floor back: stream `end_turn` / `stop_sequence`.
 # Mid-turn the model stops with `tool_use` (a tool cycle) — that does NOT end the turn.
 END_STOPS = ("end_turn", "stop_sequence")
+# The toolUseResult keys a consumer actually reads (Edit's structuredPatch → diffRows,
+# AskUserQuestion's answers map → the answered box). The atom carry is GATED on one of these
+# being present: an unconditional dict carry held every Read result's full file bytes in the
+# parse cache by reference — ~a fifth of transcript bytes on read-heavy sessions — for shapes
+# nothing reads. Widen this set when a new consumer appears; never revert to carry-all.
+TUR_CONSUMED_KEYS = frozenset(("answers", "structuredPatch"))
 # romp's own postal marker, injected into a delivered message body. It is the ONLY
 # postal signal — never the generic "Stop hook feedback:" prefix (any blocking Stop
 # hook produces that). The sender rompUuid is resolved from timeline/messages.jsonl
@@ -1259,6 +1265,19 @@ class FileAdapter:
                 atom = {"type": "user", "uuid": u, "session_id": rompuuid, "t": ts,
                         "fsid": fsid, "parentUuid": r.get("parentUuid"),
                         "message": _norm_message(r.get("message")), "_seq": seq}
+                if has_tool_result and isinstance(r.get("toolUseResult"), dict) \
+                        and (set(r["toolUseResult"]) & TUR_CONSUMED_KEYS):
+                    # The record's top-level toolUseResult — Claude Code's STRUCTURED result (Edit's
+                    # structuredPatch, AskUserQuestion's answers map). The kernel's chat build reads it
+                    # at tool_result attach time; the atom used to drop it, so every consumer silently
+                    # fell to its lossy fallback (regex-scraping the flat output string — which is how
+                    # quote-bearing AskUserQuestion answers vanished from the answered box). Dict form
+                    # only: an errored result records a plain string, which no consumer reads. Carried
+                    # ONLY when a consumed key is present (_TUR_CONSUMED_KEYS): an unconditional carry
+                    # held every Read result's full file bytes in the parse cache by reference —
+                    # roughly a fifth of transcript bytes on read-heavy sessions — for shapes nothing
+                    # reads. Widen the key set when a new consumer appears; never back to carry-all.
+                    atom["toolUseResult"] = r["toolUseResult"]
                 if ps:
                     atom["promptSource"] = ps
                 author = author_of(blocks, ps, postal_index, getattr(self, "sdk_human", False))

@@ -136,7 +136,10 @@ test("the rich tip is the ONE hover surface: no native titles, per-host sections
   assert.ok(usageJS.includes("if(!keys.length)return '';"));
   assert.ok(!usageJS.includes("spendOnly"), "spend renders for ANY host that has it");
   assert.ok(usageJS.includes("function fleetSpendHTML(sets)"));
-  assert.ok(usageJS.includes("return h+fleetSpendHTML(sets);"));
+  // the spend section renders even when NO host has window blocks (an all-keyed box, 2026-08-15) —
+  // the appended form replaced `return h+fleetSpendHTML(sets);`, whose empty-blocks short-circuit
+  // left the API cell's hover empty exactly when spend was all there was to show
+  assert.ok(usageJS.includes("h+=fleetSpendHTML(sets);"));
   // …with the summed $/hour area graph and its peak beside it — labelled PER-HOUR (the user
   // 2026-08-13 read a bare 'peak $311' and had to ask whether that was one hour)
   assert.ok(usageJS.includes("moneyGraph(wk,'#9cd2ff',series.h0+st)"));
@@ -186,8 +189,10 @@ test("a multi-host breakdown lays hosts SIDE BY SIDE, one column each", () => {
   // now each host is a flex column, and flex-wrap folds the mobile modal back to a stack on its own
   const usageJS = KERNEL.split('_LANDING_USAGE_JS = """')[1].split('"""')[0];
   assert.ok(usageJS.includes("'<div class=ru-tip-cols>'+blocks.map(function(b){return '<div class=ru-tip-col>'+b+'</div>';}).join('')+'</div>'"));
-  // a single host keeps its plain un-columned layout — the wrapper exists only when there is a fleet
-  assert.ok(usageJS.includes("var h=many?"));
+  // a single host keeps its plain un-columned layout — the column wrapper exists only when more
+  // than one host reports (blocks.length? guards the all-keyed box, whose hosts have NO window
+  // blocks at all — see expected-auth.test.ts)
+  assert.ok(usageJS.includes("var h=blocks.length?(many?"));
   assert.ok(KERNEL.includes(".ru-tip-cols{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}"));
   assert.ok(KERNEL.includes(".ru-tip-col{flex:0 1 auto;min-width:200px}"));   // 200px floor since the sparks span the column (the user 2026-08-14)
 });

@@ -95,7 +95,7 @@ the card's whole subtree (you reply to the card, never to its blocked
 sub-goals) · Continue (a needs-you card's one-click canned reply, 2026-08-08:
 "nothing needed from me, keep going" — the same reply path end to end, so it
 inherits the optimistic reopen and the judges' reassert; never a bare column
-move) · Clear / Undo clear · Resolve · the agent checking off its to-dos ·
+move) · Clear / Undo · Resolve · the agent checking off its to-dos ·
 a peer completing delegated work (courier link-back) · a failed auto-nudge
 (records a block) · the settle moment · the live floors below.
 

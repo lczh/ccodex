@@ -97,7 +97,7 @@ test("a /clear boundary that dropped cards logs once, naming them and the way ba
   assert.equal(first.notices.length, 1);
   assert.equal(first.notices[0].kind, "cleared");
   assert.match(first.notices[0].text, /^web — \/clear dropped 2 open cards: ship the notes-api, tune the rate limits/);
-  assert.match(first.notices[0].text, /Undo clear/, "the way back is in the entry itself");
+  assert.match(first.notices[0].text, /Undo on the feed/, "the way back is in the entry itself");
   const again = clearBoundaryNotices(rows, new Set(first.active));
   assert.equal(again.notices.length, 0, "the same boundary never re-logs across pushes/reloads");
 });

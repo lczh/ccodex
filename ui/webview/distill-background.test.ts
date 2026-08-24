@@ -53,7 +53,7 @@ test("state: a single mutually-exclusive secChoice (bg | summary | subgoals | ta
   // the "Awaiting task" list is the FOURTH (the user 2026-07-13)
   assert.match(FEED, /const secChoice = new Map<string, "bg" \| "summary" \| "subgoals" \| "tasks" \| "stall" \| "none">\(\);/);
   // absent from the map → the DEFAULT, set by the footer "Collapsed" toggle (off → summary, on → none)
-  assert.match(FEED, /return secChoice\.get\(id\) \?\? \(feedPrefs\(\)\.collapsed \? "none" : "summary"\);/);
+  assert.match(FEED, /return secChoice\.get\(id\) \?\? \(feedPrefs\(\)\.collapsed \? "none" : hasAwaitTasks \? "tasks" : "summary"\);/);
   // click the showing section → off; click another → switch (one at a time)
   assert.match(FEED, /secChoice\.set\(id, choice === want \? "none" : want\)/);
   assert.match(FEED, /a\._bgBtn\.onclick = pick\("bg"\);/);

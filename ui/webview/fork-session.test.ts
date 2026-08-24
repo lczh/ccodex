@@ -35,6 +35,16 @@ test("the fork affordance rides BELOW each response run — delegated, with the 
   assert.match(CSS, /\.turn-assistant:hover \.msg-fork, \.msg-fork:focus-visible \{ opacity: 0\.9; \}/);
   assert.match(CSS, /\.msg-fork:hover \{ color: var\(--fg\); border-color: var\(--accent\); \}/);
   assert.doesNotMatch(CSS, /\.msg-fork\.armed/);
+  // the under-bubble button family wears NEUTRAL chrome (the user 2026-08-23): it sits on the page
+  // ground, where the terracotta code tint (--code-bg) read as a faint red button. Only .code-copy
+  // keeps the tint — it sits ON the tinted code block and blends there.
+  for (const block of [".msg-edit {", ".msg-del, .msg-restorefiles, .msg-fork {", ".undelivered-act {"]) {
+    const body = CSS.slice(CSS.indexOf(block), CSS.indexOf("}", CSS.indexOf(block)));
+    assert.ok(body.includes("background: rgba(255, 255, 255, 0.06)"), block + " wears the neutral ground");
+    assert.ok(!body.includes("--code-bg"), block + " must not borrow the code tint");
+  }
+  const copy = CSS.slice(CSS.indexOf(".code-copy {"), CSS.indexOf("}", CSS.indexOf(".code-copy {")));
+  assert.ok(copy.includes("var(--code-bg)"), ".code-copy stays tinted — it lives on the code block");
 });
 
 test("the modal defaults to <session>-fork and posts forkSession {id, uuid, name}", () => {

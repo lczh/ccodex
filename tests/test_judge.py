@@ -7617,7 +7617,11 @@ class AwaitingVerdict(unittest.TestCase):
         # then suppressed the goal's awaiting entirely (blocked outranks awaiting by design), so a
         # session genuinely watching an external job read as needing the user.
         for phrase in ("The mirror image is NOT blocked", "will report back on its own",
-                       "never blocked; filing it blocked parks a card on the user"):
+                       # narrowed 2026-08-24 (the awaiting-peer audit): a handoff is the peer's own
+                       # (omitted, tracked by the handoff graph); "peer" needs an open sent-question
+                       'never blocked: an external process still running is awaiting (kind "job")',
+                       '"peer" is only for a question this session sent and still needs answered',
+                       "Filing these blocked parks a card on the user"):
             self.assertIn(phrase, jd.CLOSER_SYS)
 
     def test_closer_prompt_offers_awaiting_with_the_tight_rule(self):

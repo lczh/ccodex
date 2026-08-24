@@ -15,7 +15,7 @@ const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "
 test("the badge is built once and rides the wrapping chip row", () => {
   assert.match(FEED, /const dcBadge = el\("span", "fask-doneconfirming"\)/);
   assert.match(FEED, /dcBadge\.textContent = "done, confirming"/, "text label, no emoji/glyph");
-  assert.match(FEED, /row2\.append\(idwrap, origin, fupBadge, dcBadge, nfBadge, intingBadge, intBadge, warnChip, waitOnBadge\)/);
+  assert.match(FEED, /row2\.append\(idwrap, retryBadge, apiBadge, apiRetry, jauthBadge, blkBadge, origin, fupBadge, dcBadge, nfBadge, intingBadge, intBadge, warnChip, waitOnBadge\)/);
   assert.match(FEED, /a\._doneConfirming = dcBadge;/);
 });
 

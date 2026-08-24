@@ -75,7 +75,7 @@ export function badgeNotices(items: BadgeItem[], seen: Set<string>): { notices: 
 // episodes log's own settle record). Same episode-identity contract as the badges above: one bell
 // entry per boundary (sid + its t), so a clear that silently dropped cards is always findable in
 // the bell after the fact (the user 2026-07-27). The entry names the dropped cards and the way back
-// (Undo clear restores the batch).
+// (Undo restores the batch).
 export interface ClearNoticeRow { sid: string; name: string; t: number; titles: string[]; ended?: boolean; }   // ended: a session death finalized these cards (2026-08-13), not a /clear
 
 export function clearBoundaryNotices(rows: ClearNoticeRow[], seen: Set<string>): { notices: BadgeNotice[]; active: Set<string> } {
@@ -87,14 +87,14 @@ export function clearBoundaryNotices(rows: ClearNoticeRow[], seen: Set<string>):
     if (seen.has(sig)) continue;
     const n = r.titles.length;
     // an ENDED row is a session death that finalized open cards (2026-08-13) — same channel as the
-    // /clear drop, its own phrasing: nothing here is restorable by Undo clear, the session is gone
+    // /clear drop, its own phrasing: nothing here is restorable by Undo, the session is gone
     notices.push(r.ended
       ? { kind: "ended", sig, sid: r.sid, itemId: "",
           text: r.name + " ended with " + n + " open card" + (n === 1 ? "" : "s") + ": "
             + cap(r.titles.join(", "), 120) }
       : { kind: "cleared", sig, sid: r.sid, itemId: "",   // no single card — the jump opens the session
           text: r.name + " — /clear dropped " + n + " open card" + (n === 1 ? "" : "s") + ": "
-            + cap(r.titles.join(", "), 120) + " (Undo clear on the feed restores them)" });
+            + cap(r.titles.join(", "), 120) + " (Undo on the feed restores them)" });
   }
   return { notices, active };
 }

@@ -12,6 +12,29 @@
 /* A wide display formula scrolls inside its own box instead of stretching the bubble. */
 .katex-display { overflow-x: auto; overflow-y: hidden; }
 
+/* ── chat TEXT schemes (the user 2026-08-24) ─────────────────────────────────────────────────────
+   The chat's text runs on THREE tiers, all variables: --fg (prose), --dim (tool heads / commands /
+   meta — always dimmer than prose), --code-fg (inline/block code). A scheme is JUST a tier set on a
+   body class, applied live by render.ts from the gear's romp:settings pick. No body class = the
+   Default scheme = the :root values below, byte-identical to before this block existed. Text only:
+   backgrounds, status colors, and the accent are never a scheme's to change. Solarized LIGHT is
+   deliberately absent — its tiers are made for a paper-light ground and invert into mud here. */
+body.scheme-high-contrast {
+  --fg: #e8e8e8;        /* prose lifted from #cccccc… */
+  --dim: #b8b8b8;       /* …and the dim tier lifted with it, still clearly dimmer than prose */
+  --code-fg: #ecd9ae;   /* the warm code tone, brightened in step */
+}
+body.scheme-solarized-dark {
+  /* REBUILT on the user's live check (2026-08-24): the first cut used base0/base01 — solarized's
+     canonical body tiers on its OWN canvas — which sit far BELOW our default's luminance
+     (#839496 ≈ 0.28 vs #cccccc ≈ 0.60), so picking the scheme DARKENED the chat: the exact opposite
+     of the contrast-raising ask. On romp's dark ground the bright solarized content tones are the
+     text tiers: a scheme here must never drop prose below the default (pinned by luminance test). */
+  --fg: #eee8d5;        /* solarized base2 — its bright content tone; ≈0.81 luminance, above default */
+  --dim: #93a1a1;       /* solarized base1 — clearly dimmer than prose, a shade above default dim */
+  --code-fg: #d5b02d;   /* solarized yellow, lifted for the dark ground (#b58900 reads muddy here) */
+}
+
 :root {
   /* Chat reading-column width. 100% = fill the pane and grow with it (the user 2026-06-15);
      set a px value (e.g. 980px) to re-cap for prose readability. Shared by the transcript,
@@ -168,6 +191,14 @@ body.tabbar-resizing { cursor: ns-resize; user-select: none; }
    outline-offset:-2px insets it where the old shadow sat; Chromium follows the
    border-radius. (For a dash length decoupled from thickness we'd need an SVG
    border — say the word if 2px dashes aren't long enough.) */
+/* EPHEMERAL PEEK TAB (the user 2026-08-24): a session the current view hides, opened temporarily by a
+   focus/click — it breaks the view's rules and dresses accordingly: STRUCTURE, not status, so a neutral
+   ghost (dim short-dash ring + italic faded label), never a status color. Declared BEFORE the state
+   outlines below on purpose: at equal specificity a real state (awaiting/blocked/retrying) must still
+   win the outline — the cascade ORDER is the tiebreak and is pinned in peek-tab.test.ts. The italic
+   label survives a state overlap either way. */
+.tab.tab-peek { outline: 1.5px dashed rgba(255, 255, 255, 0.35); outline-offset: -2px; }
+.tab.tab-peek .tab-label { font-style: italic; opacity: 0.85; }
 .tab.tab-awaiting, .tab.tab-blocked, .tab.tab-retrying { outline: 2px dashed var(--state); outline-offset: -2px; }
 /* WORKING: a small yellow dot left of the name (replaces the old yellow outline). */
 .tab-dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--st-working-bg); }   /* solid — dot oscillation was distracting (the user 2026-06-16) */
@@ -354,7 +385,18 @@ body.tabbar-resizing { cursor: ns-resize; user-select: none; }
 .empty-state { color: var(--dim); text-align: center; padding: 40px; }
 /* brief hint while a first-visited tab's transcript builds on the next frame (the deferred build keeps the
    switch itself instant — the user 2026-06-17); the build replaces it. */
-.tx-loading { color: var(--dim); text-align: center; padding: 28px; font-size: 0.9em; }
+.tx-loading { color: var(--dim); text-align: center; padding: 28px; font-size: 0.9em;
+  display: flex; align-items: center; justify-content: center; gap: 8px; }
+/* the standing romp loader treatment (swirl reverse-spin + wordmark + pulsing accent dots) for the
+   first-visit transcript build — the boot splash / pane loader language, never a bare text hint */
+.tx-loading-swirl { width: 18px; height: 18px; animation: tx-swirl-spin 1.6s linear infinite reverse; }
+.tx-loading-wordmark { font-weight: 650; color: var(--fg); }
+.tx-loading-dots i { display: inline-block; width: 5px; height: 5px; border-radius: 50%;
+  background: var(--accent); margin-left: 4px; animation: tx-dot-pulse 1.2s ease-in-out infinite; }
+.tx-loading-dots i:nth-child(2) { animation-delay: 0.2s; }
+.tx-loading-dots i:nth-child(3) { animation-delay: 0.4s; }
+@keyframes tx-swirl-spin { to { transform: rotate(-360deg); } }
+@keyframes tx-dot-pulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
 /* a genuinely empty transcript (a session with no turns yet) — shown instead of "Loading transcript…",
    which would be a lie since the full events payload already arrived (the user 2026-06-19). */
 .tx-empty { color: var(--dim); text-align: center; padding: 28px; font-size: 0.9em; }
@@ -547,7 +589,7 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
 /* ── citation chip strip (the user 2026-07-01) ── a click on a feed card summary / sub-goal seeds a
    dismissible pill here, ABOVE the textarea: "you're following up on THIS". Accent-blue, with an ✕ to
    dismiss (Backspace-at-start dismisses too). Reads as attached context, not typed text. */
-#composer-chips { flex: 1 1 100%; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 0 0 6px 2px; }
+#composer-chips { flex: 1 1 100%; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 0 0 6px 2px; position: relative; }   /* (the Stage button flows in the column now — 2026-08-24) */
 /* attachment thumbnails (the user 2026-08-04): dropped/pasted/picked files sit as little previews above
    the box until send — a row that wraps, unlike the stacked context chips below it */
 #composer-files { flex: 1 1 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 0 0 6px 2px; }
@@ -605,6 +647,16 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
 .staged-head .staged-go { margin-left: auto; background: none; border: 1px solid var(--accent); color: var(--accent);
   border-radius: 5px; font: inherit; padding: 1px 8px; cursor: pointer; }
 .staged-head .staged-go:hover { background: var(--accent); color: var(--accent-fg); }
+/* the chips strip's Stage button (the user 2026-08-23; moved 2026-08-24): it FOLLOWS the blue
+   context chips in the strip's column — immediately after what it acts on, where its meaning reads;
+   right-justified it floated detached. Exists exactly while context is held (the strip renders it,
+   and the strip hides with the chips). NEUTRAL at rest (the under-bubble button family's dress): an
+   accent outline next to the accent-blue chips read as already-pressed — accent is for
+   hover/selected, never rest chrome */
+.composer-stage-btn { background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--box-border); color: var(--dim); border-radius: 5px; font-size: 0.78em;
+  padding: 1px 8px; cursor: pointer; }
+.composer-stage-btn:hover { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 .staged-chip { display: flex; flex-direction: column; gap: 2px; border: 1px dashed rgba(156, 210, 255, 0.45);
   border-left: 2px solid var(--accent); border-radius: 6px; padding: 2px 6px; font-size: 12px; color: var(--fg);
   cursor: pointer; }
@@ -1224,7 +1276,9 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
 .msg-edit {
   align-self: flex-end; margin-top: 3px;
   font-family: var(--sans); font-size: 11px; line-height: 1; padding: 3px 7px; border-radius: 4px;
-  border: 1px solid var(--box-border); background: var(--code-bg); color: var(--dim);
+  /* neutral ground, neutral chrome (the user 2026-08-23): these sit on the page, not on a code
+     block, so the code tint .code-copy blends with read here as a faint red button */
+  border: 1px solid var(--box-border); background: rgba(255, 255, 255, 0.06); color: var(--dim);
   cursor: pointer; opacity: 0; user-select: none;
   transition: opacity 0.12s ease, color 0.12s ease, border-color 0.12s ease;
 }
@@ -1237,7 +1291,7 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
 .msg-del, .msg-restorefiles, .msg-fork {
   align-self: flex-end; margin-top: 3px;
   font-family: var(--sans); font-size: 11px; line-height: 1; padding: 3px 7px; border-radius: 4px;
-  border: 1px solid var(--box-border); background: var(--code-bg); color: var(--dim);
+  border: 1px solid var(--box-border); background: rgba(255, 255, 255, 0.06); color: var(--dim);
   cursor: pointer; opacity: 0; user-select: none;
   transition: opacity 0.12s ease, color 0.12s ease, border-color 0.12s ease;
 }
@@ -1381,7 +1435,7 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
 }
 .undelivered-act {
   font-family: var(--sans); font-size: 11px; line-height: 1; padding: 3px 7px; border-radius: 4px;
-  border: 1px solid var(--box-border); background: var(--code-bg); color: var(--dim);
+  border: 1px solid var(--box-border); background: rgba(255, 255, 255, 0.06); color: var(--dim);
   cursor: pointer; user-select: none;
   transition: color 0.12s ease, border-color 0.12s ease;
 }
@@ -1599,6 +1653,13 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
 .todo-card-error .todo-head { color: var(--err); }
 .todo-error-msg { color: var(--err); font-size: 0.86em; line-height: 1.4; }
 .todo-item { display: flex; gap: 8px; align-items: baseline; padding: 1px 0; line-height: 1.45; }
+/* the completed bulk's fold (the user 2026-08-24): a quiet row where the finished items live —
+   on-deck stays visible, the bulk is one click away; the box holds the rows when expanded */
+.todo-fold { display: block; background: none; border: none; color: var(--dim); font: inherit;
+  padding: 1px 0; cursor: pointer; text-align: left; }
+.todo-fold:hover { color: var(--fg); }
+.todo-done { display: none; }
+.todo-done.todo-open { display: block; }
 .todo-mark { flex: 0 0 auto; width: 1.1em; text-align: center; font-weight: 700; }
 .todo-text { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
 .todo-completed .todo-mark {
@@ -2529,55 +2590,35 @@ mark.cmt-hl.unread.hl-last::after {
   content: ""; position: absolute; top: -4px; right: -4px; width: 7px; height: 7px;
   border-radius: 50%; background: var(--cmt-hl); box-shadow: 0 0 0 1.5px var(--bg);
 }
+/* the turn's rail segment shouts an unread thread (the user 2026-08-23): the identity line's own
+   segment tints the comment yellow — wider and fully opaque so it reads from across the pane — and
+   the rail-hit strip over it opens the thread on click. applyCommentMarks clears the class the
+   moment the thread is viewed. */
+.turn.cmt-rail-unread::before { background: var(--cmt-hl); opacity: 1; width: 3px; left: 10px; }
 mark.cmt-hl:hover { background: color-mix(in srgb, var(--cmt-hl) 58%, transparent); }
 mark.cmt-hl.resolved { background: rgba(255, 255, 255, 0.08); }
-/* WRITING (the user 2026-08-17; reshaped 2026-08-23): while the thread is mid-reply the region
-   wears MARCHING ANTS — a dashed outline whose dashes crawl slowly around the box — ON TOP of the
-   solid highlight, which never turns off. (It used to: the busy state blanked the tint and showed
-   only the ants, and the equation host flipped on a different rule than the text marks, so a
-   comment spanning text + math passed through a mixed phase — half dashed, half highlighted —
-   before settling. Keeping the tint underneath removes the phase by construction: the only state
-   change is the ants appearing.) Four gradient strips with an animated offset, never a border: an
-   inline border would shift the text it wraps. This rule must stay AFTER :hover — its shorthand
-   would otherwise wipe the strips mid-hover. */
+/* WRITING (the user 2026-08-17; re-reshaped 2026-08-23 — the marching ants left the PROSE: a crawl
+   around the passage read as distraction, not progress; the tick's marching ants followed it out
+   2026-08-24 — the user wanted no crawling cue at all): while the thread is mid-reply the region
+   wears a faded AWAIT-GREEN blend — the awaitbg state color, "a reply is being worked on here" —
+   settling into the full yellow the moment the reply lands. The color IS the in-flight signal now;
+   nothing moves. */
 mark.cmt-hl.busy {
-  background-color: color-mix(in srgb, var(--cmt-hl) 30%, transparent);
-  background-image:
-    repeating-linear-gradient(90deg, color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
-    repeating-linear-gradient(90deg, color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
-    repeating-linear-gradient(0deg,  color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
-    repeating-linear-gradient(0deg,  color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px);
-  background-size: calc(100% + 12px) 1.5px, calc(100% + 12px) 1.5px, 1.5px calc(100% + 12px), 1.5px calc(100% + 12px);
-  background-position: -12px 0, 0 100%, 0 0, 100% -12px;
-  background-repeat: no-repeat;
-  animation: cmt-ants 3.6s linear infinite;   /* 3× slower (the user 2026-08-23) */
+  background-color: color-mix(in srgb, var(--st-awaitbg-bg) 24%, transparent);
 }
 mark.cmt-hl.hl-first { border-top-left-radius: 2px; border-bottom-left-radius: 2px; }
 mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 2px; }
-/* the ants march clockwise: top strip right, bottom left, left edge up, right edge down — exactly
-   one 12px dash cycle per period, so the loop point is invisible. Each no-repeat strip is oversized
-   by that same 12px along its travel axis and starts one period back: a strip sized exactly to its
-   edge slid open a growing gap at its trailing end and snapped shut every cycle — a lurch that on a
-   text-height vertical edge swallowed most of the edge (the user 2026-08-19). */
-@keyframes cmt-ants {
-  to { background-position: 0 0, -12px 100%, 0 -12px, 100% 0; }
-}
-/* a code/math HOST whose mark is mid-reply wears the ants too — its element tint would otherwise
-   stay solid and defeat the outline-then-fill cue */
+/* (an unmatched stray `}` sat here from 7f0c9b8c's block removal, 2026-08-23→24: Chromium's error
+   recovery EATS the rule that follows one, which silently killed the combined code/katex busy rule
+   below — math never greened while prose did (the user 2026-08-24, screenshot). A brace-balance
+   test guards the whole class now.) */
+/* a code/math HOST whose mark is mid-reply greens the same way — its element tint would otherwise
+   stay full-strength yellow and hide the writing state */
 .md :not(pre) > code.cmt-hl-host:has(mark.cmt-hl.busy),
 .md .katex.cmt-hl-host:has(mark.cmt-hl.busy) {
-  background-color: color-mix(in srgb, var(--cmt-hl) 30%, transparent);
-  background-image:
-    repeating-linear-gradient(90deg, color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
-    repeating-linear-gradient(90deg, color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
-    repeating-linear-gradient(0deg,  color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px),
-    repeating-linear-gradient(0deg,  color-mix(in srgb, var(--cmt-hl) 85%, transparent) 0 6px, transparent 6px 12px);
-  background-size: calc(100% + 12px) 1.5px, calc(100% + 12px) 1.5px, 1.5px calc(100% + 12px), 1.5px calc(100% + 12px);
-  background-position: -12px 0, 0 100%, 0 0, 100% -12px;
-  background-repeat: no-repeat;
-  animation: cmt-ants 3.6s linear infinite;   /* 3× slower (the user 2026-08-23) */
+  background-color: color-mix(in srgb, var(--st-awaitbg-bg) 24%, transparent);
 }
-.md :not(pre) > code.cmt-hl-host:has(mark.cmt-hl.busy) { background-color: color-mix(in srgb, var(--cmt-hl) 30%, var(--code-bg)); }
+.md :not(pre) > code.cmt-hl-host:has(mark.cmt-hl.busy) { background-color: color-mix(in srgb, var(--st-awaitbg-bg) 24%, var(--code-bg)); }
 .md :not(pre) > code.cmt-hl-host { background: color-mix(in srgb, var(--cmt-hl) 30%, var(--code-bg)); }
 .md :not(pre) > code.cmt-hl-host > mark.cmt-hl { background: transparent; }
 .md :not(pre) > code.cmt-hl-host:hover { background: color-mix(in srgb, var(--cmt-hl) 58%, var(--code-bg)); }
@@ -2623,20 +2664,21 @@ mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 
 /* chat-parity turns inside the popover (the user 2026-08-17): the chat's own .turn nodes, given a
    little rail room; the popover's card is the backdrop, so no extra chrome */
 .cmt-msgs .turn { max-width: 100%; box-sizing: border-box; }
+/* the identity rail runs CONTINUOUS through the thread (the user 2026-08-24, who saw holes): each
+   turn's ::before segment spans only its own box, and the list's 6px flex gap sat unpainted between
+   them — so every turn AFTER another turn stretches its segment up across the gap. Non-turn items
+   (pending bubbles, dots, notes) come after the turns, so the + combinator never misses a pair;
+   keep the -6px paired with .cmt-msgs' gap above. */
+.cmt-msgs .turn + .turn::before { top: -6px; }
+/* the quoted passage as CONTEXT on the thread's opening message (the user 2026-08-24) — the
+   .cmt-quote dress, sitting inside the turn above its bubble, the chat's citation-as-context shape */
+.cmt-quote-ctx { margin: 0 0 4px; }
 .cmt-msg { padding: 5px 8px; border-radius: 6px; line-height: 1.35; overflow-wrap: anywhere; }
 .cmt-msg.you { background: color-mix(in srgb, var(--accent) 14%, transparent); align-self: flex-end; max-width: 92%; white-space: pre-wrap; }
 .cmt-msg.agent { background: rgba(255, 255, 255, 0.05); align-self: flex-start; max-width: 96%; }
 .cmt-msg.agent > *:first-child { margin-top: 0; }
 .cmt-msg.agent > *:last-child { margin-bottom: 0; }
 .cmt-msg.pending { opacity: 0.55; }
-.cmt-dots { display: flex; gap: 4px; padding: 2px 6px; }
-.cmt-dots span {
-  width: 5px; height: 5px; border-radius: 50%; background: var(--accent);
-  animation: cmt-dot-pulse 1.2s ease-in-out infinite;
-}
-.cmt-dots span:nth-child(2) { animation-delay: 0.2s; }
-.cmt-dots span:nth-child(3) { animation-delay: 0.4s; }
-@keyframes cmt-dot-pulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
 .cmt-note { font-size: 0.92em; opacity: 0.7; padding: 2px 6px; }
 /* the popover's message row mirrors the CHAT composer (the user 2026-08-17): clip left, ➤ right,
    pill input — the attach/send buttons share the chat's own selectors above, so they stay in sync */
@@ -2725,6 +2767,10 @@ mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 
    faint glow read as a rendering artifact, not as "new here" */
 .cmt-tick.unread { width: 10px; height: 6px; right: 0; opacity: 1;
   box-shadow: 0 0 0 1.5px var(--bg), 0 0 0 3px color-mix(in srgb, var(--cmt-hl) 85%, transparent); }
+/* a WRITING thread's tick wears the same await-green as the passage (the user 2026-08-24: the
+   marching-ants crawl — the "spinning dots" — is retired; the state COLOR is the in-flight cue,
+   here as everywhere on the rail) */
+.cmt-tick.busy { background: var(--st-awaitbg-bg); }
 
 /* a fully-covered KaTeX block tints at the ELEMENT (cmt-hl-host, same contract as inline code):
    a mark inside it cannot paint the glyph boxes' spacing, which punched gaps through highlighted
@@ -2882,27 +2928,3 @@ a.fileview-btn[hidden] { display: none; }
    spoke" from "something was injected" at a glance (the user 2026-08-18) */
 .scroll-marks .scroll-mark.machine { background: #8a8f98; opacity: 0.55; }
 
-/* ── review comments in the file viewer (the user 2026-08-14) ──────────────────────────────────
-   Comment on passages while you read, then Submit hands the whole set to the session as one
-   message. The highlight borrows the chat comment threads' tint so the two read as one idea. */
-.fileview-cmtcount { font-size: 0.82em; opacity: 0.6; flex: 0 0 auto; }
-.fileview-submit { border-color: var(--accent); color: var(--accent); }
-mark.fv-hl { background: color-mix(in srgb, var(--cmt-hl) 30%, transparent); color: inherit; cursor: pointer; }
-mark.fv-hl:hover { background: color-mix(in srgb, var(--cmt-hl) 58%, transparent); }
-.fv-num { margin-left: 2px; padding: 0 3px; border-radius: 6px; cursor: pointer;
-  background: var(--vscode-menu-background, #252526); color: var(--accent);
-  font-size: 9px; line-height: 13px; }
-.fv-note { display: inline-flex; align-items: baseline; gap: 6px; margin: 0 4px; padding: 2px 6px;
-  border-radius: 4px; background: rgba(255, 255, 255, 0.06); font-size: 0.86em; }
-.fv-note-x { border: 0; background: none; color: inherit; opacity: 0.6; cursor: pointer; font-size: 11px; }
-.fv-note-x:hover { opacity: 1; }
-.fv-new { display: flex; flex-direction: column; gap: 6px; padding: 10px;
-  border-top: 1px solid var(--box-border); }
-.fv-at { font-size: 0.86em; opacity: 0.7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.fv-ta { min-height: 62px; padding: 6px 8px; resize: vertical; font: inherit; font-size: 0.92em;
-  background: var(--vscode-input-background, #3c3c3c); color: inherit;
-  border: 1px solid var(--box-border); border-radius: 4px; }
-.fv-newrow { display: flex; gap: 6px; justify-content: flex-end; }
-/* The viewer's backdrop is z 1200 and .ctx-menu is 100, both fixed on <body> — without this lift the
-   menu renders BEHIND the viewer and the right-click looks dead (that exact bug, 2026-08-18). */
-.ctx-menu.fv-menu { z-index: 1300; }

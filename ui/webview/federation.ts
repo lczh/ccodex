@@ -134,6 +134,13 @@ function _prefixIdBearing(host: string, o: any, idKey: string): any {
   // and keep peerSid bare — the viewer may be that very host, where the bare uuid opens directly.
   if (out.origin && typeof out.origin === "object" && typeof out.origin.peerSid === "string" && !out.origin.peerHost)
     out.origin = { ...out.origin, peerHost: host, peerSid: prefixId(host, out.origin.peerSid) };
+  // The awaiting box's delegation peers (asks[].awaiting.peers) — same rule as origin: a peer the
+  // card's own kernel resolved (host "") is LOCAL TO THAT KERNEL, so attribute it here and prefix
+  // its sid for routing; an already-hosted peer passes through untouched (the user 2026-08-23).
+  if (out.awaiting && typeof out.awaiting === "object" && Array.isArray(out.awaiting.peers))
+    out.awaiting = { ...out.awaiting, peers: out.awaiting.peers.map((p: Record<string, unknown>) =>
+      p && typeof p === "object" && typeof p.sid === "string" && !p.host
+        ? { ...p, host, sid: prefixId(host, p.sid) } : p) };
   // a timeline lane's fork parent (sessions[].branch.fromId): the view looks it up against PREFIXED
   // lane ids (vidx), so an unprefixed remote parent silently missed and the branch connector never
   // drew for remote lanes (found 2026-08-17 auditing the merge)

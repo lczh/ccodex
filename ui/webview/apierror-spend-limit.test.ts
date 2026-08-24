@@ -39,7 +39,7 @@ test("the globalRetryPaused push reason is threaded into the client", () => {
 
 test("the feed card badges a spend cap and HIDES Retry (a useless click there)", () => {
   assert.match(F, /const spendLimit = !!\(it\.blocked && it\.blocked\.spendLimit\)/);
-  assert.match(F, /a\._apiRetry\.style\.display = \(isApiErr && !spendLimit && !modelLimit && !refusal\) \? "" : "none"/);
+  assert.match(F, /a\._apiRetry\.style\.display = \(showApiErr && !spendLimit && !modelLimit && !refusal\) \? "" : "none"/);
   assert.match(F, /spendLimit \? "⚠ Spend limit"/);
   assert.match(F, /spendLimit\?: boolean/);
 });

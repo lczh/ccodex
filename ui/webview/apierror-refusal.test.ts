@@ -55,7 +55,7 @@ test("the 1s countdown tick RE-ASSERTS the refusal remedy — it must never writ
 
 test("the feed card badges a refusal and HIDES Retry (a useless click there)", () => {
   assert.match(F, /const refusal = !!\(it\.blocked && it\.blocked\.refusal\)/);
-  assert.match(F, /a\._apiRetry\.style\.display = \(isApiErr && !spendLimit && !modelLimit && !refusal\) \? "" : "none"/);
+  assert.match(F, /a\._apiRetry\.style\.display = \(showApiErr && !spendLimit && !modelLimit && !refusal\) \? "" : "none"/);
   assert.match(F, /refusal \? "⚠ Safeguards refused"/);
   assert.match(F, /refusal\?: boolean/);
   // the badge tooltip carries the kernel's plain-terms remedy, not the CLI's boilerplate

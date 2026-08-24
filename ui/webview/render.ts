@@ -12,9 +12,9 @@ import markdown from "highlight.js/lib/languages/markdown";
 import diff from "highlight.js/lib/languages/diff";
 import yaml from "highlight.js/lib/languages/yaml";
 import type { ParsedAsk } from "../ask-types";
-import { quoteReply } from "../quote";
 import { TABBAR_H_KEY, TABBAR_H_DEFAULT, clampTabbarH, parseTabbarH } from "./tabbar-resize";
 import { SessionViews, viewVisible, viewsKey, hideIn, revealIn } from "./session-views";
+import { syncSessionsFromTabMeta, applyMetaToSession, notePendingMeta, PendingTabMeta } from "./tab-meta";
 import { markerLabel, dayContext } from "./time-marker";
 import { compactDisplay, toolCounts, type DisplayItem } from "./compact";
 import { senderKind } from "./sender-identity";
@@ -33,9 +33,9 @@ import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional 
 import { onlyTag, matchesOnly } from "./only-filter";
 import { numberDiff, type DiffRow } from "./diff-lines";
 import { parseAgentNotif, type AgentNotif } from "./agent-notif";
-import { previewKind, previewFull, canPreview, fileUrl, retryFailedPreviews } from "./preview";
-import { openFileView, setCommentSink } from "./file-view";
-// initFileView rides its OWN line: the import above is pinned verbatim by file-view-comments.test.ts
+import { previewKind, previewFull, canPreview, fileUrl, retryFailedPreviews, refreshSettledPreviews, installMdImgHeal } from "./preview";
+import { openFileView } from "./file-view";
+// initFileView rides its OWN line: the import above is pinned verbatim by file-view.test.ts
 import { initFileView } from "./file-view";
 import { pastedFilePath } from "./paste-path";
 import { hostNameNodes, hostPrefix, hostOf, hostIsDown, hostDownNote } from "./host-prefix";
@@ -45,7 +45,7 @@ import { initStrip, fmtReset } from "./strip";
 import { apiErrorReason } from "./api-error-reason";
 import { mathBlock, mathInline } from "./math";
 import { queuedCancelKey } from "./cancel-key";
-import { threadsByAnchor, threadBusy, threadStuck, findAnchorRange, sliceRanges, prunePending, type CommentThread } from "./comments";
+import { threadInFlight, latchBusy, type BusyLatch, threadsByAnchor, threadBusy, threadStuck, findAnchorRange, sliceRanges, prunePending, type CommentThread } from "./comments";
 
 for (const [name, lang] of Object.entries({
   bash, sh: bash, shell: bash, python, py: python, javascript, js: javascript,
@@ -77,8 +77,10 @@ marked.use({ extensions: [mathBlock, mathInline] });
 
 // One answered (or pending) question on an AskUserQuestion turn: the prompt + its options, plus the
 // user's answer TEXT per question (`chosen`). Answer text may name an option label OR be free-text
-// ("Other"), and is empty while the question is still pending (multi-select answers arrive pre-split).
-type AskAnswerBlock = { question: string; header?: string; options: { label: string; description?: string }[]; chosen: string[] };
+// ("Other"), and is empty while the question is still pending (multi-select answers arrive pre-split:
+// the kernel fills chosen from the record's structured answers map — a LIST of picked labels when
+// multiSelect, which renderAsk highlights per value; the flag itself rides along for reference).
+type AskAnswerBlock = { question: string; header?: string; options: { label: string; description?: string }[]; chosen: string[]; multiSelect?: boolean };
 
 // A completed background command's detail, keyed by its tool-use-id — the shell it ran + its output tail,
 // joined in by the kernel (build_session's taskOutputs) so the inline completion card can expand into it.
@@ -220,7 +222,7 @@ type ChatEvent = (
 interface TodoTask { id: string; subject: string; activeForm?: string; status: string }
 
 type ChipState = "working" | "ready" | "needsInput" | "awaiting" | "awaitingBg" | "idle" | "closed" | "compacting" | "clearing" | "blocked" | "retrying" | "interrupting" | "opening";   // needsInput = a live permission/picker prompt (on YOU) — renamed from the legacy "awaiting" (2026-08-15), which stays accepted for OLDER REMOTE KERNELS across federation; awaitingBg = idle main thread waiting on background work it dispatched (the user 2026-07-13)
-interface Status { state: ChipState; sinceEpoch: number | null; awaitingWhy?: string | null; awaitingKind?: string | null; awaitingTasks?: string[]; awaitingTaskIds?: string[]; effort?: string; model?: string; modelPending?: boolean; effortPending?: boolean; mode?: string; fast?: string; auth?: string; authPending?: boolean; authBoth?: boolean; authAcct?: string; ctx?: string; ctxColor?: number[]; modelColor?: number[]; effortColor?: number[]; faded?: boolean; backend?: string; apiTooLong?: boolean; apiSpendLimit?: boolean; apiModelLimit?: boolean; apiAuthErr?: boolean; apiRefusal?: boolean; retrySuppressed?: boolean; retryNextAt?: number | null; retryTries?: number | null; }   // awaitingWhy/awaitingTasks = what an awaitingBg session is waiting on (kernel _session_awaiting's phrasing + the live awaited task descriptions) — the #bg-tasks box renders it when no tracked tasks claim the box (renderAwaitWhy; the user 2026-08-13, who moved it out of the statusline the same day PR #350 put it there)   // retrySuppressed = the user interrupted this thread's API-error storm → romp's auto-retry stays OFF for it until a successful turn re-arms (the user 2026-07-06). backend = "tmux" | "sdk"; apiTooLong = the "blocked" is a "prompt is too long" error (on you → red tab) vs a transient API error (amber/retrying); apiSpendLimit = a monthly spend cap (on you → raise it; NEVER auto-retried — retrying can't fix it, the user 2026-07-14); apiModelLimit = this session's MODEL is out of allowance (on you → switch model or add credits; not auto-retried either, the user 2026-08-01); apiRefusal = the model's safeguards refused the prompt itself (on you → rewrite it or drop the thread; never auto-retried — a refusal is deterministic on the same input, so a retry just manufactures the same refusal, the user 2026-08-15); ctxColor = the GLOBAL colormap's RGB for the context%, computed server-side; modelColor/effortColor = the same map's RGB tint for the model name + effort (by capability/effort rank), server-computed; modelPending = a /model switch is resolving → the badge shows switching-dots until the new name lands (server-driven, event-based, the user 2026-07-03); fast = the CLI's fast-mode state ("on"/"off"/"cooldown", from the SDK init's fast_mode_state; absent = unknown/unavailable → no fast badge)
+interface Status { state: ChipState; sinceEpoch: number | null; awaitingWhy?: string | null; awaitingKind?: string | null; awaitingTasks?: string[]; awaitingTaskIds?: string[]; effort?: string; model?: string; modelPending?: boolean; effortPending?: boolean; mode?: string; fast?: string; auth?: string; authLive?: string; authPending?: boolean; authBoth?: boolean; authAcct?: string; ctx?: string; ctxColor?: number[]; modelColor?: number[]; effortColor?: number[]; faded?: boolean; backend?: string; apiTooLong?: boolean; apiSpendLimit?: boolean; apiModelLimit?: boolean; apiAuthErr?: boolean; apiRefusal?: boolean; retrySuppressed?: boolean; retryNextAt?: number | null; retryTries?: number | null; }   // awaitingWhy/awaitingTasks = what an awaitingBg session is waiting on (kernel _session_awaiting's phrasing + the live awaited task descriptions) — the #bg-tasks box renders it when no tracked tasks claim the box (renderAwaitWhy; the user 2026-08-13, who moved it out of the statusline the same day PR #350 put it there)   // retrySuppressed = the user interrupted this thread's API-error storm → romp's auto-retry stays OFF for it until a successful turn re-arms (the user 2026-07-06). backend = "tmux" | "sdk"; apiTooLong = the "blocked" is a "prompt is too long" error (on you → red tab) vs a transient API error (amber/retrying); apiSpendLimit = a monthly spend cap (on you → raise it; NEVER auto-retried — retrying can't fix it, the user 2026-07-14); apiModelLimit = this session's MODEL is out of allowance (on you → switch model or add credits; not auto-retried either, the user 2026-08-01); apiRefusal = the model's safeguards refused the prompt itself (on you → rewrite it or drop the thread; never auto-retried — a refusal is deterministic on the same input, so a retry just manufactures the same refusal, the user 2026-08-15); ctxColor = the GLOBAL colormap's RGB for the context%, computed server-side; modelColor/effortColor = the same map's RGB tint for the model name + effort (by capability/effort rank), server-computed; modelPending = a /model switch is resolving → the badge shows switching-dots until the new name lands (server-driven, event-based, the user 2026-07-03); fast = the CLI's fast-mode state ("on"/"off"/"cooldown", from the SDK init's fast_mode_state; absent = unknown/unavailable → no fast badge)
 interface Color { bg: string; fg: string; }
 // A run_in_background task surfaced in the #bg-tasks box (the kernel's _bg_tasks): a one-line summary +
 // status, expandable to the command + its output. status = running | completed | failed. For a dispatched
@@ -440,6 +442,9 @@ const closingTabs = new Map<string, number>();
 // the sole evidence a close didn't take is the kernel still listing the tab long after. Past this we say
 // so and let the tab back, rather than hiding a session that's really still open.
 const CLOSE_ACK_MS = 15_000;
+// Optimistic label/color edits awaiting their kernel echo — holds a stale in-flight push from
+// reverting the strip (see tab-meta.ts; the sessionViews pending machinery's reasoning).
+const pendingTabMeta = new Map<string, PendingTabMeta>();
 // The romp identity palette for the tab right-click color picker (the user 2026-06-29). Fetched once from the
 // kernel's /palette so the client holds no color literals; empty until it lands (the menu just omits the row).
 // The palette is SELECTABLE now (the user 2026-07-12): a {type:"palette"} push lands the new set on switch.
@@ -462,13 +467,38 @@ function captureViews(v: SessionViews | null) {
   if (pendingSessionViews && ((v && viewsKey(v) === viewsKey(pendingSessionViews)) || ++pendingViewsAge >= 3)) {
     pendingSessionViews = null; pendingViewsAge = 0;
   }
+  // A VIEW CHANGE that excludes the ACTIVE session converts it into the peek instead of bouncing
+  // (the user 2026-08-24: open All, pick a session, re-apply the tag filter — keep reading it in
+  // the ghost dress, and it evaporates on the next tab switch). The same derivation setActive runs
+  // on activation, run here on every views arrival; symmetric, so a view that now INCLUDES the
+  // active peek sheds the dress for free. With the active session counted by tabInView as the peek,
+  // the deferred first-tab bounce never fires (its fire-time revalidation re-checks tabInView).
+  if (activeId) assertPeekFor(activeId);
 }
+// (postViews below runs the same re-derivation for the LOCAL optimistic edit — both views-arrival
+// paths keep the active session's peek state current.)
 function postViews(v: SessionViews) {
   pendingSessionViews = v; pendingViewsAge = 0;
+  if (activeId) assertPeekFor(activeId);   // the optimistic edit re-derives the active session's peek too
   if (vscodeApi) vscodeApi.postMessage({ type: "setTimelineViews", views: v });
   renderTabs();
 }
-function tabInView(id: string): boolean { return viewVisible(effViews(), id); }
+// ── EPHEMERAL PEEK TAB (the user 2026-08-24, superseding the kernel's reveal-rule view mutation):
+// activating a session the current view HIDES opens it as a TEMPORARY tab — real and scrollable,
+// dressed .tab-peek ("breaks the view's rules") — and auto-closing: activating any other tab drops
+// it, no explicit close. Per-dashboard client state like the pending-views copy above: never
+// persisted, never federated, never written to timeline-views.json — a click is a peek, not a view
+// edit (the picker's "Hidden — reveal" row keeps the real unhide). Sending a message from a peeked
+// session does NOT pin it: the peek still drops on click-away, and the session stays reachable via
+// the feed and the nav trail. Nav history stores only the sid — back/forward lands in setActive
+// like every activation, which re-derives peek-vs-normal from the CURRENT views (a since-revealed
+// session re-pops as a normal tab, a since-hidden one as a peek).
+let peekId: string | null = null;
+function assertPeekFor(id: string): void {
+  const next = viewVisible(effViews(), id) ? null : id;
+  if (next !== peekId) { peekId = next; renderTabs(); }
+}
+function tabInView(id: string): boolean { return id === peekId || viewVisible(effViews(), id); }
 function visibleOrder(): string[] { return order.filter(tabInView); }
 function revealSession(id: string) { postViews(revealIn(effViews(), id)); }
 
@@ -957,6 +987,30 @@ function onImgData(p: string, url: string | null): void {
     const e = n as HTMLElement; if (e.dataset.imgpath === p) fillPathImg(e, p);
   });
 }
+// RECONNECT-class heal for the path-image chips (the user 2026-08-24): imgFailed was "never retry
+// for the page lifetime", so a figure that failed while the kernel/tunnel was away stayed a dead
+// chip forever. A reconnect un-parks every failed path for ONE fresh host round-trip — the same
+// request flow buildPathImg runs on mint (imgRequested still dedups in-flight asks).
+function healPathImgs(): void {
+  if (!imgFailed.size) return;
+  const failed = Array.from(imgFailed);
+  imgFailed.clear();
+  for (const p of failed) {
+    document.querySelectorAll(".js-pathimg").forEach((n) => {
+      const e = n as HTMLElement;
+      if (e.dataset.imgpath !== p) return;
+      fillPathImg(e, p);                             // back to the pending pulse while the ask is out
+      if (!imgRequested.has(p)) {
+        imgRequested.add(p);
+        if (vscodeApi) vscodeApi.postMessage({ type: "imgRequest", path: p, id: activeId });
+      }
+    });
+  }
+}
+// the page shim fires romp:wsup when THIS pane's kernel socket reconnects (kernel.py ws.onopen) —
+// the same kernel-is-back event a hostUp is for a federated tunnel; heal everything on it
+window.addEventListener("romp:wsup", () => { retryFailedPreviews(); refreshSettledPreviews(); healPathImgs(); });
+installMdImgHeal();   // markdown-inline <img> failures register for the per-message heal (capture-phase, once)
 
 // One image of a user turn: the picture (or its hydration chip) plus, when the
 // on-disk path is known, a caption line — the full absolute path (click → open),
@@ -1315,6 +1369,10 @@ function wireTurnHover(turn: HTMLElement, dot: HTMLElement | null, uuid: string 
   // dotOpen payload, so the line and the dot that begins its turn navigate to exactly the same place.
   rail.addEventListener("click", (e) => {
     e.stopPropagation();
+    // a tinted (unread-comment) rail opens THAT thread (the user 2026-08-23) — checked at click
+    // time, so the same strip goes back to timeline navigation the moment the thread is read
+    const um = turn.querySelector("mark.cmt-hl.unread") as HTMLElement | null;
+    if (um?.dataset.tid && activeId) { openCommentPopover(activeId, um.dataset.tid, e.clientX, e.clientY); return; }
     if (activeId) vscodeApi?.postMessage({ type: "dotOpen", sid: activeId, uuid, t, tlId });
   });
   let railTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2565,6 +2623,9 @@ function renderAsk(ev: Extract<ChatEvent, { kind: "tool" }>): HTMLElement | null
 // renderAsk consumes. The answer text may name an option label OR be free-text ("Other"); multi-select
 // joins labels as "A, B, C". Comma-split only when a label actually matches, so a free-text answer that
 // happens to contain commas isn't shredded.
+// NOTE: effectively unreachable — the kernel always attaches askAnswer to AskUserQuestion events, filled
+// from the record's structured answers map (authoritative; this scrape garbles quote-bearing questions).
+// Kept as the belt-and-suspenders raw parse only; don't extend it.
 function parseAskRaw(ev: Extract<ChatEvent, { kind: "tool" }>): AskAnswerBlock[] | null {
   let data: any;
   try { data = JSON.parse(ev.input); } catch { return null; }
@@ -2618,16 +2679,49 @@ function renderTodo(ev: Extract<ChatEvent, { kind: "todo" }>): HTMLElement {
   const done = ev.tasks.filter((t) => t.status === "completed").length;
   const head = el("div", "todo-head"); head.textContent = `To-do · ${done}/${ev.tasks.length}`;
   card.appendChild(head);
-  for (const t of ev.tasks) {
-    const row = el("div", "todo-item todo-" + t.status);
+  const row = (t: (typeof ev.tasks)[number]) => {
+    const r = el("div", "todo-item todo-" + t.status);
     const mark = el("span", "todo-mark");
     mark.textContent = t.status === "completed" ? "✓" : t.status === "in_progress" ? "◐" : "○";
-    row.appendChild(mark);
+    r.appendChild(mark);
     const txt = el("span", "todo-text");
     txt.textContent = t.status === "in_progress" && t.activeForm ? t.activeForm : t.subject;
-    row.appendChild(txt);
-    card.appendChild(row);
-  }
+    r.appendChild(txt);
+    return r;
+  };
+  // PROGRESSIVE DISCLOSURE (the user 2026-08-24): a continuously-dispatched session — a manager
+  // especially — accumulates dozens of finished tasks and the card showed them all. Default = the
+  // ON-DECK work (in_progress + pending); the finished bulk (completed — and cancelled/deleted,
+  // should the store carry them: anything not on deck) folds into one row, "+N more completed",
+  // click to expand and click again to re-fold, nothing lost. The fold sits WHERE the bulk lives
+  // (finished work precedes current work in the list), keyed per session so the state survives the
+  // per-push re-renders (the openFolds idiom); a list with ≤ 2 finished rows stays inline — a fold
+  // hiding two rows costs a click for nothing. The label flip + rows appearing ARE the click's
+  // acknowledgement, immediate and local (no round-trip).
+  const onDeck = ev.tasks.filter((t) => t.status === "in_progress" || t.status === "pending");
+  const finished = ev.tasks.filter((t) => t.status !== "in_progress" && t.status !== "pending");
+  if (finished.length >= 3) {
+    const foldKey = "todo-done:" + (renderingSid || "");
+    const doneBox = el("div", "todo-done");
+    for (const t of finished) doneBox.appendChild(row(t));
+    applyFold(doneBox, "todo-open", foldKey);
+    const tog = el("button", "todo-fold") as HTMLButtonElement;
+    tog.type = "button";
+    const label = () => {
+      const open = doneBox.classList.contains("todo-open");
+      tog.textContent = open ? `hide ${finished.length} completed` : `+ ${finished.length} more completed`;
+      tog.title = open ? "collapse the completed items" : "show the completed items";
+    };
+    label();
+    tog.addEventListener("click", (e) => {
+      e.stopPropagation();
+      rememberFold(doneBox, "todo-open", foldKey);
+      label();
+    });
+    card.appendChild(tog);
+    card.appendChild(doneBox);
+  } else for (const t of finished) card.appendChild(row(t));
+  for (const t of onDeck) card.appendChild(row(t));
   turn.appendChild(card);
   return turn;
 }
@@ -3818,6 +3912,13 @@ function applyTabOrder(o: any, tabs?: any) {
                             color: (t.color && typeof t.color.bg === "string") ? t.color : null });
       }
     }
+    // …and apply the same blob to EXISTING sessions (the user 2026-08-24): the label/color used to
+    // stick until a per-session frame happened to rebuild — which, after a headless POST
+    // /rename | /color, is never for a background tab (the chat build cache's sig watches
+    // transcript+states only, deliberately). The recurring push is the authoritative carrier, so
+    // ANY writer — CLI POST, WS op, another dashboard, a remote kernel — renders here within a
+    // cycle (see tab-meta.ts); the renderTabs() below repaints with it.
+    syncSessionsFromTabMeta(tabs, (id) => sessions.get(id), pendingTabMeta);
   }
   // Adopt the kernel order verbatim, keeping any just-arrived tab the push doesn't carry yet (see tab-order.ts).
   const kernelOrder = Array.isArray(o) ? o.filter((x: any) => typeof x === "string") : [];
@@ -3903,8 +4004,16 @@ function showTabTip(tab: HTMLElement, s: Session): void {
   // Billing: whether this tab bills the API key or the Claude login — and WHICH login account (the
   // user 2026-08-09: shown whenever the backend reports it, one-auth machines included; only a tmux
   // session, whose CLI env romp does not control, reports nothing). No key material, ever.
-  if (s.status.auth) rows.push(["Billing", s.status.auth === "key" ? "API key"
-    : (s.status.authAcct ? `Login (${s.status.authAcct})` : "Login")]);
+  // When the CLI's own init landed on the OTHER side (authLive — say, a key found via apiKeyHelper
+  // on a session launched for the login), the row carries the live truth beside the intent instead
+  // of wearing the lie (the user 2026-08-15). The account name yields its parenthetical then: it is
+  // not the account being billed.
+  if (s.status.auth) rows.push(["Billing",
+    s.status.authLive && s.status.authLive !== s.status.auth
+      ? (s.status.auth === "key" ? "API key" : "Login")
+        + ` (CLI reports ${s.status.authLive === "key" ? "API key" : "login"})`
+      : s.status.auth === "key" ? "API key"
+        : (s.status.authAcct ? `Login (${s.status.authAcct})` : "Login")]);
   for (const [k, v] of rows) {
     const r = el("div", "tab-tip-row");
     const ke = el("span", "tab-tip-k"); ke.textContent = k;
@@ -4097,7 +4206,10 @@ function renderTabs() {
   // setActive is a no-op once activeId is visible, so this settles in one pass.
   if (activeId && ids.includes(activeId) && !visibleIds.includes(activeId) && visibleIds.length) {
     const next = visibleIds[0];
-    setTimeout(() => { if (activeId !== next) setActive(next); }, 0);
+    // re-validate at FIRE time, not schedule time: an activation between the two (a feed click
+    // opening an ephemeral peek, a reveal landing) can have made the active tab visible — bouncing
+    // then would kick the user off the very tab they just opened (the no-flap rule)
+    setTimeout(() => { if (activeId !== next && activeId && !tabInView(activeId)) setActive(next); }, 0);
   }
   for (const id of visibleIds) {
     const s = sessions.get(id);
@@ -4132,6 +4244,7 @@ function renderTabs() {
       tab.style.setProperty("--chip-fg", s.color.fg);
       tab.classList.add("colored");
     }
+    if (id === peekId) tab.classList.add("tab-peek");   // ephemeral peek — ghost/dashed dress (styles.css)
     const st = s.status.state;
     if (st === "working") tab.classList.add("tab-working");
     // "blocked" is an API error. An on-YOU one — "prompt is too long" (compact), a monthly spend cap (raise it,
@@ -4283,41 +4396,16 @@ function showSelectionMenu(e: MouseEvent) {
     const sid = activeId, uuid = q.uuid, qtext = q.text;
     mk("Comment", () => openCommentComposer(sid, uuid, qtext, e.clientX, e.clientY));
   }
-  // "Quote" (renamed from "Quote in message", the user 2026-08-23): drops the passage INTO the box
-  // as an editable markdown blockquote — the automatic selection chip already covers select-and-type,
-  // and the handler below de-duplicates the chip the same selection seeded.
-  mk("Quote", () => quoteSelectionIntoComposer(text));
+  // "Quote" is the CHIP, and only the chip (the user 2026-08-23, consolidating the three verbs —
+  // Comment / Quote / Stage — by removal): the selection already seeded it (selectionchange), so
+  // the item just puts the caret where the reply goes. The in-box editable-blockquote form is gone.
+  mk("Quote", () => { (document.getElementById("composer-input") as HTMLTextAreaElement | null)?.focus(); });
   mk("Copy", () => copyToClipboard(text));
   document.body.appendChild(menu);
   ctxMenuEl = menu;
   const r = menu.getBoundingClientRect();
   menu.style.left = Math.max(0, Math.min(e.clientX, window.innerWidth - r.width - 4)) + "px";
   menu.style.top = Math.max(0, Math.min(e.clientY, window.innerHeight - r.height - 4)) + "px";
-}
-
-// Drop the selection into the composer as a markdown blockquote (quote.ts does the
-// formatting), cursor on the blank line below it, and remember it as the draft.
-function quoteSelectionIntoComposer(text: string) {
-  const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
-  if (!ta) return;
-  const { value, caret } = quoteReply(text, ta.value);
-  ta.value = value;
-  ta.selectionStart = ta.selectionEnd = caret;
-  growComposer(ta);
-  ta.focus();
-  if (activeId) {
-    drafts.set(activeId, ta.value);
-    // the selection that opened this menu ALSO seeded the auto quote-chip (selectionchange, the user
-    // 2026-07-13) — the quote now lives IN the composer text, so drop that chip or the send would quote it
-    // twice. Only the NEWEST chip (the one this selection's gesture made) — earlier stacked contexts stay.
-    const list = composerCitations.get(activeId);
-    if (list?.length && list[list.length - 1].quote) {
-      list.pop();
-      if (!list.length) composerCitations.delete(activeId);
-      renderComposerChips(activeId);
-    }
-    persistDrafts();
-  }
 }
 
 function copyToClipboard(text: string) {
@@ -4337,6 +4425,7 @@ function setSessionFlag(id: string, flag: "hideFromFeed" | "postalServiceOff" | 
 // _name_color. The kernel accepts only a real palette value, so a stale id is a harmless no-op there.
 function setSessionColor(id: string, bg: string) {
   const color: Color = { bg, fg: "#ffffff" };
+  notePendingMeta(pendingTabMeta, id, { colorBg: bg });   // a push built before the kernel applied this cannot revert the swatch
   const s = sessions.get(id);
   if (s) s.color = color;
   const meta = tabMeta.get(id);
@@ -5646,6 +5735,16 @@ function showForkPrompt(sid: string, uuid: string): void {
 // re-render (the transcript rebuilds constantly) reapplies it — the openFolds pattern.
 const commentThreads = new Map<string, CommentThread[]>();          // parent sid → last frame's threads
 const commentPending = new Map<string, { text: string; t: number }[]>(); // tid → optimistic sends
+// the one busy answer for the mark + rail tick: the LIVE reading (the pure predicate plus this
+// pane's own optimistic sends) OR the settle latch — a turn boundary inside a continuing thread can
+// read settled for one push, and the green must not blip yellow on it (the user 2026-08-24, second
+// report; comments.ts latchBusy has the rule). The latch advances once per comments FRAME (the
+// event); the live OR keeps optimistic sends instant between frames.
+const commentBusyLatch = new Map<string, BusyLatch>();
+const commentInFlight = (th: CommentThread): boolean => {
+  const raw = threadInFlight(th) || (th.status === "open" && !!(commentPending.get(th.tid) || []).length);
+  return raw || !!commentBusyLatch.get(th.tid)?.green;
+};
 const commentDrafts = new Map<string, string>();                    // draft key → unsent popover text
 let openCommentKey: { sid: string; tid: string } | null = null;     // the open thread popover
 let pendingCommentAnchor: { sid: string; uuid: string; exact: string;
@@ -5698,11 +5797,19 @@ function applyCommentMarks(sid: string): void {
   for (const old of Array.from(v.el.querySelectorAll("mark.cmt-hl"))) {
     if (!have.has((old as HTMLElement).dataset.tid || "")) unwrapCommentMark(old as HTMLElement);
   }
+  // the rail cue clears first (idempotent re-apply): a thread viewed, resolved, or removed must
+  // drop its turn's tint on this very pass, not linger until the next anchor match
+  for (const t of Array.from(v.el.querySelectorAll(".turn.cmt-rail-unread"))) t.classList.remove("cmt-rail-unread");
   if (!threads.length) return;
   for (const [uuid, list] of threadsByAnchor(threads)) {
     const turn = v.el.querySelector(`.turn[data-uuid="${cssEscape(uuid)}"]`) as HTMLElement | null;
     if (!turn) continue;                       // windowed out — the mark returns when the turn does
     for (const th of list) ensureCommentMark(turn, th);
+    // the turn's RAIL segment shouts the new-here state too (the user 2026-08-23: the corner dot is
+    // easy to miss — the identity line's own segment tints comment-yellow while any thread on this
+    // turn is unread, and clicking the rail opens it). Cleared above the moment it's viewed —
+    // openCommentPopover drops the unread flag and re-runs this pass.
+    turn.classList.toggle("cmt-rail-unread", list.some((t) => !!t.unread && t.status === "open"));
   }
 }
 
@@ -5793,7 +5900,7 @@ function updateCommentRail(): void {
   const v = activeId ? views.get(activeId) : null;
   const s = activeId ? sessions.get(activeId) : null;
   const threads = ((activeId && commentThreads.get(activeId)) || [])
-    .filter((t) => t.status === "open" || t.status === "resolved");
+    .filter((t) => t.status === "open" || t.status === "resolved" || t.status === "merged");
   if (!content || !v || !s || !threads.length || v.el.style.display === "none") { rail?.remove(); cmtRailSig = ""; return; }
   const r = content.getBoundingClientRect();
   if (!r.height) { rail?.remove(); cmtRailSig = ""; return; }              // hidden pane
@@ -5810,15 +5917,17 @@ function updateCommentRail(): void {
     ticks.push({ th, y: Math.min(r.height - 6, Math.round((off / frame.sh) * (r.height - 4))) });
   }
   const sig = activeId + "|" + Math.round(r.top) + "," + Math.round(r.right) + "," + Math.round(r.height)
-    + "|" + ticks.map((t) => t.th.tid + ":" + t.y + ":" + t.th.status + ":" + (t.th.unread ? 1 : 0)).join(",");
+    + "|" + ticks.map((t) => t.th.tid + ":" + t.y + ":" + t.th.status + ":" + (t.th.unread ? 1 : 0)
+                            + ":" + (commentInFlight(t.th) ? 1 : 0)).join(",");
   if (sig === cmtRailSig && rail) return;
   cmtRailSig = sig;
   if (!rail) { rail = el("div", "cmt-rail"); rail.id = "cmt-rail"; document.body.appendChild(rail); }
   rail.style.left = (r.right - 10) + "px";
   rail.style.top = r.top + "px";
   rail.style.height = r.height + "px";
-  const cls = (th: CommentThread) => "cmt-tick" + (th.status === "resolved" ? " resolved" : "")
-    + (th.unread && th.status === "open" ? " unread" : "");
+  const cls = (th: CommentThread) => "cmt-tick" + (th.status === "resolved" || th.status === "merged" ? " resolved" : "")
+    + (th.unread && th.status === "open" ? " unread" : "")
+    + (commentInFlight(th) ? " busy" : "");   // green while working OR a reply is owed (2026-08-24)
   const kids = Array.from(rail.children) as HTMLElement[];
   if (kids.length === ticks.length && kids.every((k, i) => k.dataset.tid === ticks[i].th.tid)) {
     ticks.forEach((t, i) => { kids[i].style.top = t.y + "px"; kids[i].className = cls(t.th); });
@@ -5894,18 +6003,19 @@ function ensureCommentMark(turn: HTMLElement, th: CommentThread): void {
     const host = segs[i].parentElement;
     if (host && host.tagName === "CODE" && host.parentElement?.tagName !== "PRE"
         && host.childNodes.length === 1) {
-      host.classList.toggle("cmt-hl-host", th.status !== "resolved");
+      host.classList.toggle("cmt-hl-host", th.status !== "resolved" && th.status !== "merged");
     }
     const kat = segs[i].parentElement?.closest(".katex") as HTMLElement | null;
-    if (kat) kat.classList.toggle("cmt-hl-host", th.status !== "resolved");
+    if (kat) kat.classList.toggle("cmt-hl-host", th.status !== "resolved" && th.status !== "merged");
   }
 }
 
 function styleCommentMark(m: HTMLElement, th: CommentThread): void {
-  m.classList.toggle("resolved", th.status === "resolved");
+  m.classList.toggle("resolved", th.status === "resolved" || th.status === "merged");
   m.classList.toggle("unread", !!th.unread && th.status === "open");
-  m.classList.toggle("busy", threadBusy(th.state) && th.status === "open");
+  m.classList.toggle("busy", commentInFlight(th));
   m.title = th.status === "promoted" ? "thread, now the session '" + th.promotedName + "'"
+    : th.status === "merged" ? "merged thread: its outcome was folded back into the session"
     : th.status === "resolved" ? "resolved thread: click to read or reopen"
     : "thread: click to open";
 }
@@ -5989,24 +6099,65 @@ function fillCommentMsgs(list: HTMLElement, th: CommentThread): void {
     renderingSid = th.tid;
     renderingIntoThread = true;   // same renderer, minus the transcript-coupled hover chrome (see the flag)
     let prev: number | null = null;
-    for (const ev of evs) {
-      list.appendChild(renderEvent(ev, prev, null));
+    let quoteHost: HTMLElement | null = null;   // the thread's OPENING message — the quote's home
+    // the SAME display units the chat renders (the user 2026-08-24, leg C: the popover ignored the
+    // compact/hide-thinking setting — thinking blocks and raw tool runs showed regardless of the
+    // gear): thinking dropped, consecutive tools folded to the chat's own renderToolGroup line,
+    // expansion keyed by the SHARED expandedGroups store so a toggle survives refills. The group
+    // toggle and a settings flip both refill the open popover live (toggleToolGroup / setupSettings
+    // → refillOpenCommentPop).
+    const items: DisplayItem[] = settings.compact
+      ? compactDisplay(evs.map((e) => e.kind), evs.map((e) => e.kind === "tool" ? e.name : undefined))
+      : evs.map((_, i) => ({ kind: "event", index: i } as DisplayItem));
+    for (const it of items) {
+      if (it.kind === "toolgroup") {
+        const tools = it.indices.map((ix) => evs[ix]) as Extract<ChatEvent, { kind: "tool" }>[];
+        const key = toolGroupKey(tools[0]);
+        const open = expandedGroups.has(key);
+        list.appendChild(renderToolGroup(tools, prev, key, open));
+        if (open) {
+          it.indices.forEach((ix, j) => {   // the tools only — it.indices already excludes thinking
+            const child = renderEvent(evs[ix], prev, null);
+            child.classList.add("tg-child"); if (j === it.indices.length - 1) child.classList.add("tg-last");
+            list.appendChild(child);
+            const ep = eventEpoch(evs[ix]); if (ep != null) prev = ep;
+          });
+        } else {
+          const ep = eventEpoch(tools[tools.length - 1]); if (ep != null) prev = ep;
+        }
+        continue;
+      }
+      const ev = evs[it.index];
+      const node = renderEvent(ev, prev, null);
+      list.appendChild(node);
+      if (!quoteHost && ev.kind === "user") quoteHost = node;
       const ep = eventEpoch(ev);
       if (ep != null) prev = ep;
     }
     renderingIntoThread = false;
     renderingSid = saved;
+    // The quoted passage renders as CONTEXT attached to the thread's opening message (the user
+    // 2026-08-24): it used to sit as a standalone block ABOVE the whole list — above the branch
+    // divider too, misreading chronology, since the branch happened before the quote. Same idiom
+    // as the chat's citation-as-context. The standalone block only mints while the events haven't
+    // landed yet (openCommentPop), so it is swept here the moment they have — otherwise the frame's
+    // arrival left BOTH on screen, quote on top, "branched" below it.
+    if (th.exact && quoteHost) {
+      const ctx = el("div", "cmt-quote cmt-quote-ctx");
+      ctx.textContent = th.exact;
+      ctx.title = "the highlighted passage this thread is about";
+      quoteHost.insertBefore(ctx, quoteHost.firstChild);
+      list.closest(".cmt-pop")?.querySelector(":scope > .cmt-quote")?.remove();
+    }
   } else for (const m of th.msgs) list.appendChild(commentMsgEl(m.who, m.text));
   for (const p of pend) {
     const n = commentMsgEl("you", p.text);
     n.classList.add("pending");
     list.appendChild(n);
   }
-  if (th.status === "open" && !th.error && (threadBusy(th.state) || pend.length)) {
-    const dots = el("div", "cmt-dots");
-    dots.append(el("span"), el("span"), el("span"));
-    list.appendChild(dots);
-  }
+  // (the typing dots that rendered here while the thread was busy are RETIRED — the user 2026-08-24:
+  // the await-green highlight carries the in-flight signal, and the reply's arrival is announced by
+  // the green→yellow settle; the pending bubble still acknowledges the user's own send)
   if (th.status === "open" && threadStuck(th.state)) {
     const note = el("div", "cmt-note");
     note.textContent = "This thread hit a prompt it can't answer from here. Break it out to continue.";
@@ -6021,11 +6172,24 @@ function fillCommentMsgs(list: HTMLElement, th: CommentThread): void {
   list.scrollTop = atTail ? list.scrollHeight : prevScroll;
 }
 
+// Refill the OPEN popover's conversation in place (leg C, the user 2026-08-24): the popover renders
+// the chat's display units, so everything that re-renders the chat's units — a tool-group toggle, a
+// compact/settings flip — must refill the popover too, or it holds the stale shape until the next
+// comments frame.
+function refillOpenCommentPop(): void {
+  if (!openCommentKey) return;
+  const th = (commentThreads.get(openCommentKey.sid) || []).find((t) => t.tid === openCommentKey!.tid);
+  const list = document.querySelector(".cmt-pop .cmt-msgs") as HTMLElement | null;
+  if (th && list) fillCommentMsgs(list, th);
+}
+
 function commentPopTitle(create: boolean, th: CommentThread | null | undefined): string {
   const nm = th?.name || "Thread";
   return create ? "New comment:"
     : th!.status === "promoted" ? "Now its own session: " + th!.promotedName
     : th!.status === "promoting" ? "Breaking out…"
+    : th!.status === "merging" ? "Merging back in…"
+    : th!.status === "merged" ? nm + " (merged into the session)"
     : th!.status === "resolved" ? nm + " (resolved)" : nm;
 }
 
@@ -6250,6 +6414,7 @@ function renderCommentPopover(): void {
     box.className = "cmt-input";
     box.rows = 2;
     box.placeholder = create ? "Comment on this passage…"
+      : th!.status === "merged" ? "Merged — its outcome lives in the session now"
       : th!.status === "resolved" ? "Reply to reopen…" : "Reply…";
     box.value = commentDrafts.get(dk) || "";
     box.addEventListener("input", () => commentDrafts.set(dk, box.value));
@@ -6323,6 +6488,18 @@ function renderCommentPopover(): void {
       br.title = "Continue this thread as its own session; it keeps everything it knows";
       br.dataset.act = "cmtbreak";
       row.appendChild(br);
+      // MERGE (the user 2026-08-23): the third exit — fold the thread's outcome back into the
+      // session. The kernel sends the parent the discussion as the person's own handoff and the
+      // thread settles to 'merged'; only a thread with something to say can merge (kernel-refused
+      // otherwise, loudly).
+      if (th.status === "open" || th.status === "resolved") {
+        const mg = el("button", "cmt-act") as HTMLButtonElement;
+        mg.type = "button";
+        mg.textContent = "Merge";
+        mg.title = "Send this discussion back into the session as direction going forward; the thread closes as merged";
+        mg.dataset.act = "cmtmerge";
+        row.appendChild(mg);
+      }
       // Resolve is GONE (the user 2026-08-17): an idle thread draws no usage and its transcript
       // is on disk either way, so the real verbs are Break out and Delete. Legacy resolved rows
       // still render dimmed and reopen on reply; they just can't be minted anymore. Never for
@@ -7254,6 +7431,7 @@ function toggleToolGroup(key: string): void {
   // the compact rebuild past the cache guard (a plain tab switch leaves stale false → reuses the cache).
   if (activeId) { const v = views.get(activeId); if (v) v.stale = true; syncView(activeId); }
   if (content) content.scrollTop = top;
+  refillOpenCommentPop();   // the popover renders the same units — its copy of this run must flip too
   scheduleRailSticky();
 }
 
@@ -7452,8 +7630,17 @@ function showActive() {
   // `length > 0` guard is what stops a zero-event session from flashing (or sticking on) "Loading…".
   const heavy = s.events.length > 0 && (v.el.childNodes.length === 0 || (settings.compact && (v.rendered !== s.events.length || v.stale)));
   if (!heavy) { syncView(activeId!); landActive(content, v); return; }
-  if (v.el.childNodes.length === 0) {   // truly empty → a light loading hint (a stale view keeps its old content visible)
-    const ld = el("div", "tx-loading"); ld.textContent = "Loading transcript…"; v.el.appendChild(ld);
+  if (v.el.childNodes.length === 0) {   // truly empty → the ROMP LOADER holds the spot (the standing
+    // wait-state rule: swirl + wordmark + pulsing accent dots — never a bare hint). Removed by the
+    // deferred build replacing this view's children — the content event — and that build always
+    // runs (or the next syncView rebuilds), so the loader cannot trap.
+    const ld = el("div", "tx-loading");
+    const sw = document.createElement("img"); sw.className = "tx-loading-swirl";
+    sw.src = mediaSrc("romp-swirl-glyph.svg"); sw.alt = ""; sw.onerror = () => sw.remove();
+    const wm = el("span", "tx-loading-wordmark"); wm.textContent = "romp";
+    const dots = el("span", "tx-loading-dots"); dots.append(el("i"), el("i"), el("i"));
+    ld.append(sw, wm, dots);
+    v.el.appendChild(ld);
   }
   if (pendingBuildRaf != null) cancelAnimationFrame(pendingBuildRaf);
   const target = activeId!;
@@ -9101,6 +9288,7 @@ const drafts = new Map<string, string>();
 // quotes. Each chip keeps its own ✕; Backspace-at-start eats the newest first.
 interface Citation { itemId?: string; title: string; quote?: string; uuid?: string | null; src?: string }   // src = a VS Code editor highlight's origin, workspace-relative file:lines (the user 2026-07-13)
 const composerCitations = new Map<string, Citation[]>();
+let fireStage: () => void = () => { /* assigned by the composer closure */ };
 
 // FILE ATTACHMENTS for the composer (the user 2026-08-04): a file dragged, pasted, or picked into the
 // chat box becomes a little THUMBNAIL in a strip above the textarea — not a raw path string dumped into
@@ -9232,8 +9420,13 @@ function routeUserMessage(sid: string, text: string, cites: Citation[] | undefin
   if (!vscodeApi) return;
   const goalCite = cites?.find((c) => c.itemId);
   const quoteCites = cites ? cites.filter((c) => c.quote) : [];
-  if (goalCite?.itemId) vscodeApi.postMessage({ type: "askFollowUp", itemId: goalCite.itemId, text, sid });
-  else if (quoteCites.length) vscodeApi.postMessage({ type: "sendMessage", id: sid, text: quoteReplyBody(quoteCites, text) });
+  // EVERY branch echoes optimistically (the user 2026-08-23: quoted and follow-up sends showed
+  // nothing until the kernel round-tripped, while plain sends painted instantly — the exact
+  // inconsistency reported). The quote branch echoes the COMPOSED body, which is byte-identical to
+  // what lands (quoteReplyBody IS the send path), so the reconcile's includes() match is exact; the
+  // follow-up echoes the typed words, a substring of the goal-wrapped landing.
+  if (goalCite?.itemId) { vscodeApi.postMessage({ type: "askFollowUp", itemId: goalCite.itemId, text, sid }); registerOptimistic(sid, text); }
+  else if (quoteCites.length) { const body = quoteReplyBody(quoteCites, text); vscodeApi.postMessage({ type: "sendMessage", id: sid, text: body }); registerOptimistic(sid, body); }
   else { vscodeApi.postMessage({ type: "sendMessage", id: sid, text }); registerOptimistic(sid, text); }
 }
 
@@ -9298,7 +9491,7 @@ function renderStagedStrip(id: string | null): void {
     const mark = el("span", "composer-chip-mark");
     mark.textContent = "•";
     const label = el("span", "composer-chip-label");
-    label.textContent = s.text;
+    label.textContent = s.text || "(context only — sends with your message)";
     // one line, ellipsized IN BOUNDS, with a colored "(expand)" that is visibly chrome, not message
     // text; click toggles the full text — the context-fold idiom (the user 2026-08-15, whose staged
     // line ran off the right edge with no ellipsis and no way to read the rest)
@@ -9396,6 +9589,18 @@ function renderComposerChips(id: string | null): void {
     chip.appendChild(x);
     strip.appendChild(chip);
   });
+  // The STAGE button (the user 2026-08-23; moved 2026-08-24): nobody discovers ⌘⏎ on their own, so
+  // while quote context is held the strip carries its visible face — IMMEDIATELY AFTER the chips it
+  // acts on (right-justified it floated detached, and its meaning didn't read), gone with them.
+  // Same action as the shortcut: stage the context (and any typed text) and keep going.
+  {
+    const st = el("button", "composer-stage-btn") as HTMLButtonElement;
+    st.type = "button";
+    st.textContent = "Stage";
+    st.title = "hold this context (and anything typed) for one combined send later — ⌘⏎ does the same";
+    st.addEventListener("click", (e) => { e.stopPropagation(); fireStage(); });
+    strip.appendChild(st);
+  }
 }
 
 // The attachment strip: one little thumbnail per dropped/pasted/picked file, above the textarea (the
@@ -9597,7 +9802,7 @@ function quoteReplyBody(cites: { quote?: string; src?: string | null }[], text: 
     const lead = c.src ? "Replying to this highlighted code (" + c.src + "):" : "Replying to this part of the conversation:";
     return lead + "\n" + q;
   });
-  return sections.join("\n\n") + "\n\n" + text;
+  return text ? sections.join("\n\n") + "\n\n" + text : sections.join("\n\n");
 }
 
 // HIGHLIGHT-TO-REPLY (the user 2026-07-13): selecting text in the chat transcript seeds the composer chip
@@ -9813,6 +10018,10 @@ const navHist = new NavHistory({
 
 function setActive(id: string, anchor?: string, anchorT?: number, anchorKind?: string) {
   noteMru(id);
+  // EPHEMERAL PEEK (see peekId): an out-of-view target opens as the peek; activating anything else
+  // drops it. Before the already-active early-return, so a re-focus of a hidden session re-asserts
+  // its peek even when nothing else changes.
+  assertPeekFor(id);
   if (activeId === id && anchor == null && anchorT == null) return; // already active, nothing to do
   navHist.record();   // every real navigation records the spot being LEFT (the user 2026-08-14: Ctrl+M / Ctrl+, walk the trail)
   closeMetaMenu(); // an open model/effort menu targets the tab we're leaving
@@ -9905,6 +10114,10 @@ function upsert(msg: any) {
     notify: ("notify" in msg) ? !!msg.notify : (prev ? prev.notify : undefined),
   };
   sessions.set(msg.id, s);
+  // a session frame can ride the kernel's chat build cache with a stale name/color embedded (its sig
+  // watches transcript+states only) — the freshest tabOrder meta wins over it, pending guard included
+  const tm = tabMeta.get(msg.id);
+  if (tm) applyMetaToSession(s, tm, pendingTabMeta.get(msg.id));
   reconcileRewind(s);       // pending-rewind overlay + the editable-bubble set, from the fresh payload
   reconcileOptimistic(s);   // re-assert (or retire) any in-flight optimistic sends across the rebuild
   // The kernel re-sends the FULL "session" payload on every push. Distinguish an APPEND (more turns
@@ -10184,6 +10397,7 @@ function closeTabLocally(id: string): void {
 // close) and wrong under federation, where a `closed` ack can predate stale merged frames that still list
 // the id: the moment nothing suppresses it, the strip re-draws the swirl placeholder.
 function dismissSession(id: string): void {
+  if (peekId === id) peekId = null;   // its tab is going — the peek goes with it
   sessions.delete(id);
   liveAsks.delete(id);
   ledgers.delete(id);
@@ -10245,6 +10459,10 @@ window.addEventListener("message", (e: MessageEvent) => {
   // so relay-failed figures heal the moment the tunnel returns even when no chat traffic flows
   // (idle sessions generated no messages, so figures sat until the user's next send — 2026-08-17)
   retryFailedPreviews();
+  // a RECONNECT-class event goes further: settled chips (budget spent) re-attempt regardless of
+  // their error text, and the path-image chips parked in imgFailed get one fresh host round-trip
+  // (bounded: reconnects are rare events, never a per-push loop)
+  if (m.type === "hostUp") { refreshSettledPreviews(); healPathImgs(); }
   if (m.type === "session") upsert(m);
   else if (m.type === "globalRetryPaused") {
     globalRetryPaused = !!m.value;
@@ -10269,6 +10487,7 @@ window.addEventListener("message", (e: MessageEvent) => {
     closingTabs.delete(m.id);   // an explicit reveal outranks a pending close-suppression: closing a tab and
     //                             reopening it from the picker inside the ack window must show it at once
     if (revivePending && m.id === revivePending) clearReviveLoader();   // the revive landed — the loader's success event
+    assertPeekFor(m.id);   // an out-of-view focus peeks even on the already-active fast path below (setActive is skipped there)
     // `live` (the user 2026-07-08): land on the LIVE TAIL. A blocked card's picker/permission prompt IS the
     // live bottom of the chat, so its feed chip drops the user right on it. Stick the target view to bottom so
     // showActive scrolls there; and cover the ALREADY-ACTIVE case, where setActive early-returns (activeId ===
@@ -10454,6 +10673,7 @@ window.addEventListener("message", (e: MessageEvent) => {
   else if (m.type === "imgData" && typeof m.path === "string") onImgData(m.path, typeof m.url === "string" ? m.url : null);
   else if (m.type === "tabOrder") { captureViews(m.views || null); applyTabOrder(m.order, m.tabs); }
   else if (m.type === "renamed" && m.id && typeof m.name === "string") {
+    notePendingMeta(pendingTabMeta, m.id, { name: m.name });   // kernel truth — hold it against a push built pre-rename
     const s = sessions.get(m.id);
     if (s && s.name !== m.name) { s.name = m.name; renderTabs(); }
   }
@@ -10491,9 +10711,14 @@ window.addEventListener("message", (e: MessageEvent) => {
     if (owner && owner === activeId) renderComposerFiles(owner);   // the held-send button state clears with the hold
   }
   // an EDITOR highlight (VS Code host, onDidChangeTextEditorSelection — the user 2026-07-13) seeds the
-  // same quote chip a transcript highlight does, labeled + wrapped with its file:lines origin (m.src)
-  else if (m.type === "editorSelection" && typeof m.text === "string" && m.text.trim() && activeId)
-    seedEditorQuote(activeId, m.text, typeof m.src === "string" ? m.src : undefined);
+  // same quote chip a transcript highlight does, labeled + wrapped with its file:lines origin (m.src).
+  // The FILE VIEWER posts this same shape WITH a sid — the session it was opened for — and that wins
+  // over activeId-at-gesture: the modal stays up across a tab switch, and the chip belongs to the
+  // session whose file it quotes (the 2026-08-19 routing rule). Host posts carry no sid.
+  else if (m.type === "editorSelection" && typeof m.text === "string" && m.text.trim()) {
+    const to = typeof m.sid === "string" && m.sid ? m.sid : activeId;
+    if (to) seedEditorQuote(to, m.text, typeof m.src === "string" ? m.src : undefined);
+  }
   // the editor selection collapsed (deselect / click away) — drop the chip that highlight seeded
   else if (m.type === "editorSelectionCleared") clearEditorCitation(activeId);
   // comment threads (the user 2026-08-13): the per-session thread frame — store, prune dead
@@ -10502,6 +10727,9 @@ window.addEventListener("message", (e: MessageEvent) => {
     const sid = String(m.id);
     const threads = (m.threads || []) as CommentThread[];
     commentThreads.set(sid, threads);
+    // the settle latch steps ONCE per frame — the deciding events are pushes (see comments.ts)
+    for (const t of threads) commentBusyLatch.set(t.tid, latchBusy(commentBusyLatch.get(t.tid), t, !!(commentPending.get(t.tid) || []).length));
+    for (const k of Array.from(commentBusyLatch.keys())) if (!threads.some((t) => t.tid === k)) commentBusyLatch.delete(k);
     const live = new Set(threads.filter((t) => t.status !== "promoted").map((t) => t.tid));
     for (const k of Array.from(commentPending.keys())) if (!live.has(k)) commentPending.delete(k);
     for (const k of Array.from(commentDrafts.keys())) if (!k.startsWith("new:") && !live.has(k)) commentDrafts.delete(k);
@@ -10615,7 +10843,9 @@ function setupComposer() {
   const stageComposer = () => {
     if (!activeId) return;
     const typed = ta.value.trim();
-    if (!typed) return;
+    // context stages ALONE (the user 2026-08-23): select a passage, ⌘⏎ with an empty box, repeat —
+    // then one typed message flushes the whole run. Nothing at all → nothing to stage.
+    if (!typed && !(composerCitations.get(activeId) || []).some((c) => c.quote)) return;
     if (composerAnswersAsk()) { warnToast("A picker is waiting on this box — answer it, or send normally."); return; }
     if (composerEdits.has(activeId)) { warnToast("An edit replaces a past message — send it normally."); return; }
     if ((composerFiles.get(activeId) || []).length) { warnToast("Attachments can't be staged — send them with a normal message."); return; }
@@ -10796,6 +11026,7 @@ function setupComposer() {
   const sendBtn = document.getElementById("composer-send") as HTMLButtonElement | null;
   sendBtn?.addEventListener("mousedown", (e) => { e.preventDefault(); sendComposer(); if (isCoarsePointer()) ta.blur(); else ta.focus(); });
   fireHeldSend = () => sendComposer();   // the ack handler's door into this closure (see sendOnShip)
+  fireStage = () => stageComposer();     // the chips strip's Stage button's door (renderComposerChips)
 
   // ── drag-to-resize the message box (the user 2026-07-07) ── the #composer-resize handle straddles the
   // top-edge divider; dragging it UP grows the composer (to see a long message in full), DOWN shrinks it.
@@ -11313,12 +11544,35 @@ function shipFileToHost(f: File, sidAt: string | null = activeId) {
 // ---- settings: the gear + modal live on the TIMELINE now (the user 2026-06-14). The chat just
 // CONSUMES the shared 'romp:settings' (compact mode) — applying a change made there, in a same-origin
 // tab, live via the storage event; and reading it at startup. ----
+// The chat TEXT scheme (the user 2026-08-24) is a body class the tier variables key on
+// (styles.css body.scheme-*) — toggled here so a gear pick recolors live, event-based.
+function applyChatScheme(s: RompSettings): void {
+  document.body.classList.toggle("scheme-high-contrast", s.chatScheme === "high-contrast");
+  document.body.classList.toggle("scheme-solarized-dark", s.chatScheme === "solarized-dark");
+}
 function setupSettings(): void {
+  applyChatScheme(settings);   // the persisted pick applies at startup — it survives reloads
   // renderTabs too: the tab strip reads settings (the context gauge toggle) but rerenderAll only
   // rebuilds the transcript views, so without it a gear change waited for the next kernel push.
-  onExternalSettingsChange((s) => { settings = s; renderTabs(); rerenderAll(); });
+  onExternalSettingsChange((s) => { settings = s; applyChatScheme(s); renderTabs(); rerenderAll(); refillOpenCommentPop(); });
 }
 
+// The feed's click echo (feed.ts focusEcho — the user 2026-08-24, "clicking into a not-shown
+// session is slow"): activate NOW, before any kernel round-trip — the tab/peek + loader are the
+// instant acknowledgment, and the kernel's focus frame follows with the anchor, re-deriving the
+// peek idempotently. Unknown sids fall through to the kernel (it may route a revive/confirm).
+window.addEventListener("storage", (e) => {
+  if (e.key !== "romp:focus-echo" || !e.newValue) return;
+  try {
+    const v = JSON.parse(e.newValue);
+    const sid = typeof v.sid === "string" ? v.sid : "";
+    if (!sid || (!sessions.has(sid) && !tabMeta.has(sid))) return;
+    revealSelfPane();
+    closingTabs.delete(sid);
+    assertPeekFor(sid);
+    setActive(sid);
+  } catch { /* malformed echo — the kernel frame corrects momentarily */ }
+});
 setupComposer();
 setupSettings();
 // Tab-bar clicks are DELEGATED to the stable #tabs container (installed once), not hung on the per-tab nodes
@@ -11464,6 +11718,13 @@ setupSettings();
       const cur = openCommentThread();
       if (cur) showBreakoutPrompt(cur.sid, cur.th.tid);
     },
+    cmtmerge: (elx) => {
+      const cur = openCommentThread();
+      if (!cur) return;
+      (elx as HTMLButtonElement).disabled = true;   // acknowledge before the round-trip
+      elx.textContent = "Merging…";
+      vscodeApi?.postMessage({ type: "commentMerge", id: cur.sid, tid: cur.th.tid });
+    },
     cmtresolve: (elx) => {
       const cur = openCommentThread();
       if (!cur) return;
@@ -11586,34 +11847,6 @@ setupSettings();
 })();
 // right-click a selection in the transcript → Reply (quote it) / Copy
 document.getElementById("content")?.addEventListener("contextmenu", showSelectionMenu);
-// The file viewer's review comments come back here as ONE assembled message (the user 2026-08-14).
-// It is DRAFTED into the composer, never sent: you read what the session will get, add a line if you
-// want, and send it yourself. Appended, so it never clobbers a half-typed draft.
-setCommentSink((sid, text) => {
-  // Routed by the REVIEWED session's sid, never activeId-at-submit (2026-08-19: switching tabs
-  // while the viewer was open drafted session A's review into session B's composer). Active tab →
-  // the live textarea; any other sid → straight into that session's persisted draft, where the
-  // composer restores it on the next visit (or on revival — drafts outlive the tab).
-  if (!sid) return false;
-  if (sid === activeId) {
-    const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
-    if (ta) {
-      const sep = !ta.value ? "" : ta.value.endsWith("\n\n") ? "" : ta.value.endsWith("\n") ? "\n" : "\n\n";
-      ta.value = ta.value + sep + text;
-      ta.selectionStart = ta.selectionEnd = ta.value.length;
-      growComposer(ta);
-      ta.focus();
-      drafts.set(sid, ta.value);
-      persistDrafts();
-      return true;
-    }
-  }
-  const prev = drafts.get(sid) || "";
-  const sep = !prev ? "" : prev.endsWith("\n\n") ? "" : prev.endsWith("\n") ? "\n" : "\n\n";
-  drafts.set(sid, prev + sep + text);
-  persistDrafts();
-  return true;
-});
 // The chat document hosts the viewer itself (openPath), so it boots the viewer's listener with the
 // same WS poster the feed hands it: Edit/Save round-trips and the GitHub-link ask ride post(), and
 // the kernel's replies come back as window MessageEvents via the pane shim — either document, one

@@ -3,7 +3,7 @@
 // follows the block whose prose names it (the user 2026-08-15) — absolute OR relative path; the
 // kernel resolves a relative one against the session's cwd exactly like click-to-open. Per surface:
 // web renders via previewFull (kernel /file bytes → <img> at the user-image scale / a PDF card;
-// kernel-verified paths fail LOUDLY with a retry chip, only unverified ones self-remove); the VS Code
+// kernel-verified paths fail LOUDLY with a retry chip; unverified ones hide but stay healable); the VS Code
 // webview can't reach the kernel origin from an <img>, so images ride the SAME host data-URL flow the
 // user-message pictures use (imgRequest, now carrying the session id) and PDFs keep the click-to-open
 // link. Source pins.
@@ -27,15 +27,18 @@ test("previewFull renders the image itself; a PDF is a click-to-view CARD, never
   assert.doesNotMatch(pf, /createElement\("iframe"\)/, "no auto-loading PDF frame in the chat strip");
   assert.match(pf, /box\.classList\.add\("path-full-pdfcard"\);/);
   assert.match(pf, /box\.onclick = \(ev\) => \{ ev\.stopPropagation\(\); openLightbox\(path, sid\); \};/);
-  // the HEAD probe (headers only — never a download) still removes a dead UNVERIFIED card; a
-  // kernel-verified card skips it — a transient probe failure must not erase a real file's card
-  assert.match(pf, /if \(!verified\) fetch\(fileUrl\(path, sid\), \{ method: "HEAD" \}\)/);
+  // the HEAD probe (headers only — never a download) HIDES a failed UNVERIFIED card and keeps it
+  // registered for the heal events (2026-08-24 — self-removal erased the spot until a send); a
+  // kernel-verified card skips the probe — the kernel already stat'd the file
+  assert.match(pf, /const probe = \(\) => fetch\(fileUrl\(path, sid\), \{ method: "HEAD" \}\)/);
 });
 
 test("a kernel-VERIFIED preview fails LOUDLY: a retry chip holds the figure's spot, never silent removal", () => {
   const pf = PREVIEW.slice(PREVIEW.indexOf("export function previewFull"));
-  // unverified (old kernel, no pathLinks verdict) keeps self-removal — there the error means "no such file"
-  assert.match(pf, /if \(!verified\) \{ box\.remove\(\); return; \}/);
+  // unverified (a file:// mention, an old kernel's no-pathLinks payload) now rides the SAME retry
+  // machinery hidden instead of self-removing (2026-08-24): one transient failure used to erase the
+  // figure until a send's re-render minted a fresh box — preview-heal.test.ts pins the sentinel
+  assert.match(pf, /if \(!verified\) box\.style\.display = "none";/);
   assert.match(pf, /chip\.className = "path-full-retry";/);
   assert.match(pf, /chip\.onclick = \(ev\) => \{ ev\.stopPropagation\(\); autoRetries = 3; ackTap\(ev\); build\(true\); \};/,
     "a tap re-arms persistence, acknowledges even mid-attempt, then retries");

@@ -32,6 +32,6 @@ test("cross-lit dots are drawn grown via dot()'s lit param — arrival and promp
   assert.match(SRC, /const dot = \(cx, cy, color, html, onClick, linkedHl, lit\) =>/);
   assert.match(SRC, /r: lit \? DOT_R \+ 2 : DOT_R/, "lit → the same +2 growth the native hover applies");
   assert.match(SRC, /c\.setAttribute\('r', lit \? DOT_R \+ 2 : DOT_R\)/, "mouseleave restores the lit radius");
-  assert.match(SRC, /dot\(x\(execAt\(mm\)\), cy, col, msgHtml\(mm\), msgNav\(mm\), u && u\.hl, dagOrHoverMsg\(mm\.id\)\)/);
+  assert.match(SRC, /dot\(x\(landXT\(mm\)\), cy, col, msgHtml\(mm\), msgNav\(mm\), u && u\.hl, dagOrHoverMsg\(mm\.id\)\)/);
   assert.match(SRC, /, null, dotLit\(t, dagOrHover\)\);/, "the prompt dot passes its lit state through");
 });

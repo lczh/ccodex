@@ -20,8 +20,7 @@ import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { fileUrl } from "./preview";
 import { kernelUrl } from "./media";
-import { findAnchorRange, sliceRanges } from "./comments";
-import { anchorFor, buildReviewMessage, docKey, type DocComment } from "./docreview";
+import { quoteSrcLabel } from "./docreview";
 
 // hljs is registered per-bundle. Same language set (and grammar registrations) the chat's fence
 // highlighting uses, dup-guarded, so importing this module alongside render.ts costs nothing.
@@ -161,41 +160,19 @@ registerFileViewAction({
   },
 });
 
-// ── review comments (the user 2026-08-14, who found coordinating a doc review painful) ─────────────
-// Reading a doc an agent wrote used to mean hand-copying every line you wanted changed back into the
-// chat. Now you comment on passages IN the viewer and one Submit hands the whole set over as a single
-// message drafted into that session's composer, each comment carrying its quote and source line — so
-// the agent applies the lot in one pass and nothing is copy-pasted.
-//
-// The layer is deliberately thin: the viewer already renders the file, so this adds selection →
-// comment, the marks, and the Submit. docreview.ts holds the pure half (anchoring + message shape).
-const CMT_KEY = "romp:fileviewComments";
-const comments = new Map<string, DocComment[]>();      // docKey(sid, path) → un-submitted comments
+// ── quote a passage into the composer (the user 2026-08-23, the three-verbs consolidation) ────────
+// Selecting text in the viewer seeds the SAME labeled quote chip a VS Code editor highlight does:
+// the selection posts to our own window in the editorSelection shape, so render.ts's existing
+// handler owns the chip end to end (no import cycle — the browseFiles precedent), labeled path:line
+// via quoteSrcLabel. From there the flow is the chat's own: type a note (or none), Stage, keep
+// going, send once. This REPLACED the viewer's separate review layer — the per-file comment store
+// (romp:fileviewComments), the painted marks, and the one-shot Submit that assembled a message —
+// because batching notes for one hand-off is exactly what quote chips + ⌘⏎ staging already do,
+// and "comment" now means only the transcript's live threads.
 
-function loadComments(): void {
-  try {
-    const raw = JSON.parse(localStorage.getItem(CMT_KEY) || "{}");
-    for (const [k, v] of Object.entries(raw)) {
-      const list = (Array.isArray(v) ? v : []).filter((c: any) =>
-        c && typeof c.id === "string" && typeof c.quote === "string" && typeof c.body === "string");
-      if (list.length) comments.set(k, list as DocComment[]);
-    }
-  } catch { /* unreadable store — start empty rather than throw on open */ }
-}
-loadComments();
-
-function saveComments(): void {
-  try { localStorage.setItem(CMT_KEY, JSON.stringify(Object.fromEntries(comments))); } catch { /* quota */ }
-}
-
-// render.ts owns the composer, and it imports THIS module — so the finished message is handed back
-// through a sink it registers at startup rather than importing render.ts here (which would be a cycle).
-// The sink takes THE REVIEWED SESSION'S sid and reports whether the draft LANDED (2026-08-19, two
-// user-data-loss bugs from one root): the old void sink read activeId at submit time, so switching
-// tabs drafted session A's review into session B — and Submit deleted the comments unconditionally,
-// so a closed tab or missing composer erased the whole review from memory and localStorage silently.
-let commentSink: ((sid: string, text: string) => boolean) | null = null;
-export function setCommentSink(fn: (sid: string, text: string) => boolean): void { commentSink = fn; }
+// The retired store's data would otherwise sit in localStorage forever on every browser that
+// ever commented — sweep it on load.
+try { localStorage.removeItem("romp:fileviewComments"); } catch { /* storage may be denied */ }
 
 export function closeFileView(): void {
   const wrap = document.getElementById("romp-fileview");
@@ -250,24 +227,6 @@ export function openFileView(path: string, sid?: string | null): void {
   }
   name.appendChild(dir); name.appendChild(base);
   const acts = el("div", "fileview-acts");
-
-  // Review controls. Both stay hidden until this file actually has a comment, so a plain read of a
-  // file is exactly as uncluttered as it was before this feature existed.
-  const key = docKey(sid || "", path);
-  const cmtCount = el("div", "fileview-cmtcount");
-  const submitBtn = el("button", "fileview-btn fileview-submit") as HTMLButtonElement;
-  submitBtn.type = "button";
-  submitBtn.title = "Hand every comment on this file to the session as one message";
-  const syncReview = () => {
-    // No sink registered (the feed's browser-hosted viewer) → Submit has nowhere to deliver, so the
-    // review controls never surface here; comments authored where a sink exists stay in the store
-    // and count only there — no real target, no affordance.
-    const n = commentSink ? (comments.get(key) || []).length : 0;
-    cmtCount.textContent = n === 1 ? "1 comment" : n + " comments";
-    submitBtn.textContent = "Submit " + n + (n === 1 ? " comment" : " comments");
-    cmtCount.hidden = !n;
-    submitBtn.hidden = !n;
-  };
 
   // ── format toggles (the user 2026-08-09) ── A markdown file opens RENDERED, its Raw form one click
   // away; everything else keeps the code view, whose long lines the Wrap toggle can soft-wrap. Both
@@ -375,7 +334,6 @@ export function openFileView(path: string, sid?: string | null): void {
   close.type = "button"; close.textContent = "✕"; close.title = "Close (Esc)";
   close.setAttribute("aria-label", "Close the file viewer");
   close.addEventListener("click", closeFileView);
-  acts.appendChild(cmtCount); acts.appendChild(submitBtn);
   acts.appendChild(copy); acts.appendChild(close);
   bar.appendChild(name); bar.appendChild(acts);
 
@@ -411,177 +369,34 @@ export function openFileView(path: string, sid?: string | null): void {
     cancelBtn.hidden = !editing;
     if (text === null || editing) return;   // loading, or the textarea owns the body right now
     body.replaceChildren(rendered ? mdBlock(text) : codeBlock(text, path, fmt.wrap));
-    markComments();
   };
 
-  // Paint every commented span. Reuses the chat comment threads' re-anchoring: findAnchorRange is
-  // whitespace-tolerant, which is what lets a span selected in the RENDERED view still be found in the
-  // Raw one (and the other way round). A span that can no longer be found keeps its comment — only the
-  // highlight is missing, and the Submit still carries it.
-  function markComments(): void {
-    syncReview();
-    if (!commentSink) return;                   // no sink → the marks (and their remove ✕) stay off too
-    const list = comments.get(key) || [];
-    list.forEach((c, i) => {
-      const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
-      const nodes: Text[] = [];
-      let n: Node | null;
-      while ((n = walker.nextNode())) if (!n.parentElement?.closest("mark.fv-hl")) nodes.push(n as Text);
-      const r = findAnchorRange(nodes.map((t) => t.data).join(""), c.quote);
-      if (!r) return;
-      const slices = sliceRanges(nodes.map((t) => t.data.length), r.start, r.end);
-      slices.forEach((sl, k) => {
-        const t = nodes[sl.idx];
-        const mid = sl.s > 0 ? t.splitText(sl.s) : t;
-        if (sl.e - sl.s < mid.data.length) mid.splitText(sl.e - sl.s);
-        const m = document.createElement("mark");
-        m.className = "fv-hl";
-        m.title = c.body;
-        mid.parentNode?.insertBefore(m, mid);
-        m.appendChild(mid);
-        if (k === slices.length - 1) {          // the number rides the run's tail; click to read/remove
-          const badge = document.createElement("sup");
-          badge.className = "fv-num";
-          badge.textContent = String(i + 1);
-          badge.title = c.body;
-          badge.addEventListener("click", (ev) => { ev.stopPropagation(); showNote(c, badge); });
-          m.appendChild(badge);
-        }
-      });
-    });
-  }
-
-  // The comment's text, one click under its marker — the compact form is the number (the progressive
-  // disclosure rule). Clicking the same marker again closes it.
-  function showNote(c: DocComment, at: HTMLElement): void {
-    const open = body.querySelector(".fv-note") as HTMLElement | null;
-    const same = open?.dataset.dcid === c.id;
-    open?.remove();
-    if (same) return;
-    const note = el("span", "fv-note");
-    note.dataset.dcid = c.id;
-    const txt = el("span"); txt.textContent = c.body;
-    const del = el("button", "fv-note-x") as HTMLButtonElement;
-    del.type = "button"; del.textContent = "✕"; del.title = "Remove this comment";
-    del.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      const left = (comments.get(key) || []).filter((x) => x.id !== c.id);
-      if (left.length) comments.set(key, left); else comments.delete(key);
-      saveComments();
-      renderBody();                              // repaint so the numbering closes up
-    });
-    note.appendChild(txt); note.appendChild(del);
-    at.parentNode?.insertBefore(note, at.nextSibling);
-  }
-
-  // Right-click a selection → Comment. Bound on the viewer body, so it never competes with the chat's
-  // own selection menu behind the backdrop.
-  body.addEventListener("contextmenu", (ev) => {
-    if (!commentSink) return;                   // no sink → no Comment to offer; the native menu keeps Copy
+  // Selection → labeled quote chip (the user 2026-08-23): mouseup is the gesture's settle point.
+  // The chip behaves exactly like a VS Code editor highlight's — one live source-labeled chip,
+  // replaced by the next selection, persisting until sent, staged, or ✕'d — because it IS that
+  // chip: render.ts's editorSelection handler seeds it. The post carries THIS viewer's sid, so the
+  // chip lands in the session the file was opened FOR even if the active tab changed while the
+  // modal was up (the 2026-08-19 routing rule: the gesture's session, never activeId-at-gesture).
+  let seedSeq = 0;                                 // last gesture wins if two fresh reads race
+  box.addEventListener("mouseup", () => {
+    if (editing) return;   // CodeMirror selections are edit gestures, not quotes
     const sel = window.getSelection();
-    const picked = sel ? sel.toString() : "";
-    if (!picked.trim() || !sel?.anchorNode || !body.contains(sel.anchorNode)) return;
-    ev.preventDefault();
-    document.querySelector(".fv-menu")?.remove();
-    const menu = el("div", "ctx-menu fv-menu");
-    const item = (label: string, fn: () => void) => {
-      const it = el("div", "ctx-item");
-      it.textContent = label;
-      it.addEventListener("click", (e2) => { e2.stopPropagation(); menu.remove(); fn(); });
-      menu.appendChild(it);
-    };
-    item("Comment", () => askComment(picked));
-    item("Copy", () => { navigator.clipboard?.writeText(picked).catch(() => { /* best effort */ }); });
-    document.body.appendChild(menu);
-    const r = menu.getBoundingClientRect();
-    menu.style.left = Math.max(0, Math.min(ev.clientX, window.innerWidth - r.width - 4)) + "px";
-    menu.style.top = Math.max(0, Math.min(ev.clientY, window.innerHeight - r.height - 4)) + "px";
-    const away = (e3: MouseEvent) => {
-      if (menu.contains(e3.target as Node)) return;
-      menu.remove();
-      document.removeEventListener("mousedown", away, true);
-    };
-    document.addEventListener("mousedown", away, true);
-  });
-
-  // The box that takes a new comment. Shows the anchor it will carry, so you can see where the agent
-  // will be sent before typing.
-  function askComment(picked: string): void {
-    box.querySelector(".fv-new")?.remove();
-    const a = anchorFor(text || "", picked);
-    if (!a.quote) return;
-    const nb = el("div", "fv-new");
-    const at = el("div", "fv-at");
-    at.textContent = (a.line ? "line " + a.line + " — " : "") + "\u201c" + a.quote.slice(0, 120) + "\u201d";
-    const ta = el("textarea", "fv-ta") as HTMLTextAreaElement;
-    ta.placeholder = "What should change here?";
-    const row = el("div", "fv-newrow");
-    const add = el("button", "fileview-btn fileview-submit") as HTMLButtonElement;
-    add.type = "button"; add.textContent = "Add comment";
-    const cancel = el("button", "fileview-btn") as HTMLButtonElement;
-    cancel.type = "button"; cancel.textContent = "Cancel";
-    const done = () => {
-      if (!ta.value.trim()) return;
-      const list = (comments.get(key) || []).concat([{
-        id: "fc" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-        quote: a.quote, line: a.line, body: ta.value.trim(), ts: Date.now(),
-      }]);
-      comments.set(key, list);
-      saveComments();
-      nb.remove();
-      renderBody();
-    };
-    add.addEventListener("click", done);
-    cancel.addEventListener("click", () => nb.remove());
-    ta.addEventListener("keydown", (e4) => {
-      if (e4.key === "Enter" && (e4.metaKey || e4.ctrlKey)) { e4.preventDefault(); done(); }
-      if (e4.key === "Escape") { e4.preventDefault(); e4.stopPropagation(); nb.remove(); }
-    });
-    row.appendChild(add); row.appendChild(cancel);
-    nb.appendChild(at); nb.appendChild(ta); nb.appendChild(row);
-    box.appendChild(nb);
-    ta.focus();
-  }
-
-  // Submit: every comment on this file becomes ONE message drafted into the composer. Before building
-  // it, re-read the file — if the agent rewrote it while you were reading, the line anchors may now
-  // point somewhere else, and you are told so rather than sending quietly-wrong numbers.
-  submitBtn.addEventListener("click", () => {
-    const list = comments.get(key) || [];
-    if (!list.length || !commentSink) return;
-    submitBtn.disabled = true;
-    submitBtn.textContent = "Submitting\u2026";                 // acknowledge the click before the round trip
+    if (!sel || sel.isCollapsed || !sel.anchorNode || !box.contains(sel.anchorNode)) return;
+    const picked = sel.toString().trim();
+    if (!picked) return;
+    // The label's line is minted NOW, not at open: agents edit these same trees, so the open-time
+    // snapshot's numbering may have quietly moved. Anchor against a fresh read; a FAILED re-read
+    // falls back to the snapshot rather than fabricating drift nobody observed (the old Submit
+    // guard's rule). quoteSrcLabel itself degrades to the bare path when the passage cannot be
+    // honestly found in whichever bytes it gets.
+    const seq = ++seedSeq;
     fetch(fileUrl(path, sid), { cache: "no-store" })
-      .then((r) => (r.ok ? r.text() : Promise.reject(new Error("re-read failed"))))
-      .then((fresh) => fresh !== text)
-      .catch(() => false)                                       // can't re-read → claim no staleness we didn't see
-      .then((stale) => {
-        const msg = buildReviewMessage(path, list);
-        if (!msg) { submitBtn.disabled = false; submitBtn.textContent = "Submit"; return; }
-        const landed = commentSink!(sid || "", stale
-          ? msg + "\n(Heads up: the file changed while I was reading it, so the line numbers may have moved.)\n"
-          : msg);
-        if (!landed) {
-          // the review is the user's WORK — never erased on a failed handoff. Say so, visibly,
-          // and keep every comment (memory + localStorage) for the next attempt. Deliberately
-          // touches NOTHING but the button — mid-edit, the textarea (and its buffer) must survive
-          // a failed handoff exactly as it survives a failed save.
-          submitBtn.disabled = false;
-          submitBtn.textContent = "Couldn't draft it — comments kept, try again";
-          return;
-        }
-        comments.delete(key);
-        saveComments();
-        // Delivered — but the courtesy close must not run while an edit is in progress: closeFileView's
-        // guard would pop the discard confirm over a SUBMIT, and Cancel would strand the button at
-        // "Submitting…". renderBody is off-limits mid-edit, so reset the two review controls in place
-        // and leave the editor (and its buffer) exactly as it was.
-        if (editing) {
-          submitBtn.disabled = false;
-          syncReview();
-          return;
-        }
-        closeFileView();
+      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(String(r.status)))))
+      .catch(() => text)
+      .then((doc) => {
+        if (seq !== seedSeq) return;
+        try { window.postMessage({ type: "editorSelection", text: picked, sid: sid || undefined, src: quoteSrcLabel(path, doc, picked) }, "*"); }
+        catch { /* messaging our own window cannot really fail */ }
       });
   });
 

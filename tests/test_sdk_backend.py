@@ -184,12 +184,17 @@ class _ToolUseBlock:
 class _AssistantMessage:
     def __init__(self, content, model="claude-x", uuid="a1", stop_reason="end_turn"):
         self.content, self.model, self.uuid, self.stop_reason = content, model, uuid, stop_reason
+class _ToolResultBlock:
+    def __init__(self, tool_use_id, content="", is_error=False):
+        self.tool_use_id, self.content, self.is_error = tool_use_id, content, is_error
 class _UserMessage:
-    def __init__(self, content, uuid="u1"): self.content, self.uuid = content, uuid
+    def __init__(self, content, uuid="u1", tool_use_result=None):
+        self.content, self.uuid, self.tool_use_result = content, uuid, tool_use_result
 class _ResultMessage:
     uuid = "r1"
 # rename so type(...).__name__ matches what msg_to_atom checks
 _TextBlock.__name__ = "TextBlock"; _ToolUseBlock.__name__ = "ToolUseBlock"
+_ToolResultBlock.__name__ = "ToolResultBlock"
 _AssistantMessage.__name__ = "AssistantMessage"; _UserMessage.__name__ = "UserMessage"
 _ResultMessage.__name__ = "ResultMessage"
 
@@ -213,6 +218,50 @@ class LiveTail(unittest.TestCase):
         self.assertEqual(a["message"]["content"], [{"type": "text", "text": "hello"}])
         self.assertIsNone(sb.msg_to_atom(_ResultMessage(), "s", "f", 5))   # result has no renderable content
         self.assertIsNone(sb.msg_to_atom(_AssistantMessage([]), "s", "f", 5))  # empty content → None
+
+    def test_tool_result_atom_carries_the_structured_tooluseresult(self):
+        # The SDK's UserMessage exposes the record-level structured result (the CLI streams the
+        # transcript record's toolUseResult on the wire as `tool_use_result`; the SDK parser maps it
+        # onto UserMessage.tool_use_result — verified against claude-agent-sdk 0.2.132 / CLI 2.1.224).
+        # The live atom must carry it exactly like the file adapter's atom does, or a JUST-answered
+        # AskUserQuestion renders via the lossy regex scrape until the disk record is parsed, and
+        # Edit's diffRows lag a parse behind the stream.
+        tur = {"questions": ["Pick a color"], "answers": {"Pick a color": "Blue"}}
+        m = _UserMessage([_ToolResultBlock("t1", "answered")], tool_use_result=tur)
+        a = sb.msg_to_atom(m, "s", "f", 5)
+        self.assertEqual(a["type"], "user")
+        self.assertEqual(a["toolUseResult"], tur)
+        self.assertEqual(a["message"]["content"][0]["type"], "tool_result")
+
+    def test_string_tooluseresult_is_not_carried(self):
+        # A dismissed picker records toolUseResult as a plain STRING — dict form only, the same gate
+        # as the file adapter (no consumer reads the string form).
+        m = _UserMessage([_ToolResultBlock("t1", "dismissed", is_error=True)],
+                         tool_use_result="dismissed the questions")
+        a = sb.msg_to_atom(m, "s", "f", 5)
+        self.assertNotIn("toolUseResult", a)
+
+    def test_tooluseresult_without_a_tool_result_block_is_not_carried(self):
+        # The file adapter's other gate: only an atom that carries a tool_result block may carry the
+        # record-level dict — a text-only message never does.
+        m = _UserMessage([_TextBlock("hello")], tool_use_result={"x": 1})
+        a = sb.msg_to_atom(m, "s", "f", 5)
+        self.assertNotIn("toolUseResult", a)
+
+    def test_an_unconsumed_shape_is_not_carried(self):
+        # The consumed-keys gate: a Read result's dict embeds the WHOLE read file, and nothing
+        # reads it off the atom — carrying every dict held ~a fifth of transcript bytes in the
+        # parse cache by reference. Only the consumed shapes ride (answers, structuredPatch).
+        m = _UserMessage([_ToolResultBlock("t9", "file contents…")],
+                         tool_use_result={"type": "text", "file": {"content": "x" * 512}})
+        a = sb.msg_to_atom(m, "s", "f", 5)
+        self.assertNotIn("toolUseResult", a)
+
+    def test_the_consumed_key_set_cannot_drift_from_the_file_adapter_s(self):
+        # sdk_backend loads standalone (no event-model import), so the set is MIRRORED — this pin
+        # is what keeps the two halves widening together.
+        em2 = SourceFileLoader("romp_event_model_drift", os.path.join(BIN, "romp-event-model")).load_module()
+        self.assertEqual(sb.TUR_CONSUMED_KEYS, em2.TUR_CONSUMED_KEYS)
 
     def test_command_stdout_stream_becomes_a_turn_ENDING_assistant_atom(self):
         # the user 2026-07-02: client.set_model() makes the CLI stream its feedback as a UserMessage

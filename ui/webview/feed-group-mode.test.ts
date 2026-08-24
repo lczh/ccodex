@@ -13,10 +13,12 @@ const FEED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", 
 const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.css"), "utf8");
 const FED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "federation.ts"), "utf8");
 
-test("the footer Group toggle persists `grouped` in romp:settings; grouping is the DEFAULT (the user 2026-07-13)", () => {
-  assert.match(FEED, /grouped: s\.grouped !== false/);   // default ON — the toggle opts OUT
-  assert.match(FEED, /ensureFeedToggle\("feed-grouped", "Group", \(\) => feedPrefs\(\)\.grouped, "grouped",/);
-  assert.match(FEED, /ensureGroupToggle\(\)\.style\.display = showCA \? "" : "none";/);
+test("the view menu's Group-by-session row persists `grouped` in romp:settings; grouping is the DEFAULT (the user 2026-07-13)", () => {
+  assert.match(FEED, /grouped: s\.grouped !== false/);   // default ON — the row opts OUT
+  // the footer "Group" word-button folded into the view menu (the user 2026-08-24) — same pref, same default
+  assert.match(FEED, /set\(2, "Group by session", \{/);
+  assert.match(FEED, /current: p\.grouped,/, "the ✓ reads the same !== false default — a missing key stays checked");
+  assert.match(FEED, /mk\(true, \(\) => setViewPref\("grouped", !feedPrefs\(\)\.grouped\)\)/);
 });
 
 test("session rank = the kernel's session-order list (tab/lane order); unknown sids keep time order after it", () => {

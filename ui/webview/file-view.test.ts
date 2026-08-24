@@ -24,8 +24,7 @@ test("openPath routes by HOST: the in-pane viewer modal on the web, the editor i
   assert.match(RENDER, /function openPath\(path: string, sid\?: string \| null\): void/);
   // web → the viewer opens in THIS document, framed or standalone alike — no shell relay, no fallback
   assert.match(RENDER, /openFileView\(path, sid \|\| activeId \|\| null\);/);
-  // (the import also carries setCommentSink since 2026-08-14 — the review layer's way back to the composer)
-  assert.match(RENDER, /import \{ openFileView, setCommentSink \} from "\.\/file-view";/);
+  assert.match(RENDER, /import \{ openFileView \} from "\.\/file-view";/);
   assert.doesNotMatch(RENDER, /romp: "viewFile"/, "the chat→shell→feed relay is gone");
   // VS Code keeps the host editor
   assert.match(RENDER, /vscodeApi\.postMessage\(sid \? \{ type: "openFile", path, id: sid \} : \{ type: "openFile", path \}\);/);
@@ -72,13 +71,47 @@ test("the viewer is a singleton MODAL over its pane: ~95% card, dimmed backdrop,
     "the feed boots the listener with the WS poster (saves ride it — the raw-mode slice)");
 });
 
-test("the FEED-hosted viewer registers no comment sink, so the review layer gates itself off", () => {
-  // the review layer's Submit drafts into the CHAT composer via a sink render.ts registers; the feed
-  // hosts the same viewer without one, so every comment affordance must gate on the sink or Submit is
-  // a dead button in that document (2026-08-19) — no real target, no affordance
-  assert.doesNotMatch(FEED, /setCommentSink/, "no composer in the feed to draft into");
-  assert.match(RENDER, /setCommentSink\(\(sid, text\) => \{/, "the chat bundle keeps the full behavior");
-  assert.match(VIEW, /if \(!commentSink\) return;/, "the gate exists in the viewer itself");
+// ── selection → quote chip (the user 2026-08-23, the three-verbs consolidation): the viewer's
+// separate review layer (per-file comment store, marks, one-shot Submit — romp:fileviewComments +
+// buildReviewMessage) is GONE. Selecting a passage now seeds the chat composer's own labeled quote
+// chip, exactly like a VS Code editor highlight, and batching rides the chip + ⌘⏎ staging flow the
+// chat already has. "Comment" means only the transcript's live threads now. ──
+
+test("selecting in the viewer seeds the composer's editor chip — the editorSelection shape, path:line label", () => {
+  // mouseup posts to our OWN window (the browseFiles precedent — no import cycle with render.ts),
+  // and render.ts's existing editorSelection handler owns the chip end to end
+  assert.match(VIEW, /box\.addEventListener\("mouseup", \(\) => \{/);
+  assert.match(VIEW, /window\.postMessage\(\{ type: "editorSelection", text: picked, sid: sid \|\| undefined, src: quoteSrcLabel\(path, doc, picked\) \}, "\*"\);/);
+  // a collapsed or out-of-viewer selection seeds nothing, and CodeMirror selections are edits
+  assert.match(VIEW, /if \(!sel \|\| sel\.isCollapsed \|\| !sel\.anchorNode \|\| !box\.contains\(sel\.anchorNode\)\) return;/);
+  assert.match(VIEW, /if \(editing\) return;/);
+});
+
+test("the chip lands in the session the file was opened FOR — the posted sid beats activeId-at-gesture", () => {
+  // the modal stays up across a tab switch (nothing closes it on focus), so seeding into activeId
+  // would put session A's path:line quote into session B's composer — the 2026-08-19 routing rule
+  // the retired review layer already learned once. Host (VS Code) posts carry no sid → activeId.
+  assert.match(RENDER, /const to = typeof m\.sid === "string" && m\.sid \? m\.sid : activeId;/);
+  assert.match(RENDER, /if \(to\) seedEditorQuote\(to, m\.text, typeof m\.src === "string" \? m\.src : undefined\);/);
+});
+
+test("the label's line is minted against a FRESH read, and a failed re-read falls back to the snapshot", () => {
+  // agents edit these same trees while you read: the open-time snapshot's numbering may have moved,
+  // so the line is anchored at selection time — and a failed re-read must not fabricate drift
+  // nobody observed (the retired Submit guard's rule), so it anchors the snapshot instead
+  assert.match(VIEW, /const seq = \+\+seedSeq;/);
+  assert.match(VIEW, /fetch\(fileUrl\(path, sid\), \{ cache: "no-store" \}\)\n\s*\.then\(\(r\) => \(r\.ok \? r\.text\(\) : Promise\.reject\(new Error\(String\(r\.status\)\)\)\)\)\n\s*\.catch\(\(\) => text\)/);
+  assert.match(VIEW, /if \(seq !== seedSeq\) return;/, "two racing reads: the last gesture wins");
+});
+
+test("the FEED-hosted viewer stays inert: no editorSelection listener there, and no review layer anywhere", () => {
+  // the feed document has no composer — the posted message just lands unheard, by design
+  assert.doesNotMatch(FEED, /editorSelection/);
+  // the review layer is gone from every module and both sheets, and the orphaned store is swept
+  for (const source of [VIEW, RENDER, FEED, CHAT_CSS, FEED_CSS]) {
+    assert.doesNotMatch(source, /setCommentSink|buildReviewMessage|fv-hl|fileview-submit/);
+  }
+  assert.match(VIEW, /localStorage\.removeItem\("romp:fileviewComments"\)/);
 });
 
 test("it waits with the romp loader and fails with the kernel's own words, never a blank pane", () => {

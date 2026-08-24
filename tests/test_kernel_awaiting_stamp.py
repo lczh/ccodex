@@ -154,7 +154,8 @@ class SessionLevelStamp(unittest.TestCase):
         (km.jd.GOALDIR / (SID + ".json")).write_text(json.dumps({
             "rompUuid": SID, "seq": 1, "placements": {}, "status": {}, "nodes": nodes}))
         self.assertEqual(km._session_awaiting(SID, "/p", True, stamp=True),
-                         {"kind": "job", "why": "slurm 4821 regenerating the parts"})
+                         {"kind": "job", "why": "slurm 4821 regenerating the parts",
+                          "since": 200})   # the stamp's awaitingAt → the chips' elapsed readout (the user 2026-08-23)
         self.assertEqual(km._session_stamp_full(SID),
                          ("g1", 200, "slurm 4821 regenerating the parts", "job"))
 
@@ -166,7 +167,8 @@ class SessionLevelStamp(unittest.TestCase):
     def test_stamp_true_lifts_a_live_session_whose_live_sources_are_dark(self):
         self._seed(("g1", "the watcher it armed; files the clip when it triggers", 200))
         self.assertEqual(km._session_awaiting(SID, "/p", True, stamp=True),
-                         {"kind": None, "why": "the watcher it armed; files the clip when it triggers"})
+                         {"kind": None, "since": 200,
+                          "why": "the watcher it armed; files the clip when it triggers"})
 
     def test_stamp_false_stays_none_so_the_feed_scopes_per_goal(self):
         # the crux: the feed calls stamp=False, so the session-level signal is None for a stamp-only session
@@ -253,7 +255,29 @@ class SessionLevelDelegation(unittest.TestCase):
     def test_a_fully_delegated_session_reads_awaiting_on_the_session_surfaces(self):
         self._seed(self._delegated_store())
         self.assertEqual(km._session_awaiting(SID, "/p", True, stamp=True),
-                         {"kind": "peer", "why": "delegated to probe; waiting on their result"})
+                         {"kind": "peer", "why": "delegated to probe; waiting on their result",
+                          "since": None})   # the handoff graph has no single event time here → no duration
+
+    def test_handoff_peer_identities_carry_name_host_and_colour_for_the_card(self):
+        # the card's awaiting box names the peers the way the origin line does (the user 2026-08-23):
+        # identity colour + quiet host: prefix. The helper resolves the live registry name first; a
+        # sid it cannot resolve keeps federation's recorded host marker and falls to the sid stub.
+        saved = km._name_color
+        km._name_color = lambda s: {"bg": "#abc", "fg": "#000"}
+        try:
+            far = "farhost:88888888-9999-aaaa-bbbb-cccccccccccc"
+            nodes = self._delegated_store()
+            h2 = self._handoff("h2", "g1"); h2["handoff"]["peer"] = far
+            h3 = self._handoff("h3", "g1")                       # duplicate peer → one identity
+            nodes.update({"h2": h2, "h3": h3})
+            got = km._handoff_peer_identities(nodes, ["h1", "h2", "h3"])
+            self.assertEqual(got, [
+                {"name": "88888888", "host": "farhost", "sid": far, "color": {"bg": "#abc", "fg": "#000"}},
+                {"name": "probe", "host": "", "sid": self.PEER, "color": {"bg": "#abc", "fg": "#000"}},
+            ])
+            self.assertIsNone(km._handoff_peer_identities(nodes, []), "no handoffs, no list — never []")
+        finally:
+            km._name_color = saved
 
     def test_stamp_false_stays_none_so_the_feed_keeps_scoping_per_card(self):
         self._seed(self._delegated_store())
@@ -264,7 +288,7 @@ class SessionLevelDelegation(unittest.TestCase):
         nodes["g1"]["awaitingWhy"], nodes["g1"]["awaitingAt"] = "the sweep it launched", 200
         self._seed(nodes)
         self.assertEqual(km._session_awaiting(SID, "/p", True, stamp=True),
-                         {"kind": None, "why": "the sweep it launched"})
+                         {"kind": None, "why": "the sweep it launched", "since": 200})
 
     def test_a_pure_delegation_top_stays_dark_matching_its_suppressed_card(self):
         # EVERY leaf a handoff → the feed suppresses the card in every column, so its dot never lights;
@@ -340,7 +364,7 @@ class KindScopedRules(unittest.TestCase):
     def test_a_peer_answer_supersedes_only_peer_waits(self):
         self._seed("job")
         self.assertEqual(km._session_awaiting(SID, "/p", True, stamp=True),
-                         {"kind": "job", "why": "the wait"},
+                         {"kind": "job", "why": "the wait", "since": 200},
                          "unrelated mail cannot end a wait on an external job")
         self._seed("peer")
         self.assertIsNone(km._session_awaiting(SID, "/p", True, stamp=True),
@@ -408,14 +432,15 @@ class OverlayDoesNotVeto(unittest.TestCase):
         self._overlay({"t": 100, "awaiting": False})
         self._seed()
         self.assertEqual(km._session_awaiting(SID, "/p", True, stamp=True),
-                         {"kind": None, "why": "a dispatched release watch; tags when green"},
+                         {"kind": None, "why": "a dispatched release watch; tags when green",
+                          "since": 200},
                          "the Stop hook's ambient false must not hide the judge's stamp")
 
     def test_a_live_true_row_still_wins_with_its_own_why(self):
         self._overlay({"t": 100, "awaiting": True, "why": "a job the hook reported"})
         self._seed()
         self.assertEqual(km._session_awaiting(SID, "/p", True, stamp=True),
-                         {"kind": None, "why": "a job the hook reported"},
+                         {"kind": None, "why": "a job the hook reported", "since": 100},
                          "a positive overlay row keeps its channel")
 
     def test_false_row_and_no_stamp_is_plain_none(self):
@@ -589,6 +614,16 @@ class AwaitingWake(unittest.TestCase):
         # (the user 2026-08-22) a dormant CLI still gets no WAKE — its dispatched work is gone, not
         # asleep — but the branch no longer dead-ends: the stamped Working card converts once to the
         # dead-wait procedural block, so it reaches a terminal column instead of pausing forever.
+        # The conversion is owner-corroborated: the session carries its launch record (the names
+        # entry both backends write — without it no owner here could answer for the sid), and the
+        # owner scan is pinned to an authoritative empty answer rather than this box's real tmux.
+        km.jd.NAMES.mkdir(parents=True, exist_ok=True)
+        (km.jd.NAMES / SID).write_text("web\t~/notes-api\t#3355aa\t#ffffff\n")
+        self.addCleanup(lambda: (km.jd.NAMES / SID).unlink())
+        km._TMUX.available = lambda: True
+        km._TMUX.alive_sids = lambda t=3: set()
+        self.addCleanup(lambda: [km._TMUX.__dict__.pop(nm, None)
+                                 for nm in ("available", "alive_sids")])
         now = 1_000_000
         self._seed(at=now - 7 * 3600)
         (km.jd.STATE / "states").mkdir(parents=True, exist_ok=True)

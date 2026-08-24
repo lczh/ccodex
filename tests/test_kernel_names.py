@@ -643,7 +643,9 @@ class NameClaims(unittest.TestCase):
             finally:
                 km._dismissed_lanes.clear(); km._dismissed_lanes.update(old)
 
-    def test_reveal_cannot_overwrite_a_concurrent_timeline_view_heal(self):
+    def test_tag_edit_cannot_overwrite_a_concurrent_timeline_view_heal(self):
+        # the r43 merge integration: _edit_tag's read-modify-write took only its thread lock, so it
+        # interleaved with the identity-locked heal and one side's edit was silently lost
         from pathlib import Path
         entered, release = threading.Event(), threading.Event()
         real_atomic = km._atomic_write
@@ -651,34 +653,35 @@ class NameClaims(unittest.TestCase):
             state = Path(td); codex = state / "codex"; codex.mkdir()
             views = state / "timeline-views.json"
             views.write_text(json.dumps({
-                "active": "all", "hidden": ["old", "other"],
-                "groups": [{"id": "g", "name": "g", "color": "", "members": ["old"]}]}))
+                "active": "all", "hidden": ["old"],
+                "tags": [{"id": "g", "name": "g", "color": "",
+                          "members": [{"host": "", "sid": "old"}]}]}))
 
             def pause_heal(path, text, mode=None):
                 if Path(path) == views and threading.current_thread().name == "heal":
                     entered.set(); release.wait(5)
                 return real_atomic(path, text, mode)
 
-            km._flags_cache.clear()
             try:
                 with mock.patch.object(km.jd, "STATE", state):
                     with mock.patch.object(km.jd, "CODEXDIR", codex):
                         with mock.patch.object(km, "_atomic_write", side_effect=pause_heal):
-                            with mock.patch.object(km, "_send_to_view"):
-                                first = threading.Thread(
-                                    name="heal", target=lambda: km._heal_timeline_views("old", "new"))
-                                second = threading.Thread(
-                                    name="reveal", target=lambda: km._reveal_chat_for(
-                                        {"wid": "w"}, {"type": "focus", "id": "other"}))
-                                first.start(); self.assertTrue(entered.wait(2)); second.start()
-                                self.assertTrue(second.is_alive(),
-                                                "reveal waits to read until the heal has published")
-                                release.set(); first.join(5); second.join(5)
+                            first = threading.Thread(
+                                name="heal", target=lambda: km._heal_timeline_views("old", "new"))
+                            second = threading.Thread(
+                                name="edit", target=lambda: km._edit_tag("g", add=["other"]))
+                            first.start(); self.assertTrue(entered.wait(2)); second.start()
+                            self.assertTrue(second.is_alive(),
+                                            "the tag edit waits until the heal has published")
+                            release.set(); first.join(5); second.join(5)
+                self.assertFalse(first.is_alive() or second.is_alive())
                 final = json.loads(views.read_text())
-                self.assertIn("new", final["hidden"], "the heal survives the later reveal write")
-                self.assertNotIn("other", final["hidden"], "the reveal mutation survives too")
+                self.assertIn("new", final["hidden"], "the heal survives the later tag edit")
+                sids = {m["sid"] for m in final["tags"][0]["members"]}
+                self.assertIn("other", sids, "the tag edit survives too")
+                self.assertIn("new", sids, "the heal's member carry survives")
             finally:
-                release.set(); km._flags_cache.clear()
+                release.set()
 
     def test_stale_clear_ids_are_canonical_for_the_ledger_and_durable_node_write(self):
         from pathlib import Path
@@ -698,8 +701,7 @@ class NameClaims(unittest.TestCase):
                         with mock.patch.object(km, "_delegation_linked_ids", return_value=set()):
                             with mock.patch.object(km, "_mark_nodes_cleared",
                                                    side_effect=lambda ids, value: marked.extend(ids)):
-                                with mock.patch.object(km, "_clear_wrap_notify"):
-                                    km._clear_all([tid + ":g1"])
+                                km._clear_all([tid + ":g1"])   # clear is SILENT since 2026-08-23
                 row = json.loads((state / "cleared.jsonl").read_text().splitlines()[0])
                 self.assertEqual(row["id"], sid + ":g1")
                 self.assertEqual(marked, [sid + ":g1"],
