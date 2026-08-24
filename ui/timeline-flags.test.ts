@@ -77,6 +77,12 @@ test("setSessionFlag still posts via the web host hook, with a Node-fs fallback 
   assert.match(SRC, /window\.__rompTimelineSetFlag === 'function'/);
   assert.match(SRC, /window\.__rompTimelineSetFlag\(s\.id, flag, value\)/);
   assert.match(SRC, /session-flags\.json/, "Obsidian/headless writes the same file the kernel reads");
+  assert.match(SRC, /process\.versions\.electron/, "plain node can never write real user state");
+  assert.match(SRC, /process\.env\.ROMP_STATE_DIR \|\| path\.join\(base, 'romp'\)/,
+    "the fallback honors the selected kernel state root");
+  assert.match(SRC, /tmp = fp \+ '\.tmp'/);
+  assert.match(SRC, /fs\.unlinkSync\(tmp\)[\s\S]*fs\.writeFileSync\(tmp,[\s\S]*fs\.renameSync\(tmp, fp\)/,
+    "the fallback never exposes a torn JSON file or a planted staging FIFO");
 });
 
 test("the sticky-flag machinery survives: pendingFlags reconcile on every update (no flicker-back)", () => {

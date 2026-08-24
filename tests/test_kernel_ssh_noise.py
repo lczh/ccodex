@@ -92,7 +92,7 @@ class DivergedMessageIsActionable(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, "DIVERGED\n", PQ_WARNING)
             return subprocess.CompletedProcess(argv, 0, "DIR:/home/u/romp\nHEAD:deadbeef\nDIRTY:\n", PQ_WARNING)
         with mock.patch.object(km.subprocess, "run", side_effect=fake_run), \
-             mock.patch.object(km, "_local_head", side_effect=lambda short=False: "cafe1234" if not short else "cafe123"):
+             mock.patch.object(km, "_fresh_local_head", return_value="cafe1234" * 5):
             return km._update_remote("TESTHOST")
 
     def test_names_the_rewritten_history_cause_and_the_remedy(self):

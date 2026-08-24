@@ -9,8 +9,10 @@ auto-NUDGE (_interrupt_suppresses_nudge). Functional tests on the state machine 
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
+from unittest import mock
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -58,6 +60,47 @@ class SessionRetrySuppress(unittest.TestCase):
         d = json.loads((self.dir / "retry-suppressed.json").read_text())
         self.assertIn("s1", d)
         self.assertGreater(d["s1"], 0, "the stamp is the re-arm floor (only a success AFTER it lifts it)")
+
+    def test_writer_canonicalizes_at_commit_and_cannot_restore_a_tid_row(self):
+        tid = "01911111-2222-7333-8444-555555555555"
+        sid = "11111111-2222-3333-4444-555555555555"
+        (self.dir / "retry-suppressed.json").write_text(json.dumps({tid: 10}))
+        old_map = dict(km.jd._CODEX_IDENTITY_MAP)
+        km.jd._CODEX_IDENTITY_MAP.clear()
+        km.jd._CODEX_IDENTITY_MAP[tid] = sid
+        km._retry_suppress_cache.clear()
+        try:
+            km._suppress_session_retry(tid)
+            state = json.loads((self.dir / "retry-suppressed.json").read_text())
+            self.assertNotIn(tid, state)
+            self.assertGreater(state[sid], 10)
+        finally:
+            km.jd._CODEX_IDENTITY_MAP.clear()
+            km.jd._CODEX_IDENTITY_MAP.update(old_map)
+            km._retry_suppress_cache.clear()
+
+    def test_two_writers_merge_under_the_identity_lock(self):
+        gate = threading.Barrier(2)
+        original = km.jd.canonicalize_retry_suppressed_identity
+
+        def synchronized(blob):
+            # Both callers start together, but only the one inside the shared lock reaches this
+            # function; the other must then re-read its predecessor's committed snapshot.
+            if not (self.dir / "retry-suppressed.json").exists():
+                try:
+                    gate.wait(0.05)
+                except threading.BrokenBarrierError:
+                    pass
+            return original(blob)
+
+        with mock.patch.object(
+                km.jd, "canonicalize_retry_suppressed_identity", side_effect=synchronized):
+            a = threading.Thread(target=km._suppress_session_retry, args=("s1",))
+            b = threading.Thread(target=km._suppress_session_retry, args=("s2",))
+            a.start(); b.start(); a.join(5); b.join(5)
+        self.assertFalse(a.is_alive() or b.is_alive())
+        self.assertEqual(set(json.loads((self.dir / "retry-suppressed.json").read_text())),
+                         {"s1", "s2"})
 
     # --- re-arm: a successful re-engagement clears it ---
     def test_reengaged_and_settled_clean_rearms(self):

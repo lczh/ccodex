@@ -2696,16 +2696,22 @@ class TimelinePanel {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineSetFlag === 'function') {
         window.__rompTimelineSetFlag(s.id, flag, value); return;
       }
+      // Direct state access is an Obsidian/Electron fallback only. A plain-node test process with
+      // a window shim must never touch the user's real flags, just as for order and views above.
+      if (typeof process === 'undefined' || !process.versions || !process.versions.electron) return;
       const fs = require('fs'), os = require('os'), path = require('path');
-      const dir = path.join(os.homedir(), '.local', 'state', 'romp');
-      const fp = path.join(dir, 'session-flags.json');
+      const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
+      const dir = process.env.ROMP_STATE_DIR || path.join(base, 'romp');
+      const fp = path.join(dir, 'session-flags.json'), tmp = fp + '.tmp';
       let cur = {};
       try { cur = JSON.parse(fs.readFileSync(fp, 'utf8')) || {}; } catch (e) {}
       const f = (cur[s.id] && typeof cur[s.id] === 'object') ? cur[s.id] : {};
       if (value) f[flag] = true; else delete f[flag];
       if (Object.keys(f).length) cur[s.id] = f; else delete cur[s.id];
       fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(fp, JSON.stringify(cur));
+      try { fs.unlinkSync(tmp); } catch (e) { /* absent is fine */ }
+      fs.writeFileSync(tmp, JSON.stringify(cur));
+      fs.renameSync(tmp, fp);
     } catch (e) { /* no host hook + no Node fs → can't persist */ }
   }
 

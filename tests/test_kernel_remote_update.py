@@ -119,7 +119,7 @@ class UpdateRemote(unittest.TestCase):
         km.subprocess.run = self._run
         km._HEAD_CACHE.clear(); km._HEAD_CACHE.update(self._hc)
 
-    def _wire(self, rhead=None, dirty="", disc_out=None, push_rc=0, push_err="", apply_out="SYNCED:abcdef0"):
+    def _wire(self, rhead=None, dirty="", disc_out=None, push_rc=0, push_err="", apply_out="SYNCED:1111111"):
         """Install a dispatching subprocess mock; returns the list of argv it saw."""
         if disc_out is None:
             disc_out = "DIR:/home/u/romp\nHEAD:%s\nDIRTY:%s" % (rhead if rhead is not None else self.RHEAD, dirty)
@@ -144,26 +144,47 @@ class UpdateRemote(unittest.TestCase):
         self.assertEqual(km._update_remote(""), (False, "no host"))
 
     def test_a_clean_ancestor_remote_is_pushed_reset_and_restarted(self):
-        calls = self._wire(apply_out="SYNCED:abcdef0")
+        calls = self._wire(apply_out="SYNCED:1111111")
         ok, detail = km._update_remote("TESTHOST")
         self.assertTrue(ok)
-        self.assertIn("synced to abcdef0", detail)
+        self.assertIn("synced to 1111111", detail)
         # it force-pushed local HEAD to a scratch ref at host:remote-dir
         push = next(a for a in calls if a[0] == "git" and "push" in a)
         self.assertIn("--force", push)
         self.assertIn("TESTHOST:/home/u/romp", push)
-        self.assertTrue(any(str(x).startswith("HEAD:refs/heads/") for x in push), "pushes HEAD to a scratch ref")
+        self.assertTrue(any(str(x).startswith(self.LFULL + ":refs/heads/") for x in push),
+                        "pushes the exact uncached HEAD snapshot to a scratch ref")
 
-    def test_already_up_to_date_short_circuits(self):
-        self._wire(rhead=self.LFULL)          # remote already at local HEAD
+    def test_a_synced_tag_for_any_other_commit_is_a_refusal(self):
+        self._wire(apply_out="SYNCED:abcdef0")
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("not the exact commit", detail)
+        self.assertIn(self.LFULL[:8], detail)
+
+    def test_the_push_ignores_the_display_cache_and_transports_one_exact_snapshot(self):
+        km._HEAD_CACHE.update(ts=9e18, full="a" * 40, short="a" * 8)
+        calls = self._wire(apply_out="SYNCED:1111111")
+        ok, _detail = km._update_remote("TESTHOST")
+        self.assertTrue(ok)
+        push = next(a for a in calls if a[0] == "git" and "push" in a)
+        self.assertIn(self.LFULL + ":refs/heads/" + km._P2P_REF, push)
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        self.assertIn('"$GD/romp-update.lock" "$R" ' + self.LFULL, apply,
+                      "the transaction applies the same SHA the push transported")
+
+    def test_equal_heads_still_run_the_settle_transaction(self):
+        calls = self._wire(rhead=self.LFULL)  # an armed failed-install latch may still need healing
         ok, detail = km._update_remote("TESTHOST")
         self.assertTrue(ok)
-        self.assertIn("already up to date", detail)
+        self.assertIn("synced", detail)
+        self.assertTrue(any(a[0] == "git" and "push" in a for a in calls),
+                        "HEAD equality alone cannot bypass the remote recovery record")
 
     def test_a_dirty_local_is_not_refused_it_pushes_committed_head(self):
         # "just take what is committed on local" (the user 2026-07-04): a dirty working tree is NOT a blocker —
         # _update_remote pushes the committed HEAD and never asks you to commit first.
-        self._wire(apply_out="SYNCED:abcdef0")
+        self._wire(apply_out="SYNCED:1111111")
         ok, detail = km._update_remote("TESTHOST")
         self.assertTrue(ok)
         self.assertNotIn("commit", detail.lower())
@@ -237,11 +258,11 @@ class UpdateRemote(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("reading the remote's tree state failed", detail)
         self.assertNotIn("tree changed", detail)
-        self._wire(apply_out="TAMPEREDPOSTINSTALL")
+        self._wire(apply_out="DIRTYPOSTINSTALL")
         ok, detail = km._update_remote("TESTHOST")
         self.assertFalse(ok)
-        self.assertIn("changed during the install", detail)
-        self.assertIn("NOT reported", detail)
+        self.assertIn("tracked files changed", detail)
+        self.assertIn("not reported", detail)
 
     def test_an_install_failure_on_the_remote_is_its_own_verdict(self):
         # the apply used to lock the reset alone and never install at all (the user's audit,
@@ -251,13 +272,20 @@ class UpdateRemote(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("install.sh failed", detail)
         self.assertIn("boot heal", detail)
-        calls = self._wire(apply_out="SYNCED:abcdef0")
+        calls = self._wire(apply_out="SYNCED:1111111")
         km._update_remote("TESTHOST")
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
         self.assertIn("install.sh", apply, "the apply transaction installs")
         self.assertIn("romp-install-failed", apply, "and arms the remote's latch before the reset")
         self.assertLess(apply.index("romp-install-failed"), apply.index('"merge","--ff-only"'),
                         "intent before the move, on the remote exactly as locally")
+        self.assertIn('>>"$LOGDIR/update.log" 2>&1', apply,
+                      "installer diagnostics survive in the bounded update log")
+        self._wire(apply_out="CHANNELPUBFAIL")
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("update-channel marker", detail)
+        self.assertNotIn("install.sh failed", detail)
 
     def test_the_generated_shell_actually_emits_STATERR_when_status_dies(self):
         # the string-level pins above never EXECUTE the shell: replanting the audited bug (a dead
@@ -265,7 +293,7 @@ class UpdateRemote(unittest.TestCase):
         # the real generated scripts against a fixture checkout whose git can't report status.
         import tempfile
         from pathlib import Path
-        calls = self._wire(apply_out="SYNCED:abcdef0")
+        calls = self._wire(apply_out="SYNCED:1111111")
         km._update_remote("TESTHOST")
         disc = next(a[-1] for a in calls if isinstance(a[-1], str) and "for d in" in a[-1])
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
@@ -304,7 +332,7 @@ class UpdateRemote(unittest.TestCase):
         # real apply script against a fixture whose install.sh fails, then one whose passes
         import tempfile
         from pathlib import Path
-        calls = self._wire(apply_out="SYNCED:abcdef0")
+        calls = self._wire(apply_out="SYNCED:1111111")
         km._update_remote("TESTHOST")
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
         with tempfile.TemporaryDirectory() as td:
@@ -379,7 +407,7 @@ class UpdateRemote(unittest.TestCase):
         # CONFLICTING edits)
         import tempfile
         from pathlib import Path
-        calls = self._wire(apply_out="SYNCED:abcdef0")
+        calls = self._wire(apply_out="SYNCED:1111111")
         km._update_remote("TESTHOST")
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
         with tempfile.TemporaryDirectory() as td:
@@ -411,8 +439,8 @@ class UpdateRemote(unittest.TestCase):
             apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
             (gd / "romp-install-failed").write_text("deadbee2 dev")   # a prior to settle-heal
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
-            self.assertIn("DIRTYNOW", a.stdout,
-                          "the post-settle recheck refuses — the entry check is minutes stale")
+            self.assertIn("DIRTYPOSTHEAL", a.stdout,
+                          "the successful heal keeps its record armed when the tree changed")
             self.assertNotIn("MOVED", ops.read_text() if ops.exists() else "")
             # and dirty at the FOURTH read (post-move st3): HEAD moved, install must NOT run —
             # the armed latch stays for the boot heal
@@ -463,6 +491,78 @@ class UpdateRemote(unittest.TestCase):
             self.assertLess(apply_r.index("st2="), apply_r.index('tmp=lp+".tmp"'),
                             "and BEFORE the arm")
 
+    def test_a_heal_spends_nothing_when_head_moves_while_install_runs(self):
+        calls = self._wire(apply_out="SYNCED:1111111")
+        km._update_remote("TESTHOST")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        with tempfile.TemporaryDirectory() as td:
+            fix = pathlib.Path(td) / "romp"
+            gd = fix / ".git"
+            gd.mkdir(parents=True)
+            fakebin = pathlib.Path(td) / "bin"
+            fakebin.mkdir()
+            moved = pathlib.Path(td) / "head-moved"
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' rev-parse --short=8 HEAD'*) echo aaaaaaaa;;\n"
+                "  *' rev-parse --short=8 '*) echo 11111111;;\n"
+                "  *' rev-parse HEAD'*) if [ -e '%s' ]; then printf '%%040d\\n' 2; "
+                "else printf '%%040d\\n' 1; fi;;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
+                "esac\nexit 0\n" % (gd, moved))
+            (fakebin / "git").chmod(0o755)
+            (fix / "install.sh").write_text("#!/bin/sh\ntouch '%s'\nexit 0\n" % moved)
+            (fix / "install.sh").chmod(0o755)
+            (gd / "romp-update-channel").write_text("dev\n")
+            (gd / "romp-install-failed").write_text("aaaaaaaa stable")
+            env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep,
+                                                      os.environ.get("PATH", "")))
+            apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
+            a = self._run(["bash", "-c", apply_r], env=env,
+                          capture_output=True, text=True, timeout=60)
+            self.assertIn("HEADMOVEDPOSTHEAL", a.stdout)
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(),
+                             "aaaaaaaa stable")
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "dev")
+
+    def test_a_heal_checks_head_after_its_post_install_status_probe(self):
+        calls = self._wire(apply_out="SYNCED:1111111")
+        km._update_remote("TESTHOST")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        with tempfile.TemporaryDirectory() as td:
+            fix = pathlib.Path(td) / "romp"
+            gd = fix / ".git"
+            gd.mkdir(parents=True)
+            fakebin = pathlib.Path(td) / "bin"
+            fakebin.mkdir()
+            moved = pathlib.Path(td) / "head-moved"
+            installed = pathlib.Path(td) / "install-finished"
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' status '*) [ -e '%s' ] && touch '%s';;\n"
+                "  *' rev-parse --short=8 HEAD'*) echo aaaaaaaa;;\n"
+                "  *' rev-parse --short=8 '*) echo 11111111;;\n"
+                "  *' rev-parse HEAD'*) if [ -e '%s' ]; then printf '%%040d\\n' 2; "
+                "else printf '%%040d\\n' 1; fi;;\n"
+                "  *' show '*) cat \"$2/install.sh\";;\n"
+                "esac\nexit 0\n" % (gd, installed, moved, moved))
+            (fakebin / "git").chmod(0o755)
+            (fix / "install.sh").write_text("#!/bin/sh\ntouch '%s'\nexit 0\n" % installed)
+            (fix / "install.sh").chmod(0o755)
+            (gd / "romp-update-channel").write_text("dev\n")
+            (gd / "romp-install-failed").write_text("aaaaaaaa stable")
+            env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep,
+                                                      os.environ.get("PATH", "")))
+            apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
+            result = self._run(["bash", "-c", apply_r], env=env,
+                               capture_output=True, text=True, timeout=60)
+            self.assertIn("HEADMOVEDPOSTHEAL", result.stdout)
+            self.assertEqual((gd / "romp-install-failed").read_text().strip(),
+                             "aaaaaaaa stable")
+            self.assertEqual((gd / "romp-update-channel").read_text().strip(), "dev")
+
     def test_a_writer_racing_the_install_never_executes_and_never_reports_success(self):
         # the v1.3.14 audit's P1, executed there: install.sh was replaced after the final clean
         # snapshot and the wrapper EXECUTED the replacement and reported SYNCED. The install
@@ -470,7 +570,7 @@ class UpdateRemote(unittest.TestCase):
         # only after a post-install verify — changed bytes neither execute nor produce SYNCED.
         import tempfile
         from pathlib import Path
-        calls = self._wire(apply_out="SYNCED:abcdef0")
+        calls = self._wire(apply_out="SYNCED:1111111")
         km._update_remote("TESTHOST")
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
         with tempfile.TemporaryDirectory() as td:
@@ -532,7 +632,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "esac\nexit 0\n" % (gd, committed, fix / "mid-install-edit"))
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
-            self.assertIn("TAMPEREDPOSTINSTALL", a.stdout)
+            self.assertIn("DIRTYPOSTINSTALL", a.stdout)
             self.assertNotIn("SYNCED", a.stdout,
                              "no success report from a tree that changed during the install")
             self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2",
@@ -542,7 +642,7 @@ class UpdateRemote(unittest.TestCase):
         # the r43 mutant hunt: dropping pass_fds from the rewritten bash -s calls stayed
         # suite-green — the inherited locked fd is what keeps the update flock alive when the
         # ssh wrapper dies mid-install (the 2026-08-17 double-install class)
-        calls = self._wire(apply_out="SYNCED:abcdef0")
+        calls = self._wire(apply_out="SYNCED:1111111")
         km._update_remote("TESTHOST")
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
         self.assertEqual(apply.count('["bash","-s"],cwd=r,stdin=open('), 2,
@@ -558,7 +658,7 @@ class UpdateRemote(unittest.TestCase):
         # mutable-entry hole the commit closes
         import tempfile
         from pathlib import Path
-        calls = self._wire(apply_out="SYNCED:abcdef0")
+        calls = self._wire(apply_out="SYNCED:1111111")
         km._update_remote("TESTHOST")
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
         with tempfile.TemporaryDirectory() as td:
@@ -596,7 +696,7 @@ class UpdateRemote(unittest.TestCase):
         # the latch says (the common crash form has the marker already stable with no latch)
         import tempfile
         from pathlib import Path
-        calls = self._wire(apply_out="SYNCED:abcdef0")
+        calls = self._wire(apply_out="SYNCED:1111111")
         km._update_remote("TESTHOST")
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
         with tempfile.TemporaryDirectory() as td:
@@ -656,7 +756,7 @@ class UpdateRemote(unittest.TestCase):
         # failed-install protection
         import tempfile
         from pathlib import Path
-        calls = self._wire(apply_out="SYNCED:abcdef0")
+        calls = self._wire(apply_out="SYNCED:1111111")
         km._update_remote("TESTHOST")
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
         with tempfile.TemporaryDirectory() as td:
@@ -749,7 +849,7 @@ class UpdateRemote(unittest.TestCase):
         # with STABLENOW, the marker keeps the published choice, and nothing moves
         import tempfile
         from pathlib import Path
-        calls = self._wire(apply_out="SYNCED:abcdef0")
+        calls = self._wire(apply_out="SYNCED:1111111")
         km._update_remote("TESTHOST")
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
         with tempfile.TemporaryDirectory() as td:
@@ -787,7 +887,7 @@ class UpdateRemote(unittest.TestCase):
         # persisting a 5-byte truncated record.
         import tempfile
         from pathlib import Path
-        calls = self._wire(apply_out="SYNCED:abcdef0")
+        calls = self._wire(apply_out="SYNCED:1111111")
         km._update_remote("TESTHOST")
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
         with tempfile.TemporaryDirectory() as td:
@@ -835,7 +935,7 @@ class UpdateRemote(unittest.TestCase):
         # spending the latch, and a torn NON-COMMIT line is never moot
         import tempfile
         from pathlib import Path
-        calls = self._wire(apply_out="SYNCED:abcdef0")
+        calls = self._wire(apply_out="SYNCED:1111111")
         km._update_remote("TESTHOST")
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
         with tempfile.TemporaryDirectory() as td:
@@ -1003,7 +1103,7 @@ class UpdateRemote(unittest.TestCase):
         # outer shell probes fired first in every prior test, leaving the wrapper's dead code)
         import tempfile
         from pathlib import Path
-        calls = self._wire(apply_out="SYNCED:abcdef0")
+        calls = self._wire(apply_out="SYNCED:1111111")
         km._update_remote("TESTHOST")
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
         with tempfile.TemporaryDirectory() as td:
@@ -1110,7 +1210,10 @@ class UpdateRemote(unittest.TestCase):
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
         self.assertIn("pkill -f", apply, "kills the running kernel")
         self.assertIn('"$R/bin/romp-manager" ensure', apply, "prefers the manager (ensure = idempotent supervised start)")
-        self.assertIn("/dev/tcp/127.0.0.1/29855", apply, "polls the remote's kernel port to confirm it came back")
+        self.assertIn("/version", apply, "polls the running kernel's build, not just its TCP port")
+        self.assertIn('case "$EXPECT" in "$KS"*', apply,
+                      "the restarted kernel must report the exact pushed commit")
+        self.assertIn('OLD_BOOT=', apply, "a surviving old kernel process cannot satisfy the restart")
         self.assertIn('if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve"', apply, "bare romp-serve only as a last resort")
         self.assertNotIn("--refresh", apply, "does NOT rely on `romp --refresh` (needs a manager) — the stuck bug")
 

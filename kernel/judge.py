@@ -10,7 +10,7 @@ CLI:
   romp-judge --once               # one caption pass over the live fleet (writes captions/)
   romp-judge --test <transcript>  # caption one transcript's recent units, print them (no write)
 """
-import contextlib, json, os, re, secrets, shutil, stat, sys, tempfile, time, subprocess, threading
+import contextlib, hashlib, json, os, re, secrets, shutil, stat, sys, tempfile, time, subprocess, threading
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -121,6 +121,9 @@ def _rebind_state(path):
     _episode_memo.clear()   # ...and so are the episode-log reads
     _head_memo.clear()      # transcript heads are immutable per path, but a rebind swaps the whole world of paths
     _namefp_memo.clear()    # names-entry content is memoized per SID against same-second mtimes — across a
+    if "_CODEX_IDENTITY_MAP" in globals():
+        _CODEX_IDENTITY_MAP.clear()
+        _CODEX_GOAL_IDENTITY_MAP.clear()
     #                         rebind that collides and serves the OLD root's project dir (found 2026-07-27:
     #                         the second test in a run discovered nothing, its fleet resolved into an rm'd tmpdir)
     # (the override journal needs no rebinding: _overrides_dir() derives from GOALDIR at call time, so
@@ -844,6 +847,7 @@ def _auth_write_locked(d):
     """Atomic tmp+rename (callers hold _auth_lock). Best-effort like every latch write: a failed write
     means a stale latch, and the next mark/clear retries it."""
     try:
+        d = canonicalize_session_keyed_map(d)
         tmp = JUDGE_AUTH.with_suffix(".tmp")
         tmp.unlink(missing_ok=True)   # unlink a planted FIFO at the fixed staging name before opening (the r34 verification)
         tmp.write_text(json.dumps(d))
@@ -862,22 +866,24 @@ def _auth_down_mark(fsid, mode, note):
         return
     note = str(note or "")[:300]
     with _auth_lock:
-        d = dict(_auth_down_map())
-        row = d.get(fsid) or {}
-        if row.get("mode") == mode and row.get("note") == note:
-            return
-        d[fsid] = {"t": int(row.get("t") or time.time()), "mode": mode, "note": note}
-        _auth_write_locked(d)
+        with _identity_file_lock():
+            d = dict(_auth_down_map())
+            row = d.get(fsid) or {}
+            if row.get("mode") == mode and row.get("note") == note:
+                return
+            d[fsid] = {"t": int(row.get("t") or time.time()), "mode": mode, "note": note}
+            _auth_write_locked(d)
 def _auth_down_clear(fsid):
     """Unlatch on the deciding event in the other direction: a judge call for this session SUCCEEDED,
     so its billing works again — the floored card returns to its judged column on the next build.
     Cheap when unlatched (one cached read, zero writes): this runs on every successful call."""
-    if not fsid or fsid not in _auth_down_map():
+    if not fsid:
         return
     with _auth_lock:
-        d = dict(_auth_down_map())
-        if d.pop(fsid, None) is not None:
-            _auth_write_locked(d)
+        with _identity_file_lock():
+            d = dict(_auth_down_map())
+            if d.pop(fsid, None) is not None:
+                _auth_write_locked(d)
 
 
 _limit_cache = [None, {}]
@@ -1741,14 +1747,19 @@ def _live_natoms(fsid):
         pass
     return out
 def append_caption(fsid, uid, grain, t, caption, live=False, natoms=None):
-    rec = {"id": uid, "grain": grain, "t": int(t), "caption": caption}
-    if live:                                              # provisional, re-run-able, superseded by the final on close
-        rec["live"] = True
-        if natoms is not None:
-            rec["natoms"] = natoms
-    CAPDIR.mkdir(parents=True, exist_ok=True)
-    with open(CAPDIR / (fsid + ".jsonl"), "a") as f:
-        f.write(json.dumps(rec) + "\n")
+    with _identity_file_lock():
+        fsid = canonicalize_session_identity(fsid)
+        rec = {"id": canonicalize_unit_identity(uid), "grain": grain, "t": int(t),
+               "caption": caption}
+        if live:                                          # provisional, re-run-able, superseded by the final on close
+            rec["live"] = True
+            if natoms is not None:
+                rec["natoms"] = natoms
+        CAPDIR.mkdir(parents=True, exist_ok=True)
+        path = CAPDIR / (fsid + ".jsonl")
+        with _store_file_lock(path):
+            with open(path, "a") as f:
+                f.write(json.dumps(rec) + "\n")
 
 
 CAPTION_FAIL_CAP = 3   # empty captures per unit-set before the tombstone — ARCH_FAIL_CAP's rationale
@@ -1769,15 +1780,19 @@ def _caption_fails(fsid):
 
 
 def _write_caption_fails(fsid, d):
-    CAPDIR.mkdir(parents=True, exist_ok=True)
-    path = CAPDIR / (fsid + ".fails.json")
-    if d:
-        path.write_text(json.dumps(d))
-    else:
-        try:
-            path.unlink()                             # empty ledger → no file (nothing to prune later)
-        except OSError:
-            pass
+    with _identity_file_lock():
+        fsid = canonicalize_session_identity(fsid)
+        CAPDIR.mkdir(parents=True, exist_ok=True)
+        path = CAPDIR / (fsid + ".fails.json")
+        with _store_file_lock(path):
+            d = canonicalize_unit_keyed_map(d)
+            if d:
+                path.write_text(json.dumps(d))
+            else:
+                try:
+                    path.unlink()                     # empty ledger → no file (nothing to prune later)
+                except OSError:
+                    pass
 
 
 def _caption_strike(task, struck, gave):
@@ -1790,36 +1805,39 @@ def _caption_strike(task, struck, gave):
     `struck` is the PASS's already-struck id set: two tasks can carry the same unit id at different
     grains, and one pass is one world-state — the same unchanged unit is one piece of evidence, one
     strike, however many calls the pass spent on it."""
-    fsid = task["fsid"]
-    fails = _caption_fails(fsid)
-    give_up = []
-    for w in task["writes"]:
-        if w["id"] in struck:
-            continue
-        struck.add(w["id"])
-        n = int(fails.get(w["id"], 0)) + 1
-        if n >= CAPTION_FAIL_CAP:
-            fails.pop(w["id"], None)
-            give_up.append(w)
-        else:
-            fails[w["id"]] = n
-    _write_caption_fails(fsid, fails)
-    if give_up:
-        for w in give_up:
-            append_caption(fsid, w["id"], w["grain"], w["t"], "")
-        gave[fsid] = gave.get(fsid, 0) + len(give_up)     # ONE give-up row per fsid per pass (logged
+    with _identity_file_lock():
+        fsid = canonicalize_session_identity(task["fsid"])
+        fails = _caption_fails(fsid)
+        give_up = []
+        for w in task["writes"]:
+            wid = canonicalize_unit_identity(w["id"])
+            if wid in struck:
+                continue
+            struck.add(wid)
+            n = int(fails.get(wid, 0)) + 1
+            if n >= CAPTION_FAIL_CAP:
+                fails.pop(wid, None)
+                give_up.append(w)
+            else:
+                fails[wid] = n
+        _write_caption_fails(fsid, fails)
+        if give_up:
+            for w in give_up:
+                append_caption(fsid, w["id"], w["grain"], w["t"], "")
+            gave[fsid] = gave.get(fsid, 0) + len(give_up) # ONE give-up row per fsid per pass (logged
         #                                                   after the loop) — several tasks can cross
         #                                                   the cap in the same pass
 
 
 def _caption_unfail(task):
     """A successful caption clears its units' strike counts — only CONSECUTIVE empties tombstone."""
-    fsid = task["fsid"]
-    fails = _caption_fails(fsid)
-    ids = {w["id"] for w in task["writes"]}
-    kept = {k: v for k, v in fails.items() if k not in ids}
-    if kept != fails:
-        _write_caption_fails(fsid, kept)
+    with _identity_file_lock():
+        fsid = canonicalize_session_identity(task["fsid"])
+        fails = _caption_fails(fsid)
+        ids = {canonicalize_unit_identity(w["id"]) for w in task["writes"]}
+        kept = {k: v for k, v in fails.items() if k not in ids}
+        if kept != fails:
+            _write_caption_fails(fsid, kept)
 
 
 # ───────────────────────── the archiver (index tier; per session) ─────────────────────────
@@ -1882,15 +1900,20 @@ def session_turn_captions(fsid):
     caps.sort()
     return [c for _, c in caps]
 def load_archive(fsid):
-    try:
-        return json.loads((ARCHDIR / (fsid + ".json")).read_text())
-    except Exception:
-        return None
+    with _identity_file_lock():
+        fsid = canonicalize_session_identity(fsid)
+        path = ARCHDIR / (fsid + ".json")
+        with _store_file_lock(path):
+            try:
+                return json.loads(path.read_text())
+            except Exception:
+                return None
 def write_archive(fsid, rec):
-    ARCHDIR.mkdir(parents=True, exist_ok=True)
-    tmp = ARCHDIR / (fsid + ".json.tmp.%d" % os.getpid())
-    tmp.write_text(json.dumps(rec))
-    tmp.rename(ARCHDIR / (fsid + ".json"))            # atomic publish
+    with _identity_file_lock():
+        fsid = canonicalize_session_identity(fsid)
+        path = ARCHDIR / (fsid + ".json")
+        with _store_file_lock(path):
+            _atomic_json(path, rec)
 # ───────────────────────── the planner (triage tier; per segment) ─────────────────────────
 # Places EVERY segment in the session's goal tree: mint a top-level goal (a new request),
 # add a sub-goal/step under an existing node, and/or complete a node. Plus a soft
@@ -2255,6 +2278,21 @@ def _store_file_lock(path):
             if fcntl is not None:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
+
+
+@contextlib.contextmanager
+def _store_file_locks(*paths):
+    """Acquire several store locks in one deterministic order.
+
+    Identity migration has two names for one logical store.  Locking only the destination lets an
+    old-identity appender advance the source after it was snapshotted and before it was unlinked.
+    Sorting the resolved paths gives every migration the same order and avoids an old/new deadlock.
+    """
+    unique = {str(Path(path).resolve()): Path(path) for path in paths}
+    with contextlib.ExitStack() as stack:
+        for key in sorted(unique):
+            stack.enter_context(_store_file_lock(unique[key]))
+        yield
 def _atomic_json(path, value):
     """Durably publish JSON through a unique 0600 temp file in the destination directory."""
     path = Path(path)
@@ -2317,9 +2355,11 @@ def _read_store_json(path, *, quarantine=False):
             return None
         raise
 def load_goals(fsid):
-    path = GOALDIR / (fsid + ".json")
-    with _store_file_lock(path):
-        raw = _read_store_json(path, quarantine=True)
+    with _identity_file_lock():
+        fsid = canonicalize_session_identity(fsid)
+        path = GOALDIR / (fsid + ".json")
+        with _store_file_lock(path):
+            raw = _read_store_json(path, quarantine=True)
     if raw is None:
         # a FRESH store is born at the current identity version — only stores with history recorded
         # under an OLDER derivation are ever sealed (see _migrate_placements)
@@ -2480,6 +2520,21 @@ def _overrides_dir():
     and entries leaked into later tests' freshly rebuilt stores (same synthetic ids). In production
     GOALDIR is STATE/goals, so this is STATE/overrides."""
     return GOALDIR.parent / "overrides"
+
+
+def _append_override_row(fsid, row):
+    with _identity_file_lock():
+        fsid = canonicalize_session_identity(fsid)
+        row = _canonicalize_override_row_with_maps(
+            row, _CODEX_IDENTITY_MAP, _CODEX_GOAL_IDENTITY_MAP)
+        d = _overrides_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / (fsid + ".jsonl")
+        with _store_file_lock(path):
+            with path.open("a") as f:
+                f.write(json.dumps(row) + "\n")
+
+
 def append_override(fsid, node_id, op, t):
     """Journal a user override as an append-only event (overrides/<fsid>.jsonl), written BEFORE the
     caller's store save. That save is last-writer-wins against a triage pass holding this session's
@@ -2490,10 +2545,7 @@ def append_override(fsid, node_id, op, t):
     un-seal verdict — the restore row alone re-inserts a node still flag-cleared, the user 2026-07-23);
     kernel-side block verdicts ride append_block and an undo-clear restore rides append_restore below
     (it must carry node payloads)."""
-    d = _overrides_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    with (d / (fsid + ".jsonl")).open("a") as f:
-        f.write(json.dumps({"node": node_id, "op": op, "t": int(t)}) + "\n")
+    _append_override_row(fsid, {"node": node_id, "op": op, "t": int(t)})
 def append_block(fsid, node_id, src, why, t):
     """Journal a KERNEL-side block verdict (src "nudge"/"interrupt") — the same clobber protection
     append_override gives user clicks, for the blocks the kernel stamps BETWEEN judge passes. These are
@@ -2503,10 +2555,8 @@ def append_block(fsid, node_id, src, why, t):
     auto-nudge.json kept `failed` — the "stalled" chip's retire path keyed on the erased row, so the
     chip outlived the user's own follow-up). Written BEFORE the caller's store save; replay re-records
     the block unless a user event at/after t supersedes it (their reply answered the ask)."""
-    d = _overrides_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    with (d / (fsid + ".jsonl")).open("a") as f:
-        f.write(json.dumps({"node": node_id, "op": "block", "src": src, "why": why, "t": int(t)}) + "\n")
+    _append_override_row(fsid, {"node": node_id, "op": "block", "src": src,
+                                "why": why, "t": int(t)})
 def append_restore(fsid, nodes, status, t):
     """Journal an undo-clear RESTORE with its full node payloads. Restore is the riskiest clobber of
     the family: by the time the live-store save lands, the archive has already given the nodes up, so
@@ -2514,12 +2564,9 @@ def append_restore(fsid, nodes, status, t):
     undo row pointing at nothing left to restore. The journal keeps the payload itself; replay
     re-inserts a node only when NEITHER the store NOR the archive has it (a later re-clear parks it
     back in the archive, and replay defers to that)."""
-    d = _overrides_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    with (d / (fsid + ".jsonl")).open("a") as f:
-        f.write(json.dumps({"op": "restore", "t": int(t),
-                            "nodes": {k: dict(v) for k, v in nodes.items()},
-                            "status": dict(status)}) + "\n")
+    _append_override_row(fsid, {"op": "restore", "t": int(t),
+                                "nodes": {k: dict(v) for k, v in nodes.items()},
+                                "status": dict(status)})
 def _replay_overrides(fsid, store):
     """Re-apply journaled user overrides to a freshly loaded store. Idempotent: an entry whose effect
     is already in the store (the normal case — the kernel's own save survived) is a no-op, so a node's
@@ -2723,36 +2770,53 @@ def save_goals(fsid, store):
     fleet forever. Skipping is safe precisely BECAUSE nothing changed: we have no events to contribute, so
     declining to publish can neither lose our work nor clobber a concurrent writer's. `rev` does not advance
     on a no-op, which is the honest reading of a counter that means "publications"."""
-    path = GOALDIR / (fsid + ".json")
-    with _store_file_lock(path):
-        _read_store_json(path)                       # validate before any path (including no-base writers)
-        if "_baseRev" in store and _matches_disk(fsid, store):
-            return                                   # nothing of ours to publish → leave file + mtime alone
-        candidate = store
-        base = candidate.pop("_baseRev", None)       # transient: never serialized
-        if base is not None:
-            disk = _disk_rev(fsid)
-            if disk != base:
-                _rebase_onto_disk(fsid, candidate)   # fold the current writer's events into our snapshot
-            candidate["rev"] = _disk_rev(fsid) + 1
-        else:
-            candidate["rev"] = int(candidate.get("rev") or 0) + 1
-        _atomic_json(path, candidate)
+    with _identity_file_lock():
+        fsid = canonicalize_session_identity(fsid)
+        if _CODEX_GOAL_IDENTITY_MAP:
+            mapped = canonicalize_goal_store(store)
+            store.clear()
+            store.update(mapped)                      # callers observe the rebase/publish candidate
+        path = GOALDIR / (fsid + ".json")
+        with _store_file_lock(path):
+            _read_store_json(path)                   # validate before any path (including no-base writers)
+            if "_baseRev" in store and _matches_disk(fsid, store):
+                return                               # nothing of ours to publish → leave file + mtime alone
+            candidate = store
+            base = candidate.pop("_baseRev", None)   # transient: never serialized
+            if base is not None:
+                disk = _disk_rev(fsid)
+                if disk != base:
+                    _rebase_onto_disk(fsid, candidate) # fold the current writer's events into our snapshot
+                candidate["rev"] = _disk_rev(fsid) + 1
+            else:
+                candidate["rev"] = int(candidate.get("rev") or 0) + 1
+            _atomic_json(path, candidate)
 def load_goal_archive(fsid):
     """The CLEARED-goal archive for a session (goals-archive/<fsid>.json) — dismissed top goals + their
     subtrees moved out of the live store by the kernel's compaction sweep. Same shape as the live store
     (nodes/status). The judge reads this ONLY as read-only context (_cleared_context, for the live re-plan's
     <recently-cleared> block) — its placements dedup + view-cleared sealing keep it from ever re-minting an
     archived node; the kernel's undo-clear restore and the ledger merge are the mutating readers."""
-    path = GOALARCHDIR / (fsid + ".json")
-    with _store_file_lock(path):
-        raw = _read_store_json(path, quarantine=True)
+    with _identity_file_lock():
+        fsid = canonicalize_session_identity(fsid)
+        path = GOALARCHDIR / (fsid + ".json")
+        with _store_file_lock(path):
+            raw = _read_store_json(path, quarantine=True)
     return _guard_nodes(raw) if raw is not None else {"rompUuid": fsid, "nodes": {}, "status": {}}
 def save_goal_archive(fsid, store):
-    GOALARCHDIR.mkdir(parents=True, exist_ok=True)
-    tmp = GOALARCHDIR / (fsid + ".json.tmp.%d" % os.getpid())
-    tmp.write_text(json.dumps(store))
-    tmp.rename(GOALARCHDIR / (fsid + ".json"))        # atomic publish
+    with _identity_file_lock():
+        fsid = canonicalize_session_identity(fsid)
+        if _CODEX_GOAL_IDENTITY_MAP:
+            mapped = canonicalize_goal_store(store)
+            store.clear()
+            store.update(mapped)
+        GOALARCHDIR.mkdir(parents=True, exist_ok=True)
+        path = GOALARCHDIR / (fsid + ".json")
+        with _store_file_lock(path):
+            tmp = GOALARCHDIR / (fsid + ".json.tmp.%d" % os.getpid())
+            tmp.unlink(missing_ok=True)
+            tmp.write_text(json.dumps(store))
+            tmp.rename(path)                          # atomic publish
 
 
 # The goals-archive has NONE of save_goals' rev/rebase discipline — save_goal_archive is a blind
@@ -4591,9 +4655,13 @@ def resume_lineage(sid):
 def append_episode(sid, head, fsid, t):
     """Record an observed episode head for `sid` (append-only; the caller has already established
     this head is NEW — see the kernel's boundary tick)."""
-    EPIDIR.mkdir(parents=True, exist_ok=True)
-    with (EPIDIR / (sid + ".jsonl")).open("a") as fh:
-        fh.write(json.dumps({"head": head, "fsid": fsid, "t": t}) + "\n")
+    with _identity_file_lock():
+        sid = canonicalize_session_identity(sid)
+        EPIDIR.mkdir(parents=True, exist_ok=True)
+        path = EPIDIR / (sid + ".jsonl")
+        with _store_file_lock(path):
+            with path.open("a") as fh:
+                fh.write(json.dumps({"head": head, "fsid": fsid, "t": t}) + "\n")
     _episode_memo.pop(sid, None)
 def append_episode_settle(sid, head, t, settled):
     """Annotate boundary `head` with its OWN settle record: the open cards dropped with the cleared
@@ -4602,9 +4670,16 @@ def append_episode_settle(sid, head, t, settled):
     only AFTER the head row lands (the two-writer race in the kernel's boundary check) — a seed row
     must never be able to claim a settle. episode_rows skips these rows; episode_settles reads
     them back."""
-    EPIDIR.mkdir(parents=True, exist_ok=True)
-    with (EPIDIR / (sid + ".jsonl")).open("a") as fh:
-        fh.write(json.dumps({"settleFor": head, "t": t, "settled": settled}) + "\n")
+    with _identity_file_lock():
+        sid = canonicalize_session_identity(sid)
+        settled = [dict(row, id=canonicalize_goal_identity(row.get("id")))
+                   if isinstance(row, dict) and isinstance(row.get("id"), str) else row
+                   for row in settled]
+        EPIDIR.mkdir(parents=True, exist_ok=True)
+        path = EPIDIR / (sid + ".jsonl")
+        with _store_file_lock(path):
+            with path.open("a") as fh:
+                fh.write(json.dumps({"settleFor": head, "t": t, "settled": settled}) + "\n")
     _episode_memo.pop(sid, None)
 def episode_floor(sid):
     """The current episode's start time for `sid`, or None until a /clear BOUNDARY is recorded. Both
@@ -4801,26 +4876,585 @@ def _mig_atomic(path, text):
     """Unlink-first staged publish for the migration's own records (plants + strays)."""
     tmp = path.with_name(path.name + ".mig")
     tmp.unlink(missing_ok=True)
-    tmp.write_text(text)
+    tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
 
 
-def _reid(x, tid, sid):
-    """Rewrite tid-identity prefixes anywhere in a JSON tree — keys and string values."""
+def _mig_atomic_bytes(path, data):
+    tmp = path.with_name(path.name + ".mig")
+    tmp.unlink(missing_ok=True)
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def _mig_read_bytes(path):
+    """Read one migration input without ever following a symlink or blocking on a FIFO."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("migration input is not a regular file: %s" % path)
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+
+
+def _mig_read_text(path):
+    return _mig_read_bytes(path).decode("utf-8")
+
+
+def _mig_exists(path):
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _mig_sha(data):
+    if isinstance(data, str):
+        data = data.encode()
+    return hashlib.sha256(data).hexdigest()
+
+
+_MIG_NAMESPACES = frozenset(("captions", "capfails", "arch", "goals", "goalsarch",
+                             "episodes", "journal"))
+
+
+def _mig_record(path, tid, intent=False):
+    """Read and validate one durable migration record; FileNotFoundError means absent."""
+    rec = json.loads(_mig_read_text(path))
+    if (not isinstance(rec, dict) or rec.get("tid") != tid
+            or not isinstance(rec.get("moved"), dict)):
+        raise ValueError("invalid migration record %s" % path)
+    moved = rec["moved"]
+    if (not set(moved).issubset(_MIG_NAMESPACES)
+            or any(type(v) is not bool for v in moved.values())):
+        raise ValueError("invalid migration moved ledger %s" % path)
+    for field in ("present", "preexist"):
+        value = rec.get(field)
+        if value is None:
+            if intent:
+                raise ValueError("invalid migration intent %s" % path)
+            continue
+        if (not isinstance(value, dict) or set(value) != _MIG_NAMESPACES
+                or any(type(v) is not bool for v in value.values())):
+            raise ValueError("invalid migration %s ledger %s" % (field, path))
+    present = rec.get("present")
+    if isinstance(present, dict) and any(
+            did_move and not present.get(ns) for ns, did_move in moved.items()):
+        # A namespace cannot have moved when the durable intent says its source never existed.
+        # Accepting that contradiction lets a forged/corrupt completion record manufacture goal
+        # numbering continuity and attach old shared state to unrelated SID cards.
+        raise ValueError("migration moved absent namespace in %s" % path)
+    targets = rec.get("targets", {})
+    if not isinstance(targets, dict) or not set(targets).issubset(_MIG_NAMESPACES):
+        raise ValueError("invalid migration target ledger %s" % path)
+    if not intent:
+        present = rec.get("present") or {}
+        # A completion claim is valid only when every source observed at intent time was settled.
+        # Old v1.3.15 records could mark an ambiguous SID-wins skip done while leaving the TID file
+        # active forever; rejecting that shape makes the residue visible and retryable.
+        if any(was_present and moved.get(ns) is not True
+               for ns, was_present in present.items()):
+            raise ValueError("incomplete migration done record %s" % path)
+    return rec
+
+
+def _mig_goal_continuity(rec):
+    """Whether node numbering safely moved to the SID (the same rule as journal replay)."""
+    moved, present = rec.get("moved") or {}, rec.get("present") or {}
+    return bool(moved.get("goals")
+                and (moved.get("goalsarch") or not present.get("goalsarch")))
+
+
+_CODEX_IDENTITY_MAP = {}
+_CODEX_GOAL_IDENTITY_MAP = {}
+
+
+def _map_exact_identity(value, mapping):
+    return mapping.get(value, value) if isinstance(value, str) else value
+
+
+def _map_prefixed_identity(value, mapping):
+    if not isinstance(value, str):
+        return value
+    for tid, sid in mapping.items():
+        if value == tid or value.startswith(tid + ":"):
+            return sid + value[len(tid):]
+    return value
+
+
+def _map_goal_id(value, mapping):
+    """Map one actual ``<session>:g<number>`` token, never free-form prose."""
+    if not isinstance(value, str):
+        return value
+    for tid, sid in mapping.items():
+        prefix = tid + ":g"
+        if value.startswith(prefix) and value[len(prefix):].isdigit():
+            return sid + value[len(tid):]
+    return value
+
+
+def _identity_rewrite_tokens(x, mapper):
+    """Recursively rewrite only tokens accepted by a schema-specific scalar mapper."""
     if isinstance(x, str):
-        if x == tid:
-            return sid
-        if x.startswith(tid + ":"):
-            return sid + x[len(tid):]
-        return x
+        return mapper(x)
     if isinstance(x, list):
-        return [_reid(v, tid, sid) for v in x]
+        return [_identity_rewrite_tokens(v, mapper) for v in x]
     if isinstance(x, dict):
-        return {_reid(k, tid, sid): _reid(v, tid, sid) for k, v in x.items()}
+        native, relics = [], []
+        for k, v in x.items():
+            nk = mapper(k) if isinstance(k, str) else k
+            (native if nk == k else relics).append((nk, v))
+        out = {k: _identity_rewrite_tokens(v, mapper) for k, v in native}
+        for k, v in relics:
+            out.setdefault(k, _identity_rewrite_tokens(v, mapper))
+        return GuardedNode(out) if isinstance(x, GuardedNode) else out
     return x
 
 
-def migrate_codex_identity():
+def canonicalize_session_identity(x):
+    if isinstance(x, str):
+        return _map_exact_identity(x, _CODEX_IDENTITY_MAP)
+    if isinstance(x, list):
+        return [canonicalize_session_identity(v) for v in x]
+    return x
+
+
+def canonicalize_goal_identity(x):
+    if isinstance(x, str):
+        return _map_goal_id(x, _CODEX_GOAL_IDENTITY_MAP)
+    if isinstance(x, list):
+        return [canonicalize_goal_identity(value) for value in x]
+    return x
+
+
+def canonicalize_unit_identity(x):
+    return _map_prefixed_identity(x, _CODEX_IDENTITY_MAP)
+
+
+def _canonicalize_keyed_map(blob, mapper):
+    if not isinstance(blob, dict):
+        return blob
+    native, relics = [], []
+    for key, value in blob.items():
+        new_key = mapper(key) if isinstance(key, str) else key
+        (native if new_key == key else relics).append((new_key, value))
+    out = dict(native)
+    for key, value in relics:
+        out.setdefault(key, value)                    # native SID entry wins a collision
+    return out
+
+
+def canonicalize_session_keyed_map(blob):
+    return _canonicalize_keyed_map(
+        blob, lambda value: _map_exact_identity(value, _CODEX_IDENTITY_MAP))
+
+
+def canonicalize_session_flags_identity(blob):
+    """Move flag rows by session identity without dropping disjoint fields.
+
+    A native SID row wins only a collision on the *same* flag.  Treating the
+    whole row as native-wins loses, for example, a late TID ``hideFromFeed``
+    beside an existing SID ``notify`` choice.
+    """
+    if not isinstance(blob, dict):
+        return blob
+    native, relics = [], []
+    for key, value in blob.items():
+        new_key = canonicalize_session_identity(key) if isinstance(key, str) else key
+        (native if new_key == key else relics).append((new_key, value))
+    out = dict(native)
+    for key, value in relics:
+        if key not in out:
+            out[key] = value
+        elif isinstance(value, dict) and isinstance(out[key], dict):
+            merged = dict(value)
+            merged.update(out[key])                 # native wins only same-field conflicts
+            out[key] = merged
+    return out
+
+
+def canonicalize_retry_suppressed_identity(blob):
+    """Move retry floors by session identity, keeping the most recent interrupt."""
+    if not isinstance(blob, dict):
+        return blob
+    out = {}
+    for key, value in blob.items():
+        mapped = canonicalize_session_identity(key) if isinstance(key, str) else key
+        previous = out.get(mapped)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if not isinstance(previous, (int, float)) or isinstance(previous, bool):
+                out[mapped] = value
+            else:
+                out[mapped] = max(previous, value)
+        elif mapped not in out:
+            out[mapped] = value
+    return out
+
+
+def canonicalize_session_order_identity(blob):
+    """Move ordered session slots and collapse a TID/SID collision in place."""
+    if not isinstance(blob, list):
+        return blob
+    out, seen = [], set()
+    for value in canonicalize_session_identity(blob):
+        if isinstance(value, str) and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def canonicalize_goal_keyed_map(blob):
+    return _canonicalize_keyed_map(
+        blob, lambda value: _map_goal_id(value, _CODEX_GOAL_IDENTITY_MAP))
+
+
+def canonicalize_unit_keyed_map(blob):
+    return _canonicalize_keyed_map(
+        blob, lambda value: _map_prefixed_identity(value, _CODEX_IDENTITY_MAP))
+
+
+def _map_keyed_values(blob, key_mapper, value_mapper=lambda value: value):
+    if not isinstance(blob, dict):
+        return blob
+    native, relics = [], []
+    for key, value in blob.items():
+        mapped = key_mapper(key) if isinstance(key, str) else key
+        pair = (mapped, value_mapper(value))
+        (native if mapped == key else relics).append(pair)
+    out = dict(native)
+    for key, value in relics:
+        out.setdefault(key, value)
+    return out
+
+
+def _canonicalize_goal_node(node, session_map, goal_map):
+    if not isinstance(node, dict):
+        return node
+    out = dict(node)
+    for field in ("id", "parentId", "pivotFrom"):
+        if isinstance(out.get(field), str):
+            out[field] = _map_goal_id(out[field], goal_map)
+    if isinstance(out.get("trail"), list):
+        out["trail"] = [_map_prefixed_identity(value, session_map)
+                        for value in out["trail"]]
+    if isinstance(out.get("mergedFrom"), list):
+        merged = []
+        for rec in out["mergedFrom"]:
+            if isinstance(rec, dict):
+                rec = dict(rec)
+                if isinstance(rec.get("id"), str):
+                    rec["id"] = _map_goal_id(rec["id"], goal_map)
+            merged.append(rec)
+        out["mergedFrom"] = merged
+    if isinstance(out.get("log"), list):
+        log = []
+        for rec in out["log"]:
+            if isinstance(rec, dict):
+                rec = dict(rec)
+                if isinstance(rec.get("seg"), str):
+                    rec["seg"] = _map_prefixed_identity(rec["seg"], session_map)
+            log.append(rec)
+        out["log"] = log
+    if isinstance(out.get("origin"), dict):
+        origin = dict(out["origin"])
+        if isinstance(origin.get("peer"), str):
+            origin["peer"] = _map_exact_identity(origin["peer"], session_map)
+        if isinstance(origin.get("goalId"), str):
+            origin["goalId"] = _map_goal_id(origin["goalId"], goal_map)
+        out["origin"] = origin
+    if isinstance(out.get("handoff"), dict):
+        handoff = dict(out["handoff"])
+        if isinstance(handoff.get("peer"), str):
+            handoff["peer"] = _map_exact_identity(handoff["peer"], session_map)
+        out["handoff"] = handoff
+    return GuardedNode(out) if isinstance(node, GuardedNode) else out
+
+
+def _map_group_signature(value, goal_map):
+    if not isinstance(value, str):
+        return value
+    if "#steps:" not in value:
+        return _map_goal_id(value, goal_map)
+    top, steps = value.split("#steps:", 1)
+    return "%s#steps:%s" % (_map_goal_id(top, goal_map), ",".join(
+        _map_goal_id(step, goal_map) for step in steps.split(",")))
+
+
+def _canonicalize_goal_store_with_maps(store, session_map, goal_map):
+    if not isinstance(store, dict):
+        return store
+    out = dict(store)
+    if isinstance(out.get("rompUuid"), str):
+        out["rompUuid"] = _map_exact_identity(out["rompUuid"], session_map)
+    goal_key = lambda value: _map_goal_id(value, goal_map)
+    unit_key = lambda value: _map_prefixed_identity(value, session_map)
+    if isinstance(out.get("nodes"), dict):
+        out["nodes"] = _map_keyed_values(
+            out["nodes"], goal_key,
+            lambda node: _canonicalize_goal_node(node, session_map, goal_map))
+    for field in ("status", "rewindSwept", "rewindRestored"):
+        if isinstance(out.get(field), dict):
+            out[field] = _map_keyed_values(out[field], goal_key)
+    if isinstance(out.get("placements"), dict):
+        out["placements"] = _map_keyed_values(
+            out["placements"], unit_key,
+            lambda value: _map_goal_id(value, goal_map))
+    for field in ("parseFails", "closeFails", "closedSig",
+                  "courierDeferred", "courierFails"):
+        if isinstance(out.get(field), dict):
+            out[field] = _map_keyed_values(out[field], unit_key)
+    for field in ("closedTurns", "sweptTurns"):
+        if isinstance(out.get(field), list):
+            out[field] = [unit_key(value) for value in out[field]]
+    if isinstance(out.get("lastNode"), str):
+        out["lastNode"] = goal_key(out["lastNode"])
+    if isinstance(out.get("confirming"), list):
+        out["confirming"] = [goal_key(value) for value in out["confirming"]]
+    for field in ("groupedSig", "groupFailSig"):
+        if isinstance(out.get(field), list):
+            out[field] = [_map_group_signature(value, goal_map) for value in out[field]]
+    for field in ("consolidatedSig", "consolidateFailSig"):
+        if isinstance(out.get(field), list):
+            out[field] = [goal_key(value) for value in out[field]]
+    if isinstance(out.get("seams"), list):
+        seams = []
+        for seam in out["seams"]:
+            if isinstance(seam, dict):
+                seam = dict(seam)
+                if isinstance(seam.get("top"), str):
+                    seam["top"] = goal_key(seam["top"])
+                if isinstance(seam.get("segs"), list):
+                    seam["segs"] = [unit_key(value) for value in seam["segs"]]
+            seams.append(seam)
+        out["seams"] = seams
+    return out
+
+
+def _canonicalize_override_row_with_maps(row, session_map, goal_map):
+    if not isinstance(row, dict):
+        return row
+    out = dict(row)
+    if isinstance(out.get("node"), str):
+        out["node"] = _map_goal_id(out["node"], goal_map)
+    if isinstance(out.get("nodes"), dict):
+        out["nodes"] = _map_keyed_values(
+            out["nodes"], lambda value: _map_goal_id(value, goal_map),
+            lambda node: _canonicalize_goal_node(node, session_map, goal_map))
+    if isinstance(out.get("status"), dict):
+        out["status"] = _map_keyed_values(
+            out["status"], lambda value: _map_goal_id(value, goal_map))
+    return out
+
+
+def canonicalize_goal_store(store):
+    return _canonicalize_goal_store_with_maps(
+        store, _CODEX_IDENTITY_MAP, _CODEX_GOAL_IDENTITY_MAP)
+
+
+def canonicalize_timeline_views(blob):
+    if not isinstance(blob, dict):
+        return blob
+    out = dict(blob)
+    if isinstance(out.get("hidden"), list):
+        out["hidden"] = [canonicalize_session_identity(v) for v in out["hidden"]]
+    groups = []
+    for group in out.get("groups", []) if isinstance(out.get("groups"), list) else []:
+        if not isinstance(group, dict):
+            groups.append(group)
+            continue
+        mapped = dict(group)
+        field = "members" if isinstance(mapped.get("members"), list) else "sessions"
+        if isinstance(mapped.get(field), list):
+            mapped[field] = [canonicalize_session_identity(v) for v in mapped[field]]
+        groups.append(mapped)
+    if isinstance(out.get("groups"), list):
+        out["groups"] = groups
+    return out
+
+
+def canonicalize_auto_nudge_identity(blob):
+    if not isinstance(blob, dict):
+        return blob
+    out = dict(blob)
+
+    def goal_records(records):
+        native, relics = [], []
+        for key, value in records.items():
+            new_key = canonicalize_goal_identity(key) if isinstance(key, str) else key
+            moved_owner = (new_key != key or (isinstance(key, str) and any(
+                key.startswith(sid + ":g") for sid in _CODEX_GOAL_IDENTITY_MAP.values())))
+            if moved_owner and isinstance(value, dict):
+                value = dict(value)
+                if isinstance(value.get("sid"), str):
+                    value["sid"] = canonicalize_session_identity(value["sid"])
+                if isinstance(value.get("lastTurnId"), str):
+                    value["lastTurnId"] = canonicalize_unit_identity(value["lastTurnId"])
+            pair = (new_key, value)
+            (native if new_key == key else relics).append(pair)
+        merged = dict(native)
+        for key, value in relics:
+            merged.setdefault(key, value)
+        return merged
+
+    for field in ("nudged", "deferred", "backstop"):
+        if isinstance(out.get(field), dict):
+            out[field] = goal_records(out[field])
+    if isinstance(out.get("done"), list):
+        out["done"] = [canonicalize_goal_identity(v) for v in out["done"]]
+    if isinstance(out.get("intrBlocked"), dict):
+        native, relics = [], []
+        for key, value in out["intrBlocked"].items():
+            # This record couples a session key to one of its goal ids. Session identity alone
+            # cannot move it: without proven goal continuity the value would name an unrelated
+            # future card. Preserve the pair until that continuity exists.
+            if isinstance(key, str) and key in _CODEX_GOAL_IDENTITY_MAP:
+                new_key = _CODEX_GOAL_IDENTITY_MAP[key]
+                new_value = canonicalize_goal_identity(value)
+            else:
+                new_key, new_value = key, value
+            pair = (new_key, new_value)
+            (native if new_key == key else relics).append(pair)
+        intr = dict(native)
+        for key, value in relics:
+            intr.setdefault(key, value)
+        out["intrBlocked"] = intr
+    if not isinstance(out.get("debtNudged"), dict):
+        return out
+    native, relics = {}, []
+    for key, value in out["debtNudged"].items():
+        try:
+            pair, ts = str(key).rsplit(":", 1)
+            asker, debtor = pair.split(">", 1)
+            if asker in _CODEX_IDENTITY_MAP and asker not in _CODEX_GOAL_IDENTITY_MAP:
+                # Consumers scan every debt row and load the asker's store. load_goals(TID)
+                # session-canonicalizes to SID even when goal numbering did not move, so retaining
+                # this orphan can block an unrelated fresh SID:gN. Dropping a reminder is
+                # recoverable; fabricating a verdict is not.
+                continue
+            new_key = "%s>%s:%s" % (_CODEX_GOAL_IDENTITY_MAP.get(asker, asker),
+                                      _CODEX_IDENTITY_MAP.get(debtor, debtor), ts)
+        except ValueError:
+            new_key = str(key)
+        if new_key == key:
+            native[new_key] = value
+        else:
+            relics.append((new_key, value))
+    for key, value in relics:
+        native.setdefault(key, value)
+    out = dict(out)
+    out["debtNudged"] = native
+    return out
+
+
+_IDENTITY_THREAD_LOCK = threading.RLock()
+_IDENTITY_LOCK_LOCAL = threading.local()
+
+
+@contextlib.contextmanager
+def _identity_file_lock():
+    """Serialize identity-keyed shared-file read/modify/write spans across entry points."""
+    with _IDENTITY_THREAD_LOCK:
+        depth = getattr(_IDENTITY_LOCK_LOCAL, "depth", 0)
+        if depth:
+            _IDENTITY_LOCK_LOCAL.depth = depth + 1
+            try:
+                yield
+            finally:
+                _IDENTITY_LOCK_LOCAL.depth -= 1
+            return
+        CODEXDIR.mkdir(parents=True, exist_ok=True)
+        flags = (os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_NONBLOCK", 0))
+        fd = os.open(CODEXDIR / "identity-migration.lock", flags, 0o600)
+        locked = False
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError("identity migration lock is not a regular file")
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                locked = True
+            _IDENTITY_LOCK_LOCAL.depth = 1
+            yield
+        finally:
+            _IDENTITY_LOCK_LOCAL.depth = 0
+            try:
+                if fcntl is not None and locked:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def _reid_goal_tokens(x, tid, sid):
+    return _canonicalize_override_row_with_maps(x, {tid: sid}, {tid: sid})
+
+
+def _reid_unit(value, tid, sid):
+    return _map_prefixed_identity(value, {tid: sid})
+
+
+def _reid_caption_row(row, tid, sid):
+    if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+        return row
+    out = dict(row)
+    out["id"] = _reid_unit(out["id"], tid, sid)
+    return out
+
+
+def _reid_unit_keyed(blob, tid, sid):
+    return _canonicalize_keyed_map(blob, lambda value: _reid_unit(value, tid, sid))
+
+
+def _mig_merge_preexisting(ns, old_raw, new_raw, tid, sid):
+    """Merge the namespaces whose schemas make two-name reconciliation unambiguous."""
+    if ns in ("captions", "episodes"):
+        rows, seen = [], set()
+        for raw, rewrite in ((old_raw, ns == "captions"), (new_raw, False)):
+            for line in raw.decode("utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    value = json.loads(line)
+                    if rewrite:
+                        value = _reid_caption_row(value, tid, sid)
+                    rendered = json.dumps(value)
+                    key = ("json", json.dumps(value, sort_keys=True))
+                except Exception:
+                    rendered, key = line, ("raw", line)
+                if key not in seen:
+                    seen.add(key)
+                    rows.append(rendered)
+        return ("\n".join(rows) + ("\n" if rows else "")).encode()
+    if ns == "capfails":
+        old = _reid_unit_keyed(json.loads(old_raw.decode("utf-8")), tid, sid)
+        new = json.loads(new_raw.decode("utf-8"))
+        if not isinstance(old, dict) or not isinstance(new, dict):
+            raise ValueError("caption failure ledgers must be objects")
+        merged = dict(old)
+        for key, value in new.items():
+            if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and isinstance(merged.get(key), (int, float))
+                    and not isinstance(merged.get(key), bool)):
+                merged[key] = max(value, merged[key])
+            else:
+                merged[key] = value                 # native SID state wins ambiguous values
+        return json.dumps(merged).encode()
+    return None
+
+
+def _migrate_codex_identity_locked():
     """The tid→sid identity rescue as a DURABLE PER-SESSION TRANSACTION (the v1.3.14 audit: every
     file-presence inference failed an executed crash test — a crash between the sid publish and
     the tid unlink left both files and the sid-wins skip stranded the journal forever; an
@@ -4843,42 +5477,115 @@ def migrate_codex_identity():
     continuity — the r39/r40 aliasing class). Everything idempotent; every boundary crash
     re-runs cleanly at the next entry."""
     try:
-        reg = json.loads((CODEXDIR / "registry.json").read_text())
+        reg = json.loads(_mig_read_text(CODEXDIR / "registry.json"))
     except Exception:
         return
     if not isinstance(reg, dict):
         return
     migdir = CODEXDIR / "migrated"
-    tid_to_sid = {}
-    for sid, r in reg.items():
-        if not isinstance(r, dict):
-            continue                                  # a corrupt row must not crash the BOOT
-        tid = r.get("tid") or ""
-        if not tid or tid == sid:
+    # App-server thread ids are normally UUIDs, but older registries also contain opaque ids.
+    # They are filenames throughout this migration, so validate the actual invariant: exactly
+    # one safe path component (no slash, dot-segment, control byte, or leading punctuation).
+    id_shape = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+    registry_sids = {sid for sid in reg
+                     if isinstance(sid, str) and id_shape.fullmatch(sid)}
+    raw_pairs = []
+    for sid, row in reg.items():
+        if not isinstance(sid, str) or not id_shape.fullmatch(sid):
+            sys.stderr.write("codex identity migration: invalid sid; skipping registry row\n")
             continue
-        tid_to_sid[tid] = sid
+        if not isinstance(row, dict):
+            continue
+        tid = row.get("tid")
+        if tid is None or tid == sid:
+            continue
+        if not isinstance(tid, str) or not id_shape.fullmatch(tid):
+            sys.stderr.write("codex identity migration %s: invalid tid; skipping\n" % sid[:8])
+            continue
+        raw_pairs.append((sid, tid))
+    tid_counts = {}
+    for _sid, tid in raw_pairs:
+        tid_counts[tid] = tid_counts.get(tid, 0) + 1
+    ambiguous = {tid for tid, count in tid_counts.items() if count != 1}
+    ambiguous.update(tid for _sid, tid in raw_pairs if tid in registry_sids)
+    for sid, tid in raw_pairs:
+        if tid in ambiguous:
+            sys.stderr.write("codex identity migration %s->%s: ambiguous registry identity; "
+                             "leaving stores untouched\n" % (tid[:8], sid[:8]))
+    pairs = [(sid, tid) for sid, tid in raw_pairs if tid not in ambiguous]
+    tid_to_sid = {tid: sid for sid, tid in pairs}
+    goal_tid_to_sid = {}
+    # Session identity is authoritative in registry.json, independent of whether legacy goal
+    # numbering can be proved continuous. Publish this map before a caught migration failure can
+    # return to normal writers, so an old TID filename is never recreated after its move.
+    _CODEX_IDENTITY_MAP.clear()
+    _CODEX_IDENTITY_MAP.update(tid_to_sid)
+    _CODEX_GOAL_IDENTITY_MAP.clear()
+    for sid, tid in pairs:
         done_p, intent_p = migdir / (sid + ".done"), migdir / (sid + ".intent")
+        # (namespace key, dir, old name, new name, transform). Goal stores run first: only their
+        # completed move proves that goal ids may safely follow the session id mapping.
+        plan = (("goals", GOALDIR, tid + ".json", sid + ".json", "tree"),
+                ("goalsarch", GOALARCHDIR, tid + ".json", sid + ".json", "tree"),
+                ("captions", CAPDIR, tid + ".jsonl", sid + ".jsonl", "rows"),
+                ("capfails", CAPDIR, tid + ".fails.json", sid + ".fails.json", "tree"),
+                ("arch", ARCHDIR, tid + ".json", sid + ".json", "copy"),
+                ("episodes", EPIDIR, tid + ".jsonl", sid + ".jsonl", "copy"),
+                ("journal", _overrides_dir(), tid + ".jsonl", sid + ".jsonl", "journal"))
         try:
-            if done_p.exists():
+            done = None
+            carried_goal_proof = None
+            retire_done = False
+            try:
+                done = _mig_record(done_p, tid)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                # A broken completion claim is not completion. Treat it as absent and rebuild
+                # conservatively from file state; the no-intent path's durable SID-wins rule makes
+                # this safe even when the old and new names both remain.
+                sys.stderr.write("codex identity migration %s->%s: ignoring invalid done record: %s\n"
+                                 % (tid[:8], sid[:8], e))
+            if done is not None:
+                late = [ns for ns, d, old, _new, _kind in plan if _mig_exists(d / old)]
+                if not late:
+                    if _mig_goal_continuity(done):
+                        goal_tid_to_sid[tid] = sid
+                        _CODEX_GOAL_IDENTITY_MAP[tid] = sid
+                    continue
+                # A completion marker is not permission to ignore a writer that arrived later.
+                # Retire the stale claim and let the ordinary preexist transaction either merge a
+                # safe append-only namespace or preserve both ambiguous goal stores fail-closed.
+                sys.stderr.write("codex identity migration %s->%s: legacy sources appeared after "
+                                 "completion (%s); reopening\n"
+                                 % (tid[:8], sid[:8], ",".join(late)))
+                if (_mig_goal_continuity(done)
+                        and not any(ns in ("goals", "goalsarch") for ns in late)):
+                    carried_goal_proof = done
+                retire_done = True
+            try:
+                intent = _mig_record(intent_p, tid, intent=True)
+                resumed = True
+            except FileNotFoundError:
+                intent, resumed = None, False
+            except Exception as e:
+                # Ownership is unknowable without the record: inventing empty preexist metadata
+                # converts a fresh SID writer into "our partial publish" and destroys it.
+                sys.stderr.write("codex identity migration %s->%s: invalid intent; refusing: %s\n"
+                                 % (tid[:8], sid[:8], e))
                 continue
-            # (namespace key, dir, old name, new name, transform)
-            plan = (("captions", CAPDIR, tid + ".jsonl", sid + ".jsonl", "rows"),
-                    ("capfails", CAPDIR, tid + ".fails.json", sid + ".fails.json", "tree"),
-                    ("arch", ARCHDIR, tid + ".json", sid + ".json", "copy"),
-                    ("goals", GOALDIR, tid + ".json", sid + ".json", "tree"),
-                    ("goalsarch", GOALARCHDIR, tid + ".json", sid + ".json", "tree"),
-                    ("episodes", EPIDIR, tid + ".jsonl", sid + ".jsonl", "copy"),
-                    ("journal", _overrides_dir(), tid + ".jsonl", sid + ".jsonl", "journal"))
-            resumed = intent_p.exists()
-            if resumed:
-                try:
-                    intent = json.loads(intent_p.read_text())
-                    assert isinstance(intent, dict) and isinstance(intent.get("moved"), dict)
-                except Exception:
-                    intent = {"tid": tid, "moved": {}, "present": {}, "preexist": {}}
-            else:
-                present = {ns: (d / old).exists() for ns, d, old, _n, _t in plan}
+            if resumed and retire_done:
+                # The replacement intent is already durable. Only now may the older completion
+                # claim go away; a crash with both records present simply repeats this reopen.
+                done_p.unlink(missing_ok=True)
+            if not resumed:
+                present = {ns: _mig_exists(d / old) for ns, d, old, _n, _t in plan}
                 if not any(present.values()):
+                    if retire_done:
+                        if _mig_goal_continuity(done):
+                            goal_tid_to_sid[tid] = sid
+                            _CODEX_GOAL_IDENTITY_MAP[tid] = sid
+                        continue                      # the late source vanished; original proof still holds
                     migdir.mkdir(parents=True, exist_ok=True)
                     _mig_atomic(done_p, json.dumps({"tid": tid, "moved": {}}))
                     continue                          # nothing ever to migrate: settled
@@ -4887,78 +5594,203 @@ def migrate_codex_identity():
                 # turned the protection off at the first retry, and the tid relic re-published
                 # over real post-upgrade work and unlinked the evidence (the r42 verification,
                 # executed twice: an injected crash, and a plain corrupt sibling namespace)
-                preexist = {ns: (d / new).exists() for ns, d, _o, new, _t in plan}
-                intent = {"tid": tid, "moved": {}, "present": present, "preexist": preexist}
+                preexist = {ns: _mig_exists(d / new) for ns, d, _o, new, _t in plan}
+                intent = {"tid": tid, "moved": {}, "present": present,
+                          "preexist": preexist, "targets": {}}
+                if carried_goal_proof is not None:
+                    # Reopening for a late caption/episode/etc. must not erase the durable proof
+                    # that goal numbering already moved. Only a new goal/archive source makes
+                    # that proof ambiguous; unrelated namespaces inherit the settled goal ledger.
+                    for ns in ("goals", "goalsarch"):
+                        if ns in (carried_goal_proof.get("present") or {}):
+                            intent["present"][ns] = carried_goal_proof["present"][ns]
+                        if ns in (carried_goal_proof.get("moved") or {}):
+                            intent["moved"][ns] = carried_goal_proof["moved"][ns]
+                        if ns in (carried_goal_proof.get("preexist") or {}):
+                            intent["preexist"][ns] = carried_goal_proof["preexist"][ns]
+                        if ns in (carried_goal_proof.get("targets") or {}):
+                            intent["targets"][ns] = carried_goal_proof["targets"][ns]
                 migdir.mkdir(parents=True, exist_ok=True)
                 _mig_atomic(intent_p, json.dumps(intent))   # the INTENT lands before anything moves
+                if retire_done:
+                    done_p.unlink(missing_ok=True)          # and before the prior proof is retired
             moved = intent.setdefault("moved", {})
+            targets = intent.setdefault("targets", {})
+            if not isinstance(targets, dict):
+                raise ValueError("invalid migration target ledger")
             failed = False
             for ns, d, old_name, new_name, kind in plan:
                 old_p, new_p = d / old_name, d / new_name
+                ns_lock = _store_file_locks(old_p, new_p)
                 try:
-                    if not old_p.exists():
+                    ns_lock.__enter__()
+                except Exception as e:
+                    failed = True
+                    sys.stderr.write("codex identity migration %s->%s (%s lock): %s\n"
+                                     % (tid[:8], sid[:8], d.name, e))
+                    continue
+                try:
+                    if not _mig_exists(old_p):
                         continue                      # absent: moved on a prior run, or never was
+                    if not (intent.get("present") or {}).get(ns):
+                        # A legacy writer appeared after the durable ownership snapshot. Folding
+                        # it into this transaction would create moved=true/present=false and, more
+                        # importantly, guess that the late bytes belong before the SID's current
+                        # state. Preserve the source and keep the transaction visibly unsettled.
+                        failed = True
+                        sys.stderr.write("codex identity migration %s->%s: late %s source; "
+                                         "leaving it untouched\n" % (tid[:8], sid[:8], ns))
+                        continue
+                    if moved.get(ns):
+                        # The write-ahead moved bit proves the SID publish completed. Never publish
+                        # the old bytes again: a writer may have advanced the SID store since then.
+                        _mig_read_bytes(new_p)         # missing/special target: preserve both, fail
+                        if _mig_goal_continuity(intent):
+                            goal_tid_to_sid[tid] = sid
+                            _CODEX_GOAL_IDENTITY_MAP[tid] = sid
+                        old_p.unlink(missing_ok=True)
+                        continue
                     if kind == "journal":
                         # numbering continuity: the journal's node ids only mean anything on the
                         # store THIS transaction moved (the r39/r40 aliasing class, executed) —
                         # goals must have moved, and the goal-archive must be settled by our own
                         # move or by never having existed
-                        pres = intent.get("present") or {}
-                        ok = (moved.get("goals")
-                              and (moved.get("goalsarch") or not pres.get("goalsarch")))
-                        if not ok:
+                        if not _mig_goal_continuity(intent):
+                            failed = True
                             continue                  # orphaned relic: verdicts LOST are
                         #                               recoverable by hand; FABRICATED are not
                         rows = []
-                        for ln in old_p.read_text().splitlines():
+                        old_raw = _mig_read_text(old_p)
+                        for ln in old_raw.splitlines():
                             if not ln.strip():
                                 continue
                             try:
-                                rows.append(json.dumps(_reid(json.loads(ln), tid, sid)))
+                                rows.append(json.dumps(_reid_goal_tokens(
+                                    json.loads(ln), tid, sid)))
                             except Exception:
                                 rows.append(ln)       # an unparseable row rides verbatim
-                        tail = new_p.read_text() if new_p.exists() else ""
-                        _mig_atomic(new_p, "\n".join(rows) + ("\n" if rows else "") + tail)
-                        old_p.unlink(missing_ok=True)
+                        prefix = "\n".join(rows) + ("\n" if rows else "")
+                        try:
+                            tail = _mig_read_text(new_p)
+                        except FileNotFoundError:
+                            tail = ""
+                        meta = targets.get(ns)
+                        if meta is None:
+                            # A v1.3.15 crash may already have published the prefix before this
+                            # target ledger existed. Recognize that exact legacy survivor rather
+                            # than prepending it again.
+                            body = tail if tail.startswith(prefix) else prefix + tail
+                            meta = {"source": _mig_sha(old_raw), "base": _mig_sha(tail),
+                                    "target": _mig_sha(body)}
+                            targets[ns] = meta
+                            _mig_atomic(intent_p, json.dumps(intent))
+                        if (not isinstance(meta, dict) or meta.get("source") != _mig_sha(old_raw)
+                                or not all(isinstance(meta.get(k), str)
+                                           for k in ("base", "target"))):
+                            raise RuntimeError("journal source changed during migration")
+                        cur_sha = _mig_sha(tail)
+                        if cur_sha == meta["target"]:
+                            pass                       # prior publish completed
+                        elif cur_sha == meta["base"]:
+                            body = prefix + tail
+                            if _mig_sha(body) != meta["target"]:
+                                raise RuntimeError("journal merge plan no longer matches")
+                            _mig_atomic(new_p, body)
+                        else:
+                            raise RuntimeError("journal target changed during migration")
                         moved[ns] = True
+                        _mig_atomic(intent_p, json.dumps(intent))
+                        old_p.unlink(missing_ok=True)
                         continue
-                    if new_p.exists() and (intent.get("preexist") or {}).get(ns):
-                        # a PRE-TRANSACTIONAL relic (the sid file predates our intent): it may
-                        # hold real post-upgrade work — sid wins, loudly, the relic stays
-                        # inert, and the decision is durable across every retry
+
+                    if (intent.get("preexist") or {}).get(ns):
+                        old_raw = _mig_read_bytes(old_p)
+                        new_raw = _mig_read_bytes(new_p)
+                        payload = _mig_merge_preexisting(ns, old_raw, new_raw, tid, sid)
+                        if payload is not None:
+                            meta = targets.get(ns)
+                            expected = {"source": _mig_sha(old_raw), "base": _mig_sha(new_raw),
+                                        "target": _mig_sha(payload)}
+                            if meta is None:
+                                targets[ns] = meta = expected
+                                _mig_atomic(intent_p, json.dumps(intent))
+                            if meta != expected:
+                                # A prior publish changes `new_raw` from base to target. Accept that
+                                # exact survivor; anything else is a real intervening SID writer.
+                                if (not isinstance(meta, dict)
+                                        or meta.get("source") != _mig_sha(old_raw)
+                                        or _mig_sha(new_raw) != meta.get("target")):
+                                    raise RuntimeError("%s merge state changed" % ns)
+                            elif _mig_sha(new_raw) == meta["base"]:
+                                if kind == "copy":
+                                    _mig_atomic_bytes(new_p, payload)
+                                else:
+                                    _mig_atomic(new_p, payload.decode("utf-8"))
+                            moved[ns] = True
+                            _mig_atomic(intent_p, json.dumps(intent))
+                            if _mig_goal_continuity(intent):
+                                goal_tid_to_sid[tid] = sid
+                                _CODEX_GOAL_IDENTITY_MAP[tid] = sid
+                            old_p.unlink(missing_ok=True)
+                            continue
+                        # The SID won at intent time. That decision is permanent even if its file is
+                        # later removed; resurrecting the TID relic would undo an explicit delete.
+                        failed = True
                         sys.stderr.write("codex identity migration %s->%s: %s/%s pre-existed "
                                          "the transaction — keeping the sid file; the tid "
                                          "relic is yours to reconcile\n"
                                          % (tid[:8], sid[:8], d.name, new_name))
                         continue
-                    # ours to (re-)publish: with a standing intent, the OLD file is authoritative
+
+                    # Persist the exact source/target hashes BEFORE publishing. A caught failure
+                    # returns to normal service, so a later SID file may be a legitimate writer —
+                    # only our exact target may be resumed or unlinked on the next boot.
                     if kind == "copy":
-                        data = old_p.read_bytes()
-                        tmp = new_p.with_name(new_p.name + ".mig")
-                        tmp.unlink(missing_ok=True)
-                        tmp.write_bytes(data)
-                        os.replace(tmp, new_p)
-                        moved[ns] = True
-                        _mig_atomic(intent_p, json.dumps(intent))   # write-AHEAD of the unlink
-                        old_p.unlink(missing_ok=True)
-                        continue
-                    if kind == "rows":
+                        source = payload = _mig_read_bytes(old_p)
+                    elif kind == "rows":
+                        source = _mig_read_bytes(old_p)
                         out = []
-                        for ln in old_p.read_text().splitlines():
+                        for ln in source.decode("utf-8").splitlines():
                             if not ln.strip():
                                 continue
                             try:
-                                out.append(json.dumps(_reid(json.loads(ln), tid, sid)))
+                                out.append(json.dumps(_reid_caption_row(
+                                    json.loads(ln), tid, sid)))
                             except Exception:
                                 out.append(ln)
-                        _mig_atomic(new_p, "\n".join(out) + ("\n" if out else ""))
-                    else:                             # "tree"
-                        store = _reid(json.loads(old_p.read_text()), tid, sid)
-                        if isinstance(store, dict) and ns in ("goals", "goalsarch"):
-                            store["rompUuid"] = sid
-                        _mig_atomic(new_p, json.dumps(store))
+                        payload = ("\n".join(out) + ("\n" if out else "")).encode()
+                    else:                               # "tree"
+                        source = _mig_read_bytes(old_p)
+                        store = json.loads(source.decode("utf-8"))
+                        if ns == "capfails":
+                            store = _reid_unit_keyed(store, tid, sid)
+                        else:
+                            store = _canonicalize_goal_store_with_maps(
+                                store, {tid: sid}, {tid: sid})
+                        payload = json.dumps(store).encode()
+                    meta = targets.get(ns)
+                    expected = {"source": _mig_sha(source), "target": _mig_sha(payload)}
+                    if meta is None:
+                        targets[ns] = meta = expected
+                        _mig_atomic(intent_p, json.dumps(intent))
+                    if meta != expected:
+                        raise RuntimeError("%s source changed during migration" % ns)
+                    try:
+                        current = _mig_read_bytes(new_p)
+                    except FileNotFoundError:
+                        current = None
+                    if current is not None and _mig_sha(current) != meta["target"]:
+                        raise RuntimeError("%s target changed during migration" % ns)
+                    if current is None:
+                        if kind == "copy":
+                            _mig_atomic_bytes(new_p, payload)
+                        else:
+                            _mig_atomic(new_p, payload.decode("utf-8"))
                     moved[ns] = True
                     _mig_atomic(intent_p, json.dumps(intent))       # write-AHEAD of the unlink:
+                    if _mig_goal_continuity(intent):
+                        goal_tid_to_sid[tid] = sid
+                        _CODEX_GOAL_IDENTITY_MAP[tid] = sid
                     #                                   a crash in the unlink gap used to leave
                     #                                   the store moved with the ledger empty —
                     #                                   the retry skipped it and sealed the
@@ -4968,62 +5800,112 @@ def migrate_codex_identity():
                     failed = True
                     sys.stderr.write("codex identity migration %s->%s (%s): %s\n"
                                      % (tid[:8], sid[:8], d.name, e))
+                finally:
+                    ns_lock.__exit__(None, None, None)
                 # the ledger is durable after EVERY namespace: a crash resumes knowing which
                 # moves were OURS (the v1.3.14 audit's crash-ordering requirement)
                 try:
                     _mig_atomic(intent_p, json.dumps(intent))
                 except Exception:
                     pass
+            unsettled = [ns for ns, was_present in (intent.get("present") or {}).items()
+                         if was_present and moved.get(ns) is not True]
+            if unsettled:
+                failed = True
+                sys.stderr.write("codex identity migration %s->%s: unsettled namespaces: %s\n"
+                                 % (tid[:8], sid[:8], ",".join(unsettled)))
             if not failed:
                 _mig_atomic(done_p, json.dumps(intent))
                 intent_p.unlink(missing_ok=True)
+                if _mig_goal_continuity(intent):
+                    goal_tid_to_sid[tid] = sid
         except Exception as e:
             sys.stderr.write("codex identity migration %s->%s: %s\n" % (tid[:8], sid[:8], e))
-    _migrate_shared_identity_files(tid_to_sid)
+    _CODEX_IDENTITY_MAP.clear()
+    _CODEX_IDENTITY_MAP.update(tid_to_sid)
+    _CODEX_GOAL_IDENTITY_MAP.clear()
+    _CODEX_GOAL_IDENTITY_MAP.update(goal_tid_to_sid)
+    _migrate_shared_identity_files(tid_to_sid, goal_tid_to_sid)
 
 
-def _migrate_shared_identity_files(tid_to_sid):
-    """The SHARED identity-keyed files (one file, many sessions): cleared.jsonl rows,
-    notify-cards keys, auto-nudge state, nudge-events rows, the judge-auth latch, and the
-    timeline views — each held tid references that detached from the migrated session (the
-    v1.3.14 audit's P2 cluster). Idempotent: after one pass no tid strings remain, and an
-    unchanged file is never rewritten."""
+def migrate_codex_identity():
+    # The transaction catches namespace failures and deliberately returns to service. Writers use
+    # this same lock, so none can publish into the checked ownership window before the maps and
+    # durable ledger are ready.
+    with _identity_file_lock():
+        _migrate_codex_identity_locked()
+
+
+def _migrate_shared_identity_files(tid_to_sid, goal_tid_to_sid=None):
+    """Move shared identities without attaching old card state to unrelated SID numbering."""
     if not tid_to_sid:
         return
+    goal_tid_to_sid = goal_tid_to_sid or {}
 
-    def _reid_all(x):
-        for tid, sid in tid_to_sid.items():
-            x = _reid(x, tid, sid)
-        return x
+    def _cleared(row):
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+            return row
+        out = dict(row)
+        out["id"] = _map_goal_id(out["id"], goal_tid_to_sid)
+        return out
 
-    for name, jsonl in (("cleared.jsonl", True), ("nudge-events.jsonl", True),
-                        ("notify-cards.json", False), ("auto-nudge.json", False),
-                        ("judge-auth.json", False), ("timeline-views.json", False)):
+    def _nudge_event(row):
+        if not isinstance(row, dict):
+            return row
+        out = dict(row)
+        if isinstance(out.get("sid"), str):
+            out["sid"] = _map_exact_identity(out["sid"], tid_to_sid)
+        if isinstance(out.get("gid"), str):
+            out["gid"] = _map_goal_id(out["gid"], goal_tid_to_sid)
+        return out
+
+    def _rewrite(name, transform, jsonl=False):
         p = STATE / name
         try:
-            if not p.exists() or not p.is_file():
-                continue
+            raw = _mig_read_text(p)
             if jsonl:
                 out, changed = [], False
-                for ln in p.read_text().splitlines():
+                for ln in raw.splitlines():
                     if not ln.strip():
                         continue
                     try:
-                        new = json.dumps(_reid_all(json.loads(ln)))
-                        changed = changed or (new != ln)
-                        out.append(new)
+                        original = json.loads(ln)
+                        value = transform(original)
+                        if value != original:
+                            changed = True
+                            out.append(json.dumps(value))
+                        else:
+                            out.append(ln)
                     except Exception:
                         out.append(ln)
+                text = "\n".join(out) + ("\n" if out else "")
                 if changed:
-                    _mig_atomic(p, "\n".join(out) + ("\n" if out else ""))
+                    _mig_atomic(p, text)
             else:
-                raw = p.read_text()
                 cur = json.loads(raw)
-                new = _reid_all(cur)
+                new = transform(cur)
                 if new != cur:
                     _mig_atomic(p, json.dumps(new, sort_keys=True))
+        except FileNotFoundError:
+            pass
         except Exception as e:
             sys.stderr.write("codex identity migration (%s): %s\n" % (name, e))
+
+    # Every new writer of these files takes this same process+flock lock. Each transform names
+    # the identity-bearing fields in that file; notes, group names, captions, and other user text
+    # are opaque even when they happen to begin with an old id.
+    with _identity_file_lock():
+        _rewrite("cleared.jsonl", _cleared, jsonl=True)
+        _rewrite("nudge-events.jsonl", _nudge_event, jsonl=True)
+        _rewrite("notify-cards.json", canonicalize_goal_keyed_map)
+        _rewrite("auto-nudge.json", canonicalize_auto_nudge_identity)
+        _rewrite("judge-auth.json", canonicalize_session_keyed_map)
+        _rewrite("session-flags.json", canonicalize_session_flags_identity)
+        _rewrite("session-order.json", canonicalize_session_order_identity)
+        _rewrite("retry-suppressed.json", canonicalize_retry_suppressed_identity)
+        _rewrite("timeline-views.json", canonicalize_timeline_views)
+        _rewrite("timeline-dismissed.json", canonicalize_session_identity)
+    _auth_cache[:] = [None, {}]
 
 
 def _codex_rows(cutoff, seen):
@@ -7117,13 +7999,18 @@ def _apply_echo_clears(fsid, store, targets, batch_t, now, why):
     archives the cleared roots on the kernel's next pass."""
     if not targets:
         return 0
-    with (STATE / "cleared.jsonl").open("a") as fh:
+    with _identity_file_lock():
+        fsid = canonicalize_session_identity(fsid)
+        targets = [canonicalize_goal_identity(tid) for tid in targets]
+        if any(tid not in store.get("nodes", {}) for tid in targets):
+            store = load_goals(fsid)
+        with (STATE / "cleared.jsonl").open("a") as fh:
+            for tid in targets:
+                fh.write(json.dumps({"id": tid, "t": batch_t, "op": "clear"}) + "\n")
         for tid in targets:
-            fh.write(json.dumps({"id": tid, "t": batch_t, "op": "clear"}) + "\n")
-    for tid in targets:
-        record_verdict(store, store["nodes"][tid], "romp", "clear", now, why=why)
-    rollup_status(store, False)
-    save_goals(fsid, store)
+            record_verdict(store, store["nodes"][tid], "romp", "clear", now, why=why)
+        rollup_status(store, False)
+        save_goals(fsid, store)
     return len(targets)
 def run_echo_backfill(now=None, age=86400, window=45 * 86400, max_passes=20, verbose=True, apply=False):
     """The one-time placement backfill for the 435d9df parse-identity echoes (the user 2026-07-26,

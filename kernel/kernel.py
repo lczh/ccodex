@@ -799,13 +799,15 @@ def _set_session_color(sid, bg):
     on the session's next resume."""
     if not pal.find(bg):
         return False
-    try:
-        parts = (NAMES / sid).read_text().rstrip("\n").split("\t")
-    except Exception:
-        return False
-    name = parts[0] if parts else ""
-    cwd = parts[1] if len(parts) > 1 else ""
-    _atomic_write(NAMES / sid, "\t".join([name, cwd, bg, pal.fg_for(bg)]) + "\n")
+    with jd._identity_file_lock():
+        sid = jd.canonicalize_session_identity(sid)
+        try:
+            parts = (NAMES / sid).read_text().rstrip("\n").split("\t")
+        except Exception:
+            return False
+        name = parts[0] if parts else ""
+        cwd = parts[1] if len(parts) > 1 else ""
+        _atomic_write(NAMES / sid, "\t".join([name, cwd, bg, pal.fg_for(bg)]) + "\n")
     return True
 
 
@@ -1367,7 +1369,8 @@ def _session_order():
     (parity with the old UI's session-order.json). [] when unset."""
     try:
         a = json.loads((jd.STATE / "session-order.json").read_text())
-        return [x for x in a if isinstance(x, str)] if isinstance(a, list) else []
+        rows = [x for x in a if isinstance(x, str)] if isinstance(a, list) else []
+        return jd.canonicalize_session_identity(rows)
     except Exception:
         return []
 
@@ -1463,9 +1466,16 @@ def _order_audit(kind, old, new, stack=None, only_permuted=False):
 def _write_session_order(order):
     if not isinstance(order, list):
         return
-    new = [x for x in order if isinstance(x, str)]
-    _order_audit("persist", _session_order(), new)   # every mutation of the authoritative order, with its stack
-    _atomic_write(jd.STATE / "session-order.json", json.dumps(new))
+    with jd._identity_file_lock():
+        mapped = jd.canonicalize_session_identity(
+            [x for x in order if isinstance(x, str)])
+        new, seen = [], set()
+        for sid in mapped:
+            if sid not in seen:
+                seen.add(sid)
+                new.append(sid)
+        _order_audit("persist", _session_order(), new)   # every authoritative mutation
+        _atomic_write(jd.STATE / "session-order.json", json.dumps(new))
 
 
 def _gc_session_order(known):
@@ -1475,10 +1485,11 @@ def _gc_session_order(known):
     it so a closed / aged-out session falls out on its own). Everything still around keeps its EXACT slot —
     only truly-absent sids are removed, and since the discover window only slides FORWARD a pruned sid never
     flickers back to reclaim a slot. Writes only when something actually changed (no churn on the hot path)."""
-    order = _session_order()
-    kept = [sid for sid in order if sid in known]
-    if kept != order:
-        _write_session_order(kept)
+    with jd._identity_file_lock():
+        order = _session_order()
+        kept = [sid for sid in order if sid in known]
+        if kept != order:
+            _write_session_order(kept)
 
 
 def _merge_session_order(incoming):
@@ -1490,24 +1501,34 @@ def _merge_session_order(incoming):
     this, a chat-tab drag OVERWROTE session-order.json with just the chat tabs, dropping every timeline-only
     sid's slot, so those lanes jumped — a drag that auto-reordered untouched lanes.) Returns the merged full
     SID order (deduped, strings only)."""
-    incoming = [x for x in incoming if isinstance(x, str)]
-    existing = _session_order()
-    inset = set(incoming)
-    queue = list(incoming)
-    merged = []
-    for sid in existing:
-        if sid in inset:
-            if queue:
-                merged.append(queue.pop(0))   # a dragged slot → fill from incoming, in the new order
-            # queue exhausted (existing held a dup of a dragged sid) → drop this slot; the de-dup below covers it
-        else:
-            merged.append(sid)                # a lane the drag didn't touch → keep its slot
-    merged.extend(queue)                      # any brand-new dragged sids → append at the end
-    seen = set()
-    return [s for s in merged if not (s in seen or seen.add(s))]
+    with jd._identity_file_lock():
+        incoming = jd.canonicalize_session_identity(
+            [x for x in incoming if isinstance(x, str)])
+        existing = _session_order()
+        inset = set(incoming)
+        queue = list(incoming)
+        merged = []
+        for sid in existing:
+            if sid in inset:
+                if queue:
+                    merged.append(queue.pop(0))   # a dragged slot → fill from incoming, in the new order
+                # queue exhausted (existing held a dup of a dragged sid) → drop this slot; the de-dup below covers it
+            else:
+                merged.append(sid)                # a lane the drag didn't touch → keep its slot
+        merged.extend(queue)                      # any brand-new dragged sids → append at the end
+        seen = set()
+        return [s for s in merged if not (s in seen or seen.add(s))]
 
 
-def _ordered(sessions):
+def _merge_and_write_session_order(incoming):
+    """Merge a partial drag and publish it against the same locked snapshot."""
+    with jd._identity_file_lock():
+        merged = _merge_session_order(incoming)
+        _write_session_order(merged)
+        return merged
+
+
+def _ordered_locked(sessions):
     """Order session dicts STRICTLY by the shared, persisted session order (session-order.json) — and by
     NOTHING else. A session already in the order keeps its saved slot; a session NEW to the order is
     appended ONCE at the END (in the order given) and persisted, so it keeps that fixed slot forever.
@@ -1550,6 +1571,12 @@ def _ordered(sessions):
         _write_session_order(order)
     idx = {sid: i for i, sid in enumerate(order)}
     return sorted(sessions, key=lambda s: idx.get(s["sid"], len(idx)))   # stable sort: ties keep input order
+
+
+def _ordered(sessions):
+    """Discover and persist new slots as one identity-state transaction."""
+    with jd._identity_file_lock():
+        return _ordered_locked(sessions)
 
 
 def _ordered_alive(now, tmux):
@@ -1626,7 +1653,9 @@ def _timeline_views():
 
 
 def _set_timeline_views(blob):
-    _atomic_write(_views_path(), json.dumps(_norm_timeline_views(blob), sort_keys=True))
+    with jd._identity_file_lock():
+        blob = jd.canonicalize_timeline_views(blob)
+        _atomic_write(_views_path(), json.dumps(_norm_timeline_views(blob), sort_keys=True))
 
 
 def _view_visible(views, sid):
@@ -1645,20 +1674,21 @@ def _heal_timeline_views(old_sid, new_sid):
     session): carry the old sid's hidden bit and group memberships to the new one, exactly like the
     order-slot inheritance that detects the churn. Without this a hidden tmux session would pop back
     visible on every /clear — and worse, a grouped one would silently fall out of its group."""
-    v = _timeline_views()
-    if old_sid not in v["hidden"] and not any(old_sid in g["members"] for g in v["groups"]):
-        return
-    v = json.loads(json.dumps(v))                    # deep copy: never mutate the cached blob
-    # COPY, never move: stripping the old sid un-hid its DEAD lane, which lingers on the timeline for
-    # hours — and when the old sid is still alive (a fork beside a living parent, or an unrelated new
-    # session reusing a name), moving would steal the living session's state. A dead sid left in the
-    # lists is inert; the normalizer keeps them bounded.
-    if old_sid in v["hidden"]:
-        v["hidden"] = sorted(set(v["hidden"]) | {new_sid})
-    for g in v["groups"]:
-        if old_sid in g["members"]:
-            g["members"] = sorted(set(g["members"]) | {new_sid})
-    _set_timeline_views(v)
+    with jd._identity_file_lock():
+        v = _timeline_views()
+        if old_sid not in v["hidden"] and not any(old_sid in g["members"] for g in v["groups"]):
+            return
+        v = json.loads(json.dumps(v))                # deep copy: never mutate the cached blob
+        # COPY, never move: stripping the old sid un-hid its DEAD lane, which lingers on the timeline for
+        # hours — and when the old sid is still alive (a fork beside a living parent, or an unrelated new
+        # session reusing a name), moving would steal the living session's state. A dead sid left in the
+        # lists is inert; the normalizer keeps them bounded.
+        if old_sid in v["hidden"]:
+            v["hidden"] = sorted(set(v["hidden"]) | {new_sid})
+        for g in v["groups"]:
+            if old_sid in g["members"]:
+                g["members"] = sorted(set(g["members"]) | {new_sid})
+        _set_timeline_views(v)
 
 
 # ── per-session view flags (the user 2026-06-19) ──────────────────────────────────────────────────
@@ -1680,7 +1710,7 @@ def _session_flags():
     if hit is not None and hit[0] == key:
         return hit[1]
     try:
-        d = json.loads(p.read_text())
+        d = jd.canonicalize_session_flags_identity(json.loads(p.read_text()))
         if not isinstance(d, dict):
             d = {}
     except Exception:
@@ -1704,17 +1734,20 @@ def _session_flag_raw(sid, flag):
 
 
 def _set_session_flag(sid, flag, value):
-    cur = dict(_session_flags())                     # copy: never mutate the cached dict in place
-    f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
-    if value:
-        f[flag] = True
-    else:
-        f.pop(flag, None)
-    if f:
-        cur[sid] = f
-    else:
-        cur.pop(sid, None)
-    _atomic_write(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
+    with jd._identity_file_lock():
+        sid = jd.canonicalize_session_identity(sid)
+        cur = jd.canonicalize_session_flags_identity(
+            dict(_session_flags()))                  # commit-time snapshot + identity
+        f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
+        if value:
+            f[flag] = True
+        else:
+            f.pop(flag, None)
+        if f:
+            cur[sid] = f
+        else:
+            cur.pop(sid, None)
+        _atomic_write(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
     if flag == "hideFromFeed" and value:
         # Muting takes the session OUT of task tracking → VIEW-CLEAR its current goals: seal them exactly like
         # crossing each card off the feed (cleared.jsonl + the durable node flag), NOT delete — they stay on
@@ -1722,18 +1755,21 @@ def _set_session_flag(sid, flag, value):
         # don't resurface, and the planner — already gated off for muted sessions — doesn't re-accumulate). No
         # delegation cascade (unlike _clear_all): muting X must NOT clear a peer's copy of a goal X delegated.
         try:
-            store = jd.load_goals(sid)
-            nodes, status = store.get("nodes", {}), store.get("status", {})
-            tops = [nid for nid, nd in nodes.items()
-                    if nd.get("parentId") is None and not nd.get("cleared") and status.get(nid) != "cleared"]
-            if tops:
-                p = jd.STATE / "cleared.jsonl"
-                p.parent.mkdir(parents=True, exist_ok=True)
-                t = time.time()
-                with p.open("a") as fh:
-                    for nid in tops:
-                        fh.write(json.dumps({"id": nid, "t": t, "op": "clear"}) + "\n")
-                _mark_nodes_cleared(tops, True)               # durable node flag → sealed across judge passes
+            with jd._identity_file_lock():
+                sid = jd.canonicalize_session_identity(sid)
+                store = jd.load_goals(sid)
+                nodes, status = store.get("nodes", {}), store.get("status", {})
+                tops = [jd.canonicalize_goal_identity(nid) for nid, nd in nodes.items()
+                        if nd.get("parentId") is None and not nd.get("cleared")
+                        and status.get(nid) != "cleared"]
+                if tops:
+                    p = jd.STATE / "cleared.jsonl"
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    t = time.time()
+                    with p.open("a") as fh:
+                        for nid in tops:
+                            fh.write(json.dumps({"id": nid, "t": t, "op": "clear"}) + "\n")
+                    _mark_nodes_cleared(tops, True)           # durable node flag → sealed across judge passes
         except Exception:
             pass
     if flag == "hideFromFeed" and not value:
@@ -1764,6 +1800,11 @@ NOTIFY_ALL_KEY = "*"
 _notify_cards_cache = {}   # str(path) -> ((mtime_ns,size), dict)
 
 
+def _write_notify_cards(cur):
+    cur = jd.canonicalize_goal_keyed_map(cur)
+    _atomic_write(jd.STATE / "notify-cards.json", json.dumps(cur, sort_keys=True))
+
+
 def _notify_cards():
     p = jd.STATE / "notify-cards.json"
     try:
@@ -1789,12 +1830,13 @@ def _notify_all_on():
 
 
 def _set_notify_all(value):
-    cur = dict(_notify_cards())                      # copy: never mutate the cached dict in place
-    if value:
-        cur[NOTIFY_ALL_KEY] = True
-    else:
-        cur.pop(NOTIFY_ALL_KEY, None)
-    _atomic_write(jd.STATE / "notify-cards.json", json.dumps(cur, sort_keys=True))
+    with jd._identity_file_lock():
+        cur = dict(_notify_cards())                  # copy: never mutate the cached dict in place
+        if value:
+            cur[NOTIFY_ALL_KEY] = True
+        else:
+            cur.pop(NOTIFY_ALL_KEY, None)
+        _write_notify_cards(cur)
 
 
 def _notify_session_effective(sid):
@@ -1818,15 +1860,19 @@ def _set_notify_card(item_id, value, sid=""):
     matches what the card would inherit anyway (session override, else master), in which case the
     override is deleted: clicking a bell back to its default returns it to FOLLOWING the default,
     rather than pinning today's default against tomorrow's master flip."""
-    cur = dict(_notify_cards())                      # copy: never mutate the cached dict in place
-    default = _session_flag_raw(sid, "notify")
-    if default is None:
-        default = bool(cur.get(NOTIFY_ALL_KEY))
-    if bool(value) == default:
-        cur.pop(item_id, None)
-    else:
-        cur[item_id] = bool(value)
-    _atomic_write(jd.STATE / "notify-cards.json", json.dumps(cur, sort_keys=True))
+    with jd._identity_file_lock():
+        item_id = jd.canonicalize_goal_identity(item_id)
+        sid = jd.canonicalize_session_identity(sid)
+        cur = jd.canonicalize_goal_keyed_map(
+            dict(_notify_cards()))                   # commit-time snapshot + identity
+        default = _session_flag_raw(sid, "notify")
+        if default is None:
+            default = bool(cur.get(NOTIFY_ALL_KEY))
+        if bool(value) == default:
+            cur.pop(item_id, None)
+        else:
+            cur[item_id] = bool(value)
+        _write_notify_cards(cur)
 
 
 def _set_notify_session(sid, value):
@@ -1834,28 +1880,31 @@ def _set_notify_session(sid, value):
     discipline as _set_notify_card, against the master. Not _set_session_flag: that setter's
     pop-on-false is right for the on/off view flags, but here False is a real value (muted while
     the master is on)."""
-    cur = dict(_session_flags())                     # copy: never mutate the cached dict in place
-    f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
-    if bool(value) == _notify_all_on():
-        f.pop("notify", None)
-    else:
-        f["notify"] = bool(value)
-    if f:
-        cur[sid] = f
-    else:
-        cur.pop(sid, None)
-    _atomic_write(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
+    with jd._identity_file_lock():
+        sid = jd.canonicalize_session_identity(sid)
+        cur = jd.canonicalize_session_flags_identity(dict(_session_flags()))
+        f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
+        if bool(value) == _notify_all_on():
+            f.pop("notify", None)
+        else:
+            f["notify"] = bool(value)
+        if f:
+            cur[sid] = f
+        else:
+            cur.pop(sid, None)
+        _atomic_write(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
 
 
 def _prune_notify_cards(live_ids):
     """Drop armed ids whose card is no longer in the feed (cleared/archived — the id never comes back).
     Called from the feed-diff detector, so the write happens only on the event of a card leaving.
     The master key is not a card and never prunes; values are kept as stored (False = a mute)."""
-    cur = _notify_cards()
-    gone = [i for i in cur if i not in live_ids and i != NOTIFY_ALL_KEY]
-    if gone:
-        kept = {i: cur[i] for i in cur if i in live_ids or i == NOTIFY_ALL_KEY}
-        _atomic_write(jd.STATE / "notify-cards.json", json.dumps(kept, sort_keys=True))
+    with jd._identity_file_lock():
+        cur = _notify_cards()
+        gone = [i for i in cur if i not in live_ids and i != NOTIFY_ALL_KEY]
+        if gone:
+            kept = {i: cur[i] for i in cur if i in live_ids or i == NOTIFY_ALL_KEY}
+            _write_notify_cards(kept)
 
 
 # ── Auto Nudge (the user 2026-06-19) ──────────────────────────────────────────────────────────────
@@ -1959,7 +2008,9 @@ def _auto_nudge_on():
 
 
 def _write_auto_nudge(d):
-    _atomic_write(jd.STATE / "auto-nudge.json", json.dumps(d))
+    with jd._identity_file_lock():
+        d = jd.canonicalize_auto_nudge_identity(d)
+        _atomic_write(jd.STATE / "auto-nudge.json", json.dumps(d))
 
 
 def _set_auto_nudge(enabled):
@@ -3223,42 +3274,47 @@ def _migrate_codex_flags_order():
     """The kernel-side half of jd.migrate_codex_identity: session-flags mute entries and
     session-order slots written under the OLD tid identity move to the sid (the r37
     verification: a muted codex session unmuted at upgrade and its lane lost its slot)."""
-    try:
-        reg = json.loads((jd.CODEXDIR / "registry.json").read_text())
-    except Exception:
-        return
-    if not isinstance(reg, dict):
-        return
-    tid_to_sid = {r.get("tid") or "": sid for sid, r in reg.items()
-                  if isinstance(r, dict) and r.get("tid") and r.get("tid") != sid}
+    # judge.py has already shape-checked, de-duplicated, and made this map domain/codomain
+    # disjoint. Re-parsing registry.json here used to resurrect mappings it deliberately rejected.
+    tid_to_sid = dict(jd._CODEX_IDENTITY_MAP)
     if not tid_to_sid:
         return
-    try:
-        p = jd.STATE / "session-flags.json"
-        cur = json.loads(p.read_text())
-        moved = False
-        for tid, sid in tid_to_sid.items():
-            if tid in cur and sid not in cur:
-                cur[sid] = cur.pop(tid)
-                moved = True
-        if moved:
-            _atomic_write(p, json.dumps(cur, sort_keys=True))
-    except Exception:
-        pass
-    try:
-        p = jd.STATE / "session-order.json"
-        order = json.loads(p.read_text())
-        if isinstance(order, list):
-            new, seen = [], set()
-            for x in order:
-                y = tid_to_sid.get(x, x)
-                if y not in seen:                     # both identities present → the sid's own
-                    seen.add(y)                       # slot wins, the mapped duplicate drops
-                    new.append(y)
-            if new != order:
-                _atomic_write(p, json.dumps(new))
-    except Exception:
-        pass
+    with jd._identity_file_lock():
+        try:
+            p = jd.STATE / "session-flags.json"
+            cur = json.loads(p.read_text())
+            new = jd.canonicalize_session_flags_identity(cur)
+            if new != cur:
+                _atomic_write(p, json.dumps(new, sort_keys=True))
+        except Exception:
+            pass
+        try:
+            p = jd.STATE / "session-order.json"
+            order = json.loads(p.read_text())
+            if isinstance(order, list):
+                mapped = jd.canonicalize_session_identity(order)
+                new, seen = [], set()
+                for sid in mapped:
+                    if sid not in seen:
+                        seen.add(sid)
+                        new.append(sid)
+                if new != order:
+                    _atomic_write(p, json.dumps(new))
+        except Exception:
+            pass
+        # judge.py rewrites the durable dismissal file before main(), but this module hydrated its
+        # in-memory set at import time. Refresh it now so the current boot sees the migrated SID too.
+        try:
+            cur = jd.canonicalize_session_identity(list(_load_dismissed_lanes()))
+            if set(cur) != _load_dismissed_lanes():
+                _atomic_write(_dismissed_lanes_file(), json.dumps(sorted(set(cur))))
+            _dismissed_lanes.clear()
+            _dismissed_lanes.update(cur)
+        except Exception:
+            pass
+    _notify_cards_cache.clear()
+    _autonudge_cache.clear()
+    _flags_cache.clear()
 
 
 def _migrate_channel():
@@ -3626,7 +3682,7 @@ def _retry_suppress_data():
     if hit and hit[0] == key:
         return hit[1]
     try:
-        d = json.loads(p.read_text())
+        d = jd.canonicalize_retry_suppressed_identity(json.loads(p.read_text()))
         if not isinstance(d, dict):
             d = {}
     except Exception:
@@ -3645,16 +3701,34 @@ def _session_retry_suppressed(sid):
 def _suppress_session_retry(sid):
     """Arm per-session retry-suppression at NOW (the re-arm floor). Every interrupt refreshes the floor, so
     "suppressed since your most recent interrupt" is the invariant."""
-    d = dict(_retry_suppress_data())
-    d[str(sid)] = time.time()
-    _atomic_write(jd.STATE / "retry-suppressed.json", json.dumps(d))
+    with jd._identity_file_lock():
+        sid = jd.canonicalize_session_identity(str(sid))
+        p = jd.STATE / "retry-suppressed.json"
+        try:
+            d = jd.canonicalize_retry_suppressed_identity(json.loads(p.read_text()))
+            if not isinstance(d, dict):
+                d = {}
+        except Exception:
+            d = {}
+        d[sid] = time.time()
+        _atomic_write(p, json.dumps(d, sort_keys=True))
+        _retry_suppress_cache.clear()
 
 
 def _clear_session_retry_suppress(sid):
-    d = dict(_retry_suppress_data())
-    if d.pop(str(sid), None) is not None:
-        _atomic_write(jd.STATE / "retry-suppressed.json", json.dumps(d))
-        return True
+    with jd._identity_file_lock():
+        sid = jd.canonicalize_session_identity(str(sid))
+        p = jd.STATE / "retry-suppressed.json"
+        try:
+            d = jd.canonicalize_retry_suppressed_identity(json.loads(p.read_text()))
+            if not isinstance(d, dict):
+                d = {}
+        except Exception:
+            d = {}
+        if d.pop(sid, None) is not None:
+            _atomic_write(p, json.dumps(d, sort_keys=True))
+            _retry_suppress_cache.clear()
+            return True
     return False
 
 
@@ -4110,8 +4184,12 @@ def _log_nudge_event(sid, gid, t, count):
     try:
         p = jd.STATE / "nudge-events.jsonl"
         p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("a") as f:
-            f.write(json.dumps({"sid": sid, "gid": gid, "t": int(t), "count": count}) + "\n")
+        with jd._identity_file_lock():
+            row = {"sid": jd.canonicalize_session_identity(str(sid)),
+                   "gid": jd.canonicalize_goal_identity(gid),
+                   "t": int(t), "count": count}
+            with p.open("a") as f:
+                f.write(json.dumps(row) + "\n")
     except Exception:
         pass
 
@@ -5641,7 +5719,7 @@ def _clear_done_working_notes(now, tmux):
         _set_working_note(sid, "")                        # idle + nothing working → lift the stale claim
 
 
-def _chat_tab_sessions(now, tmux):
+def _chat_tab_sessions_locked(now, tmux):
     """The sessions shown as CHAT TABS, in the shared session order: EVERY living session PLUS only the
     dead sessions the user explicitly opened READ-ONLY (_kept_open). A dead session is otherwise
     TIMELINE-ONLY — it does NOT auto-keep a tab when it dies (the user 2026-06-17 reversed the old 'keep
@@ -5663,6 +5741,12 @@ def _chat_tab_sessions(now, tmux):
     # 2026-06-24). A session merely dead-but-in-window (or explicitly kept-open) stays known and keeps its slot.
     _gc_session_order(live_sids | {s["sid"] for s in all_sessions} | set(_kept_open))
     return result
+
+
+def _chat_tab_sessions(now, tmux):
+    """Build and garbage-collect tabs against one authoritative order snapshot."""
+    with jd._identity_file_lock():
+        return _chat_tab_sessions_locked(now, tmux)
 
 
 TL_LANE_WINDOW = 12 * 3600       # default: DEAD lanes only from the last 12h (the user 2026-06-26, who
@@ -7782,6 +7866,18 @@ def _drive(msg, client):
         sid = str(msg["itemId"]).rsplit(":", 1)[0] if msg.get("itemId") else str(msg["id"])
     else:
         return False                                      # not a drive op (UI/nav) → _dispatch_ws handles it
+    # A dashboard may have loaded the old Codex TID just before the one-time identity migration
+    # published its SID. Canonicalize at the single DRIVE boundary, before both ownership lookup
+    # and dispatch, so that stale-but-valid user input is delivered rather than loudly refused.
+    # Follow-up item ids need the independently-proven goal map: a session move alone does not
+    # prove that the native SID goal numbering is the migrated TID numbering.
+    with jd._identity_file_lock():
+        sid = jd.canonicalize_session_identity(sid)
+        msg = dict(msg)
+        if msg.get("id"):
+            msg["id"] = sid
+        if t == "askFollowUp" and msg.get("itemId"):
+            msg["itemId"] = jd.canonicalize_goal_identity(str(msg["itemId"]))
     # A drive op for a session THIS kernel has never heard of is undeliverable — refuse it here, loudly.
     # backend_for() falls through to tmux for any unrecognized sid, and TmuxBackend.send then types at a pane
     # named after the sid; when no such pane exists the keystrokes evaporate with nothing raised and nothing
@@ -11001,6 +11097,17 @@ def _local_head(short=False):
     return _HEAD_CACHE["short"] if short else _HEAD_CACHE["full"]
 
 
+def _fresh_local_head():
+    """One uncached full HEAD snapshot for a code move; display polling may use `_local_head`."""
+    try:
+        r = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=3)
+        full = (r.stdout or "").strip().lower() if r.returncode == 0 else ""
+        return full if re.fullmatch(r"[0-9a-f]{40}", full) else ""
+    except Exception:
+        return ""
+
+
 def _shas_agree(a, b):
     """Whether two git shas name the SAME commit, tolerant of differing --short lengths (one a prefix of the
     other — the remote and local shorten independently). Both must be non-empty; '-dirty' is ignored."""
@@ -11331,7 +11438,7 @@ def _update_remote(host):
                        "When it is behind this build, Update asks it to fast-forward itself; otherwise "
                        "sync from that machine's own dashboard" % host)
     kport = int((_rr or {}).get("kernel_port") or _REMOTE_KERNEL_PORT)   # for the restart's port poll
-    lfull = _local_head()
+    lfull = _fresh_local_head()
     if not lfull:
         return False, "local kernel isn't a git checkout — nothing to push"
     # We push the committed HEAD; uncommitted local edits are not sent ("just take what is committed on local"
@@ -11345,14 +11452,12 @@ def _update_remote(host):
                        "state is unknown" % host)
     if rdirty:
         return False, "remote %s has uncommitted changes — commit or discard them there first (won't clobber)" % host
-    if rhead and rhead == lfull:
-        return True, "already up to date (%s)" % (_local_head(short=True) or lfull[:8])
     # (2) push local HEAD to a scratch ref on the remote (non-checked-out → no denyCurrentBranch issue)
     env = dict(os.environ, GIT_SSH_COMMAND="%s %s" % (SSH_BIN, " ".join(_SSH_OPTS)))
     push_url = "%s:%s" % (host, rdir)
     try:
         p = subprocess.run(["git", "-C", str(ROOT), "push", "--force", push_url,
-                            "HEAD:refs/heads/%s" % _P2P_REF],
+                            "%s:refs/heads/%s" % (lfull, _P2P_REF)],
                            capture_output=True, text=True, timeout=120, env=env)
     except Exception as e:
         return False, "git push to %s failed: %s" % (host, str(e)[:160])
@@ -11360,7 +11465,8 @@ def _update_remote(host):
         return False, "git push to %s failed: %s" % (host, (_ssh_err(p.stderr) or p.stdout or "").strip()[:160])
     # (3) verify no divergence, reset the remote to the pushed HEAD, clean up, restart
     apply_cmd = (
-        'LOGDIR="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}"; mkdir -p "$LOGDIR"; R=%s; '
+        'LOGDIR="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}"; mkdir -p "$LOGDIR"; '
+        'R=%s; EXPECT=%s; PORT=%d; '
         # Re-check dirtiness HERE, in the same shell as the reset — the discover-step probe ran an
         # ssh round-trip ago, and an edit landing in that window would be destroyed by reset --hard
         # on the strength of a stale answer (the user's audit, 2026-08-17). A status that FAILS is
@@ -11468,9 +11574,13 @@ def _update_remote(host):
         "    sys.exit(10)\n"
         'carry=""\n'
         "if lines:\n"
-        '    curh=subprocess.run(["git","-C",r,"rev-parse","--short=8","HEAD"],capture_output=True,text=True)\n'
-        '    cur8=(curh.stdout or "").strip()[:8]\n'
-        "    if not cur8:\n"
+        '    curh=subprocess.run(["git","-C",r,"rev-parse","HEAD"],capture_output=True,text=True)\n'
+        '    curfull=(curh.stdout or "").strip()\n'
+        '    curs=subprocess.run(["git","-C",r,"rev-parse","--short=8","HEAD"],capture_output=True,text=True)\n'
+        '    curv=subprocess.run(["git","-C",r,"rev-parse","HEAD"],capture_output=True,text=True)\n'
+        '    cur8=(curs.stdout or "").strip()[:8]\n'
+        "    if (curh.returncode or curs.returncode or curv.returncode or not cur8\n"
+        '            or (curv.stdout or "").strip()!=curfull):\n'
         "        sys.exit(9)\n"
         "    if cur8 in lines:\n"
         '        curline=next((l.strip() for l in rawlines if l.strip().split() and l.strip().split()[0][:8]==cur8),cur8)\n'
@@ -11488,13 +11598,13 @@ def _update_remote(host):
         "        except FileNotFoundError:\n"
         "            pass\n"
         "        heal_fail=False\n"
-        '        ge=subprocess.run(["git","-C",r,"show","HEAD:install.sh"],capture_output=True,text=True)\n'
+        '        ge=subprocess.run(["git","-C",r,"show",curfull+":install.sh"],capture_output=True)\n'
         "        if ge.returncode or not ge.stdout:\n"
         "            heal_fail=True\n"
         "        else:\n"
         '            efd=os.open(ie,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o755)\n'
         "            try:\n"
-        "                if os.write(efd,ge.stdout.encode())!=len(ge.stdout.encode()):\n"
+        "                if os.write(efd,ge.stdout)!=len(ge.stdout):\n"
         '                    raise OSError("short entry write")\n'
         "            finally:\n"
         "                os.close(efd)\n"
@@ -11504,15 +11614,26 @@ def _update_remote(host):
         "            carry=merge_carry()\n"
         '            if len(carry.split())>1 and carry.split()[1]=="stable":\n'
         "                sys.exit(12)\n"
-        "        elif not pub_line(pick_pub(curline,rawlines)):\n"
-        "            carry=merge_carry()\n"
-        '            if len(carry.split())>1 and carry.split()[1]=="stable":\n'
-        "                sys.exit(12)\n"
         "        else:\n"
-        "            os.remove(lp)\n"
-        '            pp=pick_pub(curline,rawlines).split()\n'
-        '            if len(pp)>1 and pp[1]=="stable":\n'
-        "                sys.exit(13)\n"
+        '            hst=subprocess.run(["git","-C",r,"status","--porcelain"],capture_output=True,text=True)\n'
+        "            if hst.returncode:\n"
+        "                sys.exit(22)\n"
+        '            if (hst.stdout or "").strip():\n'
+        "                sys.exit(23)\n"
+        '            hs=subprocess.run(["git","-C",r,"rev-parse","HEAD"],capture_output=True,text=True)\n'
+        "            if hs.returncode or not (hs.stdout or \"\").strip():\n"
+        "                sys.exit(24)\n"
+        "            if (hs.stdout or \"\").strip()!=curfull:\n"
+        "                sys.exit(25)\n"
+        "            if not pub_line(pick_pub(curline,rawlines)):\n"
+        "                carry=merge_carry()\n"
+        '                if len(carry.split())>1 and carry.split()[1]=="stable":\n'
+        "                    sys.exit(12)\n"
+        "            else:\n"
+        "                os.remove(lp)\n"
+        '                pp=pick_pub(curline,rawlines).split()\n'
+        '                if len(pp)>1 and pp[1]=="stable":\n'
+        "                    sys.exit(13)\n"
         "    elif len(lines)>1:\n"
         "        sys.exit(10)\n"
         '    elif len(lines[0])!=8 or any(c not in "0123456789abcdef" for c in lines[0]):\n'
@@ -11577,12 +11698,12 @@ def _update_remote(host):
         "    os.unlink(ie2)\n"
         "except FileNotFoundError:\n"
         "    pass\n"
-        'ge2=subprocess.run(["git","-C",r,"show",target+":install.sh"],capture_output=True,text=True)\n'
+        'ge2=subprocess.run(["git","-C",r,"show",target+":install.sh"],capture_output=True)\n'
         "if ge2.returncode or not ge2.stdout:\n"
         "    sys.exit(4)\n"
         'efd2=os.open(ie2,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o755)\n'
         "try:\n"
-        "    if os.write(efd2,ge2.stdout.encode())!=len(ge2.stdout.encode()):\n"
+        "    if os.write(efd2,ge2.stdout)!=len(ge2.stdout):\n"
         '        raise OSError("short entry write")\n'
         "finally:\n"
         "    os.close(efd2)\n"
@@ -11590,18 +11711,32 @@ def _update_remote(host):
         "    sys.exit(4)\n"
         'st4=subprocess.run(["git","-C",r,"status","--porcelain"],capture_output=True,text=True)\n'
         'h3=subprocess.run(["git","-C",r,"rev-parse","HEAD"],capture_output=True,text=True)\n'
-        'if st4.returncode or (st4.stdout or "").strip() or h3.returncode or (h3.stdout or "").strip()!=target:\n'
-        "    sys.exit(20)\n"
+        "if st4.returncode:\n"
+        "    sys.exit(26)\n"
+        'if (st4.stdout or "").strip():\n'
+        "    sys.exit(27)\n"
+        'if h3.returncode or not (h3.stdout or "").strip():\n'
+        "    sys.exit(28)\n"
+        'if (h3.stdout or "").strip()!=target:\n'
+        "    sys.exit(29)\n"
         "if not pub_line(pick_pub(body.splitlines()[0],body.splitlines())):\n"
-        "    sys.exit(4)\n"
+        "    sys.exit(30)\n"
         "os.remove(lp)' "
-        '"$GD/romp-update.lock" "$R" %s >/dev/null 2>&1; RRC=$?; '
+        '"$GD/romp-update.lock" "$R" %s >>"$LOGDIR/update.log" 2>&1; RRC=$?; '
+        'if [ "$RRC" = 30 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo CHANNELPUBFAIL; exit 0; fi; '
         'if [ "$RRC" = 3 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo UPDATERUNNING; exit 0; fi; '
         'if [ "$RRC" = 7 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIVERGED; exit 0; fi; '
         'if [ "$RRC" = 8 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYNOW; exit 0; fi; '
         'if [ "$RRC" = 9 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERR; exit 0; fi; '
         'if [ "$RRC" = 10 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo LATCHSTUCK; exit 0; fi; '
-        'if [ "$RRC" = 20 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo TAMPEREDPOSTINSTALL; exit 0; fi; '
+        'if [ "$RRC" = 29 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo HEADMOVEDPOSTINSTALL; exit 0; fi; '
+        'if [ "$RRC" = 28 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo HEADUNKNOWNPOSTINSTALL; exit 0; fi; '
+        'if [ "$RRC" = 27 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYPOSTINSTALL; exit 0; fi; '
+        'if [ "$RRC" = 26 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERRPOSTINSTALL; exit 0; fi; '
+        'if [ "$RRC" = 25 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo HEADMOVEDPOSTHEAL; exit 0; fi; '
+        'if [ "$RRC" = 24 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo HEADUNKNOWNPOSTHEAL; exit 0; fi; '
+        'if [ "$RRC" = 23 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYPOSTHEAL; exit 0; fi; '
+        'if [ "$RRC" = 22 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERRPOSTHEAL; exit 0; fi; '
         'if [ "$RRC" = 19 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STATERRPOSTMOVE; exit 0; fi; '
         'if [ "$RRC" = 18 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIRTYPOSTMOVE; exit 0; fi; '
         'if [ "$RRC" = 17 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESTOREFAIL; exit 0; fi; '
@@ -11614,6 +11749,15 @@ def _update_remote(host):
         'if [ "$RRC" != 0 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; fi; '
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; '
         'NEW="$(git -C "$R" rev-parse --short HEAD)"; '
+        # A listening socket is not a restart verdict: pkill can fail and leave the old kernel
+        # answering forever. Capture its boot id, then accept only a different process whose
+        # auth-exempt /version says it is running the exact commit this transaction installed.
+        "probe(){ python3 -c \"import json,sys,urllib.request; j=json.load(urllib.request.urlopen('http://127.0.0.1:'+sys.argv[1]+'/version',timeout=2)); print(str(j.get('kernel_sha') or '')+' '+str(j.get('boot') or ''))\" \"$PORT\" 2>/dev/null; }; "
+        'OLD="$(probe || true)"; OLD_BOOT="${OLD#* }"; [ "$OLD_BOOT" = "$OLD" ] && OLD_BOOT=""; '
+        'healthy(){ INFO="$(probe)" || return 1; KS="${INFO%%%% *}"; BID="${INFO#* }"; '
+        '[ -n "$KS" ] && [ "${#KS}" -ge 7 ] && [ "$BID" != "$INFO" ] || return 1; '
+        'case "$EXPECT" in "$KS"*) ;; *) return 1;; esac; '
+        '[ -z "$OLD_BOOT" ] || [ "$BID" != "$OLD_BOOT" ]; }; '
         # RESTART the kernel THROUGH THE MANAGER (the user 2026-07-04: the manager is romp's durable supervisor —
         # "there is never an invisible orphan" — so a restart should keep/leave the remote MANAGER-owned, not
         # launch a bare romp-serve). Kill the kernel, then `romp-manager ensure` (the SAME idempotent auto-start
@@ -11633,12 +11777,17 @@ def _update_remote(host):
         # this script's own text (romp-kern[e]l), so pkill can no longer take itself down.
         'pkill -f "bin/romp-kern[e]l" 2>/dev/null; '
         'if command -v node >/dev/null 2>&1 && [ -x "$R/bin/romp-manager" ]; then "$R/bin/romp-manager" ensure >>"$LOGDIR/update.log" 2>&1 || true; fi; '
-        'UP=0; for i in 1 2 3 4 5 6 7 8; do sleep 1; if bash -c "exec 3<>/dev/tcp/127.0.0.1/%d" 2>/dev/null; then UP=1; break; fi; done; '
-        'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null &  sleep 1; fi; '
+        'UP=0; for i in 1 2 3 4 5 6 7 8; do sleep 1; if healthy; then UP=1; break; fi; done; '
+        'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null & '
+        'for i in 1 2 3 4 5 6 7 8; do sleep 1; if healthy; then UP=1; break; fi; done; fi; '
+        'if [ "$UP" = 0 ]; then echo "RESTARTFAIL:$NEW"; exit 0; fi; '
         'echo "SYNCED:$NEW"'
-    ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, lfull, _P2P_REF, _P2P_REF,
-         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
-         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, kport)
+    ) % (shlex.quote(rdir), shlex.quote(lfull), kport,
+         _P2P_REF, _P2P_REF, _P2P_REF, lfull, _P2P_REF, _P2P_REF, _P2P_REF,
+         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
+         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
+         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
+         _P2P_REF)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -11660,7 +11809,15 @@ def _update_remote(host):
     tag, _, rest = aout.partition(":")
     tag, rest = tag.strip(), rest.strip()
     if tag == "SYNCED":
+        if not re.fullmatch(r"[0-9a-f]{7,40}", rest or "") or not lfull.startswith(rest):
+            return False, ("the remote reported a restart on %s, not the exact commit that was "
+                           "pushed; expected %s, got %s" %
+                           (host, lfull[:8], rest or "no commit"))
         return True, "synced to %s + restarting" % (rest or _local_head(short=True) or "HEAD")
+    if tag == "RESTARTFAIL":
+        return False, ("installed %s on %s, but neither the manager nor the fallback launcher "
+                       "brought its kernel port back; inspect update.log and kernel.log"
+                       % (rest or "the new build", host))
     if tag == "DIVERGED":
         # Two very different causes land here, and the old wording only described the first, which is
         # why a rewritten local history read as an unexplained refusal (the user 2026-07-22): either the
@@ -11683,10 +11840,30 @@ def _update_remote(host):
         return False, ("pushed, but %s's install latch names commits its HEAD doesn't match — an "
                        "update died there mid-move from a broken state; heal it by hand on that "
                        "machine (run install.sh, then remove the latch)" % host)
-    if tag == "TAMPEREDPOSTINSTALL":
-        return False, ("pushed and installed, but the remote's tree changed during the install — "
-                       "success was NOT reported and its install latch stays armed; inspect the "
-                       "remote before trusting this build")
+    if tag == "STATERRPOSTHEAL":
+        return False, ("the prior install passed on %s, but its tree status could not be read "
+                       "afterward; its recovery record remains armed" % host)
+    if tag == "DIRTYPOSTHEAL":
+        return False, ("the prior install passed on %s, but tracked files changed while it ran; "
+                       "its recovery record and channel choice remain unspent" % host)
+    if tag == "HEADUNKNOWNPOSTHEAL":
+        return False, ("the prior install passed on %s, but HEAD became unreadable; its recovery "
+                       "record and channel choice remain unspent" % host)
+    if tag == "HEADMOVEDPOSTHEAL":
+        return False, ("the prior install passed on %s, but HEAD moved while it ran; its recovery "
+                       "record and channel choice remain unspent" % host)
+    if tag == "STATERRPOSTINSTALL":
+        return False, ("pushed and installed on %s, but the final tree-status read failed; "
+                       "success was not reported and the install record remains armed" % host)
+    if tag == "DIRTYPOSTINSTALL":
+        return False, ("pushed and installed on %s, but tracked files changed while install ran; "
+                       "success was not reported and the install record remains armed" % host)
+    if tag == "HEADUNKNOWNPOSTINSTALL":
+        return False, ("pushed and installed on %s, but the final HEAD read failed; success was "
+                       "not reported and the install record remains armed" % host)
+    if tag == "HEADMOVEDPOSTINSTALL":
+        return False, ("pushed and installed on %s, but HEAD no longer names the validated commit; "
+                       "success was not reported and the install record remains armed" % host)
     if tag == "STATERRPOSTMOVE":
         return False, ("pushed and merged, but reading the remote's tree state failed — nothing "
                        "installed; its install latch stays armed; its boot heal settles it")
@@ -11718,6 +11895,10 @@ def _update_remote(host):
         return False, ("pushed and reset %s, but its install.sh failed — the latch is armed, so "
                        "nothing restarts onto it until install passes there (its boot heal "
                        "retries)" % host)
+    if tag == "CHANNELPUBFAIL":
+        return False, ("pushed and installed on %s, but publishing its update-channel marker "
+                       "failed; the install latch remains armed and nothing restarted. Inspect "
+                       "update.log and repair the marker path before retrying." % host)
     if tag == "DIRTYNOW":
         return False, ("pushed, but %s picked up uncommitted work between the check and the apply — "
                        "not clobbering it. Commit or stash there, then push again." % host)
@@ -16159,29 +16340,35 @@ def _load_dismissed_lanes():
         return set()                                  # absent/corrupt file = no dismissals, never a crash
 
 
-def _save_dismissed_lanes():
+def _mutate_dismissed_lanes(add=(), remove=()):
+    """Merge one dismissal mutation with disk while holding the identity lock."""
     try:
-        _dismissed_lanes_file().parent.mkdir(parents=True, exist_ok=True)
-        _dismissed_lanes_file().write_text(json.dumps(sorted(_dismissed_lanes)))
+        with jd._identity_file_lock():
+            # More than one kernel can share STATE. Disk is authoritative for both additions and
+            # removals; unioning this process's import-time set resurrected a sibling's undismissal.
+            mapped = set(jd.canonicalize_session_identity(
+                sorted(_load_dismissed_lanes())))
+            mapped.update(jd.canonicalize_session_identity([str(s) for s in add]))
+            mapped.difference_update(
+                jd.canonicalize_session_identity([str(s) for s in remove]))
+            _dismissed_lanes.clear()
+            _dismissed_lanes.update(mapped)
+            _dismissed_lanes_file().parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write(_dismissed_lanes_file(), json.dumps(sorted(_dismissed_lanes)))
     except OSError as e:
         sys.stderr.write("romp-kernel: could not persist timeline dismissals: %s\n" % e)
-
 
 _dismissed_lanes = _load_dismissed_lanes()   # sids the user cleared from the timeline (dead lanes only)
 
 
 def _dismiss_lane(sid):
     """Record a Clear-pill dismissal durably — it survives kernel restarts and reconnects."""
-    _dismissed_lanes.add(str(sid))
-    _save_dismissed_lanes()
+    _mutate_dismissed_lanes(add=[sid])
 
 
 def _undismiss_lanes(sids):
     """Shed dismissal records whose sids came back LIVE — the revive is the un-dismiss event."""
-    hit = _dismissed_lanes.intersection(str(s) for s in sids)
-    if hit:
-        _dismissed_lanes.difference_update(hit)
-        _save_dismissed_lanes()
+    _mutate_dismissed_lanes(remove=sids)
 
 
 def _mark_compacting(sid):
@@ -18518,26 +18705,30 @@ def _episode_boundary_check(sid, path, now):
     if all(r.get("head") == head["uuid"] for r in jd.episode_rows(sid)):
         sys.stderr.write("episode boundary: %s seeded (head %.8s)\n" % (sid[:8], head["uuid"]))
         return
-    store = jd.load_goals(sid)
-    nodes, status = store.get("nodes", {}), store.get("status", {})
-    tops = [nid for nid, nd in nodes.items()
-            if nd.get("parentId") is None and not nd.get("cleared") and status.get(nid) != "cleared"
-            and not (nd.get("nodeComplete") or status.get(nid) == "completed")]
-    if not tops:
-        return
-    p = jd.STATE / "cleared.jsonl"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    t = time.time()                  # one shared batch t → a single Undo restores the whole boundary batch
-    with p.open("a") as fh:
-        for nid in tops:
-            fh.write(json.dumps({"id": nid, "t": t, "op": "clear"}) + "\n")
-    # The settle's OWN record — which cards this boundary dropped — rides the episodes log as an
-    # annotation row keyed to this head, appended only on THIS settle path so the race-decided seed
-    # above can never claim one (the user 2026-07-27, who found the drop invisible): the feed's bell
-    # notice and the chat boundary card read it back.
-    jd.append_episode_settle(sid, head["uuid"], int(t),
-                             [{"id": nid, "text": (nodes[nid].get("text") or "")[:120]} for nid in tops])
-    _mark_nodes_cleared(tops, True, src="romp", why="dropped when the conversation was cleared")
+    with jd._identity_file_lock():
+        sid = jd.canonicalize_session_identity(sid)
+        store = jd.load_goals(sid)
+        nodes, status = store.get("nodes", {}), store.get("status", {})
+        tops = [jd.canonicalize_goal_identity(nid) for nid, nd in nodes.items()
+                if nd.get("parentId") is None and not nd.get("cleared")
+                and status.get(nid) != "cleared"
+                and not (nd.get("nodeComplete") or status.get(nid) == "completed")]
+        if not tops:
+            return
+        p = jd.STATE / "cleared.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        t = time.time()              # one shared batch t → a single Undo restores the whole boundary batch
+        with p.open("a") as fh:
+            for nid in tops:
+                fh.write(json.dumps({"id": nid, "t": t, "op": "clear"}) + "\n")
+        # The settle's OWN record — which cards this boundary dropped — rides the episodes log as an
+        # annotation row keyed to this head, appended only on THIS settle path so the race-decided seed
+        # above can never claim one (the user 2026-07-27, who found the drop invisible): the feed's bell
+        # notice and the chat boundary card read it back.
+        jd.append_episode_settle(sid, head["uuid"], int(t),
+                                 [{"id": nid, "text": (nodes[nid].get("text") or "")[:120]}
+                                  for nid in tops])
+        _mark_nodes_cleared(tops, True, src="romp", why="dropped when the conversation was cleared")
     sys.stderr.write("episode boundary: %s cleared -> settled %d open card(s)\n" % (sid[:8], len(tops)))
 
 
@@ -18616,15 +18807,18 @@ def _clear_all(item_ids):
     item_ids = [i for i in item_ids if i]
     if not item_ids:
         return
-    seen = set(item_ids)
-    item_ids = item_ids + [i for i in _delegation_linked_ids(item_ids) if i not in seen]   # + the delegation's peer copy
     p = jd.STATE / "cleared.jsonl"
     p.parent.mkdir(parents=True, exist_ok=True)
     t = time.time()
-    with p.open("a") as f:
-        for iid in item_ids:
-            f.write(json.dumps({"id": iid, "t": t, "op": "clear"}) + "\n")
-    _mark_nodes_cleared(item_ids, True)               # durable node flag → no grouper re-wrap, no column bounce
+    with jd._identity_file_lock():
+        item_ids = [jd.canonicalize_goal_identity(i) for i in item_ids]
+        seen = set(item_ids)
+        item_ids = item_ids + [jd.canonicalize_goal_identity(i)
+                               for i in _delegation_linked_ids(item_ids) if i not in seen]
+        with p.open("a") as f:
+            for iid in item_ids:
+                f.write(json.dumps({"id": iid, "t": t, "op": "clear"}) + "\n")
+        _mark_nodes_cleared(item_ids, True)           # durable node flag → no grouper re-wrap, no column bounce
     _clear_wrap_notify(item_ids)                      # ONE-round wrap-up to live sessions whose OPEN card this
     #                                                   dismissed (the user 2026-07-24); after the flags land, so
     #                                                   any response processing sees the cleared state
@@ -18737,14 +18931,16 @@ def _clear_wrap_notify(item_ids):
 def _undo_clear():
     """Restore the most-recent clear BATCH — every id cleared at the latest timestamp. So one
     UndoClear undoes a Clear-all as a unit, and a single-card clear restores just that card."""
-    cur = _cleared_ids()
-    if not cur:
-        return
-    newest = max(cur.values())
-    restored = [i for i, ct in cur.items() if ct == newest]
-    with (jd.STATE / "cleared.jsonl").open("a") as f:
-        for iid in restored:
-            f.write(json.dumps({"id": iid, "t": time.time(), "op": "undo"}) + "\n")
+    with jd._identity_file_lock():
+        cur = _cleared_ids()
+        if not cur:
+            return
+        newest = max(cur.values())
+        restored = [jd.canonicalize_goal_identity(i)
+                    for i, ct in cur.items() if ct == newest]
+        with (jd.STATE / "cleared.jsonl").open("a") as f:
+            for iid in restored:
+                f.write(json.dumps({"id": iid, "t": time.time(), "op": "undo"}) + "\n")
     _restore_goal_archive(restored)                   # pull the restored tops back OUT of the archive FIRST,
     _mark_nodes_cleared(restored, False)              # so this finds the nodes → un-set the durable flag → real status
 
@@ -18903,30 +19099,33 @@ def _resolve_node(sid, node_id):
     new state. We do NOT reuse the view-level `cleared` path: that only hides the card, leaving the
     rollup's block (and a card that was the last open work stuck on 'working'). Recomputes the rolled-up
     status right here so the BLOCKED chip clears now, not on the next judge pass. (the user 2026-06-17.)"""
-    store = jd.load_goals(sid)
-    nd = store.get("nodes", {}).get(node_id)
-    if not nd or nd.get("nodeComplete"):
-        return False
-    now = int(time.time())
+    with jd._identity_file_lock():
+        sid = jd.canonicalize_session_identity(sid)
+        node_id = jd.canonicalize_goal_identity(node_id)
+        store = jd.load_goals(sid)
+        nd = store.get("nodes", {}).get(node_id)
+        if not nd or nd.get("nodeComplete"):
+            return False
+        now = int(time.time())
     # Journal FIRST (the user 2026-07-10): this handler races a triage pass that may hold this same
     # store in memory across a model call — whichever save lands last wins the whole file, so the
     # pass's stale save could erase the resolve, flag and diary event alike. The journal is the
     # durable copy: jd.load_goals replays it idempotently, so a clobbered resolve re-applies on the
     # very next load instead of silently reverting (same pattern as cleared.jsonl).
-    jd.append_override(sid, node_id, "resolve", now)
+        jd.append_override(sid, node_id, "resolve", now)
     # The event is the write (found 2026-07-07): without it the rollup two lines down re-derives the
     # flags from the diary and REVERTS the user's own resolve — the flip made eventless writes no-ops.
-    jd.record_verdict(store, nd, "user", "done", now,
-                      why=nd.get("doneWhy") or "Resolved by the user.")
-    nd["mt"] = now                                    # deep-link / recency land on the resolution moment
-    try:                                              # session_closed gate for the rollup, same as run_plan
-        path = next((s["path"] for s in _sessions(now) if s["sid"] == sid), None)
-        closed = jd._session_closed(_parse(path, sid, now)) if path else False
-    except Exception:
-        closed = False
-    jd.rollup_status(store, closed)
-    jd.save_goals(sid, store)
-    _note_user_goal_write(sid)                        # crossing a node off shows mid-pass too (_feed_goals)
+        jd.record_verdict(store, nd, "user", "done", now,
+                          why=nd.get("doneWhy") or "Resolved by the user.")
+        nd["mt"] = now                                # deep-link / recency land on the resolution moment
+        try:                                          # session_closed gate for the rollup, same as run_plan
+            path = next((s["path"] for s in _sessions(now) if s["sid"] == sid), None)
+            closed = jd._session_closed(_parse(path, sid, now)) if path else False
+        except Exception:
+            closed = False
+        jd.rollup_status(store, closed)
+        jd.save_goals(sid, store)
+        _note_user_goal_write(sid)                    # crossing a node off shows mid-pass too (_feed_goals)
     for lid in _delegation_linked_ids([node_id]):     # crossing off propagates across a delegation link: resolve the
         _resolve_node(lid.rsplit(":", 1)[0], lid)     # peer copy too, so a handed-off piece is checked off ONCE, not
         #                                               twice (the user 2026-06-23). Bounded recursion: a node already
@@ -22296,20 +22495,24 @@ def _reveal_chat_for(client, focus_msg):
     # a membership edit.
     sid = focus_msg.get("id") if isinstance(focus_msg, dict) else None
     if sid:
-        v = _timeline_views()
-        if not _view_visible(v, sid):
-            v = json.loads(json.dumps(v))
-            if sid not in v["hidden"]:
-                v["active"] = "all"
-            else:
-                holder = next((g["id"] for g in v["groups"] if sid in g["members"]), None)
-                if holder:
-                    v["active"] = holder
-                else:
-                    v["hidden"] = [x for x in v["hidden"] if x != sid]
+        with jd._identity_file_lock():
+            sid = jd.canonicalize_session_identity(sid)
+            focus_msg = dict(focus_msg)
+            focus_msg["id"] = sid
+            v = _timeline_views()
+            if not _view_visible(v, sid):
+                v = json.loads(json.dumps(v))
+                if sid not in v["hidden"]:
                     v["active"] = "all"
-            _set_timeline_views(v)
-            _mark_views_dirty()
+                else:
+                    holder = next((g["id"] for g in v["groups"] if sid in g["members"]), None)
+                    if holder:
+                        v["active"] = holder
+                    else:
+                        v["hidden"] = [x for x in v["hidden"] if x != sid]
+                        v["active"] = "all"
+                _set_timeline_views(v)
+                _mark_views_dirty()
     _send_to_view("chat", focus_msg, wid)
     _send_to_view("shell", {"type": "reveal", "pane": "chat"}, wid)
 
@@ -29343,7 +29546,9 @@ class Handler(BaseHTTPRequestHandler):
                 # _resolve_node returning False did nothing and said nothing, leaving an optimistic tick
                 # with no state behind it. Distinguish the two Falses, because only one is a failure —
                 # an already-complete node means the state the click asked for already holds.
-                _rsid, _rnid = str(msg["sid"]), str(msg["nodeId"])
+                with jd._identity_file_lock():
+                    _rsid = jd.canonicalize_session_identity(str(msg["sid"]))
+                    _rnid = jd.canonicalize_goal_identity(str(msg["nodeId"]))
                 try:
                     _nd = jd.load_goals(_rsid).get("nodes", {}).get(_rnid)
                     if _nd is None:
@@ -29372,7 +29577,9 @@ class Handler(BaseHTTPRequestHandler):
             # the journaled row replays the flip on every load, so the click can't be silently erased.
             # The re-armed line reads None = pending, so the card's "Distilling…" swirl is the live
             # acknowledgement; the ACK below is the failure path's voice (fail loudly).
-            _dsid, _dnid = str(msg["sid"]), str(msg["itemId"])
+            with jd._identity_file_lock():
+                _dsid = jd.canonicalize_session_identity(str(msg["sid"]))
+                _dnid = jd.canonicalize_goal_identity(str(msg["itemId"]))
             try:
                 jd.append_override(_dsid, _dnid, "redistill", int(time.time()))
                 _dst = jd.load_goals(_dsid)              # load replays the journal → the flip is applied
@@ -29444,7 +29651,7 @@ class Handler(BaseHTTPRequestHandler):
         elif msg and msg.get("type") in ("reorderTabs", "writeOrder") and isinstance(msg.get("order"), list):
             # tab-drag or lane-drag → reorder BOTH surfaces. MERGE the dragged surface's order into the
             # persisted one (don't overwrite): a chat-tab drag must not drop/reshuffle timeline-only lanes.
-            _write_session_order(_merge_session_order(msg["order"]))
+            _merge_and_write_session_order(msg["order"])
             # _mark_views_dirty, NOT _push_all: the feed/timeline order the grouped cards CLIENT-side by this
             # list, but a plain push serves the CACHED feed — reused for REBUILD_MIN_S (2s) even though the sig
             # changed — so the reordered cards lagged up to ~2s (the user 2026-07-15). The dirty mark bypasses

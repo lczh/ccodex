@@ -84,7 +84,8 @@ class ElectronStagingWriters(unittest.TestCase):
         # synchronously — a writerless FIFO froze the renderer
         src = open(os.path.join(ROOT, "ui", "romp-timeline-view.js")).read()
         for anchor, target in (("'session-order.json'", "fs.unlinkSync(tmp)"),
-                               ("'timeline-views.json'", "fs.unlinkSync(fp + '.tmp')")):
+                               ("'timeline-views.json'", "fs.unlinkSync(fp + '.tmp')"),
+                               ("'session-flags.json'", "fs.unlinkSync(tmp)")):
             i = src.index(anchor)
             window = src[i:i + 500]
             self.assertIn(target, window,
@@ -97,6 +98,9 @@ class ElectronStagingWriters(unittest.TestCase):
         i = src.index("'session-order.json'")
         self.assertIn("tmp = f + '.tmp'", src[i:i + 300],
                       "_persistOrder's staging name derives from the target + .tmp")
+        i = src.index("'session-flags.json'")
+        self.assertIn("tmp = fp + '.tmp'", src[i:i + 300],
+                      "_setSessionFlag's staging name derives from the target + .tmp")
 
 
 if __name__ == "__main__":

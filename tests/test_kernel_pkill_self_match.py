@@ -49,7 +49,7 @@ def _apply_script():
 
     from unittest import mock
     with mock.patch.object(km.subprocess, "run", side_effect=fake_run), \
-         mock.patch.object(km, "_local_head", side_effect=lambda short=False: "cafe1234" if not short else "cafe123"):
+         mock.patch.object(km, "_fresh_local_head", return_value="cafe1234" * 5):
         km._update_remote("TESTHOST")
     return seen.get("apply", "")
 

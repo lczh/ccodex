@@ -388,26 +388,318 @@ class NameClaims(unittest.TestCase):
                 {sid: {"tid": tid, "name": "cx", "cwd": "/x"}, "bad": 7}))
             (state / "session-flags.json").write_text(_json.dumps({tid: {"mute": True}}))
             (state / "session-order.json").write_text(_json.dumps([tid, "zzz", sid]))
-            with mock.patch.object(km.jd, "STATE", state):
-                with mock.patch.object(km.jd, "CODEXDIR", state / "codex"):
-                    km._migrate_codex_flags_order()
+            (state / "timeline-dismissed.json").write_text(_json.dumps([tid, "zzz"]))
+            km._dismissed_lanes.clear()
+            km._dismissed_lanes.add(tid)             # module-import hydration happened pre-migration
+            old_map = dict(km.jd._CODEX_IDENTITY_MAP)
+            km.jd._CODEX_IDENTITY_MAP.clear()
+            km.jd._CODEX_IDENTITY_MAP[tid] = sid     # produced by the validated judge migration
+            try:
+                with mock.patch.object(km.jd, "STATE", state):
+                    with mock.patch.object(km.jd, "CODEXDIR", state / "codex"):
+                        km._migrate_codex_flags_order()
+            finally:
+                km.jd._CODEX_IDENTITY_MAP.clear()
+                km.jd._CODEX_IDENTITY_MAP.update(old_map)
             flags = _json.loads((state / "session-flags.json").read_text())
             self.assertEqual(flags.get(sid), {"mute": True}, "the mute survives the identity")
             self.assertNotIn(tid, flags)
             # sid-wins with BOTH rows present: a stale tid relic must never clobber the live
             # sid row (the r39 mutant hunt — the guard's removal survived every fixture)
             (state / "session-flags.json").write_text(_json.dumps(
-                {tid: {}, sid: {"mute": True}}))
-            with mock.patch.object(km.jd, "STATE", state):
-                with mock.patch.object(km.jd, "CODEXDIR", state / "codex"):
-                    km._migrate_codex_flags_order()
+                {tid: {"hideFromFeed": True, "notify": True},
+                 sid: {"mute": True, "notify": False}}))
+            old_map = dict(km.jd._CODEX_IDENTITY_MAP)
+            km.jd._CODEX_IDENTITY_MAP.clear()
+            km.jd._CODEX_IDENTITY_MAP[tid] = sid
+            try:
+                with mock.patch.object(km.jd, "STATE", state):
+                    with mock.patch.object(km.jd, "CODEXDIR", state / "codex"):
+                        km._migrate_codex_flags_order()
+            finally:
+                km.jd._CODEX_IDENTITY_MAP.clear()
+                km.jd._CODEX_IDENTITY_MAP.update(old_map)
             flags2 = _json.loads((state / "session-flags.json").read_text())
-            self.assertEqual(flags2.get(sid), {"mute": True},
-                             "the live sid row survives untouched beside a tid relic")
+            self.assertEqual(flags2.get(sid),
+                             {"hideFromFeed": True, "mute": True, "notify": False},
+                             "disjoint relic flags survive; native wins only the notify collision")
             order = _json.loads((state / "session-order.json").read_text())
             self.assertEqual(order, [sid, "zzz"],
                              "the slot maps tid→sid, and the sid's own later slot dedups — "
                              "never two rows for one session")
+            self.assertEqual(km._dismissed_lanes, {sid, "zzz"},
+                             "the current boot rehydrates the migrated dismissal identities")
+
+    def test_kernel_migration_never_reintroduces_a_registry_mapping_the_judge_rejected(self):
+        import json as _json
+        from pathlib import Path
+        sid = "../outside"
+        tid = "01911111-2222-7333-8444-555555555555"
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td)
+            (state / "codex").mkdir()
+            (state / "codex" / "registry.json").write_text(_json.dumps(
+                {sid: {"tid": tid, "name": "bad", "cwd": "/x"}}))
+            (state / "session-flags.json").write_text(_json.dumps({tid: {"mute": True}}))
+            old_map = dict(km.jd._CODEX_IDENTITY_MAP)
+            km.jd._CODEX_IDENTITY_MAP.clear()         # judge rejected the unsafe SID
+            try:
+                with mock.patch.object(km.jd, "STATE", state):
+                    with mock.patch.object(km.jd, "CODEXDIR", state / "codex"):
+                        km._migrate_codex_flags_order()
+                self.assertEqual(km.jd._CODEX_IDENTITY_MAP, {})
+                self.assertIn(tid, _json.loads((state / "session-flags.json").read_text()))
+            finally:
+                km.jd._CODEX_IDENTITY_MAP.clear()
+                km.jd._CODEX_IDENTITY_MAP.update(old_map)
+
+    def test_session_flag_writer_cannot_republish_a_tid_snapshot_after_migration(self):
+        import json as _json
+        from pathlib import Path
+        sid = "11111111-2222-3333-4444-555555555555"
+        tid = "01911111-2222-7333-8444-555555555555"
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td)
+            (state / "codex").mkdir()
+            flags = state / "session-flags.json"
+            flags.write_text(_json.dumps({tid: {"mute": True}}))
+            entered, release = threading.Event(), threading.Event()
+            real_atomic = km._atomic_write
+
+            def pause_writer(path, text, mode=None):
+                if Path(path) == flags and threading.current_thread().name == "legacy-writer":
+                    entered.set()
+                    release.wait(5)
+                return real_atomic(path, text, mode)
+
+            old_map = dict(km.jd._CODEX_IDENTITY_MAP)
+            km.jd._CODEX_IDENTITY_MAP.clear()
+            km.jd._CODEX_IDENTITY_MAP[tid] = sid
+            km._flags_cache.clear()
+            try:
+                with mock.patch.object(km.jd, "STATE", state):
+                    with mock.patch.object(km.jd, "CODEXDIR", state / "codex"):
+                        with mock.patch.object(km, "_atomic_write", side_effect=pause_writer):
+                            writer = threading.Thread(
+                                name="legacy-writer",
+                                target=lambda: km._set_session_flag(
+                                    tid, "postalServiceOff", True))
+                            mover = threading.Thread(target=km._migrate_codex_flags_order)
+                            writer.start()
+                            self.assertTrue(entered.wait(2))
+                            mover.start()
+                            release.set()
+                            writer.join(5); mover.join(5)
+                self.assertFalse(writer.is_alive() or mover.is_alive())
+                final = _json.loads(flags.read_text())
+                self.assertNotIn(tid, final)
+                self.assertEqual(final[sid], {"mute": True, "postalServiceOff": True})
+            finally:
+                release.set()
+                km.jd._CODEX_IDENTITY_MAP.clear()
+                km.jd._CODEX_IDENTITY_MAP.update(old_map)
+                km._flags_cache.clear()
+
+    def test_stale_drive_and_followup_ids_canonicalize_before_routing(self):
+        sid = "11111111-2222-3333-4444-555555555555"
+        tid = "01911111-2222-7333-8444-555555555555"
+        old_session = dict(km.jd._CODEX_IDENTITY_MAP)
+        old_goal = dict(km.jd._CODEX_GOAL_IDENTITY_MAP)
+        km.jd._CODEX_IDENTITY_MAP.clear(); km.jd._CODEX_IDENTITY_MAP[tid] = sid
+        km.jd._CODEX_GOAL_IDENTITY_MAP.clear(); km.jd._CODEX_GOAL_IDENTITY_MAP[tid] = sid
+        try:
+            be = mock.MagicMock()
+            with mock.patch.object(km, "_kernel_knows", side_effect=lambda value: value == sid) as knows:
+                with mock.patch.object(km.Sessions, "backend_for", return_value=be) as backend:
+                    with mock.patch.object(km, "_send_or_park") as send:
+                        km._drive({"type": "sendMessage", "id": tid, "text": "hello"},
+                                  {"send": lambda _m: None})
+                    knows.assert_called_with(sid)
+                    backend.assert_called_with(sid)
+                    self.assertEqual(send.call_args.args[1], sid)
+
+                with mock.patch.object(km.Sessions, "backend_for", return_value=be):
+                    with mock.patch.object(km, "_followup_body", return_value="body") as body:
+                        with mock.patch.object(km, "_send_or_park"):
+                            with mock.patch.object(km, "_predict_working"):
+                                with mock.patch.object(km.jd, "optimistic_followup", return_value=True) as follow:
+                                    km._drive({"type": "askFollowUp", "id": tid,
+                                               "itemId": tid + ":g7", "text": "more"},
+                                              {"send": lambda _m: None})
+                    self.assertEqual(body.call_args.args[0], sid + ":g7")
+                    self.assertEqual(follow.call_args.args[:2], (sid, sid + ":g7"))
+        finally:
+            km.jd._CODEX_IDENTITY_MAP.clear(); km.jd._CODEX_IDENTITY_MAP.update(old_session)
+            km.jd._CODEX_GOAL_IDENTITY_MAP.clear(); km.jd._CODEX_GOAL_IDENTITY_MAP.update(old_goal)
+
+    def test_stale_session_color_targets_the_native_name_under_the_identity_lock(self):
+        from pathlib import Path
+        sid = "11111111-2222-3333-4444-555555555555"
+        tid = "01911111-2222-7333-8444-555555555555"
+        old_map = dict(km.jd._CODEX_IDENTITY_MAP)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); names = root / "names"; codex = root / "codex"
+            names.mkdir(); codex.mkdir()
+            (names / sid).write_text("web\t/tmp\t#000000\twhite\n")
+            km.jd._CODEX_IDENTITY_MAP.clear(); km.jd._CODEX_IDENTITY_MAP[tid] = sid
+            try:
+                with mock.patch.object(km, "NAMES", names):
+                    with mock.patch.object(km.jd, "CODEXDIR", codex):
+                        chosen = km.pal.colors(km.pal.DEFAULT)[0]
+                        self.assertTrue(km._set_session_color(tid, chosen))
+                self.assertFalse((names / tid).exists())
+                self.assertIn(chosen, (names / sid).read_text())
+            finally:
+                km.jd._CODEX_IDENTITY_MAP.clear(); km.jd._CODEX_IDENTITY_MAP.update(old_map)
+
+    def test_tab_gc_cannot_delete_a_slot_appended_between_order_and_gc(self):
+        from pathlib import Path
+        a = {"sid": "aaaaaaaa", "name": "a", "anchor": "a", "path": "/a", "mtime": 1}
+        b = {"sid": "bbbbbbbb", "name": "b", "anchor": "b", "path": "/b", "mtime": 2}
+        entered, release = threading.Event(), threading.Event()
+        real_gc = km._gc_session_order
+
+        def paused_gc(known):
+            entered.set()
+            release.wait(5)
+            return real_gc(known)
+
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td); codex = state / "codex"; codex.mkdir()
+            (state / "session-order.json").write_text("[]")
+            try:
+                with mock.patch.object(km.jd, "STATE", state):
+                    with mock.patch.object(km.jd, "CODEXDIR", codex):
+                        with mock.patch.object(km, "_alive_sessions", return_value=[a]):
+                            with mock.patch.object(km, "_sessions", return_value=[a]):
+                                with mock.patch.object(km, "_gc_session_order", side_effect=paused_gc):
+                                    first = threading.Thread(
+                                        target=lambda: km._chat_tab_sessions(10, {}))
+                                    second = threading.Thread(target=lambda: km._ordered([a, b]))
+                                    first.start(); self.assertTrue(entered.wait(2)); second.start()
+                                    self.assertTrue(second.is_alive(),
+                                                    "the append waits for the tab build's GC transaction")
+                                    release.set(); first.join(5); second.join(5)
+                self.assertFalse(first.is_alive() or second.is_alive())
+                self.assertEqual(json.loads((state / "session-order.json").read_text()),
+                                 ["aaaaaaaa", "bbbbbbbb"])
+            finally:
+                release.set()
+
+    def test_dismiss_mutation_merges_a_sibling_kernels_disk_rows(self):
+        from pathlib import Path
+        old = set(km._dismissed_lanes)
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td); codex = state / "codex"; codex.mkdir()
+            (state / "timeline-dismissed.json").write_text(json.dumps(["a", "b"]))
+            km._dismissed_lanes.clear(); km._dismissed_lanes.add("a")
+            try:
+                with mock.patch.object(km.jd, "STATE", state):
+                    with mock.patch.object(km.jd, "CODEXDIR", codex):
+                        km._dismiss_lane("c")
+                        self.assertEqual(set(json.loads(
+                            (state / "timeline-dismissed.json").read_text())), {"a", "b", "c"})
+                        km._undismiss_lanes(["b"])
+                        self.assertEqual(set(json.loads(
+                            (state / "timeline-dismissed.json").read_text())), {"a", "c"})
+                        # Disk is authoritative in the other direction too: a sibling that already
+                        # undismissed A must not have A resurrected from this kernel's stale memory.
+                        (state / "timeline-dismissed.json").write_text("[]")
+                        km._dismissed_lanes.clear(); km._dismissed_lanes.add("a")
+                        km._dismiss_lane("d")
+                        self.assertEqual(json.loads(
+                            (state / "timeline-dismissed.json").read_text()), ["d"])
+            finally:
+                km._dismissed_lanes.clear(); km._dismissed_lanes.update(old)
+
+    def test_reveal_cannot_overwrite_a_concurrent_timeline_view_heal(self):
+        from pathlib import Path
+        entered, release = threading.Event(), threading.Event()
+        real_atomic = km._atomic_write
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td); codex = state / "codex"; codex.mkdir()
+            views = state / "timeline-views.json"
+            views.write_text(json.dumps({
+                "active": "all", "hidden": ["old", "other"],
+                "groups": [{"id": "g", "name": "g", "color": "", "members": ["old"]}]}))
+
+            def pause_heal(path, text, mode=None):
+                if Path(path) == views and threading.current_thread().name == "heal":
+                    entered.set(); release.wait(5)
+                return real_atomic(path, text, mode)
+
+            km._flags_cache.clear()
+            try:
+                with mock.patch.object(km.jd, "STATE", state):
+                    with mock.patch.object(km.jd, "CODEXDIR", codex):
+                        with mock.patch.object(km, "_atomic_write", side_effect=pause_heal):
+                            with mock.patch.object(km, "_send_to_view"):
+                                first = threading.Thread(
+                                    name="heal", target=lambda: km._heal_timeline_views("old", "new"))
+                                second = threading.Thread(
+                                    name="reveal", target=lambda: km._reveal_chat_for(
+                                        {"wid": "w"}, {"type": "focus", "id": "other"}))
+                                first.start(); self.assertTrue(entered.wait(2)); second.start()
+                                self.assertTrue(second.is_alive(),
+                                                "reveal waits to read until the heal has published")
+                                release.set(); first.join(5); second.join(5)
+                final = json.loads(views.read_text())
+                self.assertIn("new", final["hidden"], "the heal survives the later reveal write")
+                self.assertNotIn("other", final["hidden"], "the reveal mutation survives too")
+            finally:
+                release.set(); km._flags_cache.clear()
+
+    def test_stale_clear_ids_are_canonical_for_the_ledger_and_durable_node_write(self):
+        from pathlib import Path
+        sid = "11111111-2222-3333-4444-555555555555"
+        tid = "01911111-2222-7333-8444-555555555555"
+        old_session = dict(km.jd._CODEX_IDENTITY_MAP)
+        old_goal = dict(km.jd._CODEX_GOAL_IDENTITY_MAP)
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td)
+            (state / "codex").mkdir()
+            km.jd._CODEX_IDENTITY_MAP.clear(); km.jd._CODEX_IDENTITY_MAP[tid] = sid
+            km.jd._CODEX_GOAL_IDENTITY_MAP.clear(); km.jd._CODEX_GOAL_IDENTITY_MAP[tid] = sid
+            marked = []
+            try:
+                with mock.patch.object(km.jd, "STATE", state):
+                    with mock.patch.object(km.jd, "CODEXDIR", state / "codex"):
+                        with mock.patch.object(km, "_delegation_linked_ids", return_value=set()):
+                            with mock.patch.object(km, "_mark_nodes_cleared",
+                                                   side_effect=lambda ids, value: marked.extend(ids)):
+                                with mock.patch.object(km, "_clear_wrap_notify"):
+                                    km._clear_all([tid + ":g1"])
+                row = json.loads((state / "cleared.jsonl").read_text().splitlines()[0])
+                self.assertEqual(row["id"], sid + ":g1")
+                self.assertEqual(marked, [sid + ":g1"],
+                                 "the durable store update uses the same identity as the view ledger")
+            finally:
+                km.jd._CODEX_IDENTITY_MAP.clear(); km.jd._CODEX_IDENTITY_MAP.update(old_session)
+                km.jd._CODEX_GOAL_IDENTITY_MAP.clear(); km.jd._CODEX_GOAL_IDENTITY_MAP.update(old_goal)
+
+    def test_stale_card_bell_click_updates_the_native_sid_override(self):
+        from pathlib import Path
+        sid = "11111111-2222-3333-4444-555555555555"
+        tid = "01911111-2222-7333-8444-555555555555"
+        old_session = dict(km.jd._CODEX_IDENTITY_MAP)
+        old_goal = dict(km.jd._CODEX_GOAL_IDENTITY_MAP)
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td)
+            (state / "codex").mkdir()
+            (state / "notify-cards.json").write_text(json.dumps({sid + ":g1": True}))
+            km.jd._CODEX_IDENTITY_MAP.clear(); km.jd._CODEX_IDENTITY_MAP[tid] = sid
+            km.jd._CODEX_GOAL_IDENTITY_MAP.clear(); km.jd._CODEX_GOAL_IDENTITY_MAP[tid] = sid
+            km._notify_cards_cache.clear()
+            try:
+                with mock.patch.object(km.jd, "STATE", state):
+                    with mock.patch.object(km.jd, "CODEXDIR", state / "codex"):
+                        km._set_notify_card(tid + ":g1", False, sid=tid)
+                self.assertNotIn(sid + ":g1",
+                                 json.loads((state / "notify-cards.json").read_text()))
+            finally:
+                km.jd._CODEX_IDENTITY_MAP.clear(); km.jd._CODEX_IDENTITY_MAP.update(old_session)
+                km.jd._CODEX_GOAL_IDENTITY_MAP.clear(); km.jd._CODEX_GOAL_IDENTITY_MAP.update(old_goal)
+                km._notify_cards_cache.clear()
 
     def test_renames_are_serialized_under_one_lock(self):
         # two interleaved renames of one sid left the registry at one name and the shared file

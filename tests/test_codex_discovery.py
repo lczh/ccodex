@@ -10,6 +10,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -374,6 +375,51 @@ class MigrationTransaction(unittest.TestCase):
         self.assertFalse((ov / (TID + ".jsonl")).exists())
         self.assertTrue((jd.CODEXDIR / "migrated" / (SID + ".done")).exists())
 
+    def test_a_journal_publish_unlink_crash_never_duplicates_rows_on_retry(self):
+        self._state(goals=True, journal=True)
+        ov = jd._overrides_dir()
+        real_unlink = Path.unlink
+
+        def crash_at_journal_unlink(p, *a, **kw):
+            if p == ov / (TID + ".jsonl"):
+                raise SystemExit("crash: journal published, tid journal not yet unlinked")
+            return real_unlink(p, *a, **kw)
+
+        with mock.patch.object(Path, "unlink", crash_at_journal_unlink):
+            with self.assertRaises(SystemExit):
+                jd.migrate_codex_identity()
+        self.assertTrue((ov / (TID + ".jsonl")).exists())
+        self.assertTrue((ov / (SID + ".jsonl")).exists())
+        jd.migrate_codex_identity()
+        rows = [json.loads(ln) for ln in (ov / (SID + ".jsonl")).read_text().splitlines()]
+        self.assertEqual(len(rows), 1,
+                         "retry must not prepend the same migrated verdict a second time")
+        self.assertEqual(rows[0]["node"], SID + ":g1")
+        self.assertFalse((ov / (TID + ".jsonl")).exists())
+
+    def test_shared_goal_state_waits_for_a_proven_store_move(self):
+        self._state(goals=False)
+        (jd.GOALDIR / (SID + ".json")).write_text(json.dumps(
+            {"rompUuid": SID, "nodes": {SID + ":g1": {"t": 999, "fresh": True}},
+             "status": {SID + ":g1": "working"}}))
+        (jd.STATE / "cleared.jsonl").write_text(json.dumps(
+            {"id": TID + ":g1", "t": 1, "op": "clear"}) + "\n")
+        (jd.STATE / "notify-cards.json").write_text(json.dumps({TID + ":g1": "all"}))
+        (jd.STATE / "auto-nudge.json").write_text(json.dumps(
+            {"nudged": {TID + ":g1": {"count": 1}},
+             "intrBlocked": {TID: TID + ":g1"},
+             "debtNudged": {TID + ">peer:10": 20}}))
+        jd.migrate_codex_identity()
+        self.assertIn(TID + ":g1", (jd.STATE / "cleared.jsonl").read_text(),
+                      "an orphaned clear cannot attach to a fresh SID:g1")
+        self.assertIn(TID + ":g1", json.loads(
+            (jd.STATE / "notify-cards.json").read_text()))
+        an = json.loads((jd.STATE / "auto-nudge.json").read_text())
+        self.assertIn(TID + ":g1", an["nudged"])
+        self.assertIn(TID, an["intrBlocked"])
+        self.assertEqual(an["debtNudged"], {},
+                         "an orphan debt row must not load a fresh SID goal store")
+
     def test_an_archive_only_session_never_merges_the_journal(self):
         # the v1.3.14 audit's P1: archive-only used to count as "complete" and the journal's
         # old resolve completed a future store's g1
@@ -385,7 +431,8 @@ class MigrationTransaction(unittest.TestCase):
                         "stays an orphaned relic")
         self.assertFalse((ov / (SID + ".jsonl")).exists())
         self.assertTrue((jd.GOALARCHDIR / (SID + ".json")).exists(), "the archive itself moves")
-        self.assertTrue((jd.CODEXDIR / "migrated" / (SID + ".done")).exists(), "and settles")
+        self.assertFalse((jd.CODEXDIR / "migrated" / (SID + ".done")).exists(),
+                         "the explicitly orphaned journal keeps the transaction visible")
 
     def test_caption_rows_and_the_fail_ledger_rewrite_their_unit_ids(self):
         # the v1.3.14 audit's P1: a bare file rename left every row id TID-prefixed — the
@@ -413,6 +460,232 @@ class MigrationTransaction(unittest.TestCase):
                          "the row's fsid names the physical transcript and rides untouched")
         self.assertFalse((jd.EPIDIR / (TID + ".jsonl")).exists())
 
+    def test_preexisting_append_only_sid_stores_merge_instead_of_stranding_history(self):
+        self._state(goals=False, captions=True, episodes=True)
+        (jd.CAPDIR / (SID + ".jsonl")).write_text(
+            json.dumps({"id": SID + ":200:new", "text": "new caption"}) + "\n")
+        (jd.CAPDIR / (SID + ".fails.json")).write_text(json.dumps({SID + ":200:fail": 1}))
+        (jd.EPIDIR / (SID + ".jsonl")).write_text(
+            json.dumps({"head": "u-head-2", "fsid": SID, "t": 60}) + "\n")
+        jd.migrate_codex_identity()
+        cap = (jd.CAPDIR / (SID + ".jsonl")).read_text()
+        self.assertIn(SID + ":100:aaa", cap)
+        self.assertIn(SID + ":200:new", cap)
+        fails = json.loads((jd.CAPDIR / (SID + ".fails.json")).read_text())
+        self.assertEqual((fails[SID + ":100:bbb"], fails[SID + ":200:fail"]), (2, 1))
+        heads = [r["head"] for r in jd.episode_rows(SID)]
+        self.assertEqual(heads, ["u-head-1", "u-head-2"])
+        for p in (jd.CAPDIR / (TID + ".jsonl"), jd.CAPDIR / (TID + ".fails.json"),
+                  jd.EPIDIR / (TID + ".jsonl")):
+            self.assertFalse(p.exists(), "the reconciled source is no longer an active relic")
+        self.assertTrue((jd.CODEXDIR / "migrated" / (SID + ".done")).exists())
+
+    def test_a_late_legacy_writer_reopens_a_done_transaction(self):
+        self._state(goals=False)
+        jd.migrate_codex_identity()
+        done = jd.CODEXDIR / "migrated" / (SID + ".done")
+        self.assertTrue(done.exists())
+        (jd.GOALDIR / (TID + ".json")).write_text(json.dumps(
+            {"rompUuid": TID, "nodes": {TID + ":g1": {"old": True}}, "status": {}}))
+        (jd.GOALDIR / (SID + ".json")).write_text(json.dumps(
+            {"rompUuid": SID, "nodes": {SID + ":g9": {"fresh": True}}, "status": {}}))
+        jd.migrate_codex_identity()
+        self.assertFalse(done.exists(), "completion is not a permanent blind skip")
+        self.assertTrue((jd.GOALDIR / (TID + ".json")).exists())
+        self.assertIn(SID + ":g9", json.loads(
+            (jd.GOALDIR / (SID + ".json")).read_text())["nodes"])
+
+    def test_a_late_non_goal_writer_preserves_completed_goal_continuity(self):
+        self._state(goals=True)
+        jd.migrate_codex_identity()
+        self.assertEqual(jd._CODEX_GOAL_IDENTITY_MAP.get(TID), SID)
+        (jd.CAPDIR / (TID + ".jsonl")).write_text(
+            json.dumps({"id": TID + ":200:late", "caption": "late"}) + "\n")
+        jd.migrate_codex_identity()
+        self.assertEqual(jd._CODEX_GOAL_IDENTITY_MAP.get(TID), SID,
+                         "a late caption cannot erase the durable proof that goals moved")
+        done = json.loads((jd.CODEXDIR / "migrated" / (SID + ".done")).read_text())
+        self.assertTrue(done["moved"]["goals"])
+
+    def test_reopen_intent_is_durable_before_the_old_goal_proof_is_retired(self):
+        self._state(goals=True)
+        jd.migrate_codex_identity()
+        done = jd.CODEXDIR / "migrated" / (SID + ".done")
+        intent = jd.CODEXDIR / "migrated" / (SID + ".intent")
+        (jd.CAPDIR / (TID + ".jsonl")).write_text(
+            json.dumps({"id": TID + ":200:late", "caption": "late"}) + "\n")
+        real = jd._mig_atomic
+
+        def die_after_reopen(path, text):
+            real(path, text)
+            if path == intent:
+                raise SystemExit("hard death after reopened intent publish")
+
+        with mock.patch.object(jd, "_mig_atomic", side_effect=die_after_reopen):
+            with self.assertRaises(SystemExit):
+                jd.migrate_codex_identity()
+        self.assertTrue(done.exists(), "old proof survives until its successor is durable")
+        self.assertTrue(intent.exists())
+        jd.migrate_codex_identity()
+        self.assertEqual(jd._CODEX_GOAL_IDENTITY_MAP.get(TID), SID)
+
+    def test_a_truthy_nonboolean_done_ledger_cannot_fabricate_goal_continuity(self):
+        self._state(goals=False)
+        (jd.GOALDIR / (SID + ".json")).write_text(json.dumps(
+            {"rompUuid": SID, "nodes": {SID + ":g1": {"fresh": True}}, "status": {}}))
+        (jd.STATE / "cleared.jsonl").write_text(json.dumps(
+            {"id": TID + ":g1", "t": 1, "op": "clear"}) + "\n")
+        mig = jd.CODEXDIR / "migrated"
+        mig.mkdir(parents=True, exist_ok=True)
+        (mig / (SID + ".done")).write_text(json.dumps(
+            {"tid": TID, "moved": {"goals": "corrupt-truthy"}, "present": {}}))
+        jd.migrate_codex_identity()
+        self.assertIn(TID + ":g1", (jd.STATE / "cleared.jsonl").read_text())
+        self.assertTrue(json.loads((jd.GOALDIR / (SID + ".json")).read_text())
+                        ["nodes"][SID + ":g1"]["fresh"])
+
+    def test_a_moved_namespace_absent_from_the_intent_cannot_fabricate_continuity(self):
+        self._state(goals=False)
+        (jd.GOALDIR / (SID + ".json")).write_text(json.dumps(
+            {"rompUuid": SID, "nodes": {SID + ":g1": {"fresh": True}}, "status": {}}))
+        (jd.STATE / "cleared.jsonl").write_text(json.dumps(
+            {"id": TID + ":g1", "t": 1, "op": "clear"}) + "\n")
+        mig = jd.CODEXDIR / "migrated"
+        mig.mkdir(parents=True, exist_ok=True)
+        absent = {ns: False for ns in jd._MIG_NAMESPACES}
+        (mig / (SID + ".done")).write_text(json.dumps(
+            {"tid": TID, "moved": {"goals": True}, "present": absent,
+             "preexist": absent, "targets": {}}))
+        jd.migrate_codex_identity()
+        self.assertIn(TID + ":g1", (jd.STATE / "cleared.jsonl").read_text(),
+                      "a contradictory ledger must not prove that goal numbering moved")
+
+    def test_archive_writer_cannot_land_inside_the_migration_publish_window(self):
+        self._state(goals=False)
+        old = jd.ARCHDIR / (TID + ".json")
+        old.write_text(json.dumps({"headline": "legacy", "abstract": "old"}))
+        go = threading.Event()
+        finished = threading.Event()
+
+        def writer():
+            go.wait()
+            jd.write_archive(SID, {"headline": "fresh", "abstract": "new"})
+            finished.set()
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        real = jd._mig_atomic_bytes
+
+        def pause_before_archive_publish(path, payload):
+            if path == jd.ARCHDIR / (SID + ".json"):
+                go.set()
+                time.sleep(0.05)       # without the identity lock, the SID writer lands here
+            return real(path, payload)
+
+        with mock.patch.object(jd, "_mig_atomic_bytes", side_effect=pause_before_archive_publish):
+            jd.migrate_codex_identity()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(jd.load_archive(SID), {"headline": "fresh", "abstract": "new"},
+                         "migration must not overwrite an archive published during its move")
+        self.assertFalse(old.exists())
+
+    def test_a_source_born_after_the_intent_is_preserved_and_never_marks_moved(self):
+        self._state(goals=False, captions=True)
+        mig = jd.CODEXDIR / "migrated"
+        mig.mkdir(parents=True, exist_ok=True)
+        present = {ns: ns in ("captions", "capfails") for ns in jd._MIG_NAMESPACES}
+        (mig / (SID + ".intent")).write_text(json.dumps(
+            {"tid": TID, "moved": {}, "present": present,
+             "preexist": {ns: False for ns in jd._MIG_NAMESPACES}, "targets": {}}))
+        late = jd.GOALDIR / (TID + ".json")
+        late.write_text(json.dumps(
+            {"rompUuid": TID, "nodes": {TID + ":g1": {"late": True}}, "status": {}}))
+        (jd.STATE / "cleared.jsonl").write_text(json.dumps(
+            {"id": TID + ":g1", "t": 1, "op": "clear"}) + "\n")
+        jd.migrate_codex_identity()
+        jd.migrate_codex_identity()
+        self.assertTrue(late.exists(), "ownership of a post-intent source is unknown")
+        self.assertFalse((jd.GOALDIR / (SID + ".json")).exists())
+        self.assertFalse((mig / (SID + ".done")).exists())
+        intent = json.loads((mig / (SID + ".intent")).read_text())
+        self.assertNotIn("goals", intent["moved"])
+        self.assertIn(TID + ":g1", (jd.STATE / "cleared.jsonl").read_text())
+
+    def test_duplicate_or_overlapping_registry_identities_leave_evidence_untouched(self):
+        tmp = Path(tempfile.mkdtemp())
+        jd._rebind_state(tmp)
+        for d in (jd.GOALDIR, jd.CODEXDIR):
+            d.mkdir(parents=True, exist_ok=True)
+        sid2 = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        tid2 = "01922222-3333-7444-8555-666666666666"
+        # TID is claimed by two SIDs, while SID2 is also (corruptly) used as SID's TID.
+        (jd.CODEXDIR / "registry.json").write_text(json.dumps({
+            SID: {"tid": TID, "cwd": "/TESTDIR"},
+            sid2: {"tid": TID, "cwd": "/TESTDIR2"},
+            "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff": {"tid": sid2, "cwd": "/TESTDIR3"},
+            "cccccccc-dddd-4eee-8fff-000000000000": {"tid": tid2, "cwd": "/TESTDIR4"},
+        }))
+        valid_sid = "cccccccc-dddd-4eee-8fff-000000000000"
+        sources = (TID, sid2, tid2)
+        for ident in sources:
+            (jd.GOALDIR / (ident + ".json")).write_text(json.dumps(
+                {"rompUuid": ident, "nodes": {ident + ":g1": {}}, "status": {}}))
+        jd.migrate_codex_identity()
+        self.assertTrue((jd.GOALDIR / (TID + ".json")).exists(),
+                        "a duplicate source has no authoritative destination")
+        self.assertTrue((jd.GOALDIR / (sid2 + ".json")).exists(),
+                        "a current SID cannot simultaneously be consumed as a legacy source")
+        self.assertFalse((jd.GOALDIR / (tid2 + ".json")).exists(),
+                         "an unrelated valid mapping can still migrate")
+        self.assertTrue((jd.GOALDIR / (valid_sid + ".json")).exists())
+        self.assertNotIn(TID, jd._CODEX_IDENTITY_MAP)
+        self.assertNotIn(sid2, jd._CODEX_IDENTITY_MAP)
+
+    def test_invalid_registry_ids_cannot_escape_namespaces_or_crash_boot(self):
+        tmp = Path(tempfile.mkdtemp())
+        jd._rebind_state(tmp)
+        for d in (jd.GOALDIR, jd.CODEXDIR):
+            d.mkdir(parents=True, exist_ok=True)
+        (jd.CODEXDIR / "registry.json").write_text(json.dumps({
+            "../owned": {"tid": TID, "cwd": "/TESTDIR"},
+            SID: {"tid": 7, "cwd": "/TESTDIR2"},
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee": {
+                "tid": "../legacy", "cwd": "/TESTDIR3"},
+        }))
+        (jd.GOALDIR / (TID + ".json")).write_text(json.dumps(
+            {"rompUuid": TID, "nodes": {}, "status": {}}))
+        jd.migrate_codex_identity()
+        self.assertTrue((jd.GOALDIR / (TID + ".json")).exists())
+        self.assertFalse((jd.STATE / "owned.json").exists())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo") and os.path.isdir("/dev/fd"),
+                         "POSIX descriptor regression")
+    def test_rejected_identity_lock_files_do_not_leak_descriptors(self):
+        tmp = Path(tempfile.mkdtemp())
+        jd._rebind_state(tmp)
+        jd.CODEXDIR.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(jd.CODEXDIR / "identity-migration.lock")
+        before = len(os.listdir("/dev/fd"))
+        for _ in range(20):
+            with self.assertRaises(OSError):
+                with jd._identity_file_lock():
+                    pass
+        after = len(os.listdir("/dev/fd"))
+        self.assertLessEqual(after, before + 1)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX FIFO regression")
+    def test_a_fifo_intent_fails_closed_without_blocking_boot(self):
+        self._state(goals=True)
+        mig = jd.CODEXDIR / "migrated"
+        mig.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(mig / (SID + ".intent"))
+        started = time.monotonic()
+        jd.migrate_codex_identity()
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertTrue((jd.GOALDIR / (TID + ".json")).exists())
+        self.assertFalse((mig / (SID + ".done")).exists())
+
     def test_a_corrupt_goals_store_holds_the_transaction_open(self):
         self._state(goals=False, journal=True)
         (jd.GOALDIR / (TID + ".json")).write_text("{ corrupt")
@@ -423,7 +696,7 @@ class MigrationTransaction(unittest.TestCase):
         self.assertTrue((jd._overrides_dir() / (TID + ".jsonl")).exists(),
                         "and the journal held with it")
 
-    def test_both_files_with_no_intent_is_sid_wins_and_settles(self):
+    def test_both_goal_files_with_no_intent_preserve_both_and_stay_open(self):
         # a pre-transactional (v1.3.14) crash relic: the sid file may hold real post-upgrade
         # work — it wins, the relic stays inert, and the session settles
         self._state(goals=True)
@@ -433,7 +706,8 @@ class MigrationTransaction(unittest.TestCase):
         g = json.loads((jd.GOALDIR / (SID + ".json")).read_text())
         self.assertTrue(g["nodes"][SID + ":g1"].get("fresh"), "the sid store's work survives")
         self.assertTrue((jd.GOALDIR / (TID + ".json")).exists(), "the relic stays, inert")
-        self.assertTrue((jd.CODEXDIR / "migrated" / (SID + ".done")).exists())
+        self.assertFalse((jd.CODEXDIR / "migrated" / (SID + ".done")).exists(),
+                         "an ambiguous relic is preserved and never hidden behind a permanent skip")
 
     def test_the_shared_identity_files_rewrite_and_stay_stable(self):
         # the v1.3.14 audit's P2 cluster
@@ -443,31 +717,127 @@ class MigrationTransaction(unittest.TestCase):
             + json.dumps({"id": "other:g2", "t": 2, "op": "clear"}) + "\n")
         (jd.STATE / "notify-cards.json").write_text(json.dumps({TID + ":g1": "all", "*": "off"}))
         (jd.STATE / "auto-nudge.json").write_text(json.dumps(
-            {"enabled": True, "nudged": {TID + ":g1": 3}}))
+            {"enabled": True,
+             "nudged": {TID + ":g1": {"why": TID + ": literal",
+                                          "lastTurnId": TID + ":100:abc"}},
+             "deferred": {TID + ":g1": {"sid": TID, "why": "the judge is running"}},
+             "intrBlocked": {TID: TID + ":g1", SID: SID + ":g9"},
+             "debtNudged": {TID + ">peer:10": 20, "peer>" + TID + ":11": 21}}))
         (jd.STATE / "nudge-events.jsonl").write_text(json.dumps(
             {"sid": TID, "gid": TID + ":g1", "t": 4, "count": 1}) + "\n")
-        (jd.STATE / "judge-auth.json").write_text(json.dumps({TID: {"t": 9, "mode": "login"}}))
+        (jd.STATE / "judge-auth.json").write_text(json.dumps(
+            {TID: {"t": 9, "mode": "login", "note": TID + ": literal"}}))
+        (jd.STATE / "session-flags.json").write_text(json.dumps(
+            {TID: {"hideFromFeed": True, "notify": True},
+             SID: {"notify": False, "postalServiceOff": True}}))
+        (jd.STATE / "session-order.json").write_text(json.dumps([TID, "zzz", SID]))
+        (jd.STATE / "retry-suppressed.json").write_text(json.dumps(
+            {TID: 20, SID: 10}))
         (jd.STATE / "timeline-views.json").write_text(json.dumps(
-            {"groups": [{"id": "gA", "sessions": [TID, "zzz"]}], "hidden": [TID]}))
+            {"groups": [{"id": "gA", "name": TID + ": literal",
+                          "sessions": [TID, "zzz"]}], "hidden": [TID]}))
+        (jd.STATE / "timeline-dismissed.json").write_text(json.dumps([TID, "zzz"]))
         jd.migrate_codex_identity()
         self.assertIn(SID + ":g1", (jd.STATE / "cleared.jsonl").read_text())
         self.assertNotIn(TID, (jd.STATE / "cleared.jsonl").read_text())
         self.assertIn(SID + ":g1", json.loads((jd.STATE / "notify-cards.json").read_text()))
         self.assertIn(SID + ":g1",
                       json.loads((jd.STATE / "auto-nudge.json").read_text())["nudged"])
+        self.assertEqual(json.loads((jd.STATE / "auto-nudge.json").read_text())
+                         ["nudged"][SID + ":g1"]["why"], TID + ": literal")
+        auto = json.loads((jd.STATE / "auto-nudge.json").read_text())
+        self.assertEqual(auto["nudged"][SID + ":g1"]["lastTurnId"], SID + ":100:abc")
+        self.assertEqual(auto["deferred"][SID + ":g1"]["sid"], SID)
+        self.assertEqual(auto["intrBlocked"], {SID: SID + ":g9"},
+                         "the already-native stop record wins a relic collision")
+        debt = json.loads((jd.STATE / "auto-nudge.json").read_text())["debtNudged"]
+        self.assertIn(SID + ">peer:10", debt)
+        self.assertIn("peer>" + SID + ":11", debt)
         ev = json.loads((jd.STATE / "nudge-events.jsonl").read_text().splitlines()[0])
         self.assertEqual((ev["sid"], ev["gid"]), (SID, SID + ":g1"))
-        self.assertIn(SID, json.loads((jd.STATE / "judge-auth.json").read_text()))
+        auth = json.loads((jd.STATE / "judge-auth.json").read_text())
+        self.assertIn(SID, auth)
+        self.assertEqual(auth[SID]["note"], TID + ": literal")
+        self.assertEqual(json.loads((jd.STATE / "session-flags.json").read_text()),
+                         {SID: {"hideFromFeed": True, "notify": False,
+                                "postalServiceOff": True}},
+                         "disjoint relic fields survive while native wins a same-flag collision")
+        self.assertEqual(json.loads((jd.STATE / "session-order.json").read_text()),
+                         [SID, "zzz"],
+                         "the standalone migration owns shared identity stores, not the kernel")
+        self.assertEqual(json.loads((jd.STATE / "retry-suppressed.json").read_text()),
+                         {SID: 20},
+                         "the newest interrupt floor wins a TID/SID collision")
         tv = json.loads((jd.STATE / "timeline-views.json").read_text())
         self.assertEqual(tv["groups"][0]["sessions"], [SID, "zzz"])
+        self.assertEqual(tv["groups"][0]["name"], TID + ": literal")
         self.assertEqual(tv["hidden"], [SID])
+        self.assertEqual(json.loads((jd.STATE / "timeline-dismissed.json").read_text()),
+                         [SID, "zzz"],
+                         "a dead Codex lane dismissed before the identity flip must not reappear")
         # idempotent: a second pass rewrites nothing (mtimes stable)
         mt = {n: (jd.STATE / n).stat().st_mtime_ns
-              for n in ("cleared.jsonl", "notify-cards.json", "timeline-views.json")}
+              for n in ("cleared.jsonl", "notify-cards.json", "session-flags.json",
+                        "session-order.json", "retry-suppressed.json", "timeline-views.json")}
         jd.migrate_codex_identity()
         for n, v in mt.items():
             self.assertEqual((jd.STATE / n).stat().st_mtime_ns, v,
                              "%s rewritten with no change — churn on every boot" % n)
+
+    def test_migration_rewrites_identity_fields_without_rewriting_user_text(self):
+        self._state(goals=True, captions=True, journal=True)
+        goal_path = jd.GOALDIR / (TID + ".json")
+        goal = json.loads(goal_path.read_text())
+        goal["nodes"][TID + ":g1"].update(
+            {"id": TID + ":g1", "text": TID + ":g1",
+             "blockWhy": TID + ":g2", "doneWhy": TID + ":g3",
+             "log": [{"seg": TID + ":100:aaa", "why": TID + ":g4"}],
+             "origin": {"peer": TID, "goalId": TID + ":g2", "msgId": "m1"},
+             "handoff": {"peer": TID, "msgId": "m2"}})
+        goal["closedTurns"] = [TID + ":100:aaa"]
+        goal["closedSig"] = {TID + ":100:aaa": 3}
+        goal_path.write_text(json.dumps(goal))
+        cap_path = jd.CAPDIR / (TID + ".jsonl")
+        rows = [json.loads(line) for line in cap_path.read_text().splitlines()]
+        rows[0]["caption"] = TID + ":g5"
+        cap_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        with (jd._overrides_dir() / (TID + ".jsonl")).open("a") as fh:
+            fh.write(json.dumps(
+                {"op": "block", "node": TID + ":g1", "why": TID + ":g6", "t": 8}) + "\n")
+        jd.migrate_codex_identity()
+        moved = json.loads((jd.GOALDIR / (SID + ".json")).read_text())
+        node = moved["nodes"][SID + ":g1"]
+        self.assertEqual(node["id"], SID + ":g1")
+        self.assertEqual(node["text"], TID + ":g1")
+        self.assertEqual(node["blockWhy"], TID + ":g2")
+        self.assertEqual(node["doneWhy"], TID + ":g3")
+        self.assertEqual(node["log"][0]["seg"], SID + ":100:aaa")
+        self.assertEqual(node["log"][0]["why"], TID + ":g4")
+        self.assertEqual(node["origin"], {"peer": SID, "goalId": SID + ":g2",
+                                          "msgId": "m1"})
+        self.assertEqual(node["handoff"], {"peer": SID, "msgId": "m2"})
+        self.assertEqual(moved["closedTurns"], [SID + ":100:aaa"])
+        self.assertEqual(moved["closedSig"], {SID + ":100:aaa": 3})
+        caption = json.loads((jd.CAPDIR / (SID + ".jsonl")).read_text().splitlines()[0])
+        self.assertTrue(caption["id"].startswith(SID + ":"))
+        self.assertEqual(caption["caption"], TID + ":g5")
+        journal = [json.loads(line) for line in
+                   (jd._overrides_dir() / (SID + ".jsonl")).read_text().splitlines()]
+        block = next(row for row in journal if row.get("op") == "block")
+        self.assertEqual(block["node"], SID + ":g1")
+        self.assertEqual(block["why"], TID + ":g6")
+
+    def test_canonicalizing_a_loaded_goal_store_preserves_guarded_nodes(self):
+        self._state(goals=True)
+        jd.migrate_codex_identity()
+        store = jd.load_goals(SID)
+        node = store["nodes"][SID + ":g1"]
+        self.assertIsInstance(node, jd.GuardedNode)
+        jd.save_goals(SID, store)
+        node = store["nodes"][SID + ":g1"]
+        self.assertIsInstance(node, jd.GuardedNode)
+        with self.assertRaises(TypeError):
+            node["blocked"] = True
 
 
 class MigrationResumeSafety(unittest.TestCase):
@@ -519,6 +889,49 @@ class MigrationResumeSafety(unittest.TestCase):
         g = json.loads((jd.GOALDIR / (SID + ".json")).read_text())
         self.assertIn(SID + ":g2", g["nodes"])
         self.assertTrue((jd.GOALDIR / (TID + ".json")).exists())
+
+    def test_a_corrupt_intent_fails_closed_instead_of_clobbering_the_sid_store(self):
+        self._state()
+        mig = jd.CODEXDIR / "migrated"
+        mig.mkdir(parents=True, exist_ok=True)
+        (mig / (SID + ".intent")).write_text("{ corrupt")
+        jd.migrate_codex_identity()
+        g = json.loads((jd.GOALDIR / (SID + ".json")).read_text())
+        self.assertIn(SID + ":g2", g["nodes"],
+                      "an unreadable transaction record cannot erase post-upgrade SID work")
+        self.assertTrue(g["nodes"][SID + ":g2"].get("fresh"))
+        self.assertTrue((jd.GOALDIR / (TID + ".json")).exists(),
+                        "unknown ownership leaves both stores for explicit recovery")
+        self.assertFalse((mig / (SID + ".done")).exists(),
+                         "unknown ownership must not be declared settled")
+
+    def test_a_writer_after_a_caught_failure_is_never_clobbered_on_retry(self):
+        tmp = Path(tempfile.mkdtemp())
+        jd._rebind_state(tmp)
+        for d in (jd.GOALDIR, jd.CODEXDIR):
+            d.mkdir(parents=True, exist_ok=True)
+        (jd.CODEXDIR / "registry.json").write_text(json.dumps(
+            {SID: {"tid": TID, "name": "cx", "cwd": "/TESTDIR", "dead": False}}))
+        (jd.GOALDIR / (TID + ".json")).write_text(json.dumps(
+            {"rompUuid": TID, "nodes": {TID + ":g1": {"text": "old"}}, "status": {}}))
+        real = jd._mig_atomic
+
+        def refuse_goal_publish(path, text):
+            if path == jd.GOALDIR / (SID + ".json"):
+                raise OSError("synthetic publish failure")
+            return real(path, text)
+
+        with mock.patch.object(jd, "_mig_atomic", side_effect=refuse_goal_publish):
+            jd.migrate_codex_identity()
+        (jd.GOALDIR / (SID + ".json")).write_text(json.dumps(
+            {"rompUuid": SID, "nodes": {SID + ":g9": {"text": "new", "fresh": True}},
+             "status": {}}))
+        jd.migrate_codex_identity()
+        g = json.loads((jd.GOALDIR / (SID + ".json")).read_text())
+        self.assertIn(SID + ":g9", g["nodes"],
+                      "a post-failure SID writer is legitimate, not our partial publish")
+        self.assertTrue((jd.GOALDIR / (TID + ".json")).exists())
+        self.assertFalse((jd.CODEXDIR / "migrated" / (SID + ".done")).exists())
 
     def test_the_ledger_lands_before_the_unlink(self):
         # the r42 verification's P3: publish→unlink→persist was write-BEHIND — a crash in the
