@@ -975,6 +975,41 @@ class MigrationTransaction(unittest.TestCase):
         rec = json.loads((mig / (SID + ".done")).read_text())
         self.assertTrue(rec["stranded"]["captions"])
 
+    def test_a_settled_migration_skips_the_shared_file_pass(self):
+        # the r43 verification: _migrate_shared_identity_files re-read and re-parsed the
+        # unbounded cleared.jsonl / nudge-events.jsonl under the EXCLUSIVE flock at every boot
+        # and every romp-judge invocation, forever — the registry keeps its tid rows for life.
+        # A durable marker records the map state the pass last completed against; steady state
+        # skips it, and any per-session work re-runs it.
+        self._state(goals=True)
+        calls = []
+        real = jd._migrate_shared_identity_files
+
+        def counting(*a, **kw):
+            calls.append(1)
+            return real(*a, **kw)
+
+        with mock.patch.object(jd, "_migrate_shared_identity_files", side_effect=counting):
+            jd.migrate_codex_identity()
+            self.assertEqual(len(calls), 1, "the first entry runs the pass")
+            jd.migrate_codex_identity()
+            self.assertEqual(len(calls), 1, "a fully-settled entry skips it")
+            (jd.CAPDIR / (TID + ".jsonl")).write_text(
+                json.dumps({"id": TID + ":200:late", "caption": "late"}) + "\n")
+            jd.migrate_codex_identity()   # reopen: per-session work happened
+            jd.migrate_codex_identity()   # the reopened intent migrates the late file
+            self.assertGreater(len(calls), 1, "new work re-runs the shared pass")
+        self.assertTrue((jd.CODEXDIR / "migrated" / "shared.state").exists())
+
+    def test_the_identity_flock_wait_is_observable(self):
+        # the r43 verification: a blocking LOCK_EX while holding the process-wide RLock wedged
+        # every kernel thread SILENTLY behind a sibling process. The wait is correct; the
+        # silence is not — pin the non-blocking retry loop and its warning.
+        import inspect
+        src = inspect.getsource(jd._identity_file_lock)
+        self.assertIn("fcntl.LOCK_EX | fcntl.LOCK_NB", src)
+        self.assertIn("waiting on another romp process", src)
+
     def test_canonicalizing_a_loaded_goal_store_preserves_guarded_nodes(self):
         self._state(goals=True)
         jd.migrate_codex_identity()

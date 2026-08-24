@@ -643,6 +643,32 @@ class NameClaims(unittest.TestCase):
             finally:
                 km._dismissed_lanes.clear(); km._dismissed_lanes.update(old)
 
+    def test_the_clear_flag_sweep_runs_outside_the_identity_lock(self):
+        # the r43 verification: _mark_nodes_cleared runs a full session discovery plus a
+        # transcript parse per touched session — holding the GLOBAL identity lock across it froze
+        # every store writer and _drive dispatch for seconds. The ledger append stays locked; the
+        # sweep runs after, at identity-lock depth 0 (its own store ops re-lock per call).
+        from pathlib import Path
+        depths = []
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td); (state / "codex").mkdir()
+            with mock.patch.object(km.jd, "STATE", state):
+                with mock.patch.object(km.jd, "CODEXDIR", state / "codex"):
+                    with mock.patch.object(km, "_delegation_linked_ids", return_value=set()):
+                        with mock.patch.object(
+                                km, "_mark_nodes_cleared",
+                                side_effect=lambda *a, **kw: depths.append(
+                                    getattr(km.jd._IDENTITY_LOCK_LOCAL, "depth", 0))):
+                            km._clear_all(["s:g1"])
+        self.assertEqual(depths, [0], "_clear_all's flag sweep left the identity lock")
+        import inspect
+        src = inspect.getsource(km._episode_boundary_check)
+        self.assertIn('\n    _mark_nodes_cleared(tops, True, src="romp"', src,
+                      "the boundary settle's sweep sits OUTSIDE the with-block (module indent)")
+        src2 = inspect.getsource(km._set_session_flag)
+        self.assertIn("\n            if tops:\n                _mark_nodes_cleared(tops, True)", src2,
+                      "the mute path's sweep sits outside the identity span")
+
     def test_tag_edit_cannot_overwrite_a_concurrent_timeline_view_heal(self):
         # the r43 merge integration: _edit_tag's read-modify-write took only its thread lock, so it
         # interleaved with the identity-locked heal and one side's edit was silently lost

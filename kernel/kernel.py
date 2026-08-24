@@ -1979,7 +1979,11 @@ def _set_session_flag(sid, flag, value):
                     with p.open("a") as fh:
                         for nid in tops:
                             fh.write(json.dumps({"id": nid, "t": t, "op": "clear"}) + "\n")
-                    _mark_nodes_cleared(tops, True)           # durable node flag → sealed across judge passes
+            if tops:
+                _mark_nodes_cleared(tops, True)       # durable node flag → sealed across judge passes;
+                #                                       OUTSIDE the identity lock — it discovers and
+                #                                       parses (the r43 verification), re-locking per
+                #                                       store op on its own
         except Exception:
             pass
     if flag == "hideFromFeed" and not value:
@@ -6345,7 +6349,11 @@ def _chat_tab_sessions_locked(now, tmux):
 
 
 def _chat_tab_sessions(now, tmux):
-    """Build and garbage-collect tabs against one authoritative order snapshot."""
+    """Build and garbage-collect tabs against one authoritative order snapshot. The discovery
+    walk is WARMED before the lock (the r43 verification: holding the global identity flock
+    across a cold jd.discover() froze every writer for its duration) — the locked build then
+    reads the same memoized answers, so gc-vs-append atomicity costs cache hits, not walks."""
+    _sessions(now)
     with jd._identity_file_lock():
         return _chat_tab_sessions_locked(now, tmux)
 
@@ -19661,7 +19669,9 @@ def _episode_boundary_check(sid, path, now):
         jd.append_episode_settle(sid, head["uuid"], int(t),
                                  [{"id": nid, "text": (nodes[nid].get("text") or "")[:120]}
                                   for nid in tops])
-        _mark_nodes_cleared(tops, True, src="romp", why="dropped when the conversation was cleared")
+    _mark_nodes_cleared(tops, True, src="romp", why="dropped when the conversation was cleared")
+    #                                             ^ OUTSIDE the identity lock (the r43 verification):
+    #                                               it discovers + parses; its store ops re-lock
     sys.stderr.write("episode boundary: %s cleared -> settled %d open card(s)\n" % (sid[:8], len(tops)))
 
 
@@ -19751,7 +19761,11 @@ def _clear_all(item_ids):
         with p.open("a") as f:
             for iid in item_ids:
                 f.write(json.dumps({"id": iid, "t": t, "op": "clear"}) + "\n")
-        _mark_nodes_cleared(item_ids, True)           # durable node flag → no grouper re-wrap, no column bounce
+    # OUTSIDE the identity lock (the r43 verification: _mark_nodes_cleared runs a full session
+    # discovery plus a transcript parse per touched session, and holding the GLOBAL lock across
+    # that froze every store writer and _drive dispatch for seconds). The ids are already
+    # canonical, and each of its store operations re-enters the lock briefly on its own.
+    _mark_nodes_cleared(item_ids, True)               # durable node flag → no grouper re-wrap, no column bounce
     # CLEAR IS SILENT (the user 2026-08-23, reversing the 2026-07-24 wrap-up): the session hears
     # NOTHING. The wrap's response turn routinely re-minted the very card the user had just cleared —
     # a discard that answered back — so the gesture now only discards; if anything real remains, the

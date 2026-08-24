@@ -5435,7 +5435,26 @@ def _identity_file_lock():
             except OSError:
                 pass
             if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    # another PROCESS holds it (a boot migration, a romp-judge run). Waiting is
+                    # correct — but silently wedging every kernel thread behind the in-process
+                    # RLock is not observable, so say so once after a few seconds (the r43
+                    # verification), then keep waiting.
+                    deadline = time.time() + 5
+                    warned = False
+                    while True:
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except OSError:
+                            if not warned and time.time() > deadline:
+                                warned = True
+                                sys.stderr.write("identity lock: waiting on another romp process "
+                                                 "(migration or a romp-judge run) — holding all "
+                                                 "identity-keyed writes until it releases\n")
+                            time.sleep(0.05)
                 locked = True
             _IDENTITY_LOCK_LOCAL.depth = 1
             yield
@@ -5566,6 +5585,7 @@ def _migrate_codex_identity_locked():
     pairs = [(sid, tid) for sid, tid in raw_pairs if tid not in ambiguous]
     tid_to_sid = {tid: sid for sid, tid in pairs}
     goal_tid_to_sid = {}
+    did_work = False
     # Session identity is authoritative in registry.json, independent of whether legacy goal
     # numbering can be proved continuous. Publish this map before a caught migration failure can
     # return to normal writers, so an old TID filename is never recreated after its move.
@@ -5640,6 +5660,7 @@ def _migrate_codex_identity_locked():
                         continue                      # the late source vanished; original proof still holds
                     migdir.mkdir(parents=True, exist_ok=True)
                     _mig_atomic(done_p, json.dumps({"tid": tid, "moved": {}}))
+                    did_work = True
                     continue                          # nothing ever to migrate: settled
                 # which SID files already exist BEFORE anything moves: the sid-wins decision
                 # keys on this DURABLE record — gating it on the in-process `resumed` flag
@@ -5934,13 +5955,32 @@ def _migrate_codex_identity_locked():
                 intent_p.unlink(missing_ok=True)
                 if _mig_goal_continuity(intent):
                     goal_tid_to_sid[tid] = sid
+            did_work = True                           # an intent stood this entry: state moved
         except Exception as e:
             sys.stderr.write("codex identity migration %s->%s: %s\n" % (tid[:8], sid[:8], e))
+            did_work = True
     _CODEX_IDENTITY_MAP.clear()
     _CODEX_IDENTITY_MAP.update(tid_to_sid)
     _CODEX_GOAL_IDENTITY_MAP.clear()
     _CODEX_GOAL_IDENTITY_MAP.update(goal_tid_to_sid)
+    state_sha = _mig_sha(json.dumps([sorted(tid_to_sid.items()),
+                                     sorted(goal_tid_to_sid.items())]))
+    marker = migdir / "shared.state"
+    try:
+        settled = not did_work and _mig_read_text(marker).strip() == state_sha
+    except Exception:
+        settled = False
+    if settled:
+        return                                        # steady state: the shared files were already
+    #                                                   rewritten against these exact maps, and no
+    #                                                   per-session state moved this entry — skip
+    #                                                   the unbounded re-parses (the r43 verification)
     _migrate_shared_identity_files(tid_to_sid, goal_tid_to_sid)
+    try:
+        migdir.mkdir(parents=True, exist_ok=True)
+        _mig_atomic(marker, state_sha)
+    except Exception:
+        pass                                          # no marker → the next entry re-runs; never wrong
 
 
 def migrate_codex_identity():
