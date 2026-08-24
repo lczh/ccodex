@@ -66,6 +66,32 @@ class _ProbeCase(unittest.TestCase):
         self.addCleanup(lambda: setattr(km, "SSH_BIN", self._saved))
 
 
+class LatchReport(_ProbeCase):
+    """The discover step's LATCH line is what gates the equal-heads no-op (the r43 verification's
+    P1) — executed here against real git fixtures, both answers plus the fail-closed UNKNOWN."""
+
+    def test_the_latch_state_is_read_from_the_real_git_dir(self):
+        home = tempfile.mkdtemp()
+        root = _mk_clone(os.path.join(home, "projects", "romp"))
+        subprocess.run(["git", "init", "-q", root], check=True,
+                       env=dict(os.environ, HOME=home), capture_output=True)
+        self._use(home)
+        _, _, _, latch, err = km._discover_remote_clone("TESTHOST")
+        self.assertEqual((latch, err), ("0", ""), "a clear latch is affirmatively reported")
+        with open(os.path.join(root, ".git", "romp-install-failed"), "w") as f:
+            f.write("aaaaaaaa\n")
+        _, _, _, latch, _ = km._discover_remote_clone("TESTHOST")
+        self.assertEqual(latch, "1", "an armed latch is reported — equal heads must still heal")
+
+    def test_an_unresolvable_git_dir_reports_unknown_never_clear(self):
+        home = tempfile.mkdtemp()
+        _mk_clone(os.path.join(home, "projects", "romp"))   # a bare .git DIR, not a repo
+        self._use(home)
+        _, _, _, latch, _ = km._discover_remote_clone("TESTHOST")
+        self.assertEqual(latch, "UNKNOWN",
+                         "no git answer must never read as a presumed-clear latch")
+
+
 class RepoRootStateFile(_ProbeCase):
     def test_state_file_wins_over_the_candidate_dirs(self):
         home = tempfile.mkdtemp()
@@ -73,7 +99,7 @@ class RepoRootStateFile(_ProbeCase):
         _mk_clone(os.path.join(home, "projects", "romp"))               # decoy in the candidate list
         _state_file(home, real)
         self._use(home)
-        rdir, _, _, err = km._discover_remote_clone("TESTHOST")
+        rdir, _, _, _latch, err = km._discover_remote_clone("TESTHOST")
         self.assertEqual((rdir, err), (real, ""))
         ok, detail = km._start_remote_kernel("TESTHOST")
         self.assertTrue(ok, detail)
@@ -84,7 +110,7 @@ class RepoRootStateFile(_ProbeCase):
         enved = _mk_clone(os.path.join(home, "override", "romp"))
         _state_file(home, _mk_clone(os.path.join(home, "stale", "romp")))
         self._use(home, extra_env='ROMP_REPO_ROOT="%s"' % enved)
-        rdir, _, _, err = km._discover_remote_clone("TESTHOST")
+        rdir, _, _, _latch, err = km._discover_remote_clone("TESTHOST")
         self.assertEqual((rdir, err), (enved, ""))
 
     def test_a_stale_state_file_falls_through_to_the_dirs(self):
@@ -92,7 +118,7 @@ class RepoRootStateFile(_ProbeCase):
         _state_file(home, os.path.join(home, "moved-away", "romp"))     # points at nothing
         want = _mk_clone(os.path.join(home, "projects", "romp"))
         self._use(home)
-        rdir, _, _, err = km._discover_remote_clone("TESTHOST")
+        rdir, _, _, _latch, err = km._discover_remote_clone("TESTHOST")
         self.assertEqual((rdir, err), (want, ""))
 
     def test_the_kernel_persists_its_own_repo_root_at_boot(self):
@@ -110,7 +136,7 @@ class CandidateDirs(_ProbeCase):
         home = tempfile.mkdtemp()
         want = _mk_clone(os.path.join(home, "projects", "romp"))        # the dir the old list missed
         self._use(home)
-        rdir, _, _, err = km._discover_remote_clone("TESTHOST")
+        rdir, _, _, _latch, err = km._discover_remote_clone("TESTHOST")
         self.assertEqual((rdir, err), (want, ""))
         ok, detail = km._start_remote_kernel("TESTHOST")
         self.assertTrue(ok, detail)
@@ -132,7 +158,7 @@ class LoginShellPath(_ProbeCase):
         ok, detail = km._start_remote_kernel("TESTHOST")
         self.assertTrue(ok, detail)
         self.assertTrue(detail.endswith("romp-serve"), detail)
-        rdir, _, _, err = km._discover_remote_clone("TESTHOST")
+        rdir, _, _, _latch, err = km._discover_remote_clone("TESTHOST")
         # realpath both sides: readlink -f canonicalizes (macOS /var → /private/var)
         self.assertEqual((os.path.realpath(rdir), err), (os.path.realpath(clone), ""))
 
@@ -141,7 +167,7 @@ class MissIsLoud(_ProbeCase):
     def test_noromp_names_every_source_it_tried(self):
         home = tempfile.mkdtemp()                                       # nothing romp-ish at all
         self._use(home)
-        rdir, _, _, err = km._discover_remote_clone("TESTHOST")
+        rdir, _, _, _latch, err = km._discover_remote_clone("TESTHOST")
         self.assertEqual(rdir, "")
         self.assertIn("not installed", err)
         for named in ("repo-root", "PATH", "login shell", "~/projects/romp", "~/GitRepos/romp"):
