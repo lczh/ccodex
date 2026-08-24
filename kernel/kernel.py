@@ -3358,10 +3358,11 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
             return
         if not _converge_install(tip[:8], lock_fd):
             return
-        if not _kernel_code_changed(_kernel_sha(), _checkout_sha()):
+        if not _kernel_code_changed(_kernel_sha(), tip):
             # the pull moved only UI/dist inputs (the user 2026-08-23): install.sh above already
-            # rebuilt the served dist, so converge IN PLACE — no restart, no cut turns
-            _REBUILT_FOR[0] = _checkout_sha()
+            # rebuilt the served dist, so converge IN PLACE — no restart, no cut turns. `tip` IS
+            # the checkout now (head2 == tip was verified before install ran).
+            _REBUILT_FOR[0] = tip
             _sync_notice("new build served in place (UI-only change; no restart) — reload the "
                          "dashboard to pick it up")
             return

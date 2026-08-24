@@ -286,8 +286,10 @@ class ConvergeFunctional(unittest.TestCase):
 
     def _run(self, kind="pull", target=None, fail=(), tip=None, channel=None, restart_fails=False,
              dirty_second_status=False, second_status_rc_fails=False, diverge_second_ancestry=False,
-             post_move_head=None, post_move_head_rc_fails=False):
-        """Drive _run_main_update with every subprocess scripted. `fail` names steps that exit 1."""
+             post_move_head=None, post_move_head_rc_fails=False, ui_only=False):
+        """Drive _run_main_update with every subprocess scripted. `fail` names steps that exit 1.
+        `ui_only` scripts the pull leg's code-changed probe (the fork runs it AFTER the install
+        gate); the default False answer keeps the restart path every step-order pin expects."""
         import subprocess as sp
         target = self.FULL if target is None else target
         tip = self.FULL if tip is None else tip
@@ -345,12 +347,28 @@ class ConvergeFunctional(unittest.TestCase):
                    HTTP_PROXY="http://127.0.0.1:9")   # a proxy that must NEVER be consulted
         with mock.patch.object(km, "_update_channel", return_value=channel or "dev"), \
              mock.patch.object(km.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(km, "_kernel_code_changed", return_value=not ui_only), \
+             mock.patch.object(km, "_kernel_sha", return_value="cur-sha"), \
              mock.patch.object(km, "_sync_notice",
                                side_effect=lambda m, ok=True: self.notices.append(m)), \
              mock.patch.dict(km.os.environ, env, clear=True), \
              mock.patch.object(km.http.client, "HTTPConnection", FakeConn):
             km._run_main_update(kind, target=target)
         return [s for s, _ in calls], calls
+
+    def test_a_ui_only_pull_installs_but_never_restarts(self):
+        # the fork keeps the INSTALL gate ahead of the in-place converge (a vscode-extension dep
+        # change is "UI-only" to the classifier, and building it against stale node_modules is the
+        # exact stale-build the gate exists to stop); only the RESTART is skipped
+        km._REBUILT_FOR[0] = ""
+        steps, _calls = self._run(ui_only=True)
+        self.assertEqual(steps, ["status", "fetch", "rev-parse", "merge-base", "status",
+                                 "merge-base", "checkout", "rev-parse", "install"],
+                         "the full pull transaction INCLUDING install still runs")
+        self.assertEqual(self.requests, [], "no restart POST for a converge that cuts nothing")
+        self.assertTrue(any("no restart" in m for m in self.notices))
+        self.assertTrue(km._REBUILT_FOR[0], "the in-place converge latches its sha")
+        km._REBUILT_FOR[0] = ""
 
     def test_happy_path_runs_in_order_and_checks_out_the_bound_sha(self):
         steps, calls = self._run()
@@ -1603,7 +1621,15 @@ class UiOnlyConverge(unittest.TestCase):
         self.assertTrue(km._kernel_code_changed("", "b2"), "unknown shas: the restart is the safe converge")
 
     def test_the_pull_path_carries_the_same_in_place_converge(self):
-        src = inspect.getsource(km._run_main_update)
-        self.assertIn('if kind == "pull" and not _kernel_code_changed(_kernel_sha(), _checkout_sha()):', src)
-        self.assertIn("_rebuild_dist()", src)
-        self.assertIn("_REBUILT_FOR[0] = _checkout_sha()", src)
+        # the fork splits _run_main_update into a wrapper + _locked body, and its in-place
+        # converge sits AFTER the install gate (install still runs; only the restart is skipped)
+        src = inspect.getsource(km._run_main_update_locked)
+        self.assertIn('if not _kernel_code_changed(_kernel_sha(), tip):', src)
+        self.assertLess(src.index("_converge_install(tip[:8], lock_fd)"),
+                        src.index("if not _kernel_code_changed("),
+                        "the install gate comes first — a UI-dep change still installs, so a "
+                        "vscode-extension dep bump never builds against stale node_modules "
+                        "(install.sh IS the build here; no separate _rebuild_dist)")
+        self.assertIn("_REBUILT_FOR[0] = tip", src)
+        self.assertLess(src.index("_REBUILT_FOR[0] = tip"), src.index('if kind == "restart":'),
+                        "the in-place converge returns before the restart machinery")
