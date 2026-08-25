@@ -6019,23 +6019,46 @@ def _migrate_codex_identity_locked():
     _CODEX_IDENTITY_MAP.update(tid_to_sid)
     _CODEX_GOAL_IDENTITY_MAP.clear()
     _CODEX_GOAL_IDENTITY_MAP.update(goal_tid_to_sid)
-    state_sha = _mig_shared_state_sha(tid_to_sid, goal_tid_to_sid)
     marker = migdir / "shared.state"
+    maps_sha = _mig_sha(json.dumps([sorted(tid_to_sid.items()),
+                                    sorted(goal_tid_to_sid.items())]))
+    cur_fps = _mig_shared_fps()
     try:
-        settled = not did_work and _mig_read_text(marker).strip() == state_sha
+        rec = json.loads(_mig_read_text(marker))
     except Exception:
-        settled = False
-    if settled:
+        rec = None                                    # v1/interim text markers land here: distrusted
+    #                                                   once, then re-certified in this format (the
+    #                                                   v1.3.17 audit's P1.4)
+    valid = (isinstance(rec, dict) and rec.get("v") == 2
+             and rec.get("maps") == maps_sha and isinstance(rec.get("files"), dict))
+    if valid and not did_work and rec["files"] == cur_fps:
         return                                        # steady state: the shared files were already
-    #                                                   rewritten against these exact maps, and no
+    #                                                   rewritten against these exact maps, nothing
+    #                                                   changed under the certificate, and no
     #                                                   per-session state moved this entry — skip
     #                                                   the unbounded re-parses (the r43 verification)
-    if _migrate_shared_identity_files(tid_to_sid, goal_tid_to_sid):
+    only = None
+    if valid and not did_work:
+        # the maps are certified and no per-session state moved: re-canonicalize ONLY the keyed
+        # files whose content moved under the certificate — never the unbounded journals, whose
+        # writers append canonical rows (the r45 verification: a full pass here re-parsed
+        # cleared.jsonl at every boot after any ordinary flag write)
+        only = {n for n in _MIG_FP_FILES if rec["files"].get(n) != cur_fps.get(n)}
+    ok_pass, pass_fps = _migrate_shared_identity_files(tid_to_sid, goal_tid_to_sid, only=only)
+    if ok_pass:
         try:
             migdir.mkdir(parents=True, exist_ok=True)
-            # recompute AFTER the rewrites: they moved the files' fingerprints, and the marker
-            # must certify the bytes it leaves behind, not the ones it found
-            _mig_atomic(marker, _mig_shared_state_sha(tid_to_sid, goal_tid_to_sid))
+            files = dict(rec["files"]) if valid else {}
+            # processed files carry the hash of the BYTES THIS PASS WROTE (or read-verified) —
+            # a write sneaking in between the rewrite and this marker mismatches at the next
+            # entry instead of being absorbed into the certificate (the r45 verification);
+            # untouched keyed files keep their certified hashes
+            files.update(pass_fps)
+            for n in _MIG_FP_FILES:
+                files.setdefault(n, cur_fps.get(n))
+            files = {n: files[n] for n in _MIG_FP_FILES}
+            _mig_atomic(marker, json.dumps({"v": 2, "maps": maps_sha, "files": files},
+                                           sort_keys=True))
         except Exception:
             pass                                      # no marker → the next entry re-runs; never wrong
     else:
@@ -6048,30 +6071,29 @@ def _migrate_codex_identity_locked():
         #                                               whose per-file failure was swallowed)
 
 
-# Every file _migrate_shared_identity_files rewrites — the certificate below fingerprints each
-# one so ANY external write (an Electron fallback, a hand edit) invalidates the marker and the
-# next entry re-canonicalizes (the v1.3.17 audit's P1.4).
-_MIG_SHARED_FILES = ("cleared.jsonl", "nudge-events.jsonl", "notify-cards.json", "auto-nudge.json",
-                     "judge-auth.json", "session-flags.json", "session-order.json",
-                     "retry-suppressed.json", "timeline-views.json", "timeline-dismissed.json")
+# The KEYED shared files _migrate_shared_identity_files rewrites — each fingerprinted in the
+# certificate so a write that bypassed canonicalization (an old client's direct write, a hand
+# edit) voids the settle and the next entry re-canonicalizes (the v1.3.17 audit's P1.4). The two
+# journals (cleared.jsonl, nudge-events.jsonl) are deliberately NOT fingerprinted: their writers
+# append canonicalized rows in normal operation, and fingerprinting them made the settle a
+# near-permanent miss that re-parsed the unbounded journals at every boot (the r45 verification).
+_MIG_FP_FILES = ("notify-cards.json", "auto-nudge.json", "judge-auth.json", "session-flags.json",
+                 "session-order.json", "retry-suppressed.json", "timeline-views.json",
+                 "timeline-dismissed.json")
+_MIG_JOURNALS = ("cleared.jsonl", "nudge-events.jsonl")
 
 
-def _mig_shared_state_sha(tid_to_sid, goal_tid_to_sid):
-    """The shared.state certificate text: VERSIONED ("v2:") and salted with each shared file's
-    (size, mtime_ns) fingerprint. The v1 marker was the bare identity-map digest, so a marker
-    wrongly issued by v1.3.16 (whose per-file failures were swallowed) certified this exact map
-    forever and v1.3.17 skipped the repaired rewrites (the v1.3.17 audit's P1.4). The version
-    prefix distrusts every pre-v1.3.18 marker once; the fingerprints distrust any marker whose
-    files changed under it."""
-    fps = []
-    for name in _MIG_SHARED_FILES:
+def _mig_shared_fps():
+    """Content hash per keyed shared file (absent -> None). CONTENT, not (size, mtime): a write
+    landing between the pass's own rewrite and a stat would be CERTIFIED as settled (absorbed,
+    the r45 verification), and mtime granularity is filesystem-dependent."""
+    fps = {}
+    for name in _MIG_FP_FILES:
         try:
-            st = (STATE / name).stat()
-            fps.append([name, int(st.st_size), int(st.st_mtime_ns)])
+            fps[name] = _mig_sha(_mig_read_text(STATE / name))
         except OSError:
-            fps.append([name, None, None])
-    return "v2:" + _mig_sha(json.dumps([sorted(tid_to_sid.items()),
-                                        sorted(goal_tid_to_sid.items()), fps]))
+            fps[name] = None
+    return fps
 
 
 def migrate_codex_identity():
@@ -6082,15 +6104,19 @@ def migrate_codex_identity():
         _migrate_codex_identity_locked()
 
 
-def _migrate_shared_identity_files(tid_to_sid, goal_tid_to_sid=None):
+def _migrate_shared_identity_files(tid_to_sid, goal_tid_to_sid=None, only=None):
     """Move shared identities without attaching old card state to unrelated SID numbering.
-    Returns True only when EVERY file that exists rewrote (or needed nothing) — a swallowed
-    per-file failure must never let the settle marker certify the pass (the v1.3.16 audit:
-    an invalid timeline-views.json logged an error, the marker landed anyway, and the file's
-    TID rows were never migrated after repair)."""
+    Returns (ok, fps): ok True only when EVERY file processed rewrote (or needed nothing) — a
+    swallowed per-file failure must never let the settle marker certify the pass (the v1.3.16
+    audit) — and fps maps each processed KEYED file to the content hash of the bytes this pass
+    wrote or read-verified (the r45 verification: the certificate must fingerprint what the
+    pass PRODUCED, never what a later stat happens to see). `only` (a set of keyed names)
+    scopes a re-canonicalization to the files whose content moved; the journals are processed
+    only on a full (only=None) pass."""
     if not tid_to_sid:
-        return True
+        return True, {}
     goal_tid_to_sid = goal_tid_to_sid or {}
+    fps = {}
 
     def _cleared(row):
         if not isinstance(row, dict) or not isinstance(row.get("id"), str):
@@ -6135,8 +6161,15 @@ def _migrate_shared_identity_files(tid_to_sid, goal_tid_to_sid=None):
                 cur = json.loads(raw)
                 new = transform(cur)
                 if new != cur:
-                    _mig_atomic(p, json.dumps(new, sort_keys=True))
+                    text = json.dumps(new, sort_keys=True)
+                    _mig_atomic(p, text)
+                else:
+                    text = raw
+                if name in _MIG_FP_FILES:
+                    fps[name] = _mig_sha(text)        # the bytes this pass wrote / read-verified
         except FileNotFoundError:
+            if name in _MIG_FP_FILES:
+                fps[name] = None
             return True                               # absent = nothing to migrate: clean
         except Exception as e:
             sys.stderr.write("codex identity migration (%s): %s\n" % (name, e))
@@ -6146,20 +6179,24 @@ def _migrate_shared_identity_files(tid_to_sid, goal_tid_to_sid=None):
     # Every new writer of these files takes this same process+flock lock. Each transform names
     # the identity-bearing fields in that file; notes, group names, captions, and other user text
     # are opaque even when they happen to begin with an old id.
+    keyed = (("notify-cards.json", canonicalize_goal_keyed_map),
+             ("auto-nudge.json", canonicalize_auto_nudge_identity),
+             ("judge-auth.json", canonicalize_session_keyed_map),
+             ("session-flags.json", canonicalize_session_flags_identity),
+             ("session-order.json", canonicalize_session_order_identity),
+             ("retry-suppressed.json", canonicalize_retry_suppressed_identity),
+             ("timeline-views.json", canonicalize_timeline_views),
+             ("timeline-dismissed.json", canonicalize_session_identity))
     ok = True
     with _identity_file_lock():
-        ok &= _rewrite("cleared.jsonl", _cleared, jsonl=True)
-        ok &= _rewrite("nudge-events.jsonl", _nudge_event, jsonl=True)
-        ok &= _rewrite("notify-cards.json", canonicalize_goal_keyed_map)
-        ok &= _rewrite("auto-nudge.json", canonicalize_auto_nudge_identity)
-        ok &= _rewrite("judge-auth.json", canonicalize_session_keyed_map)
-        ok &= _rewrite("session-flags.json", canonicalize_session_flags_identity)
-        ok &= _rewrite("session-order.json", canonicalize_session_order_identity)
-        ok &= _rewrite("retry-suppressed.json", canonicalize_retry_suppressed_identity)
-        ok &= _rewrite("timeline-views.json", canonicalize_timeline_views)
-        ok &= _rewrite("timeline-dismissed.json", canonicalize_session_identity)
+        if only is None:
+            ok &= _rewrite("cleared.jsonl", _cleared, jsonl=True)
+            ok &= _rewrite("nudge-events.jsonl", _nudge_event, jsonl=True)
+        for name, fn in keyed:
+            if only is None or name in only:
+                ok &= _rewrite(name, fn)
     _auth_cache[:] = [None, {}]
-    return bool(ok)
+    return bool(ok), fps
 
 
 def _codex_rows(cutoff, seen):

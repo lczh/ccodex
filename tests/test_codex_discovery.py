@@ -1029,8 +1029,10 @@ class MigrationTransaction(unittest.TestCase):
         (jd.STATE / "session-flags.json").write_text(json.dumps({TID: {"postalServiceOff": True}}))
         jd.migrate_codex_identity()
         marker = jd.CODEXDIR / "migrated" / "shared.state"
-        self.assertTrue(marker.read_text().startswith("v2:"),
-                        "the certificate is versioned and salted")
+        rec = json.loads(marker.read_text())
+        self.assertEqual(rec.get("v"), 2, "the certificate is versioned")
+        self.assertIn("session-flags.json", rec.get("files") or {},
+                      "…and fingerprints the keyed shared files")
         flags = json.loads((jd.STATE / "session-flags.json").read_text())
         self.assertIn(SID, flags)
         self.assertNotIn(TID, flags)
@@ -1043,7 +1045,7 @@ class MigrationTransaction(unittest.TestCase):
         flags = json.loads((jd.STATE / "session-flags.json").read_text())
         self.assertNotIn(TID, flags, "a pre-v1.3.18 certificate is distrusted — the pass re-ran")
         self.assertIn(SID, flags)
-        self.assertTrue(marker.read_text().startswith("v2:"))
+        self.assertEqual(json.loads(marker.read_text()).get("v"), 2)
 
     def test_an_external_shared_write_invalidates_the_certificate(self):
         # the v2 marker fingerprints each shared file (size, mtime_ns): a write landing OUTSIDE
@@ -1068,6 +1070,46 @@ class MigrationTransaction(unittest.TestCase):
         flags = json.loads((jd.STATE / "session-flags.json").read_text())
         self.assertNotIn(TID, flags, "the external write was re-canonicalized")
         self.assertIn(SID, flags)
+
+    def test_a_journal_append_never_voids_the_settle(self):
+        # the r45 verification: fingerprinting the journals made the settle a near-permanent
+        # miss — every clear event re-parsed the unbounded cleared.jsonl at the next boot.
+        # Journal writers append CANONICAL rows; only the keyed maps carry the bypass risk.
+        self._state(goals=True)
+        jd.migrate_codex_identity()
+        calls = []
+        real = jd._migrate_shared_identity_files
+
+        def counting(*a, **kw):
+            calls.append(1)
+            return real(*a, **kw)
+
+        with mock.patch.object(jd, "_migrate_shared_identity_files", side_effect=counting):
+            with (jd.STATE / "cleared.jsonl").open("a") as fh:
+                fh.write(json.dumps({"id": SID + ":g9", "t": 1, "op": "clear"}) + "\n")
+            jd.migrate_codex_identity()
+            self.assertEqual(calls, [], "an ordinary clear event leaves the settle standing")
+
+    def test_a_moved_keyed_file_recanonicalizes_selectively(self):
+        # …and when a keyed file DOES move under the certificate, only IT re-canonicalizes:
+        # the unbounded journals are never re-read on that path
+        self._state(goals=True)
+        jd.migrate_codex_identity()
+        (jd.STATE / "session-flags.json").write_text(
+            json.dumps({TID: {"hideFromFeed": True}}))
+        reads = []
+        real_read = jd._mig_read_text
+
+        def counting_read(p):
+            reads.append(getattr(p, "name", str(p)))
+            return real_read(p)
+
+        with mock.patch.object(jd, "_mig_read_text", side_effect=counting_read):
+            jd.migrate_codex_identity()
+        flags = json.loads((jd.STATE / "session-flags.json").read_text())
+        self.assertNotIn(TID, flags, "the moved file re-canonicalized")
+        self.assertNotIn("cleared.jsonl", [n for n in reads],
+                         "the journals are untouched by a selective pass")
 
     def test_a_permanent_flock_error_propagates_instead_of_spinning(self):
         # the v1.3.16 audit: an injected ENOTSUP was still spinning after 300ms — every OSError
