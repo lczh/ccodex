@@ -10,7 +10,7 @@ CLI:
   romp-judge --once               # one caption pass over the live fleet (writes captions/)
   romp-judge --test <transcript>  # caption one transcript's recent units, print them (no write)
 """
-import contextlib, hashlib, json, os, re, secrets, shutil, stat, sys, tempfile, time, subprocess, threading
+import contextlib, errno, hashlib, json, os, re, secrets, shutil, stat, sys, tempfile, time, subprocess, threading
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -5481,9 +5481,16 @@ def _identity_file_lock():
             except OSError:
                 pass
             if fcntl is not None:
+                # only CONTENTION retries (EWOULDBLOCK/EAGAIN — another process holds it — plus
+                # EACCES, some platforms' contention spelling, and EINTR). A PERMANENT failure
+                # (ENOTSUP on a network filesystem, EBADF) used to spin in this loop forever
+                # (the v1.3.16 audit): it propagates, loudly, so the caller fails visibly.
+                _RETRIABLE = (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES, errno.EINTR)
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except OSError:
+                except OSError as fe:
+                    if fe.errno not in _RETRIABLE:
+                        raise
                     # another PROCESS holds it (a boot migration, a romp-judge run). Waiting is
                     # correct — but silently wedging every kernel thread behind the in-process
                     # RLock is not observable, so say so once after a few seconds (the r43
@@ -5494,7 +5501,9 @@ def _identity_file_lock():
                         try:
                             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                             break
-                        except OSError:
+                        except OSError as fe2:
+                            if fe2.errno not in _RETRIABLE:
+                                raise
                             if not warned and time.time() > deadline:
                                 warned = True
                                 sys.stderr.write("identity lock: waiting on another romp process "
@@ -6021,12 +6030,17 @@ def _migrate_codex_identity_locked():
     #                                                   rewritten against these exact maps, and no
     #                                                   per-session state moved this entry — skip
     #                                                   the unbounded re-parses (the r43 verification)
-    _migrate_shared_identity_files(tid_to_sid, goal_tid_to_sid)
-    try:
-        migdir.mkdir(parents=True, exist_ok=True)
-        _mig_atomic(marker, state_sha)
-    except Exception:
-        pass                                          # no marker → the next entry re-runs; never wrong
+    if _migrate_shared_identity_files(tid_to_sid, goal_tid_to_sid):
+        try:
+            migdir.mkdir(parents=True, exist_ok=True)
+            _mig_atomic(marker, state_sha)
+        except Exception:
+            pass                                      # no marker → the next entry re-runs; never wrong
+    else:
+        marker.unlink(missing_ok=True)                # a failed pass RETRACTS any prior certificate:
+        #                                               the next entry must re-run the rewrites (the
+        #                                               v1.3.16 audit — the marker certified a pass
+        #                                               whose per-file failure was swallowed)
 
 
 def migrate_codex_identity():
@@ -6038,9 +6052,13 @@ def migrate_codex_identity():
 
 
 def _migrate_shared_identity_files(tid_to_sid, goal_tid_to_sid=None):
-    """Move shared identities without attaching old card state to unrelated SID numbering."""
+    """Move shared identities without attaching old card state to unrelated SID numbering.
+    Returns True only when EVERY file that exists rewrote (or needed nothing) — a swallowed
+    per-file failure must never let the settle marker certify the pass (the v1.3.16 audit:
+    an invalid timeline-views.json logged an error, the marker landed anyway, and the file's
+    TID rows were never migrated after repair)."""
     if not tid_to_sid:
-        return
+        return True
     goal_tid_to_sid = goal_tid_to_sid or {}
 
     def _cleared(row):
@@ -6088,25 +6106,29 @@ def _migrate_shared_identity_files(tid_to_sid, goal_tid_to_sid=None):
                 if new != cur:
                     _mig_atomic(p, json.dumps(new, sort_keys=True))
         except FileNotFoundError:
-            pass
+            return True                               # absent = nothing to migrate: clean
         except Exception as e:
             sys.stderr.write("codex identity migration (%s): %s\n" % (name, e))
+            return False
+        return True
 
     # Every new writer of these files takes this same process+flock lock. Each transform names
     # the identity-bearing fields in that file; notes, group names, captions, and other user text
     # are opaque even when they happen to begin with an old id.
+    ok = True
     with _identity_file_lock():
-        _rewrite("cleared.jsonl", _cleared, jsonl=True)
-        _rewrite("nudge-events.jsonl", _nudge_event, jsonl=True)
-        _rewrite("notify-cards.json", canonicalize_goal_keyed_map)
-        _rewrite("auto-nudge.json", canonicalize_auto_nudge_identity)
-        _rewrite("judge-auth.json", canonicalize_session_keyed_map)
-        _rewrite("session-flags.json", canonicalize_session_flags_identity)
-        _rewrite("session-order.json", canonicalize_session_order_identity)
-        _rewrite("retry-suppressed.json", canonicalize_retry_suppressed_identity)
-        _rewrite("timeline-views.json", canonicalize_timeline_views)
-        _rewrite("timeline-dismissed.json", canonicalize_session_identity)
+        ok &= _rewrite("cleared.jsonl", _cleared, jsonl=True)
+        ok &= _rewrite("nudge-events.jsonl", _nudge_event, jsonl=True)
+        ok &= _rewrite("notify-cards.json", canonicalize_goal_keyed_map)
+        ok &= _rewrite("auto-nudge.json", canonicalize_auto_nudge_identity)
+        ok &= _rewrite("judge-auth.json", canonicalize_session_keyed_map)
+        ok &= _rewrite("session-flags.json", canonicalize_session_flags_identity)
+        ok &= _rewrite("session-order.json", canonicalize_session_order_identity)
+        ok &= _rewrite("retry-suppressed.json", canonicalize_retry_suppressed_identity)
+        ok &= _rewrite("timeline-views.json", canonicalize_timeline_views)
+        ok &= _rewrite("timeline-dismissed.json", canonicalize_session_identity)
     _auth_cache[:] = [None, {}]
+    return bool(ok)
 
 
 def _codex_rows(cutoff, seen):

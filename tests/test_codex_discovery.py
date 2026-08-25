@@ -1001,6 +1001,61 @@ class MigrationTransaction(unittest.TestCase):
             self.assertGreater(len(calls), 1, "new work re-runs the shared pass")
         self.assertTrue((jd.CODEXDIR / "migrated" / "shared.state").exists())
 
+    def test_a_failed_shared_rewrite_is_never_certified_by_the_settle_marker(self):
+        # the v1.3.16 audit's P1: an invalid timeline-views.json logged an error, yet the
+        # shared.state marker landed — after repair the TID rows were never migrated
+        self._state(goals=True)
+        (jd.STATE / "timeline-views.json").write_text("{ corrupt")
+        (jd.STATE / "session-flags.json").write_text(json.dumps({TID: {"hideFromFeed": True}}))
+        jd.migrate_codex_identity()
+        marker = jd.CODEXDIR / "migrated" / "shared.state"
+        self.assertFalse(marker.exists(),
+                         "a pass with a swallowed per-file failure is not certified")
+        (jd.STATE / "timeline-views.json").write_text(json.dumps(
+            {"active": "all", "tags": [{"id": "g", "name": "g", "color": "",
+                                        "members": [{"host": "", "sid": TID}]}]}))
+        jd.migrate_codex_identity()
+        self.assertTrue(marker.exists(), "the repaired pass certifies")
+        tv = json.loads((jd.STATE / "timeline-views.json").read_text())
+        self.assertEqual(tv["tags"][0]["members"][0]["sid"], SID,
+                         "the repaired file's TID rows migrate — nothing was skipped as settled")
+
+    def test_a_permanent_flock_error_propagates_instead_of_spinning(self):
+        # the v1.3.16 audit: an injected ENOTSUP was still spinning after 300ms — every OSError
+        # read as contention. Permanent errors must fail loudly; contention still waits.
+        import errno as _errno
+        if jd.fcntl is None:
+            self.skipTest("no fcntl")
+        tmp = Path(tempfile.mkdtemp())
+        jd._rebind_state(tmp)
+        jd.CODEXDIR.mkdir(parents=True, exist_ok=True)
+        real_flock = jd.fcntl.flock
+        calls = []
+
+        def enotsup(fd, op):
+            calls.append(op)
+            raise OSError(_errno.ENOTSUP, "not supported")
+
+        with mock.patch.object(jd.fcntl, "flock", side_effect=enotsup):
+            with self.assertRaises(OSError):
+                with jd._identity_file_lock():
+                    pass
+        self.assertLessEqual(len(calls), 2, "a permanent errno never enters the retry spin")
+        # contention (EWOULDBLOCK) still waits and then proceeds
+        state = {"n": 0}
+
+        def contended_then_free(fd, op):
+            state["n"] += 1
+            if state["n"] < 3:
+                raise OSError(_errno.EWOULDBLOCK, "contended")
+            return real_flock(fd, op)
+
+        entered = []
+        with mock.patch.object(jd.fcntl, "flock", side_effect=contended_then_free):
+            with jd._identity_file_lock():
+                entered.append(1)
+        self.assertEqual(entered, [1], "contention retries through to acquisition")
+
     def test_the_identity_flock_wait_is_observable(self):
         # the r43 verification: a blocking LOCK_EX while holding the process-wide RLock wedged
         # every kernel thread SILENTLY behind a sibling process. The wait is correct; the
