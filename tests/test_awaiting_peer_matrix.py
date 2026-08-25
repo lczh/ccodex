@@ -492,6 +492,28 @@ class CrossHostDelegation(_Base):
         self.assertEqual(km._peer_answered_at(SID), T0 + 300,
                          "the logged old-name binding resolves the legacy row to the stable sid")
 
+    def test_a_later_rebinding_never_rekeys_an_answered_legacy_ask(self):
+        # the r45 verification: the alias map was last-write-wins per host:name, so a binding
+        # logged AFTER the ask re-keyed an already-answered legacy ask onto whatever session now
+        # wears the name — a false Awaiting minted with no new information (the flap rule).
+        self._fleet_stub()
+        other = "99999999-8888-7777-6666-555555555555"
+        rows = [json.dumps({"t": T0 + 5, "ev": "peer-alias", "from_host": self.RHOST,
+                            "from": "oldworker", "from_id": self.RSID}),
+                json.dumps({"id": "px-21.mail.TESTHOST-A", "ev": "sent", "from": "api",
+                            "from_id": SID, "to_id": "peer:%s" % self.RHOST,
+                            "toName": "%s:oldworker" % self.RHOST,
+                            "t": T0 + 10, "kind": "question", "body": "the port?"}),
+                json.dumps({"id": "rx-21.mail.%s" % self.RHOST, "ev": "sent", "from": "worker",
+                            "from_id": self.RSID, "from_host": self.RHOST, "to_id": SID,
+                            "t": T0 + 300, "kind": "coordinate", "body": "8080"}),
+                json.dumps({"t": T0 + 400, "ev": "peer-alias", "from_host": self.RHOST,
+                            "from": "oldworker", "from_id": other})]   # the name moved on
+        self._log(rows)
+        km._POSTAL_WAIT_CACHE[0] = None
+        self.assertEqual(km._peer_answered_at(SID), T0 + 300,
+                         "the ask resolves through the binding active WHEN IT WAS SENT")
+
     def test_an_unrelated_peers_reply_never_completes(self):
         self._fleet_stub()
         self._log([self._xrow(1, T0 + 10)])

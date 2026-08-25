@@ -21207,7 +21207,12 @@ def _postal_wait_maps():
     last_any, last_ask, last_await = {}, {}, {}
     try:
         rows = []
-        alias = {}   # "host:name" -> sid, learned from every row a remote sender stamped
+        ahist = {}   # "host:name" -> [(t, sid)...]: every binding a remote row (mail or the bus's
+        #              durable peer-alias record) ever declared, WITH its time — a legacy row must
+        #              resolve through the binding active WHEN IT WAS SENT, or a name re-bound to a
+        #              different session later re-keys an already-answered ask onto the new holder
+        #              and mints a false Awaiting (the r45 verification: cards move on new
+        #              information, never on an inference flap)
         for line in jd.MESSAGES.read_text(errors="replace").splitlines():
             try:
                 o = json.loads(line)
@@ -21215,7 +21220,16 @@ def _postal_wait_maps():
                 continue
             rows.append(o)
             if o.get("from_host") and o.get("from") and o.get("from_id"):
-                alias[str(o["from_host"]) + ":" + str(o["from"])] = str(o["from_id"])
+                ahist.setdefault(str(o["from_host"]) + ":" + str(o["from"]), []).append(
+                    (int(o.get("t") or 0), str(o["from_id"])))
+
+        def _alias_at(key, when):
+            hist = ahist.get(key) or []
+            before = [e for e in hist if e[0] <= when]
+            if before:
+                return max(before)[1]
+            after = [e for e in hist if e[0] > when]   # the peer first spoke after the ask —
+            return min(after)[1] if after else ""      # the earliest binding is the ask's world
         for o in rows:
             f, t_, ts = o.get("from_id"), o.get("to_id"), o.get("t")
             if not (f and t_ and ts):
@@ -21238,7 +21252,8 @@ def _postal_wait_maps():
                     # pair, the later silently overwriting the earlier (the 2026-08-18 audit found a
                     # 29.6h-invisible ask eaten this way). The maps rebuild from the full log, so the
                     # moment the peer speaks the alias resolves and every row re-keys to the real sid.
-                    t_ = alias.get(str(o["toName"]), "peer:" + str(o["toName"]))
+                    t_ = _alias_at(str(o["toName"]), int(o.get("t") or 0)) \
+                        or "peer:" + str(o["toName"])
             ts = int(ts)
             last_any[(f, t_)] = max(last_any.get((f, t_), 0), ts)
             k = o.get("kind")                            # the sender's DECLARED intent (schema field) wins

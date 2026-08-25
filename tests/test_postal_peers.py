@@ -727,6 +727,66 @@ class ReceiptDurability(unittest.TestCase):
                       "the mail's own headers are the second durable source")
 
 
+class UnknownReceiptScanMemo(unittest.TestCase):
+    """the r45 verification: a 404-retryable receipt is re-posted every judge pass forever, and
+    each retry paid a full messages.jsonl scan plus two all-mailbox globs. The scan re-runs only
+    when the log has actually grown — and recovery still works the moment it does."""
+
+    def test_the_second_miss_skips_the_scan_and_growth_recovers(self):
+        pm._HDA_MISS.clear()
+        pm.TLDIR.mkdir(parents=True, exist_ok=True)
+        payload, status = pm.handoff_done_apply({"mid": "memo-1"})
+        self.assertEqual(status, 404)
+        self.assertIn("memo-1", pm._HDA_MISS)
+        import pathlib
+        reads = []
+        real = pathlib.Path.read_text
+
+        def counting(self2, *a, **kw):
+            if self2.name == "messages.jsonl":
+                reads.append(1)
+            return real(self2, *a, **kw)
+
+        with mock.patch.object(pathlib.Path, "read_text", counting):
+            payload, status = pm.handoff_done_apply({"mid": "memo-1"})
+        self.assertEqual(status, 404)
+        self.assertEqual(reads, [], "an unchanged log is never rescanned")
+        with (pm.TLDIR / "messages.jsonl").open("a") as fh:
+            fh.write(json.dumps({"t": 1, "ev": "sent", "id": "memo-1", "from": "x",
+                                 "from_id": "s", "to_id": "sid-b", "body": "b",
+                                 "from_host": "hosta", "relay_mid": "px-m1",
+                                 "relay_via": "hosta"}) + "\n")
+        payload, status = pm.handoff_done_apply({"mid": "memo-1"})
+        self.assertEqual(status, 200, "a grown log rescans — retryable means retryable")
+        self.assertNotIn("memo-1", pm._HDA_MISS)
+
+
+class QuarantineApproveById(unittest.TestCase):
+    """the r45 verification (the P1.6 sibling leg): approve re-matched a dead toId by NAME,
+    handing id-addressed mail to whatever session now wears the name."""
+
+    def test_id_addressed_mail_never_approves_to_a_name_squatter(self):
+        m = {"mid": "qw-1", "to": "oldname", "to_id": "sid-gone", "frm": "peer",
+             "frm_id": "sid-p", "body": "hi", "kind": "question"}
+        self.assertTrue(pm._quarantine_put("hostq", m, "sid-gone", via="hostq"))
+        with mock.patch.object(pm, "local_agents",
+                               lambda: [{"name": "oldname", "id": "sid-squat"}]):
+            ok, err = pm.quarantine_decide("qw-1", "approve")
+        self.assertFalse(ok)
+        self.assertIn("no longer a live", err)
+
+    def test_name_addressed_mail_still_rematches_by_name(self):
+        m = {"mid": "qw-2", "to": "web", "frm": "peer",
+             "frm_id": "sid-p", "body": "hi", "kind": "question"}
+        self.assertTrue(pm._quarantine_put("hostq", m, "sid-old", via="hostq"))
+        with mock.patch.object(pm, "local_agents",
+                               lambda: [{"name": "web", "id": "sid-new"}]):
+            ok, err = pm.quarantine_decide("qw-2", "approve")
+        self.assertTrue(ok, err)
+        self.assertTrue(list((pm.MAILROOT / "sid-new" / "new").glob("*")),
+                        "a revived name-addressed recipient still gets its held mail")
+
+
 class WireStableId(unittest.TestCase):
     """the v1.3.17 audit's P1.6: the envelope serialized the recipient's NAME, so a rename
     between enqueue and intake bounced the mail though the session sat live. The validated
@@ -777,6 +837,20 @@ class AliasHistory(unittest.TestCase):
                  if r.get("ev") == "peer-alias" and r.get("from_host") == "hostz"]
         self.assertIn(("web", "sid-z1"), binds, "the OLD binding is durable history")
         self.assertIn(("web2", "sid-z1"), binds, "the new binding lands too")
+
+    def test_a_name_returning_to_a_prior_holder_relogs(self):
+        # the r45 verification: a (host,name,id) triple memo left the MIDDLE holder as the
+        # log's last word when a name went A -> B -> A
+        pm._ALIAS_LOGGED.clear()
+        for aid in ("sid-a1", "sid-b1", "sid-a1"):
+            pm.PEER_STATE["hostw"] = {"presence": [{"name": "w", "id": aid}]}
+            pm._log_peer_aliases("hostw")
+        pm.PEER_STATE.pop("hostw", None)
+        rows = [json.loads(l) for l in (pm.TLDIR / "messages.jsonl").read_text().splitlines()]
+        binds = [r["from_id"] for r in rows
+                 if r.get("ev") == "peer-alias" and r.get("from_host") == "hostw"]
+        self.assertEqual(binds, ["sid-a1", "sid-b1", "sid-a1"],
+                         "each rebinding lands, so the return to A is chronologically last")
 
     def test_bindings_are_deduped_in_process(self):
         pm._ALIAS_LOGGED.clear()

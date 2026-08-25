@@ -381,6 +381,12 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
     _mark_pending(to_id)            # new/ is now non-empty -> raise the marker (covers park + live)
     return name   # the message id (maildir filename); joins to the log + status-bar prefix
 
+_HDA_MISS = {}   # mid -> messages.jsonl (size, mtime_ns) at the last failed translation scan:
+#                  a 404-retryable receipt is re-posted every judge pass forever, and each retry
+#                  was a full log scan plus two all-mailbox globs (the r45 verification) — the
+#                  scan re-runs only when the log has actually grown
+
+
 def handoff_done_apply(data):
     """POST /handoff-done body -> (payload, status). The recipient KERNEL reports a cross-host
     delegation's planted goal COMPLETE by its DELIVERY id; this bus owns the delivery row and
@@ -396,6 +402,13 @@ def handoff_done_apply(data):
         return {"error": "mid (a path-safe id) required"}, 400
     if mid in _receipts_done():
         return {"ok": True, "already": True}, 200
+    try:
+        _st = (TLDIR / "messages.jsonl").stat()
+        _logkey = (_st.st_size, _st.st_mtime_ns)
+    except OSError:
+        _logkey = None
+    if mid in _HDA_MISS and _HDA_MISS[mid] == _logkey:
+        return {"ok": False, "unknown": True, "retry": True}, 404
     row = None
     try:
         for line in (TLDIR / "messages.jsonl").read_text(errors="replace").splitlines():
@@ -411,7 +424,11 @@ def handoff_done_apply(data):
     if row is None:
         row = _receipt_row_from_maildir(mid)   # second durable source: the mail's own headers
     if row is None:
+        if len(_HDA_MISS) > 4096:
+            _HDA_MISS.clear()
+        _HDA_MISS[mid] = _logkey
         return {"ok": False, "unknown": True, "retry": True}, 404
+    _HDA_MISS.pop(mid, None)
     relay_mid = str(row.get("relay_mid") or "")
     relay_via = str(row.get("relay_via") or "")
     if not (relay_mid and relay_via and _safe_id(relay_mid) and _safe_id(relay_via)):
@@ -2175,7 +2192,10 @@ _SEEN_COMPACT_EVERY = 256                  # disk stays within CAP + this many c
 _seen_lock = threading.Lock()              # check + delivery + receipt publish is one idempotence claim
 EXCHANGE_WAIT = int(os.environ.get("ROMP_POSTAL_EXCHANGE_WAIT", "20"))
 PEER_STATE = {}                            # host -> {"presence": [...], "epoch": int, "seenAt": t, "drift": str}
-_ALIAS_LOGGED = set()                      # (host, name, id) bindings already written this process
+_ALIAS_LOGGED = {}                         # (host, name) -> last id logged this process: a name
+#                                            RETURNING to a prior holder must re-log, or the log's
+#                                            last word for that name stays the middle holder
+#                                            (the r45 verification)
 
 
 def _log_peer_aliases(host):
@@ -2191,10 +2211,10 @@ def _log_peer_aliases(host):
             name, aid = str(a.get("name") or ""), str(a.get("id") or "")
             if not name or not aid:
                 continue
-            key = (host, name, aid)
-            if key in _ALIAS_LOGGED:
+            key = (host, name)
+            if _ALIAS_LOGGED.get(key) == aid:
                 continue
-            _ALIAS_LOGGED.add(key)
+            _ALIAS_LOGGED[key] = aid
             _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "peer-alias",
                                           "from_host": host, "from": name, "from_id": aid})
     except Exception:
@@ -2851,6 +2871,7 @@ def _quarantine_put(origin, m, to_id, via=""):
         return False
     rec = {"mid": mid, "to": m.get("to") or "", "toId": to_id, "frm": m.get("frm") or "?",
            "frmId": m.get("frm_id") or "", "body": m.get("body") or "", "kind": m.get("kind") or "",
+           "toWireId": m.get("to_id") or "",   # id-addressed mail stays id-addressed at approve
            "origin": origin, "via": via or origin, "at": int(time.time())}
     try:
         QUARANTINE.mkdir(parents=True, exist_ok=True)
@@ -2925,8 +2946,16 @@ def quarantine_decide(mid, action, text=None, feedback=None):
         body = str(text) if (text is not None and str(text).strip()) else (rec.get("body") or "")
         to_id = rec.get("toId") or ""
         live = {a["id"] for a in local_agents()}
-        if to_id not in live:                         # session renamed/revived since it was held → re-match by name
-            match = [a for a in local_agents() if a["name"] == rec.get("to") and not _postal_off(a["id"])]
+        if to_id not in live:
+            wire = str(rec.get("toWireId") or "")
+            if wire:
+                # ID-ADDRESSED mail (the r45 verification, the P1.6 sibling leg): the sender named
+                # the SESSION — a name re-match here would hand its mail to whatever session now
+                # wears the name, exactly the squatter delivery intake refuses
+                match = [a for a in local_agents() if str(a["id"]) == wire and not _postal_off(a["id"])]
+            else:
+                # name-addressed mail held before the recipient renamed/revived → re-match by name
+                match = [a for a in local_agents() if a["name"] == rec.get("to") and not _postal_off(a["id"])]
             if not match:
                 return False, "recipient '%s' is no longer a live local session" % (rec.get("to") or "?")
             to_id = match[0]["id"]

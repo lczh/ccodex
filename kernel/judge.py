@@ -9139,7 +9139,7 @@ def _postal_ask_maps():
         return {}, {}, {}
     if _PEER_ASK_CACHE[0] == key:
         return _PEER_ASK_CACHE[1]
-    last_any, last_ask, rows, alias = {}, {}, [], {}
+    last_any, last_ask, rows, alias, ahist = {}, {}, [], {}, {}
     try:
         for line in MESSAGES.read_text(errors="replace").splitlines():
             try:
@@ -9148,7 +9148,19 @@ def _postal_ask_maps():
                 continue
             rows.append(o)
             if o.get("from_host") and o.get("from") and o.get("from_id"):
-                alias[str(o["from_host"]) + ":" + str(o["from"])] = str(o["from_id"])
+                key = str(o["from_host"]) + ":" + str(o["from"])
+                alias[key] = str(o["from_id"])
+                ahist.setdefault(key, []).append((int(o.get("t") or 0), str(o["from_id"])))
+
+        def _alias_at(key, when):
+            # the binding ACTIVE when the row was sent (the r45 verification; the kernel's
+            # _postal_wait_maps applies the identical rule — the two readers must not disagree)
+            hist = ahist.get(key) or []
+            before = [e for e in hist if e[0] <= when]
+            if before:
+                return max(before)[1]
+            after = [e for e in hist if e[0] > when]
+            return min(after)[1] if after else ""
         for o in rows:
             f, t_, ts = o.get("from_id"), o.get("to_id"), o.get("t")
             if not (f and t_ and ts):
@@ -9161,7 +9173,8 @@ def _postal_ask_maps():
                     # sent after the recipient renamed)
                     t_ = str(o["to_sid"])
                 elif o.get("toName"):
-                    t_ = alias.get(str(o["toName"]), "peer:" + str(o["toName"]))
+                    t_ = _alias_at(str(o["toName"]), int(o.get("t") or 0)) \
+                        or "peer:" + str(o["toName"])
             ts = int(ts)
             last_any[(f, t_)] = max(last_any.get((f, t_), 0), ts)
             k = o.get("kind")
