@@ -443,6 +443,77 @@ print(ps._load_serve_token(), flush=True)
 
 
 
+class WireCarriesTheStableId(unittest.TestCase):
+    """the v1.3.17 audit's P1.6: /send resolved the uuid but serialized the current NAME into
+    the relay envelope — a rename after enqueue bounced the delivery. The envelope now carries
+    the validated stable id."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), ps.Handler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def test_send_stamps_to_id_into_the_outbox_envelope(self):
+        os.environ["ROMP_POSTAL_PEERS"] = "1"
+        ps.PEER_STATE["hostx"] = {"presence": [{"name": "web", "id": "sid-web1"}],
+                                  "epoch": 1, "seenAt": 1}
+        ps.PEERS["hostx"] = {"port": 1, "up": False}
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/send" % self.port,
+                data=json.dumps({"to": "hostx:web", "from": "api", "from_id": "sid-a",
+                                 "body": "hello", "kind": "question"}).encode(),
+                headers={"Content-Type": "application/json", "X-Romp-Token": TOK},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=5) as r:
+                out = json.loads(r.read().decode())
+            self.assertTrue(out.get("ok"))
+            msg = ps.outbox_get("hostx", out["id"])
+            self.assertIsNotNone(msg)
+            self.assertEqual(msg.get("to_id"), "sid-web1",
+                             "the stable id rides the wire; the name is display/legacy only")
+        finally:
+            ps.PEER_STATE.pop("hostx", None)
+            ps.PEERS.pop("hostx", None)
+            os.environ.pop("ROMP_POSTAL_PEERS", None)
+
+
+class McpTrackedIsARealBoolean(unittest.TestCase):
+    """the v1.3.17 audit's P2.13, MCP surface: bool("false") armed tracking the sender declined,
+    and `is True` alone would silently DROP a tracking the sender believed armed — refuse."""
+
+    def test_a_string_tracked_refuses_and_sends_nothing(self):
+        with mock.patch.object(ps, "my_name", lambda: "web"), \
+             mock.patch.object(ps, "my_id", lambda: "sid-w"), \
+             mock.patch.object(ps, "_heartbeat", lambda *a, **k: None), \
+             mock.patch.object(ps, "_http", side_effect=AssertionError("must not send")):
+            out, is_err = ps._mcp_call("send_message",
+                                       {"to": "api", "body": "x", "kind": "delegate",
+                                        "tracked": "false"})
+        self.assertTrue(is_err)
+        self.assertIn("boolean", out)
+
+    def test_a_real_boolean_still_arms(self):
+        seen = {}
+
+        def fake_http(method, path, payload):
+            seen.update(payload)
+            return {"ok": True, "id": "m1"}
+
+        with mock.patch.object(ps, "my_name", lambda: "web"), \
+             mock.patch.object(ps, "my_id", lambda: "sid-w"), \
+             mock.patch.object(ps, "_heartbeat", lambda *a, **k: None), \
+             mock.patch.object(ps, "_http", side_effect=fake_http):
+            ps._mcp_call("send_message", {"to": "api", "body": "x", "kind": "delegate",
+                                          "tracked": True})
+        self.assertIs(seen.get("tracked"), True)
+
+
 class TrackedIsARealBoolean(unittest.TestCase):
     """the v1.3.16 audit: bool("false") is True — the string spelling ARMED the report-back the
     sender declined. A behavioral flag takes a real JSON boolean only."""

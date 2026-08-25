@@ -675,3 +675,115 @@ class RecallAndReceipts(unittest.TestCase):
                          "no tunnel record at all reads down, matching the send path's branch")
         row = pm._sent_receipts("sid-a")[-1]
         self.assertEqual(row["parked"], "srv", "the parked key keeps its host-string shape")
+
+
+class ReceiptDurability(unittest.TestCase):
+    """the v1.3.17 audit's P1.3: the delivery row published AFTER the mail, and an unknown
+    receipt was marked done forever — a crash between publish and log lost the sender's
+    completion permanently while the durable mail sat delivered."""
+
+    def test_an_unknown_receipt_stays_retryable_and_recovers(self):
+        payload, status = pm.handoff_done_apply({"mid": "ghost-1"})
+        self.assertEqual(status, 404)
+        self.assertTrue(payload.get("retry"), "unknown is a retry, never a silent done")
+        self.assertNotIn("ghost-1", pm._receipts_done(),
+                         "an unknowable id is NOT recorded done — a later source may appear")
+        pm.TLDIR.mkdir(parents=True, exist_ok=True)
+        with (pm.TLDIR / "messages.jsonl").open("a") as fh:
+            fh.write(json.dumps({"t": 1, "ev": "sent", "id": "ghost-1", "from": "api",
+                                 "from_id": "sid-a", "to_id": "sid-b", "body": "x",
+                                 "from_host": "hosta", "relay_mid": "px-g1",
+                                 "relay_via": "hosta"}) + "\n")
+        payload, status = pm.handoff_done_apply({"mid": "ghost-1"})
+        self.assertEqual(status, 200)
+        self.assertIn({"mid": "px-g1", "origin": "hosta"}, pm.receiptbox_list("hosta"),
+                      "the retried post translates once the row exists")
+
+    def test_the_delivery_row_lands_before_the_mail_publishes(self):
+        import pathlib
+
+        def boom(self2, target):
+            raise OSError(5, "crash before publish")
+
+        with mock.patch.object(pathlib.Path, "rename", boom):
+            with self.assertRaises(OSError):
+                pm.deliver("sid-cw", "peer", "sid-p", "task", kind="delegate",
+                           from_host="hosta", relay_mid="px-cw1", relay_via="hosta")
+        rows = [json.loads(l) for l in (pm.TLDIR / "messages.jsonl").read_text().splitlines()]
+        row = [r for r in rows if r.get("ev") == "sent" and r.get("relay_mid") == "px-cw1"]
+        self.assertTrue(row, "the translation row is durable before the publish point")
+        payload, status = pm.handoff_done_apply({"mid": row[0]["id"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload.get("queued"), "hosta")
+
+    def test_maildir_headers_recover_a_lost_row(self):
+        mb = pm._mailbox("sid-hr")
+        (mb / "new" / "deliv-hr1").write_text(
+            "From: peer\nFrom-Id: sid-p\nDate: now\nX-From-Host: hosta\n"
+            "X-Peer-Mid: px-hr1\nX-Peer-Via: hosta\n\nbody\n")
+        payload, status = pm.handoff_done_apply({"mid": "deliv-hr1"})
+        self.assertEqual(status, 200)
+        self.assertIn({"mid": "px-hr1", "origin": "hosta"}, pm.receiptbox_list("hosta"),
+                      "the mail's own headers are the second durable source")
+
+
+class WireStableId(unittest.TestCase):
+    """the v1.3.17 audit's P1.6: the envelope serialized the recipient's NAME, so a rename
+    between enqueue and intake bounced the mail though the session sat live. The validated
+    to_id rides the wire and outranks the name; an id miss never falls back to the name."""
+
+    def test_intake_delivers_by_stable_id_after_a_rename(self):
+        m = {"mid": "wid-1", "to": "oldname", "to_id": "sid-r1", "frm": "peer",
+             "frm_id": "sid-p", "body": "hi", "kind": "question"}
+        with mock.patch.object(pm, "local_agents", lambda: [{"name": "newname", "id": "sid-r1"}]):
+            verdict, b = pm._relay_in("hostq", m, token_proven=True)
+        self.assertEqual(verdict, "ack")
+        self.assertTrue(list((pm.MAILROOT / "sid-r1" / "new").glob("*")),
+                        "the renamed recipient still gets its mail, by id")
+
+    def test_an_id_miss_never_hands_the_mail_to_a_name_squatter(self):
+        m = {"mid": "wid-2", "to": "oldname", "to_id": "sid-gone", "frm": "peer",
+             "frm_id": "sid-p", "body": "hi", "kind": "question"}
+        with mock.patch.object(pm, "local_agents", lambda: [{"name": "oldname", "id": "sid-squat"}]):
+            verdict, b = pm._relay_in("hostq", m, token_proven=True)
+        self.assertEqual(verdict, "bounce")
+        self.assertEqual(b["code"], "recipient-unavailable")
+        self.assertFalse(list((pm.MAILROOT / "sid-squat" / "new").glob("*")) if
+                         (pm.MAILROOT / "sid-squat" / "new").exists() else [],
+                         "the session that took the name never receives id-addressed mail")
+
+    def test_an_unsafe_to_id_drops(self):
+        m = {"mid": "wid-3", "to": "web", "to_id": "../../etc", "frm": "peer",
+             "frm_id": "sid-p", "body": "hi", "kind": "question"}
+        with mock.patch.object(pm, "local_agents", lambda: [{"name": "web", "id": "sid-w"}]):
+            verdict, b = pm._relay_in("hostq", m, token_proven=True)
+        self.assertEqual(verdict, "drop")
+
+
+class AliasHistory(unittest.TestCase):
+    """the v1.3.17 audit's P2.14: the wait-map alias was built only from rows the peer SPOKE in,
+    so legacy pre-to_sid rows sent under a renamed peer's OLD name never joined their replies.
+    Presence bindings are logged durably, in the exact fields the readers already consume."""
+
+    def test_presence_bindings_land_and_survive_renames(self):
+        pm._ALIAS_LOGGED.clear()
+        pm.PEER_STATE["hostz"] = {"presence": [{"name": "web", "id": "sid-z1"}]}
+        pm._log_peer_aliases("hostz")
+        pm.PEER_STATE["hostz"] = {"presence": [{"name": "web2", "id": "sid-z1"}]}
+        pm._log_peer_aliases("hostz")
+        pm.PEER_STATE.pop("hostz", None)
+        rows = [json.loads(l) for l in (pm.TLDIR / "messages.jsonl").read_text().splitlines()]
+        binds = [(r["from"], r["from_id"]) for r in rows
+                 if r.get("ev") == "peer-alias" and r.get("from_host") == "hostz"]
+        self.assertIn(("web", "sid-z1"), binds, "the OLD binding is durable history")
+        self.assertIn(("web2", "sid-z1"), binds, "the new binding lands too")
+
+    def test_bindings_are_deduped_in_process(self):
+        pm._ALIAS_LOGGED.clear()
+        pm.PEER_STATE["hosty"] = {"presence": [{"name": "api", "id": "sid-y1"}]}
+        pm._log_peer_aliases("hosty")
+        pm._log_peer_aliases("hosty")
+        pm.PEER_STATE.pop("hosty", None)
+        rows = [json.loads(l) for l in (pm.TLDIR / "messages.jsonl").read_text().splitlines()]
+        n = sum(1 for r in rows if r.get("ev") == "peer-alias" and r.get("from_host") == "hosty")
+        self.assertEqual(n, 1)

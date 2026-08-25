@@ -472,6 +472,26 @@ class CrossHostDelegation(_Base):
         km._POSTAL_WAIT_CACHE[0] = None
         self.assertEqual(km._peer_answered_at(SID), 0)
 
+    def test_a_legacy_row_joins_through_the_durable_alias_binding(self):
+        # the v1.3.17 audit's P2.14: a pre-to_sid row sent under the peer's OLD name never
+        # joined its reply — the alias map was built only from rows the peer spoke in, and a
+        # renamed peer speaks only under the new name. The bus now logs each presence binding
+        # as an ev:"peer-alias" row wearing the reader's own fields; the OLD binding is history.
+        self._fleet_stub()
+        legacy_ask = json.dumps({"id": "px-14.mail.TESTHOST-A", "ev": "sent", "from": "api",
+                                 "from_id": SID, "to_id": "peer:%s" % self.RHOST,
+                                 "toName": "%s:oldworker" % self.RHOST,
+                                 "t": T0 + 10, "kind": "question", "body": "the port?"})
+        binding = json.dumps({"t": T0 + 5, "ev": "peer-alias", "from_host": self.RHOST,
+                              "from": "oldworker", "from_id": self.RSID})
+        reply = json.dumps({"id": "rx-14.mail.%s" % self.RHOST, "ev": "sent", "from": "worker",
+                            "from_id": self.RSID, "from_host": self.RHOST, "to_id": SID,
+                            "t": T0 + 300, "kind": "coordinate", "body": "8080"})
+        self._log([binding, legacy_ask, reply])
+        km._POSTAL_WAIT_CACHE[0] = None
+        self.assertEqual(km._peer_answered_at(SID), T0 + 300,
+                         "the logged old-name binding resolves the legacy row to the stable sid")
+
     def test_an_unrelated_peers_reply_never_completes(self):
         self._fleet_stub()
         self._log([self._xrow(1, T0 + 10)])

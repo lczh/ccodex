@@ -352,10 +352,13 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
     if h["relay_mid"] and h["relay_via"]:
         hdr += "X-Peer-Mid: %s\nX-Peer-Via: %s\n" % (h["relay_mid"], h["relay_via"])
     tmp.write_text(hdr + "\n" + body + "\n")
-    tmp.rename(mb / "new" / name)   # atomic within the same filesystem
-    _mark_pending(to_id)            # new/ is now non-empty -> raise the marker (covers park + live)
     # Timeline log: a message was SENT (the matching exec event is logged when
     # the recipient consumes it in read_box). id = maildir filename joins the two.
+    # Logged BEFORE the rename publishes the mail (the v1.3.17 audit's P1.3): this row is the
+    # only record /handoff-done can translate a delivery id through, and publishing first left
+    # a crash window where durable mail existed with no row — the receipt was then lost
+    # permanently. A row for mail whose publish then fails reads as an attempted send: the
+    # receipt lane keys on the mail's own id, so an unpublished mail's row completes nothing.
     ev = {"t": int(time.time()), "ev": "sent", "id": name,
           "from": from_name, "from_id": from_id, "to_id": to_id, "body": body}
     if park:
@@ -374,7 +377,73 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
         #                                              handoff-done receipt translates through
         #                                              (the r44 verification's P1)
     _tl_append("messages.jsonl", ev)
+    tmp.rename(mb / "new" / name)   # atomic within the same filesystem — the PUBLISH point
+    _mark_pending(to_id)            # new/ is now non-empty -> raise the marker (covers park + live)
     return name   # the message id (maildir filename); joins to the log + status-bar prefix
+
+def handoff_done_apply(data):
+    """POST /handoff-done body -> (payload, status). The recipient KERNEL reports a cross-host
+    delegation's planted goal COMPLETE by its DELIVERY id; this bus owns the delivery row and
+    translates it into the SENDER's relay mid, parking the receipt toward the direct peer the
+    delegate arrived from (the v1.3.16 audit's P1.3 / the r44 verification's P1). Idempotent:
+    RECEIPTS_DONE (keyed by the delivery id) silences kernel re-posts. An id NEITHER the log nor
+    the maildir headers can translate answers 404-retryable — never done (the v1.3.17 audit's
+    P1.3: marking it done lost the sender's completion permanently)."""
+    if not isinstance(data, dict):
+        return {"error": "the body must be a JSON object"}, 400
+    mid = str(data.get("mid") or "")
+    if not _safe_id(mid):
+        return {"error": "mid (a path-safe id) required"}, 400
+    if mid in _receipts_done():
+        return {"ok": True, "already": True}, 200
+    row = None
+    try:
+        for line in (TLDIR / "messages.jsonl").read_text(errors="replace").splitlines():
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("ev") == "sent" and o.get("id") == mid:
+                row = o
+                break
+    except OSError:
+        row = None
+    if row is None:
+        row = _receipt_row_from_maildir(mid)   # second durable source: the mail's own headers
+    if row is None:
+        return {"ok": False, "unknown": True, "retry": True}, 404
+    relay_mid = str(row.get("relay_mid") or "")
+    relay_via = str(row.get("relay_via") or "")
+    if not (relay_mid and relay_via and _safe_id(relay_mid) and _safe_id(relay_via)):
+        _receipts_done_add(mid)                # a LOCAL delivery: the origin back-link owns
+        return {"ok": True, "local": True}, 200   # it — nothing to relay
+    origin = str(row.get("from_host") or "")
+    receiptbox_put(relay_via, relay_mid, origin=(origin if _safe_id(origin) else ""))
+    return {"ok": True, "queued": relay_via}, 200
+
+
+def _receipt_row_from_maildir(mid):
+    """Recover a delivery's relay identity from the maildir headers when the log row is missing
+    (pre-v1.3.18 mail was published before its row; an append can also be lost): deliver() stamps
+    X-Peer-Mid/X-Peer-Via/X-From-Host into the durable mail file itself, and the filename IS the
+    delivery id (the v1.3.17 audit's P1.3)."""
+    if not _safe_id(mid):
+        return None
+    try:
+        for f in list(MAILROOT.glob("*/new/" + mid)) + list(MAILROOT.glob("*/cur/" + mid)):
+            hd = {}
+            for line in f.read_text(errors="replace").splitlines():
+                if not line.strip():
+                    break
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    hd[k.strip().lower()] = v.strip()
+            return {"relay_mid": hd.get("x-peer-mid") or "", "relay_via": hd.get("x-peer-via") or "",
+                    "from_host": hd.get("x-from-host") or ""}
+    except OSError:
+        pass
+    return None
+
 
 def read_box(sid, consume):
     if not _safe_id(sid):            # reject traversal in the id from /inbox, /drain
@@ -1383,36 +1452,8 @@ class Handler(BaseHTTPRequestHandler):
             # P1: the raw ids live in two disjoint spaces and never matched; and relay_via, not
             # the origin label, is the reachable park target under a hub). Idempotent: the
             # kernel re-posts every pass; RECEIPTS_DONE (keyed by the delivery id) silences it.
-            if not isinstance(data, dict):
-                return self._send({"error": "the body must be a JSON object"}, 400)
-            mid = str(data.get("mid") or "")
-            if not _safe_id(mid):
-                return self._send({"error": "mid (a path-safe id) required"}, 400)
-            if mid in _receipts_done():
-                return self._send({"ok": True, "already": True})
-            row = None
-            try:
-                for line in (TLDIR / "messages.jsonl").read_text(errors="replace").splitlines():
-                    try:
-                        o = json.loads(line)
-                    except Exception:
-                        continue
-                    if o.get("ev") == "sent" and o.get("id") == mid:
-                        row = o
-                        break
-            except OSError:
-                row = None
-            if row is None:
-                _receipts_done_add(mid)              # unknowable forever — silence the re-posts
-                return self._send({"ok": True, "unknown": True})
-            relay_mid = str(row.get("relay_mid") or "")
-            relay_via = str(row.get("relay_via") or "")
-            if not (relay_mid and relay_via and _safe_id(relay_mid) and _safe_id(relay_via)):
-                _receipts_done_add(mid)              # a LOCAL delivery: the origin back-link owns
-                return self._send({"ok": True, "local": True})   # it — nothing to relay
-            origin = str(row.get("from_host") or "")
-            receiptbox_put(relay_via, relay_mid, origin=(origin if _safe_id(origin) else ""))
-            return self._send({"ok": True, "queued": relay_via})
+            payload, status = handoff_done_apply(data)
+            return self._send(payload, status)
         if u.path == "/send":
             to = data.get("to", "")
             frm, frm_id = data.get("from", "unknown"), data.get("from_id", "")
@@ -1465,9 +1506,15 @@ class Handler(BaseHTTPRequestHandler):
                 tnote = (" — report-back tracking does not cross hosts yet; sent as a plain handoff"
                          if tracked else "")
                 mid = "px-" + _unique()
-                outbox_put(phost, {"mid": mid, "to": hit.get("name") or to, "frm": frm,
-                                   "frm_id": frm_id, "body": body, "kind": kind,
-                                   "t": int(time.time())})
+                relay_msg = {"mid": mid, "to": hit.get("name") or to, "frm": frm,
+                             "frm_id": frm_id, "body": body, "kind": kind,
+                             "t": int(time.time())}
+                if hit.get("id") and _safe_id(str(hit["id"])):
+                    # the recipient's STABLE id rides the wire (the v1.3.17 audit's P1.6): the
+                    # serialized NAME goes stale the moment the recipient renames mid-flight —
+                    # intake then bounced recipient-unavailable though the session sat live
+                    relay_msg["to_id"] = str(hit["id"])
+                outbox_put(phost, relay_msg)
                 sent_row = {"t": int(time.time()), "ev": "sent", "id": mid,
                             "from": frm, "from_id": frm_id,
                             "to_id": "peer:%s" % phost,
@@ -2128,6 +2175,30 @@ _SEEN_COMPACT_EVERY = 256                  # disk stays within CAP + this many c
 _seen_lock = threading.Lock()              # check + delivery + receipt publish is one idempotence claim
 EXCHANGE_WAIT = int(os.environ.get("ROMP_POSTAL_EXCHANGE_WAIT", "20"))
 PEER_STATE = {}                            # host -> {"presence": [...], "epoch": int, "seenAt": t, "drift": str}
+_ALIAS_LOGGED = set()                      # (host, name, id) bindings already written this process
+
+
+def _log_peer_aliases(host):
+    """Durably record each (host, name -> stable id) binding a peer's presence declares, as a
+    messages.jsonl row wearing the SAME fields the wait-map alias readers already consume
+    (from_host/from/from_id). A rename would otherwise strand every pre-to_sid row sent under
+    the old name: the alias map was built only from rows the peer SPOKE in, and a renamed peer
+    speaks only under its new name (the v1.3.17 audit's P2.14). The old binding stays in the
+    log after the presence list moves on. Deduped in-memory; a bus restart re-logs at most one
+    row per live binding, which the map-building readers absorb idempotently."""
+    try:
+        for a in (PEER_STATE.get(host) or {}).get("presence") or []:
+            name, aid = str(a.get("name") or ""), str(a.get("id") or "")
+            if not name or not aid:
+                continue
+            key = (host, name, aid)
+            if key in _ALIAS_LOGGED:
+                continue
+            _ALIAS_LOGGED.add(key)
+            _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "peer-alias",
+                                          "from_host": host, "from": name, "from_id": aid})
+    except Exception:
+        pass
 _peer_wakes = {}                           # host -> threading.Event (long-poll release + dialer poke)
 _peer_threads = {}                         # host -> Thread (one dialer loop per up peer)
 _peer_pending = {}                         # host -> {"acks": [mid], "bounces": [{mid, code}]} for the NEXT request
@@ -2909,6 +2980,12 @@ def _relay_in(host, m, token_proven=False):
     if (origin and not _safe_id(origin)) or (frm_id and not _safe_id(frm_id)):
         return "drop", None
 
+    raw_to_id = m.get("to_id")
+    to_id = "" if raw_to_id is None else raw_to_id
+    if not isinstance(to_id, str):
+        return "drop", None
+    if to_id and not _safe_id(to_id):
+        return "drop", None
     raw_to = m.get("to")
     raw_to = "" if raw_to is None else raw_to
     if not isinstance(raw_to, str):
@@ -2962,7 +3039,16 @@ def _relay_in(host, m, token_proven=False):
     m = {"mid": mid, "to": to, "frm": frm, "frm_id": frm_id, "body": body, "kind": kind}
     if origin:
         m["origin"] = origin
-    match = [a for a in local_agents() if a["name"] == to and not _postal_off(a["id"])]
+    if to_id:
+        m["to_id"] = to_id
+    # A validated to_id addresses the SESSION, not whatever currently wears the name (the
+    # v1.3.17 audit's P1.6): a rename between enqueue and intake must still deliver, and an
+    # id-miss must never fall back to the name — the name may have been taken by a DIFFERENT
+    # session since, and a name fallback would hand it that session's mail.
+    if to_id:
+        match = [a for a in local_agents() if str(a["id"]) == to_id and not _postal_off(a["id"])]
+    else:
+        match = [a for a in local_agents() if a["name"] == to and not _postal_off(a["id"])]
     if match:
         # Hold the idempotence claim across the effect and receipt publish.  Two exchange threads can
         # carry the same mid concurrently; neither may pass a separate check before either appends.
@@ -3002,10 +3088,11 @@ def _relay_in(host, m, token_proven=False):
         return "ack", None
     if peer_seen_check(mid):
         return "ack", None                           # a duplicate whose recipient has since vanished
-    if any(a["name"] == to for a in local_agents()):
+    if (any(str(a["id"]) == to_id for a in local_agents()) if to_id
+            else any(a["name"] == to for a in local_agents())):
         return "bounce", {"mid": mid, "code": "recipient-isolated"}
     if not m.get("origin"):                          # one hop MAX: a message that already hopped never re-forwards
-        fh, hit = peer_route(to)
+        fh, hit = peer_route(to_id or to)            # the stable id outranks the name here too
         if fh and fh != host and not (hit or {}).get("via"):
             if outbox_get(fh, mid) is None:          # a resend while we hold it forwards nothing twice
                 outbox_put(fh, dict(m, origin=host))
@@ -3117,6 +3204,7 @@ def peer_exchange_handle(data):
     tier = _peer_tier(data.get("tier"))
     if tier:                                         # the dialer's declared tier-of-us (additive; older peers omit it)
         PEER_STATE[host]["theirTier"] = tier
+    _log_peer_aliases(host)
     for mid in _peer_ack_ids(data.get("acks")):      # the dialer confirmed relays landed — end-to-end:
         _ack_arrived(host, mid)                      # a forwarded one relays its ack back to the origin
     for b in _peer_bounce_rows(data.get("bounces")): # ...or refused them → backward, or to our sender
@@ -3243,6 +3331,7 @@ def peer_exchange_apply(host, req_sent, resp):
     tier = _peer_tier(resp.get("tier"))
     if tier:                                         # the dialed side's declared tier-of-us
         PEER_STATE[host]["theirTier"] = tier
+    _log_peer_aliases(host)
     for mid in _peer_ack_ids(resp.get("acks")):
         _ack_arrived(host, mid)
     for b in _peer_bounce_rows(resp.get("bounces")):
@@ -3601,7 +3690,13 @@ def _mcp_call(name, args):
             return ("Cannot send: this session's own identity did not resolve (no session id), so "
                     "the mail would arrive anonymously and the recipient could not place or answer "
                     "it. This is a session-identity bug worth surfacing to the user.", True)
-        tracked = bool(args.get("tracked")) and kind == "delegate"
+        traw = args.get("tracked")
+        if traw is not None and traw is not True and traw is not False:
+            # never coerce: string "false" is truthy, and silently dropping the flag would let
+            # the sender believe a report-back was armed when none was (the v1.3.17 audit's P2.13)
+            return ("'tracked' must be a JSON boolean (true or false), not a string — "
+                    "nothing was sent.", True)
+        tracked = traw is True and kind == "delegate"
         try:
             payload = {"to": to, "from": me or "unknown", "from_id": mid, "body": body, "kind": kind}
             if tracked:

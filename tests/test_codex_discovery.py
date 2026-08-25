@@ -1020,6 +1020,55 @@ class MigrationTransaction(unittest.TestCase):
         self.assertEqual(tv["tags"][0]["members"][0]["sid"], SID,
                          "the repaired file's TID rows migrate — nothing was skipped as settled")
 
+    def test_a_v1_certificate_is_distrusted_and_the_files_recanonicalize(self):
+        # the v1.3.17 audit's P1.4: shared.state was the bare identity-map digest, so a marker
+        # wrongly issued by v1.3.16 (whose per-file failures were swallowed) certified this
+        # exact map forever and v1.3.17 skipped the repaired TID-keyed rewrites. The v2 marker
+        # is versioned: every pre-v1.3.18 text mismatches once and the pass re-runs.
+        self._state(goals=True)
+        (jd.STATE / "session-flags.json").write_text(json.dumps({TID: {"postalServiceOff": True}}))
+        jd.migrate_codex_identity()
+        marker = jd.CODEXDIR / "migrated" / "shared.state"
+        self.assertTrue(marker.read_text().startswith("v2:"),
+                        "the certificate is versioned and salted")
+        flags = json.loads((jd.STATE / "session-flags.json").read_text())
+        self.assertIn(SID, flags)
+        self.assertNotIn(TID, flags)
+        # forge the v1.3.16-shaped marker (bare map digest) over a REGRESSED file — the exact
+        # false certificate the audit planted; the next entry must distrust it and repair
+        (jd.STATE / "session-flags.json").write_text(json.dumps({TID: {"postalServiceOff": True}}))
+        marker.write_text(jd._mig_sha(json.dumps([sorted({TID: SID}.items()),
+                                                  sorted({TID: SID}.items())])))
+        jd.migrate_codex_identity()
+        flags = json.loads((jd.STATE / "session-flags.json").read_text())
+        self.assertNotIn(TID, flags, "a pre-v1.3.18 certificate is distrusted — the pass re-ran")
+        self.assertIn(SID, flags)
+        self.assertTrue(marker.read_text().startswith("v2:"))
+
+    def test_an_external_shared_write_invalidates_the_certificate(self):
+        # the v2 marker fingerprints each shared file (size, mtime_ns): a write landing OUTSIDE
+        # the migration (an Electron fallback, a hand edit) voids the settle, so the next entry
+        # re-canonicalizes what the writer left instead of trusting a stale certificate.
+        self._state(goals=True)
+        jd.migrate_codex_identity()
+        calls = []
+        real = jd._migrate_shared_identity_files
+
+        def counting(*a, **kw):
+            calls.append(1)
+            return real(*a, **kw)
+
+        with mock.patch.object(jd, "_migrate_shared_identity_files", side_effect=counting):
+            jd.migrate_codex_identity()
+            self.assertEqual(len(calls), 0, "unchanged fingerprints settle — no re-parse")
+            (jd.STATE / "session-flags.json").write_text(
+                json.dumps({TID: {"hideFromFeed": True}}))   # an external TID write
+            jd.migrate_codex_identity()
+            self.assertEqual(len(calls), 1, "a moved fingerprint re-runs the pass")
+        flags = json.loads((jd.STATE / "session-flags.json").read_text())
+        self.assertNotIn(TID, flags, "the external write was re-canonicalized")
+        self.assertIn(SID, flags)
+
     def test_a_permanent_flock_error_propagates_instead_of_spinning(self):
         # the v1.3.16 audit: an injected ENOTSUP was still spinning after 300ms — every OSError
         # read as contention. Permanent errors must fail loudly; contention still waits.

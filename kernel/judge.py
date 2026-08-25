@@ -6019,8 +6019,7 @@ def _migrate_codex_identity_locked():
     _CODEX_IDENTITY_MAP.update(tid_to_sid)
     _CODEX_GOAL_IDENTITY_MAP.clear()
     _CODEX_GOAL_IDENTITY_MAP.update(goal_tid_to_sid)
-    state_sha = _mig_sha(json.dumps([sorted(tid_to_sid.items()),
-                                     sorted(goal_tid_to_sid.items())]))
+    state_sha = _mig_shared_state_sha(tid_to_sid, goal_tid_to_sid)
     marker = migdir / "shared.state"
     try:
         settled = not did_work and _mig_read_text(marker).strip() == state_sha
@@ -6034,7 +6033,9 @@ def _migrate_codex_identity_locked():
     if _migrate_shared_identity_files(tid_to_sid, goal_tid_to_sid):
         try:
             migdir.mkdir(parents=True, exist_ok=True)
-            _mig_atomic(marker, state_sha)
+            # recompute AFTER the rewrites: they moved the files' fingerprints, and the marker
+            # must certify the bytes it leaves behind, not the ones it found
+            _mig_atomic(marker, _mig_shared_state_sha(tid_to_sid, goal_tid_to_sid))
         except Exception:
             pass                                      # no marker → the next entry re-runs; never wrong
     else:
@@ -6045,6 +6046,32 @@ def _migrate_codex_identity_locked():
         #                                               the next entry must re-run the rewrites (the
         #                                               v1.3.16 audit — the marker certified a pass
         #                                               whose per-file failure was swallowed)
+
+
+# Every file _migrate_shared_identity_files rewrites — the certificate below fingerprints each
+# one so ANY external write (an Electron fallback, a hand edit) invalidates the marker and the
+# next entry re-canonicalizes (the v1.3.17 audit's P1.4).
+_MIG_SHARED_FILES = ("cleared.jsonl", "nudge-events.jsonl", "notify-cards.json", "auto-nudge.json",
+                     "judge-auth.json", "session-flags.json", "session-order.json",
+                     "retry-suppressed.json", "timeline-views.json", "timeline-dismissed.json")
+
+
+def _mig_shared_state_sha(tid_to_sid, goal_tid_to_sid):
+    """The shared.state certificate text: VERSIONED ("v2:") and salted with each shared file's
+    (size, mtime_ns) fingerprint. The v1 marker was the bare identity-map digest, so a marker
+    wrongly issued by v1.3.16 (whose per-file failures were swallowed) certified this exact map
+    forever and v1.3.17 skipped the repaired rewrites (the v1.3.17 audit's P1.4). The version
+    prefix distrusts every pre-v1.3.18 marker once; the fingerprints distrust any marker whose
+    files changed under it."""
+    fps = []
+    for name in _MIG_SHARED_FILES:
+        try:
+            st = (STATE / name).stat()
+            fps.append([name, int(st.st_size), int(st.st_mtime_ns)])
+        except OSError:
+            fps.append([name, None, None])
+    return "v2:" + _mig_sha(json.dumps([sorted(tid_to_sid.items()),
+                                        sorted(goal_tid_to_sid.items()), fps]))
 
 
 def migrate_codex_identity():
