@@ -97,6 +97,23 @@ class Persistence(unittest.TestCase):
         self.assertEqual(len(km._pr_watches), 1)
 
 
+class SupervisorReachesTheTick(unittest.TestCase):
+    """The sweep must run on a box with NO remotes (the 2026-08-25 audit's #664 specimen): `now` was
+    bound only inside the supervisor's per-remote loop, so with remotes.json = [] every pass died on
+    UnboundLocalError inside the catch-all before reaching _pr_watch_tick — the landing mail never
+    sent, and a merged PR's awaiting stamp sat stale for hours with no retire path short of the
+    dead-man. The binding is per-pass now; this pins the ORDER (bound before the loop)."""
+
+    def test_now_is_bound_per_pass_before_the_tick(self):
+        import inspect
+        src = inspect.getsource(km._tunnel_supervisor)
+        self.assertIn("now = time.time()               # bound per PASS", src,
+                      "the unconditional per-pass binding exists (loop-local bindings do not count)")
+        self.assertLess(src.index("now = time.time()               # bound per PASS"),
+                        src.index("_pr_watch_tick(now)"),
+                        "…and it precedes the tick, so zero remotes can never unbind it")
+
+
 class Tick(unittest.TestCase):
     """The sweep: terminal delivers + retires; gh failure retires LOUDLY after three; in-flight
     backs off while checks run."""

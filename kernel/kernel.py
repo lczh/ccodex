@@ -5101,7 +5101,12 @@ def _lift_spent_awaiting(now, tmux):
                     # every lift: the (re)spawn must be newer than the stamp's anchor.
                     if (nd.get("awaitingKind") == "agents" and reg_ids is not None and not reg_ids
                             and not snap.get("subagents") and not running
-                            and sp > (nd.get("awaitingAt") or 0)):
+                            and (sp > (nd.get("awaitingAt") or 0)
+                                 # …or the transcript itself shows NOTHING running at all (2026-08-25
+                                 # audit): the closer stamped agents over a world with zero live
+                                 # dispatches — the misread-peer-as-agents shape needs no respawn to
+                                 # prove the notification can never arrive; the pairing already did
+                                 or not any(t.get("status") == "running" for t in every))):
                         if jd.record_verdict(store, nd, "romp", "awaiting", _lift_ev_t(nd, now), lift=True):
                             changed = True
                             _drop_auto_nudge_rec(top)
@@ -5144,8 +5149,15 @@ def _lift_spent_awaiting(now, tmux):
                 _evidence = max((max(t.get("endT") or 0, t.get("t") or 0, t.get("deadline") or 0,
                                      sp if t.get("id") in dead else 0)
                                  for t in own), default=0)
-                if _last_lift and _last_assert > _last_lift and _stamp_written_at(nd) > _evidence:
-                    continue
+                if _last_lift and _last_assert > _last_lift and _evidence <= _last_lift:
+                    continue                          # every citable return was already ruled on by that
+                    #                                   lift — re-lifting off it is the flap. A return
+                    #                                   NEWER than the last lift is new information even
+                    #                                   when the re-assert's WRITE postdates it by seconds:
+                    #                                   the closer's audit segment ended before the return
+                    #                                   landed (2026-08-25 audit — a watcher's stamp written
+                    #                                   17s after its merge notification stood 9.5h because
+                    #                                   write-time was read as the epistemic boundary)
                 if jd.record_verdict(store, nd, "romp", "awaiting", _lift_ev_t(nd, now), lift=True):
                     changed = True
                     # The lift is NEW INFORMATION for the escalation ladder: the wait this goal's last
@@ -13853,6 +13865,12 @@ def _tunnel_supervisor():
                             except Exception:
                                 pass
             last_addr[0] = addr
+            now = time.time()               # bound per PASS, not per remote row: the pass tail below
+            #                                 (_pr_watch_tick) reads it, and on a box with NO remotes the
+            #                                 loop body never ran — every pass died on UnboundLocalError
+            #                                 inside the catch-all, so PR-landing watches never fired and
+            #                                 a merged PR's stamp sat stale for hours (2026-08-25 audit,
+            #                                 the #664 specimen: merged 50s after the stamp, mail never sent)
             for r in rows:
                 now = time.time()
                 skip = False

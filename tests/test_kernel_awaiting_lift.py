@@ -160,6 +160,30 @@ class AwaitingLift(unittest.TestCase):
         self.assertIsNone(self._stamp(), "a real terminal record ends the wait for every kind")
 
     # ---- self-scoping: the other awaiting flavors are untouched ----
+    def test_a_return_newer_than_the_last_lift_lifts_despite_a_late_reassert(self):
+        # the 2026-08-25 audit's watcher shape: assert → lift → the watch re-armed and RETURNED →
+        # the closer, auditing a segment cut BEFORE that return, re-asserted seconds after it. The
+        # old stand-down read the WRITE time as the epistemic boundary and blocked the lift forever;
+        # the discriminator is the EVIDENCE against the last lift — a return newer than the last
+        # lift was never ruled on, whatever the re-assert's arrival says.
+        self._transcript([_launch("t1", LAUNCH), _notification("t1", BACK)])
+        why = "the re-armed watcher; reports when it lands"
+        nd = {"id": self.gid, "text": "a goal", "parentId": None, "nodeComplete": False,
+              "blocked": False, "cleared": False, "trail": [], "t": BORN, "mt": BORN,
+              "awaitingWhy": why, "awaitingAt": STAMP, "log": [
+                  {"ev_t": STAMP, "src": "closer", "kind": "awaiting", "why": why, "at": STAMP + 10},
+                  {"ev_t": STAMP, "src": "romp", "kind": "awaiting", "lift": True, "at": STAMP + 20},
+                  {"ev_t": STAMP, "src": "closer", "kind": "awaiting", "why": why,
+                   "at": BACK + 10}]}                 # the live shape: a SAME-ANCHOR re-assert (two closer
+        #                                               rows on one ev_t), written AFTER the 400 return
+        #                                               its audit segment never saw
+        (km.jd.GOALDIR / (SID + ".json")).write_text(json.dumps({
+            "rompUuid": SID, "seq": 1, "placements": {}, "status": {}, "nodes": {self.gid: nd}}))
+        self._tick()
+        self.assertIsNone(self._stamp(),
+                          "the return (endT %d) postdates the last lift (%d) — new information lifts"
+                          % (BACK, STAMP + 20))
+
     def test_a_wait_with_no_dispatches_of_its_own_is_untouched(self):
         # a CI run / scheduled check-back / peer handoff: nothing was dispatched, so nothing can be paired
         self._transcript([])
@@ -494,11 +518,20 @@ class RestartReconcile(unittest.TestCase):
         self.assertIsNone(self._stamp(), "no dispatch anywhere + empty authoritative set -> orphan, lifted")
 
     def test_the_dispatchless_lift_respects_the_anchor_and_the_kind(self):
-        self._transcript([])
+        # (2026-08-25 audit) the respawn is ONE sufficient evidence, not the only one: an agents
+        # stamp over a world with NOTHING running anywhere — registry authoritatively empty, no
+        # subagents, no raw-running task in the pairing — lifts regardless of the spawn epoch (the
+        # misread-peer-as-agents shape: the notification it claims to await can never arrive). A
+        # world with a dispatch still RUNNING keeps every stamp, exactly as before.
+        self._transcript([_monitor("t1", LAUNCH, timeout_ms=30_000_000)])   # one genuinely-running task
         self._seed("agents")
         self.spawn = STAMP - 50                       # the stamp POSTDATES the last restart
+        self._tick({"state": "", "bgTasks": [{"toolUseId": "t1"}]})   # …and the registry agrees it lives
+        self.assertIsNotNone(self._stamp(), "something IS running — no lift without its return")
+        self._transcript([])
+        self._seed("agents")
         self._tick({"state": "", "bgTasks": []})
-        self.assertIsNotNone(self._stamp(), "evidence must postdate the anchor — the wake stays the backstop")
+        self.assertIsNone(self._stamp(), "nothing running anywhere → the wait can never end; lifted")
         self.spawn = BACK
         self._seed(None)                              # a kindless stamp never matches the agents-orphan rule
         self._tick({"state": "", "bgTasks": []})

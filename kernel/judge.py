@@ -3847,7 +3847,8 @@ def apply_plan(store, seg_id, seg_t, ops, menu, place_key=None, prompt_uuid=None
             # through machinery that already exists. Lifted by the closer's next audit of the goal.
             t = _target(o)
             k = o.get("kind")
-            kp = (_open_ask_peers(nodes[t]["id"].rsplit(":", 1)[0]) if k == "peer" and t else None)
+            kp = (_open_ask_peers(nodes[t]["id"].rsplit(":", 1)[0], since=nodes[t].get("t") or 0)
+                  if k == "peer" and t else None)
             if k == "peer" and t and not kp:
                 # the peer-kind write gate (the user 2026-08-24, same rule as apply_close): no open
                 # sent-question, no peer wait. DEMOTED to kindless rather than dropped — this op's
@@ -9039,7 +9040,13 @@ CLOSER_SYS = (
     "asynchronously and plans to act on when it completes: a background task or agent it launched, a "
     "long job or CI run it kicked off, a check-back it scheduled, a question it sent a peer session "
     "and still needs answered. Work handed OFF to a peer is the peer's own — ownership transferred, "
-    "not a wait; omit it. "
+    "not a wait; omit it. The kind boundaries are strict: job means an external computation the "
+    "session ITSELF launched (a cluster job, CI, a build) — another SESSION's work is never a job, "
+    "however long it runs; agents means background agents this session dispatched and still out; "
+    "timer means a scheduled check-back that actually EXISTS at turn end — never one the turn "
+    "canceled. Waiting for INBOUND mail (the manager's next dispatch, a peer's next message) is not "
+    "a wait at all: an idle recipient reads idle — omit it. Never relabel a wait to a different "
+    "kind to get it filed: work with a peer is kind peer, or no stamp. "
     "The turn must show **both** halves: the async work in flight (dispatched this turn, or re-checked "
     "and found still running) and the stated or clear intent to take action again when its result "
     "arrives. Waiting on the user is blocked, never awaiting. Async work whose result already came "
@@ -9140,20 +9147,24 @@ def _postal_ask_maps():
     return last_any, last_ask, alias
 
 
-def _open_ask_peers(sid):
+def _open_ask_peers(sid, since=0):
     """The peer keys `sid` itself sent a kind=question to that no reply of any kind has come back
     for — the awaiting-peer admit gate's evidence AND the identity the stamp records (2026-08-24):
     _peer_answered's pair-aware supersede matches these exact keys (sids, or the wait maps' own
     "peer:<host>:<name>" for an unresolved cross-host recipient — both sides derive them from the
-    same alias re-key, so they can never disagree)."""
+    same alias re-key, so they can never disagree). `since` (2026-08-25 audit) scopes the evidence
+    in TIME: an ask sent before the GOAL even existed cannot be what its wait is on — the waitfor
+    gate's own evidence-order rule, applied at the write gate. Unscoped, three week-old open
+    questions to another host admitted a peer stamp for a no-reply delegate, and the stamp's
+    awaitPeers named the wrong peers, so the pair-scoped supersede missed the reply that came."""
     last_any, last_ask, _alias = _postal_ask_maps()
     return sorted(peer for (f, peer), ts in last_ask.items()
-                  if f == sid and last_any.get((peer, f), 0) < ts)
+                  if f == sid and ts >= (since or 0) and last_any.get((peer, f), 0) < ts)
 
 
-def _open_peer_asks(sid):
-    """True iff `sid` itself sent a kind=question no reply of any kind has come back for."""
-    return bool(_open_ask_peers(sid))
+def _open_peer_asks(sid, since=0):
+    """True iff `sid` itself sent a kind=question (at/after `since`) no reply has come back for."""
+    return bool(_open_ask_peers(sid, since))
 
 
 def _parse_close(raw, menu_len):
@@ -9508,7 +9519,8 @@ def apply_close(store, menu, verdicts, t=None, touched=None, t_overrides=None):
         elif i in awaiting:
             aw_why = (awaiting[i] or {}).get("why") or None
             aw_kind = (awaiting[i] or {}).get("kind")
-            aw_peers = (_open_ask_peers(nd["id"].rsplit(":", 1)[0]) if aw_kind == "peer" else None)
+            aw_peers = (_open_ask_peers(nd["id"].rsplit(":", 1)[0], since=nd.get("t") or 0)
+                        if aw_kind == "peer" else None)
             if aw_kind == "peer" and not aw_peers:
                 # the peer-kind write gate (the user 2026-08-24): awaiting-a-peer requires an
                 # outstanding kind=question this session ITSELF sent. A delegate transferred
@@ -9518,6 +9530,14 @@ def apply_close(store, menu, verdicts, t=None, touched=None, t_overrides=None):
                 # this wait — the design rule's own tell that it is the wrong trigger — so the
                 # closer's claim stands down at the write moment: nothing is filed, no lift either
                 # (a stand-down is not new information in either direction).
+                continue
+            if any(e.get("kind") in ("awaiting", "done") and (e.get("lift") or e.get("kind") == "done")
+                   and (e.get("at") or e.get("ev_t") or 0) > (ev or 0) for e in nd.get("log") or []):
+                # the wait this assert describes already ENDED in the diary AFTER this turn's evidence
+                # (2026-08-25 audit: a closer auditing the pre-merge segment re-asserted a watch whose
+                # lift AND whose goal's done were both already filed — the stamp then stood for hours
+                # with the job kind exempt from every mail retire). The writer's world is older than
+                # the diary: stand down; a REAL new wait re-asserts from the next pass's fresh evidence.
                 continue
             if nd.get("awaitingWhy") != aw_why:
                 # a changed why is a real event → new row, new anchor (as ever)
