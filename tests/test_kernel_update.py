@@ -371,10 +371,16 @@ class RunUpdate(Fresh):
                       "the move VERIFIES it landed before install: merge --ff-only exits 0 as a "
                       "no-op when a seam commit already contains the tag (the r31 verification)")
         self.assertLess(script.index("merge --ff-only v0.7.0"),
-                        script.index('= "$NEW8" ] && ./install.sh'),
-                        "the landed-verify sits between the move and the install")
+                        script.index('= "$NEW8" ] && snap_install "$NEW8"'),
+                        "the landed-verify sits between the move and the SNAPSHOT install "
+                        "(the commit's own tree executes — the v1.3.16 audit's P1.1, r44)")
+        self.assertIn('git archive "$1" | tar -x -C', script,
+                      "snap_install materializes the complete target tree")
+        self.assertIn('ROMP_INSTALL_TARGET="$(pwd)"', script,
+                      "…and aims the snapshot's outputs at the real checkout")
         self.assertNotIn("git pull", script, "a pull takes whatever the branch has gained past the tag")
-        self.assertIn("./install.sh", script)
+        self.assertIn('snap_install "$NEW8"', script,
+                      "the install runs the snapshot, never ./install.sh from the live tree")
         self.assertIn("update-report.json", script)
         # the restart rides the SUCCESS branch only: everything after `if` up to `else` has it,
         # the failure branch does not
@@ -453,7 +459,8 @@ class RunUpdate(Fresh):
                            "  *' config '*) exec /usr/bin/git \"$@\";;\n"
                            "  *' verify-tag '*) exit %d;;\n"
                            "  *' rev-parse '*) echo deadbee1;;\n"
-                           "esac\nexit 0\n" % (calls, int(verify_rc)))
+                           "  *' archive '*) tar -c -C '%s' install.sh;;\n"
+                           "esac\nexit 0\n" % (calls, int(verify_rc), root))
             git.chmod(0o755)
             install = root / "install.sh"
             install.write_text("#!/bin/sh\nprintf 'install\\n' >> '%s'\nexit %d\n"

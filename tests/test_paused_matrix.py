@@ -129,10 +129,11 @@ class MatrixMint(_Base):
         # DIFFERENT topic/peer than the stamp's subject, and the stamp still goes dark. The sweep's
         # durable lift is what turns this cell from paused-forever into a fresh closer ruling.
         other = "99999999-aaaa-bbbb-cccc-dddddddddddd"
-        self._log([_msg(1, SID, other, STAMP_EV - 50, "coordinate"),
+        self._log([_msg(1, SID, other, STAMP_EV - 50, "question"),
                    _msg(2, other, SID, REPLY, "coordinate")])
         self.assertTrue(self._dark(self._node(kind="peer")),
-                        "any answered outbound pair supersedes a peer stamp (the known trade)")
+                        "any answered outbound ASK supersedes a peer stamp (the known trade; "
+                        "a mere coordinate stopped counting as an ask — v1.3.16 P2.11)")
 
     def test_a_stamp_written_after_the_reply_stands(self):
         # the write-time contract (2026-08-19 audit): the closer stamped KNOWING the reply

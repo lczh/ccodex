@@ -446,11 +446,19 @@ HOLDPY
     # overwrite orphaned the old record (the audits, 2026-08-18/19). The synthesis: the update
     # PROCEEDS, and the new arm carries BOTH shas — a crash before the move still protects the
     # old build, and a fixed install in the new commit is reachable.
+    # the COMMITTED install consults an untracked flag: the snapshot pins the CODE (a
+    # working-tree swap of install.sh is inert now — the v1.3.16 audit's P1.1), and the flag
+    # is the machine state a real install legitimately depends on
+    printf '#!/usr/bin/env bash\n[ -e "${ROMP_INSTALL_TARGET:-.}/.install-broken" ] && exit 1\nexit 0\n' \
+        > "$ROMP_REPO/install.sh"
+    git -C "$ROMP_REPO" add install.sh
+    git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -qm conditional-install
+    git -C "$ROMP_REPO" tag -s -f v0.2.9 -m v0.2.9 2>/dev/null || git -C "$ROMP_REPO" tag -f v0.2.9
     ROMP_DIR="$HOME/romp" bash "$REPO_ROOT/bootstrap.sh"
     gd="$(git -C "$HOME/romp" rev-parse --absolute-git-dir)"
     cur8="$(git -C "$HOME/romp" rev-parse --short=8 HEAD | head -c 8)"
     printf '%s' "$cur8" > "$gd/romp-install-failed"
-    printf '#!/usr/bin/env bash\nexit 1\n' > "$HOME/romp/install.sh"   # broken at BOTH commits
+    touch "$HOME/romp/.install-broken"                  # broken at BOTH commits (machine state)
     git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m r3
     git -C "$ROMP_REPO" tag -s v0.3.0 -m v0.3.0
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
@@ -460,7 +468,7 @@ HOLDPY
     [ "$(sed -n 1p "$gd/romp-install-failed" | awk '{print $1}')" = "$new8" ]   # the intent line
     [ "$(sed -n 2p "$gd/romp-install-failed")" = "$cur8" ]   # the CARRIED prior — never orphaned
     # and when install is FIXED, a re-run heals everything and spends the latch entirely
-    printf '#!/usr/bin/env bash\necho STUB_INSTALL_RAN\n' > "$HOME/romp/install.sh"
+    rm -f "$HOME/romp/.install-broken"
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -eq 0 ]
     [ ! -e "$gd/romp-install-failed" ]
@@ -667,7 +675,8 @@ exec(compile(open(txn).read(), txn, "exec"))
 PYEOF
     root="$TEST_DIR/clone"; mkdir -p "$root"
     git -C "$root" init -q -b main .
-    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    printf '#!/usr/bin/env bash\n[ -e "${ROMP_INSTALL_TARGET:-.}/.install-broken" ] && exit 1\nexit 0\n' \
+        > "$root/install.sh"
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm one
     git -C "$root" -c user.email=t@t -c user.name=t commit -q --allow-empty -m two
@@ -683,13 +692,14 @@ PYEOF
     [ "$(cat "$gd/romp-install-failed")" = "$x8 stable" ]
     # update B (dev, target Y) runs before any healer, with a FAILING install: its settle-heal of
     # A's latch fails (carry rides the FULL line), and its move fails — B exits 6
-    printf '#!/usr/bin/env bash\nexit 1\n' > "$root/install.sh"
+    touch "$root/.install-broken"                      # the flag, not a working-tree swap: the
+    #                                                     snapshot pins the committed code (P1.1)
     git -C "$root" branch rel
     run python3 "$TEST_DIR/txn.py" "$root" "$gd" "$Y" "-" "dev" branch -f rel/14 "$Y"
     [ "$status" -eq 6 ]
     [ "$(cat "$gd/romp-install-failed")" = "$x8 stable" ]   # A's FULL record survives B
     # install recovers; the gate heals A's latch and must land A's intended channel
-    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
+    rm -f "$root/.install-broken"
     run python3 "$TEST_DIR/gate.py" "$root"
     [ "$status" -eq 0 ]
     [ "$(cat "$gd/romp-update-channel")" = "stable" ]

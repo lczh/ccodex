@@ -145,10 +145,11 @@ class LinkBackLift(_Base):
     def test_cross_host_reply_lifts_the_same_way(self):
         self._seed_sender(peer="boxa:worker_two")
         jd.MESSAGES.parent.mkdir(parents=True, exist_ok=True)
-        jd.MESSAGES.write_text(json.dumps({"id": "m1", "ev": "sent", "from": "worker_two",
-                                           "from_id": "peer:boxa:worker_two", "to_id": SENDER,
-                                           "t": T + 60, "kind": "coordinate", "body": "x"}) + "\n")
+        jd.MESSAGES.write_text(json.dumps({"id": MID, "ev": "handoff-done",
+                                           "t": T + 60, "from_host": "boxa"}) + "\n")
         jd._PEER_ASK_CACHE[:] = [None, ({}, {})]
+        jd._HANDOFF_DONE_MEMO["key"] = None           # a reply no longer completes — the
+        #                                               per-message RECEIPT does (v1.3.16 P1.3)
         self.assertEqual(jd.run_propagate(now=T + 200), 1)
         st = jd.load_goals(SENDER)
         self.assertTrue(st["nodes"][H].get("nodeComplete"))

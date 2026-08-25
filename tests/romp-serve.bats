@@ -189,7 +189,13 @@ _latch_fixture() {
     mkdir -p "$FIX/bin"
     cp "$ROMP_SERVE" "$FIX/bin/romp-serve"
     git -C "$FIX" init -q -b main
-    git -C "$FIX" -c user.email=t@t -c user.name=t commit -q --allow-empty -m x
+    # the COMMITTED install consults an untracked flag (+ echoes): the gate heal runs the
+    # SNAPSHOT's bytes now (v1.3.16 P1.1), so working-tree swaps of install.sh are inert
+    printf '#!/bin/sh\necho INSTALL_RAN\n[ -e "${ROMP_INSTALL_TARGET:-.}/.install-broken" ] && exit 1\nexit 0\n' \
+        > "$FIX/install.sh"
+    chmod +x "$FIX/install.sh"
+    git -C "$FIX" add install.sh
+    git -C "$FIX" -c user.email=t@t -c user.name=t commit -qm x
     GD="$(git -C "$FIX" rev-parse --absolute-git-dir)"
     CUR="$(git -C "$FIX" rev-parse --short=8 HEAD | head -c 8)"
     printf '#!/usr/bin/env bash\necho KERNEL_RAN\n' > "$FIX/bin/romp-kernel"
@@ -199,7 +205,7 @@ _latch_fixture() {
 
 @test "romp-serve: an armed latch with a FAILING install refuses to start the kernel (exit 70)" {
     _latch_fixture
-    printf '#!/bin/sh\nexit 1\n' > "$FIX/install.sh"; chmod +x "$FIX/install.sh"
+    touch "$FIX/.install-broken"
     printf '%s' "$CUR" > "$GD/romp-install-failed"
     run "$FIX/bin/romp-serve"
     [ "$status" -eq 70 ]
@@ -210,7 +216,6 @@ _latch_fixture() {
 
 @test "romp-serve: an armed latch heals (install passes), spends the latch, and starts the kernel" {
     _latch_fixture
-    printf '#!/bin/sh\nexit 0\n' > "$FIX/install.sh"; chmod +x "$FIX/install.sh"
     printf '%s' "$CUR" > "$GD/romp-install-failed"
     run "$FIX/bin/romp-serve"
     [ "$status" -eq 0 ]
@@ -220,7 +225,7 @@ _latch_fixture() {
 
 @test "romp-serve: a latch naming some OTHER commit is moot — cleared, kernel starts, no install" {
     _latch_fixture
-    printf '#!/bin/sh\necho INSTALL_RAN; exit 1\n' > "$FIX/install.sh"; chmod +x "$FIX/install.sh"
+    touch "$FIX/.install-broken"                        # would fail IF it ran — it must not
     printf '%s' "00000000" > "$GD/romp-install-failed"
     run "$FIX/bin/romp-serve"
     [ "$status" -eq 0 ]

@@ -46,7 +46,7 @@ class DebtBase(unittest.TestCase):
         km._name_of = lambda sid: {ASKER: "web", ASKER2: "api", DEBTOR: "tests"}.get(sid)
         self.rec = _Recorder()
         km.Sessions.backend_for = lambda sid: self.rec
-        self._maps = ({}, {})
+        self._maps = ({}, {}, {})
         km._postal_wait_maps = lambda: self._maps
 
     def tearDown(self):
@@ -59,7 +59,7 @@ class DebtBase(unittest.TestCase):
         if answered_at is not None:
             last_any[(DEBTOR, asker)] = answered_at
         last_ask = {(asker, DEBTOR): (ts, kind, head)}
-        self._maps = (last_any, last_ask)
+        self._maps = (last_any, last_ask, {})
         km._postal_wait_maps = lambda: self._maps
 
 
@@ -81,7 +81,7 @@ class DebtAsks(DebtBase):
 
     def test_legacy_two_tuple_records_still_read(self):
         # a cached (ts, kind) record from before the head rode along must not crash the scan
-        self._maps = ({(ASKER, DEBTOR): T_ASK}, {(ASKER, DEBTOR): (T_ASK, "question")})
+        self._maps = ({(ASKER, DEBTOR): T_ASK}, {(ASKER, DEBTOR): (T_ASK, "question")}, {(ASKER, DEBTOR): T_ASK})
         km._postal_wait_maps = lambda: self._maps
         self.assertEqual(km._debt_asks(DEBTOR, {ASKER}),
                          [(ASKER, "web", T_ASK, "question", "")])
@@ -129,7 +129,7 @@ class DebtReminder(DebtBase):
         last_any = {(ASKER, DEBTOR): T_ASK, (ASKER2, DEBTOR): T_ASK + 5}
         last_ask = {(ASKER, DEBTOR): (T_ASK, "question", "Which port?"),
                     (ASKER2, DEBTOR): (T_ASK + 5, "delegate", "Take the backfill.")}
-        self._maps = (last_any, last_ask)
+        self._maps = (last_any, last_ask, {})
         km._postal_wait_maps = lambda: self._maps
         self.assertTrue(km._fire_debt_reminder(DEBTOR, NOW, {ASKER, ASKER2, DEBTOR}))
         self.assertEqual(len(self.rec.sent), 1, "debts coalesce into one message")

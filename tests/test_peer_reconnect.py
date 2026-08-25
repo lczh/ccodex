@@ -89,6 +89,9 @@ class PersistedIntent(unittest.TestCase):
     def test_a_checkin_peer_row_survives_the_hub_restart(self):
         # the hub side of the same bug: the mobile's row must come back on boot, so the standing
         # reverse forward reads up within one pass with no handshake needed at all
+        km._known_note("mobile1", "trusted")          # this fork gates check-in on explicit
+        #                                               trust (the v1.3.7 hardening) — upstream's
+        #                                               test arrived via the r44 merge without it
         ans, code = km.checkin_apply({"host": "mobile1", "kernelPort": 29855, "busPort": 25302,
                                       "token": "mtok"})
         self.assertEqual(code, 200)
