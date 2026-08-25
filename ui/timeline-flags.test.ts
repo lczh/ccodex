@@ -149,11 +149,35 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
     assert.ok(win.indexOf("_applyLocalOp(o.inverse)") > 0,
       "the refusing host's entries roll the local half back — the union never stays split");
   }
+  {
+    // the r45 verification's P1: the CAS refused the rollback itself. Every whole-blob write
+    // commits against the optimistic counter (payload rev, +1 per local write), re-anchored on
+    // every fresh payload — same-client sequences never self-409.
+    const fn = SRC.indexOf("_nextViewsRev() {");
+    assert.ok(fn > 0, "the optimistic rev counter exists");
+    const sv = SRC.indexOf("_setViews(v, ops) {");
+    const win = SRC.slice(sv, sv + 700);
+    assert.match(win, /const baseRev = this\._nextViewsRev\(\);/);
+    assert.match(win, /v\.baseRev = baseRev; delete v\.rev;/,
+      "the stale payload rev never rides a write — the counter is the declared base");
+    assert.match(SRC, /this\._optViewsRev = typeof data\.views\.rev === 'number' \? data\.views\.rev : 0;/,
+      "every fresh payload re-anchors the counter, so a refused write self-heals");
+  }
+  {
+    // the r45 verification: compensation entries drop on the DECIDING EVENT (the owner's RAW
+    // polled store confirms the edit), never a push counter racing a slow refusal
+    const fn = SRC.indexOf("_reconcileUnionOps() {");
+    const win = SRC.slice(fn, fn + 800);
+    assert.ok(win.indexOf("this._views && this._views.remoteTags") > 0,
+      "the RAW payload decides — the optimistic overlay would echo our own edit back");
+    assert.ok(win.indexOf("_unionOpApplied") > 0);
+    assert.ok(win.indexOf("age") < 0, "no push-counter age-out survives");
+  }
 });
 
 test("the sticky-flag machinery survives: pendingFlags reconcile on every update (no flicker-back)", () => {
   assert.match(SRC, /this\._pendingFlags = \{\};/);
-  assert.match(SRC, /this\.data = data;\s*\n(?:[^\n]*\n){0,4}\s*this\._reconcilePendingFlags\(\);/);
+  assert.match(SRC, /this\.data = data;\s*\n(?:[^\n]*\n){0,8}\s*this\._reconcilePendingFlags\(\);/);
   assert.match(SRC, /_reconcilePendingFlags\(\) \{[\s\S]*?if \(s\[flag\] === p\[flag\]\) delete p\[flag\];[\s\S]*?else s\[flag\] = p\[flag\];/);
 });
 

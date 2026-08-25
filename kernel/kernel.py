@@ -1817,7 +1817,10 @@ def _apply_views_ops(ops):
             raw = {}
         currev = int(raw.get("rev") or 0) if isinstance(raw, dict) else 0
         d = _norm_timeline_views(raw)
-        pair = lambda s: {"host": "", "sid": str(s)}
+        # _member_pair, not a bare-sid wrapper (the r45 verification): clients post the
+        # viewer-relative "host:sid" spelling for REMOTE members — wrapping it as a home sid
+        # stored a corrupt pair, and remove could never match one
+        pair = _member_pair
         for op in ops if isinstance(ops, list) else []:
             if not isinstance(op, dict):
                 continue
@@ -1830,8 +1833,8 @@ def _apply_views_ops(ops):
                 if cid and not any(t["id"] == cid for t in d["tags"]):
                     d["tags"].append({"id": cid, "name": str(cr.get("name") or "tag"),
                                       "color": str(cr.get("color") or ""),
-                                      "members": [pair(s) for s in (cr.get("members") or [])
-                                                  if isinstance(s, str)]})
+                                      "members": [m for m in (pair(s) for s in (cr.get("members") or []))
+                                                  if m]})
                 continue
             key = str(op.get("tag") or "")
             t = next((x for x in d["tags"] if x.get("name") == key or x.get("id") == key), None)
@@ -1839,12 +1842,13 @@ def _apply_views_ops(ops):
                 continue
             if isinstance(op.get("add"), list):
                 have = {(m["host"], m["sid"]) for m in t["members"]}
-                t["members"] = t["members"] + [pair(s) for s in op["add"]
-                                               if isinstance(s, str) and ("", s) not in have]
+                adds = [m for m in (pair(s) for s in op["add"]) if m]
+                t["members"] = t["members"] + [m for m in adds
+                                               if (m["host"], m["sid"]) not in have]
             if isinstance(op.get("remove"), list):
-                gone = {str(s) for s in op["remove"] if isinstance(s, str)}
+                gone = {(m["host"], m["sid"]) for m in (pair(s) for s in op["remove"]) if m}
                 t["members"] = [m for m in t["members"]
-                                if not (m.get("host") == "" and m.get("sid") in gone)]
+                                if (m.get("host") or "", m.get("sid")) not in gone]
             if isinstance(op.get("rename"), str) and op["rename"].strip():
                 t["name"] = op["rename"].strip()
             if isinstance(op.get("color"), str):
@@ -26150,6 +26154,10 @@ def _fleet_view_sig(now, tmux):
     return tuple(sorted(sig.items()))
 
 
+_PURE_FEED = [None, 0.0]   # GET /feed.json's own cold-build cache (feed, builtAt) — deliberately
+#                            separate from _built_feed (see the route)
+
+
 def _cached_feed(now, tmux, sig, connect=False):
     # connect (a fresh client) NEVER triggers a rebuild — it serves whatever the pusher has warmed, so startup
     # is instant; the pusher refreshes it within a tick. Else: reuse on an unchanged sig OR a recent rebuild —
@@ -30418,11 +30426,23 @@ class Handler(BaseHTTPRequestHandler):
                 # a cold kernel builds once, a read like any client connect). Token-gated like its
                 # stateful siblings; read-only, no side effects.
                 e = _built_feed
-                feed = e[1] if e[1] is not None else build_feed(time.time(), _tmux_sessions())
-                # a COLD kernel builds once WITHOUT _cached_feed's supervisor transitions — the
-                # notification baseline advance, badge pushes and notify-cards prune are the
-                # PUSHER's job, and a read-only GET was rewriting notify-cards.json (the v1.3.17
-                # audit's P2.12). The warmed build serves as-is, exactly as before.
+                feed = e[1]
+                if feed is None:
+                    # a COLD kernel builds WITHOUT _cached_feed's supervisor transitions — the
+                    # notification baseline advance, badge pushes and notify-cards prune are the
+                    # PUSHER's job, and a read-only GET was rewriting notify-cards.json (the
+                    # v1.3.17 audit's P2.12). The pure build gets its OWN short cache (never
+                    # _built_feed: seeding the pusher's diff baseline from a read would swallow
+                    # a notification transition), so repeated cold GETs don't each pay the full
+                    # ~1.5s build (the r45 verification). buildId 0 = an unversioned read: this
+                    # build never enters the ack-ordering lane.
+                    if _PURE_FEED[0] is not None and (time.time() - _PURE_FEED[1]) < REBUILD_MIN_S \
+                            and _views_dirty[0] <= _PURE_FEED[1]:
+                        feed = _PURE_FEED[0]
+                    else:
+                        feed = build_feed(time.time(), _tmux_sessions())
+                        feed["buildId"] = 0
+                        _PURE_FEED[:] = [feed, time.time()]
                 return self._send(200, json.dumps(feed),
                                   "application/json", cache="no-cache")
             if p == "/classify":

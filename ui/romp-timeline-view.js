@@ -1499,7 +1499,10 @@ class TimelinePanel {
     }
     this.data = data;
     if (data.cmapGrad) this._cmapGrad = data.cmapGrad;   // compaction-sweep colormap gradient (persists across the lighter {type:bars} pushes)
-    if (data.views) this._views = data.views;            // the views blob rides every push (skeleton included)
+    if (data.views) {
+      this._views = data.views;                          // the views blob rides every push (skeleton included)
+      this._optViewsRev = typeof data.views.rev === 'number' ? data.views.rev : 0;
+    }
     if (Array.isArray(data.palette) && data.palette.length) this._palette = data.palette;
     this._reconcilePendingFlags();   // hold an optimistic eye-toggle sticky until THIS push (or a later one) confirms it
     this._reconcileDismissed();      // ...and a Cleared dead lane, so a stale/merged push can't pop it back
@@ -2489,16 +2492,33 @@ class TimelinePanel {
   }
 
   // one pending compensation per dispatched remote half: applied on that host's tagEditFailed,
-  // aged out (3 polls, the optimistic-overlay convention) once the owner presumably applied it
-  _noteUnionOp(rt, name, inverse) {
+  // dropped when the owner's store CONFIRMS the edit (never a push counter — a slow refusal can
+  // outlive any count of pushes; the r45 verification: the 3-push age-out raced the forward
+  // path's 8s timeout and slow refusals got no rollback at all)
+  _noteUnionOp(rt, name, inverse, edit) {
     if (!this._unionOps) this._unionOps = [];
-    this._unionOps.push({ host: rt.host || '', name: name || '', inverse: inverse, age: 0 });
+    this._unionOps.push({ host: rt.host || '', name: name || '', inverse: inverse,
+                          edit: edit || {} });
   }
 
   _reconcileUnionOps() {
     if (!this._unionOps || !this._unionOps.length) return;
-    for (const o of this._unionOps) o.age = (o.age || 0) + 1;
-    this._unionOps = this._unionOps.filter((o) => o.age < 3);
+    // the RAW polled payload, never _curViews(): the optimistic overlay would echo our own edit
+    // straight back and drop the entry before any refusal could arrive
+    const rts = (this._views && this._views.remoteTags) || [];
+    this._unionOps = this._unionOps.filter((o) => !this._unionOpApplied(o, rts));
+  }
+
+  _unionOpApplied(o, rts) {
+    const e = o.edit || {};
+    const byName = (n) => rts.find((t) => (t.host || '') === o.host && t.name === n);
+    if (e.delete) return !byName(o.name);
+    if (e.rename) return !!byName(e.rename);
+    const rt = byName(o.name);
+    if (!rt) return false;                       // owner detached/silent → keep the entry
+    if (e.color) return rt.color === e.color;
+    if (e.remove) return !e.remove.some((m) => (rt.members || []).indexOf(m) >= 0);
+    return false;
   }
 
   // apply one targeted op to the LOCAL store: the optimistic clone mutates and the same op
@@ -2562,7 +2582,8 @@ class TimelinePanel {
           // dispatch success only means the request left (the v1.3.17 audit's P2.11: the local
           // deletion stayed committed while the remote member survived, splitting the union)
           for (const rt of dispatched)
-            this._noteUnionOp(rt, g.name, { tag: g.localId, add: had });
+            this._noteUnionOp(rt, g.name, { tag: g.localId, add: had },
+                              { remove: edit.remove.slice() });
         }
       }
     }
@@ -2590,7 +2611,9 @@ class TimelinePanel {
           if (edit.color) { op.color = edit.color; inverse.color = before.color; }
         }
         this._setViews(nv, [op]);
-        for (const rt of g.remotes) this._noteUnionOp(rt, g.name, inverse);
+        for (const rt of g.remotes)
+          this._noteUnionOp(rt, g.name, inverse,
+                            { rename: edit.rename, color: edit.color, delete: !!edit.delete });
       }
     }
   }
@@ -2672,10 +2695,24 @@ class TimelinePanel {
   // are QUEUED for the kernel's locked replay (_spoolOp); the direct whole-file write is gone —
   // it raced other Electron processes and could recreate migrated TIDs (the audit's P1.5).
   // Optimistic + sticky, like the lane flags.
+  // The CAS base for the NEXT whole-blob write: the payload's rev, advanced once per local write
+  // (the server increments by one per accepted write). Without this, the SECOND of two quick
+  // same-client gestures still carried the first's base and was silently 409'd — and the P2.11
+  // ROLLBACK itself writes through _setViews, so the CAS refused the very compensation and the
+  // split-tag state persisted (the r45 verification's P1). update() re-anchors the counter to
+  // every fresh payload, so a cross-client conflict costs at most one refused gesture.
+  _nextViewsRev() {
+    const base = (this._views && typeof this._views.rev === 'number') ? this._views.rev : 0;
+    this._optViewsRev = Math.max(this._optViewsRev || 0, base) + 1;
+    return this._optViewsRev - 1;
+  }
+
   _setViews(v, ops) {
     this._pendingViews = v; this._pendingViewsAge = 0;
+    const baseRev = this._nextViewsRev();
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineSetViews === 'function') {
+        if (v && typeof v === 'object') { v.baseRev = baseRev; delete v.rev; }
         window.__rompTimelineSetViews(v);
       } else if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
         // Obsidian only — the Electron guard keeps a bare-node test run from ever touching real

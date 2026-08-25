@@ -197,6 +197,22 @@ class ViewsRevisionAndOps(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertEqual(km._timeline_views()["tags"], [])
 
+    def test_ops_speak_the_remote_member_spelling(self):
+        # the r45 verification: clients post viewer-relative "host:sid" strings for REMOTE
+        # members — the bare-sid wrapper stored a corrupt {"host":"","sid":"host:sid"} pair on
+        # add, and remove could never match one
+        self._post("/views", {"ops": [{"create": {"id": "tr", "name": "remote-taggable",
+                                                  "color": "", "members": []}}]})
+        st, r = self._post("/views", {"ops": [{"tag": "tr", "add": ["TESTHOST:" + SID]}]})
+        self.assertEqual(st, 200)
+        v = km._timeline_views()
+        self.assertEqual(v["tags"][0]["members"], [{"host": "TESTHOST", "sid": SID}],
+                         "the canonical pair, not a corrupt home-sid wrap")
+        st, r = self._post("/views", {"ops": [{"tag": "tr", "remove": ["TESTHOST:" + SID]}]})
+        self.assertEqual(st, 200)
+        self.assertEqual(km._timeline_views()["tags"][0]["members"], [],
+                         "a remote member is removable through the same spelling")
+
     def test_an_op_on_a_deleted_tag_drops_quietly(self):
         st, r = self._post("/views", {"ops": [{"tag": "ghost", "add": [SID]}]})
         self.assertEqual((st, r.get("ok")), (200, True),
@@ -297,6 +313,27 @@ class FeedJsonIsAPureRead(unittest.TestCase):
         finally:
             km.build_feed, km._cached_feed, km._tmux_sessions = saved[0], saved[1], saved[2]
             km._built_feed[:] = saved[3]
+
+    def test_repeated_cold_gets_build_once(self):
+        # the r45 verification: every cold GET paid the full ~1.5s build. The pure path gets
+        # its OWN short cache — never _built_feed, whose diff baseline a read must not seed.
+        builds = []
+        saved = (km.build_feed, km._tmux_sessions, list(km._built_feed), list(km._PURE_FEED))
+        km._built_feed[:] = [None, None, 0, 0]
+        km._PURE_FEED[:] = [None, 0.0]
+        km._tmux_sessions = lambda: {}
+        km.build_feed = lambda now, tmux: (builds.append(1), {"items": [], "n": len(builds)})[1]
+        try:
+            st, b1 = self._get("/feed.json")
+            st, b2 = self._get("/feed.json")
+            self.assertEqual(len(builds), 1, "the second cold GET serves the pure cache")
+            self.assertEqual(b1.get("buildId"), 0, "an unversioned read, marked as such")
+            self.assertEqual(km._built_feed[1], None,
+                             "the pure cache never seeds the pusher's diff baseline")
+        finally:
+            km.build_feed, km._tmux_sessions = saved[0], saved[1]
+            km._built_feed[:] = saved[2]
+            km._PURE_FEED[:] = saved[3]
 
     def test_a_warmed_build_serves_as_is(self):
         saved = (km.build_feed, list(km._built_feed))
