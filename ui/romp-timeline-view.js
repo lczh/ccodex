@@ -1776,9 +1776,11 @@ class TimelinePanel {
       // two fixture sids on every `npm test`, which is exactly the "tabs keep reordering themselves"
       // bug the order-audit log finally pinned (the user 2026-07-02). Electron-or-nothing, no heuristic.
       if (typeof process === 'undefined' || !process.versions || !process.versions.electron) return;
+      // requires sit DIRECTLY in the try body: esbuild only tolerates unbundlable require()
+      // there, and inside the .then callback it hard-errors the production webview bundle (r44)
+      const fs = require('fs'), path = require('path'), os = require('os');
       this._kernelPost('/order', { order: order }).then((ok) => {
         if (ok !== false) return;                    // merged, or refused (kernel up — see /flag)
-        const fs = require('fs'), path = require('path'), os = require('os');
         const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
         const root = process.env.ROMP_STATE_DIR || path.join(base, 'romp');   // per-kernel state root (plans/multi-kernel.md)
         const f = path.join(root, 'session-order.json'), tmp = f + '.tmp';
@@ -2602,9 +2604,9 @@ class TimelinePanel {
         // whole-blob last-write-wins the WS op has, through the locked + canonicalizing +
         // normalizing setter (the v1.3.16 audit's P2.17); the direct file write is the
         // kernel-down last resort only.
+        const fs = require('fs'), os = require('os'), path = require('path');   // try-scope: see _persistOrder
         this._kernelPost('/views', { views: v }).then((ok) => {
           if (ok !== false) return;                  // normalized, or refused (kernel up)
-          const fs = require('fs'), os = require('os'), path = require('path');
           const root = process.env.ROMP_STATE_DIR
             || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'romp');
           fs.mkdirSync(root, { recursive: true });
@@ -3166,11 +3168,11 @@ class TimelinePanel {
       // Direct state access is an Obsidian/Electron fallback only. A plain-node test process with
       // a window shim must never touch the user's real flags, just as for order and views above.
       if (typeof process === 'undefined' || !process.versions || !process.versions.electron) return;
+      const fs = require('fs'), os = require('os'), path = require('path');   // try-scope: see _persistOrder
       this._kernelPost('/flag', { target: s.id, flag: flag, value: !!value }).then((ok) => {
         if (ok !== false) return;                    // took it, or REFUSED it (kernel up: never
         //                                              race its writers with a raw file write)
         // kernel unreachable → the last-resort direct write (its racing writers are down too)
-        const fs = require('fs'), os = require('os'), path = require('path');
         const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
         const dir = process.env.ROMP_STATE_DIR || path.join(base, 'romp');
         const fp = path.join(dir, 'session-flags.json'), tmp = fp + '.tmp';
