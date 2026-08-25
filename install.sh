@@ -8,14 +8,21 @@
 # bin/ is NOT symlinked anywhere — add it to PATH in your shell rc:
 #   export PATH="$PATH:<this repo>/bin"
 set -euo pipefail
-ROMP_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROMP_CODE="$(cd "$(dirname "$0")" && pwd)"
+# ROMP_INSTALL_TARGET (the v1.3.16 audit's P1.1): an updater executes this script — and every
+# shell child — from an IMMUTABLE snapshot of the target commit, so a writer racing the live
+# tree can never swap a child mid-install. The snapshot is the CODE source; the checkout being
+# installed is the TARGET every durable output references (service units, the PATH note, the
+# extension build). Without the override (a hand-run install) code and target are the same tree.
+ROMP_DIR="${ROMP_INSTALL_TARGET:-$ROMP_CODE}"
+export ROMP_INSTALL_TARGET="$ROMP_DIR"
 
 # This script installs the clone it lives in, so it must be RUN from one. Piped
 # (`curl ... | bash`), $0 is "bash" and ROMP_DIR silently becomes the caller's
 # cwd. And since `ln -s` happily links a nonexistent target, that would point
 # every hook in ~/.claude at a dangling path and break Claude Code. Check for a
 # file only the repo has, and send them to bootstrap.sh instead.
-if [[ ! -x "$ROMP_DIR/bin/romp" ]]; then
+if [[ ! -x "$ROMP_DIR/bin/romp" || ! -e "$ROMP_CODE/bin/romp" ]]; then
     echo "install.sh: this doesn't look like a romp clone ($ROMP_DIR)." >&2
     echo "  install.sh installs the clone it lives in; it cannot be piped from curl." >&2
     echo "  To install from scratch:" >&2
@@ -214,17 +221,17 @@ fi
 # (that is precisely what happened on a fresh Ubuntu box, the user 2026-07-27 — an apt python3 with no
 # ensurepip, one swallowed `|| echo`, and romp looked installed but could start nothing).
 ROMP_SDK_MISSING=""
-if [[ -z "${ROMP_NO_SDK:-}" && -x "$ROMP_DIR/bin/romp-sdk-setup" ]]; then
-    "$ROMP_DIR/bin/romp-sdk-setup" || ROMP_SDK_MISSING=1
+if [[ -z "${ROMP_NO_SDK:-}" && -e "$ROMP_CODE/bin/romp-sdk-setup" ]]; then
+    bash "$ROMP_CODE/bin/romp-sdk-setup" || ROMP_SDK_MISSING=1   # executes SNAPSHOT bytes; writes only the state dir
 fi
 
 # The webview bundles live here too — this step builds vscode-extension/dist, which the KERNEL serves
 # to the browser dashboard, editor or no editor. A failure means either that build or every editor
 # install failed, so it is remembered and reported at the end rather than echoed past.
 ROMP_EXT_FAILED=""
-if [[ -z "${ROMP_NO_EXT:-}" && -x "$ROMP_DIR/vscode-extension/install.sh" ]]; then
+if [[ -z "${ROMP_NO_EXT:-}" && -e "$ROMP_CODE/vscode-extension/install.sh" ]]; then
     echo "  Building the dashboard UI (and installing romp-chat-view where an editor is present)..."
-    "$ROMP_DIR/vscode-extension/install.sh" || ROMP_EXT_FAILED=1
+    bash "$ROMP_CODE/vscode-extension/install.sh" || ROMP_EXT_FAILED=1   # snapshot bytes; builds the TARGET tree
 fi
 
 # Auto-start: install the login service so the kernel supervisor (romp-manager) is
@@ -233,7 +240,7 @@ fi
 # ROMP_NO_SERVICE=1; remove later with `romp-service uninstall`.
 if [[ -z "${ROMP_NO_SERVICE:-}" ]]; then
     # ROMP_SERVICE_BIN overrides the binary (tests stub it); defaults to the repo copy.
-    _svc="${ROMP_SERVICE_BIN:-$ROMP_DIR/bin/romp-service}"
+    _svc="${ROMP_SERVICE_BIN:-$ROMP_CODE/bin/romp-service}"   # snapshot bytes; units point at the TARGET
     if [[ -x "$_svc" ]]; then
         # Don't tear down a HEALTHY manager just to ship a webview dist/VSIX change. `romp-service
         # install` boots the running romp-manager OUT (SIGTERM, drains every kernel) then re-bootstraps;

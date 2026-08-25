@@ -22,6 +22,11 @@ while [[ -L "$src" ]]; do
     case "$tgt" in /*) src="$tgt" ;; *) src="$(cd "$(dirname "$src")" && pwd)/$tgt" ;; esac
 done
 ROMP_DIR="$(cd "$(dirname "$src")/.." && pwd)"
+# under an updater the script runs from an immutable snapshot — the TARGET checkout is what the
+# service must point at, or the unit would embed a temp staging path (the v1.3.16 audit's P1.1)
+if [[ -n "${ROMP_INSTALL_TARGET:-}" && -x "$ROMP_INSTALL_TARGET/bin/romp-serve" ]]; then
+    ROMP_DIR="$ROMP_INSTALL_TARGET"
+fi
 MANAGER="${ROMP_MANAGER_BIN:-$ROMP_DIR/bin/romp-manager}"
 LABEL="com.romp.manager"
 STATE="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}"

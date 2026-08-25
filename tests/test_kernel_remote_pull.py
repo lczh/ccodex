@@ -205,6 +205,29 @@ class PullRemote(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("no ssh path", detail)
 
+    def test_equal_heads_with_a_clear_latch_are_a_true_no_op(self):
+        self._wire(rhead=LOCAL)                       # the remote already sits at OUR head
+        with mock.patch.object(km, "_install_latch_lines", return_value=[]):
+            ok, detail = km._pull_remote("TESTHOST", expected_sha=LOCAL)
+        self.assertTrue(ok, detail)
+        self.assertIn("already up to date", detail)
+
+    def test_equal_heads_with_an_armed_latch_still_run_the_settle_transaction(self):
+        # the v1.3.16 audit's P2.10: the equal-HEAD return reported success while an armed
+        # install latch sat unsettled and the update lock was never taken
+        self._wire(rhead=LOCAL)
+        with mock.patch.object(km, "_install_latch_lines", return_value=["aaaaaaaa"]):
+            ok, detail = km._pull_remote("TESTHOST", expected_sha=LOCAL)
+        self.assertNotIn("already up to date", detail,
+                         "HEAD equality alone cannot bypass this checkout's recovery record")
+
+    def test_equal_heads_with_an_unreadable_latch_still_run_the_settle_transaction(self):
+        self._wire(rhead=LOCAL)
+        with mock.patch.object(km, "_install_latch_lines", return_value=None):
+            ok, detail = km._pull_remote("TESTHOST", expected_sha=LOCAL)
+        self.assertNotIn("already up to date", detail,
+                         "an unreadable latch is never presumed clear")
+
     def test_a_dirty_local_tree_is_refused(self):
         # the fast-forward rewrites the working tree, and peers' uncommitted edits are not ours to move
         self._wire(dirty=" M kernel/kernel.py")

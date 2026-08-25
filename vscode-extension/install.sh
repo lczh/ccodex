@@ -22,7 +22,14 @@
 # Mirrors ../vscode-trackchanges/install.sh, minus the shared-engine wiring
 # (romp-chat-view is standalone; esbuild bundles its deps in).
 set -euo pipefail
-cd "$(dirname "$0")"
+# ROMP_INSTALL_TARGET (the v1.3.16 audit's P1.1): under an updater this script's BYTES come from
+# an immutable snapshot, but the build acts on the TARGET checkout — node_modules and dist live
+# there, and the tree was verified clean at the target commit before and after the install.
+if [[ -n "${ROMP_INSTALL_TARGET:-}" && -d "$ROMP_INSTALL_TARGET/vscode-extension" ]]; then
+  cd "$ROMP_INSTALL_TARGET/vscode-extension"
+else
+  cd "$(dirname "$0")"
+fi
 
 if ! command -v node >/dev/null 2>&1; then
   echo "!! node not found — skipping romp-chat-view install."

@@ -1577,19 +1577,26 @@ class UiOnlyConverge(unittest.TestCase):
         km._REBUILT_FOR[0] = ""
 
     def test_ui_only_restart_drift_rebuilds_in_place_and_latches(self):
-        km._main_drift_verdict = lambda o, c, k: ("restart", "tgt-ui")
+        km._main_drift_verdict = lambda o, c, k: ("restart", "abcd1234ef" + "0" * 30)
         km._kernel_code_changed = lambda a, b: False
         km._rebuild_dist = lambda: (self.rebuilds.append(1), (True, ""))[1]
         km._main_drift_check()
         self.assertEqual(len(self.rebuilds), 1)
-        self.assertEqual(km._REBUILT_FOR[0], "tgt-ui", "the converge latches on the target sha")
+        self.assertEqual(km._REBUILT_FOR[0], "abcd1234",
+                         "the converge latches on the SHORT8 target sha — one shape on every "
+                         "store and compare (the v1.3.16 audit's P2.9)")
         self.assertEqual(self.banners, [], "no restart banner for a rebuild that cuts nothing")
         self.assertTrue(any("no restart" in m for m, _ in self.notices))
         km._main_drift_check()   # same target again: already converged, no second build
         self.assertEqual(len(self.rebuilds), 1)
+        # …and the FULL-vs-short mismatch that rebuilt the same commit twice is gone: a full-sha
+        # verdict for the commit the pull leg just built matches the short8 latch
+        km._main_drift_verdict = lambda o, c, k: ("restart", "abcd1234")
+        km._main_drift_check()
+        self.assertEqual(len(self.rebuilds), 1, "short and full spellings are ONE commit")
 
     def test_a_failed_build_falls_through_to_the_restart_path_loudly(self):
-        km._main_drift_verdict = lambda o, c, k: ("restart", "tgt-ui")
+        km._main_drift_verdict = lambda o, c, k: ("restart", "eeee1234" + "0" * 32)
         km._kernel_code_changed = lambda a, b: False
         km._rebuild_dist = lambda: (False, "esbuild boom")
         km._main_drift_check()
@@ -1630,6 +1637,7 @@ class UiOnlyConverge(unittest.TestCase):
                         "the install gate comes first — a UI-dep change still installs, so a "
                         "vscode-extension dep bump never builds against stale node_modules "
                         "(install.sh IS the build here; no separate _rebuild_dist)")
-        self.assertIn("_REBUILT_FOR[0] = tip", src)
-        self.assertLess(src.index("_REBUILT_FOR[0] = tip"), src.index('if kind == "restart":'),
+        self.assertIn("_REBUILT_FOR[0] = _sha8(tip)", src,
+                      "one sha shape on the store (the v1.3.16 audit's P2.9)")
+        self.assertLess(src.index("_REBUILT_FOR[0] = _sha8(tip)"), src.index('if kind == "restart":'),
                         "the in-place converge returns before the restart machinery")

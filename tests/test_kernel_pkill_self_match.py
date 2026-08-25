@@ -57,8 +57,9 @@ def _apply_script():
 class ApplyScriptPkillPattern(unittest.TestCase):
     def test_the_pattern_does_not_match_its_own_text(self):
         script = _apply_script()
-        self.assertIn("pkill -f", script, "the apply still kills the old kernel")
-        pat = re.search(r'pkill -f "([^"]+)"', script).group(1)
+        self.assertIn('["pkill","-f",', script, "the apply still kills the old kernel "
+                      "(inside the locked python since r44)")
+        pat = re.search(r'\["pkill","-f","([^"]+)"\]', script).group(1)
         # THE bug: the pattern, applied to the script that carries it, must find nothing.
         self.assertIsNone(re.search(pat, script),
                           "pkill pattern %r matches the apply script's own text — it would kill the "
@@ -66,7 +67,7 @@ class ApplyScriptPkillPattern(unittest.TestCase):
 
     def test_the_pattern_still_matches_a_real_kernel_command_line(self):
         script = _apply_script()
-        pat = re.search(r'pkill -f "([^"]+)"', script).group(1)
+        pat = re.search(r'\["pkill","-f","([^"]+)"\]', script).group(1)
         for real in ("/usr/bin/python3 /home/u/GitRepos/romp/bin/romp-kernel",
                      "python3.12 /home/u/romp/bin/romp-kernel --port 29855"):
             self.assertIsNotNone(re.search(pat, real),
@@ -82,7 +83,7 @@ class RealPkillBehaviour(unittest.TestCase):
 
     def test_pgrep_does_not_match_a_process_merely_carrying_the_pattern(self):
         script = _apply_script()
-        pat = re.search(r'pkill -f "([^"]+)"', script).group(1)
+        pat = re.search(r'\["pkill","-f","([^"]+)"\]', script).group(1)
         # a decoy that merely CONTAINS the pattern text, like the apply shell does
         decoy = subprocess.Popen(["/bin/sh", "-c",
                                   'echo "pkill -f \\"%s\\"" >/dev/null; sleep 5' % pat])

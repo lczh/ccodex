@@ -3149,16 +3149,31 @@ def _main_drift_check():
     # verdict cannot say "pull", and the restart half needs no network.
     origin = _origin_main_sha() if _update_channel() == "dev" else ""
     kind, target = _main_drift_verdict(origin, _checkout_sha(), _kernel_sha())
-    if kind == "restart" and target == _REBUILT_FOR[0]:
-        return                                        # already converged in place (UI-only rebuild)
+    if kind == "restart" and _REBUILT_FOR[0] and _sha8(target) == _REBUILT_FOR[0]:
+        return                                        # already converged in place (UI-only rebuild).
+    #                                                   ONE sha shape (short8) on every store and
+    #                                                   compare: the pull leg stored a FULL sha the
+    #                                                   restart leg then compared to 8 chars, so the
+    #                                                   same commit rebuilt twice (the v1.3.16 audit)
     if kind == "restart" and not _kernel_code_changed(_kernel_sha(), target):
         # UI-ONLY drift (the user 2026-08-23): the checkout moved but nothing the running process
         # executes changed — converge by rebuilding dist in place, in EVERY mode and with no
         # cool-down (a rebuild cuts no turns, which is the only thing the gates protect). A failed
-        # build falls through to the normal restart path, loudly.
-        ok, err = _rebuild_dist()
+        # build falls through to the normal restart path, loudly. UNDER the update flock (the
+        # v1.3.16 audit's P2.8): two concurrent esbuilds corrupt the served bundles — an owned
+        # transaction converges/restarts on its own, so contention just yields this pass.
+        lk = _update_flock()
+        if lk is None:
+            return
+        try:
+            ok, err = _rebuild_dist()
+        finally:
+            try:
+                os.close(lk)
+            except OSError:
+                pass
         if ok:
-            _REBUILT_FOR[0] = target
+            _REBUILT_FOR[0] = _sha8(target)
             _sync_notice("new build served in place (UI-only change; no restart) — reload the "
                          "dashboard to pick it up")
             return
@@ -3394,7 +3409,7 @@ def _run_main_update_locked(kind, immediate, target, lock_fd=None):
             # the pull moved only UI/dist inputs (the user 2026-08-23): install.sh above already
             # rebuilt the served dist, so converge IN PLACE — no restart, no cut turns. `tip` IS
             # the checkout now (head2 == tip was verified before install ran).
-            _REBUILT_FOR[0] = tip
+            _REBUILT_FOR[0] = _sha8(tip)              # ONE sha shape — see _check_main_drift (v1.3.16)
             _sync_notice("new build served in place (UI-only change; no restart) — reload the "
                          "dashboard to pick it up")
             return
@@ -12619,8 +12634,30 @@ def _update_remote(host):
         # ref, which any concurrent sender force-updates (the user's audit, 2026-08-18) — and the
         # ancestry check runs HERE, under the lock: outside it, HEAD could move between the check
         # and the reset and the reset would rewind it. Exit 7 = diverged under the lock.
-        "python3 -c 'import fcntl,os,re,stat,subprocess,sys\n"
+        "python3 -c 'import fcntl,json,os,re,shutil,stat,subprocess,sys,time\n"
         "lock,r,target=sys.argv[1],sys.argv[2],sys.argv[3]\n"
+        "kport,logdir=int(sys.argv[4]),sys.argv[5]\n"
+        # the COMPLETE target tree, materialized under the git dir and executed from there
+        # (the v1.3.16 audit's P1.1: pinning install.sh alone still executed its shell children
+        # from the LIVE tree — a racing writer swapped one mid-install). ROMP_INSTALL_TARGET
+        # points the snapshot's scripts at the real checkout for their outputs; pass_fds keeps
+        # the update flock alive if this wrapper dies mid-install (the 2026-08-17 class).
+        "def snap_install(commit):\n"
+        '    sd=os.path.join(os.path.dirname(lock),"romp-install-snap")\n'
+        "    shutil.rmtree(sd,ignore_errors=True)\n"
+        "    os.makedirs(sd)\n"
+        '    ar=subprocess.run(["git","-C",r,"archive",commit],capture_output=True)\n'
+        "    if ar.returncode or not ar.stdout:\n"
+        "        return False\n"
+        '    tr=subprocess.run(["tar","-x","-C",sd],input=ar.stdout)\n'
+        '    if tr.returncode or not os.path.exists(os.path.join(sd,"install.sh")):\n'
+        "        shutil.rmtree(sd,ignore_errors=True)\n"
+        "        return False\n"
+        "    env=dict(os.environ)\n"
+        '    env["ROMP_INSTALL_TARGET"]=r\n'
+        '    rc=subprocess.run(["bash",os.path.join(sd,"install.sh")],cwd=r,env=env,pass_fds=(fd,)).returncode\n'
+        "    shutil.rmtree(sd,ignore_errors=True)\n"
+        "    return rc==0\n"
         "fd=os.open(lock,os.O_RDWR|os.O_CREAT,0o644)\n"
         "try:\n"
         "    fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
@@ -12722,24 +12759,7 @@ def _update_remote(host):
         "                return curline\n"
         "            o=rawlines[1].strip().split()\n"
         '            return curline+" "+o[1] if len(o)>1 and o[1] in ("stable","dev") else curline\n'
-        '        ie=os.path.join(os.path.dirname(lock),"romp-install-entry.sh")\n'
-        "        try:\n"
-        "            os.unlink(ie)\n"
-        "        except FileNotFoundError:\n"
-        "            pass\n"
-        "        heal_fail=False\n"
-        '        ge=subprocess.run(["git","-C",r,"show",curfull+":install.sh"],capture_output=True)\n'
-        "        if ge.returncode or not ge.stdout:\n"
-        "            heal_fail=True\n"
-        "        else:\n"
-        '            efd=os.open(ie,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o755)\n'
-        "            try:\n"
-        "                if os.write(efd,ge.stdout)!=len(ge.stdout):\n"
-        '                    raise OSError("short entry write")\n'
-        "            finally:\n"
-        "                os.close(efd)\n"
-        '            if subprocess.run(["bash","-s"],cwd=r,stdin=open(ie,"rb"),pass_fds=(fd,)).returncode:\n'
-        "                heal_fail=True\n"
+        "        heal_fail=not snap_install(curfull)\n"
         "        if heal_fail:\n"
         "            carry=merge_carry()\n"
         '            if len(carry.split())>1 and carry.split()[1]=="stable":\n'
@@ -12823,21 +12843,7 @@ def _update_remote(host):
         "    sys.exit(19)\n"
         'if (st3.stdout or "").strip():\n'
         "    sys.exit(18)\n"
-        'ie2=os.path.join(os.path.dirname(lock),"romp-install-entry.sh")\n'
-        "try:\n"
-        "    os.unlink(ie2)\n"
-        "except FileNotFoundError:\n"
-        "    pass\n"
-        'ge2=subprocess.run(["git","-C",r,"show",target+":install.sh"],capture_output=True)\n'
-        "if ge2.returncode or not ge2.stdout:\n"
-        "    sys.exit(4)\n"
-        'efd2=os.open(ie2,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o755)\n'
-        "try:\n"
-        "    if os.write(efd2,ge2.stdout)!=len(ge2.stdout):\n"
-        '        raise OSError("short entry write")\n'
-        "finally:\n"
-        "    os.close(efd2)\n"
-        'if subprocess.run(["bash","-s"],cwd=r,stdin=open(ie2,"rb"),pass_fds=(fd,)).returncode:\n'
+        "if not snap_install(target):\n"
         "    sys.exit(4)\n"
         'st4=subprocess.run(["git","-C",r,"status","--porcelain"],capture_output=True,text=True)\n'
         'h3=subprocess.run(["git","-C",r,"rev-parse","HEAD"],capture_output=True,text=True)\n'
@@ -12851,8 +12857,56 @@ def _update_remote(host):
         "    sys.exit(29)\n"
         "if not pub_line(pick_pub(body.splitlines()[0],body.splitlines())):\n"
         "    sys.exit(30)\n"
-        "os.remove(lp)' "
-        '"$GD/romp-update.lock" "$R" %s >>"$LOGDIR/update.log" 2>&1; RRC=$?; '
+        "os.remove(lp)\n"
+        # the LAUNCH runs INSIDE the lock (the v1.3.16 audit's P1.2: the transaction ended
+        # before the spawn, so a writer could swap bin/romp-serve between the verify and the
+        # launch). Manager-first exactly as before (the user 2026-07-04), bare romp-serve as
+        # the last resort, the /version probe (kernel_sha prefix of the installed target + a
+        # boot id different from the pre-kill one) as the only healthy verdict (2026-08-24).
+        # Spawned children do NOT inherit the lock fd (close_fds default; only the pinned
+        # installs pass it), so nothing outlives the transaction holding the flock. The pkill
+        # self-match guard (romp-kern[e]l, the user 2026-07-22) keeps this wrapper from
+        # matching itself.
+        'if not os.access(os.path.join(r,"bin","romp-serve"),os.X_OK):\n'
+        "    sys.exit(33)\n"
+        "import urllib.request\n"
+        "def probe():\n"
+        "    try:\n"
+        '        j=json.load(urllib.request.urlopen("http://127.0.0.1:%%d/version"%%kport,timeout=2))\n'
+        '        return str(j.get("kernel_sha") or ""),str(j.get("boot") or "")\n'
+        "    except Exception:\n"
+        '        return "",""\n'
+        "old_ks,old_boot=probe()\n"
+        "def healthy():\n"
+        "    ks,bid=probe()\n"
+        "    if not ks or len(ks)<7 or not bid:\n"
+        "        return False\n"
+        "    if not target.startswith(ks):\n"
+        "        return False\n"
+        "    return not old_boot or bid!=old_boot\n"
+        'subprocess.run(["pkill","-f","bin/romp-kern[e]l"])\n'
+        'mgr=os.path.join(r,"bin","romp-manager")\n'
+        "up=False\n"
+        'lf=open(os.path.join(logdir,"update.log"),"a")\n'
+        'if shutil.which("node") and os.access(mgr,os.X_OK):\n'
+        '    subprocess.run([mgr,"ensure"],stdout=lf,stderr=lf)\n'
+        "for i in range(12):\n"
+        "    time.sleep(1)\n"
+        "    if healthy():\n"
+        "        up=True\n"
+        "        break\n"
+        "if not up:\n"
+        '    kl=open(os.path.join(logdir,"kernel.log"),"a")\n'
+        '    subprocess.Popen([os.path.join(r,"bin","romp-serve")],stdout=kl,stderr=kl,\n'
+        "                     stdin=subprocess.DEVNULL,start_new_session=True)\n"
+        "    for i in range(12):\n"
+        "        time.sleep(1)\n"
+        "        if healthy():\n"
+        "            up=True\n"
+        "            break\n"
+        "if not up:\n"
+        "    sys.exit(32)' "
+        '"$GD/romp-update.lock" "$R" %s %d "$LOGDIR" >>"$LOGDIR/update.log" 2>&1; RRC=$?; '
         'if [ "$RRC" = 30 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo CHANNELPUBFAIL; exit 0; fi; '
         'if [ "$RRC" = 3 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo UPDATERUNNING; exit 0; fi; '
         'if [ "$RRC" = 7 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIVERGED; exit 0; fi; '
@@ -12876,48 +12930,20 @@ def _update_remote(host):
         'if [ "$RRC" = 13 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo STABLENOW; exit 0; fi; '
         'if [ "$RRC" = 12 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo PENDINGSTABLE; exit 0; fi; '
         'if [ "$RRC" = 4 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo INSTALLFAIL; exit 0; fi; '
+        'if [ "$RRC" = 33 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; NEW="$(git -C "$R" rev-parse --short HEAD)"; echo "NOLAUNCH:$NEW"; exit 0; fi; '
+        'if [ "$RRC" = 32 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; NEW="$(git -C "$R" rev-parse --short HEAD)"; echo "RESTARTFAIL:$NEW"; exit 0; fi; '
         'if [ "$RRC" != 0 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; fi; '
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; '
         'NEW="$(git -C "$R" rev-parse --short HEAD)"; '
-        # A listening socket is not a restart verdict: pkill can fail and leave the old kernel
-        # answering forever. Capture its boot id, then accept only a different process whose
-        # auth-exempt /version says it is running the exact commit this transaction installed.
-        "probe(){ python3 -c \"import json,sys,urllib.request; j=json.load(urllib.request.urlopen('http://127.0.0.1:'+sys.argv[1]+'/version',timeout=2)); print(str(j.get('kernel_sha') or '')+' '+str(j.get('boot') or ''))\" \"$PORT\" 2>/dev/null; }; "
-        'OLD="$(probe || true)"; OLD_BOOT="${OLD#* }"; [ "$OLD_BOOT" = "$OLD" ] && OLD_BOOT=""; '
-        'healthy(){ INFO="$(probe)" || return 1; KS="${INFO%%%% *}"; BID="${INFO#* }"; '
-        '[ -n "$KS" ] && [ "${#KS}" -ge 7 ] && [ -n "$BID" ] && [ "$BID" != "$INFO" ] || return 1; '
-        'case "$EXPECT" in "$KS"*) ;; *) return 1;; esac; '
-        '[ -z "$OLD_BOOT" ] || [ "$BID" != "$OLD_BOOT" ]; }; '
-        # RESTART the kernel THROUGH THE MANAGER (the user 2026-07-04: the manager is romp's durable supervisor —
-        # "there is never an invisible orphan" — so a restart should keep/leave the remote MANAGER-owned, not
-        # launch a bare romp-serve). Kill the kernel, then `romp-manager ensure` (the SAME idempotent auto-start
-        # the SessionStart hook uses): if a manager already supervises this host it respawns the kernel on the new
-        # code; if this host was only ATTACH-bootstrapped (bare kernel, no manager) ensure STARTS the manager,
-        # which spawns a SUPERVISED kernel — UPGRADING the orphan to properly managed. ensure needs node; if it
-        # can't run (or the port never returns) we relaunch romp-serve bare as a last resort so the host isn't
-        # left dead. The port poll confirms whichever path brought it back.
-        'if [ ! -x "$R/bin/romp-serve" ]; then echo "NOLAUNCH:$NEW"; exit 0; fi; '
-        # SELF-MATCH GUARD. `pkill -f` matches its pattern against every process's FULL COMMAND LINE —
-        # including this apply script's own, because the pattern text sits literally inside it. The plain
-        # spelling therefore killed the apply shell AT THIS LINE, before it could restart the kernel or
-        # echo SYNCED. The reset had already run, so the code really was synced, but romp reported
-        # "remote apply failed" and left the host with NO kernel — both halves of "pushes always fail and
-        # it's never clear why", plus the recurring dead remote, from this one line (the user 2026-07-22).
-        # `romp-kern[e]l` is a regex that still matches the real process (romp-kernel) while NOT matching
-        # this script's own text (romp-kern[e]l), so pkill can no longer take itself down.
-        'pkill -f "bin/romp-kern[e]l" 2>/dev/null; '
-        'if command -v node >/dev/null 2>&1 && [ -x "$R/bin/romp-manager" ]; then "$R/bin/romp-manager" ensure >>"$LOGDIR/update.log" 2>&1 || true; fi; '
-        'UP=0; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 1; if healthy; then UP=1; break; fi; done; '
-        'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null & '
-        'for i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 1; if healthy; then UP=1; break; fi; done; fi; '
-        'if [ "$UP" = 0 ]; then echo "RESTARTFAIL:$NEW"; exit 0; fi; '
+        # the restart already ran INSIDE the locked python above; rc 0 here means the probe
+        # confirmed a fresh kernel on the exact installed commit
         'echo "SYNCED:$NEW"'
     ) % (shlex.quote(rdir), shlex.quote(lfull), kport,
-         _P2P_REF, _P2P_REF, _P2P_REF, lfull, _P2P_REF, _P2P_REF, _P2P_REF,
+         _P2P_REF, _P2P_REF, _P2P_REF, lfull, kport,
          _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
          _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
          _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
-         _P2P_REF)
+         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -13113,7 +13139,10 @@ def _pull_remote(host, expected_sha=None):
     if rhead != expected:
         return False, ("%s changed build after it was polled (expected %s, now %s) — refresh and try again"
                        % (host, expected[:12], rhead[:12]))
-    if rhead and rhead == lfull:
+    if rhead and rhead == lfull and _install_latch_lines() == []:
+        # equal heads alone cannot bypass this checkout's recovery record: the old return here
+        # reported success while an armed install latch sat unsettled and the lock was never
+        # taken (the v1.3.16 audit's P2.10) — only an affirmatively CLEAR latch is a no-op
         return True, "already up to date (%s)" % (_local_head(short=True) or lfull[:8])
     env = dict(os.environ, GIT_SSH_COMMAND="%s %s" % (SSH_BIN, " ".join(_SSH_OPTS)))
     try:

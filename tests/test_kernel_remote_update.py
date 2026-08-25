@@ -5,6 +5,7 @@ SYNTHETIC hosts; subprocess/http are stubbed so nothing actually launches or con
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -339,6 +340,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' status '*) echo 'fatal: index corrupt' >&2; exit 128;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % log)
             (fakebin / "git").chmod(0o755)
             env = dict(os.environ, HOME=str(home),
@@ -378,6 +380,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % gd)
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\nexit 1\n")
@@ -410,6 +413,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' merge-base '*) exit 1;;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % gd)
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("DIVERGED", a.stdout, "divergence is decided UNDER the lock, executed")
@@ -425,6 +429,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' status '*) echo ' M peer-edit.py';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % gd)
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("DIRTYNOW", a.stdout, "the locked wrapper's own dirty check refuses")
@@ -461,6 +466,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % (gd, nstat, nstat, ops))
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\necho INSTALLED >> '%s'\nexit 0\n" % ops)
@@ -487,6 +493,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % (gd, nstat, nstat, ops))
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("DIRTYPOSTMOVE", a.stdout)
@@ -508,6 +515,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % (gd, nstat, nstat))
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("STATERRPOSTMOVE", a.stdout)
@@ -540,6 +548,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse HEAD'*) if [ -e '%s' ]; then printf '%%040d\\n' 2; "
                 "else printf '%%040d\\n' 1; fi;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % (gd, moved))
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\ntouch '%s'\nexit 0\n" % moved)
@@ -577,6 +586,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse HEAD'*) if [ -e '%s' ]; then printf '%%040d\\n' 2; "
                 "else printf '%%040d\\n' 1; fi;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % (gd, installed, moved, moved))
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\ntouch '%s'\nexit 0\n" % installed)
@@ -611,24 +621,28 @@ class UpdateRemote(unittest.TestCase):
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
             ops = Path(td) / "ops.log"
-            committed = Path(td) / "committed-install.sh"
-            # the committed bytes self-locate the way the REAL install.sh does: running the
-            # entry as `bash $GD/entry` resolved ROMP_DIR to .git and its sanity guard exited —
-            # every real p2p update INSTALLFAILed (the r42 verification). Fed over stdin with
-            # cwd=$R, $0 is "bash" and dirname resolves to the checkout.
+            commitdir = Path(td) / "committed-tree"
+            commitdir.mkdir()
+            committed = commitdir / "install.sh"
+            # the committed bytes prove WHERE they ran from and WHAT they were told to install:
+            # the snapshot installer executes them from an immutable staging under the git dir
+            # (dirname $0), with ROMP_INSTALL_TARGET naming the real checkout — the split the
+            # real install.sh uses for code-vs-target (the v1.3.16 audit's P1.1; the r42
+            # dirname-guard lesson rides the TARGET now)
             committed.write_text(
                 "#!/bin/sh\nD=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n"
-                "echo \"COMMITTED DIR=$D\" >> '%s'\nexit 0\n" % ops)
-            # the COMMITTED bytes come from `git show`; the TREE's install.sh is the racing
+                "echo \"COMMITTED SELF=$D TARGET=${ROMP_INSTALL_TARGET:-}\" >> '%s'\nexit 0\n" % ops)
+            # the COMMITTED tree comes from `git archive`; the TREE's install.sh is the racing
             # writer's replacement
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' merge-base '*) exit 0;;\n"
                 "  *' show '*) cat '%s';;\n"
+                "  *' archive '*) tar -c -C '%s' install.sh;;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
-                "esac\nexit 0\n" % (gd, committed))
+                "esac\nexit 0\n" % (gd, committed, commitdir))
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\necho RACED >> '%s'\nexit 0\n" % ops)
             (fix / "install.sh").chmod(0o755)
@@ -637,12 +651,14 @@ class UpdateRemote(unittest.TestCase):
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             log = ops.read_text() if ops.exists() else ""
             self.assertIn("COMMITTED", log, "the TARGET's committed install bytes executed")
-            self.assertIn("DIR=%s\n" % os.path.realpath(fix), log,
-                          "the entry self-locates to the CHECKOUT, not .git — install.sh's "
-                          "dirname-$0 guard exited otherwise (the r42 verification's P1). "
-                          "REALPATH both sides: macOS mounts /var as a symlink to /private/var, "
-                          "so the entry's cd+pwd resolves differently from the fixture string "
-                          "(the v1.3.15 first gate attempt); got: %r" % log)
+            m = re.search(r"SELF=(\S+) TARGET=(\S+)", log)
+            self.assertTrue(m, log)
+            self.assertIn("romp-install-snap", m.group(1),
+                          "the install executed FROM the immutable snapshot under the git dir — "
+                          "so a racing writer can swap no shell child (the v1.3.16 audit's P1.1)")
+            self.assertEqual(os.path.realpath(m.group(2)), os.path.realpath(fix),
+                             "…while ROMP_INSTALL_TARGET names the real checkout for outputs. "
+                             "REALPATH both sides: macOS mounts /var under /private/var; got: %r" % log)
             self.assertNotIn("RACED", log,
                              "the racing writer's replacement NEVER executes — the entry is "
                              "immutable (the v1.3.14 audit's executed repro)")
@@ -657,16 +673,61 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' merge-base '*) exit 0;;\n"
                 "  *' show '*) cat '%s';;\n"
+                "  *' archive '*) tar -c -C '%s' install.sh;;\n"
                 "  *' status '*) [ -e '%s' ] && echo ' M mid-install-edit';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
-                "esac\nexit 0\n" % (gd, committed, fix / "mid-install-edit"))
+                "esac\nexit 0\n" % (gd, committed, commitdir, fix / "mid-install-edit"))
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("DIRTYPOSTINSTALL", a.stdout)
             self.assertNotIn("SYNCED", a.stdout,
                              "no success report from a tree that changed during the install")
             self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2",
                              "the latch stays armed on ANY uncertainty (the audit's requirement)")
+
+    def test_a_swapped_child_script_never_executes(self):
+        # the v1.3.16 audit's P1.1 repro (pinned_parent=yes observed=CHILD_V2): install.sh's
+        # bytes were pinned, but it executed its shell CHILDREN from the live tree — a racing
+        # writer swapped one mid-install. The whole target tree materializes into the snapshot
+        # now, and dirname-$0 resolution keeps every child inside it.
+        calls = self._wire(apply_out="SYNCED:1111111")
+        km._update_remote("TESTHOST")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        with tempfile.TemporaryDirectory() as td:
+            fix = pathlib.Path(td) / "romp"
+            gd = fix / ".git"
+            gd.mkdir(parents=True)
+            (gd / "romp-update-channel").write_text("dev\n")
+            fakebin = pathlib.Path(td) / "bin"
+            fakebin.mkdir()
+            ops = pathlib.Path(td) / "ops.log"
+            commitdir = pathlib.Path(td) / "committed-tree"
+            (commitdir / "bin").mkdir(parents=True)
+            (commitdir / "install.sh").write_text(
+                '#!/bin/sh\nD="$(cd "$(dirname "$0")" && pwd)"\nsh "$D/bin/child.sh"\nexit 0\n')
+            (commitdir / "bin" / "child.sh").write_text(
+                "#!/bin/sh\necho CHILD_V1 >> '%s'\n" % ops)
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' merge-base '*) exit 0;;\n"
+                "  *' archive '*) tar -c -C '%s' install.sh bin/child.sh;;\n"
+                "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
+                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "esac\nexit 0\n" % (gd, commitdir))
+            (fakebin / "git").chmod(0o755)
+            # the RACING WRITER's replacements sit in the live tree, both parent and child
+            (fix / "bin").mkdir()
+            (fix / "install.sh").write_text("#!/bin/sh\necho PARENT_V2 >> '%s'\n" % ops)
+            (fix / "bin" / "child.sh").write_text("#!/bin/sh\necho CHILD_V2 >> '%s'\n" % ops)
+            env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
+            apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
+            self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
+            log = ops.read_text() if ops.exists() else ""
+            self.assertIn("CHILD_V1", log, "the COMMITTED child executed, from the snapshot")
+            self.assertNotIn("CHILD_V2", log,
+                             "the racing writer's child NEVER executes (the audit's repro)")
+            self.assertNotIn("PARENT_V2", log)
 
     def test_both_install_entries_inherit_the_update_flock(self):
         # the r43 mutant hunt: dropping pass_fds from the rewritten bash -s calls stayed
@@ -675,12 +736,15 @@ class UpdateRemote(unittest.TestCase):
         calls = self._wire(apply_out="SYNCED:1111111")
         km._update_remote("TESTHOST")
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
-        self.assertEqual(apply.count('["bash","-s"],cwd=r,stdin=open('), 2,
-                         "both entries (heal + main) run over stdin")
-        for frag in ('stdin=open(ie,"rb"),pass_fds=(fd,)',
-                     'stdin=open(ie2,"rb"),pass_fds=(fd,)'):
-            self.assertIn(frag, apply,
-                          "the installer subtree INHERITS the locked fd: %s" % frag)
+        self.assertEqual(apply.count("snap_install("), 3,
+                         "one snapshot installer, called by BOTH legs (heal + main)")
+        self.assertIn('cwd=r,env=env,pass_fds=(fd,)', apply,
+                      "the installer subtree INHERITS the locked fd")
+        self.assertIn('env["ROMP_INSTALL_TARGET"]=r', apply,
+                      "the snapshot's scripts aim their outputs at the real checkout")
+        self.assertIn('["git","-C",r,"archive",commit]', apply,
+                      "the COMPLETE target tree is materialized — pinning install.sh alone "
+                      "still executed its shell children from the live tree (v1.3.16 P1.1)")
 
     def test_an_empty_committed_install_refuses_and_never_falls_to_the_tree(self):
         # the r42 mutant hunt's M5: a git show that SUCCEEDS with empty output must refuse
@@ -743,6 +807,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % (gd, ops))
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\necho INSTALLED >> '%s'\nexit 0\n" % ops)
@@ -774,6 +839,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % (gd, ops))
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertNotIn("STABLENOW", a.stdout)
@@ -804,6 +870,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse HEAD'*) echo cccccccccccccccccccccccccccccccccccccccc;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % (gd, ops))          # HEAD sits on a SEAM commit post-merge
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\necho INSTALLED >> '%s'\nexit 0\n" % ops)
@@ -828,6 +895,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --short=8 '*) echo 1c432642;;\n"
                 "  *' rev-parse HEAD'*) echo cccccccccccccccccccccccccccccccccccccccc;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % gd)
             (gd / "romp-install-failed").write_text("deadbee2 dev")
             (fix / "install.sh").write_text("#!/bin/sh\nexit 1\n")   # the carried heal fails
@@ -848,9 +916,9 @@ class UpdateRemote(unittest.TestCase):
                 "def _short(fd, data):\n"
                 "    if fd > 2 and len(data) > 6:\n"
                 "        _state['n'] += 1\n"
-                "        if _state['n'] == 3:\n"          # the heal ENTRY is write 1 (immutable
-                #                                             install bytes, r42), the ARM is 2,
-                #                                             the RESTORE is 3
+                "        if _state['n'] == 2:\n"          # the ARM is write 1 (the entry-file
+                #                                             writes retired with the snapshot
+                #                                             installer, r44), the RESTORE is 2
                 "            return _real(fd, data[:5])\n"
                 "    return _real(fd, data)\n"
                 "os.write = _short\n")
@@ -866,6 +934,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) exit 1;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % gd)
             (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
@@ -895,6 +964,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s/ops.log';;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % (gd, td))
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
@@ -932,6 +1002,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % gd)
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
@@ -980,6 +1051,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % gd)
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
@@ -1153,6 +1225,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' status '*) if [ -e '%s' ]; then echo ' M raced-edit.py'; else touch '%s'; fi;;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % (gd, marker, marker))
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
@@ -1173,6 +1246,7 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
+                "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % gd)
             (gd / "romp-install-failed").write_text("01dbd11d")
             (fix / "install.sh").write_text("#!/bin/sh\nexit 1\n")
@@ -1238,19 +1312,27 @@ class UpdateRemote(unittest.TestCase):
         calls = self._wire()
         km._update_remote("TESTHOST")
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
-        self.assertIn("pkill -f", apply, "kills the running kernel")
-        self.assertIn('"$R/bin/romp-manager" ensure', apply, "prefers the manager (ensure = idempotent supervised start)")
+        self.assertIn('["pkill","-f","bin/romp-kern[e]l"]', apply,
+                      "kills the running kernel (self-match-guarded, the user 2026-07-22)")
+        self.assertIn('[mgr,"ensure"]', apply, "prefers the manager (ensure = idempotent supervised start)")
         self.assertIn("/version", apply, "polls the running kernel's build, not just its TCP port")
-        self.assertIn('case "$EXPECT" in "$KS"*', apply,
-                      "the restarted kernel must report the exact pushed commit")
-        self.assertIn('OLD_BOOT=', apply, "a surviving old kernel process cannot satisfy the restart")
-        self.assertIn('[ -n "$BID" ]', apply,
-                      "a /version with no boot id must fail healthy(): the empty-BID parse left "
-                      "BID != INFO true via the trailing space, so the guard was vacuous (r43)")
-        self.assertEqual(apply.count("for i in 1 2 3 4 5 6 7 8 9 10 11 12"), 2,
+        self.assertIn("if not target.startswith(ks):", apply,
+                      "the restarted kernel must report the exact installed commit")
+        self.assertIn("old_ks,old_boot=probe()", apply,
+                      "a surviving old kernel process cannot satisfy the restart")
+        self.assertIn("bid!=old_boot", apply)
+        self.assertLess(apply.index("os.remove(lp)\nif not os.access"),
+                        apply.index('["pkill","-f"'),
+                        "the launch runs INSIDE the locked python — the transaction no longer "
+                        "ends before the spawn (the v1.3.16 audit's P1.2)")
+        self.assertIn("if not ks or len(ks)<7 or not bid:", apply,
+                      "a /version with no boot id must fail healthy() (r43; python-side r44)")
+        self.assertEqual(apply.count("for i in range(12):"), 2,
                          "both restart waits fit a real (~17s) manager boot — 8s read a landed "
                          "install as RESTARTFAIL (r43)")
-        self.assertIn('if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve"', apply, "bare romp-serve only as a last resort")
+        self.assertIn('subprocess.Popen([os.path.join(r,"bin","romp-serve")]', apply,
+                      "bare romp-serve only as a last resort — spawned detached, no lock fd")
+        self.assertIn("start_new_session=True", apply)
         self.assertNotIn("--refresh", apply, "does NOT rely on `romp --refresh` (needs a manager) — the stuck bug")
 
     def test_apply_is_detached_from_the_ssh_session(self):
