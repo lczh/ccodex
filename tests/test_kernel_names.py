@@ -679,7 +679,7 @@ class NameClaims(unittest.TestCase):
             state = Path(td); codex = state / "codex"; codex.mkdir()
             views = state / "timeline-views.json"
             views.write_text(json.dumps({
-                "active": "all", "hidden": ["old"],
+                "active": "all",
                 "tags": [{"id": "g", "name": "g", "color": "",
                           "members": [{"host": "", "sid": "old"}]}]}))
 
@@ -702,10 +702,9 @@ class NameClaims(unittest.TestCase):
                             release.set(); first.join(5); second.join(5)
                 self.assertFalse(first.is_alive() or second.is_alive())
                 final = json.loads(views.read_text())
-                self.assertIn("new", final["hidden"], "the heal survives the later tag edit")
                 sids = {m["sid"] for m in final["tags"][0]["members"]}
                 self.assertIn("other", sids, "the tag edit survives too")
-                self.assertIn("new", sids, "the heal's member carry survives")
+                self.assertIn("new", sids, "the heal's member carry survives the later edit")
             finally:
                 release.set()
 

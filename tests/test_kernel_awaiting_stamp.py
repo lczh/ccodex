@@ -704,12 +704,15 @@ class AwaitingWakeOutcomeSweep(unittest.TestCase):
                         "wake still surfaces")
         self.assertEqual(store["nodes"][self.gid].get("blockWhy"), km.jd.WAKE_BLOCK_WHY)
 
-    def test_sweep_leaves_a_fresh_wake_to_the_walk(self):
+    def test_sweep_leaves_a_walked_ungated_wake_to_the_walk(self):
+        # ownership is the JOURNALED gate + the walked roster now, never age (the user 2026-08-24,
+        # W1b): the walk visited this session and stood down on no gate, so the record is the
+        # walk's — at ANY age (the retired 6h clock is not resurrected by this sweep)
         now = 1_000_000
         self._seed_goal(at=now - 20 * 3600)
         self._seed_rec({"wake": True, "anchor": now - 20 * 3600, "count": 1, "lastTurnId": "t1",
                         "armAtoms": 0, "at": now - 3600})
-        self.assertFalse(km._awaiting_wake_outcomes(now))
+        self.assertFalse(km._awaiting_wake_outcomes(now, walked={SID}))
         self.assertFalse(km.jd.load_goals(SID)["nodes"][self.gid]["blocked"])
 
     def test_sweep_ignores_a_goal_the_world_moved_past(self):

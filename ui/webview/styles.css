@@ -300,6 +300,14 @@ body.tabbar-resizing { cursor: ns-resize; user-select: none; }
    gray + slashed. So the same blue marks "enabled" in both the menu and the timeline. */
 .ctx-item-toggle .ctx-icon { flex: 0 0 auto; margin-top: 1px; color: var(--accent); display: flex; }
 .ctx-item-toggle .ctx-icon.off { color: var(--dim); }
+/* the tab menu's Tags flyout (the user 2026-08-24): identity dot per union tag, ✕ = remove-
+   everywhere, an inline New tag… input — all in the menu vocabulary, no new font sizes */
+.ctx-tag-dot { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; }
+.ctx-tag-x { flex: 0 0 auto; background: none; border: none; color: var(--dim); cursor: pointer; font: inherit; padding: 0 2px; }
+.ctx-tag-x:hover { color: var(--fg); }
+.ctx-item-newtag { cursor: default; }
+.ctx-tag-input { width: 100%; background: #1e1e1e; color: #ccc; border: 1px solid #3a3a3a; border-radius: 5px; padding: 3px 6px; font: inherit; }
+.ctx-tag-input:focus { outline: none; border-color: var(--accent); }
 .ctx-item-body { display: flex; flex-direction: column; line-height: 1.25; }
 .ctx-item-sub { font-size: 0.82em; opacity: 0.6; }
 /* identity-color swatches (the user 2026-06-29): the romp palette as circles, the current one ringed. A grid
@@ -2829,6 +2837,40 @@ a.fileview-btn[hidden] { display: none; }
    feed.css so the viewer behaves identically wherever it mounts */
 .fileview-dir-link { cursor: pointer; }
 .fileview-dir-link:hover { color: var(--accent); text-decoration: underline; }
+
+/* ── the file BROWSER (file-browse.ts) in the CHAT document ── the 642 move made the browser
+   pane-local here, but its overlay dress lived only in feed.css, so it mounted as unstyled block
+   flow at the document bottom, below the composer (the user 2026-08-24, near-verbatim: "totally
+   messed up — showing at the bottom"). This block MIRRORS feed.css's (the .romp-acted precedent:
+   the two pages load different sheets, so shared overlays are declared in both — a test pins the
+   pair equal). The browser fills the pane (fixed inset-0), sits one z layer BENEATH the viewer
+   (890 < 1200) so a file opened from a listing overlays it, and body.filebrowse-open locks the
+   thread's scroll while open. */
+.filebrowse { position: fixed; inset: 0; z-index: 890; display: flex; flex-direction: column;
+  background: var(--bg, #1e1e1e); }
+body.filebrowse-open { overflow: hidden; }
+.fb-bar { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; min-width: 0;
+  padding: 7px 10px; border-bottom: 1px solid var(--box-border); }
+.fb-crumbs { flex: 1 1 auto; min-width: 0; font-size: 0.86em; color: var(--dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
+.fb-crumbs > * { direction: ltr; unicode-bidi: isolate; }
+.fb-crumb { cursor: pointer; }
+.fb-crumb:hover { color: var(--accent); text-decoration: underline; }
+.fb-crumb:last-child { color: var(--fg); }
+.fb-crumb-sep { margin: 0 3px; opacity: 0.6; }
+.fb-list { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 4px 0; }
+.fb-row { display: flex; align-items: baseline; gap: 8px; padding: 4px 14px; cursor: pointer;
+  font-size: 0.86em; }
+.fb-row:hover, .fb-row.active { background: rgba(255, 255, 255, 0.07); }
+.fb-row.active { outline: 1px solid rgba(156, 210, 255, 0.35); outline-offset: -1px; }
+.fb-name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-family: var(--mono, ui-monospace, monospace); }
+.fb-dir .fb-name { color: var(--accent); }
+.fb-size { flex: 0 0 auto; margin-left: auto; color: var(--dim); font-size: 0.92em; }
+.fb-dlonly .fb-name { color: var(--dim); }
+.fb-more { padding: 6px 14px; color: var(--dim); font-size: 0.82em; }
+#fb-ctx { z-index: 950; }
+.fb-crumb-up { opacity: 0.65; }
 /* gutter + code as two columns of ONE scroller: the numbers stay put horizontally against long lines,
    and because they are a sibling element a selection of the code copies without dragging them along */
 .fileview-code { display: flex; align-items: flex-start; min-height: 100%; }

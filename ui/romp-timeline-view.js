@@ -26,20 +26,18 @@ function _rompOnlyTag() {
 }
 // <tag> may be a comma-separated LIST (`#only=api,tests,web`) so demo sessions need no shared
 // on-camera prefix (the user 2026-07-16). Mirrors ui/webview/only-filter.ts's matchesOnly.
-// ── session VIEWS (the user 2026-08-18): which sessions the lanes — and the chat tab strip — show.
-// {active:"all"|"untagged"|gid, hidden:[id...], tags:[{id,name,color,members:[id...]}]},
+// ── session VIEWS (the user 2026-08-18; the hidden set RETIRED outright 2026-08-24 — the tag
+// system covers backgrounding, and the kernel migrated existing hidden entries into an "archived"
+// tag once): {active:"all"|"untagged"|gid, tags:[{id,name,color,members:[id...]}]},
 // kernel-persisted (timeline-views.json) and echoed on every payload as data.views. TWO built-in
-// sentinels, not tags: "all" — the DEFAULT (the user 2026-08-24) — shows every session minus the
-// `hidden` set (hiding is a deliberate gesture, so All respects it); "untagged" keeps the old
-// default's meaning under its own honest name — a TAG marks a SPECIALIZED session (the user
-// 2026-08-23), excluded from the untagged view and shown under its tag views (independent member
-// lists, multi-membership by construction). "all" used to MEAN untagged, so reinterpreting it as
-// truly-all lands every legacy persisted blob on the new All default with no migration. A tag view
-// shows exactly its members — membership beats the hidden bit. A hidden session is a BACKGROUND
-// session — still judged and carded, surfaced by the feed and the pickers. The kernel's
-// _view_visible is the decision of record; this is its mirror for the lanes. The kernel emits
-// `tags`; `groups` is honored as the pre-rename key an un-updated kernel still pushes, in ONE
-// place so every rule reads through it.
+// sentinels, not tags: "all" — the DEFAULT — shows LITERALLY EVERYTHING (that is All's meaning
+// now; nothing can hide from it); "untagged" keeps the old default's meaning under its own honest
+// name — a TAG marks a SPECIALIZED session (the user 2026-08-23), excluded from the untagged view
+// and shown under its tag views (independent member lists, multi-membership by construction). A
+// tag view shows exactly its members. A tagged session is a BACKGROUND session — still judged and
+// carded, surfaced by the feed and the pickers. The kernel's _view_visible is the decision of
+// record; this is its mirror for the lanes. The kernel emits `tags`; `groups` is honored as the
+// pre-rename key an un-updated kernel still pushes, in ONE place so every rule reads through it.
 function viewTags(views) { return (views && (views.tags || views.groups)) || []; }
 // A tag IS its NAME, everywhere (user ruling 2026-08-24: "if the UX requires understanding that
 // tags exist across different kernels, it is not good"): one name = one identity, membership the
@@ -70,11 +68,12 @@ function viewTagUnion(views) {
 }
 function viewVisible(views, id) {
   if (!views || !views.active || views.active === 'all') {
-    return !(views && Array.isArray(views.hidden) && views.hidden.indexOf(id) >= 0);
+    return true;                                   // All = literally everything (hidden retired 2026-08-24)
   }
   if (views.active === 'untagged') {
-    if (Array.isArray(views.hidden) && views.hidden.indexOf(id) >= 0) return false;
-    return !viewTags(views).some((t) => (t.members || []).indexOf(id) >= 0);
+    // the UNION excludes (the user 2026-08-24): a session held by ANY kernel's tag is tagged —
+    // a remote-homed tag pulls it out of untagged exactly like a local one
+    return !viewTags(views).concat((views && views.remoteTags) || []).some((t) => (t.members || []).indexOf(id) >= 0);
   }
   // a tag view shows the NAME-KEYED UNION (user ruling 2026-08-24): whichever store's id is
   // active, the members are every same-name tag's, local and remote joined
@@ -83,23 +82,17 @@ function viewVisible(views, id) {
 }
 function viewLabel(views) {
   if (!views || !views.active || views.active === 'all') return 'All';
-  if (views.active === 'untagged') return '(untagged)';
+  if (views.active === 'untagged') return '(no tags)';   // the user-chosen words (2026-08-24); parens stay, marking the built-in apart from tag names
   const g = viewTagUnion(views).find((x) => x.ids.indexOf(views.active) >= 0);
   return g ? g.name : 'All';   // the NAME, never a host prefix — kernels are plumbing
 }
-// live sessions the current view is NOT showing — the "N more" cue that keeps a hidden or tagged
-// session exactly one glance away (nothing may run in secret: the 2026-08-11 hidden-tabs rule)
+// live sessions the current view is NOT showing (tag-filtered) — the "N more" cue that keeps a
+// backgrounded session exactly one glance away (nothing may run in secret: the 2026-08-11 rule)
 function viewMoreCount(views, sessions) {
   return (sessions || []).filter((s) => s.live && !viewVisible(views, s.id)).length;
 }
-// the dialog's two pure mutations (executed by tests; the dialog itself only wires DOM):
-// the hidden bit (the manual one-off hide), and membership in one tag alone
-function viewToggleHidden(views, id) {
-  const v = JSON.parse(JSON.stringify(views || {}));
-  const i = (v.hidden || []).indexOf(id);
-  if (i >= 0) v.hidden.splice(i, 1); else (v.hidden = v.hidden || []).push(id);
-  return v;
-}
+// the dialog's pure mutation (executed by tests; the dialog itself only wires DOM): membership in
+// one tag alone. (the hide toggle retired with the hidden set, the user 2026-08-24.)
 function viewToggleMember(views, gid, id) {
   const v = JSON.parse(JSON.stringify(views || {}));
   const g = viewTags(v).find((x) => x.id === gid);
@@ -2741,7 +2734,7 @@ class TimelinePanel {
     // All is the default and sits first (the user 2026-08-24); (untagged) — the old default's
     // meaning under its own sentinel — second; both are built-ins, not rows in the tags dialog
     item('All', { current: !v.active || v.active === 'all' }).addEventListener('click', () => pick('all'));
-    item('(untagged)', { current: v.active === 'untagged' }).addEventListener('click', () => pick('untagged'));
+    item('(no tags)', { current: v.active === 'untagged' }).addEventListener('click', () => pick('untagged'));
     // NAME-KEYED (user ruling 2026-08-24, superseding the v0 host-marked two-rows render: "if the
     // UX requires understanding that tags exist across different kernels, it is not good"): one row
     // per tag NAME, membership the union across every kernel defining it, the local store's colour
@@ -2982,15 +2975,9 @@ class TimelinePanel {
             fic.addEventListener('mouseleave', () => { fic.style.opacity = on ? '' : '0.55'; });
             feedCell.appendChild(fic);
           }
-          // EYE — only on a hidden session, to un-hide (hiding lives on the chat tab)
-          const eyeCell = grid.createDiv();
-          if (((vv.hidden || [])).indexOf(s.id) >= 0) {
-            const eye = eyeCell.createSpan({ text: '⌀' });
-            eye.setAttribute('style', 'cursor:pointer;opacity:0.6;');
-            hover(eye, 'opacity:1;', 'opacity:0.6;');
-            eye.setAttribute('title', 'hidden from the All and (untagged) views — click to show it again');
-            eye.addEventListener('click', () => { this._setViews(viewToggleHidden(this._curViews(), s.id)); build(); });
-          }
+          // (the un-hide EYE retired with the hidden set, the user 2026-08-24 — tags cover
+          // backgrounding, and the kernel migrated existing hidden entries into "archived")
+          grid.createDiv();
           if (this._tagAddFor === s.id) addMenu([s.id]);
         }
       };
@@ -3943,6 +3930,36 @@ class TimelinePanel {
     // (the CLI's unmappable-member precedent).
     const msgHtml = (mm) => () => { const col = colorOf(mm.fromId); return '<div class="r"><span class="chip" style="background:' + col + '"></span><span class="who" style="color:' + col + '">' + esc(mm.from || mm.fromId) + '</span><span class="ar">→</span><span class="who" style="color:' + colorOf(mm.toId) + '">' + esc(mm.to || mm.toId) + '</span>' + (mm.pending ? ' <span class="k">pending</span>' : '') + '<span class="t">' + clock(mm.sent) + (mm.pending ? ' → …' : ' → ' + clock(mm.exec)) + '</span></div>' + this.body(esc(mm.summary || mm.text || '')); };
     const msgNav = (mm) => () => { const an = this.nearestTurnAnchor(mm.toId, execAt(mm)); this._select(mm.toId); this.openChat((an && an.tid) || mm.toId, mm.id || (an && (an.uuid || an.replyUuid)), false, false, execAt(mm)); };   // land on the message's OWN postal card BY ID — the chat matches mm.id to the card's data-mid (the user 2026-06-20); nearest-turn uuid / time only as fallback
+    // OVERLAP HOVER (the user 2026-08-24): message marks stack — several exchanges on one pair, a
+    // stub riding another's track — and the topmost hit swallowed the hover, so the modal named ONE
+    // message where the cursor covered several. Resolve every message element under the point
+    // (elementsFromPoint walks the whole paint stack; every message hit and arrival dot carries its
+    // message index) and show them ALL: one modal, each message its own block, every unit lit
+    // together, oldest first. Capped so a pile-up stays a modal, not a wall. Environments without
+    // elementsFromPoint (bare-node tests, odd hosts) fall back to the hovered message alone —
+    // exactly the old behavior.
+    const MSG_TIP_CAP = 8;
+    const msgHoverSet = (e, selfI) => {
+      const found = new Set([selfI]);
+      try {
+        const doc = (this.svg && this.svg.ownerDocument) || document;
+        if (e && e.clientX != null && doc.elementsFromPoint)
+          for (const n of doc.elementsFromPoint(e.clientX, e.clientY))
+            if (n && n.__tlMsgI != null && data.messages[n.__tlMsgI]) found.add(n.__tlMsgI);
+      } catch (err) { /* fall back to the hovered message alone */ }
+      return Array.from(found).sort((a, b) => (data.messages[a].sent || 0) - (data.messages[b].sent || 0));
+    };
+    const msgSetHtml = (set) => set.slice(0, MSG_TIP_CAP).map((ix, k) =>
+      (k ? '<div style="margin-top:6px;border-top:1px solid #ffffff1f;padding-top:6px">' : '<div>')
+      + msgHtml(data.messages[ix])() + '</div>').join('')
+      + (set.length > MSG_TIP_CAP
+         ? '<div class="k" style="margin-top:4px">+' + (set.length - MSG_TIP_CAP) + ' more messages here</div>' : '');
+    const msgSetLight = (set, on) => set.forEach((ix) => {
+      const u = msgUI[ix];
+      if (!u) return;
+      if (u.hl) u.hl.setAttribute('opacity', (on || u.lit) ? '0.95' : '0');
+      if (u.dot) u.dot.setAttribute('r', (on || u.lit) ? DOT_R + 2 : DOT_R);
+    });
     // ── HIDDEN-COUNTERPART STUBS (the user 2026-08-24; HORIZONTAL form later the same day — the
     // angled diagonals fanned out of a busy lane like a starburst and read as noise): a message
     // whose OTHER endpoint has no visible lane still shows on the lane it does touch, as a
@@ -4027,8 +4044,9 @@ class TimelinePanel {
       const hit = el('path', { d, fill: 'none', stroke: 'transparent', 'stroke-width': MSG_HIT_W,
                                'stroke-linecap': 'round', 'stroke-linejoin': 'round' });
       hit.style.cursor = 'pointer';
-      const mEnter = (e) => { hl.setAttribute('opacity', '0.95'); if (u.dot) u.dot.setAttribute('r', DOT_R + 2); this.showTip(msgHtml(mm)(), e); };
-      const mLeave = () => { hl.setAttribute('opacity', msgLit ? '0.95' : '0'); if (u.dot) u.dot.setAttribute('r', msgLit ? DOT_R + 2 : DOT_R); this.hideTip(); };
+      const mEnter = (e) => { u.hoverSet = msgHoverSet(e, i); msgSetLight(u.hoverSet, true); this.showTip(msgSetHtml(u.hoverSet), e); };
+      const mLeave = () => { msgSetLight(u.hoverSet || [i], false); u.hoverSet = null; this.hideTip(); };
+      hit.__tlMsgI = i;                            // the overlap resolver's key (msgHoverSet)
       hit.__tlHoverIn = mEnter;                    // re-armable after a redraw rebuilds this stub (_rehover)
       hit.addEventListener('mouseenter', mEnter);
       hit.addEventListener('mousemove', (e) => this.moveTip(e));
@@ -4080,11 +4098,12 @@ class TimelinePanel {
       // and a wider stroke so a short vertical (an immediately-delivered message is almost ALL vertical)
       // is still an easy target.
       const hit = el('path', { d, fill: 'none', stroke: 'transparent', 'stroke-width': MSG_HIT_W, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }); hit.style.cursor = 'pointer';
-      const mEnter = (e) => { hl.setAttribute('opacity', '0.95'); if (u.dot) u.dot.setAttribute('r', DOT_R + 2); this.showTip(msgHtml(mm)(), e); };
+      const mEnter = (e) => { u.hoverSet = msgHoverSet(e, i); msgSetLight(u.hoverSet, true); this.showTip(msgSetHtml(u.hoverSet), e); };
+      hit.__tlMsgI = i;                            // the overlap resolver's key (msgHoverSet)
       hit.__tlHoverIn = mEnter;                    // re-armable after a redraw rebuilds this path (_rehover)
       hit.addEventListener('mouseenter', mEnter);
       hit.addEventListener('mousemove', (e) => this.moveTip(e));
-      hit.addEventListener('mouseleave', () => { hl.setAttribute('opacity', msgLit ? '0.95' : '0'); if (u.dot) u.dot.setAttribute('r', msgLit ? DOT_R + 2 : DOT_R); this.hideTip(); });
+      hit.addEventListener('mouseleave', () => { msgSetLight(u.hoverSet || [i], false); u.hoverSet = null; this.hideTip(); });
       hit.addEventListener('click', msgNav(mm));
       u.hit = hit;
     });
@@ -4092,13 +4111,20 @@ class TimelinePanel {
     // dot helper: optional onClick (deep-link) + optional linkedHl (co-light a connector on hover).
     // lit = cross-hover focus (feed-card hover / DAG journey): drawn GROWN in its own color — the same
     // growth the native hover applies, no white ring (the user 2026-07-17) — and mouseleave restores it.
-    const dot = (cx, cy, color, html, onClick, linkedHl, lit) => {
+    const dot = (cx, cy, color, html, onClick, linkedHl, lit, msgI) => {
       const c = el('circle', { cx, cy, r: lit ? DOT_R + 2 : DOT_R, fill: color, stroke: '#e8eef5', 'stroke-width': 0.75 }); c.style.cursor = onClick ? 'pointer' : 'default';   // thinner white border on EVERY dot — romp + user (the user 2026-06-23)
-      const dEnter = (e) => { c.setAttribute('r', DOT_R + 2); if (linkedHl) linkedHl.setAttribute('opacity', '0.95'); this.showTip(html(), e); };
+      // a MESSAGE dot (msgI) hovers as its whole overlap set — stacked arrivals on one lane x are
+      // the commonest pile-up of all; a non-message dot keeps the plain single tooltip
+      const dEnter = (msgI != null)
+        ? (e) => { const u0 = msgUI[msgI] || (msgUI[msgI] = { hl: linkedHl, dot: c, lit }); u0.hoverSet = msgHoverSet(e, msgI); msgSetLight(u0.hoverSet, true); c.setAttribute('r', DOT_R + 2); this.showTip(msgSetHtml(u0.hoverSet), e); }
+        : (e) => { c.setAttribute('r', DOT_R + 2); if (linkedHl) linkedHl.setAttribute('opacity', '0.95'); this.showTip(html(), e); };
       c.__tlHoverIn = dEnter;                      // re-armable after a redraw rebuilds this dot (_rehover)
+      if (msgI != null) c.__tlMsgI = msgI;         // the overlap resolver's key (msgHoverSet)
       c.addEventListener('mouseenter', dEnter);
       c.addEventListener('mousemove', (e) => this.moveTip(e));
-      c.addEventListener('mouseleave', () => { c.setAttribute('r', lit ? DOT_R + 2 : DOT_R); if (linkedHl) linkedHl.setAttribute('opacity', lit ? '0.95' : '0'); this.hideTip(); });
+      c.addEventListener('mouseleave', (msgI != null)
+        ? () => { const u0 = msgUI[msgI]; msgSetLight((u0 && u0.hoverSet) || [msgI], false); if (u0) u0.hoverSet = null; c.setAttribute('r', lit ? DOT_R + 2 : DOT_R); this.hideTip(); }
+        : () => { c.setAttribute('r', lit ? DOT_R + 2 : DOT_R); if (linkedHl) linkedHl.setAttribute('opacity', lit ? '0.95' : '0'); this.hideTip(); });
       if (onClick) c.addEventListener('click', onClick);
       svg.appendChild(c);
       return c;
@@ -4111,7 +4137,7 @@ class TimelinePanel {
       if (vidx[mm.toId] == null || !inWin(landXT(mm))) return;
       const col = colorOf(mm.fromId), cy = laneY(vidx[mm.toId]);
       const u = msgUI[i];
-      const c = dot(x(landXT(mm)), cy, col, msgHtml(mm), msgNav(mm), u && u.hl, dagOrHoverMsg(mm.id));
+      const c = dot(x(landXT(mm)), cy, col, msgHtml(mm), msgNav(mm), u && u.hl, dagOrHoverMsg(mm.id), i);
       if (u) u.dot = c;
     });
 
@@ -4384,4 +4410,4 @@ class TimelinePanel {
   body(s) { return s ? '<div class="b">' + s + '</div>' : ''; }
 }
 
-module.exports = { TimelinePanel, badgeFor, roundedPath, crossX, workAnchorOf, idleGaps, fmtSpan, dotLit, barLit, interpNow, shouldReanchorEdge, reanchorEdge, isFreshNowSample, barEndT, dragAxis, stripRompMarks, collapseRepeat, reqText, menuTop, offsetRect, viewVisible, viewLabel, viewMoreCount, viewToggleHidden, viewToggleMember, viewTagUnion };
+module.exports = { TimelinePanel, badgeFor, roundedPath, crossX, workAnchorOf, idleGaps, fmtSpan, dotLit, barLit, interpNow, shouldReanchorEdge, reanchorEdge, isFreshNowSample, barEndT, dragAxis, stripRompMarks, collapseRepeat, reqText, menuTop, offsetRect, viewVisible, viewLabel, viewMoreCount, viewToggleMember, viewTagUnion };

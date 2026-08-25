@@ -319,6 +319,23 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 
 /* drop-point lines on an asks-column card: where the work is currently parked */
 
+/* ↪ BREAKTHROUGH cue (the user 2026-08-24): a needs-you card from a session the active view HIDES
+   still shows (the interrupt rule) — the cue says why it's here. The ↪ provenance family: dim,
+   quiet, the sub-line scale, never a status colour. */
+.fask-viewbreak { color: var(--dim); font-size: 0.82em; font-style: italic; white-space: nowrap; align-self: center; }
+/* "N cards outside this view" (the N-more idiom; the 2026-08-11 rule: filtered is never silent):
+   one dim line after the columns, click switches the view to All. */
+#feed-viewmore { padding: 4px 14px 10px; color: var(--dim); font-size: 0.82em; cursor: pointer; }
+#feed-viewmore:hover { color: var(--accent); text-decoration: underline; }
+/* PROMOTED (the user 2026-08-25, who read a view-narrowed board as broken): when the view hides
+   MORE than the board shows, the whisper trades up to the judge-limit banner's card chrome — same
+   #252526 card, hairline, 6px radius, 0.9em — and names the view. Neutral chrome, never a status
+   colour: a narrowed board is a choice, not an error. */
+#feed-viewmore.prominent { margin: 6px 8px 2px; padding: 10px 14px; background: #252526;
+  border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px;
+  color: var(--fg); font-size: 0.9em; }
+#feed-viewmore.prominent:hover { color: var(--fg); text-decoration: none;
+  border-color: var(--accent); }
 /* "↪ from <sender>" — courier handoff provenance beside the owning session: the "↪ from" reads as dim
    gray chrome, the peer name as a bold, identity-coloured session link (the user 2026-06-16). */
 /* a direct child of the WRAPPING name row, kept on one line — .fask-id's flex-grow pushes it to the
@@ -457,6 +474,9 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 /* the chip's elapsed readout (" · 42m") — same size as the chip text, dimmed like a sub-line so the
    peer name stays the loudest word (the user 2026-08-23) */
 .fask-waiton-dur { opacity: 0.6; font-weight: 400; }
+/* the sub-goals button's dim " · N parked" suffix (the user 2026-08-24) — same quiet sub-line
+   treatment as the waiting-chip's elapsed readout; the loud word stays the sub-goal count */
+.fask-subparked { opacity: 0.6; font-weight: 400; }
 
 /* ---- ask DAG tree (expanded body) — nodes only; click a node for its history ---- */
 /* width:fit-content hugs the widest row so the right-aligned "(Xm ago)" node times sit just past the
@@ -568,6 +588,11 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 /* the one-word "cleared" chip on a cleared row (the user 2026-07-25: the strike alone read as
    unexplained machinery) — dim, outside the strikethrough, same small-tag size as .ftree-who */
 .fcleared-tag { flex: 0 0 auto; font-size: 0.92em; color: var(--dim);
+  border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 4px; padding: 0 5px; line-height: 1.5; }
+/* the one-word "parked" hint on a leapfrogged open row (the user 2026-08-24: a queued ask sat
+   silently while newer siblings were dispatched past it) — the cleared tag's exact metrics, dim by
+   design: a hint to glance at, never the trouble-chip family's yellow/red */
+.fparked-tag { flex: 0 0 auto; font-size: 0.92em; color: var(--dim);
   border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 4px; padding: 0 5px; line-height: 1.5; }
 .ftree-node.st-cleared .ftree-text { text-decoration: line-through; text-decoration-color: var(--dim); }
 .ftree-node.st-cleared .ftree-mark { color: var(--dim); }
@@ -690,6 +715,16 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 }
 /* hover lightens via an inset overlay + lifts — never touches the inline tint */
 .fitem:hover { box-shadow: inset 0 0 0 999px rgba(255, 255, 255, 0.07), 0 2px 7px rgba(0, 0, 0, 0.30); }
+/* the grouped session header leaves as ONE MOTION with its run's last card (the user 2026-08-24,
+   whose recording showed the header popping out a frame after the card): the card-dismiss family —
+   fade + slight shrink + height collapse so the reflow glides. fill-mode holds the end state until
+   the animationend removal lands (feed.ts startSessHeadExit — event-keyed, backstopped). */
+.feed-sess-head.sess-exit { animation: sess-exit 0.18s ease forwards; overflow: hidden; pointer-events: none; }
+@keyframes sess-exit {
+  from { opacity: 1; transform: scale(1); max-height: 60px; }
+  to   { opacity: 0; transform: scale(0.9); max-height: 0; margin: 0; padding: 0; }
+}
+@media (prefers-reduced-motion: reduce) { .feed-sess-head.sess-exit { animation: none; opacity: 0; } }
 /* a cleared/dismissed card CONTRACTS in on itself — scales down + fades while its height collapses so the
    neighbours slide up to close the gap — instead of sliding off to one side (the user 2026-06-18). */
 .fitem.dismissing { animation: fask-dismiss 0.18s ease forwards; overflow: hidden; pointer-events: none; transform-origin: center; }
@@ -901,10 +936,8 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
    wears the shared .ctx-menu vocabulary (chrome defined with the card menus below); these rules add
    the ✓-in-circle current mark every romp menu uses (ported from styles.css — the feed page loads
    only this sheet) and the forced row's inert fade. */
-/* two ids, deliberately: #feed-foot .fdismiss's (1,1,0) padding beats a bare #feed-viewbtn — the
-   repo's recurring cascade trap (the 2026-08-19 forced-fade bug class) */
-#feed-foot #feed-viewbtn { display: inline-flex; align-items: center; padding: 2px 7px; }
-#feed-viewbtn svg { display: block; }
+/* ("View ▴" is a word-button since 2026-08-24 round two — the shared #feed-foot .fdismiss metrics
+   cover it, so the old icon-button's bespoke two-id padding rule went with the icon.) */
 .feed-viewmenu { min-width: 178px; }
 /* rows are real <button>s (keyboard operability) — strip the UA chrome and re-inherit the menu's
    font/colour (a button that doesn't inherit is exactly how a menu drifts onto the host font, the

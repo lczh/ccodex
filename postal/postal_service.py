@@ -552,6 +552,16 @@ def format_agents(agents, me, me_id=""):
             # say whose it is so nobody mistakes it for a full peer (the user 2026-08-22)
             pn = next((x.get("name") for x in agents if x.get("id") == a.get("parent")), "")
             tag = " (thread of %s)" % (pn or "a session here")
+        # host prefix + short stable id (the user 2026-08-24): a duplicate-name refusal lists its
+        # candidates as host:name, and the uuid is the rename-proof address — without either on the
+        # row, the reader matched an error message by guesswork. Short form: enough to disambiguate
+        # AND to paste as a recipient (resolve_recipient matches an unambiguous id prefix of 8+
+        # chars) — progressive disclosure, not a wall of hex.
+        rid = str(a.get("id") or "")
+        host = rid.split(":", 1)[0] if (a.get("remote") and ":" in rid) else ""
+        disp = ("%s:%s" % (host, a["name"])) if (host and not str(a["name"]).startswith(host + ":")) else a["name"]
+        short = (rid.rsplit(":", 1)[-1] if ":" in rid else rid)[:8]
+        sid_tag = (" · %s" % short) if short else ""
         br = ("  [%s]" % a["branch"]) if a.get("branch") else ""
         wk = ""
         if a.get("working"):
@@ -563,7 +573,7 @@ def format_agents(agents, me, me_id=""):
             st = a.get("state", "")
             stale = "  (idle now — claim may be stale)" if st and st != "working" else ""
             wk = "  — %s%s" % (a["working"], stale)
-        lines.append("  %s%s%s%s" % (a["name"], tag, br, wk))
+        lines.append("  %s%s%s%s%s" % (disp, tag, sid_tag, br, wk))
     return "\n".join(lines)
 
 def _hhmm_epoch(t):
@@ -805,6 +815,15 @@ def resolve_recipient(to, frm_id=""):
     direct_all = ([] if (want_host and want_host != here)
                   else [a for a in all_agents(threads=True)
                         if (a.get("id") == bare if by_id else a["name"] == bare)])   # threads addressable for replies
+    if not direct_all and not by_id and not want_host             and re.fullmatch(r"[0-9a-fA-F][0-9a-fA-F-]{7,35}", bare):
+        # a SHORT id — the ` · <8-char>` form every list_agents row now carries (the user
+        # 2026-08-24) — addresses by unambiguous id PREFIX, so the row is enough to act on. An
+        # exact NAME match always wins first (a name may be hex-shaped); at least 8 characters so
+        # a stray word can never catch a session by luck; a remote row's id ("host:uuid") matches
+        # on its uuid part, the part the row shows. TWO prefix hits fall through to the standing
+        # ambiguity refusal below, exactly like a duplicated name.
+        direct_all = [a for a in all_agents(threads=True)
+                      if str(a.get("id") or "").rsplit(":", 1)[-1].startswith(bare)]
 
     if frm_id and any(a["id"] == frm_id for a in direct_all):
         return {"kind": "error", "status": 409,
@@ -1045,6 +1064,14 @@ def _sweep_orphans():
                     _log("bounce to %s failed: %s" % (s["name"], e))
             try:
                 f.unlink()
+                # the destroy is the message's TERMINAL EVENT — record it on the original mid, the
+                # way _bounce_apply records a peer's refusal (the user 2026-08-24): without this row
+                # the ledger's last word stayed "sent", and the timeline's pending flag had to lean
+                # on an age window / recipient liveness — which a same-sid REVIVAL then flips back
+                # to pending for mail that no longer exists. The ledger is now terminal-complete.
+                _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "bounced", "id": f.name,
+                                              "to": recip or "?",
+                                              "why": "recipient exited; unread mail destroyed by the orphan sweep"})
             except Exception:
                 pass
         _mark_pending(box.name)                         # bounced orphans may have emptied new/

@@ -181,7 +181,16 @@ def _distill_effort():
     if v == "triage":
         return _triage_effort()
     return "" if v == "none" else v
-WINDOW      = 48 * 3600                  # only caption transcripts touched in the last N hours (matches the parse horizon)
+WINDOW      = 48 * 3600                  # discover()'s default reach — a COST horizon, not semantics: it bounds
+#                                          how much history each pass re-walks, never eligibility or correctness
+#                                          (read-side.md: a time window is allowed only as a perf bound on how far
+#                                          back to parse). Liveness owns visibility (kernel _alive_sessions' wide
+#                                          walk), death owns finalization (run_close's DEATH_BACKFILL_WINDOW drain),
+#                                          the picker reaches 30 days; an untouched store is simply not rescanned and
+#                                          re-enters the fleet the moment its transcript is touched again. ONE
+#                                          consumer aliases this value as POLICY: COURIER_RETRY_HORIZON's give-up
+#                                          deadline below — deliberate, and the reason this number is not free to
+#                                          shrink as a pure perf knob.
 COURIER_RETRY_HORIZON = WINDOW           # a usage-limited courier call comes back empty and retries every pass, but a
 #                                          peer message still unsummarized past this many seconds (matches discover()'s
 #                                          48h WINDOW) is abandoned — marked 'fyi' — so a long limit window can't
@@ -704,6 +713,25 @@ _judge_ctx = threading.local()                       # per-thread: the fsid bein
 # (SourceFileLoader), so it reads `active_runs()` directly — no file, no cross-process race. Self-cleaning:
 # every call deregisters in a `finally`, so a timeout/parse-fail/exception can't leak a forever-growing bar.
 _active = {}                                          # run_id -> {"judge", "fsid", "sent"}
+_PASS_DONE = {}                                       # (tier, fsid) -> wall clock of that tier's last COMPLETED
+#                                                       per-session pass THIS BOOT. In-memory on purpose (W2c,
+#                                                       the user 2026-08-24): a restart resets it, so "the first
+#                                                       completed post-boot pass over this fsid" is the re-arm
+#                                                       event — a pre-boot deferral can never fire off a stale
+#                                                       stamp. Usage rows can't serve here: they record CALLS,
+#                                                       and a tier with no new work makes zero calls, so keying
+#                                                       the wedged-reviver bound on usage would defer forever in
+#                                                       exactly the wedged cases it exists to catch.
+
+
+def pass_done(tier, fsid):
+    """Stamp: `tier` finished its per-session pass over fsid (work done OR declined-as-no-work)."""
+    _PASS_DONE[(str(tier), str(fsid))] = time.time()
+
+
+def pass_watermark(tier, fsid):
+    """When `tier` last completed a per-session pass over fsid this boot, or None."""
+    return _PASS_DONE.get((str(tier), str(fsid)))
 _active_lock = threading.Lock()
 _active_seq = [0]
 def _active_begin(judge, fsid, sent):
@@ -3665,9 +3693,12 @@ def _mark_node_done(store, nid, why, t, src="planner"):
     kids = {}
     for x, nd in nodes.items():
         kids.setdefault(nd.get("parentId"), []).append(x)
-    stack = [nid]
-    while stack:
-        x = stack.pop()
+    stack, seen = [nid], set()
+    while stack:                                       # seen-set: a parentId cycle (two rebased reparent
+        x = stack.pop()                                # writers can compose one neither wrote) must degrade,
+        if x in seen:                                  # never spin the judge forever (the 2026-08-24 review's
+            continue                                   # verified crash class, guarded here like _parked_rows)
+        seen.add(x)
         if x != nid and nodes[x].get("blocked"):
             record_verdict(store, nodes[x], src, "unblock", t,
                            why="discharged with the completed parent")
@@ -3951,6 +3982,21 @@ def rollup_status(store, session_closed, now=None):
     nodes = store["nodes"]
     folds = _materialize_from_log(nodes)               # P3.3: history → flags; the log is the authority
     #                                                    (migration is a BOOT sweep now — migrate_all_stores)
+    # DONE-BY-ASSOCIATION GUARD (the user 2026-08-24): before the roll-down loops can fold them, the
+    # OPEN children of every COMPLETED handoff tracking node move up beside it (_lift_handoff_children)
+    # — a delegation's completion is evidence about the delegation, never about the un-ruled asks filed
+    # under it by topical placement (the audited case: the completing report explicitly DECLINED a
+    # child's ask, and the fold sealed it done anyway). Living HERE, in every writer's rollup, the
+    # guard covers every completer alike — the courier link-back, a closer done on the tracking node,
+    # a planner op — and SELF-HEALS the save-rebase race: a concurrent pass that republishes a stale
+    # parentId puts the child back under the completed node, and the very next rollup lifts it again
+    # (the rebase folds diary rows, not parents). rolledUp tracking nodes are skipped on purpose:
+    # their completion rolled down from an ANCESTOR the judges actually ruled — that absorb is the
+    # designed umbrella ending, not an association.
+    for _hid in list(nodes):
+        _hn = nodes[_hid]
+        if isinstance(_hn.get("handoff"), dict) and _hn.get("nodeComplete") and not _hn.get("rolledUp"):
+            _lift_handoff_children(store, _hid)
     children = {}
     for nid, nd in nodes.items():
         children.setdefault(nd.get("parentId"), []).append(nid)
@@ -7267,8 +7313,19 @@ def migrate_store(store):
 def _migrate_node(nd):
     changed = nd.pop("logBorn", None) is not None
     changed = nd.pop("everDone", None) is not None or changed   # retired 2026-07-08: once-done now lives in
-    if not nd.get("log") and (nd.get("nodeComplete") or nd.get("blocked") or nd.get("cleared")
-                              or nd.get("followupAt")):         #   the diary (done events), nowhere reads the flag
+    # KEY-PRESENCE, not truthiness (the user 2026-08-24): the diary KEY is the era marker — every
+    # diary-era mint writes "log": [] at birth, and the two sibling guards encoding the same concept
+    # (record_verdict's frozen check, _materialize_node's fail-loud) both test absence. Testing
+    # `not nd.get("log")` also matched a DIARY-ERA node whose flags were set eventlessly — a rollup
+    # roll-down child, whose flags are "tree-derived display cache", never verdicts — and manufactured
+    # a witnessed-looking src=judge done row from that cache. The live case: a delegation completed
+    # while the completing report explicitly DECLINED a child's ask; the roll-down folded the child,
+    # the next boot synthesized its "done", and the reopen un-resolve then re-completed it forever
+    # (the synth fold outranks the popped flags — done by association, unrecoverable). Genuinely
+    # legacy nodes (no log key at all) keep the synth, rolledUp included: pre-diary flags are the
+    # only history they have, so archives render unchanged.
+    if "log" not in nd and (nd.get("nodeComplete") or nd.get("blocked") or nd.get("cleared")
+                            or nd.get("followupAt")):           #   the diary (done events), nowhere reads the flag
         _synth_log(nd)
         changed = True
     if "log" not in nd:
@@ -8121,6 +8178,7 @@ def run_plan(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verb
         for fut in as_completed(futs):
             try:
                 placed += fut.result()
+                pass_done("plan", futs[fut])          # the pass over THIS fsid completed (W2c's event)
             except Exception:
                 pass
     if verbose:
@@ -8946,7 +9004,10 @@ CLOSER_SYS = (
     "No-work-filed rule: a note may instead flag goals that have had no work filed since they were "
     "created while other pieces of the same effort settled. Judge each from goal history and the other "
     "goals' state: done if its outcome was in fact delivered under another goal, or the approach it "
-    "names was replaced by one that shipped — say which in the why; blocked if it genuinely awaits the "
+    "names was replaced by one that shipped — say which in the why, and only where that covering work "
+    "answers this goal's own ask affirmatively (a report that explicitly declines or defers the ask is "
+    "evidence AGAINST closing: leave it open — or blocked, if the decline hands the user a decision — "
+    "and say in the why that the report declined it); blocked if it genuinely awaits the "
     "user; omit it (leave it open) if its work is simply still pending. Never close a flagged goal just "
     "because it is old or quiet: the ruling needs the covering work, named.\n"
     "- awaiting: the turn **ends** with the goal waiting on something the assistant itself set running "
@@ -9503,8 +9564,10 @@ def _close_turn(store, turn, samples=None, seg_by_id=None):
                       "elsewhere on the same board: judge %s ONLY from what the reply explicitly says "
                       "about it — done only where the reply plainly reports that goal's outcome "
                       "delivered or nothing left to do on it; block where the reply's account of it "
-                      "ends by asking the user for a decision or go-ahead. A goal the reply does not "
-                      "clearly cover is a considered omission, not a completion."
+                      "ends by asking the user for a decision or go-ahead. A reply that declines or "
+                      "defers a goal's ask is not a completion either: leave that goal open (or block "
+                      "it, if the decline itself asks the user), and say the reply declined it. A goal "
+                      "the reply does not clearly cover is a considered omission, not a completion."
                       % ("s" if len(tflagged) > 1 else "",
                          ", ".join("#%d" % i for i in tflagged),
                          "are" if len(tflagged) > 1 else "is",
@@ -9843,6 +9906,7 @@ def run_close(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, ver
         for fut in as_completed(futs):
             try:
                 n += len(fut.result())
+                pass_done("close", futs[fut])         # the pass over THIS fsid completed (W2c's event)
             except Exception:
                 pass
     if verbose:
@@ -10464,6 +10528,18 @@ def dead_wait_block_why(why):
     tail = (why or "").strip().rstrip(".")
     return ("%s%s. Reviving the session picks the thread back up; replying here or clearing the "
             "card drops the wait." % (DEAD_WAIT_WHY_PREFIX, tail or "background work"))
+
+
+def dead_peer_block_why(peer_name, why):
+    """The block why for a kind=peer wait whose AWAITED PEER died with the ask unanswered (the user
+    2026-08-24, W1a): the asked session can never answer now — its death, observed at the leave
+    transition, is the wait's own ending event, so the card converts to the user's call instead of
+    idling toward a wake on a clock. Same exact-shape rationale as dead_wait_block_why above; the
+    shared prefix keeps it procedural for every reader."""
+    tail = (why or "").strip().rstrip(".")
+    return ("%sthe session it was waiting on ('%s') has exited with the ask unanswered — %s. "
+            "Reviving that session (or re-asking another) picks it back up; replying here or "
+            "clearing the card drops the wait." % (DEAD_WAIT_WHY_PREFIX, peer_name, tail or "a peer reply"))
 
 
 def procedural_block_why(why):
@@ -11338,7 +11414,11 @@ COURIER_SYS = (
     "prose, no markdown fences):\n"
     '{\"verdict\": \"delegating\" | \"coordinating\", \"goal\": <n>, \"text\": \"...\"}\n'
     "- \"delegating\": B now owns a concrete piece of work. text = the outcome B owns, ≤8 words. goal = "
-    "which of A's open goals #N this work carries forward, or 0 if none or unclear.\n"
+    "which of A's open goals #N this work carries forward, or 0 if none or unclear. When SEVERAL open "
+    "goals ask for this same work (an original and a later restatement), pick the OLDEST — completion "
+    "must land on the original ask, or it resurfaces demanding status on finished work. Only a goal "
+    "this work would genuinely discharge counts: a merely-adjacent goal is 0, never a guess — a wrong "
+    "link closes the wrong card, which is worse than none.\n"
     "- \"coordinating\": no work is transferred, just confirming, aligning, acknowledging, a heads-up, "
     "or a question to answer. goal = 0, text = empty string.\n"
     "The sender's lead word is a hint, not the verdict: DELEGATE:/HANDOFF: usually means delegating; "
@@ -11678,6 +11758,37 @@ def _plant_handoff_track(store, parent_id, text, peer_sid, peer_name, t, mid, tr
                   "nodeComplete": False, "blocked": False, "cleared": False,
                   "trail": [], "t": t, "mt": t, "handoff": handoff, "log": []})
     return nid
+
+
+def _lift_handoff_children(store, hid):
+    """Move a COMPLETED handoff tracking node's OPEN direct children (their subtrees ride along) up
+    beside it — to its own parent, top-level when it is a top — before the roll-down can fold them.
+    Called from rollup_status's pre-pass, i.e. after every writer, for every completer alike.
+
+    The courier's link-back evidence — the recipient finished the DELEGATED work — supports completing
+    the tracking node and nothing else. But completion triggers rollup's roll-down, which folds every
+    open descendant into an eventless done-display cache, seals it out of every judge menu, and renders
+    it a full ✓: done by tree position, never by a ruling (the user 2026-08-24: a delegation's
+    completing report explicitly DECLINED a child's ask, and the child read done anyway). An ask filed
+    under a delegation sits there by topical placement; the delegation shipping WITHOUT it is the exact
+    event proving it is its own outstanding work. Moved up, it stays open, visible, and judgeable — the
+    closer's channels rule it done with the covering work named, or leave it open/blocked per the
+    decline rule (CLOSER_SYS) — while the completed delegation keeps the children that earned their own
+    verdicts. A moved child that is itself a handoff node keeps its own link-back alive: folding it
+    used to mark a live sub-delegation satisfied by association. Idempotent (after the move the node
+    has no open children), and the rollup pre-pass re-runs it on every write, so a stale concurrent
+    republish of the old parent is healed a pass later instead of sealing the child forever.
+    Returns the number moved."""
+    nodes = store.get("nodes", {})
+    dest = (nodes.get(hid) or {}).get("parentId")
+    moved = 0
+    for nd in list(nodes.values()):
+        if nd.get("parentId") == hid and not nd.get("nodeComplete") and not nd.get("cleared"):
+            nd["parentId"] = dest
+            moved += 1
+    return moved
+
+
 def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
     """DETERMINISTIC delegation completion link-back (the user 2026-06-22). When a courier-planted goal G
     (origin.peer + origin.goalId) is COMPLETE on the recipient B's tree, mark the SENDER's tracking node
@@ -11881,7 +11992,11 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
             placed += 1
             continue
         sender_store = load_goals(sender)
-        menu = open_menu(sender_store)
+        # cap 40 for the LINK menu (the user 2026-08-24, the resurfaced-ask specimen): open_menu is
+        # oldest-first, and a busy sender holds >20 open nodes — the default cap starved exactly the
+        # candidates a dispatch usually serves (the fresh ask AND its older original), so the courier
+        # could not even SEE the goal it should link. Bounded: the courier scans one list per plant.
+        menu = open_menu(sender_store, cap=40)
         _judge_ctx.fsid = fsid                        # usage logging: attribute to the recipient session
         raw = courier_llm(text, _menu_text(sender_store, menu), declared=declared)
         edit = _parse_courier(raw, len(menu))

@@ -23,9 +23,27 @@ test("scope entry: the hovered card (clicks hover too), else the keyboard card c
 test("the cycle covers every visible control in the card's own (visual) order, and WRAPS", () => {
   assert.match(FEED, /return Array\.from\(card\.querySelectorAll<HTMLElement>\(KB_EL_SEL\)\)\.filter\(\(e\) => e\.offsetParent !== null\);/,
     "one selector, DOM order — the card's reading order — visible controls only");
+  // Shift+Tab is the SAME cycle reversed (the user 2026-08-24, verified + pinned): shiftKey picks the
+  // decrement arm, both arms wrap, and the reverse path shares release/flush/restore with forward
   assert.match(FEED, /i = e\.shiftKey \? \(i <= 0 \? els\.length - 1 : i - 1\) : \(i >= els\.length - 1 \? 0 : i \+ 1\);/,
     "both directions wrap at the ends");
   assert.match(FEED, /\.fask-secbtn,\.fask-bellbtn/, "the section pills and the bell are in the set");
+});
+
+test("view pills SELECT on focus; action buttons stay inert until Enter/Space (the user 2026-08-24)", () => {
+  // radio-group semantics for the SELECTORS only — .fask-secbtn switches what the card shows; every
+  // other control is an ACTION (the safe default) and must never fire from mere focus
+  assert.match(FEED, /if \(landed && landed\.matches\("\.fask-secbtn"\) && !landed\.classList\.contains\("on"\)\) landed\.click\(\);/);
+  // exactly ONE application per user gesture: the click lives in the Tab branch, never in
+  // tabScopeFocus — the render-tail restore calls tabScopeFocus, and a click there would re-apply
+  // per re-render (select-on-focus itself triggers a render whose restore re-focuses the pill)
+  const tsf = FEED.slice(FEED.indexOf("function tabScopeFocus"), FEED.indexOf("function releaseTabScope"));
+  assert.ok(!tsf.includes(".click()"), "tabScopeFocus never clicks — the restore path rides it");
+  const restore = FEED.slice(FEED.indexOf("// keyboard-scope focus restore"), FEED.indexOf("function feedWantsKeys"));
+  assert.ok(!restore.includes(".click()"), "the restore path never clicks either");
+  // the already-selected pill is a no-op on focus: pick() toggles a showing section OFF on click,
+  // and cycling through the active pill must not flip the card's view closed
+  assert.match(FEED, /!landed\.classList\.contains\("on"\)/);
 });
 
 test("Enter/Space activate — native controls natively, span controls by an exact synthetic click", () => {

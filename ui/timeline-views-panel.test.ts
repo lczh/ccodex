@@ -1,7 +1,7 @@
 // The timeline's corner control panel (the user 2026-08-18; filter-chip form + TAG model
 // 2026-08-23): "Filter ▾" in the bottom-left corner — the strip under the lane gutter, left of the
-// time labels. The dropdown picks the active VIEW (All — every session minus hidden, the default
-// since 2026-08-24 — / the (untagged) built-in / the named tags),
+// time labels. The dropdown picks the active VIEW (All — literally everything, the default
+// since 2026-08-24 — / the (no tags) built-in / the named tags),
 // holds New tag… / Sessions & tags…, and carries the two timeline display toggles (collapse idle
 // gaps, active only) so they finally work in every host. The dialog is TAG-CENTRIC: one row per
 // session wearing its tag chips (✕ leaves a tag; [+] joins or mints one) — a tagged session leaves
@@ -16,20 +16,20 @@ import { createRequire } from "node:module";
 const requireCjs = createRequire(__filename);
 const VIEW_PATH = path.resolve(process.cwd(), "..", "ui", "romp-timeline-view.js");
 const SRC = fs.readFileSync(VIEW_PATH, "utf8");
-const { TimelinePanel, viewVisible, viewLabel, viewMoreCount, viewToggleHidden, viewToggleMember, viewTagUnion } = requireCjs(VIEW_PATH);
+const { TimelinePanel, viewVisible, viewLabel, viewMoreCount, viewToggleMember, viewTagUnion } = requireCjs(VIEW_PATH);
 
 const G = { id: "g1", name: "pool", color: "#DD42FF", members: ["s2", "s3"] };
 const V = (active: string, hidden: string[] = [], tags: any[] = [G]) => ({ active, hidden, tags });
 
-test("executed: All shows every session minus hidden; untagged the tagless; a tag view its members", () => {
+test("executed: All shows literally everything (hidden retired 2026-08-24); untagged the tagless; a tag view its members", () => {
   assert.equal(viewVisible(null, "s1"), true, "no blob yet → everything shows");
-  assert.equal(viewVisible(V("all", ["s9"]), "s9"), false, "hidden — All respects the deliberate hide");
+  assert.equal(viewVisible(V("all", ["s9"]), "s9"), true, "a legacy hidden entry is IGNORED — nothing hides from All (the user 2026-08-24)");
   assert.equal(viewVisible(V("all"), "s2"), true, "TAGGED → All still shows it (the user 2026-08-24)");
   assert.equal(viewVisible(V("all"), "s1"), true, "untagged → shown");
-  assert.equal(viewVisible(V("untagged", ["s9"]), "s9"), false, "hidden hides in the untagged view too");
+  assert.equal(viewVisible(V("untagged", ["s9"]), "s9"), true, "…and legacy hidden does not hide in untagged either");
   assert.equal(viewVisible(V("untagged"), "s2"), false, "TAGGED → out of the untagged view (the user 2026-08-23)");
   assert.equal(viewVisible(V("untagged"), "s1"), true, "tagless → the untagged view shows it");
-  assert.equal(viewVisible(V("g1", ["s2"]), "s2"), true, "a tag view shows its members, hidden or not");
+  assert.equal(viewVisible(V("g1", ["s2"]), "s2"), true, "a tag view shows its members");
   assert.equal(viewVisible(V("g1"), "s1"), false, "a tag view shows exactly its members");
   assert.equal(viewVisible(V("ghost", [], []), "s1"), true, "an orphaned active falls back open");
   assert.equal(viewVisible({ active: "untagged", groups: [G] }, "s2"), false,
@@ -37,15 +37,15 @@ test("executed: All shows every session minus hidden; untagged the tagless; a ta
 });
 
 test("executed: the trigger label and the N-more cue (live sessions outside the view)", () => {
-  // the views are named for what they show: "All" (every session minus hidden — the default since
-  // 2026-08-24) and "(untagged)", parenthesized as the built-in it is
+  // the views are named for what they show: "All" (literally everything — the hidden set retired
+  // 2026-08-24) and "(no tags)" — the user-chosen words (2026-08-24), parens kept as the built-in marker
   assert.equal(viewLabel(null), "All");
-  assert.equal(viewLabel(V("untagged")), "(untagged)");
+  assert.equal(viewLabel(V("untagged")), "(no tags)");
   assert.equal(viewLabel(V("g1")), "pool");
   const sessions = [{ id: "s1", live: true }, { id: "s2", live: true }, { id: "s4", live: false }];
   assert.equal(viewMoreCount(V("g1"), sessions), 1, "s1 is live and outside; dead s4 never counts");
-  assert.equal(viewMoreCount(V("all", ["s1"]), sessions), 1, "hidden live s1 counts under All; tagged s2 shows now");
-  assert.equal(viewMoreCount(V("untagged", ["s1"]), sessions), 2, "hidden s1 AND tagged s2 sit outside untagged");
+  assert.equal(viewMoreCount(V("all", ["s1"]), sessions), 0, "NOTHING sits outside All — legacy hidden ignored");
+  assert.equal(viewMoreCount(V("untagged", ["s1"]), sessions), 1, "tagged s2 sits outside untagged; legacy-hidden s1 shows");
 });
 
 test("executed: an optimistic edit holds until the kernel echoes it — then yields to authority", () => {
@@ -144,7 +144,7 @@ test("the dropdown and dialog wear the shared menu vocabulary and adopt into the
 });
 
 test("the sessions dialog is a TABLE speaking romp's own conventions (the user 2026-08-24, JLD-designed)", () => {
-  // one grid, columns [name | chips | + | feed | eye] — the [+] column's ALIGNMENT carries the
+  // one grid, columns [name | chips | + | feed | (spare)] — the un-hide eye retired 2026-08-24; the [+] column's ALIGNMENT carries the
   // table structure (JLD: sequence in space suggests structure)
   assert.match(SRC, /grid-template-columns:max-content 1fr max-content max-content max-content;/);
   // the session NAME wears its identity colour directly (JLD: label directly, never a legend-like
@@ -172,20 +172,20 @@ test("the sessions dialog is a TABLE speaking romp's own conventions (the user 2
     "chip ✕ = remove-everywhere, through the one dispatcher");
   assert.match(SRC, /ni\.placeholder = 'new tag…';/, "minting a tag right from a row or the bulk bar");
   assert.match(SRC, /delete nv\.groups;/, "a write normalizes onto the tags key, never re-emitting the legacy one");
-  // the eye-off appears ONLY on a hidden session, to un-hide it (hiding lives on the chat tab)
-  assert.match(SRC, /if \(\(\(vv\.hidden \|\| \[\]\)\)\.indexOf\(s\.id\) >= 0\) \{/);
+  // (the un-hide eye retired with the hidden set, the user 2026-08-24 — tags cover backgrounding)
+  assert.doesNotMatch(SRC, /viewToggleHidden/);
   // the feed toggle still rides every live row (the user 2026-08-19 pool-builder rule), aligned in
   // its own column; NOT auto-coupled to membership.
   assert.match(SRC, /const ft = LANE_TOGGLES\.find\(\(t\) => t\.flag === 'hideFromFeed'\);/);
   assert.match(SRC, /\(this\._pendingFlags\[s\.id\] = this\._pendingFlags\[s\.id\] \|\| \{\}\)\.hideFromFeed = next;/,
     "the same optimistic sticky flags the lane gear uses");
-  // the menu items say so: All first (the default), (untagged) second, then New tag… / Sessions & tags…
+  // the menu items say so: All first (the default), (no tags) second, then New tag… / Sessions & tags…
   assert.match(SRC, /item\('New tag…', \{ dim: true \}\)/);
   assert.match(SRC, /item\('Sessions & tags…', \{ dim: true \}\)/);
   assert.match(SRC, /item\('All', \{ current: !v\.active \|\| v\.active === 'all' \}\)/);
-  assert.match(SRC, /item\('\(untagged\)', \{ current: v\.active === 'untagged' \}\)/);
-  assert.match(SRC, /item\('All',[\s\S]{0,300}item\('\(untagged\)',/, "All sits ABOVE (untagged) in the menu");
-  assert.match(SRC, /item\('\(untagged\)',[\s\S]{0,600}for \(const g of viewTagUnion\(v\)\)/,
+  assert.match(SRC, /item\('\(no tags\)', \{ current: v\.active === 'untagged' \}\)/);
+  assert.match(SRC, /item\('All',[\s\S]{0,300}item\('\(no tags\)',/, "All sits ABOVE (no tags) in the menu");
+  assert.match(SRC, /item\('\(no tags\)',[\s\S]{0,600}for \(const g of viewTagUnion\(v\)\)/,
     "…and the tag rows come AFTER both built-ins — the DoD's menu order, pinned end to end (the rows are the NAME-KEYED union since the 2026-08-24 ruling)");
 });
 
@@ -234,13 +234,12 @@ test("_setViews posts through the host hook with a GUARDED, atomic Obsidian fall
   assert.match(SRC, /this\._reconcileViews\(\);\s*\/\/ \.\.\.and an optimistic view edit/);
 });
 
-test("executed: the dialog's two checkbox mutations, pure", () => {
-  const v = { active: "all", hidden: ["a"], tags: [{ id: "g1", members: ["m"] }] };
-  assert.deepEqual(viewToggleHidden(v, "a").hidden, [], "unhide");
-  assert.deepEqual(viewToggleHidden(v, "b").hidden, ["a", "b"], "hide");
+test("executed: the dialog's membership mutation, pure (viewToggleHidden retired 2026-08-24 with the hidden set)", () => {
+  const v = { active: "all", tags: [{ id: "g1", members: ["m"] }] };
   assert.deepEqual(viewToggleMember(v, "g1", "m").tags[0].members, [], "leave");
   assert.deepEqual(viewToggleMember(v, "g1", "n").tags[0].members, ["m", "n"], "join");
   assert.deepEqual(viewToggleMember(v, "ghost", "n"), v, "an unknown tag mutates nothing");
+  assert.ok(!("viewToggleHidden" in requireCjs(VIEW_PATH)), "the hide mutation is gone from the exports");
 });
 
 test("the trigger measures its WHOLE string against the gutter, and the dialog's Escape hook dies on every close", () => {

@@ -181,24 +181,26 @@ test("the hljs token palette lives in feed.css too, identical to the chat's", ()
 // call, 2026-08-09) and any malformed stored value reads as the defaults — a corrupt entry may cost the
 // preference, never the viewer (feed-view-state's parseViewState contract).
 test("format prefs: rendered is the markdown default, and a corrupt entry reads as the defaults", () => {
-  type Fmt = { md: "rendered" | "raw"; wrap: boolean };
+  // wrap is GONE from the format state (the user 2026-08-24) — a stored wrap key from the toggle
+  // era parses away silently
+  type Fmt = { md: "rendered" | "raw" };
   const parseFmt = (raw: string | null): Fmt => {
-    const def: Fmt = { md: "rendered", wrap: false };
+    const def: Fmt = { md: "rendered" };
     if (!raw) return def;
     try {
-      const o = JSON.parse(raw) as { md?: unknown; wrap?: unknown };
+      const o = JSON.parse(raw) as { md?: unknown };
       if (!o || typeof o !== "object") return def;
-      return { md: o.md === "raw" ? "raw" : "rendered", wrap: o.wrap === true };
+      return { md: o.md === "raw" ? "raw" : "rendered" };
     } catch { return def; }
   };
-  assert.deepEqual(parseFmt(null), { md: "rendered", wrap: false }, "first open: rendered, unwrapped");
-  assert.deepEqual(parseFmt('{"md":"raw","wrap":true}'), { md: "raw", wrap: true }, "the round-trip");
-  assert.deepEqual(parseFmt("not json"), { md: "rendered", wrap: false });
-  assert.deepEqual(parseFmt('{"md":"purple","wrap":"yes"}'), { md: "rendered", wrap: false },
+  assert.deepEqual(parseFmt(null), { md: "rendered" }, "first open: rendered");
+  assert.deepEqual(parseFmt('{"md":"raw","wrap":true}'), { md: "raw" }, "the toggle-era wrap key parses away");
+  assert.deepEqual(parseFmt("not json"), { md: "rendered" });
+  assert.deepEqual(parseFmt('{"md":"purple","wrap":"yes"}'), { md: "rendered" },
                    "foreign values fall to the defaults field by field");
   // replica ↔ source
-  assert.match(VIEW, /const def: FileViewFmt = \{ md: "rendered", wrap: false \};/);
-  assert.match(VIEW, /return \{ md: o\.md === "raw" \? "raw" : "rendered", wrap: o\.wrap === true \};/);
+  assert.match(VIEW, /const def: FileViewFmt = \{ md: "rendered" \};/);
+  assert.match(VIEW, /return \{ md: o\.md === "raw" \? "raw" : "rendered" \};/);
   // …and the prefs persist in localStorage, the feed-view-state call: per-BROWSER view state that must
   // survive a kernel restart without a round-trip to the thing that just restarted
   assert.match(VIEW, /const FMT_KEY = "romp:fileviewFmt";/);
@@ -271,8 +273,9 @@ test("wrap mode: per-line rows, spans rebalanced across newlines, no phantom tra
 });
 
 // C: the toggle and the CSS that carries the honest gutter answer
-test("the Wrap toggle persists, hides with rendered prose, and its numbers still never copy", () => {
-  assert.match(VIEW, /wrapBtn\.addEventListener\("click", \(\) => \{ fmt\.wrap = !fmt\.wrap; saveFmt\(fmt\); renderBody\(\); \}\);/);
+test("long lines ALWAYS soft-wrap — the dedicated toggle button is gone (the user 2026-08-24)", () => {
+  assert.doesNotMatch(VIEW, /wrapBtn/, "no wrap chrome anywhere in the modal");
+  assert.match(VIEW, /codeBlock\(text, path, true\)/, "the pre view is born wrapped");
   // wrap mode returns BEFORE the sibling gutter is built — a misaligned column cannot exist
   assert.match(VIEW, /if \(wrapLines\) \{[\s\S]*?return wrap;\s*\}\s*const gutter = el\("div", "fileview-gutter"\);/);
   // plain files wrap too: no grammar → the text is HTML-escaped before the line walk
@@ -282,10 +285,14 @@ test("the Wrap toggle persists, hides with rendered prose, and its numbers still
     assert.match(SHEET, /\.fileview-wrap \.fv-cl::before \{[\s\S]*?counter-increment: fvln/);
     assert.match(SHEET, /\.fileview-wrap \.fv-cl::before \{[\s\S]*?user-select: none/);
   }
-  // wrap governs the pre view only — rendered prose always wraps — so the button leaves with it
-  // (and with edit mode, whose textarea has no wrap toggle to govern — the raw-mode slice)
-  assert.match(VIEW, /wrapBtn\.hidden = rendered \|\| editing;/);
-  assert.match(VIEW, /wrapBtn\.classList\.toggle\("on", fmt\.wrap\);/, "pressed state flips synchronously");
+});
+
+test("a file opened FROM the listing offers the way back — close only the viewer, listing intact beneath", () => {
+  // the one-directional stack: the browser sits beneath, so closing just the viewer IS the back;
+  // presence-gated on the browser's DOM id (import-free), absent for path-link opens
+  assert.match(VIEW, /if \(document\.getElementById\("romp-filebrowse"\)\) \{/);
+  assert.match(VIEW, /back\.textContent = "‹ Files"; back\.title = "Back to the file listing";/);
+  assert.match(VIEW, /back\.addEventListener\("click", \(\) => closeFileView\(\)\);/);
 });
 
 // ── download (the user 2026-08-09): any linked file can be SAVED, including everything the pane cannot

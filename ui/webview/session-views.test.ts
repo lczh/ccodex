@@ -1,8 +1,8 @@
 // Session views on the chat side (the user 2026-08-18; TAG model 2026-08-23; ALL default
 // 2026-08-24): the kernel's views blob — echoed on every tabOrder push — gates which sessions get
-// TABS. Two built-in sentinels: "all" — the default — shows every session minus the hidden set;
+// TABS. Two built-in sentinels: "all" — the default — shows LITERALLY EVERYTHING (the hidden set retired 2026-08-24);
 // "untagged" keeps the old default's meaning (a tag marks a specialized session, excluded from the
-// untagged view and shown under its tag views). A hidden session is a BACKGROUND session: still running, judged,
+// untagged view and shown under its tag views). A tagged session is a BACKGROUND session: still running, judged,
 // carded; the + picker lists it under "Hidden — reveal" and the timeline's corner panel counts it,
 // so nothing runs in secret (the 2026-08-11 rule this feature deliberately carves an exception
 // into, keeping its spirit). Executed tests on the pure module + source pins.
@@ -10,21 +10,21 @@ import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { viewVisible, viewsKey, hideIn, revealIn } from "../../ui/webview/session-views";
+import { viewVisible, viewsKey, revealIn } from "../../ui/webview/session-views";
 
 const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
 
 const G = { id: "g1", name: "pool", color: "#DD42FF", members: ["s2"] };
 
-test("executed: All shows every session minus hidden; untagged the tagless; a tag view its members", () => {
+test("executed: All shows literally everything (hidden retired 2026-08-24); untagged the tagless; a tag view its members", () => {
   assert.equal(viewVisible(null, "s1"), true);
-  assert.equal(viewVisible({ active: "all", hidden: ["s1"] }, "s1"), false, "All respects the deliberate hide");
+  assert.equal(viewVisible({ active: "all", hidden: ["s1"] }, "s1"), true, "a legacy hidden entry is IGNORED — nothing hides from All (the user 2026-08-24)");
   assert.equal(viewVisible({ active: "all", tags: [G] }, "s2"), true, "TAGGED → All still shows it (2026-08-24)");
   assert.equal(viewVisible({ active: "all", tags: [G] }, "s1"), true, "untagged → shown");
   assert.equal(viewVisible({ active: "untagged", tags: [G] }, "s2"), false, "TAGGED → out of the untagged view");
   assert.equal(viewVisible({ active: "untagged", tags: [G] }, "s1"), true, "tagless → the untagged view shows it");
-  assert.equal(viewVisible({ active: "untagged", hidden: ["s1"], tags: [G] }, "s1"), false, "hidden hides there too");
-  assert.equal(viewVisible({ active: "g1", hidden: ["s2"], tags: [G] }, "s2"), true, "a tag view shows its members, hidden or not");
+  assert.equal(viewVisible({ active: "untagged", hidden: ["s1"], tags: [G] }, "s1"), true, "…and a legacy hidden entry does not hide in untagged either — only membership excludes");
+  assert.equal(viewVisible({ active: "g1", hidden: ["s2"], tags: [G] }, "s2"), true, "a tag view shows its members");
   assert.equal(viewVisible({ active: "g1", tags: [G] }, "s1"), false);
   assert.equal(viewVisible({ active: "gone", tags: [] }, "s1"), true, "an orphaned active fails open");
   // the pre-rename key an un-updated kernel still pushes reads identically
@@ -32,40 +32,19 @@ test("executed: All shows every session minus hidden; untagged the tagless; a ta
   assert.equal(viewVisible({ active: "g1", groups: [G] }, "s2"), true);
 });
 
-test("executed: hide sets the one-off bit (and leaves the active tag); reveal SWITCHES views", () => {
-  const hid = hideIn({ active: "all", hidden: [] }, "s1");
-  assert.deepEqual(hid.hidden, ["s1"], "hiding = the manual one-off hide");
-  assert.deepEqual(hideIn(hid, "s1").hidden, ["s1"], "idempotent");
-  // hiding while a tag that CONTAINS the session is active must also leave that tag — the tag view
-  // shows its members however hidden they are, so without this the gesture is a silent no-op
-  const g = hideIn({ active: "g1", hidden: [], tags: [{ id: "g1", members: ["s2", "s3"] }, { id: "g2", members: ["s2"] }] }, "s2");
-  assert.deepEqual(g.hidden, ["s2"]);
-  assert.deepEqual(g.tags![0].members, ["s3"], "dropped from the ACTIVE tag");
-  assert.deepEqual(g.tags![1].members, ["s2"], "other tags keep it — multi-tag membership");
-  // reveal never mutates membership (re-grounded 2026-08-23: peeking at a tagged worker must not
-  // strip its tag) — it lands on a visible tab with the MINIMAL move (ALL default 2026-08-24)
-  const rev = revealIn({ active: "g1", hidden: [], tags: [G] }, "s1");
+test("executed: reveal SWITCHES views, never mutates membership (hideIn retired 2026-08-24)", () => {
+  // the hide gesture is GONE with the hidden set (the user 2026-08-24: the tag system covers
+  // backgrounding; the kernel migrated existing entries into "archived"). revealIn survives for the
+  // picker's jump: minimal move, membership untouched (2026-08-23 — a peek never strips a tag).
+  const rev = revealIn({ active: "g1", tags: [G] }, "s1");
   assert.equal(rev.active, "all", "tagless session from a tag view → land on All, the default");
-  assert.deepEqual(rev.hidden, [], "…and nothing edited");
-  const rev2 = revealIn({ active: "untagged", hidden: [], tags: [G] }, "s2");
+  const rev2 = revealIn({ active: "untagged", tags: [G] }, "s2");
   assert.equal(rev2.active, "g1", "tagged → its holder tag is its home view");
-  assert.deepEqual(rev2.tags![0].members, ["s2"], "membership untouched — the peek never strips a tag");
-  const revAll = revealIn({ active: "all", hidden: [], tags: [G] }, "s2");
-  assert.equal(revAll.active, "all", "tagged is VISIBLE under All → nothing changes at all");
-  const revHid = revealIn({ active: "all", hidden: ["s2"], tags: [G] }, "s2");
-  assert.equal(revHid.active, "all", "hidden under All → unhide and STAY — a focus never kicks off All");
-  assert.deepEqual(revHid.hidden, [], "…even for a tagged session: the unhide wins, not a holder switch");
-  const rev3 = revealIn({ active: "untagged", hidden: ["sX"], tags: [G] }, "sX");
-  assert.equal(rev3.active, "untagged", "unhidden tagless session already shows here — no gratuitous switch");
-  assert.deepEqual(rev3.hidden, [], "hidden and tagless → un-hidden (the one edit)");
-  const rev4 = revealIn({ active: "g1", hidden: ["s2"], tags: [G] }, "s2");
+  assert.deepEqual(rev2.tags![0].members, ["s2"], "membership untouched — the jump never strips a tag");
+  const revAll = revealIn({ active: "all", tags: [G] }, "s2");
+  assert.equal(revAll.active, "all", "everything is visible under All → nothing changes at all");
+  const rev4 = revealIn({ active: "g1", tags: [G] }, "s2");
   assert.equal(rev4.active, "g1", "already visible in the active tag → nothing changes");
-  const rev5 = revealIn({ active: "g1", hidden: ["sX"], tags: [G] }, "sX");
-  assert.deepEqual(rev5.hidden, [], "hidden AND tagless from a tag view → BOTH edits: un-hidden…");
-  assert.equal(rev5.active, "all", "…and still invisible after the unhide, so the view switches to All");
-  const rev6 = revealIn({ active: "untagged", hidden: ["s2"], tags: [G] }, "s2");
-  assert.equal(rev6.active, "g1", "hidden AND tagged under untagged → the holder tag wins");
-  assert.deepEqual(rev6.hidden, ["s2"], "…hidden bit untouched — membership beats hidden in a tag view");
 });
 
 test("executed: the canonical key ignores list order AND which key the kernel used", () => {
@@ -97,16 +76,19 @@ test("optimistic edits hold sticky and yield to the kernel after three silent pu
   assert.match(RENDER, /function postViews\(v: SessionViews\) \{[\s\S]{0,300}setTimelineViews/);
 });
 
-test("a hidden session keeps one visible home: the picker's Hidden section, and picking reveals", () => {
+test("a view-filtered session keeps one visible home: the picker's other-view section, and picking jumps views", () => {
+  // (the label was "Hidden — reveal" until the hidden set retired, the user 2026-08-24 — the
+  // section now serves tag-filtered sessions, same no-secret rule from 2026-08-11)
   assert.match(RENDER, /isOpenTab\(it\.id\) && !tabInView\(it\.id\)/);
-  assert.match(RENDER, /label\("Hidden — reveal"\)/);
-  assert.match(RENDER, /time\.textContent = "hidden";/);
-  assert.match(RENDER, /revealSession\(it\.id\);\s*\/\/ its tab already exists[\s\S]{0,80}setActive\(it\.id\);/);
+  assert.match(RENDER, /label\("In another view — open"\)/);
+  assert.match(RENDER, /time\.textContent = "other view";/);
+  assert.match(RENDER, /revealSession\(it\.id\);\s*\/\/ its tab already exists[\s\S]{0,120}setActive\(it\.id\);/);
 });
 
-test("the tab menu's hide gesture posts the same blob the timeline dialog edits", () => {
-  assert.match(RENDER, /l\.textContent = "Hide from chat & timeline";/);
-  assert.match(RENDER, /postViews\(hideIn\(effViews\(\), id\)\);/);
+test("the hide MECHANISM is fully retired (the user 2026-08-24) — reveal survives as the view jump", () => {
+  assert.doesNotMatch(RENDER, /Hide from chat & timeline/);
+  assert.doesNotMatch(RENDER, /hideIn\(/, "no hide gesture anywhere");
+  assert.match(RENDER, /function revealSession\(id: string\) \{ postViews\(revealIn\(effViews\(\), id\)\); \}/);
 });
 
 test("federation carries the LOCAL kernel's views blob through merged tabOrder re-emits", () => {
@@ -150,5 +132,14 @@ test("executed: a tag view is the NAME-KEYED union (user ruling 2026-08-24) — 
   assert.equal(viewVisible(both, "m1"), true, "the remote store's member joins the local id's view");
   assert.equal(viewVisible(both, "other"), false);
   assert.equal(viewVisible({ ...both, active: "TESTHOST-A:g1" }, "local1"), true, "either id, same union");
+});
+
+test("executed: untagged excludes by the UNION — a remote-homed tag counts (the user 2026-08-24)", () => {
+  // the reported bug: tagging from the chat left the session in the untagged view, because only
+  // LOCAL tags excluded there. Held by any kernel's tag = tagged, on every surface.
+  const v = { active: "untagged", hidden: [], tags: [],
+              remoteTags: [{ id: "alpha:g1", host: "alpha", name: "workers", members: ["cards1"] }] };
+  assert.equal(viewVisible(v, "cards1"), false, "remote-homed tag → out of untagged");
+  assert.equal(viewVisible(v, "other"), true);
 });
 

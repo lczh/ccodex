@@ -42,7 +42,10 @@ test("the filter defaults to NOTHING selected and only ever narrows the RENDER, 
   // painter must count exactly what the user sees, so render and the painter share one view) — and
   // the tracked-delegation satellite exclusion lives INSIDE it for the same reason (2026-08-24):
   // the unfiltered board hides only satellites; a picked session still renders ALL its cards
-  assert.ok(FEED.includes("let shown = feedOnlySid ? list.filter((a) => a.sid === feedOnlySid) : list.filter((a) => !a.satellite);"));
+  // the view gate (2026-08-24) runs FIRST; the session filter / satellite split is the second stage
+  assert.ok(FEED.includes("shown = feedOnlySid ? shown.filter((a) => a.sid === feedOnlySid) : shown.filter((a) => !a.satellite);"));
+  assert.ok(FEED.includes("let shown = feedViews ? list.filter((a) => cardInView(feedViews, a.sid, askColumn(a) === \"needsInput\")) : list;"),
+    "the active view gates the board through the shared decider, breakthroughs held");
   assert.ok(FEED.includes("let shown = viewFiltered(asks);"), "render reads the shared view");
   // (`let`, since 2026-08-23: the SEARCH filter composes onto the same render-side view — see feed-search.test.ts)
   assert.ok(FEED.includes("for (const a of shown) {"), "the group-fold loop reads the filtered view");

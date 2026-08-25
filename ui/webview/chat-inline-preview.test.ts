@@ -93,7 +93,7 @@ test("a failed preview heals on the next kernel push — the kernel-is-back even
 });
 
 test("the chat uses the FULL render on web, and the host data-URL flow for images in VS Code", () => {
-  assert.match(RENDER, /const full = canPreview\(\) \? previewFull\(p, activeId, kernelVerified\.has\(p\), \(pathPins \|\| \{\}\)\[p\]\)\s*\n\s*: previewKind\(p\) === "img" \? buildPathImg\(p\) : null;/);
+  assert.match(RENDER, /const full = canPreview\(\) \? previewFull\(p, renderingOwnerSid \?\? activeId, kernelVerified\.has\(p\), \(pathPins \|\| \{\}\)\[p\]\)\s*\n\s*: previewKind\(p\) === "img" \? buildPathImg\(p, renderingOwnerSid \?\? activeId\) : null;/);
   assert.doesNotMatch(RENDER, /previewThumb/, "the chat no longer renders mention thumbnails — full renders now");
 });
 
@@ -109,13 +109,15 @@ test("figures render AT their mention: after the block naming them; same-block f
 });
 
 test("VS Code's pending image chip pulses while the host round-trip is in flight; a failed one doesn't", () => {
-  assert.match(RENDER, /"user-img-path" \+ \(imgFailed\.has\(p\) \? "" : " img-pending"\)/);
+  assert.match(RENDER, /"user-img-path" \+ \(imgFailed\.has\(imgKey\(sid, p\)\) \? "" : " img-pending"\)/);
   assert.match(CSS, /\.user-img-path\.img-pending::after \{ content: " ···";/);
   assert.match(CSS, /prefers-reduced-motion: reduce\) \{ \.user-img-path\.img-pending::after \{ animation: none;/);
 });
 
-test("imgRequest carries the session id so RELATIVE mentioned paths resolve against the session cwd", () => {
-  assert.match(RENDER, /vscodeApi\.postMessage\(\{ type: "imgRequest", path: p, id: activeId \}\);/);
+test("imgRequest carries the OWNING session id so relative paths resolve against that session's cwd", () => {
+  // the caller-passed sid, never activeId: a background prebuild renders hidden tabs while another
+  // session is active, and baking activeId asked the wrong session (often the wrong HOST) for the bytes
+  assert.match(RENDER, /vscodeApi\.postMessage\(\{ type: "imgRequest", path: p, id: sid \}\);/);
   assert.match(KERNEL, /_img_data_url\(_resolve_open_path\(p, msg\.get\("id"\)\)\)/);
 });
 

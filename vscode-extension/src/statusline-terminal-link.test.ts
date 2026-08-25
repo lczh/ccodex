@@ -12,7 +12,7 @@ const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "
 test("asFolderLink routes by host: BROWSE on the web, folder-open in VS Code (the user 2026-08-14)", () => {
   assert.match(SRC, /function asFolderLink\(elem: HTMLElement, cwd: string, sid\?: string\): void/);
   // web dashboard → the file browser (works from every device); VS Code keeps the host-side open
-  assert.match(SRC, /elem\.dataset\.act = web && window\.parent !== window \? "browseFiles" : "openFolder";/);
+  assert.match(SRC, /elem\.dataset\.act = web \? "browseFiles" : "openFolder";/);   // pane-local browse needs no shell frame (2026-08-24)
   assert.match(SRC, /elem\.dataset\.cwd = cwd;/);
   assert.match(SRC, /elem\.classList\.add\("folder-link"\)/);
   assert.match(SRC, /click to browse this folder/);

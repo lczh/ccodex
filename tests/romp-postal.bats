@@ -92,6 +92,10 @@ iso() { mkdir -p "$XDG_STATE_HOME/romp"; printf '{"%s":{"postalServiceOff":true}
     [ "$status" -eq 0 ]
     [[ "$output" == *"alpha (you)"* ]]
     [[ "$output" == *"beta"* ]]
+    # every row carries its short stable id (2026-08-24): the rename-proof address, and what a
+    # duplicate-name refusal's candidates can be matched against
+    [[ "$output" == *"alpha (you) · uuid-a"* ]]
+    [[ "$output" == *"beta · uuid-b"* ]]
 }
 
 # ── comment threads (the user 2026-08-22): a thread is a real forked session hidden until promotion;

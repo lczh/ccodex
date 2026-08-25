@@ -10,6 +10,8 @@ import { distillText, distillInputs, applyDistillLine, distillPending, distillSt
 import { spinFor, KIND_WORD, waitedSuffix } from "./spin-caption";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { searchMatches, searchSids } from "./feed-search";
+import { cardInView, outsideView, outsideViewCount, viewLabel } from "./feed-view";
+import { SessionViews, viewsKey } from "./session-views";
 import { freezeDiff } from "./feed-freeze";
 import { hostNameNodes, hostPartsNodes, hostIsDown, hostDownNote, hostOf } from "./host-prefix";
 import { extHoverMatches } from "./card-key";
@@ -53,6 +55,7 @@ interface AskTreeNode {
   trgb?: [number, number, number];                               // last-activity recency tint (timestamp)
   cleared?: boolean;                                             // user-cleared sub (nodeOverride op:clear) → struck-through faded row + "cleared" chip; the mark stays tied to status (box = done, the user 2026-07-26)
   reviewedEarlier?: boolean;                                     // this done sub predates the top's review boundary (kernel flatten ↔ jd.review_boundary, the distiller's own scoping) → collapsed behind one "N reviewed earlier" row (the user 2026-08-19)
+  parked?: { n: number } | null;                                 // LEAPFROGGED open row (kernel _parked_rows, the user 2026-08-24): nothing filed under it while n younger siblings were dispatched past it → quiet "parked" tag + the card's dim sub-goals suffix; retires on its own delegation edge or any verdict
   log?: NodeLogRow[] | null;                                     // the node's newest verdict rows (kernel _node_log_rows, non-done only) → the modal's per-item story (the user 2026-07-20)
   children: string[];
 }
@@ -467,6 +470,14 @@ let sessionOrder: string[] = [];
 // menu lists exactly the tabs (the user 2026-08-08) — a session with no cards still appears, and
 // filtering to it shows an empty board. Federation prefixes sid+name per host and concatenates.
 let sessionsMeta: { sid: string; name: string; color: { bg: string; fg: string } | null }[] = [];
+// The ACTIVE session view (the user 2026-08-24): the same views blob every tabOrder push carries,
+// riding the feed payload — the board's cards gate on it (feed-view.ts / viewFiltered). The pending
+// copy is the tab strip's own optimistic convention (render.ts pendingSessionViews): a view switch
+// from THIS page applies at once and holds until the kernel's echo matches by shape (viewsKey) or
+// three pushes pass — a push count, never a timer.
+let feedViews: SessionViews | null = null;
+let feedViewsPending: SessionViews | null = null;
+let feedViewsPendingAge = 0;
 // The one session the board is filtered to, or null — the DEFAULT, nothing selected, everything shows.
 // sessionStorage, deliberately: it survives this tab's reloads (webviews reload on updates) but a fresh
 // window always starts unfiltered — a filter that persisted for days would read as silently lost cards.
@@ -875,7 +886,14 @@ function makeAskCard(it: AskItem): HTMLElement {
   // against the chips whenever it does fit on the one line.
   const origin = el("a", "fask-origin"); origin.style.display = "none";
   origin.title = "this work was delegated from another session — click to open it";
-  idwrap.append(name);
+  // ↪ BREAKTHROUGH cue (the user 2026-08-24): this card's session is OUTSIDE the active view — it
+  // shows anyway because it needs you (the interrupt rule); the cue says why it's here. Quiet, the
+  // ↪ provenance family, never a status colour.
+  const viewbreak = el("span", "fask-viewbreak"); viewbreak.style.display = "none";
+  viewbreak.textContent = "\u21aa outside this view";
+  viewbreak.title = "the active view hides this session — this card shows because it needs you";
+  idwrap.append(name);   // the cue is a DIRECT row2 child below: grouped mode hides idwrap wholesale,
+  //                        and a breakthrough under a session header still needs its why
   const actions = el("div", "fask-actions");
   // (the "reopened" chip was DELETED 2026-07-07: dead since cleared-is-sealed-forever made a follow-up
   // to a cleared card a FRESH goal (2026-06-22) — the kernel never produced the flag again.)
@@ -999,7 +1017,7 @@ function makeAskCard(it: AskItem): HTMLElement {
   // direct children they render in BOTH modes, count toward row2's grouped-mode liveness, and the
   // API badge stays immediately before its Retry button — one visual unit. idwrap keeps only the
   // name. Placement only; every badge's mint/retire semantics are untouched.
-  row2.append(idwrap, retryBadge, apiBadge, apiRetry, jauthBadge, blkBadge, origin, fupBadge, dcBadge, nfBadge, intingBadge, intBadge, warnChip, waitOnBadge);
+  row2.append(idwrap, retryBadge, apiBadge, apiRetry, jauthBadge, blkBadge, origin, viewbreak, fupBadge, dcBadge, nfBadge, intingBadge, intBadge, warnChip, waitOnBadge);
   // the bell BUTTON (the user 2026-07-28): INLINE in row1's metadata cluster, right after the
   // timestamp (the last line's tail), the one spot that never shoves the title — and in-flow, so it
   // cannot overlap the floated Clear. It hides with VISIBILITY, so its slot is reserved whether or
@@ -1124,6 +1142,7 @@ function makeAskCard(it: AskItem): HTMLElement {
     // never fires and the timeline/chat highlight stuck until you moved the mouse (the user 2026-07-03). The
     // synthetic mouseleave runs the exact leave logic (clears the highlight, or restores a pinned card's).
     card.dispatchEvent(new MouseEvent("mouseleave"));
+    dressHeaderIfLast(card, it.sid);   // the run's last card takes its header with it — one motion (2026-08-24)
     pendingCleared.add(it.itemId);   // suppress from incoming pushes until the kernel confirms the clear
     clearedStack.push([it]);         // cache for an instant optimistic Undo
     card.classList.add("dismissing");
@@ -1219,6 +1238,7 @@ function makeAskCard(it: AskItem): HTMLElement {
   a._taskBtn = taskBtn; a._taskLbl = taskLbl;
   a._awaitSpin = awaitSpin; a._awaitWhy = awaitWhy;
   a._origin = origin;
+  a._viewbreak = viewbreak;
   return card;
 }
 
@@ -1388,6 +1408,28 @@ function applySections(a: any, it: AskItem, distillShown: boolean): void {
   const subBtn = a._subBtn as HTMLElement;
   subBtn.style.display = hasSubs ? "" : "none";
   subBtn.textContent = subCount === 1 ? "1 sub-goal" : subCount + " sub-goals";
+  // dim " · N parked" suffix (the user 2026-08-24): the card-level gist of the row tags. Counts ONLY
+  // rows the checklist this button toggles can actually reach — the same walk, stopping at handoff
+  // nodes (delegations render in their own section) and at the root (the card head, not a row) — so
+  // the suffix never advertises rows no expansion reveals (review 2026-08-24; a parked ask under a
+  // LIVE delegation is the modal tree's to show).
+  let parkedCount = 0;
+  if (root) {
+    const pseen = new Set<string>([root.id]);
+    const pwalk = (nid: string) => {
+      const n = byId.get(nid);
+      if (!n || n.kind === "handoff" || pseen.has(n.id)) return;
+      pseen.add(n.id);
+      if (n.parked && n.parked.n) parkedCount++;
+      for (const c of n.children || []) pwalk(c);
+    };
+    for (const c of (root.children || [])) pwalk(c);
+  }
+  if (hasSubs && parkedCount) {
+    const pk = el("span", "fask-subparked");
+    pk.textContent = " · " + parkedCount + " parked";
+    subBtn.appendChild(pk);
+  }
   subBtn.classList.toggle("on", choice === "subgoals");
   subBtn.setAttribute("aria-pressed", choice === "subgoals" ? "true" : "false");
   subBtn.title = choice === "subgoals" ? "hide the sub-goals" : "show the sub-goals";
@@ -1491,6 +1533,7 @@ function applySections(a: any, it: AskItem, distillShown: boolean): void {
       const txt = el("span", "fcheck-text"); txt.textContent = s.text;
       row.append(tri, mark, txt);
       if (s.cleared) row.appendChild(clearedTag());   // the strike alone doesn't say WHY — see CLEARED_TIP
+      if (s.parked && s.parked.n && !s.cleared) row.appendChild(parkedTag(s.parked.n));   // leapfrogged — see parkedTag
       // clicks match the modal tree node exactly (text → the message, checkbox → where it resolved) via the
       // SAME wireNodeZones; a dim repeat is display-only (wire=false).
       wireNodeZones(it, s, mark, txt, null, !repeat);
@@ -1564,6 +1607,8 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
   a._name.replaceChildren(...hostNameNodes(it.name, it.sid));   // remote "host:" prefix = quiet metadata
   if (it.color) a._name.style.color = it.color.bg;
   setWorkDot(a._name, dotFor(it.name));   // working/awaiting dot before the session name
+  // a card on the board whose session the active view HIDES is a breakthrough — say why it's here
+  (a._viewbreak as HTMLElement).style.display = outsideView(feedViews, it.sid) ? "" : "none";
   // ↪ courier handoff: planted by a peer's message → "↪ from <sender>", click opens the sender
   const og = a._origin as HTMLElement;
   if (it.origin && it.origin.peer) {
@@ -2180,6 +2225,9 @@ function makeGroupCard(g: AskGroup): HTMLElement {
   const row2 = el("div", "fask-row2");
   const idwrap = el("div", "fask-id");
   const name = el("a", "fname"); name.title = "open this session";
+  const gviewbreak = el("span", "fask-viewbreak"); gviewbreak.style.display = "none";
+  gviewbreak.textContent = "\u21aa outside this view";   // breakthrough cue — same dress as the ask card's
+  gviewbreak.title = "the active view hides this session — this card shows because it needs you";
   idwrap.append(name);   // no "· N parts" label — the member checklist below already shows the count
   const clr = el("button", "fdismiss"); clr.textContent = "Clear"; clr.title = "clear ALL sub-asks of this request (inbox-zero)";
   // Clear rides row1's action corner in every mode (the user 2026-08-08) — matches the ask card. Same
@@ -2188,7 +2236,7 @@ function makeGroupCard(g: AskGroup): HTMLElement {
   const btns = el("span", "fask-btns");
   btns.append(clr);
   row1.append(btns);
-  row2.append(idwrap);
+  row2.append(idwrap, gviewbreak);   // the cue is a row2 SIBLING: grouped mode hides idwrap wholesale
   const memberList = el("div", "fgroup-members");   // no row3: the group card has no time-row content left
   main.append(row1, row2, memberList);
   card.append(main);
@@ -2200,6 +2248,7 @@ function makeGroupCard(g: AskGroup): HTMLElement {
     ev.stopPropagation();
     card.dispatchEvent(new MouseEvent("mouseleave"));   // flush the group's stuck hover highlight (see the ask card's clear)
     const cur = (card as any)._g as AskGroup;
+    dressHeaderIfLast(card, cur.sid);   // a group is one session's turn — same one-motion rule (2026-08-24)
     card.classList.add("dismissing");
     clearedStack.push(cur.members.slice());   // cache the whole batch for an instant optimistic Undo
     for (const m of cur.members) { pendingCleared.add(m.itemId); vscodeApi?.postMessage({ type: "askClear", itemId: m.itemId, sid: m.sid }); }   // clear every member
@@ -2270,6 +2319,9 @@ function updateGroupCard(card: HTMLElement, g: AskGroup) {
   a._name.replaceChildren(...hostNameNodes(g.name, g.sid));
   if (g.color) a._name.style.color = g.color.bg;
   setWorkDot(a._name, dotFor(g.name));   // working/awaiting dot before the session name
+  const gbroke = outsideView(feedViews, g.sid);   // shown AND view-hidden = a breakthrough
+  const gvb = card.querySelector(".fask-viewbreak") as HTMLElement | null;
+  if (gvb) gvb.style.display = gbroke ? "" : "none";   // breakthrough cue
   a._time.textContent = relAge(hostNow - g.t);
   wireAgeTip(a._time, () => provenanceGroupRows(g.members.map(rootStart), g.t, hostNow, PROV_FMT));
   // member lines — rebuilt only when the member set or any member's status changes
@@ -2289,7 +2341,8 @@ function updateGroupCard(card: HTMLElement, g: AskGroup) {
   // user 2026-08-08 — no re-home between renders.)
   const gmode = feedPrefs().grouped;
   ((a._name as HTMLElement).parentElement as HTMLElement).style.display = gmode ? "none" : "";
-  (a._row2 as HTMLElement).style.display = gmode ? "none" : "";   // the group's row2 is only the name now
+  (a._row2 as HTMLElement).style.display = gmode && !gbroke ? "none" : "";   // the group's row2 is only the
+  //   name now — except a BREAKTHROUGH's cue (grouped hides the name via idwrap; the cue stays)
 }
 
 // Transient hover-highlight signal: hovering a modal line emits its event id(s);
@@ -2323,6 +2376,18 @@ function clearedTag(): HTMLElement {
   const tag = el("span", "fcleared-tag");
   tag.textContent = "cleared";
   tag.title = CLEARED_TIP;
+  return tag;
+}
+
+// The parked row's plain-language story (the user 2026-08-24: a queued ask silently sat 40 minutes
+// while the same card's younger items were dispatched one after another, and nothing said so). One
+// quiet word on the row, the explanation on hover — a hint, never a needs-you alarm; the kernel
+// retires it the instant the row gets its own delegation or any verdict (_parked_rows).
+function parkedTag(n: number): HTMLElement {
+  const tag = el("span", "fparked-tag");
+  tag.textContent = "parked";
+  tag.title = "nothing has happened here yet — " + n + " newer ask" + (n === 1 ? " was" : "s were")
+    + " dispatched past this one; this tag clears on its own dispatch or any ruling";
   return tag;
 }
 
@@ -2437,6 +2502,9 @@ function hasQuestionDescendant(node: AskTreeNode, byId: Map<string, AskTreeNode>
 function treeSig(it: AskItem): string {
   return it.tree.map((n) =>
     n.id + n.status + (n.cleared ? "x" : "") + (n.whoWorking ? "W" : "")
+    // parked can mint/retire off a DIFFERENT top's dispatch (tops are siblings), which changes
+    // nothing else in THIS tree — without it in the sig an open group modal kept a stale tag
+    + (n.parked && n.parked.n ? "p" + n.parked.n : "")
     + (collapsedNodes.has(it.itemId + ":" + n.id) ? "c" : "")
     + (nodeLogOpen.has(it.itemId + ":" + n.id) ? "L" : "") + ((n.log || []).length || "")).join("|");
 }
@@ -2613,6 +2681,7 @@ function renderTreeNode(box: HTMLElement, it: AskItem, node: AskTreeNode, byId: 
   if (node.status === "question") mark.title = node.qderived ? "a sub-goal inside is blocked — the ⏸ below is the ask" : "blocked — needs you";
   const txt = el("span", "ftree-text"); txt.textContent = node.text || "(node)"; line.appendChild(txt);
   if (node.cleared) line.appendChild(clearedTag());   // same one-word story as the card checklist
+  if (node.parked && node.parked.n && !node.cleared) line.appendChild(parkedTag(node.parked.n));   // and the parked hint
   // (The node's why/blocked/done rationale hover tooltip was removed 2026-06-27 — just the goal text now.)
   if (node.who && node.who !== parentWho) {
     const who = el("a", "ftree-who"); who.title = node.whoWorking ? "open this session (working now)" : "open this session";
@@ -3378,23 +3447,17 @@ function openViewMenu(btn: HTMLElement): void {
   document.addEventListener("pointerdown", viewMenuAway, true);
   document.addEventListener("keydown", viewMenuKey, true);
 }
-// The icon: an ordering glyph — three shortening bars + a direction arrow — drawn inline so
-// currentColor keeps it monochrome in every state. NOT a gear: the kernel page's strip shows its
-// ⛭ right below this footer, and two gears would read as the same control (the user 2026-08-24).
-function viewMenuGlyph(): string {
-  return '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" '
-    + 'stroke-width="1.6" stroke-linecap="round" aria-hidden="true">'
-    + '<path d="M2.5 4h8"/><path d="M2.5 8h5.5"/><path d="M2.5 12h3"/>'
-    + '<path d="M12.5 5.5v5.8"/><path d="M10.6 9.6l1.9 2 1.9-2"/></svg>';
-}
+// A WORD, not an icon (the user 2026-08-24, round two: the ordering glyph beside "Sessions ▴" read
+// as "not what I would expect for what to show"): "View ▴" says exactly what clicking does — the
+// footer's own word-button vocabulary, the same upward caret its Sessions neighbour wears. The
+// original glyph existed to be compact; one short word costs a few px and buys first-look legibility.
 function ensureViewMenuBtn(): HTMLElement {
   let b = document.getElementById("feed-viewbtn") as HTMLElement | null;
   if (!b) {
     b = el("button", "fdismiss ffollow feed-modetoggle");
     b.id = "feed-viewbtn";
-    b.innerHTML = viewMenuGlyph();
+    b.textContent = "View \u25b4";
     b.title = "view options — sort direction, single column, group by session";
-    b.setAttribute("aria-label", "view options");
     b.setAttribute("aria-haspopup", "menu");
     b.onclick = (ev) => {   // opening the menu IS the acknowledgement (same as the session filter)
       ev.stopPropagation();
@@ -3781,6 +3844,44 @@ function ensureCols(list: HTMLElement) {
 // Keyed in-place reconcile of ONE column (mixes ask + standalone cards; a card
 // whose column changed is MOVED, not rebuilt — no hover flicker). Records each key
 // in `globalDesired` for the cross-column cache cleanup the caller runs after.
+// A grouped session header leaves as ONE MOTION with its run's last card (the user 2026-08-24,
+// whose recording showed the header popping out a frame after the card finished fading): the exit
+// wears the card-dismiss family (fade + slight shrink + height collapse) instead of vanishing at
+// the next render. The element is UN-KEYED first — dropped from sessHeadEls and re-keyed to a
+// tombstone — so a reappearing run mints a FRESH header while the ghost finishes; DOM removal keys
+// on animationend (the event), with a backstop timeout so a lost event can never trap the ghost,
+// and reduced motion removes at once (no animation ever plays there).
+let sessGhostSeq = 0;
+function startSessHeadExit(key: string, head: HTMLElement): void {
+  if (sessHeadEls.get(key) === head) sessHeadEls.delete(key);
+  if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    head.remove();
+    return;
+  }
+  head.dataset.key = "x:" + (++sessGhostSeq);   // keyed-but-never-desired: survives the unkeyed-child sweep
+  head.classList.add("sess-exit");
+  const done = () => head.remove();
+  head.addEventListener("animationend", done, { once: true });
+  window.setTimeout(done, 600);                 // backstop — a lost event can never trap the ghost
+}
+// The CONJUNCTION half: when a dismissing card is its run's LAST, the header starts its exit at the
+// same moment (the same click), not at the post-dismiss render. Grouped mode only; a run with other
+// live cards keeps its header rock-steady. The walk reads the CURRENT DOM: back to the run's own
+// header, then across the run for any member that is neither the leaving card nor already dismissing.
+function dressHeaderIfLast(card: HTMLElement, sid: string): void {
+  if (!feedPrefs().grouped) return;
+  let head: HTMLElement | null = null;
+  for (let p = card.previousElementSibling as HTMLElement | null; p; p = p.previousElementSibling as HTMLElement | null) {
+    if (p.classList.contains("feed-sess-head")) { head = p; break; }
+  }
+  if (!head || head.getAttribute("data-fsid") !== sid || head.classList.contains("sess-exit")) return;
+  for (let n = head.nextElementSibling as HTMLElement | null; n && !n.classList.contains("feed-sess-head"); n = n.nextElementSibling as HTMLElement | null) {
+    if (n !== card && n.classList.contains("fitem") && !n.classList.contains("dismissing")) return;   // the run lives on
+  }
+  const key = head.dataset.key || "";
+  startSessHeadExit(key, head);
+}
+
 function reconcileCol(listEl: HTMLElement, entries: Entry[], globalDesired: Set<string>) {
   const existing = new Map<string, HTMLElement>();
   for (const c of Array.from(listEl.children) as HTMLElement[]) {
@@ -3812,7 +3913,12 @@ function reconcileCol(listEl: HTMLElement, entries: Entry[], globalDesired: Set<
     globalDesired.add(key); colDesired.add(key);
     ordered.push(card);
   }
-  for (const [k, c] of existing) if (!colDesired.has(k)) c.remove();
+  for (const [k, c] of existing) {
+    if (colDesired.has(k)) continue;
+    if (c.classList.contains("sess-exit")) continue;             // a ghost mid-exit — its end event removes it
+    if (k.startsWith("s:")) startSessHeadExit(k, c);             // headers leave as one motion (2026-08-24)
+    else c.remove();
+  }
   let cur: ChildNode | null = listEl.firstChild;
   for (const node of ordered) {
     if (cur === node) { cur = cur.nextSibling; continue; }
@@ -3973,11 +4079,16 @@ function paintJudgeLimit(): void {
 // Shared by render() and the hover-freeze badge painter, so the deferred-churn hint counts exactly
 // what the user would see move.
 function viewFiltered(list: AskItem[]): AskItem[] {
+  // the ACTIVE session view gates the board FIRST (the user 2026-08-24): the same union-aware
+  // decider the tabs read (feed-view.ts cardInView -> session-views.ts viewVisible — never a fourth
+  // fork), with the BREAKTHROUGH GUARD: a needs-you card always shows, wearing the outside-view cue.
+  // Inside this helper like every display filter — the hover-freeze churn badges count through it.
+  let shown = feedViews ? list.filter((a) => cardInView(feedViews, a.sid, askColumn(a) === "needsInput")) : list;
   // A tracked delegation's satellite lives under its delegator's PRIMARY card: the default board
   // hides it, and picking its session in the filter is the one-click path back. INSIDE this helper
   // on purpose — the hover-freeze churn badges count through it, so they see exactly what the
   // board shows (a filter outside would paint +N for cards that never appear).
-  let shown = feedOnlySid ? list.filter((a) => a.sid === feedOnlySid) : list.filter((a) => !a.satellite);
+  shown = feedOnlySid ? shown.filter((a) => a.sid === feedOnlySid) : shown.filter((a) => !a.satellite);
   const sMatch = searchSids(feedSearchQ, sessionsMeta);
   if (sMatch) shown = shown.filter((a) => sMatch.has(a.sid) || searchMatches(feedSearchQ, (a as { name?: string }).name));
   return shown;
@@ -4130,6 +4241,41 @@ function render() {
   }
   for (const tid of Array.from(groupEls.keys())) if (!desired.has("g:" + tid) && undismissed(groupEls.get(tid))) { groupEls.get(tid)?.remove(); groupEls.delete(tid); }
 
+  // "N cards outside this view" (the user 2026-08-24; the 2026-08-11 rule: what a view filters
+  // away stays one glance from reach, never silently omitted). Dim, one line, after the columns;
+  // the click switches the active view to All — optimistically (the board reflows NOW, the
+  // click-safety acknowledgement), the kernel echo reconciling through the pending-copy above.
+  const outN = feedViews ? outsideViewCount(feedViews,
+    asks.map((a) => ({ sid: a.sid, needsYou: askColumn(a) === "needsInput" }))) : 0;
+  let vmore = document.getElementById("feed-viewmore");
+  if (!vmore) {
+    vmore = el("div", "");
+    vmore.id = "feed-viewmore";
+    vmore.title = "cards from sessions the active view hides — click to switch the view to All";
+    vmore.onclick = () => {
+      if (!feedViews) return;
+      feedViewsPending = { ...feedViews, active: "all" };
+      feedViewsPendingAge = 0;
+      feedViews = feedViewsPending;
+      vscodeApi?.postMessage({ type: "setTimelineViews", views: feedViewsPending });
+      render();
+    };
+    list.appendChild(vmore);
+  }
+  // PROMOTION (the user 2026-08-25, who read a view-narrowed board as "the feed is broken": one card
+  // showed, twenty hid, and the dim line went unseen): when the view hides MORE than the board shows,
+  // the line trades the whisper for the judge-limit banner's card chrome and NAMES the view — the
+  // near-empty board must state plainly which view it is showing and how to widen. Exact rule, no
+  // heuristics: outN > (cards on the board).
+  const shownN = viewFiltered(asks).length;
+  vmore.classList.toggle("prominent", outN > shownN);
+  vmore.style.display = outN ? "" : "none";
+  if (outN) {
+    vmore.textContent = outN > shownN
+      ? "Showing the \u201c" + viewLabel(feedViews) + "\u201d view — " + outN
+        + (outN === 1 ? " card is" : " cards are") + " in other views · show all"
+      : outN + (outN === 1 ? " card" : " cards") + " outside this view — show all";
+  }
   list.scrollTop = prevScroll;
   // Stale-freeze heal (hover-freeze): a LOCAL render can detach or re-key the hovered element with
   // no mouseleave — a removed element never fires leave events (typing in search filters the card
@@ -4380,7 +4526,10 @@ function flushFreeze(): void {
     flushQueued = false;   // dispatched mid-click (the clear path) must not re-render the board under
     //                        the rest of its own handler (pendingCleared.add, .dismissing come after
     //                        the dispatch). Gesture-ordering, not a timer: no time window anywhere.
-    if (freezeKey) return; // re-armed before the tick ended → keep the queue for the next leave
+    // EITHER holder keeps the queue (post-merge audit 2026-08-24): with the keyboard scope on card
+    // A and the pointer merely visiting card B, B's mouseleave queues this flush — running it would
+    // apply the payload and move the card being keyed. The scope's own release paths all flush.
+    if (freezeKey || tabScopeKey) return;
     const m = pendingFeedPayload;
     pendingFeedPayload = null;
     if (m) applyFeedPayload(m);          // render() repaints the badges away (nothing pending)
@@ -4500,7 +4649,18 @@ window.addEventListener("keydown", (e) => {
     e.preventDefault(); e.stopPropagation();
     let i = ae ? els.indexOf(ae) : -1;
     i = e.shiftKey ? (i <= 0 ? els.length - 1 : i - 1) : (i >= els.length - 1 ? 0 : i + 1);   // WRAP at the ends
+    //                                                     (Shift+Tab = the same cycle, reversed)
     tabScopeFocus(card, els, i);
+    // SELECT-ON-FOCUS for the view pills (the user 2026-08-24): landing on a SELECTOR applies it at
+    // once, no Enter — radio-group semantics. The split: .fask-secbtn (Background/Summary/Sub-goals,
+    // which switch what the card SHOWS) are selectors; everything else — Clear, retries, the bell,
+    // follow-up, session names, sub-goal links — is an ACTION and must never fire from mere focus
+    // (action is the default for anything ambiguous). The click lives HERE, in the Tab gesture, and
+    // NOT in tabScopeFocus: the render-tail focus restore calls tabScopeFocus too, and a click there
+    // would re-apply per re-render — one application per user gesture. The already-selected pill is
+    // a no-op (focus keeps, nothing toggles), so cycling through it never flips the card's view off.
+    const landed = els[i];
+    if (landed && landed.matches(".fask-secbtn") && !landed.classList.contains("on")) landed.click();
     return;
   }
   if ((e.key === "Enter" || e.key === " ") && tabScopeKey) {
@@ -4567,6 +4727,13 @@ function applyFeedPayload(m: any): void {
   unknownSet = new Set(Array.isArray(m.stateUnknown) ? m.stateUnknown : []);   // listed-but-unreadable → gray ring, never a blank
   bgServicesMap = m.bgServices && typeof m.bgServices === "object" ? m.bgServices : {};   // session name -> judge-classified service descs → the session-header chip (2026-07-24)
   if (Array.isArray(m.order)) sessionOrder = m.order.filter((x: any) => typeof x === "string");   // grouped-mode session rank (tab/lane order)
+  if (m.views && typeof m.views === "object") {
+    const incoming = m.views as SessionViews;
+    if (feedViewsPending && (viewsKey(incoming) === viewsKey(feedViewsPending) || ++feedViewsPendingAge >= 3)) {
+      feedViewsPending = null; feedViewsPendingAge = 0;   // the echo landed (or three pushes said it never will)
+    }
+    feedViews = feedViewsPending || incoming;
+  }
   if (Array.isArray(m.sessions)) {
     sessionsMeta = m.sessions.filter((s: any) => s && typeof s.sid === "string" && typeof s.name === "string");
     // a filter aimed at a session the tab strip no longer shows is moot — clear it (the deciding

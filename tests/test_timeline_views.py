@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Session views (the user 2026-08-18; TAG model 2026-08-23): one timeline-views.json blob under
-STATE — {"active", "hidden", "tags"} — deciding which sessions show on the timeline lanes AND the
+STATE — {"active", "tags"} (the hidden set retired 2026-08-24, migrated into an "archived" tag) — deciding which sessions show on the timeline lanes AND the
 chat tab strip. TWO built-in sentinels: "all" — the DEFAULT (2026-08-24) — shows every session
-minus the hidden set; "untagged" keeps the old default's meaning (a TAG marks a SPECIALIZED
+(literally everything since 2026-08-24); "untagged" keeps the old default's meaning (a TAG marks a SPECIALIZED
 session, excluded from the untagged view and shown under its tag views). "all" used to MEAN
-untagged, so reinterpreting it lands every legacy blob on the new All default. A tagged or hidden
+untagged, so reinterpreting it lands every legacy blob on the new All default. A tagged
 session is a BACKGROUND session: still judged and carded, surfaced by the feed, the pickers, and
 the "N more" cue. The legacy "groups" key (pre-rename files and un-updated panels) reads as tags.
 Local-kernel persisted (a viewer display pref, not federated). These pin the storage helpers, the
@@ -44,16 +44,16 @@ class TimelineViews(unittest.TestCase):
         # fresh blobs open on "all" — and since 2026-08-24 that sentinel means truly-ALL, so a
         # legacy blob persisted when "all" meant untagged lands on the new default automatically
         v = km._timeline_views()
-        self.assertEqual(v, {"active": "all", "hidden": [], "tags": []})
+        self.assertEqual(v, {"active": "all", "tags": []})
         self.assertTrue(km._view_visible(v, "anything"))
 
     def test_all_shows_every_session_and_untagged_the_tagless_ones(self):
-        # ALL — the default (the user 2026-08-24) — is every session minus the hidden set: hiding is
-        # a deliberate gesture, so All respects it, but a tag no longer excludes a session there
+        # ALL — the default — shows LITERALLY EVERYTHING (the user 2026-08-24, retiring the hidden
+        # set outright: the tag system covers backgrounding); a legacy hidden key is ignored
         km._set_timeline_views({"active": "all", "hidden": ["s9"], "tags": [G1]})
         km._flags_cache.clear()
         v = km._views_client()   # _view_visible reads the RENDERED shape (string members + remoteTags)
-        self.assertFalse(km._view_visible(v, "s9"), "hidden — All respects the deliberate hide")
+        self.assertTrue(km._view_visible(v, "s9"), "a legacy hidden entry is IGNORED — nothing hides from All")
         self.assertTrue(km._view_visible(v, "s2"), "TAGGED → All still shows it")
         self.assertTrue(km._view_visible(v, "s1"), "untagged → shown")
         # the untagged view keeps the old default's meaning under its own sentinel (the user
@@ -62,13 +62,13 @@ class TimelineViews(unittest.TestCase):
         km._flags_cache.clear()
         v = km._views_client()
         self.assertEqual(v["active"], "untagged", "the sentinel survives the normalizer round-trip")
-        self.assertFalse(km._view_visible(v, "s9"), "hidden hides in the untagged view too")
+        self.assertTrue(km._view_visible(v, "s9"), "…and legacy hidden does not hide in untagged either")
         self.assertFalse(km._view_visible(v, "s2"), "TAGGED → out of the untagged view")
-        self.assertTrue(km._view_visible(v, "s1"), "tagless, not hidden → shown")
+        self.assertTrue(km._view_visible(v, "s1"), "tagless → shown")
         km._set_timeline_views({"active": "g1", "hidden": ["s2"], "tags": [G1]})
         km._flags_cache.clear()
         v = km._views_client()
-        self.assertTrue(km._view_visible(v, "s2"), "a tag view shows exactly its members — hidden or not")
+        self.assertTrue(km._view_visible(v, "s2"), "a tag view shows exactly its members")
         self.assertFalse(km._view_visible(v, "s1"), "…and nothing else")
 
     def test_legacy_groups_key_reads_as_tags(self):
@@ -87,7 +87,7 @@ class TimelineViews(unittest.TestCase):
                                      "tags": [{"id": "g1", "name": "x" * 99, "members": ["m", 3]},
                                               {"noid": True}, "junk"]})
         self.assertEqual(km._norm_timeline_views({"hidden": 7, "tags": "nope"}),
-                         {"active": "all", "hidden": [], "tags": []},
+                         {"active": "all", "tags": []},
                          "wrong-TYPED fields drop instead of raising")
         self.assertEqual(km._norm_timeline_views({"tags": [{"id": "g", "members": 3}]})["tags"][0]["members"],
                          [], "a wrong-typed members list drops, never raises")
@@ -95,27 +95,26 @@ class TimelineViews(unittest.TestCase):
         self.assertEqual(km._norm_timeline_views({"active": "untagged"})["active"], "untagged",
                          "the untagged sentinel passes the whitelist — a rewrite here is SILENT and"
                          " reads as flicker after the client's optimistic hold expires")
-        self.assertEqual(v["hidden"], ["a"], "junk and duplicates dropped")
+        self.assertNotIn("hidden", v, "a legacy hidden key is dropped outright (retired 2026-08-24)")
         self.assertEqual(len(v["tags"]), 1)
         self.assertEqual(len(v["tags"][0]["name"]), km._VIEWS_MAX_NAME)
         self.assertEqual(v["tags"][0]["members"], [{"host": "", "sid": "m"}])
 
     def test_cache_invalidates_on_write(self):
-        self.assertEqual(km._timeline_views()["hidden"], [])
-        km._set_timeline_views({"hidden": ["s9"]})
-        self.assertEqual(km._timeline_views()["hidden"], ["s9"], "mtime+size key sees the write")
+        self.assertEqual(km._timeline_views()["tags"], [])
+        km._set_timeline_views({"tags": [{"id": "g9", "name": "pool", "members": ["s9"]}]})
+        self.assertEqual([t["id"] for t in km._timeline_views()["tags"]], ["g9"], "mtime+size key sees the write")
 
-    def test_churn_heal_copies_hidden_and_membership(self):
-        # COPY, never move: stripping the old sid un-hid its dead lane (it lingers on the timeline for
-        # hours), and a still-alive same-name session would have its state stolen
-        km._set_timeline_views({"active": "all", "hidden": ["old"], "tags": [
+    def test_churn_heal_copies_membership(self):
+        # COPY, never move (the hidden half retired with the set, 2026-08-24): a still-alive
+        # same-name session would have its state stolen by a move
+        km._set_timeline_views({"active": "all", "tags": [
             {"id": "g1", "name": "pool", "members": ["old", "other"]}]})
         km._heal_timeline_views("old", "new")
         v = km._timeline_views()
-        self.assertEqual(v["hidden"], ["new", "old"], "the fork inherits the hidden bit; the old sid keeps it")
         self.assertEqual(v["tags"][0]["members"],
                          [{"host": "", "sid": x} for x in ("new", "old", "other")],
-                         "membership copies the same way")
+                         "the fork inherits membership; the old sid keeps it")
         before = json.loads((jd.STATE / "timeline-views.json").read_text())
         km._heal_timeline_views("stranger", "new2")   # untouched sid → no write at all
         self.assertEqual(json.loads((jd.STATE / "timeline-views.json").read_text()), before)
@@ -125,9 +124,39 @@ class TimelineViews(unittest.TestCase):
         km._write_session_order(["old"])
         (jd.STATE / "names").mkdir(parents=True, exist_ok=True)
         (jd.STATE / "names" / "old").write_text("web\t/tmp\t#123456\twhite\n")
-        km._set_timeline_views({"active": "all", "hidden": ["old"], "tags": []})
+        km._set_timeline_views({"active": "all", "tags": [{"id": "g1", "name": "pool", "members": ["old"]}]})
         km._ordered([{"sid": "old", "name": "web"}, {"sid": "new", "name": "web"}])
-        self.assertEqual(km._timeline_views()["hidden"], ["new", "old"], "copied, so the dead lane stays hidden too")
+        self.assertEqual(km._timeline_views()["tags"][0]["members"],
+                         [{"host": "", "sid": "new"}, {"host": "", "sid": "old"}],
+                         "membership copied, so the fork keeps its tag")
+
+    def test_stored_hidden_entries_migrate_into_the_archived_tag_once(self):
+        # the ONE-TIME MIGRATION (the user 2026-08-24, retiring hide-from-chat outright): a blob
+        # persisted by the pre-retirement normalizer still carries hidden entries — the first read
+        # maps them into an "archived" tag (muted color), drops the key, and persists; they show
+        # under All (nothing hides from All now) and stay out of the untagged view.
+        raw = {"active": "all", "hidden": ["s7", "s8"], "tags": [{"id": "g1", "name": "pool", "members": ["s2"]}]}
+        (jd.STATE / "timeline-views.json").write_text(json.dumps(raw))
+        km._flags_cache.clear()
+        v = km._timeline_views()
+        self.assertNotIn("hidden", v)
+        arch = next(t for t in v["tags"] if t["name"] == "archived")
+        self.assertEqual(arch["members"], [{"host": "", "sid": "s7"}, {"host": "", "sid": "s8"}])
+        self.assertEqual(arch["color"], "#6b7280", "a muted slate — never a status color")
+        on_disk = json.loads((jd.STATE / "timeline-views.json").read_text())
+        self.assertNotIn("hidden", on_disk, "the mapping persisted — the next read has nothing to migrate")
+        rendered = km._views_client()   # _view_visible reads the RENDERED shape (string members)
+        self.assertTrue(km._view_visible(rendered, "s7"), "archived sessions SHOW under All")
+        self.assertFalse(km._view_visible(dict(rendered, active="untagged"), "s7"), "…and stay out of untagged (tagged now)")
+        # idempotent: a second read (fresh cache) neither duplicates members nor re-mints the tag
+        km._flags_cache.clear()
+        v2 = km._timeline_views()
+        self.assertEqual([t["name"] for t in v2["tags"]].count("archived"), 1)
+        self.assertEqual(next(t for t in v2["tags"] if t["name"] == "archived")["members"], arch["members"])
+        # an install with NO hidden entries never mints the tag
+        (jd.STATE / "timeline-views.json").write_text(json.dumps({"active": "all", "tags": []}))
+        km._flags_cache.clear()
+        self.assertEqual(km._timeline_views()["tags"], [], "minted only when hidden entries exist")
 
     def test_ws_op_persists_via_normalizer(self):
         # the handler body is _set_timeline_views + _mark_views_dirty; pin the setter's normalization
@@ -230,21 +259,57 @@ class TimelineViews(unittest.TestCase):
         finally:
             km._remotes.clear(); km._remotes.update(saved)
 
-    def test_a_down_kernel_contributes_nothing_and_active_hidden_stay_local(self):
+    def test_a_down_kernels_CACHE_keeps_contributing_and_active_hidden_stay_local(self):
+        # REVERSED from v0 (the user 2026-08-24, the untagged-view bug): visibility must not flap
+        # with a peer's restart, so the last-known tags keep excluding from untagged and keep their
+        # views pickable while the link reconnects. Bounded staleness — the auto-reconnect heals
+        # within a pass, and detach pops the row and its cache with it.
         saved = dict(km._remotes)
         try:
             km._remotes.clear()
             self._attach("alpha", {"tags": [{"id": "g1", "name": "team", "members": []}]}, status="down")
             v = km._views_client()
-            self.assertNotIn("remoteTags", v, "a down kernel's cached tags never join the union")
+            self.assertEqual([t["id"] for t in v.get("remoteTags") or []], ["alpha:g1"],
+                             "the cached read stands while the kernel reconnects")
             # a remote-tag ACTIVE survives normalization (validated at read time, ":" is the marker);
             # hidden stays exactly the viewer-local list — neither is federated state
-            n = km._norm_timeline_views({"active": "alpha:g1", "hidden": ["h1"], "tags": []})
+            n = km._norm_timeline_views({"active": "alpha:g1", "hidden": ["h1"], "tags": []})   # legacy hidden: dropped below
             self.assertEqual(n["active"], "alpha:g1")
-            self.assertEqual(n["hidden"], ["h1"])
+            self.assertNotIn("hidden", n, "legacy hidden dropped (retired 2026-08-24); active stays local")
             # a client echoing the derived remoteTags back never persists it
             n2 = km._norm_timeline_views({"active": "all", "remoteTags": [{"id": "x"}], "tags": []})
             self.assertNotIn("remoteTags", n2)
+        finally:
+            km._remotes.clear(); km._remotes.update(saved)
+
+    def test_untagged_excludes_by_the_UNION_both_tag_homes(self):
+        # the user's repro (2026-08-24): they tagged a session from the chat while showing only
+        # untagged, and it STAYED — the untagged branch counted local tags only, so a REMOTE-homed
+        # tag never excluded. A tag is its NAME wherever it homes: held by any kernel's tag = tagged.
+        saved = dict(km._remotes)
+        try:
+            km._remotes.clear()
+            # remote-homed: the viewer's kernel holds no tag at all; alpha's tag holds two sessions —
+            # one of alpha's own, and one of OURS (the local sid, known here)
+            (jd.STATE / "names").mkdir(parents=True, exist_ok=True)
+            (jd.STATE / "names" / "00000000-aaaa-bbbb-cccc-000000000002").write_text("cards\t/tmp\t#123456\twhite\n")
+            self._attach("alpha", {"tags": [{"id": "g1", "name": "workers", "color": "#DD42FF",
+                                             "members": [{"host": "", "sid": "rsid1"},
+                                                         {"host": "viewer", "sid": "00000000-aaaa-bbbb-cccc-000000000002"}]}]})
+            km._set_timeline_views({"active": "untagged", "hidden": [], "tags": []})
+            km._flags_cache.clear()
+            v = km._views_client()
+            self.assertFalse(km._view_visible(v, "alpha:rsid1"),
+                             "a remote-homed tag excludes its member from untagged")
+            self.assertFalse(km._view_visible(v, "00000000-aaaa-bbbb-cccc-000000000002"),
+                             "…including OUR OWN session it holds — the exact reported case")
+            self.assertTrue(km._view_visible(v, "someone-else"))
+            # local-homed: unchanged behavior, pinned beside it
+            km._set_timeline_views({"active": "untagged", "hidden": [],
+                                    "tags": [{"id": "gL", "name": "local", "members": ["locsid"]}]})
+            km._flags_cache.clear()
+            v = km._views_client()
+            self.assertFalse(km._view_visible(v, "locsid"))
         finally:
             km._remotes.clear(); km._remotes.update(saved)
 

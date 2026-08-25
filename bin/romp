@@ -659,7 +659,8 @@ EOF
     _romp_cmd "romp fork <parent> <name>"  -            "Branch a session into a new parallel one (parent untouched; --at <uuid> picks the cut)"
     _romp_cmd "romp rename <session> <name>" -          "Rename a session (uuid-keyed: mailboxes, goals and history all follow)"
     _romp_cmd "romp color <session> [<#hex|1-9>]" -     "Recolor a session's identity swatch (palette hex or slot 1-9; no color arg reads bg/fg)"
-    _romp_cmd "romp tag [<name>] [--add ...]" -         "Session tags: bare lists them; <name> with --add/--remove/--color/--delete merges one (a tagged session leaves the untagged view); --host <kernel> edits an attached kernel's tag; --rename renames"
+    _romp_cmd "romp tag [<name>] [--add ...]" -         "Session tags: bare lists them; <name> with --add/--remove/--color/--delete merges one (a tagged session leaves the no-tags view); --host <kernel> edits an attached kernel's tag; --rename renames"
+    _romp_cmd "romp watch-pr <n> [--repo o/r]" -        "One mail here when the PR lands or fails — the kernel owns the watch, so it survives restarts (replaces the mortal shell loop)"
     _romp_cmd "romp mail ..."              romp-postal-service  "Romp Postal Service: send <to> <text> | inbox | agents | remote"
     _romp_cmd "romp send <session> [--tag <label>] <text>" - "Hand a session a message; scripts/cron SHOULD pass --tag so it renders machine-sent, not as your typed words"
     _romp_cmd "romp interrupt <session>"   -            "Interrupt a session's current turn"
@@ -949,6 +950,64 @@ fi
 # payload only when given — an absent color means keep, "" would mean clear. A bare NAME with no
 # edit flag READS that one tag (exit 1 when absent) — creating on a read-shaped call minted
 # phantoms from typos. "group" is the pre-rename alias, accepted quietly.
+# PR-landing watch (the user 2026-08-24, both teams' surveys): register kernel-owned interest in a
+# PR and get ONE [romp] mail when it reaches a terminal state (merged, closed, or a failed check) —
+# replacing the mortal `while :; gh pr view; sleep 30` loop that died with every kernel restart.
+# The SESSION defaults to the caller (ROMP_SID, spawn-frozen in SDK sessions; --session overrides);
+# the REPO defaults to the caller's checkout (gh resolves it from cwd; --repo overrides). Both
+# resolve CLIENT-side so the kernel route stays explicit.
+if [[ "${1:-}" == "watch-pr" ]]; then
+    shift
+    _wp_usage="usage: romp watch-pr <number> [--repo <owner/name>] [--session <name>]"
+    _wp_pr=""; _wp_repo=""; _wp_sess=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --repo)    shift; [[ $# -eq 0 || -z "$1" || "$1" == -* ]] && { echo "$_wp_usage" >&2; exit 2; }
+                       _wp_repo="$1"; shift ;;
+            --session) shift; [[ $# -eq 0 || -z "$1" || "$1" == -* ]] && { echo "$_wp_usage" >&2; exit 2; }
+                       _wp_sess="$1"; shift ;;
+            -*)        echo "$_wp_usage" >&2; exit 2 ;;
+            *)         [[ -n "$_wp_pr" ]] && { echo "$_wp_usage" >&2; exit 2; }
+                       _wp_pr="$1"; shift ;;
+        esac
+    done
+    if [[ -z "$_wp_pr" || ! "$_wp_pr" =~ ^[0-9]+$ ]]; then echo "$_wp_usage" >&2; exit 2; fi
+    if [[ -z "$_wp_repo" ]]; then
+        _wp_repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+        if [[ -z "$_wp_repo" ]]; then
+            echo "romp watch-pr: no --repo given and the current directory has no gh-resolvable repo" >&2
+            exit 1
+        fi
+    fi
+    _wp_who="$_wp_sess"
+    if [[ -z "$_wp_who" ]]; then
+        if [[ -z "${ROMP_SID:-}" ]]; then
+            echo "romp watch-pr: --session <name> required outside a romp SDK session (ROMP_SID is not set)" >&2
+            exit 2
+        fi
+        _wp_who="$ROMP_SID"
+    fi
+    _tok="$(_romp_token)"
+    _kport="${ROMP_KERNEL_PORT:-29855}"
+    if [[ -z "$_tok" ]]; then
+        echo "romp watch-pr: the kernel isn't running (no serve token). Start romp first." >&2
+        exit 1
+    fi
+    _wp_key="id"; [[ -n "$_wp_sess" ]] && _wp_key="name"
+    _payload="$(python3 -c 'import json,sys; print(json.dumps({"pr": int(sys.argv[1]), "repo": sys.argv[2], sys.argv[3]: sys.argv[4]}))' \
+        "$_wp_pr" "$_wp_repo" "$_wp_key" "$_wp_who")"
+    _resp="$(_romp_token_cfg | curl -sf -m 15 --config - -X POST "http://127.0.0.1:$_kport/watch-pr" \
+                  -H 'Content-Type: application/json' -d "$_payload")" \
+        || { echo "romp watch-pr: kernel not reachable on :$_kport (is romp running?)" >&2; exit 1; }
+    if [[ "$_resp" == *'"ok": true'* || "$_resp" == *'"ok":true'* ]]; then
+        echo "romp watch-pr: watching $_wp_repo#$_wp_pr — one mail here when it lands or fails"
+        exit 0
+    fi
+    _err="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("error") or sys.argv[1])' "$_resp" 2>/dev/null || printf '%s' "$_resp")"
+    echo "romp watch-pr: refused — $_err" >&2
+    exit 1
+fi
+
 if [[ "${1:-}" == "tag" || "${1:-}" == "group" ]]; then
     shift
     _gr_usage="usage: romp tag [--json]
@@ -1024,7 +1083,8 @@ def spell(x):
     return x
 groups = v.get("tags") or v.get("groups") or []   # older kernel: pre-rename key
 act = v.get("active") or "all"
-act = next((g.get("name") for g in groups if g.get("id") == act), act)
+act = {"all": "All", "untagged": "no tags"}.get(act) \
+    or next((g.get("name") for g in groups if g.get("id") == act), act)
 print("active view: %s" % act)
 for g in groups:
     m = [names.get(spell(x)) or spell(x) for x in (g.get("members") or [])]

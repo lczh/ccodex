@@ -55,7 +55,7 @@ test("the page's own kernel-socket recovery (romp:wsup) heals everything the sam
 
 test("imgFailed is no longer forever: a reconnect gives every parked path ONE fresh host round-trip", () => {
   assert.match(RENDER, /function healPathImgs\(\): void \{/);
-  assert.match(RENDER, /const failed = Array\.from\(imgFailed\);\s*\n\s*imgFailed\.clear\(\);/);
-  assert.match(RENDER, /if \(!imgRequested\.has\(p\)\) \{/, "in-flight asks still dedup");
+  assert.match(RENDER, /const failed = new Set\(imgFailed\);\s*\n\s*imgFailed\.clear\(\);/);
+  assert.match(RENDER, /if \(!imgRequested\.has\(k\)\) \{/, "in-flight asks still dedup — per (sid, path) key");
   assert.match(RENDER, /installMdImgHeal\(\);/, "the md-img capture heal is installed once at boot");
 });

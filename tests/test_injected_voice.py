@@ -22,7 +22,9 @@ Scope note — what is deliberately NOT checked:
   session manager's bookkeeping to ignore (the user 2026-07-25). Pinned by test_session_prompt.py.
 - sdk_backend's "[romp] The kernel restarted…" notices, which are genuinely ABOUT romp: they tell a
   session why its turn was cut, so naming it is the point (and the housekeeping note gives the
-  name meaning).
+  name meaning). The rename ping (RENAME_NUDGE, 2026-08-24) is the same family — it tells a session
+  its own new name — and is pinned below to stay one marker-free line with no romp nouns beyond
+  the sanctioned prefix.
 
 SYNTHETIC fixtures only (placeholder ids, invented goal text).
 """
@@ -159,6 +161,23 @@ class InjectedBodiesSpeakAsTheUser(unittest.TestCase):
                                      "%r speaks romp at the session (%r: %s). Write it as the person "
                                      "it works for asking — see CLAUDE.md, 'Messages we inject into a "
                                      "session'." % (name, word, why))
+
+    def test_the_rename_ping_stays_one_clean_mechanics_line(self):
+        # the [romp] prefix is the sanctioned mechanics family (the restart notices' shape); past
+        # it, the line must speak plainly — no markers (it joins an EXISTING message and would
+        # re-author it), no romp nouns, one line
+        import os as _os
+        from importlib.machinery import SourceFileLoader as _L
+        sb = _L("romp_sdk_backend_voice", _os.path.join(BIN, "romp_sdk_backend.py")).load_module()
+        line = sb.RENAME_NUDGE % "tests"
+        self.assertTrue(line.startswith("[romp] "), "the sanctioned mechanics prefix")
+        self.assertNotIn("\n", line, "one line")
+        self.assertNotIn("<!--", line, "marker-free — it rides inside an existing message")
+        body = line.split("]", 1)[1].lower()
+        for word, why in ROMP_WORDS:
+            self.assertNotIn(word, body, "the ping speaks plainly past its prefix (%r: %s)" % (word, why))
+        self.assertIn("renamed", body)
+        self.assertIn("'tests'", body, "…and it names the new name itself")
 
     def test_the_untitled_fallback_names_no_romp_object(self):
         # a node with no text still renders SOMETHING; that placeholder must not smuggle in "goal"

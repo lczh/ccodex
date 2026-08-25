@@ -176,7 +176,7 @@ test("highlights re-apply after every render path", () => {
 
 test("a comments frame refreshes the open popover IN PLACE — composer and caret survive", () => {
   assert.match(UI, /prev\.dataset\.mode === mode && prev\.dataset\.tid === \(th \? th\.tid : create!\.uuid\)\s*\n\s*&& prev\.dataset\.status === status/);
-  assert.match(UI, /function fillCommentMsgs\(list: HTMLElement, th: CommentThread\)/);
+  assert.match(UI, /function fillCommentMsgs\(list: HTMLElement, th: CommentThread, sid: string\)/);
 });
 
 test("the working state starts on the gesture, and delete is optimistic and cuts the work", () => {

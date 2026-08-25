@@ -13,7 +13,7 @@ import diff from "highlight.js/lib/languages/diff";
 import yaml from "highlight.js/lib/languages/yaml";
 import type { ParsedAsk } from "../ask-types";
 import { TABBAR_H_KEY, TABBAR_H_DEFAULT, clampTabbarH, parseTabbarH } from "./tabbar-resize";
-import { SessionViews, viewVisible, viewsKey, hideIn, revealIn } from "./session-views";
+import { SessionViews, viewVisible, viewsKey, revealIn, viewTagUnion, viewTags, type TagUnion, type SessionTag } from "./session-views";
 import { syncSessionsFromTabMeta, applyMetaToSession, notePendingMeta, PendingTabMeta } from "./tab-meta";
 import { markerLabel, dayContext } from "./time-marker";
 import { compactDisplay, toolCounts, type DisplayItem } from "./compact";
@@ -37,6 +37,7 @@ import { previewKind, previewFull, canPreview, fileUrl, retryFailedPreviews, ref
 import { openFileView } from "./file-view";
 // initFileView rides its OWN line: the import above is pinned verbatim by file-view.test.ts
 import { initFileView } from "./file-view";
+import { initFileBrowse, openFileBrowse } from "./file-browse";   // the browser is pane-local here now (the user 2026-08-24)
 import { pastedFilePath } from "./paste-path";
 import { hostNameNodes, hostPrefix, hostOf, hostIsDown, hostDownNote } from "./host-prefix";
 import { dirStatusHint, nextDirActive, createDirPrompt, type DirStatus } from "./dir-complete";
@@ -488,7 +489,7 @@ function postViews(v: SessionViews) {
 // dressed .tab-peek ("breaks the view's rules") — and auto-closing: activating any other tab drops
 // it, no explicit close. Per-dashboard client state like the pending-views copy above: never
 // persisted, never federated, never written to timeline-views.json — a click is a peek, not a view
-// edit (the picker's "Hidden — reveal" row keeps the real unhide). Sending a message from a peeked
+// edit (the picker's other-view row jumps views instead — the hidden set retired 2026-08-24). Sending a message from a peeked
 // session does NOT pin it: the peek still drops on click-away, and the session stays reachable via
 // the feed and the nav trail. Nav history stores only the sid — back/forward lands in setActive
 // like every activation, which re-derives peek-vs-normal from the CURRENT views (a since-revealed
@@ -508,6 +509,15 @@ fetch(kernelUrl("/palette"), { cache: "no-store" }).then((r) => r.json())
 const mru: string[] = [];             // recency stack, front = most-recently-active (close → return to previous)
 let activeId: string | null = null;
 let renderingSid: string | null = null;   // the session id syncView is currently building (for per-session fold keys)
+// The SESSION whose transcript DOM is being built — the id preview/image URLs must bake in, host prefix
+// included. Distinct from renderingSid, which is a fold KEY the comment popover retargets to its thread id.
+// Baking activeId instead routed a background build's file fetches at whatever session the user was READING:
+// the idle prebuild renders hidden tabs' new turns, so a federated session's figures asked the WRONG host's
+// kernel, whose truthful 404 looped "fetching → not found" on files that exist — and every retry/heal
+// re-fetches the closure's captured URL, so only the next send's tail re-render ever fixed it (the user
+// 2026-08-24, the recurring inline-preview failure). Same class for relative paths across LOCAL sessions:
+// they resolved against the active session's cwd, not the owning session's.
+let renderingOwnerSid: string | null = null;
 // TRUE while fillCommentMsgs renders into the comment popover (the user 2026-08-23): the thread uses
 // the chat's own renderer deliberately — but the transcript-COUPLED hover machinery must stay out.
 // wireTurnHover's glow band appends to turn.parentElement (the .cmt-msgs list, positioned nowhere the
@@ -787,25 +797,18 @@ function openPath(path: string, sid?: string | null): void {
 // gated off at their call sites (the editor has its own explorer, and the webview can't reach the
 // kernel origin anyway).
 function openBrowse(path: string, sid?: string | null): void {
+  // PANE-LOCAL since 2026-08-24 (the user: it opened over the FEED cards — the wrong pane): the
+  // browser is a modal over the chat that launched it, the same document the viewer already uses —
+  // no shell lift, no pane juggling (the shell's browseClosed restore is a no-op here: it only
+  // fires when the shell itself lifted the feed). Web-only stands — the VS Code webview cannot
+  // reach the kernel origin, and the editor has its own explorer.
   const web = location.protocol === "http:" || location.protocol === "https:";
-  if (!web || window.parent === window) return;
-  try {
-    window.parent.postMessage({ romp: "browseFiles", path: path || ".", sid: sid || activeId || null }, "*");
-  } catch { /* no shell — nothing to surface into */ }
+  if (!web) return;
+  openFileBrowse(path || ".", sid || activeId || null);
 }
-
-// The viewer's directory half asks for the BROWSER by posting {romp:'browseFiles'} to its OWN window
-// (file-view.ts): in the feed document initFileBrowse answers it, but the chat hosts no browser, so
-// this forwarder hands the ask to the shell — openBrowse's exact relay — which brings the feed pane
-// forward and delivers it there. Without it that click is a silent no-op in a chat-opened viewer.
-// openBrowse's own gates apply (web-only, framed-only: standalone /chat has no feed to surface, and
-// a repost to window.parent === window would only echo back here). Own-window messages only — the
-// pane shim redispatches kernel frames through this channel too, and no OTHER window sends this ask.
-window.addEventListener("message", (e: MessageEvent) => {
-  const m = e.data as { romp?: unknown; path?: unknown; sid?: unknown } | null;
-  if (!m || m.romp !== "browseFiles" || e.source !== window) return;
-  openBrowse(typeof m.path === "string" ? m.path : ".", typeof m.sid === "string" ? m.sid : null);
-});
+// (The old forwarder that relayed the viewer's directory-half {romp:'browseFiles'} ask to the shell
+// is gone with the move: initFileBrowse's own listener answers it in THIS document now.)
+initFileBrowse((m) => vscodeApi?.postMessage(m));
 
 // A clickable file name that opens the real file — in the editor (VS Code) or the in-pane viewer
 // modal (web). Shared open/navigate surface; see extension.ts's openFile handler and file-view.ts.
@@ -952,39 +955,60 @@ function renderAgentNotif(a: AgentNotif, outputs?: TaskOutputs, key?: string): H
 // path; until/unless it returns a dataURL we show a "🖼 filename" chip, then swap in
 // the real thumbnail when the host answers. Re-renders rebuild the element from these
 // caches, so a thumbnail already fetched stays a thumbnail.
-const imgUrlCache = new Map<string, string>();   // path → dataURL (loaded)
-const imgFailed = new Set<string>();             // path → keep the chip, never retry
-const imgRequested = new Set<string>();          // path → request in flight
-function fillPathImg(wrap: HTMLElement, p: string): void {
+// EVERYTHING on this ride is keyed by (session, path), never the bare path: the same RELATIVE path
+// string in two sessions names two different files (each cwd its own), and a bare-path cache let the
+// FIRST asker's answer fill every session's chips — wrong pixels shown silently, and a first-ask
+// failure parked every session's chip (found adversarially reviewing the owner-sid fix, 2026-08-24).
+// The chip carries its sid in data-imgsid so refills and heals match on both halves.
+const imgKey = (sid: string | null, p: string): string => (sid || "") + "\u0000" + p;
+const imgUrlCache = new Map<string, string>();   // (sid,path) → dataURL (loaded)
+const imgFailed = new Set<string>();             // (sid,path) → keep the chip until a reconnect heal
+const imgRequested = new Set<string>();          // (sid,path) → request in flight
+function fillPathImg(wrap: HTMLElement, p: string, sid: string | null): void {
   wrap.textContent = "";
-  const url = imgUrlCache.get(p);
+  const url = imgUrlCache.get(imgKey(sid, p));
   if (url) {
     const img = document.createElement("img"); img.className = "user-img"; img.src = url; img.loading = "lazy"; img.title = p;
     wrap.appendChild(img);
   } else {
     // still waiting on the host round-trip → pulsing-dots loading cue (pure CSS — the sandbox can't
     // fetch the swirl asset); a FAILED path drops the pulse and reads as the plain chip it is
-    const chip = el("div", "user-img-path" + (imgFailed.has(p) ? "" : " img-pending"));
+    const chip = el("div", "user-img-path" + (imgFailed.has(imgKey(sid, p)) ? "" : " img-pending"));
     chip.textContent = "🖼 " + (p.split("/").pop() || p); chip.title = p;
     wrap.appendChild(chip);
   }
 }
-function buildPathImg(p: string): HTMLElement {
+function buildPathImg(p: string, sid: string | null): HTMLElement {
   const wrap = el("span", "js-pathimg"); wrap.dataset.imgpath = p;
-  fillPathImg(wrap, p);
-  if (!imgUrlCache.has(p) && !imgFailed.has(p) && !imgRequested.has(p)) {
-    imgRequested.add(p);
+  wrap.dataset.imgsid = sid || "";
+  fillPathImg(wrap, p, sid);
+  const k = imgKey(sid, p);
+  if (!imgUrlCache.has(k) && !imgFailed.has(k) && !imgRequested.has(k)) {
+    imgRequested.add(k);
     // id → the kernel resolves a RELATIVE path against this session's cwd (assistant-mentioned
-    // "plots/out.png" renders too, not just absolute user-attachment paths — the user 2026-07-20)
-    if (vscodeApi) vscodeApi.postMessage({ type: "imgRequest", path: p, id: activeId });
+    // "plots/out.png" renders too, not just absolute user-attachment paths — the user 2026-07-20).
+    // The OWNING session's id, passed by the caller: a background build must never send activeId here.
+    if (vscodeApi) vscodeApi.postMessage({ type: "imgRequest", path: p, id: sid });
   }
   return wrap;
 }
-function onImgData(p: string, url: string | null): void {
-  imgRequested.delete(p);
-  if (url) imgUrlCache.set(p, url); else imgFailed.add(p);
+function onImgData(p: string, url: string | null, sid: string | null): void {
+  // A kernel that echoes the sid answers exactly the chips that asked; an OLDER kernel's reply
+  // (no sid echo) falls back to path-only matching — at worst the old sharing, never a dead chip.
+  const bySid = typeof sid === "string";
+  const keys = bySid ? [imgKey(sid, p)]
+    : Array.from(document.querySelectorAll(".js-pathimg"))
+        .filter((n) => (n as HTMLElement).dataset.imgpath === p)
+        .map((n) => imgKey((n as HTMLElement).dataset.imgsid || null, p));
+  for (const k of keys) {
+    imgRequested.delete(k);
+    if (url) imgUrlCache.set(k, url); else imgFailed.add(k);
+  }
   document.querySelectorAll(".js-pathimg").forEach((n) => {
-    const e = n as HTMLElement; if (e.dataset.imgpath === p) fillPathImg(e, p);
+    const e = n as HTMLElement;
+    if (e.dataset.imgpath !== p) return;
+    if (bySid && (e.dataset.imgsid || "") !== (sid || "")) return;
+    fillPathImg(e, p, e.dataset.imgsid || null);
   });
 }
 // RECONNECT-class heal for the path-image chips (the user 2026-08-24): imgFailed was "never retry
@@ -993,19 +1017,22 @@ function onImgData(p: string, url: string | null): void {
 // request flow buildPathImg runs on mint (imgRequested still dedups in-flight asks).
 function healPathImgs(): void {
   if (!imgFailed.size) return;
-  const failed = Array.from(imgFailed);
+  const failed = new Set(imgFailed);
   imgFailed.clear();
-  for (const p of failed) {
-    document.querySelectorAll(".js-pathimg").forEach((n) => {
-      const e = n as HTMLElement;
-      if (e.dataset.imgpath !== p) return;
-      fillPathImg(e, p);                             // back to the pending pulse while the ask is out
-      if (!imgRequested.has(p)) {
-        imgRequested.add(p);
-        if (vscodeApi) vscodeApi.postMessage({ type: "imgRequest", path: p, id: activeId });
-      }
-    });
-  }
+  document.querySelectorAll(".js-pathimg").forEach((n) => {
+    const e = n as HTMLElement;
+    const p = e.dataset.imgpath;
+    // the chip's own minted sid — a heal fired while another tab is active must re-ask for the
+    // OWNING session, not the one being looked at (and the popover's chips carry theirs too)
+    const own = e.dataset.imgsid || activeId;
+    const k = p ? imgKey(own, p) : "";
+    if (!p || !failed.has(k)) return;
+    fillPathImg(e, p, own);                          // back to the pending pulse while the ask is out
+    if (!imgRequested.has(k)) {
+      imgRequested.add(k);
+      if (vscodeApi) vscodeApi.postMessage({ type: "imgRequest", path: p, id: own });
+    }
+  });
 }
 // the page shim fires romp:wsup when THIS pane's kernel socket reconnects (kernel.py ws.onopen) —
 // the same kernel-is-back event a hostUp is for a federated tunnel; heal everything on it
@@ -1022,7 +1049,7 @@ installMdImgHeal();   // markdown-inline <img> failures register for the per-mes
 function userImage(im: { src: string; path?: string }, pathInText = false): HTMLElement {
   const fig = el("span", "user-img-wrap");
   if (im.src.startsWith("path:")) {
-    fig.appendChild(buildPathImg(im.src.slice(5)));   // host reads it → real thumbnail; chip until then / on failure
+    fig.appendChild(buildPathImg(im.src.slice(5), renderingOwnerSid ?? activeId));   // host reads it → real thumbnail; chip until then / on failure
   } else {
     const img = document.createElement("img"); img.className = "user-img"; img.src = im.src; img.loading = "lazy";
     fig.appendChild(img);
@@ -1250,8 +1277,8 @@ function linkifyFileUris(root: HTMLElement, skipThumbs?: string[], spacePaths?: 
     const BLOCK_SEL = "p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th";
     const strips = new Map<HTMLElement, HTMLElement>();   // figure anchor → its strip (same block shares one)
     for (const p of previewable.slice(0, 4)) {
-      const full = canPreview() ? previewFull(p, activeId, kernelVerified.has(p), (pathPins || {})[p])
-        : previewKind(p) === "img" ? buildPathImg(p) : null;
+      const full = canPreview() ? previewFull(p, renderingOwnerSid ?? activeId, kernelVerified.has(p), (pathPins || {})[p])
+        : previewKind(p) === "img" ? buildPathImg(p, renderingOwnerSid ?? activeId) : null;
       if (!full) continue;
       const block = mentionAt.get(p)?.closest(BLOCK_SEL) as HTMLElement | null;
       const anchor = block && root.contains(block) && block !== root ? block : root;
@@ -2475,7 +2502,7 @@ function asFolderLink(elem: HTMLElement, cwd: string, sid?: string): void {
   // the row's right-click menu for the genuinely-local case (the contextmenu delegate below). In
   // VS Code the browser overlay doesn't exist, so the click keeps opening the folder host-side.
   const web = location.protocol === "http:" || location.protocol === "https:";
-  elem.dataset.act = web && window.parent !== window ? "browseFiles" : "openFolder";
+  elem.dataset.act = web ? "browseFiles" : "openFolder";   // pane-local browse needs no shell (2026-08-24)
   elem.dataset.cwd = cwd;
   if (sid) elem.dataset.id = sid;
   elem.classList.add("folder-link");
@@ -2840,9 +2867,21 @@ function chatEpisode(m: any): void {
   const got = { events: (m.events || []) as ChatEvent[], truncated: m.truncated || 0,
                 error: m.error ? String(m.error) : undefined };
   episodeCache.set(key, got);
-  document.querySelectorAll<HTMLElement>(".clear-body").forEach((b) => {
-    if (b.dataset.clearKey === key) fillClearBody(b, got);
-  });
+  // This fill runs in the MESSAGE handler, outside any syncView — renderingSid/renderingOwnerSid still
+  // hold whatever was built last. Pin both to the episode's own session so fold keys and file/preview
+  // URLs belong to it, then restore.
+  const savedKey = renderingSid;
+  const savedOwner = renderingOwnerSid;
+  renderingSid = sid;
+  renderingOwnerSid = sid;
+  try {
+    document.querySelectorAll<HTMLElement>(".clear-body").forEach((b) => {
+      if (b.dataset.clearKey === key) fillClearBody(b, got);
+    });
+  } finally {
+    renderingSid = savedKey;
+    renderingOwnerSid = savedOwner;
+  }
 }
 
 // LIVE /clear in progress (the user 2026-07-27): an animated inline element between the /clear delivery
@@ -4444,7 +4483,7 @@ function setSessionColor(id: string, bg: string) {
 
 // Small inline-SVG icon for the tab menu's toggle items (trusted constant markup; `off` slashes + dims it,
 // matching the timeline lane toggles). 16-unit viewBox; currentColor so .ctx-icon/.off set the tint.
-function ctxIcon(kind: "feed" | "mail" | "bell" | "bill", off: boolean): HTMLElement {
+function ctxIcon(kind: "feed" | "mail" | "bell" | "bill" | "folder" | "tag" | "pencil", off: boolean): HTMLElement {
   const span = el("span", "ctx-icon" + (off ? " off" : ""));
   const slash = off ? '<line x1="1.6" y1="14.4" x2="14.4" y2="1.6"/>' : "";
   const body = kind === "feed"
@@ -4453,7 +4492,13 @@ function ctxIcon(kind: "feed" | "mail" | "bell" | "bill", off: boolean): HTMLEle
       ? '<rect x="2" y="4" width="12" height="8" rx="1.5"/><path d="M2.5 5 L8 9 L13.5 5"/>'  // envelope (on the postal service)
       : kind === "bill"
         ? '<rect x="2" y="4" width="12" height="8" rx="1.5"/><line x1="2" y1="6.8" x2="14" y2="6.8"/><line x1="4.2" y1="9.6" x2="7.4" y2="9.6"/>'  // payment card (billing)
-        : '<path d="M8 2 C5.9 2.2 4.7 3.8 4.7 5.8 L4.7 8 L3.4 9.9 L12.6 9.9 L11.3 8 L11.3 5.8 C11.3 3.8 10.1 2.2 8 2 Z"/><path d="M6.6 11.6 A1.5 1.5 0 0 0 9.4 11.6"/>';  // bell (system notifications)
+        : kind === "folder"
+          ? '<path d="M2 4.5 A1.2 1.2 0 0 1 3.2 3.3 L6.2 3.3 L7.6 4.9 L12.8 4.9 A1.2 1.2 0 0 1 14 6.1 L14 11.5 A1.2 1.2 0 0 1 12.8 12.7 L3.2 12.7 A1.2 1.2 0 0 1 2 11.5 Z"/>'  // folder (browse files)
+        : kind === "tag"
+          ? '<path d="M2 3.4 A1.4 1.4 0 0 1 3.4 2 L7.6 2 A1.4 1.4 0 0 1 8.6 2.4 L13.6 7.4 A1.4 1.4 0 0 1 13.6 9.4 L9.4 13.6 A1.4 1.4 0 0 1 7.4 13.6 L2.4 8.6 A1.4 1.4 0 0 1 2 7.6 Z"/><circle cx="5.4" cy="5.4" r="1.1"/>'  // luggage tag (session tags)
+        : kind === "pencil"
+          ? '<path d="M3 13 L3.6 10.4 L10.8 3.2 A1.3 1.3 0 0 1 12.8 5.2 L5.6 12.4 Z"/><line x1="9.8" y1="4.2" x2="11.8" y2="6.2"/>'  // pencil (rename)
+          : '<path d="M8 2 C5.9 2.2 4.7 3.8 4.7 5.8 L4.7 8 L3.4 9.9 L12.6 9.9 L11.3 8 L11.3 5.8 C11.3 3.8 10.1 2.2 8 2 Z"/><path d="M6.6 11.6 A1.5 1.5 0 0 0 9.4 11.6"/>';  // bell (system notifications)
   span.innerHTML = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" '
     + 'stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">' + body + slash + "</svg>";
   return span;
@@ -4462,20 +4507,48 @@ function ctxIcon(kind: "feed" | "mail" | "bell" | "bill", off: boolean): HTMLEle
 function showTabMenu(e: MouseEvent, id: string) {
   dismissTabMenu();
   const menu = el("div", "ctx-menu");
-  const rename = el("div", "ctx-item");
-  rename.textContent = "Rename";
+  // Rename leads ONE top section with the session controls (the user 2026-08-24: it sat alone and
+  // bare above its own divider) — the standard dress like its siblings: icon + the sub-line, which
+  // says what a rename PRESERVES (sessions are uuid-keyed, the name is a label — mailboxes, goals
+  // and history follow the session, per the /rename route's contract).
   // id only, never the tab node under the cursor: the menu (on document.body) outlives kernel pushes,
   // but the tab it was opened from does not — renderTabs() swaps the strip on every push, so a node
   // captured here is usually DETACHED by the time Rename is clicked (the click-safety rule).
-  rename.addEventListener("click", (ev) => { ev.stopPropagation(); dismissTabMenu(); startTabRename(id); });
-  menu.appendChild(rename);
+  {
+    const rename = el("div", "ctx-item ctx-item-toggle");
+    rename.appendChild(ctxIcon("pencil", false));
+    const bodyEl = el("span", "ctx-item-body");
+    const l = el("span", "ctx-item-label"); l.textContent = "Rename"; bodyEl.appendChild(l);
+    const sb = el("span", "ctx-item-sub"); sb.textContent = "the name is a label — mail, goals and history follow the session"; bodyEl.appendChild(sb);
+    rename.appendChild(bodyEl);
+    rename.addEventListener("click", (ev) => { ev.stopPropagation(); dismissTabMenu(); startTabRename(id); });
+    menu.appendChild(rename);
+  }
+  // Colors join Rename in the AESTHETIC section (the user 2026-08-24, the final by-kind grouping:
+  // [Rename + colors] / [feed, mail, bell, billing, Tags] / [Browse]). The swatch row itself is
+  // unchanged (the user 2026-06-29): the identity palette as circles, the current one ringed,
+  // omitted until /palette has loaded.
+  if (paletteColors.length) {
+    const sNow = sessions.get(id);
+    const cur = (sNow && sNow.color ? sNow.color.bg : "").toLowerCase();
+    const row = el("div", "ctx-colors");
+    for (const bg of paletteColors) {
+      const sw = el("button", "ctx-swatch" + (bg.toLowerCase() === cur ? " sel" : ""));
+      sw.style.background = bg;
+      sw.title = bg;
+      sw.setAttribute("aria-label", "Set color " + bg);
+      sw.addEventListener("click", (ev) => { ev.stopPropagation(); dismissTabMenu(); setSessionColor(id, bg); });
+      row.appendChild(sw);
+    }
+    menu.appendChild(row);
+  }
+  menu.appendChild(el("div", "ctx-sep"));
   // Feed + Mail per-session toggles (the user 2026-06-26) — the same controls as the timeline lane's feed
   // checkbox + postal mailbox, here as icon + label + a faint "what it does" sub-line. State from the session.
   const s = sessions.get(id);
   const offFeed = !!(s && s.hideFromFeed);
   const offMail = !!(s && s.postalServiceOff);
   const onBell = !!(s && s.notify);
-  menu.appendChild(el("div", "ctx-sep"));
   const toggle = (kind: "feed" | "mail" | "bell", off: boolean, lab: string, sub: string, fn: () => void) => {
     const item = el("div", "ctx-item ctx-item-toggle");
     item.appendChild(ctxIcon(kind, off));
@@ -4494,37 +4567,15 @@ function showTabMenu(e: MouseEvent, id: string) {
     offMail ? "Rejoin mail" : "Mute mail",
     offMail ? "reconnect it to the postal service" : "hide from peers — no messages in or out",
     () => setSessionFlag(id, "postalServiceOff", !offMail));
-  // Browse the session's working tree in the feed pane. Web-only: openBrowse no-ops outside the
-  // shell, and VS Code's editor has its own explorer, so the row only renders where the click can
-  // land.
-  if ((location.protocol === "http:" || location.protocol === "https:") && window.parent !== window) {
-    const browse = el("div", "ctx-item");
-    browse.textContent = "Browse files";
-    browse.addEventListener("click", (ev) => {
-      ev.stopPropagation(); dismissTabMenu();
-      openBrowse(s?.cwd || ".", id);
-    });
-    menu.appendChild(browse);
-  }
   // system-notification bell (the user 2026-07-28) — same flag the timeline lane bell toggles. NOTE the
   // inverted polarity vs the two above: `notify` true is the ENABLED state, so the icon slashes on !onBell.
   toggle("bell", !onBell,
     onBell ? "Stop notifying" : "Notify me",
     onBell ? "no more system notifications for this session" : "system notification when its work blocks on you or completes",
     () => setSessionFlag(id, "notify", !onBell));
-  // Background the session (the user 2026-08-18): out of the tab strip AND the timeline lanes — it
-  // keeps running, judged and carded; the + picker lists it under "Hidden — reveal" and the
-  // timeline's corner panel counts it. Same views blob the timeline dialog edits. A plain item, not
-  // a toggle: its undo lives where the hidden session lives (the picker, the timeline panel).
-  {
-    const hide = el("div", "ctx-item ctx-item-toggle");
-    const bodyEl = el("span", "ctx-item-body");
-    const l = el("span", "ctx-item-label"); l.textContent = "Hide from chat & timeline"; bodyEl.appendChild(l);
-    const sb = el("span", "ctx-item-sub"); sb.textContent = "background it — the + picker and the feed still surface it"; bodyEl.appendChild(sb);
-    hide.appendChild(bodyEl);
-    hide.addEventListener("click", (ev) => { ev.stopPropagation(); dismissTabMenu(); postViews(hideIn(effViews(), id)); });
-    menu.appendChild(hide);
-  }
+  // (The hide-session mechanism is fully RETIRED, the user 2026-08-24 — the tag system covers
+  // backgrounding; the kernel migrated existing hidden entries into the "archived" tag. revealIn
+  // survives for the picker's tagged-session jump.)
   // Billing submenu (the user 2026-08-09, who wants the login/API-key switch here rather than as a
   // statusline badge). Only when the machine offers BOTH choices (st.authBoth) — a one-auth machine
   // keeps the fact on the tab hover, never a dead selector — and the key stays labelled plainly
@@ -4533,7 +4584,7 @@ function showTabMenu(e: MouseEvent, id: string) {
   // reconnects to apply, so the sub-line says "applying…" while st.authPending rides the status).
   const st = s ? s.status : null;
   if (st && st.auth && st.authBoth) {
-    menu.appendChild(el("div", "ctx-sep"));
+    // (no divider: billing sits in the behavior section with the toggles — the by-kind grouping)
     const item = el("div", "ctx-item ctx-item-toggle ctx-item-billing");
     item.appendChild(ctxIcon("bill", false));
     const bodyEl = el("span", "ctx-item-body");
@@ -4570,21 +4621,146 @@ function showTabMenu(e: MouseEvent, id: string) {
     });
     menu.appendChild(item);
   }
-  // Color swatches (the user 2026-06-29): the romp identity palette as circles, the session's current one
-  // ringed. Click one to recolor the session. Omitted until /palette has loaded (paletteColors empty).
-  if (paletteColors.length) {
+  // TAGS (the user 2026-08-24, overruling the earlier skip: tag editing belongs everywhere a
+  // session is in front of you — you might not have the timeline open and still want to organize
+  // or dispatch). A compact one-line row — the current tag names as the sub-line — with the
+  // mechanics one click away in a flyout (progressive disclosure; the Billing submenu's chrome).
+  // SAME semantics as the timeline dialog, name-keyed union rules throughout (kernels are plumbing,
+  // no host prefixes): an ADD lands on the local store when the name exists locally, else the
+  // tag's single home over the editTag wire; a REMOVE removes the (name, member) pair from EVERY
+  // store holding it; New tag… creates locally with the next unused palette colour. Local writes
+  // post the whole blob (postViews — pendingSessionViews echoes instantly); remote writes ride the
+  // editTag op and settle on the next push (a refused edit re-appears — the kernel's loud
+  // tagEditFailed lands on the timeline dialog, 628's surface).
+  {
+    const unionFor = () => viewTagUnion(effViews());
+    const holding = () => unionFor().filter((g) => g.members.includes(id));
+    const tagsItem = el("div", "ctx-item ctx-item-toggle ctx-item-tags");
+    tagsItem.appendChild(ctxIcon("tag", false));
+    const bodyEl = el("span", "ctx-item-body");
+    const l = el("span", "ctx-item-label"); l.textContent = "Tags"; bodyEl.appendChild(l);
+    const sb = el("span", "ctx-item-sub");
+    const subText = () => { const names = holding().map((g) => g.name); return names.length ? names.join(" · ") : "none yet — tag it to organize and dispatch"; };
+    sb.textContent = subText();
+    bodyEl.appendChild(sb);
+    tagsItem.appendChild(bodyEl);
+    const caret = el("span", "ctx-caret"); caret.textContent = "▸"; tagsItem.appendChild(caret);
+    const editUnion = (g: TagUnion, edit: { add?: string[]; remove?: string[] }) => {
+      // ONE optimistic blob per gesture: the local store's edit AND the remote entries' mirror both
+      // land in pendingSessionViews so the flyout reads true instantly. Echoed remoteTags are
+      // DERIVED — the kernel drops them from the echo — so mutating the copy is presentation-only;
+      // the remote's own next push is the durable truth (a refused edit re-appears there).
+      const nv = JSON.parse(JSON.stringify(effViews() || {})) as SessionViews;
+      let dirty = false;
+      const nvRemote = (rt: SessionTag) => (nv.remoteTags || []).find((x) => x.id === rt.id);
+      if (edit.add?.length) {
+        if (g.localId) {
+          const t = viewTags(nv).find((x) => x.id === g.localId);
+          if (t) { t.members = Array.from(new Set((t.members || []).concat(edit.add))); dirty = true; }
+        } else if (g.remotes.length) {
+          vscodeApi?.postMessage({ type: "editTag", edit: { host: g.remotes[0].host || "", name: g.name, add: edit.add.slice() } });
+          const mine = nvRemote(g.remotes[0]);
+          if (mine) { mine.members = Array.from(new Set((mine.members || []).concat(edit.add))); dirty = true; }
+        }
+      }
+      if (edit.remove?.length) {
+        if (g.localId) {
+          const t = viewTags(nv).find((x) => x.id === g.localId);
+          if (t && (t.members || []).some((m) => edit.remove!.includes(m))) {
+            t.members = (t.members || []).filter((m) => !edit.remove!.includes(m));
+            dirty = true;
+          }
+        }
+        for (const rt of g.remotes) {
+          if (!(rt.members || []).some((m) => edit.remove!.includes(m))) continue;
+          vscodeApi?.postMessage({ type: "editTag", edit: { host: rt.host || "", name: g.name, remove: edit.remove!.slice() } });
+          const mine = nvRemote(rt);
+          if (mine) { mine.members = (mine.members || []).filter((m) => !edit.remove!.includes(m)); dirty = true; }
+        }
+      }
+      if (dirty) postViews(nv);
+    };
+    tagsItem.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const openFly = menu.querySelector(".ctx-sub-tags");
+      if (openFly) { openFly.remove(); return; }                 // second click folds the flyout
+      menu.querySelector(".ctx-sub")?.remove();                  // one flyout at a time (Billing's rule)
+      const sub = el("div", "ctx-menu ctx-sub ctx-sub-tags");
+      const build = () => {
+        sub.replaceChildren();
+        for (const g of holding()) {                             // one chip per NAME — never a host prefix
+          const row = el("div", "ctx-item ctx-item-toggle");
+          const chip = el("span", "ctx-tag-dot"); chip.style.background = g.color || "var(--dim)"; row.appendChild(chip);
+          const bodyE = el("span", "ctx-item-body");
+          const lb = el("span", "ctx-item-label"); lb.textContent = g.name; bodyE.appendChild(lb);
+          row.appendChild(bodyE);
+          const x = el("button", "ctx-tag-x") as HTMLButtonElement;
+          x.type = "button"; x.textContent = "✕"; x.title = "remove this tag from the session — everywhere it holds it";
+          x.addEventListener("click", (e2) => { e2.stopPropagation(); editUnion(g, { remove: [id] }); build(); sb.textContent = subText(); });
+          row.appendChild(x);
+          sub.appendChild(row);
+        }
+        const others = unionFor().filter((g) => !g.members.includes(id));
+        if (holding().length && others.length) sub.appendChild(el("div", "ctx-sep"));
+        for (const g of others) {
+          const row = el("div", "ctx-item ctx-item-toggle");
+          const chip = el("span", "ctx-tag-dot"); chip.style.background = g.color || "var(--dim)"; row.appendChild(chip);
+          const bodyE = el("span", "ctx-item-body");
+          const lb = el("span", "ctx-item-label"); lb.textContent = "+ " + g.name; bodyE.appendChild(lb);
+          row.appendChild(bodyE);
+          row.addEventListener("click", (e2) => { e2.stopPropagation(); editUnion(g, { add: [id] }); build(); sb.textContent = subText(); });
+          sub.appendChild(row);
+        }
+        if (holding().length || others.length) sub.appendChild(el("div", "ctx-sep"));
+        // New tag… — an inline input, never a native prompt (the menus vocabulary)
+        const nrow = el("div", "ctx-item ctx-item-newtag");
+        const inp = el("input", "ctx-tag-input") as HTMLInputElement;
+        inp.placeholder = "New tag…"; inp.maxLength = 40;
+        inp.addEventListener("click", (e2) => e2.stopPropagation());
+        inp.addEventListener("keydown", (e2) => {
+          if (e2.key !== "Enter") return;
+          const name = inp.value.trim();
+          if (!name) return;
+          const existing = unionFor().find((g) => g.name === name);
+          if (existing) { editUnion(existing, { add: [id] }); build(); sb.textContent = subText(); return; }
+          const nv = JSON.parse(JSON.stringify(effViews() || {})) as SessionViews;
+          const used = new Set(viewTags(nv).map((t) => t.color));
+          const color = paletteColors.find((c) => !used.has(c)) || paletteColors[0] || "#1EA1EB";
+          nv.tags = viewTags(nv).concat([{ id: "g" + Date.now().toString(36), name, color, members: [id] }]);
+          delete nv.groups;
+          postViews(nv);
+          build(); sb.textContent = subText();
+        });
+        nrow.appendChild(inp);
+        sub.appendChild(nrow);
+      };
+      build();
+      menu.appendChild(sub);
+      const ir = tagsItem.getBoundingClientRect();
+      const sr = sub.getBoundingClientRect();
+      sub.style.left = Math.max(0, Math.min(ir.right + 2, window.innerWidth - sr.width - 4)) + "px";
+      sub.style.top = Math.max(0, Math.min(ir.top, window.innerHeight - sr.height - 4)) + "px";
+      (sub.querySelector(".ctx-tag-input") as HTMLInputElement | null)?.focus();
+    });
+    menu.appendChild(tagsItem);
+  }
+  // BROWSE FILES — at the BOTTOM behind its own divider (the user 2026-08-24: it is a different
+  // kind of thing from the toggles above), wearing the standard icon + sub-description dress, and
+  // opening PANE-LOCAL over this chat (openBrowse). Web-only: the VS Code webview cannot reach the
+  // kernel origin, and the editor has its own explorer.
+  if (location.protocol === "http:" || location.protocol === "https:") {
     menu.appendChild(el("div", "ctx-sep"));
-    const cur = (s && s.color ? s.color.bg : "").toLowerCase();
-    const row = el("div", "ctx-colors");
-    for (const bg of paletteColors) {
-      const sw = el("button", "ctx-swatch" + (bg.toLowerCase() === cur ? " sel" : ""));
-      sw.style.background = bg;
-      sw.title = bg;
-      sw.setAttribute("aria-label", "Set color " + bg);
-      sw.addEventListener("click", (ev) => { ev.stopPropagation(); dismissTabMenu(); setSessionColor(id, bg); });
-      row.appendChild(sw);
-    }
-    menu.appendChild(row);
+    const browse = el("div", "ctx-item ctx-item-toggle");
+    browse.appendChild(ctxIcon("folder", false));
+    const bodyEl = el("span", "ctx-item-body");
+    const l = el("span", "ctx-item-label"); l.textContent = "Browse files"; bodyEl.appendChild(l);
+    const sb = el("span", "ctx-item-sub"); sb.textContent = "the session's working tree, in a viewer over this chat"; bodyEl.appendChild(sb);
+    browse.appendChild(bodyEl);
+    browse.addEventListener("click", (ev) => {
+      ev.stopPropagation(); dismissTabMenu();
+      openBrowse(s?.cwd || ".", id);
+    });
+    menu.appendChild(browse);
   }
   document.body.appendChild(menu);
   ctxMenuEl = menu;
@@ -6084,7 +6260,7 @@ function openCommentThread(): { sid: string; th: CommentThread } | null {
 
 /** The popover's conversation area, (re)filled in place — shared by the full build and the
  *  frame-driven refresh so an update never rebuilds the composer under the user's caret. */
-function fillCommentMsgs(list: HTMLElement, th: CommentThread): void {
+function fillCommentMsgs(list: HTMLElement, th: CommentThread, sid: string): void {
   const prevScroll = list.scrollTop;
   const atTail = list.scrollTop >= list.scrollHeight - list.clientHeight - 8;
   list.replaceChildren();
@@ -6096,7 +6272,9 @@ function fillCommentMsgs(list: HTMLElement, th: CommentThread): void {
     // rail dots, markdown, tool folds, notice cards — never a simplified twin). renderingSid keys
     // the folds per thread, exactly as a chat tab would.
     const saved = renderingSid;
+    const savedOwner = renderingOwnerSid;
     renderingSid = th.tid;
+    renderingOwnerSid = sid;   // fold keys are per-thread; file/preview URLs belong to the thread's SESSION
     renderingIntoThread = true;   // same renderer, minus the transcript-coupled hover chrome (see the flag)
     let prev: number | null = null;
     let quoteHost: HTMLElement | null = null;   // the thread's OPENING message — the quote's home
@@ -6136,6 +6314,7 @@ function fillCommentMsgs(list: HTMLElement, th: CommentThread): void {
     }
     renderingIntoThread = false;
     renderingSid = saved;
+    renderingOwnerSid = savedOwner;
     // The quoted passage renders as CONTEXT attached to the thread's opening message (the user
     // 2026-08-24): it used to sit as a standalone block ABOVE the whole list — above the branch
     // divider too, misreading chronology, since the branch happened before the quote. Same idiom
@@ -6180,7 +6359,7 @@ function refillOpenCommentPop(): void {
   if (!openCommentKey) return;
   const th = (commentThreads.get(openCommentKey.sid) || []).find((t) => t.tid === openCommentKey!.tid);
   const list = document.querySelector(".cmt-pop .cmt-msgs") as HTMLElement | null;
-  if (th && list) fillCommentMsgs(list, th);
+  if (th && list) fillCommentMsgs(list, th, openCommentKey.sid);
 }
 
 function commentPopTitle(create: boolean, th: CommentThread | null | undefined): string {
@@ -6232,7 +6411,7 @@ function commentSendFromPop(pop: HTMLElement): void {
   commentDrafts.delete(cur.th.tid);
   box.value = "";
   const list = pop.querySelector(".cmt-msgs") as HTMLElement | null;
-  if (list) fillCommentMsgs(list, cur.th);      // the pending bubble IS the acknowledgement
+  if (list) fillCommentMsgs(list, cur.th, cur.sid);      // the pending bubble IS the acknowledgement
 }
 
 /** A live thread's model/effort chip label: the frame's value, tinted from the shared /models
@@ -6266,7 +6445,7 @@ function renderCommentPopover(): void {
     const t = prev.querySelector(".cmt-title") as HTMLElement | null;
     if (t) t.textContent = commentPopTitle(!!create, th);
     const list = prev.querySelector(".cmt-msgs") as HTMLElement | null;
-    if (th && list) fillCommentMsgs(list, th);
+    if (th && list) fillCommentMsgs(list, th, sid);
     if (th) for (const b of Array.from(prev.querySelectorAll(".meta-btn[data-kind]")) as HTMLElement[]) {
       const lbl = b.querySelector(".meta-label") as HTMLElement | null;
       if (lbl) liveMetaLabel(lbl, b.dataset.kind === "model" ? "model" : "effort", th);
@@ -6355,7 +6534,7 @@ function renderCommentPopover(): void {
   }
   if (th) {
     const list = el("div", "cmt-msgs");
-    fillCommentMsgs(list, th);
+    fillCommentMsgs(list, th, sid);
     pop.appendChild(list);
   }
   let metaRowPending: HTMLElement | null = null;   // appended under the composer row — the statusline position
@@ -6811,8 +6990,8 @@ function renderPicker(items: any[]) {
     name.replaceChildren(...hostNameNodes(it.name, it.id));
     if (it.color && it.color.bg) name.style.color = it.color.bg;
     const time = el("span", "picker-time");
-    if (it.hiddenTab) {   // open as a tab but view-hidden (a background session) → picking reveals it
-      time.textContent = "hidden";
+    if (it.hiddenTab) {   // open as a tab but filtered out of the CURRENT view (tagged) → picking jumps to its view
+      time.textContent = "other view";
       time.style.opacity = "0.7";
     } else if (it.running) {   // a live session (SDK/tmux backend) whose tab is closed → a green "running" badge
       time.classList.add("picker-running-badge");
@@ -6833,7 +7012,7 @@ function renderPicker(items: any[]) {
         if (vscodeApi) vscodeApi.postMessage({ type: "pickResult", id: it.id, name: it.name });
         pickMode = false; // so closePicker doesn't also post a cancel
       } else if (it.hiddenTab) {
-        revealSession(it.id);   // its tab already exists — un-hide it and switch to it
+        revealSession(it.id);   // its tab already exists — switch to a view that shows it (revealIn, post-retirement)
         setActive(it.id);
       } else if (vscodeApi) {
         vscodeApi.postMessage({ type: "openSession", id: it.id });
@@ -6851,15 +7030,16 @@ function renderPicker(items: any[]) {
     for (const it of items) list.appendChild(mkRow(it));
   } else {
     const avail = items.filter((it) => !isOpenTab(it.id));
-    // open-as-tab but view-HIDDEN sessions still list (the user 2026-08-18): a background session's
-    // one visible home on the chat side — omitting them here plus hiding the tab would recreate the
-    // secret-running-session state abolished 2026-08-11
+    // open-as-tab but filtered out of the CURRENT view (tagged; the hidden set retired 2026-08-24)
+    // still list (the user 2026-08-18): a background session's one visible home on the chat side —
+    // omitting them here plus the tab being out of view would recreate the secret-running-session
+    // state abolished 2026-08-11
     const hidden = items.filter((it) => isOpenTab(it.id) && !tabInView(it.id))
                         .map((it) => Object.assign({}, it, { hiddenTab: true }));
     const running = avail.filter((it) => it.running);
     const rest = avail.filter((it) => !it.running);
     if (running.length) { list.appendChild(label("Running — reopen")); for (const it of running) list.appendChild(mkRow(it)); }
-    if (hidden.length) { list.appendChild(label("Hidden — reveal")); for (const it of hidden) list.appendChild(mkRow(it)); }
+    if (hidden.length) { list.appendChild(label("In another view — open")); for (const it of hidden) list.appendChild(mkRow(it)); }
     if (rest.length) { if (running.length || hidden.length) list.appendChild(label("Recent")); for (const it of rest) list.appendChild(mkRow(it)); }
   }
   if (!list.children.length && pickerListHost) {
@@ -7148,6 +7328,7 @@ function syncViewInner(id: string, atBottom?: boolean): View {
   // content above is unchanged. true/undefined ⇒ free to evict the top (we're at the bottom, or it's a
   // non-append sync).
   renderingSid = id;          // so renderSystem can key the pinned card's persisted open-state by session
+  renderingOwnerSid = id;     // preview/image URLs bake THIS session's id (host prefix included), never activeId's
   const v = ensureView(id);
   const s = sessions.get(id);
   if (!s) return v;
@@ -7555,6 +7736,7 @@ function runPrebuild(deadline: IdleDeadline): void {
     };
   };
   const savedRenderingSid = renderingSid; // syncView sets this; restore it so nothing keys off a pre-built tab
+  const savedOwnerSid = renderingOwnerSid;
   for (const id of prebuildPlan(activeId, mru, order, viewState)) {
     if (!sessions.has(id)) continue;
     try {
@@ -7564,6 +7746,7 @@ function runPrebuild(deadline: IdleDeadline): void {
     if (deadline.timeRemaining() < 3) { schedulePrebuild(); break; } // out of idle budget → resume next idle
   }
   renderingSid = savedRenderingSid;
+  renderingOwnerSid = savedOwnerSid;
 }
 
 function showActive() {
@@ -9660,7 +9843,7 @@ function renderComposerFiles(id: string | null): void {
         img.addEventListener("load", () => doc.replaceWith(img));
         img.src = fileUrl(p, id);
       } else {
-        const w = buildPathImg(p);                 // VS Code: host-read data URL fills in; chip until then
+        const w = buildPathImg(p, id);             // VS Code: host-read data URL fills in; chip until then
         w.classList.add("composer-file-hostimg");
         box.appendChild(w);
       }
@@ -10670,7 +10853,7 @@ window.addEventListener("message", (e: MessageEvent) => {
   else if (m.type === "clipboardText") insertClipboardText(String(m.text ?? ""));
   else if (m.type === "ledger") setLedger(m.id, m.ledger ?? null);
   else if (m.type === "working") { workingSet = new Set(Array.isArray(m.names) ? m.names : []); refreshPostalDots(); }
-  else if (m.type === "imgData" && typeof m.path === "string") onImgData(m.path, typeof m.url === "string" ? m.url : null);
+  else if (m.type === "imgData" && typeof m.path === "string") onImgData(m.path, typeof m.url === "string" ? m.url : null, typeof m.sid === "string" ? m.sid : null);
   else if (m.type === "tabOrder") { captureViews(m.views || null); applyTabOrder(m.order, m.tabs); }
   else if (m.type === "renamed" && m.id && typeof m.name === "string") {
     notePendingMeta(pendingTabMeta, m.id, { name: m.name });   // kernel truth — hold it against a push built pre-rename

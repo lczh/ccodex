@@ -11,19 +11,15 @@ import * as path from "node:path";
 const FEED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.ts"), "utf8");
 const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.css"), "utf8");
 
-test("one icon button replaces the three word-buttons; the old footer toggles are gone", () => {
+test("one 'View ▴' word-button replaces the three toggles; the old footer toggles stay gone", () => {
   assert.match(FEED, /function ensureViewMenuBtn\(\): HTMLElement/);
   assert.match(FEED, /b\.id = "feed-viewbtn";/);
+  // a WORD, not an icon (the user 2026-08-24, round two: the ordering glyph read as "not what I
+  // would expect for what to show") — the footer's word-button vocabulary, the Sessions caret
+  assert.match(FEED, /b\.textContent = "View \\u25b4";/);
+  assert.doesNotMatch(FEED, /viewMenuGlyph/, "the guessable glyph is gone outright");
   assert.doesNotMatch(FEED, /ensureFeedToggle|makeFeedToggle/, "the word-button helper went with its buttons");
   assert.doesNotMatch(FEED, /feed-newestfirst|feed-stacked|feed-grouped/, "no old toggle ids survive");
-  // monochrome by construction: THE GLYPH ITSELF strokes currentColor (scoped to the function — an
-  // unscoped match would ride any other svg in the file), so it wears the button's own states
-  // (dim, hover accent) with no colors of its own — and it is NOT a gear (the kernel page's strip
-  // shows its ⛭ right below this footer)
-  const glyph = FEED.slice(FEED.indexOf("function viewMenuGlyph"), FEED.indexOf("function ensureViewMenuBtn"));
-  assert.ok(glyph.includes('stroke="currentColor"'), "the glyph strokes currentColor");
-  assert.ok(!/#[0-9a-fA-F]{3,8}|rgb\(/.test(glyph), "no hardcoded color anywhere in the glyph");
-  assert.ok(!glyph.includes("⛭"), "not a gear");
   assert.match(FEED, /b\.setAttribute\("aria-haspopup", "menu"\);/);
 });
 
@@ -75,11 +71,11 @@ test("the popup wears the repo menu vocabulary: .ctx-menu chrome + the ✓-in-ci
   // the ✓-in-circle every romp menu uses (styles.css .ctx-sub/.meta-item.current), ported here because
   // the feed page loads only feed.css — on --check-bg, the panel-wide checkmark disc
   assert.match(CSS, /\.feed-viewmenu \.ctx-item\.current::after \{\s*\n\s*content: "✓"; position: absolute; right: 8px; top: 50%; transform: translateY\(-50%\);\s*\n\s*background: var\(--check-bg\); color: #fff; border-radius: 50%;\s*\n\s*width: 13px; height: 13px; font-size: 9px; font-weight: 900;/);
-  // THE CASCADE, both ways (the repo's recurring bug class): the icon button's padding must carry two
-  // ids or #feed-foot .fdismiss's (1,1,0) wins; and the row reset ties .ctx-item:hover at (0,2,0), so
-  // the reset must sit EARLIER in the file for the hover wash to win its tie by order.
-  assert.match(CSS, /#feed-foot #feed-viewbtn \{ display: inline-flex; align-items: center; padding: 2px 7px; \}/);
-  assert.doesNotMatch(CSS, /^#feed-viewbtn \{/m, "no (1,0,0) button rule that #feed-foot .fdismiss would beat");
+  // THE CASCADE (the repo's recurring bug class): the word-button rides the shared #feed-foot
+  // .fdismiss metrics — NO bespoke #feed-viewbtn rule survives to lose (or half-win) a specificity
+  // tie; and the row reset ties .ctx-item:hover at (0,2,0), so the reset must sit EARLIER in the
+  // file for the hover wash to win its tie by order.
+  assert.doesNotMatch(CSS, /#feed-viewbtn/, "no bespoke button rule at all — shared metrics only");
   const resetAt = CSS.indexOf(".feed-viewmenu .ctx-item {");
   const hoverAt = CSS.indexOf(".ctx-item:hover {");
   assert.ok(resetAt >= 0 && hoverAt > resetAt,
@@ -88,7 +84,7 @@ test("the popup wears the repo menu vocabulary: .ctx-menu chrome + the ✓-in-ci
 
 test("menu mechanics mirror the session menu: on document.body, opens upward, away/Escape close", () => {
   // on document.body, OUTSIDE render()'s reconcile — a push can never rebuild it mid-press (click-safety)
-  const open = FEED.slice(FEED.indexOf("function openViewMenu"), FEED.indexOf("function viewMenuGlyph"));
+  const open = FEED.slice(FEED.indexOf("function openViewMenu"), FEED.indexOf("function ensureViewMenuBtn"));
   assert.ok(open.includes("document.body.appendChild(menu);"));
   assert.ok(open.includes('menu.style.bottom = Math.round(window.innerHeight - r.top + 6) + "px";'), "opens upward from the footer");
   assert.match(FEED, /function viewMenuAway\(ev: Event\): void/);

@@ -325,7 +325,12 @@ permission/API-error floors: one interrupt at a time, the present event first.
   durable awaiting verdict (the goal store's ⏳ stamp) carrying a KIND naming
   what the wait is on: agents, task, job (an external computation), peer, timer.
   The kind scopes the rules: a peer's answer supersedes only peer waits, and a
-  job stamp survives its watcher dying (the wake is its backstop).
+  job stamp survives its watcher dying. The wake's clock is a DEAD-MAN'S SWITCH
+  for waits whose ending romp cannot observe — kind=job (external compute),
+  cross-host peers, legacy kindless stamps, hung-forever agents/tasks, and
+  prose-declared timer check-backs; every observable ending (a notification
+  pairing, the restart epoch, a tool's declared deadline, a peer's answer or
+  death) retires its wait as an event, with no clock at all.
 
 ## Where responsibilities overlap
 

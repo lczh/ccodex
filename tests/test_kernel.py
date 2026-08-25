@@ -580,6 +580,14 @@ class ViewBuilder(unittest.TestCase):
         self.assertEqual(me["name"], "testsess")
         self.assertEqual(me["color"], km._name_color(SID), "the tab_meta colour resolution, verbatim")
 
+    def test_feed_payload_carries_the_views_blob_the_tabs_read(self):
+        """The board follows the ACTIVE session view (the user 2026-08-24): the feed payload carries
+        the SAME views blob every tabOrder push does, so feed.ts can gate cards through the client
+        mirror of _view_visible (session-views.ts) — one decider, however many surfaces."""
+        feed = km.build_feed(NOW)
+        self.assertIn("views", feed)
+        self.assertEqual(feed["views"], km._views_client())
+
     def test_judge_awaiting_stamp_suppresses_the_stalled_chip(self):
         """The false-'stalled' chain, reproduced end to end: a failed-nudge record exists, the live
         awaiting sources are dark, but the goal store carries the judge's stamp — the card must wear

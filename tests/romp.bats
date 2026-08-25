@@ -265,6 +265,28 @@ MOCK
     [[ "$output" == *"--host goes with an edit"* ]]
 }
 
+@test "watch-pr: posts pr+repo+session; self needs ROMP_SID; usage errors exit 2" {
+    _stub_curl
+    touch "$MOCK_LOG"
+    export ROMP_SERVE_TOKEN=testtok
+    run env ROMP_SID=11111111-2222-3333-4444-555555555555 "$ROMP_SCRIPT" watch-pr 7 --repo TESTORG/testrepo
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"watching TESTORG/testrepo#7"* ]]
+    grep '/watch-pr' "$MOCK_LOG" | grep -q '"pr": *7'
+    grep '/watch-pr' "$MOCK_LOG" | grep -q '"repo": *"TESTORG/testrepo"'
+    grep '/watch-pr' "$MOCK_LOG" | grep -q '"id": *"11111111-2222-3333-4444-555555555555"'
+    # --session overrides self and rides as a NAME
+    run env ROMP_SID= "$ROMP_SCRIPT" watch-pr 8 --repo TESTORG/testrepo --session web
+    [ "$status" -eq 0 ]
+    grep '/watch-pr' "$MOCK_LOG" | grep -q '"name": *"web"'
+    # outside a session with no --session: a loud usage refusal, never a silent guess
+    run env ROMP_SID= "$ROMP_SCRIPT" watch-pr 9 --repo TESTORG/testrepo
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--session <name> required"* ]]
+    run run_romp watch-pr
+    [ "$status" -eq 2 ]
+}
+
 @test "tag: --rename rides the payload and counts as an edit" {
     _stub_curl
     touch "$MOCK_LOG"

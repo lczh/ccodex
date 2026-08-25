@@ -51,7 +51,7 @@ test("chat: a mentioned image/PDF grows a FULL render at its mention, deduped an
   assert.match(RENDER, /if \(previewKind\(open\) && !previewable\.includes\(open\) && !\(skipThumbs && skipThumbs\.includes\(open\)\)\) \{/, "collected while linkifying — same detection, no second regex pass; an in-bubble image never re-renders");
   assert.match(RENDER, /if \(previewable\.length\) \{/, "both surfaces now — VS Code images ride the host data-URL flow");
   assert.match(RENDER, /previewable\.slice\(0, 4\)/, "capped so a directory listing doesn't wallpaper the chat");
-  assert.match(RENDER, /previewFull\(p, activeId, kernelVerified\.has\(p\), \(pathPins \|\| \{\}\)\[p\]\)/, "relative paths resolve against the ACTIVE session's cwd, as openPathLink; verified paths fail loudly");
+  assert.match(RENDER, /previewFull\(p, renderingOwnerSid \?\? activeId, kernelVerified\.has\(p\), \(pathPins \|\| \{\}\)\[p\]\)/, "URLs bake the OWNING session's id — a background build must never capture activeId; verified paths fail loudly");
 });
 
 test("the chat sheet carries the lightbox + preview styles (the feed no longer previews)", () => {

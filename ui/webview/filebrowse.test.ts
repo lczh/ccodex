@@ -89,10 +89,13 @@ test("Escape closes the TOPMOST surface only, and Backspace walks up", () => {
 });
 
 test("every entry point is gated to where the click can land, and posts the one shell message", () => {
-  // chat: openBrowse posts {romp:'browseFiles'} to the shell, web-only
-  assert.match(RENDER, /window\.parent\.postMessage\(\{ romp: "browseFiles", path: path \|\| "\.", sid: sid \|\| activeId \|\| null \}, "\*"\);/);
-  // tab right-click menu row, web-only
-  assert.match(RENDER, /browse\.textContent = "Browse files";/);
+  // chat: openBrowse is PANE-LOCAL (2026-08-24 — it used to relay to the shell and open over the
+  // FEED, the wrong pane): the browser opens over the chat that launched it, web-only, framed or not
+  assert.match(RENDER, /openFileBrowse\(path \|\| "\.", sid \|\| activeId \|\| null\);/);
+  assert.match(RENDER, /initFileBrowse\(\(m\) => vscodeApi\?\.postMessage\(m\)\);/, "the chat hosts its own browser instance");
+  assert.doesNotMatch(RENDER, /window\.parent\.postMessage\(\{ romp: "browseFiles"/, "no shell relay from the chat anymore");
+  // tab right-click menu row: bottom of the menu, behind a divider, icon + sub-description
+  assert.match(RENDER, /l\.textContent = "Browse files"; bodyEl\.appendChild\(l\);/);
   // feed card menu row rides canPreview (web only — the VS Code webview can't reach the kernel
   // origin), and sends only the sid — the kernel resolves "." against the session's cwd authoritatively
   assert.match(FEED, /openFileBrowse\("\.", it\.sid\);/);
@@ -100,7 +103,7 @@ test("every entry point is gated to where the click can land, and posts the one 
 });
 
 test("the statusline folder link BROWSES on the web; OS-open lives on its right-click (the user 2026-08-14)", () => {
-  assert.match(RENDER, /elem\.dataset\.act = web && window\.parent !== window \? "browseFiles" : "openFolder";/);
+  assert.match(RENDER, /elem\.dataset\.act = web \? "browseFiles" : "openFolder";/);   // pane-local browse needs no shell (2026-08-24)
   assert.match(RENDER, /click to browse this folder/);
   // the demoted OS-open: one document-level contextmenu on folder links, posting the old openFolder
   assert.match(RENDER, /item\.textContent = "Open folder window";/);
@@ -180,4 +183,22 @@ test("the row menu carries the plan's full vocabulary: Copy path / Download / Op
   assert.match(BROWSE, /add\("Copy path", \(\) => \{ navigator\.clipboard\?\.writeText\(path\); \}\);/);
   assert.match(BROWSE, /if \(!isDir\) add\("Download", \(\) => startDownload\(path\)\);/);
   assert.match(BROWSE, /add\("Open folder window", \(\) => \{/);
+});
+
+// ── the tab-menu restructure (the user 2026-08-24) ───────────────────────────────────────────────
+test("Browse files sits at the BOTTOM of the tab menu, behind a divider, wearing icon + sub-description", () => {
+  const at = RENDER.indexOf("function showTabMenu");
+  const menuBody = RENDER.slice(at, RENDER.indexOf("document.body.appendChild(menu);", at));
+  const browseAt = menuBody.indexOf('l.textContent = "Browse files"');
+  assert.ok(browseAt > 0, "the item exists");
+  // nothing else is appended to the menu after the Browse block — it is the last thing before mount
+  assert.equal(menuBody.indexOf("menu.appendChild(", browseAt + 200) > 0 ? menuBody.slice(browseAt).match(/menu\.appendChild\(browse\);/) !== null : true, true);
+  assert.ok(menuBody.lastIndexOf('menu.appendChild(el("div", "ctx-sep"));') < browseAt
+            && menuBody.slice(0, browseAt).trimEnd().includes('menu.appendChild(el("div", "ctx-sep"));'),
+    "a divider immediately precedes it — a different kind of thing");
+  assert.match(menuBody.slice(browseAt - 400, browseAt), /ctxIcon\("folder", false\)/, "the folder icon");
+  assert.match(menuBody, /sb\.textContent = "the session's working tree, in a viewer over this chat";/,
+    "the standard sub-description line");
+  // …and the Billing submenu (the previous last item) now sits ABOVE it
+  assert.ok(menuBody.indexOf('l.textContent = "Billing"') < browseAt, "Browse is last");
 });

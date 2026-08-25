@@ -64,7 +64,8 @@ test("flush is event-based: card mouseleave, window blur backstop — no timers 
   // the clear path's synthetic mouseleave used to re-render the board under the rest of its own
   // click handler, before pendingCleared.add ran). Ordering, not a time window.
   assert.match(FEED, /queueMicrotask\(\(\) => \{/);
-  assert.match(FEED, /if \(freezeKey\) return; \/\/ re-armed before the tick ended → keep the queue for the next leave/);
+  assert.match(FEED, /if \(freezeKey \|\| tabScopeKey\) return;/,
+    "EITHER holder keeps the queue — a stranger card's mouseleave must not flush under an armed keyboard scope");
 });
 
 test("a local render that detaches or re-keys the hovered element heals the freeze (:hover truth)", () => {

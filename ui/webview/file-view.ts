@@ -81,17 +81,19 @@ marked.use({
 // must survive a kernel restart without a round-trip to the thing that just restarted). RENDERED is the
 // default for markdown (the user 2026-08-09); Raw stays one click away.
 const FMT_KEY = "romp:fileviewFmt";
-type FileViewFmt = { md: "rendered" | "raw"; wrap: boolean };
+// wrap is GONE from the format state (the user 2026-08-24: "there doesn't need to be a button for
+// that") — long lines always soft-wrap; a stored wrap key from the toggle era is simply ignored.
+type FileViewFmt = { md: "rendered" | "raw" };
 
 // Any malformed/foreign value reads as the defaults rather than throwing — a corrupt entry may cost the
 // stored preference, never the viewer (feed-view-state's parseViewState contract).
 function parseFmt(raw: string | null | undefined): FileViewFmt {
-  const def: FileViewFmt = { md: "rendered", wrap: false };
+  const def: FileViewFmt = { md: "rendered" };
   if (!raw) return def;
   try {
-    const o = JSON.parse(raw) as { md?: unknown; wrap?: unknown };
+    const o = JSON.parse(raw) as { md?: unknown };
     if (!o || typeof o !== "object") return def;
-    return { md: o.md === "raw" ? "raw" : "rendered", wrap: o.wrap === true };
+    return { md: o.md === "raw" ? "raw" : "rendered" };
   } catch { return def; }
 }
 
@@ -204,6 +206,17 @@ export function openFileView(path: string, sid?: string | null): void {
   document.body.classList.add("fileview-open");
 
   const bar = el("div", "fileview-bar");
+  // BACK to the listing (the user 2026-08-24): a file opened FROM the browser overlays it with the
+  // listing intact beneath (the one-directional stack above) — closing just the viewer IS the back.
+  // The button renders only when a listing is actually underneath; a viewer opened from a path link
+  // has nowhere to go back to and shows none. Import-free by design: presence is the DOM id (the
+  // browser may not even be loaded in this document).
+  if (document.getElementById("romp-filebrowse")) {
+    const back = el("button", "fileview-btn fileview-back") as HTMLButtonElement;
+    back.type = "button"; back.textContent = "‹ Files"; back.title = "Back to the file listing";
+    back.addEventListener("click", () => closeFileView());
+    bar.appendChild(back);
+  }
   // Directory then basename as TWO elements, because only the directory may be truncated: the filename
   // is what identifies the file, so it never shrinks however deep the path is. (A single text node with
   // the rtl-ellipsis trick would truncate the right end — exactly the wrong half.)
@@ -259,10 +272,6 @@ export function openFileView(path: string, sid?: string | null): void {
       acts.appendChild(b);
     }
   }
-  const wrapBtn = el("button", "fileview-btn") as HTMLButtonElement;
-  wrapBtn.type = "button"; wrapBtn.textContent = "Wrap"; wrapBtn.title = "Soft-wrap long lines";
-  wrapBtn.addEventListener("click", () => { fmt.wrap = !fmt.wrap; saveFmt(fmt); renderBody(); });
-  acts.appendChild(wrapBtn);
 
   // ── edit (the raw-mode slice) ── exactly what raw mode can show is what Edit can touch: the
   // button arms only when the kernel served text/plain WITH a Last-Modified to anchor the save's
@@ -360,15 +369,11 @@ export function openFileView(path: string, sid?: string | null): void {
       b.setAttribute("aria-pressed", String(on));
       b.hidden = editing;                       // format choices leave with edit mode; Save/Cancel own the bar
     }
-    // wrap governs the pre view only — rendered prose always wraps — so the button leaves with it
-    wrapBtn.hidden = rendered || editing;
-    wrapBtn.classList.toggle("on", fmt.wrap);
-    wrapBtn.setAttribute("aria-pressed", String(fmt.wrap));
     editBtn.hidden = editing || text === null || !isText || !mtimeNs;
     saveBtn.hidden = !editing;
     cancelBtn.hidden = !editing;
     if (text === null || editing) return;   // loading, or the textarea owns the body right now
-    body.replaceChildren(rendered ? mdBlock(text) : codeBlock(text, path, fmt.wrap));
+    body.replaceChildren(rendered ? mdBlock(text) : codeBlock(text, path, true));   // long lines always soft-wrap (the user 2026-08-24)
   };
 
   // Selection → labeled quote chip (the user 2026-08-23): mouseup is the gesture's settle point.

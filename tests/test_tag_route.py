@@ -84,7 +84,7 @@ class TagRoute(unittest.TestCase):
     def test_get_views_serves_the_normalized_default(self):
         st, v = self._views()
         self.assertEqual(st, 200)
-        self.assertEqual(v, {"active": "all", "hidden": [], "tags": []})
+        self.assertEqual(v, {"active": "all", "tags": []})
 
     def test_create_resolves_a_live_name_and_mints_the_ui_id_shape(self):
         st, r = self._post({"name": "pool", "add": ["web"]})
@@ -196,14 +196,14 @@ class TagRoute(unittest.TestCase):
 
     def test_an_edit_merges_and_never_clobbers_the_rest_of_the_blob(self):
         GB = {"id": "gb", "name": "beta", "color": "#DD42FF", "members": ["s2"]}
-        km._set_timeline_views({"active": "gb", "hidden": ["s9"], "tags": [
+        km._set_timeline_views({"active": "gb", "tags": [
             {"id": "ga", "name": "alpha", "color": "", "members": ["s1"]}, GB]})
         km._flags_cache.clear()
         st, r = self._post({"name": "alpha", "add": ["api"]})
         self.assertTrue(r.get("ok"), r)
         st, v = self._views()
         self.assertEqual(v["active"], "gb", "the active view survives the merge")
-        self.assertEqual(v["hidden"], ["s9"], "the hidden list survives")
+        self.assertNotIn("hidden", v, "the hidden key is retired (2026-08-24) — never re-minted by an edit")
         want = dict(GB, members=[{"host": "", "sid": "s2"}])
         self.assertEqual([g for g in v["tags"] if g["id"] == "gb"], [want],
                          "the tag the edit never looked at is untouched (stored as pairs)")
