@@ -3,6 +3,7 @@ dist
 dist.gen.*
 .dist.lnk.*
 .dist.old.*
+.romp-chat-view.vsix.*
 site/
 *.vsix
 __pycache__/

@@ -3270,32 +3270,52 @@ def _kernel_code_changed(a, b):
         return True
 
 
-def _publish_dist_generation(srcdir):
+_DIST_GEN_SEQ = [0]   # per-process publish counter: generation names must be unique PER PUBLISH
+
+
+def _publish_dist_generation(srcdir, pub=None):
     """Atomically publish a freshly-built dist as a new GENERATION under the live extension dir:
-    copy to dist.gen.<pid>, then swap the `dist` symlink with one rename(2) — readers never see a
-    half-written bundle set (the v1.3.17 audit's P2.7: the in-place esbuild published file by
-    file). A pre-generations REAL dist dir is moved aside first (one microsecond gap, once, on
-    upgrade). Mirrors vscode-extension/install.sh's publish_dist — the two protocols must match."""
+    copy to a UNIQUE dist.gen.<pid>.<seq>, then swap the `dist` symlink with one rename(2) —
+    readers never see a half-written bundle set (the v1.3.17 audit's P2.7: the in-place esbuild
+    published file by file). The name is unique per PUBLISH, not per process: the first cut
+    reused dist.gen.<pid>, so a long-lived kernel's SECOND UI-only converge rmtree'd the very
+    generation the live symlink was serving and repopulated it in place — the exact non-atomic
+    window this function exists to close, plus a dangling symlink whenever the copy died
+    (the r45 verification's P1). Neither the staging rmtree nor the prune ever touches the name
+    `dist` currently resolves to. A pre-generations REAL dist dir is moved aside first (one
+    microsecond gap, once, on upgrade). Mirrors vscode-extension/install.sh's publish_dist —
+    the two protocols must match."""
     import shutil as _sh
-    pub = ROOT / "vscode-extension"
-    gen = pub / ("dist.gen.%d" % os.getpid())
+    pub = (ROOT / "vscode-extension") if pub is None else Path(pub)
+    dist = pub / "dist"
+
+    def _live():
+        try:
+            return os.readlink(dist)
+        except OSError:
+            return ""
+
+    _DIST_GEN_SEQ[0] += 1
+    gen = pub / ("dist.gen.%d.%d" % (os.getpid(), _DIST_GEN_SEQ[0]))
+    while gen.name == _live() or gen.exists():
+        _DIST_GEN_SEQ[0] += 1
+        gen = pub / ("dist.gen.%d.%d" % (os.getpid(), _DIST_GEN_SEQ[0]))
     lnk = pub / (".dist.lnk.%d" % os.getpid())
     old = pub / (".dist.old.%d" % os.getpid())
-    _sh.rmtree(gen, ignore_errors=True)
     _sh.copytree(srcdir, gen)
     try:
         lnk.unlink()
     except OSError:
         pass
     os.symlink(gen.name, lnk)
-    dist = pub / "dist"
     if dist.is_dir() and not dist.is_symlink():
         _sh.rmtree(old, ignore_errors=True)
         os.rename(dist, old)
     os.rename(lnk, dist)
     _sh.rmtree(old, ignore_errors=True)
+    live = _live()
     for g in pub.glob("dist.gen.*"):
-        if g != gen:
+        if g != gen and g.name != live:
             _sh.rmtree(g, ignore_errors=True)
 
 
@@ -12310,6 +12330,9 @@ def _clear_restart_marker_if_current():
     except OSError:
         return
     ks = _kernel_sha()
+    if ks.endswith("-dirty"):
+        ks = ks[:-len("-dirty")]        # the suffix defeats both prefix checks, and dirty-vs-clean
+    #                                     is the tree's state, not the running commit's identity
     if want and ks and (want.startswith(ks) or ks.startswith(want)):
         try:
             os.remove(mk)
@@ -13199,11 +13222,20 @@ def _update_remote(host):
         "except OSError:\n"
         "    sys.exit(35)\n"
         "os.remove(lp)\n"
-        # LAUNCH SNAPSHOT (P1.2): the bin/ tree of the EXACT verified commit — the first exec'd
-        # byte streams (manager, fallback serve) are pinned against a post-verify swap of the
-        # live files; ROMP_DIR / ROMP_SERVE_ROOT point them at the real checkout, so the
-        # long-lived processes serve the durable install, never the temp snapshot.
-        'lsnap=os.path.join(os.path.dirname(lp),"romp-launch-snap")\n'
+        # LAUNCH SNAPSHOT (P1.2): the byte streams THIS WRAPPER EXECS — the manager-ensure
+        # entry and the fallback serve — come from the EXACT verified commit, immune to a
+        # post-verify swap of the live files; ROMP_DIR / ROMP_SERVE_ROOT point them at the real
+        # checkout. BOUNDARY, named plainly (the r45 verification): a manager that is ALREADY
+        # running (ensure then spawns nothing) respawns the kernel through the live checkout's
+        # bin/romp-serve, and a manager the snapshot entry STARTS resolves the live serve for
+        # every later respawn too — the durable supervisor must run the durable install, never
+        # a temp snapshot this wrapper deletes (the romp-service unit boundary, v1.3.16). The
+        # pin covers the transaction's own execs; the runtime supervisor's files are the
+        # checkout's, guarded by the verified-clean tree + the flock-cooperating writers.
+        # a UNIQUE staging name (the r45 verification): the remote-restart leg shares this git
+        # dir and cleans ITS snapshot without the flock — a fixed shared name let it delete the
+        # scripts this wrapper was about to exec
+        'lsnap=os.path.join(os.path.dirname(lp),"romp-launch-snap-%%d"%%os.getpid())\n'
         "shutil.rmtree(lsnap,ignore_errors=True)\n"
         'ar=subprocess.run(["git","-C",r,"archive",target,"bin"],capture_output=True)\n'
         "if ar.returncode or not ar.stdout:\n"
@@ -13563,7 +13595,11 @@ def _pull_remote(host, expected_sha=None):
         if eq_fd is None:
             return False, "another update is already running on this checkout — try again when it finishes"
         try:
-            if _local_head() == rhead and _install_latch_lines() == []:
+            # UNCACHED (the r45 verification): _local_head() serves a 15s cache the /tunnels
+            # poll keeps warm, so the "re-read under the lock" was a cache hit — a HEAD moved
+            # by a peer session inside the window sailed through as "already up to date". The
+            # push leg's _fresh_local_head() exists for exactly this read.
+            if _fresh_local_head() == rhead and _install_latch_lines() == []:
                 return True, "already up to date (%s)" % (_local_head(short=True) or lfull[:8])
         finally:
             try:
@@ -13989,12 +14025,12 @@ def _restart_remote_kernel(host):
         # pin the exec'd manager bytes to the just-verified HEAD (the v1.3.17 audit's P1.2): a
         # snapshot failure falls back to the live path — this leg's restart was always
         # best-effort (|| true), and a degraded restart beats none
-        'LGD="$(git -C "$R" rev-parse --absolute-git-dir 2>/dev/null)"; MGR="$R/bin/romp-manager"; '
-        'if [ -n "$LGD" ]; then rm -rf "$LGD/romp-launch-snap"; mkdir -p "$LGD/romp-launch-snap"; '
-        'if git -C "$R" archive HEAD bin 2>/dev/null | tar -x -C "$LGD/romp-launch-snap" 2>/dev/null '
-        '&& [ -r "$LGD/romp-launch-snap/bin/romp-manager" ]; then MGR="$LGD/romp-launch-snap/bin/romp-manager"; fi; fi; '
+        'LGD="$(git -C "$R" rev-parse --absolute-git-dir 2>/dev/null)"; MGR="$R/bin/romp-manager"; RRSNAP="$LGD/romp-launch-snap-rr.$$"; '
+        'if [ -n "$LGD" ]; then rm -rf "$RRSNAP"; mkdir -p "$RRSNAP"; '
+        'if git -C "$R" archive HEAD bin 2>/dev/null | tar -x -C "$RRSNAP" 2>/dev/null '
+        '&& [ -r "$RRSNAP/bin/romp-manager" ]; then MGR="$RRSNAP/bin/romp-manager"; fi; fi; '
         'if command -v node >/dev/null 2>&1 && [ -r "$MGR" ]; then ROMP_DIR="$R" ROMP_SERVE_ROOT="$R" node "$MGR" ensure >>"$LOGDIR/update.log" 2>&1 || true; fi; '
-        '[ -n "$LGD" ] && rm -rf "$LGD/romp-launch-snap"; '
+        '[ -n "$LGD" ] && rm -rf "$RRSNAP"; '
         'UP=0; for i in 1 2 3 4 5 6 7 8; do sleep 1; if bash -c "exec 3<>/dev/tcp/127.0.0.1/%d" 2>/dev/null; then UP=1; break; fi; done; '
         'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null &  sleep 1; fi; '
         'echo "RESTARTED:$UP"'

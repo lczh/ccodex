@@ -1574,6 +1574,83 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class DistGenerationPublish(unittest.TestCase):
+    """the r45 verification's P1: dist.gen.<pid> was constant per process, so a long-lived
+    kernel's second publish rmtree'd the generation the live symlink was serving — the exact
+    non-atomic window the generation scheme exists to close."""
+
+    def test_two_publishes_in_one_process_never_touch_the_live_generation(self):
+        import pathlib
+        import shutil
+        with tempfile.TemporaryDirectory() as td:
+            pub = pathlib.Path(td) / "vscode-extension"
+            src = pathlib.Path(td) / "src"
+            (src / "sub").mkdir(parents=True)
+            pub.mkdir()
+            (src / "feed.js").write_text("one")
+            km._publish_dist_generation(str(src), pub=pub)
+            first = (pub / "dist").resolve()
+            self.assertEqual((pub / "dist" / "feed.js").read_text(), "one")
+            (src / "feed.js").write_text("two")
+            real_copytree = shutil.copytree
+
+            def watching(*a, **kw):
+                # shutil.copytree recurses through itself for subdirs — accept any arity
+                self.assertTrue((pub / "dist" / "feed.js").exists(),
+                                "the LIVE generation is servable throughout the second copy")
+                return real_copytree(*a, **kw)
+
+            with mock.patch.object(shutil, "copytree", side_effect=watching):
+                km._publish_dist_generation(str(src), pub=pub)
+            self.assertEqual((pub / "dist" / "feed.js").read_text(), "two")
+            self.assertNotEqual((pub / "dist").resolve(), first,
+                                "each publish is its OWN generation")
+            gens = list(pub.glob("dist.gen.*"))
+            self.assertEqual(len(gens), 1, "the swap prunes everything but the live generation")
+
+    def test_a_failed_copy_leaves_the_old_generation_serving(self):
+        import pathlib
+        import shutil
+        with tempfile.TemporaryDirectory() as td:
+            pub = pathlib.Path(td) / "vscode-extension"
+            src = pathlib.Path(td) / "src"
+            src.mkdir(parents=True)
+            pub.mkdir()
+            (src / "feed.js").write_text("one")
+            km._publish_dist_generation(str(src), pub=pub)
+            with mock.patch.object(shutil, "copytree", side_effect=OSError(28, "ENOSPC")):
+                with self.assertRaises(OSError):
+                    km._publish_dist_generation(str(src), pub=pub)
+            self.assertEqual((pub / "dist" / "feed.js").read_text(), "one",
+                             "a died copy must never dangle the live symlink (r45 P1)")
+
+
+class RestartMarkerClear(unittest.TestCase):
+    """the r45 verification: _kernel_sha()'s -dirty suffix defeated both prefix checks, so the
+    marker never cleared on a dirty tree and the restart banner nagged forever."""
+
+    def test_a_dirty_kernel_sha_still_clears_its_own_marker(self):
+        import pathlib
+        with tempfile.TemporaryDirectory() as td:
+            gd = pathlib.Path(td)
+            (gd / "romp-restart-needed").write_text("a" * 40 + "\n")
+            with mock.patch.object(km, "_update_git_dir", return_value=gd), \
+                 mock.patch.object(km, "_kernel_sha", return_value="a" * 8 + "-dirty"):
+                km._clear_restart_marker_if_current()
+            self.assertFalse((gd / "romp-restart-needed").exists())
+
+    def test_a_marker_for_a_different_commit_stays(self):
+        import pathlib
+        with tempfile.TemporaryDirectory() as td:
+            gd = pathlib.Path(td)
+            (gd / "romp-restart-needed").write_text("b" * 40 + "\n")
+            with mock.patch.object(km, "_update_git_dir", return_value=gd), \
+                 mock.patch.object(km, "_kernel_sha", return_value="a" * 8):
+                km._clear_restart_marker_if_current()
+            self.assertTrue((gd / "romp-restart-needed").exists(),
+                            "the running kernel is not the intended one — the record stands")
+
+
 class UiOnlyConverge(unittest.TestCase):
     """A drift whose commits touch nothing the running process executes converges by rebuilding dist
     in place — kernel left up, zero cut turns (the user 2026-08-23: most changes are UI-only, and

@@ -769,7 +769,7 @@ class UpdateRemote(unittest.TestCase):
                               "flock before probing — RESTARTFAIL here is the r44 deadlock")
                 self.assertFalse((gd / "romp-restart-needed").exists(),
                                  "a verified healthy launch clears the durable restart intent")
-                self.assertFalse((gd / "romp-launch-snap").exists(),
+                self.assertEqual(list(gd.glob("romp-launch-snap*")), [],
                                  "the pinned launch snapshot is cleaned up")
                 # negative leg: a manager that starts nothing → no healthy verdict → no SYNCED
                 (fix / "bin" / "romp-manager").write_text("#!/bin/sh\nexit 0\n")

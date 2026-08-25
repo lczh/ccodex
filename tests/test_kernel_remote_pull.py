@@ -213,23 +213,38 @@ class PullRemote(unittest.TestCase):
 
     def test_equal_heads_with_a_clear_latch_are_a_true_no_op(self):
         self._wire(rhead=LOCAL)                       # the remote already sits at OUR head
-        with mock.patch.object(km, "_install_latch_lines", return_value=[]):
+        with mock.patch.object(km, "_install_latch_lines", return_value=[]), \
+             mock.patch.object(km, "_fresh_local_head", return_value=LOCAL):
             ok, detail = km._pull_remote("TESTHOST", expected_sha=LOCAL)
         self.assertTrue(ok, detail)
         self.assertIn("already up to date", detail)
+
+    def test_a_head_moved_under_the_cache_is_never_a_no_op(self):
+        # the r45 verification: the locked "re-read" was a 15s cache hit — a peer session
+        # moving the checkout inside the window read back as "already up to date". The eq
+        # branch must consult git, not the cache.
+        self._wire(rhead=LOCAL)
+        moved = "f" * 40
+        with mock.patch.object(km, "_install_latch_lines", return_value=[]), \
+             mock.patch.object(km, "_fresh_local_head", return_value=moved):
+            ok, detail = km._pull_remote("TESTHOST", expected_sha=LOCAL)
+        self.assertNotIn("already up to date", detail,
+                         "the uncached HEAD read decides — the warm cache cannot")
 
     def test_equal_heads_with_an_armed_latch_still_run_the_settle_transaction(self):
         # the v1.3.16 audit's P2.10: the equal-HEAD return reported success while an armed
         # install latch sat unsettled and the update lock was never taken
         self._wire(rhead=LOCAL)
-        with mock.patch.object(km, "_install_latch_lines", return_value=["aaaaaaaa"]):
+        with mock.patch.object(km, "_fresh_local_head", return_value=LOCAL), \
+             mock.patch.object(km, "_install_latch_lines", return_value=["aaaaaaaa"]):
             ok, detail = km._pull_remote("TESTHOST", expected_sha=LOCAL)
         self.assertNotIn("already up to date", detail,
                          "HEAD equality alone cannot bypass this checkout's recovery record")
 
     def test_equal_heads_with_an_unreadable_latch_still_run_the_settle_transaction(self):
         self._wire(rhead=LOCAL)
-        with mock.patch.object(km, "_install_latch_lines", return_value=None):
+        with mock.patch.object(km, "_fresh_local_head", return_value=LOCAL), \
+             mock.patch.object(km, "_install_latch_lines", return_value=None):
             ok, detail = km._pull_remote("TESTHOST", expected_sha=LOCAL)
         self.assertNotIn("already up to date", detail,
                          "an unreadable latch is never presumed clear")
@@ -263,6 +278,7 @@ class PullRemote(unittest.TestCase):
             return []
 
         with mock.patch.object(km, "_update_flock", side_effect=lock_first), \
+             mock.patch.object(km, "_fresh_local_head", return_value=LOCAL), \
              mock.patch.object(km, "_install_latch_lines", side_effect=latch_read):
             ok, detail = km._pull_remote("TESTHOST", expected_sha=LOCAL)
         self.assertTrue(ok, detail)
@@ -615,7 +631,8 @@ class PullRemote(unittest.TestCase):
     def test_already_up_to_date_short_circuits(self):
         km._remotes["TESTHOST"]["kernel_sha"] = LOCAL
         self._wire(rhead=LOCAL)
-        ok, detail = km._pull_remote("TESTHOST")
+        with mock.patch.object(km, "_fresh_local_head", return_value=LOCAL):
+            ok, detail = km._pull_remote("TESTHOST")
         self.assertTrue(ok)
         self.assertIn("already up to date", detail)
 

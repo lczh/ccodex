@@ -43,9 +43,15 @@ cd "$SELF_DIR"
 # swap has a microsecond gap, once, on upgrade; every later publish is atomic. Old generations
 # are pruned after the swap (installs serialize under the updater's flock).
 publish_dist() {
-  local pub="$1" gen="dist.gen.$$"
-  rm -rf "$pub/$gen"
+  local pub="$1" gen live g
+  # UNIQUE per publish, never the name the live symlink resolves to (the r45 verification: a
+  # reused name rmtree'd the generation being served); leftover staging links are pre-cleaned
+  # so a crashed prior run cannot abort this one's ln.
+  live="$(readlink "$pub/dist" 2>/dev/null || true)"
+  gen="dist.gen.$$.$RANDOM"
+  while [ "$gen" = "$live" ] || [ -e "$pub/$gen" ]; do gen="dist.gen.$$.$RANDOM"; done
   cp -R dist "$pub/$gen"
+  rm -rf "$pub/.dist.lnk.$$"
   ln -s "$gen" "$pub/.dist.lnk.$$"
   if [ -d "$pub/dist" ] && [ ! -L "$pub/dist" ]; then
     rm -rf "$pub/.dist.old.$$"
@@ -53,10 +59,12 @@ publish_dist() {
   fi
   python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$pub/.dist.lnk.$$" "$pub/dist"
   rm -rf "$pub/.dist.old.$$" 2>/dev/null || true
-  local g
+  live="$(readlink "$pub/dist" 2>/dev/null || true)"
   for g in "$pub"/dist.gen.*; do
     [ -e "$g" ] || continue
-    [ "$g" = "$pub/$gen" ] || rm -rf "$g"
+    [ "$g" = "$pub/$gen" ] && continue
+    [ "$(basename "$g")" = "$live" ] && continue
+    rm -rf "$g"
   done
 }
 
