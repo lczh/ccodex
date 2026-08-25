@@ -259,6 +259,31 @@ ext_setup() {   # a throwaway copy so nothing here can touch the real extension 
     export PATH="$TEST_DIR/stub:$PATH"
 }
 
+@test "vscode-extension/install.sh: builds in ITS OWN dir and atomically publishes one dist generation into the target (v1.3.17 audit P1.1)" {
+    ext_setup
+    # the build must consume THIS (snapshot) dir's esbuild.js; the target's copy is the live
+    # bytes a racing writer controls — executing it is the audited hole (rc=0 observed=LIVE_ESBUILD)
+    echo 'require("fs").mkdirSync("dist",{recursive:true});require("fs").writeFileSync("dist/feed.js","snapshot-built")' > "$EXT/esbuild.js"
+    TGT="$TEST_DIR/target"
+    mkdir -p "$TGT/vscode-extension/dist"
+    echo "live-stale" > "$TGT/vscode-extension/dist/feed.js"
+    echo 'require("fs").writeFileSync("live-ran","LIVE")' > "$TGT/vscode-extension/esbuild.js"
+    ROMP_INSTALL_TARGET="$TGT" ROMP_EXT_PACKAGE_ONLY=1 run bash "$EXT/install.sh"
+    [ "$status" -eq 0 ]
+    [ ! -e "$TGT/vscode-extension/live-ran" ]
+    [ -f "$EXT/dist/feed.js" ]
+    [ -L "$TGT/vscode-extension/dist" ]
+    [ "$(cat "$TGT/vscode-extension/dist/feed.js")" = "snapshot-built" ]
+    [ -f "$TGT/vscode-extension/romp-chat-view.vsix" ]
+    # a second publish swaps the symlink and prunes the old generation — exactly one remains
+    ROMP_INSTALL_TARGET="$TGT" ROMP_EXT_PACKAGE_ONLY=1 run bash "$EXT/install.sh"
+    [ "$status" -eq 0 ]
+    gens=$(ls -d "$TGT/vscode-extension"/dist.gen.* | wc -l)
+    [ "$gens" -eq 1 ]
+    [ -L "$TGT/vscode-extension/dist" ]
+    [ "$(cat "$TGT/vscode-extension/dist/feed.js")" = "snapshot-built" ]
+}
+
 @test "vscode-extension/install.sh: restores package.json, leaving the committed version untouched" {
     ext_setup
     before="$(cat "$EXT/package.json")"

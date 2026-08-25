@@ -1582,7 +1582,8 @@ class UiOnlyConverge(unittest.TestCase):
     def setUp(self):
         self._saved = {n: getattr(km, n) for n in
                        ("_main_drift_verdict", "_kernel_code_changed", "_rebuild_dist",
-                        "_sync_notice", "_update_mode", "_send_to_app", "_kernel_sha")}
+                        "_sync_notice", "_update_mode", "_send_to_app", "_kernel_sha",
+                        "_checkout_sha")}
         km._MAIN_DRIFT[0] = km._MAIN_DRIFT[1] = ""
         km._REBUILT_FOR[0] = ""
         self.notices, self.banners, self.rebuilds = [], [], []
@@ -1600,7 +1601,8 @@ class UiOnlyConverge(unittest.TestCase):
     def test_ui_only_restart_drift_rebuilds_in_place_and_latches(self):
         km._main_drift_verdict = lambda o, c, k: ("restart", "abcd1234ef" + "0" * 30)
         km._kernel_code_changed = lambda a, b: False
-        km._rebuild_dist = lambda: (self.rebuilds.append(1), (True, ""))[1]
+        km._checkout_sha = lambda: "abcd1234ef" + "0" * 30   # unmoved under the lock (P2.7)
+        km._rebuild_dist = lambda commit: (self.rebuilds.append(commit), (True, ""))[1]
         km._main_drift_check()
         self.assertEqual(len(self.rebuilds), 1)
         self.assertEqual(km._REBUILT_FOR[0], "abcd1234",
@@ -1619,17 +1621,28 @@ class UiOnlyConverge(unittest.TestCase):
     def test_a_failed_build_falls_through_to_the_restart_path_loudly(self):
         km._main_drift_verdict = lambda o, c, k: ("restart", "eeee1234" + "0" * 32)
         km._kernel_code_changed = lambda a, b: False
-        km._rebuild_dist = lambda: (False, "esbuild boom")
+        km._checkout_sha = lambda: "eeee1234" + "0" * 32
+        km._rebuild_dist = lambda commit: (False, "esbuild boom")
         km._main_drift_check()
         self.assertEqual(km._REBUILT_FOR[0], "", "a failed build never latches")
         self.assertTrue(any(not ok and "esbuild boom" in m for m, ok in self.notices))
         self.assertEqual([b.get("drift") for b in self.banners], ["restart"],
                          "the normal restart offer still fires")
 
+    def test_a_checkout_moved_under_the_lock_is_never_built(self):
+        # the v1.3.17 audit's P2.7 repro: classification ran unlocked, an updater moved the
+        # checkout before acquisition, and the converge built the WRONG commit's bundles
+        km._main_drift_verdict = lambda o, c, k: ("restart", "aaaaaaaa" + "0" * 32)
+        km._kernel_code_changed = lambda a, b: False
+        km._checkout_sha = lambda: "bbbbbbbb" + "0" * 32     # the world moved
+        km._rebuild_dist = lambda commit: self.fail("a moved checkout must never be built here")
+        km._main_drift_check()
+        self.assertEqual(km._REBUILT_FOR[0], "", "nothing latched — the next pass reclassifies")
+
     def test_kernel_code_drift_keeps_the_restart_path(self):
         km._main_drift_verdict = lambda o, c, k: ("restart", "tgt-kern")
         km._kernel_code_changed = lambda a, b: True
-        km._rebuild_dist = lambda: self.fail("a kernel-code drift must never rebuild in place")
+        km._rebuild_dist = lambda commit: self.fail("a kernel-code drift must never rebuild in place")
         km._main_drift_check()
         self.assertEqual([b.get("drift") for b in self.banners], ["restart"])
 

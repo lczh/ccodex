@@ -3270,16 +3270,73 @@ def _kernel_code_changed(a, b):
         return True
 
 
-def _rebuild_dist():
-    """Rebuild the served bundles in place — the UI-only converge. The same esbuild the launcher runs,
-    kernel left up: _dist_ver() stats per page render so the fresh ?v= token flows on the next paint,
-    and the extension's newer-build prompt keys off the dv keepalive. (ok, err_tail)."""
+def _publish_dist_generation(srcdir):
+    """Atomically publish a freshly-built dist as a new GENERATION under the live extension dir:
+    copy to dist.gen.<pid>, then swap the `dist` symlink with one rename(2) — readers never see a
+    half-written bundle set (the v1.3.17 audit's P2.7: the in-place esbuild published file by
+    file). A pre-generations REAL dist dir is moved aside first (one microsecond gap, once, on
+    upgrade). Mirrors vscode-extension/install.sh's publish_dist — the two protocols must match."""
+    import shutil as _sh
+    pub = ROOT / "vscode-extension"
+    gen = pub / ("dist.gen.%d" % os.getpid())
+    lnk = pub / (".dist.lnk.%d" % os.getpid())
+    old = pub / (".dist.old.%d" % os.getpid())
+    _sh.rmtree(gen, ignore_errors=True)
+    _sh.copytree(srcdir, gen)
     try:
-        r = subprocess.run(["node", "esbuild.js"], cwd=str(ROOT / "vscode-extension"),
-                           capture_output=True, text=True, timeout=180)
-        return r.returncode == 0, (r.stderr or r.stdout or "").strip()[-300:]
+        lnk.unlink()
+    except OSError:
+        pass
+    os.symlink(gen.name, lnk)
+    dist = pub / "dist"
+    if dist.is_dir() and not dist.is_symlink():
+        _sh.rmtree(old, ignore_errors=True)
+        os.rename(dist, old)
+    os.rename(lnk, dist)
+    _sh.rmtree(old, ignore_errors=True)
+    for g in pub.glob("dist.gen.*"):
+        if g != gen:
+            _sh.rmtree(g, ignore_errors=True)
+
+
+def _rebuild_dist(commit):
+    """Rebuild the served bundles for the EXACT commit from an immutable snapshot — the UI-only
+    converge, kernel left up: _dist_ver() stats per page render so the fresh ?v= token flows on
+    the next paint. The first cut ran `node esbuild.js` over the LIVE tree (a racing writer could
+    swap inputs post-classification), without --production (the installers' contract — a dev
+    bundle shipped), publishing file by file (the v1.3.17 audit's P2.7). Now: git-archive the
+    commit, npm ci the snapshot's integrity-hashed lockfile, build with --production, publish ONE
+    dist generation atomically. (ok, err_tail)."""
+    import shutil as _sh
+    gd = _update_git_dir()
+    if not gd:
+        return False, "cannot resolve the git dir for the build snapshot"
+    snap = os.path.join(str(gd), "romp-ui-snap")
+    try:
+        _sh.rmtree(snap, ignore_errors=True)
+        os.makedirs(snap)
+        ar = subprocess.run(["git", "-C", str(ROOT), "archive", str(commit)],
+                            capture_output=True, timeout=120)
+        if ar.returncode or not ar.stdout:
+            return False, "git archive %s failed" % str(commit)[:12]
+        tr = subprocess.run(["tar", "-x", "-C", snap], input=ar.stdout, timeout=120)
+        ext = os.path.join(snap, "vscode-extension")
+        if tr.returncode or not os.path.exists(os.path.join(ext, "esbuild.js")):
+            return False, "unpacking the build snapshot failed"
+        ci = subprocess.run(["npm", "ci", "--silent", "--prefer-offline"], cwd=ext,
+                            capture_output=True, text=True, timeout=600)
+        if ci.returncode != 0:
+            return False, ("npm ci: " + (ci.stderr or ci.stdout or "").strip()[-260:])
+        r = subprocess.run(["node", "esbuild.js", "--production"], cwd=ext,
+                           capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            return False, (r.stderr or r.stdout or "").strip()[-300:]
+        _publish_dist_generation(os.path.join(ext, "dist"))
+        return True, ""
     except Exception as e:
-        return False, str(e)
+        return False, str(e)[:300]
+    finally:
+        _sh.rmtree(snap, ignore_errors=True)
 
 
 def _main_drift_check():
@@ -3315,7 +3372,17 @@ def _main_drift_check():
         if lk is None:
             return
         try:
-            ok, err = _rebuild_dist()
+            # REVALIDATE under the lock (the v1.3.17 audit's P2.7): the classification above ran
+            # unlocked, and an updater that moved the checkout between it and acquisition had
+            # this branch build the WRONG commit's bundles (the executed repro classified
+            # aaaaaaaa and rebuilt bbbbbbbb). A moved world simply yields — the next pass
+            # reclassifies against it.
+            tip = _checkout_sha()
+            if _sha8(tip) != _sha8(target):
+                return
+            if _kernel_code_changed(_kernel_sha(), tip):
+                return                                # kernel code differs now: the restart path owns it
+            ok, err = _rebuild_dist(tip)
         finally:
             try:
                 os.close(lk)
@@ -12226,6 +12293,30 @@ _pr_watches = []             # [{pr, repo, sid, at} + runtime {_next, _fails, _b
 _pr_watch_lock = threading.Lock()
 
 
+def _clear_restart_marker_if_current():
+    """The p2p apply wrapper arms romp-restart-needed BEFORE it spends the install latch and
+    clears it only on a verified healthy launch (the v1.3.17 audit's P1.2: an exec failure
+    after the latch was spent used to leave NO durable restart evidence — RESETFAIL with
+    latch_exists=False). A kernel that boots AS the marker's target is that intent fulfilled —
+    clear it here so a wrapper that died between probe and cleanup leaves no stale record. A
+    marker naming a DIFFERENT commit stays: the running kernel is not the intended one, and
+    the main-drift restart banner (checkout != kernel) is the surface that says so."""
+    gd = _update_git_dir()
+    if not gd:
+        return
+    mk = gd / "romp-restart-needed"
+    try:
+        want = mk.read_text().strip()
+    except OSError:
+        return
+    ks = _kernel_sha()
+    if want and ks and (want.startswith(ks) or ks.startswith(want)):
+        try:
+            os.remove(mk)
+        except OSError:
+            pass
+
+
 def _pr_watches_load():
     try:
         rows = json.loads(PR_WATCH_FILE.read_text())
@@ -13098,7 +13189,30 @@ def _update_remote(host):
         "    sys.exit(29)\n"
         "if not pub_line(pick_pub(body.splitlines()[0],body.splitlines())):\n"
         "    sys.exit(30)\n"
+        # DURABLE restart intent (the v1.3.17 audit's P1.2): armed BEFORE the latch is spent,
+        # cleared only by a verified healthy launch below (or by the target kernel itself at
+        # boot) — an exec failure after this point leaves evidence instead of silence.
+        'mk=os.path.join(os.path.dirname(lp),"romp-restart-needed")\n'
+        "try:\n"
+        '    with open(mk,"w") as mfh:\n'
+        '        mfh.write(target+"\\n")\n'
+        "except OSError:\n"
+        "    sys.exit(35)\n"
         "os.remove(lp)\n"
+        # LAUNCH SNAPSHOT (P1.2): the bin/ tree of the EXACT verified commit — the first exec'd
+        # byte streams (manager, fallback serve) are pinned against a post-verify swap of the
+        # live files; ROMP_DIR / ROMP_SERVE_ROOT point them at the real checkout, so the
+        # long-lived processes serve the durable install, never the temp snapshot.
+        'lsnap=os.path.join(os.path.dirname(lp),"romp-launch-snap")\n'
+        "shutil.rmtree(lsnap,ignore_errors=True)\n"
+        'ar=subprocess.run(["git","-C",r,"archive",target,"bin"],capture_output=True)\n'
+        "if ar.returncode or not ar.stdout:\n"
+        "    sys.exit(34)\n"
+        "os.makedirs(lsnap)\n"
+        'tr=subprocess.run(["tar","-x","-C",lsnap],input=ar.stdout)\n'
+        "if tr.returncode:\n"
+        "    shutil.rmtree(lsnap,ignore_errors=True)\n"
+        "    sys.exit(34)\n"
         # the KILL and the SPAWN REQUEST run INSIDE the lock (the v1.3.16 audit's P1.2: the
         # transaction used to end before the spawn, so a writer could swap bin/romp-serve
         # between the verify and the launch) — then the lock is EXPLICITLY RELEASED before the
@@ -13111,7 +13225,9 @@ def _update_remote(host):
         # different from the pre-kill one) as the only healthy verdict. Spawned children never
         # inherit the lock fd; the pkill self-match guard (romp-kern[e]l, the user 2026-07-22)
         # keeps this wrapper from matching itself.
-        'if not os.access(os.path.join(r,"bin","romp-serve"),os.X_OK):\n'
+        'sv=os.path.join(lsnap,"bin","romp-serve")\n'
+        'mg=os.path.join(lsnap,"bin","romp-manager")\n'
+        "if not os.access(sv,os.X_OK):\n"
         "    sys.exit(33)\n"
         "import urllib.request\n"
         "def probe():\n"
@@ -13129,30 +13245,48 @@ def _update_remote(host):
         "        return False\n"
         "    return not old_boot or bid!=old_boot\n"
         'subprocess.run(["pkill","-f","bin/romp-kern[e]l"])\n'
-        'mgr=os.path.join(r,"bin","romp-manager")\n'
+        'env=dict(os.environ,ROMP_DIR=r,ROMP_SERVE_ROOT=r)\n'
         'lf=open(os.path.join(logdir,"update.log"),"a")\n'
-        'if shutil.which("node") and os.access(mgr,os.X_OK):\n'
-        '    subprocess.run([mgr,"ensure"],stdout=lf,stderr=lf)\n'
+        # the ensure's exit status is CAUGHT now (P1.2): a failed manager launch used to burn
+        # the whole probe window on nothing and then read as RESTARTFAIL with no cause on record
+        "mgr_ok=False\n"
+        'if shutil.which("node") and os.access(mg,os.R_OK):\n'
+        "    try:\n"
+        '        mgr_ok=subprocess.run(["node",mg,"ensure"],stdout=lf,stderr=lf,env=env).returncode==0\n'
+        "    except Exception:\n"
+        "        mgr_ok=False\n"
         "fcntl.flock(fd,fcntl.LOCK_UN)\n"
         "os.close(fd)\n"
         "up=False\n"
         'tries=int(os.environ.get("ROMP_LAUNCH_TRIES") or 12)\n'
-        "for i in range(tries):\n"
-        "    time.sleep(1)\n"
-        "    if healthy():\n"
-        "        up=True\n"
-        "        break\n"
-        "if not up:\n"
-        '    kl=open(os.path.join(logdir,"kernel.log"),"a")\n'
-        '    subprocess.Popen([os.path.join(r,"bin","romp-serve")],stdout=kl,stderr=kl,\n'
-        "                     stdin=subprocess.DEVNULL,start_new_session=True)\n"
+        "if mgr_ok:\n"
         "    for i in range(tries):\n"
         "        time.sleep(1)\n"
         "        if healthy():\n"
         "            up=True\n"
         "            break\n"
         "if not up:\n"
-        "    sys.exit(32)' "
+        '    kl=open(os.path.join(logdir,"kernel.log"),"a")\n'
+        "    try:\n"
+        "        subprocess.Popen([sv],stdout=kl,stderr=kl,env=env,\n"
+        "                         stdin=subprocess.DEVNULL,start_new_session=True)\n"
+        "    except OSError:\n"
+        "        shutil.rmtree(lsnap,ignore_errors=True)\n"
+        "        sys.exit(32)\n"
+        "    for i in range(tries):\n"
+        "        time.sleep(1)\n"
+        "        if healthy():\n"
+        "            up=True\n"
+        "            break\n"
+        # the spawned scripts hold open fds to the snapshot files; the unlinked inodes outlive
+        # the rmtree (POSIX), so cleanup here strands nothing
+        "shutil.rmtree(lsnap,ignore_errors=True)\n"
+        "if not up:\n"
+        "    sys.exit(32)\n"
+        "try:\n"
+        "    os.remove(mk)\n"
+        "except OSError:\n"
+        "    pass' "
         '"$GD/romp-update.lock" "$R" %s %d "$LOGDIR" >>"$LOGDIR/update.log" 2>&1; RRC=$?; '
         'if [ "$RRC" = 30 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo CHANNELPUBFAIL; exit 0; fi; '
         'if [ "$RRC" = 3 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo UPDATERUNNING; exit 0; fi; '
@@ -13179,6 +13313,8 @@ def _update_remote(host):
         'if [ "$RRC" = 4 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo INSTALLFAIL; exit 0; fi; '
         'if [ "$RRC" = 33 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; NEW="$(git -C "$R" rev-parse --short HEAD)"; echo "NOLAUNCH:$NEW"; exit 0; fi; '
         'if [ "$RRC" = 32 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; NEW="$(git -C "$R" rev-parse --short HEAD)"; echo "RESTARTFAIL:$NEW"; exit 0; fi; '
+        'if [ "$RRC" = 34 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo LAUNCHSNAPFAIL; exit 0; fi; '
+        'if [ "$RRC" = 35 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo MARKERFAIL; exit 0; fi; '
         'if [ "$RRC" != 0 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; fi; '
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; '
         'NEW="$(git -C "$R" rev-parse --short HEAD)"; '
@@ -13190,7 +13326,7 @@ def _update_remote(host):
          _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
          _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
          _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
-         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF)
+         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -13277,6 +13413,14 @@ def _update_remote(host):
     if tag == "RESTOREFAIL":
         return False, ("the push did not land, and restoring the prior install record failed — "
                        "the armed latch stays; the remote's boot heal settles it")
+    if tag == "LAUNCHSNAPFAIL":
+        return False, ("pushed and installed on %s, but staging the pinned launch snapshot "
+                       "(git archive of the verified commit's bin/) failed — the restart was "
+                       "not attempted; its restart-needed record stays armed" % host)
+    if tag == "MARKERFAIL":
+        return False, ("pushed and installed on %s, but its restart-needed record could not be "
+                       "written — refusing to spend the install latch without durable restart "
+                       "intent; run the sync again" % host)
     if tag == "NOTLANDED":
         return False, ("the remote checkout moved while updating — the push did not land on the "
                        "validated commit; nothing installed")
@@ -13409,11 +13553,23 @@ def _pull_remote(host, expected_sha=None):
     if rhead != expected:
         return False, ("%s changed build after it was polled (expected %s, now %s) — refresh and try again"
                        % (host, expected[:12], rhead[:12]))
-    if rhead and rhead == lfull and _install_latch_lines() == []:
-        # equal heads alone cannot bypass this checkout's recovery record: the old return here
-        # reported success while an armed install latch sat unsettled and the lock was never
-        # taken (the v1.3.16 audit's P2.10) — only an affirmatively CLEAR latch is a no-op
-        return True, "already up to date (%s)" % (_local_head(short=True) or lfull[:8])
+    if rhead and rhead == lfull:
+        # the no-op is DECIDED INSIDE the lock (the v1.3.17 audit's P2.8): checked unlocked, a
+        # latch armed — or a HEAD moved — between the check and the report was bypassed
+        # entirely, with no settle ever running. Both facts re-read under the lock; anything
+        # but an affirmatively clear latch on an unmoved HEAD falls through to the full locked
+        # transaction below, whose settle/heal owns the recovery (the v1.3.16 audit's P2.10).
+        eq_fd = _update_flock()
+        if eq_fd is None:
+            return False, "another update is already running on this checkout — try again when it finishes"
+        try:
+            if _local_head() == rhead and _install_latch_lines() == []:
+                return True, "already up to date (%s)" % (_local_head(short=True) or lfull[:8])
+        finally:
+            try:
+                os.close(eq_fd)
+            except OSError:
+                pass
     env = dict(os.environ, GIT_SSH_COMMAND="%s %s" % (SSH_BIN, " ".join(_SSH_OPTS)))
     try:
         f = subprocess.run(["git", "-C", str(ROOT), "fetch", "%s:%s" % (host, rdir), "HEAD"],
@@ -13830,7 +13986,15 @@ def _restart_remote_kernel(host):
         'LOGDIR="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}"; mkdir -p "$LOGDIR"; R=%s; '
         'if [ ! -x "$R/bin/romp-serve" ]; then echo NOLAUNCH; exit 0; fi; '
         'pkill -f "bin/romp-kern[e]l" 2>/dev/null; '
-        'if command -v node >/dev/null 2>&1 && [ -x "$R/bin/romp-manager" ]; then "$R/bin/romp-manager" ensure >>"$LOGDIR/update.log" 2>&1 || true; fi; '
+        # pin the exec'd manager bytes to the just-verified HEAD (the v1.3.17 audit's P1.2): a
+        # snapshot failure falls back to the live path — this leg's restart was always
+        # best-effort (|| true), and a degraded restart beats none
+        'LGD="$(git -C "$R" rev-parse --absolute-git-dir 2>/dev/null)"; MGR="$R/bin/romp-manager"; '
+        'if [ -n "$LGD" ]; then rm -rf "$LGD/romp-launch-snap"; mkdir -p "$LGD/romp-launch-snap"; '
+        'if git -C "$R" archive HEAD bin 2>/dev/null | tar -x -C "$LGD/romp-launch-snap" 2>/dev/null '
+        '&& [ -r "$LGD/romp-launch-snap/bin/romp-manager" ]; then MGR="$LGD/romp-launch-snap/bin/romp-manager"; fi; fi; '
+        'if command -v node >/dev/null 2>&1 && [ -r "$MGR" ]; then ROMP_DIR="$R" ROMP_SERVE_ROOT="$R" node "$MGR" ensure >>"$LOGDIR/update.log" 2>&1 || true; fi; '
+        '[ -n "$LGD" ] && rm -rf "$LGD/romp-launch-snap"; '
         'UP=0; for i in 1 2 3 4 5 6 7 8; do sleep 1; if bash -c "exec 3<>/dev/tcp/127.0.0.1/%d" 2>/dev/null; then UP=1; break; fi; done; '
         'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null &  sleep 1; fi; '
         'echo "RESTARTED:$UP"'
@@ -32778,6 +32942,7 @@ def main():
     _known_load()                                              # remembered past hosts (popover's re-attach rows)
     _remotes_load()                                            # re-attach remote kernels from a prior run
     _pr_watches_load()                                         # re-arm PR-landing watches (same intent rule)
+    _clear_restart_marker_if_current()                         # this boot IS the restart the marker wanted (P1.2)
     _replay_ui_op_spool()                                      # gestures queued while no kernel ran — applied
     #                                                            through the locked setters, post-migration (P1.5)
     _consume_update_report()                                   # last self-update's outcome → the Log, once

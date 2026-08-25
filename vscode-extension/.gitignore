@@ -1,5 +1,8 @@
 node_modules/
-dist/
+dist
+dist.gen.*
+.dist.lnk.*
+.dist.old.*
 *.vsix
 .DS_Store
 out-tests/

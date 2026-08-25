@@ -234,6 +234,42 @@ class PullRemote(unittest.TestCase):
         self.assertNotIn("already up to date", detail,
                          "an unreadable latch is never presumed clear")
 
+    def test_the_equal_head_no_op_is_decided_inside_the_lock(self):
+        # the v1.3.17 audit's P2.8: the clear-latch check preceded lock acquisition, so a latch
+        # armed (or a HEAD moved) between the check and the report was bypassed with no settle.
+        # With the update lock HELD elsewhere, the no-op must refuse — never report success on
+        # facts it could not read under the lock.
+        self._wire(rhead=LOCAL)
+        with mock.patch.object(km, "_install_latch_lines", return_value=[]), \
+             mock.patch.object(km, "_update_flock", return_value=None):
+            ok, detail = km._pull_remote("TESTHOST", expected_sha=LOCAL)
+        self.assertFalse(ok)
+        self.assertIn("another update", detail)
+
+    def test_the_no_op_facts_are_read_only_after_acquisition(self):
+        # the audit's schedule (latch armed between an unlocked check and the report) is
+        # structurally gone: there is no unlocked check left. Pin the order — the lock is
+        # acquired BEFORE the latch/HEAD reads that justify "already up to date".
+        self._wire(rhead=LOCAL)
+        seq = []
+        real_flock = km._update_flock
+
+        def lock_first():
+            seq.append("lock")
+            return os.open(os.devnull, os.O_RDONLY)
+
+        def latch_read():
+            seq.append("latch")
+            return []
+
+        with mock.patch.object(km, "_update_flock", side_effect=lock_first), \
+             mock.patch.object(km, "_install_latch_lines", side_effect=latch_read):
+            ok, detail = km._pull_remote("TESTHOST", expected_sha=LOCAL)
+        self.assertTrue(ok, detail)
+        self.assertIn("already up to date", detail)
+        self.assertEqual(seq[0], "lock", "acquisition precedes every no-op fact read")
+        self.assertIn("latch", seq)
+
     def test_a_dirty_local_tree_is_refused(self):
         # the fast-forward rewrites the working tree, and peers' uncommitted edits are not ours to move
         self._wire(dirty=" M kernel/kernel.py")

@@ -21,7 +21,11 @@ while [[ -L "$src" ]]; do
         *)  src="$(cd "$(dirname "$src")" && pwd)/$tgt" ;;
     esac
 done
-ROMP_DIR="$(cd "$(dirname "$src")/.." && pwd)"
+# ROMP_SERVE_ROOT (the v1.3.17 audit's P1.2): an updater launches a SNAPSHOT copy of this
+# script — the exec'd byte stream is the verified commit's, immune to a post-verify swap of the
+# live file — and points it at the real checkout to serve. Everything below acts on ROMP_DIR,
+# so the override is complete; without it the path-derived default is unchanged.
+ROMP_DIR="${ROMP_SERVE_ROOT:-$(cd "$(dirname "$src")/.." && pwd)}"
 # ROMP_KERNEL_BIN is the test seam (same pattern as ROMP_*_BIN elsewhere).
 KERNEL="${ROMP_KERNEL_BIN:-$ROMP_DIR/bin/romp-kernel}"
 

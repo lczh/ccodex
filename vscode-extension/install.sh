@@ -22,14 +22,43 @@
 # Mirrors ../vscode-trackchanges/install.sh, minus the shared-engine wiring
 # (romp-chat-view is standalone; esbuild bundles its deps in).
 set -euo pipefail
-# ROMP_INSTALL_TARGET (the v1.3.16 audit's P1.1): under an updater this script's BYTES come from
-# an immutable snapshot, but the build acts on the TARGET checkout — node_modules and dist live
-# there, and the tree was verified clean at the target commit before and after the install.
-if [[ -n "${ROMP_INSTALL_TARGET:-}" && -d "$ROMP_INSTALL_TARGET/vscode-extension" ]]; then
-  cd "$ROMP_INSTALL_TARGET/vscode-extension"
-else
-  cd "$(dirname "$0")"
+# ROMP_INSTALL_TARGET (the v1.3.16 audit's P1.1, completed by the v1.3.17 audit's P1.1): under
+# an updater this script's BYTES come from an immutable snapshot — and the BUILD runs there too.
+# The first cut cd'd into the target and ran the LIVE npm ci + esbuild.js, so a racing writer
+# could still swap the build's inputs after verification. Now every input is the snapshot's:
+# npm ci reproduces the snapshot's lockfile (integrity-hashed), esbuild runs the snapshot's
+# config over the snapshot's sources, and only GENERATED ARTIFACTS (one dist generation, the
+# .vsix) are published into the target — atomically, via a symlink swap.
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+PUBLISH_DIR=""
+if [[ -n "${ROMP_INSTALL_TARGET:-}" && -d "$ROMP_INSTALL_TARGET/vscode-extension" \
+      && "$SELF_DIR" != "$(cd "$ROMP_INSTALL_TARGET/vscode-extension" && pwd)" ]]; then
+  PUBLISH_DIR="$(cd "$ROMP_INSTALL_TARGET/vscode-extension" && pwd)"
 fi
+cd "$SELF_DIR"
+
+# Atomically publish the built dist/ into "$1" as a fresh GENERATION: copy to dist.gen.<pid>,
+# then swap the `dist` symlink with a rename(2) (python3 os.rename replaces the link in one
+# step; mv -T is GNU-only). A pre-generations REAL dist dir is moved aside first — that one
+# swap has a microsecond gap, once, on upgrade; every later publish is atomic. Old generations
+# are pruned after the swap (installs serialize under the updater's flock).
+publish_dist() {
+  local pub="$1" gen="dist.gen.$$"
+  rm -rf "$pub/$gen"
+  cp -R dist "$pub/$gen"
+  ln -s "$gen" "$pub/.dist.lnk.$$"
+  if [ -d "$pub/dist" ] && [ ! -L "$pub/dist" ]; then
+    rm -rf "$pub/.dist.old.$$"
+    mv "$pub/dist" "$pub/.dist.old.$$"
+  fi
+  python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$pub/.dist.lnk.$$" "$pub/dist"
+  rm -rf "$pub/.dist.old.$$" 2>/dev/null || true
+  local g
+  for g in "$pub"/dist.gen.*; do
+    [ -e "$g" ] || continue
+    [ "$g" = "$pub/$gen" ] || rm -rf "$g"
+  done
+}
 
 if ! command -v node >/dev/null 2>&1; then
   echo "!! node not found — skipping romp-chat-view install."
@@ -66,6 +95,11 @@ build_flags="--production"
 [ -n "${ROMP_EXT_DEV_BUILD:-}" ] && build_flags=""
 echo "==> build${build_flags:+ (minified)}"
 node esbuild.js $build_flags
+
+if [[ -n "$PUBLISH_DIR" ]]; then
+  echo "==> publish dist generation -> $PUBLISH_DIR"
+  publish_dist "$PUBLISH_DIR"
+fi
 
 # ── collect editor CLIs (dedup by resolved path) ──────────────────────
 declare -a CLIS=()
@@ -113,6 +147,12 @@ node -e 'const fs=require("fs"),f="package.json",p=JSON.parse(fs.readFileSync(f)
 echo "==> package .vsix"
 npx --no-install vsce package --no-dependencies --allow-missing-repository -o romp-chat-view.vsix >/dev/null
 echo "    packaged romp-chat-view.vsix"
+if [[ -n "$PUBLISH_DIR" ]]; then
+  # the packaged artifact lands in the target too (atomic: staged copy + rename) — the fixed
+  # name is the contract other tooling reads
+  cp romp-chat-view.vsix "$PUBLISH_DIR/.romp-chat-view.vsix.$$"
+  mv "$PUBLISH_DIR/.romp-chat-view.vsix.$$" "$PUBLISH_DIR/romp-chat-view.vsix"
+fi
 
 if [ -n "$PACKAGE_ONLY" ]; then
   echo "==> ROMP_EXT_PACKAGE_ONLY set — packaged only, installed into no editor."

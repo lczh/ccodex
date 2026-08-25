@@ -715,11 +715,17 @@ class UpdateRemote(unittest.TestCase):
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' merge-base '*) exit 0;;\n"
+                "  *' archive '*' bin'*) tar -c -C '%s' bin;;\n"
                 "  *' archive '*) tar -c -C '%s' install.sh;;\n"
                 "  *' rev-parse --short=8 '*) echo 11111111;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
-                "esac\nexit 0\n" % (gd, commitdir))
+                "esac\nexit 0\n" % (gd, fix, commitdir))
             (fakebin / "git").chmod(0o755)
+            # the wrapper execs the SNAPSHOT manager via `node` (the pinned byte stream, the
+            # v1.3.17 audit's P1.2); the fixture manager is a shell stub, so the fixture node
+            # is a shell trampoline
+            (fakebin / "node").write_text("#!/bin/sh\nf=\"$1\"; shift; exec sh \"$f\" \"$@\"\n")
+            (fakebin / "node").chmod(0o755)
             # NEVER the real pkill: this executed leg reaches the kill line
             (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
             (fakebin / "pkill").chmod(0o755)
@@ -761,6 +767,10 @@ class UpdateRemote(unittest.TestCase):
                 self.assertIn("SYNCED:", a.stdout,
                               "a gate-faithful kernel comes up ONLY if the wrapper released the "
                               "flock before probing — RESTARTFAIL here is the r44 deadlock")
+                self.assertFalse((gd / "romp-restart-needed").exists(),
+                                 "a verified healthy launch clears the durable restart intent")
+                self.assertFalse((gd / "romp-launch-snap").exists(),
+                                 "the pinned launch snapshot is cleaned up")
                 # negative leg: a manager that starts nothing → no healthy verdict → no SYNCED
                 (fix / "bin" / "romp-manager").write_text("#!/bin/sh\nexit 0\n")
                 env["ROMP_LAUNCH_TRIES"] = "1"
@@ -770,6 +780,10 @@ class UpdateRemote(unittest.TestCase):
                 self.assertNotIn("SYNCED", a.stdout,
                                  "SYNCED without a healthy() verdict is the exact dishonesty "
                                  "the probe exists to prevent")
+                self.assertEqual((gd / "romp-restart-needed").read_text().strip(),
+                                 "1111111111111111111111111111111111111111",
+                                 "a failed launch leaves DURABLE restart evidence (the v1.3.17 "
+                                 "audit's P1.2: exec failure after the latch spend left silence)")
             finally:
                 subprocess.run(["pkill", "-f", str(serve_py)], capture_output=True)
 
@@ -1402,14 +1416,26 @@ class UpdateRemote(unittest.TestCase):
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
         self.assertIn('["pkill","-f","bin/romp-kern[e]l"]', apply,
                       "kills the running kernel (self-match-guarded, the user 2026-07-22)")
-        self.assertIn('[mgr,"ensure"]', apply, "prefers the manager (ensure = idempotent supervised start)")
+        self.assertIn('["node",mg,"ensure"]', apply,
+                      "prefers the manager (ensure = idempotent supervised start) — exec'd from "
+                      "the PINNED launch snapshot (the v1.3.17 audit's P1.2)")
+        self.assertIn('["git","-C",r,"archive",target,"bin"]', apply,
+                      "the launch byte streams come from the verified commit, never live files")
+        self.assertIn("ROMP_SERVE_ROOT=r", apply,
+                      "the pinned scripts serve the REAL checkout, not the temp snapshot")
+        self.assertIn('"romp-restart-needed"', apply)
+        self.assertLess(apply.index('"romp-restart-needed"'), apply.index("os.remove(lp)\nlsnap="),
+                        "durable restart intent is armed BEFORE the latch is spent (the earlier "
+                        "os.remove(lp) occurrences are the heal branch's)")
+        self.assertIn("if mgr_ok:", apply,
+                      "a manager that failed to launch skips straight to the fallback")
         self.assertIn("/version", apply, "polls the running kernel's build, not just its TCP port")
         self.assertIn("if not target.startswith(ks):", apply,
                       "the restarted kernel must report the exact installed commit")
         self.assertIn("old_ks,old_boot=probe()", apply,
                       "a surviving old kernel process cannot satisfy the restart")
         self.assertIn("bid!=old_boot", apply)
-        self.assertLess(apply.index("os.remove(lp)\nif not os.access"),
+        self.assertLess(apply.index("os.remove(lp)\nlsnap="),
                         apply.index('["pkill","-f"'),
                         "the launch runs INSIDE the locked python — the transaction no longer "
                         "ends before the spawn (the v1.3.16 audit's P1.2)")
@@ -1420,14 +1446,15 @@ class UpdateRemote(unittest.TestCase):
                          "install as RESTARTFAIL (r43); default 12, env-tunable for tests")
         self.assertIn('int(os.environ.get("ROMP_LAUNCH_TRIES") or 12)', apply)
         self.assertIn("fcntl.flock(fd,fcntl.LOCK_UN)", apply)
-        self.assertLess(apply.index('[mgr,"ensure"]'), apply.index("fcntl.flock(fd,fcntl.LOCK_UN)"),
+        self.assertLess(apply.index('["node",mg,"ensure"]'), apply.index("fcntl.flock(fd,fcntl.LOCK_UN)"),
                         "the kill + spawn request run INSIDE the lock…")
         self.assertLess(apply.index("fcntl.flock(fd,fcntl.LOCK_UN)"), apply.index("for i in range(tries):"),
                         "…and the probe runs UNLOCKED: the new kernel's boot gate polls this "
                         "same flock, so a locked probe deadlocked into RESTARTFAIL (the r44 "
                         "verification's P1)")
-        self.assertIn('subprocess.Popen([os.path.join(r,"bin","romp-serve")]', apply,
-                      "bare romp-serve only as a last resort — spawned detached, no lock fd")
+        self.assertIn("subprocess.Popen([sv]", apply,
+                      "bare romp-serve only as a last resort — the SNAPSHOT copy, spawned "
+                      "detached, no lock fd")
         self.assertIn("start_new_session=True", apply)
         self.assertNotIn("--refresh", apply, "does NOT rely on `romp --refresh` (needs a manager) — the stuck bug")
 
