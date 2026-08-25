@@ -746,7 +746,10 @@ class UpdateRemote(unittest.TestCase):
                 "http.server.HTTPServer(('127.0.0.1',port),H).serve_forever()\n")
             (fix / "bin" / "romp-manager").write_text(
                 "#!/bin/sh\n[ \"$1\" = ensure ] || exit 0\n"
-                "(setsid python3 '%s' '%s' %d 11111111 >/dev/null 2>&1 &)\nexit 0\n"
+                # nohup, not setsid: macOS has no setsid, and the fixture kernel silently never
+                # started there — both macOS python gate jobs read the r44 deadlock's RESTARTFAIL
+                # from a healthy wrapper (the v1.3.17 first gate attempt)
+                "nohup python3 '%s' '%s' %d 11111111 >/dev/null 2>&1 &\nexit 0\n"
                 % (serve_py, gd / "romp-update.lock", port))
             (fix / "bin" / "romp-manager").chmod(0o755)
             env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")),
