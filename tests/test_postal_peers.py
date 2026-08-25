@@ -337,6 +337,19 @@ class TwoBusExchange(unittest.TestCase):
         self.assertEqual(host, "srv", "host:name breaks the tie")
         self.assertEqual(hit["id"], "sid-b")
 
+    def test_peer_route_resolves_a_stable_uuid_like_a_name(self):
+        # the v1.3.16 audit: the uuid is documented as the rename-proof address, but remote
+        # presence matched names only — the same remote uuid 404'd while its name relayed
+        pm.PEER_STATE["srv"] = {"presence": [{"name": "beta", "id": "sid-b"}], "seenAt": 1}
+        pm.PEER_STATE["other"] = {"presence": [{"name": "carol", "id": "sid-c"}], "seenAt": 1}
+        host, hit = pm.peer_route("sid-b")
+        self.assertEqual(host, "srv", "a bare stable id routes exactly like a unique name")
+        self.assertEqual(hit["name"], "beta")
+        host, hit = pm.peer_route("srv:sid-b")
+        self.assertEqual(host, "srv", "host:uuid works exactly like host:name")
+        self.assertEqual((pm.peer_route("sid-zzz")[0], pm.peer_route("sid-zzz")[1]), (None, []),
+                         "an unknown id stays a loud miss")
+
 
 _C_STATE = tempfile.mkdtemp()
 os.environ["XDG_STATE_HOME"] = _C_STATE

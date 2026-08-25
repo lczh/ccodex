@@ -442,5 +442,42 @@ print(ps._load_serve_token(), flush=True)
                          "a kept token file must not stay at the loose mode it arrived with")
 
 
+
+class TrackedIsARealBoolean(unittest.TestCase):
+    """the v1.3.16 audit: bool("false") is True — the string spelling ARMED the report-back the
+    sender declined. A behavioral flag takes a real JSON boolean only."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), ps.Handler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def _send(self, payload):
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/send" % self.port, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "X-Romp-Token": TOK}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    def test_a_string_false_is_a_400_never_an_armed_track(self):
+        st, body = self._send({"to": "api", "from": "web", "from_id": "sid-w",
+                               "body": "x", "kind": "delegate", "tracked": "false"})
+        self.assertEqual(st, 400, body)
+        self.assertIn("boolean", body)
+
+    def test_a_real_boolean_passes_this_gate(self):
+        st, body = self._send({"to": "no-such-recipient-zzz", "from": "web", "from_id": "sid-w",
+                               "body": "x", "kind": "delegate", "tracked": True})
+        self.assertNotEqual(st, 400, "a real boolean reaches recipient resolution: %s" % body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

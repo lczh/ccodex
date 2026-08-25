@@ -1386,7 +1386,12 @@ class Handler(BaseHTTPRequestHandler):
             kind = str(data.get("kind", "")).strip().lower()
             if kind not in ("delegate", "coordinate", "question"):
                 kind = ""                              # legacy/CLI mail may be undeclared; never invent one
-            tracked = bool(data.get("tracked")) and kind == "delegate"   # report-back delegation
+            if "tracked" in data and not isinstance(data.get("tracked"), bool):
+                # bool("false") is True: the string spelling ARMED the report-back the sender
+                # declined (the v1.3.16 audit) — a behavioral flag takes a real JSON boolean only
+                return self._send({"error": "tracked must be a JSON boolean (true/false), "
+                                   "not a string"}, 400)
+            tracked = data.get("tracked") is True and kind == "delegate"   # report-back delegation
             #   (the user 2026-08-24): only a delegate can be tracked; wire metadata only — nothing
             #   about the flag ever appears in message prose (the injected-voice rule)
             if _postal_off(frm_id):                # the sender is in isolation → sending is disabled
@@ -3070,7 +3075,11 @@ def peer_route(to):
         if want_host and host != want_host:
             continue
         for a in st.get("presence") or []:
-            if a.get("name") != to or _via_duplicate(a, direct_bus):
+            # name OR stable id: the uuid is documented as a rename-proof address, but remote
+            # presence only matched names — the same remote uuid 404'd while its name relayed
+            # (the v1.3.16 audit). host:uuid works exactly like host:name.
+            if (a.get("name") != to and (a.get("id") or "") != to) \
+                    or _via_duplicate(a, direct_bus):
                 continue
             sid = a.get("id") or ""
             if sid and sid in seen_ids:                # one session, two gossip paths → one candidate;
