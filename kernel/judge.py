@@ -9116,8 +9116,15 @@ def _postal_ask_maps():
             f, t_, ts = o.get("from_id"), o.get("to_id"), o.get("t")
             if not (f and t_ and ts):
                 continue
-            if isinstance(t_, str) and t_.startswith("peer:") and o.get("toName"):
-                t_ = alias.get(str(o["toName"]), "peer:" + str(o["toName"]))
+            if isinstance(t_, str) and t_.startswith("peer:"):
+                if o.get("to_sid"):
+                    # the sent row's snapshot of the recipient's STABLE sid (the presence row's
+                    # id) — the reply's from_id matches it whatever the peer renamed to (the
+                    # v1.3.16 audit's P1.5: the name-keyed alias could never join a first reply
+                    # sent after the recipient renamed)
+                    t_ = str(o["to_sid"])
+                elif o.get("toName"):
+                    t_ = alias.get(str(o["toName"]), "peer:" + str(o["toName"]))
             ts = int(ts)
             last_any[(f, t_)] = max(last_any.get((f, t_), 0), ts)
             k = o.get("kind")
@@ -11811,6 +11818,67 @@ def _lift_handoff_children(store, hid):
     return moved
 
 
+_HANDOFF_DONE_MEMO = {"key": None, "ids": set()}
+
+
+def _handoff_done_ids():
+    """Delegation mids whose recipients reported the planted goal COMPLETE — the bus's
+    ev:"handoff-done" rows, written when a completion receipt crosses the peer exchange (or a
+    local test writes one). The exact per-message ending event for a cross-host handoff.
+    Memoized on the log's (mtime, size)."""
+    try:
+        st = os.stat(MESSAGES)
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return set()
+    if _HANDOFF_DONE_MEMO["key"] != key:
+        ids = set()
+        try:
+            for line in MESSAGES.read_text(errors="replace").splitlines():
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("ev") == "handoff-done" and r.get("id"):
+                    ids.add(str(r["id"]))
+        except OSError:
+            return set()
+        _HANDOFF_DONE_MEMO["key"], _HANDOFF_DONE_MEMO["ids"] = key, ids
+    return _HANDOFF_DONE_MEMO["ids"]
+
+
+_RECEIPTS_POSTED = set()   # in-process fast path; the bus's RECEIPTS_DONE is the durable dedup
+
+
+def _post_handoff_receipt(mid, host):
+    """Report a cross-host delegation's planted goal COMPLETE to the local postal bus, which
+    relays the receipt to the sender's bus over the peer exchange. Best-effort and idempotent:
+    this fires on every propagate pass for every completed cross-host-origin node, and the bus's
+    durable RECEIPTS_DONE makes a confirmed receipt a no-op."""
+    if not mid or not host or (mid, host) in _RECEIPTS_POSTED:
+        return
+    try:
+        import http.client
+        import urllib.parse
+        tok = ""
+        try:
+            tok = (STATE / "serve-token").read_text().strip()
+        except OSError:
+            pass
+        c = http.client.HTTPConnection(
+            "127.0.0.1", int(os.environ.get("ROMP_POSTAL_PORT", "25302")), timeout=3)
+        c.request("POST", "/handoff-done",
+                  body=json.dumps({"mid": mid, "host": host}),
+                  headers={"Content-Type": "application/json", "X-Romp-Token": tok})
+        r = c.getresponse()
+        r.read()
+        c.close()
+        if r.status == 200:
+            _RECEIPTS_POSTED.add((mid, host))
+    except Exception:
+        pass                                          # the bus is down: the next pass retries
+
+
 def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
     """DETERMINISTIC delegation completion link-back (the user 2026-06-22). When a courier-planted goal G
     (origin.peer + origin.goalId) is COMPLETE on the recipient B's tree, mark the SENDER's tracking node
@@ -11827,6 +11895,11 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
             if not nd.get("nodeComplete"):
                 continue                                # B hasn't finished it yet
             o = nd.get("origin")
+            if isinstance(o, dict) and o.get("msgId") and o.get("peerHost"):
+                # a CROSS-HOST delegation completed here: its origin back-link can never fire
+                # (the sender's store lives on another kernel) — report the per-message receipt
+                # home instead (the v1.3.16 audit's P1.3)
+                _post_handoff_receipt(str(o["msgId"]), str(o["peerHost"]))
             refs = ([o] if (isinstance(o, dict) and o.get("peer") and o.get("goalId")) else [])
             refs += [l for l in (nd.get("links") or [])
                      if isinstance(l, dict) and l.get("peer") and l.get("goalId")]
@@ -11843,18 +11916,15 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
                 rollup_status(a_store, False)           # sender just had work close → recompute its columns
                 save_goals(a_sid, a_store)
                 n += 1
-    # REMOTE recipients (the user 2026-08-24): their goal stores live on another kernel, so the
-    # origin back-link above can never fire for them. The local log still records the exact
-    # report-back event: the recipient's REPLY mail — any kind — at/after the delegate's send, the
-    # same event the stamp machinery has treated as a handoff's ending since the 2026-08-18 audit
-    # ("a delegated peer's reply lifts the awaiting stamp"). `relayed` is deliberately NOT it: that
-    # ack only says the ASK was delivered, and completing on delivery would check off undone work.
-    # Granularity is per-PEER, not per-message — the log carries no reply→delegate join, so one
-    # reply completes every outstanding cross-host handoff to that peer sent at/before it; coarse,
-    # but forward-only and honest, where the alternative was a wait no event could ever end. Keys
-    # re-derive from the stored toName exactly as the wait maps do: the alias when the peer has
-    # spoken (it must have, to reply), else the raw relay key.
-    last_any, _la, alias = _postal_ask_maps()
+    # REMOTE recipients (the user 2026-08-24; re-grounded by the v1.3.16 audit's P1.3): their
+    # goal stores live on another kernel, so the origin back-link above can never fire for them.
+    # The completion event is now the PER-MESSAGE receipt the recipient's kernel reports home
+    # over the peer exchange (ev:"handoff-done", joined on the delegate's own msgId) — the old
+    # per-peer reply heuristic completed every outstanding delegation to that peer on one
+    # unrelated reply, checking off undone work. Unrelated mail completes NOTHING now; a handoff
+    # to a peer whose bus predates the receipt lane stays visibly open (the nudge/debt machinery
+    # surfaces it) rather than being silently fabricated done.
+    done_mids = _handoff_done_ids()
     for fsid, path, anchor, name in discover(now)[:sessions_cap]:
         store = load_goals(fsid)
         changed = False
@@ -11865,16 +11935,13 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
             pk = str(h["peer"])
             if ":" not in pk:                          # a LOCAL recipient: the origin back-link owns it
                 continue
-            keys = {"peer:" + pk}
-            if alias.get(pk):
-                keys.add(alias[pk])
-            reply = max((last_any.get((k, fsid), 0) for k in keys), default=0)
-            if reply and reply >= (nd.get("t") or 0):
-                why = "reported back by %s (delegated cross-host)" % pk
-                if record_verdict(store, nd, "courier", "done", reply, why=why):
-                    _mark_node_done(store, nid, why, reply, src="courier")
-                    changed = True
-                    n += 1
+            if str(h.get("msgId") or "") not in done_mids:
+                continue                               # no receipt: the work is not known done
+            why = "reported done by %s (delegated cross-host; completion receipt)" % pk
+            if record_verdict(store, nd, "courier", "done", now, why=why):
+                _mark_node_done(store, nid, why, now, src="courier")
+                changed = True
+                n += 1
         if changed:
             rollup_status(store, False)
             save_goals(fsid, store)

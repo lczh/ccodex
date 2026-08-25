@@ -356,6 +356,73 @@ os.environ["XDG_STATE_HOME"] = _C_STATE
 pmc = SourceFileLoader("romp_postal_peers_c", os.path.join(BIN, "romp-postal-service")).load_module()
 
 
+
+class HandoffReceiptLane(unittest.TestCase):
+    """The completion receipt crosses the peer exchange and confirms durably (the v1.3.16
+    audit's P1.3): recipient bus parks it, the exchange carries it, the sender bus records the
+    ev row, and the response confirms the request-carried receipt out of the box."""
+
+    def setUp(self):
+        os.environ["ROMP_POSTAL_PEERS"] = "1"
+        self._saved = (pm.self_host, pmb.self_host)
+        pm.self_host = lambda: "hosta"
+        pmb.self_host = lambda: "hostb"
+        for m in (pm, pmb):
+            m.PEER_STATE.clear()
+            m._peer_pending.clear()
+            m._HANDOFF_DONE_MEMO["key"] = None
+        import shutil
+        for m in (pm, pmb):
+            shutil.rmtree(m.RECEIPTBOX, ignore_errors=True)
+            try:
+                m.RECEIPTS_DONE.unlink()
+            except OSError:
+                pass
+
+    def tearDown(self):
+        (pm.self_host, pmb.self_host) = self._saved
+        os.environ.pop("ROMP_POSTAL_PEERS", None)
+
+    def test_the_receipt_crosses_confirms_and_dedups(self):
+        pmb.receiptbox_put("hosta", "px-42")           # the recipient kernel reported completion
+        self.assertEqual(pmb.receiptbox_list("hosta"), [{"mid": "px-42"}])
+        req = pmb.build_exchange_request("hosta", wait=False)
+        self.assertEqual(req.get("handoffDone"), [{"mid": "px-42"}],
+                         "the parked receipt rides the next exchange")
+        resp, st = pm.peer_exchange_handle(req)
+        self.assertEqual(st, 200)
+        self.assertIn("px-42", pm._handoff_done_ids(),
+                      "the sender's bus records the per-message completion event")
+        pmb.peer_exchange_apply("hosta", req, resp)
+        self.assertEqual(pmb.receiptbox_list("hosta"), [],
+                         "a response means the whole request was processed — receipt confirmed")
+        self.assertIn("px-42", pmb._receipts_done())
+        # the kernel's re-post is now a no-op — RECEIPTS_DONE is the durable dedup
+        pmb.receiptbox_put("hosta", "px-42")           # a raw re-park would re-relay…
+        pmb.receiptbox_del("hosta", "px-42")           # …but the route checks _receipts_done first
+        self.assertIn("px-42", pmb._receipts_done())
+        # and a duplicate arrival on the sender's side appends nothing new
+        before = (pm.TLDIR / "messages.jsonl").read_text().count("handoff-done")
+        pm._handoff_done_arrived("hostb", {"mid": "px-42"})
+        self.assertEqual((pm.TLDIR / "messages.jsonl").read_text().count("handoff-done"), before,
+                         "duplicate receipts never duplicate the log row")
+
+    def test_response_carried_receipts_apply_and_ack_next_dial(self):
+        pm.receiptbox_put("hostb", "px-77")            # hosta owes hostb's sender a receipt
+        req = pmb.build_exchange_request("hosta", wait=False)
+        resp, st = pm.peer_exchange_handle(req)
+        self.assertEqual([r["mid"] for r in resp.get("handoffDone") or []], ["px-77"],
+                         "the dialed side hands its parked receipts back in the response")
+        pmb.peer_exchange_apply("hosta", req, resp)
+        self.assertIn("px-77", pmb._handoff_done_ids(), "the dialer records the event")
+        self.assertEqual(pm.receiptbox_list("hostb"), [{"mid": "px-77"}],
+                         "response-carried receipts stay parked until the next request acks them")
+        req2 = pmb.build_exchange_request("hosta", wait=False)
+        self.assertEqual(req2.get("handoffDoneAcks"), [{"mid": "px-77"}])
+        pm.peer_exchange_handle(req2)
+        self.assertEqual(pm.receiptbox_list("hostb"), [], "the ack drains the box")
+
+
 class ThreeBusRelay(unittest.TestCase):
     """Spoke-to-spoke through a shared hub (plans/postal-peer-buses.md 3b): A and C each exchange only
     with hub B. Presence gossips one hop with a `via` label; a relay for a far spoke forwards ONE hop

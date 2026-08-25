@@ -1368,6 +1368,22 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/peer-exchange":             # a peer bus dialing us through the kernel's -L forward
             payload, status = peer_exchange_handle(data)
             return self._send(payload, status)
+        if u.path == "/handoff-done":
+            # The recipient KERNEL reports a cross-host delegation's planted goal COMPLETE —
+            # the per-message ending event the sender's tracking node completes on (the v1.3.16
+            # audit's P1.3: the per-peer reply heuristic completed every outstanding delegation
+            # to that peer). Idempotent: the kernel re-posts on every pass; RECEIPTS_DONE makes
+            # a confirmed receipt a no-op, the receiptbox makes an unconfirmed one at-least-once.
+            if not isinstance(data, dict):
+                return self._send({"error": "the body must be a JSON object"}, 400)
+            mid = str(data.get("mid") or "")
+            host = str(data.get("host") or "")
+            if not (_safe_id(mid) and _safe_id(host)):
+                return self._send({"error": "mid and host (both path-safe ids) required"}, 400)
+            if mid in _receipts_done():
+                return self._send({"ok": True, "already": True})
+            receiptbox_put(host, mid)
+            return self._send({"ok": True, "queued": host})
         if u.path == "/send":
             to = data.get("to", "")
             frm, frm_id = data.get("from", "unknown"), data.get("from_id", "")
@@ -1423,11 +1439,17 @@ class Handler(BaseHTTPRequestHandler):
                 outbox_put(phost, {"mid": mid, "to": hit.get("name") or to, "frm": frm,
                                    "frm_id": frm_id, "body": body, "kind": kind,
                                    "t": int(time.time())})
-                _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "sent", "id": mid,
-                                              "from": frm, "from_id": frm_id,
-                                              "to_id": "peer:%s" % phost,
-                                              "toName": "%s:%s" % (phost, hit.get("name") or to),
-                                              "body": body, "kind": kind})
+                sent_row = {"t": int(time.time()), "ev": "sent", "id": mid,
+                            "from": frm, "from_id": frm_id,
+                            "to_id": "peer:%s" % phost,
+                            "toName": "%s:%s" % (phost, hit.get("name") or to),
+                            "body": body, "kind": kind}
+                if hit.get("id"):
+                    # the recipient's STABLE sid off its presence row — the rename-proof join:
+                    # a name-keyed alias could never connect a first reply sent after the
+                    # recipient renamed (the v1.3.16 audit's P1.5)
+                    sent_row["to_sid"] = str(hit["id"])
+                _tl_append("messages.jsonl", sent_row)
                 if PEERS.get(phost, {}).get("up"):
                     return self._send({"ok": True, "id": mid,
                                        "note": "relaying to '%s' on %s%s" % (hit.get("name") or to, phost, tnote)})
@@ -1967,6 +1989,8 @@ PEER_LIST_LIMITS = {
     "bounces": 256,
     "reads": 512,
     "readAcks": 512,
+    "handoffDone": 512,
+    "handoffDoneAcks": 512,
 }
 PEER_RELAY_BYTE_BUDGET = 6 * 1024 * 1024
 PEER_REFUSAL_REASON = "the receiving machine refused delivery"
@@ -2062,6 +2086,9 @@ BUS_EPOCH = int(time.time())               # this bus process's boot — peers k
 BUS_ID = os.urandom(16).hex()
 OUTBOX = STATE / "outbox"                  # outbox/<host>/<mid>.json — cross-host mail awaiting its ACK
 READBOX = STATE / "readbox"                # readbox/<host>/<mid>.json — read receipts awaiting their peer
+RECEIPTBOX = STATE / "receiptbox"          # receiptbox/<host>/<mid>.json — handoff-done receipts awaiting their peer
+RECEIPTS_DONE = STATE / "receipts-done.json"   # {mid: t} — receipts a peer CONFIRMED; the kernel re-posts
+#                                                forever (idempotent), this is what makes the re-post a no-op
 CORRUPT = STATE / "corrupt"                 # preserved unreadable durable records, grouped by store
 PEER_SEEN = STATE / "peer-seen.jsonl"      # append-only receipt log — the idempotence window
 _SEEN_CAP = 4000
@@ -2346,6 +2373,110 @@ def outbox_del(host, mid):
         return True
     except Exception:
         return False
+
+def _receipts_done():
+    try:
+        d = json.loads(RECEIPTS_DONE.read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def _receipts_done_add(mid):
+    d = _receipts_done()
+    if mid in d:
+        return
+    d[mid] = int(time.time())
+    if len(d) > 4096:                                # bounded: oldest confirmations age out — the
+        for k in sorted(d, key=d.get)[:len(d) - 4096]:   # kernel's re-post then re-parks, harmlessly
+            d.pop(k, None)
+    _atomic_json_put(RECEIPTS_DONE, d)
+
+def receiptbox_put(host, mid):
+    """Park one handoff-done receipt for `host` (receiptbox/<host>/<mid>.json). Same
+    at-least-once + idempotent-apply contract as the readbox: it survives a bus restart and
+    re-sends until the peer confirms; the recipient kernel re-POSTs /handoff-done on every
+    pass, and RECEIPTS_DONE is what makes the re-post a no-op after confirmation."""
+    if not (_safe_id(host) and _safe_id(mid)):
+        _log("receiptbox_put: refusing unsafe host/mid %r/%r" % (host, mid))
+        return
+    d = RECEIPTBOX / host
+    d.mkdir(parents=True, exist_ok=True)
+    _atomic_json_put(d / (mid + ".json"), {"mid": mid})
+    _peer_wake(host).set()
+
+def receiptbox_list(host, limit=None):
+    if not _safe_id(host):
+        return []
+    try:
+        out = []
+        for f in sorted((RECEIPTBOX / host).glob("*.json")):
+            if limit is not None and len(out) >= limit:
+                break
+            try:
+                row = json.loads(f.read_text())
+                if isinstance(row, dict) and _safe_id(row.get("mid") or ""):
+                    out.append({"mid": row["mid"]})
+            except Exception as e:
+                _quarantine_corrupt_json(f, "receiptbox", e, None)
+        return out
+    except Exception:
+        return []
+
+def receiptbox_del(host, mid):
+    if not (_safe_id(host) and _safe_id(mid)):
+        return
+    try:
+        (RECEIPTBOX / host / (mid + ".json")).unlink()
+    except Exception:
+        pass
+    _receipts_done_add(mid)
+
+def _receipt_rows(value):
+    """Accept only bounded {mid} receipt rows from an exchange list."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for row in value[:PEER_LIST_LIMITS["handoffDone"]]:
+        if isinstance(row, dict) and _safe_id(str(row.get("mid") or "")):
+            out.append({"mid": str(row["mid"])})
+    return out
+
+_HANDOFF_DONE_MEMO = {"key": None, "ids": set()}
+
+def _handoff_done_ids():
+    """The set of delegation mids whose recipients reported the planted goal COMPLETE — the
+    exact per-message ending event for a cross-host handoff (the v1.3.16 audit's P1.3: the
+    per-peer reply heuristic completed every outstanding delegation to that peer). Memoized
+    on the log's (mtime, size)."""
+    log_path = TLDIR / "messages.jsonl"
+    try:
+        st = os.stat(log_path)
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return set()
+    if _HANDOFF_DONE_MEMO["key"] != key:
+        ids = set()
+        try:
+            for line in log_path.read_text(errors="replace").splitlines():
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("ev") == "handoff-done" and r.get("id"):
+                    ids.add(str(r["id"]))
+        except OSError:
+            return set()
+        _HANDOFF_DONE_MEMO["key"], _HANDOFF_DONE_MEMO["ids"] = key, ids
+    return _HANDOFF_DONE_MEMO["ids"]
+
+def _handoff_done_arrived(host, row):
+    """One peer-confirmed completion landed: record it durably (idempotent by mid)."""
+    mid = str((row or {}).get("mid") or "")
+    if not _safe_id(mid) or mid in _handoff_done_ids():
+        return
+    _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "handoff-done", "id": mid,
+                                  "from_host": host})
+    _HANDOFF_DONE_MEMO["key"] = None                 # the log moved under the memo
 
 def readbox_put(host, rec):
     """Park one read receipt for `host` (readbox/<host>/<mid>.json) and poke its exchange. Keyed by
@@ -2868,7 +2999,8 @@ def _pending(host):
     with _peer_lock:
         p = _peer_pending.get(host)
         if p is None:
-            p = _peer_pending[host] = {"acks": [], "bounces": [], "readAcks": []}
+            p = _peer_pending[host] = {"acks": [], "bounces": [], "readAcks": [],
+                                       "handoffDoneAcks": []}
         return p
 
 def _canon_peer_name(host, bus_id):
@@ -2941,6 +3073,11 @@ def peer_exchange_handle(data):
         readbox_del(host, ra)
     for r in _peer_read_rows(data.get("reads")):     # read receipts flowing back — ours or one hop onward
         _read_arrived(host, r)
+    for hd in _receipt_rows(data.get("handoffDone")):     # completion receipts: the request-carried
+        _handoff_done_arrived(host, hd)                   # ones need no explicit ack (a response
+    #                                                       means the whole request was processed)
+    for ha in _receipt_rows(data.get("handoffDoneAcks")):  # the dialer confirmed response-carried ones
+        receiptbox_del(host, ha["mid"])
     acks, bounces = [], []
     for m in data.get("relays") or []:
         if not isinstance(m, dict):
@@ -2985,7 +3122,10 @@ def peer_exchange_handle(data):
                "presence": _peer_presence_rows(fleet_presence(host)),
                "holds": _peer_hold_rows(holds_payload(host)),
                "tier": my_tier_of(host),             # how WE hold the dialer's mail (display/mirror, never the gate)
-               "relays": rel, "acks": acks, "bounces": bounces, "reads": reads}
+               "relays": rel, "acks": acks, "bounces": bounces, "reads": reads,
+               "handoffDone": receiptbox_list(host, PEER_LIST_LIMITS["handoffDone"])}
+    # (like `reads`: response-carried receipts stay parked until the dialer's NEXT request
+    # handoffDoneAcks them — a response can vanish after we send it)
     return _fit_peer_exchange_payload(payload), 200
 
 def build_exchange_request(host, wait=True):
@@ -2994,6 +3134,7 @@ def build_exchange_request(host, wait=True):
         acks = _peer_ack_ids(p["acks"])
         bounces = _peer_bounce_rows(p["bounces"])
         read_acks = _peer_read_ack_rows(p.get("readAcks") or [])
+        hd_acks = _receipt_rows(p.get("handoffDoneAcks") or [])
     payload = {"host": self_host(), "epoch": BUS_EPOCH, "proto": PEER_PROTO, "busId": BUS_ID,
                "presence": _peer_presence_rows(fleet_presence(host)),
                "holds": _peer_hold_rows(holds_payload(host)),
@@ -3002,7 +3143,9 @@ def build_exchange_request(host, wait=True):
                "acks": acks, "bounces": bounces,
                "reads": _peer_read_rows(readbox_list(
                    host, PEER_LIST_LIMITS["reads"], 512 * 1024)),
-               "readAcks": read_acks, "wait": bool(wait)}
+               "readAcks": read_acks,
+               "handoffDone": receiptbox_list(host, PEER_LIST_LIMITS["handoffDone"]),
+               "handoffDoneAcks": hd_acks, "wait": bool(wait)}
     return _fit_peer_exchange_payload(payload)
 
 def peer_exchange_apply(host, req_sent, resp):
@@ -3025,8 +3168,13 @@ def peer_exchange_apply(host, req_sent, resp):
         p["bounces"] = [b for b in p["bounces"]
                           if not isinstance(b, dict) or b.get("mid") not in sent_bounces]
         p["readAcks"] = [a for a in p.get("readAcks") or [] if a not in sent_read_acks]
+        sent_hd_acks = {row["mid"] for row in _receipt_rows(req_sent.get("handoffDoneAcks"))}
+        p["handoffDoneAcks"] = [a for a in p.get("handoffDoneAcks") or []
+                                if not isinstance(a, dict) or a.get("mid") not in sent_hd_acks]
     for r in _peer_read_rows(req_sent.get("reads")):
         readbox_del(host, r)
+    for hd in _receipt_rows(req_sent.get("handoffDone")):
+        receiptbox_del(host, hd["mid"])              # a response = the whole request was processed
     PEER_STATE[host] = {"presence": _peer_presence_rows(resp.get("presence")),
                         "epoch": _peer_epoch(resp.get("epoch")),
                         "holds": _peer_hold_rows(resp.get("holds")), "seenAt": int(time.time())}
@@ -3047,6 +3195,10 @@ def peer_exchange_apply(host, req_sent, resp):
         _read_arrived(host, r)
         with _peer_lock:
             p["readAcks"].append({"mid": r.get("mid"), "unread": bool(r.get("unread"))})
+    for hd in _receipt_rows(resp.get("handoffDone")):   # completion receipts: same apply-then-ack
+        _handoff_done_arrived(host, hd)
+        with _peer_lock:
+            p["handoffDoneAcks"].append({"mid": hd["mid"]})
     for m in resp.get("relays") or []:
         if not isinstance(m, dict):
             continue

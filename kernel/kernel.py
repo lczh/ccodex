@@ -1116,7 +1116,7 @@ def _debt_asks(sid, alive_ids):
     asks this session OWES: the exact inverse of _wait_for_graph's sender edge, from the same maps. An
     ask counts only while the ASKER is alive (answering a dead session releases nobody), and any later
     message back — whatever its kind — already answered it (same rule as the sender's chip)."""
-    last_any, last_ask = _postal_wait_maps()
+    last_any, last_ask, _aw = _postal_wait_maps()
     out = []
     for (f, t_), rec in last_ask.items():
         if t_ != str(sid) or f not in (alive_ids or ()):
@@ -1228,7 +1228,7 @@ def _debt_reminder_outcomes(sid, lt, now):
     dn = dict(d.get("debtNudged") or {})
     if not dn:
         return
-    last_any, _ask = _postal_wait_maps()
+    last_any, _ask, _aw = _postal_wait_maps()
     lt_end = (lt.get("end", lt.get("t", 0)) or 0) if lt else 0
     changed = False
     for key, fire_t in list(dn.items()):
@@ -1256,7 +1256,7 @@ def _debt_backstop_tick(now):
     dn = dict(d.get("debtNudged") or {})
     if not dn:
         return
-    last_any, _ask = _postal_wait_maps()
+    last_any, _ask, _aw = _postal_wait_maps()
     changed = False
     for key, fire_t in list(dn.items()):
         parsed = _debt_key_parse(key)
@@ -20668,9 +20668,11 @@ _POSTAL_WAIT_CACHE = [None, None]   # (mtime_ns, size) , (last_any, last_ask) �
 
 
 def _postal_wait_maps():
-    """(last_any, last_ask) from the postal log, cached on the file's (mtime, size): per ordered pair
-    (from_id, to_id), last_any holds the latest t of ANY message, last_ask the latest (t, kind) of a
-    reply-EXPECTING ask — a QUESTION only (an answer is definitionally required). A DELEGATE transfers
+    """(last_any, last_ask, last_await) from the postal log, cached on the file's (mtime, size): per
+    ordered pair (from_id, to_id), last_any holds the latest t of ANY message, last_ask the latest
+    (t, kind) of a reply-EXPECTING ask — a QUESTION only (an answer is definitionally required) —
+    and last_await the latest t of any outbound that REQUIRES a reply (question or delegate): the
+    answered-clock, which a later coordinate must not reset (the v1.3.16 audit's P2.11). A DELEGATE transfers
     OWNERSHIP and sets no edge (the user 2026-08-15: a handoff whose body said "no reply needed" still
     parked its sender as awaiting-peer, and a sender with many outstanding handoffs read as permanently
     stalled — this REVERSES the 2026-07-25 rule that counted delegates, whose real want, handoff
@@ -20684,10 +20686,10 @@ def _postal_wait_maps():
         st = jd.MESSAGES.stat()
         key = (st.st_mtime_ns, st.st_size)
     except OSError:
-        return {}, {}
+        return {}, {}, {}
     if _POSTAL_WAIT_CACHE[0] == key:
         return _POSTAL_WAIT_CACHE[1]
-    last_any, last_ask = {}, {}
+    last_any, last_ask, last_await = {}, {}, {}
     try:
         rows = []
         alias = {}   # "host:name" -> sid, learned from every row a remote sender stamped
@@ -20708,26 +20710,38 @@ def _postal_wait_maps():
             # (obsidian↔lab_manager, 2026-08-15: the reply landed, the edge never cleared). The row's
             # toName ("<host>:<name>") resolves to the real sid through the alias map above; an
             # unresolvable relay keeps the raw id and behaves exactly as before.
-            if isinstance(t_, str) and t_.startswith("peer:") and o.get("toName"):
-                # unresolvable (the peer never sent a row, so the alias map can't know its sid) →
-                # key on the NAMED recipient rather than the bare relay: two asks to different
-                # sessions on one detached host used to collapse onto the single (from, relay)
-                # pair, the later silently overwriting the earlier (the 2026-08-18 audit found a
-                # 29.6h-invisible ask eaten this way). The maps rebuild from the full log, so the
-                # moment the peer speaks the alias resolves and every row re-keys to the real sid.
-                t_ = alias.get(str(o["toName"]), "peer:" + str(o["toName"]))
+            if isinstance(t_, str) and t_.startswith("peer:"):
+                if o.get("to_sid"):
+                    # the sent row's snapshot of the recipient's STABLE sid — rename-proof: the
+                    # reply's from_id matches it whatever the peer renamed to (the v1.3.16
+                    # audit's P1.5)
+                    t_ = str(o["to_sid"])
+                elif o.get("toName"):
+                    # unresolvable (the peer never sent a row, so the alias map can't know its sid) →
+                    # key on the NAMED recipient rather than the bare relay: two asks to different
+                    # sessions on one detached host used to collapse onto the single (from, relay)
+                    # pair, the later silently overwriting the earlier (the 2026-08-18 audit found a
+                    # 29.6h-invisible ask eaten this way). The maps rebuild from the full log, so the
+                    # moment the peer speaks the alias resolves and every row re-keys to the real sid.
+                    t_ = alias.get(str(o["toName"]), "peer:" + str(o["toName"]))
             ts = int(ts)
             last_any[(f, t_)] = max(last_any.get((f, t_), 0), ts)
             k = o.get("kind")                            # the sender's DECLARED intent (schema field) wins
             is_ask = (k == "question") if k else bool(_WAIT_Q_RE.match(o.get("body") or ""))
+            if is_ask or k == "delegate":
+                # the reply-REQUIRING clock (the v1.3.16 audit's P2.11): question@10 → reply@150
+                # → coordinate@200 read as unanswered, because the answered-check compared the
+                # reply against the newest outbound of ANY kind. A coordinate requests nothing;
+                # only asks and handoffs reset this clock.
+                last_await[(f, t_)] = max(last_await.get((f, t_), 0), ts)
             if is_ask and ts >= last_ask.get((f, t_), (0, ""))[0]:
                 # the ask's HEAD rides along (the user 2026-07-26): the debt reminder quotes the asker's
                 # own first words back at the debtor, so the reminder needs no second log scan
                 last_ask[(f, t_)] = (ts, k or "question", str(o.get("body") or "")[:300])
     except OSError:
         pass
-    _POSTAL_WAIT_CACHE[:] = [key, (last_any, last_ask)]
-    return last_any, last_ask
+    _POSTAL_WAIT_CACHE[:] = [key, (last_any, last_ask, last_await)]
+    return last_any, last_ask, last_await
 
 
 def _wait_for_graph(now, alive_sids):
@@ -20741,7 +20755,7 @@ def _wait_for_graph(now, alive_sids):
     DELEGATE edges since 2026-07-25: a handoff previously made no edge, so the card fell through to the
     judge's generic ⏳ stamp ("Awaiting background agents") and, with no edge to clear, the peer's actual
     reply lifted nothing — a card read awaiting for 5h after the answer landed. Best-effort {}."""
-    last_any, last_ask = _postal_wait_maps()
+    last_any, last_ask, _aw = _postal_wait_maps()
     edge = {}                                            # X → Y: X's most-recent UNANSWERED ask to a LIVE peer
     for (f, t_), (ts, _k, _h) in last_ask.items():
         if t_ not in alive_sids:                         # dead peer won't reply → not a wait
@@ -20775,19 +20789,18 @@ def _peer_answered_at(sid):
     AFTER the reply survives — the closer's verdict is fresher than the answer it already saw. If the
     stamp was really about non-peer work (subagents, a build), the LIVE sources that outrank it still
     carry the wait, and the closer's next pass can re-stamp with a fresh awaitingAt."""
-    last_any, last_ask = _postal_wait_maps()
+    last_any, last_ask, last_await = _postal_wait_maps()
     best = 0
-    # OUTBOUND rides last_any, not last_ask (2026-08-18 audit): the 2026-08-15 change that stopped
-    # DELEGATES from making chip edges also emptied last_ask of them — which silently removed this
-    # release, so a delegated peer's reply no longer superseded a judge kind=peer stamp (a cross-host
-    # handoff answered in 23 minutes still wore Awaiting six hours later, with the 6h wake as the
-    # only exit). Reading every outbound restores the designed exact ending event for questions and
-    # handoffs alike; the chip edge stays question-only, exactly as #430 intended.
-    for (f, t_), sent in last_any.items():
+    # OUTBOUND rides last_await, not last_any or last_ask: last_ask excludes delegates (the
+    # 2026-08-18 audit — a handoff's reply must supersede a kind=peer stamp), while last_any
+    # counted COORDINATES, which request nothing — question@10 → reply@150 → coordinate@200
+    # read as unanswered because the reply was compared against the coordinate's newer clock
+    # (the v1.3.16 audit's P2.11). The chip edge stays question-only, exactly as #430 intended.
+    for (f, t_), sent in last_await.items():
         if f != sid:
             continue
         r = last_any.get((t_, f), 0)
-        if r >= sent:                                    # the pair's newest outbound is answered
+        if r >= sent:                                    # the pair's newest reply-REQUIRING ask is answered
             best = max(best, r)
     return best
 
@@ -20801,9 +20814,9 @@ def _peer_answered(sid):
     (sids, or "peer:<host>:<name>" for an unresolved cross-host recipient) — the same alias re-key
     the admit gate derives them from, so the two sides can never disagree."""
     best = _peer_answered_at(sid)        # the scalar rides the existing name — the tests' stub seam
-    last_any, _la = _postal_wait_maps()
+    last_any, _la, last_await = _postal_wait_maps()
     per = {}
-    for (f, t_), sent in last_any.items():
+    for (f, t_), sent in last_await.items():
         if f != sid:
             continue
         r = last_any.get((t_, f), 0)

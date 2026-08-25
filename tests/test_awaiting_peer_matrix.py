@@ -13,6 +13,7 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -168,7 +169,7 @@ class MatrixCloserGate(_Base):
         # alive-filtered _wait_for_graph: the gate deliberately keeps a dead/unknown peer's open ask
         # (the dead-wait sweep owns that ending, not the write gate).
         def km_open(sid):
-            last_any, last_ask = km._postal_wait_maps()
+            last_any, last_ask, _aw = km._postal_wait_maps()
             return any(f == sid and last_any.get((p, sid), 0) < meta[0]
                        for (f, p), meta in last_ask.items())
         grid = [
@@ -279,7 +280,7 @@ class PairAwareSupersede(_Base):
         future = int(time.time()) + 10_000
         # an answered exchange with a DIFFERENT peer, after the stamp's write time
         self._log([_msg(1, SID, MGR, T0 + 10, "question"),
-                   _msg(2, SID, self.OTHER, T0 + 20, "coordinate"),
+                   _msg(2, SID, self.OTHER, T0 + 20, "question"),
                    _msg(3, self.OTHER, SID, future, "coordinate")])
         answered = km._peer_answered(SID)
         self.assertGreater(answered[0], 0, "the pair-blind scalar WOULD have superseded")
@@ -304,7 +305,7 @@ class PairAwareSupersede(_Base):
         del s["nodes"][gid]["awaitingPeers"]           # a pre-identity stamp, as stored stores hold
         future = int(time.time()) + 10_000
         self._log([_msg(1, SID, MGR, T0 + 10, "question"),
-                   _msg(2, SID, self.OTHER, T0 + 20, "coordinate"),
+                   _msg(2, SID, self.OTHER, T0 + 20, "question"),
                    _msg(3, self.OTHER, SID, future, "coordinate")])
         self.assertIsNone(km._goal_awaiting_stamp_full(s["nodes"], gid, answered_at=km._peer_answered(SID)),
                           "no identity on the stamp -> today's behavior exactly (never strand legacy)")
@@ -381,13 +382,95 @@ class CrossHostDelegation(_Base):
         jd.run_propagate(now=T0 + 200)
         self.assertFalse(self._handoffs()[0].get("nodeComplete"),
                          "relayed = delivered, not completed — delivery cannot check work off")
-        # the recipient's reply mail is the report-back event
+        # a mere REPLY is not the report-back event any more (the v1.3.16 audit's P1.3: one
+        # reply completed every outstanding delegation to that peer) — the per-message receipt is
         rows.append(self._reply(1, T0 + 300))
         self._log(rows)
         jd.run_propagate(now=T0 + 400)
+        self.assertFalse(self._handoffs()[0].get("nodeComplete"),
+                         "a reply alone completes nothing — the join is the receipt's mid")
+        rows.append(json.dumps({"id": "px-1.mail.TESTHOST-A", "ev": "handoff-done",
+                                "t": T0 + 500, "from_host": "TESTHOST-B"}))
+        self._log(rows)
+        jd._HANDOFF_DONE_MEMO["key"] = None
+        jd.run_propagate(now=T0 + 600)
         nd = self._handoffs()[0]
-        self.assertTrue(nd.get("nodeComplete"), "the reply completes the tracking node")
-        self.assertIn("reported back by TESTHOST-B:web", nd.get("doneWhy") or "")
+        self.assertTrue(nd.get("nodeComplete"), "the completion receipt checks the handoff off")
+        self.assertIn("completion receipt", nd.get("doneWhy") or "")
+
+    def test_a_completed_cross_host_planted_goal_reports_its_receipt_home(self):
+        # the recipient side of the lane: a completed planted goal whose origin crossed hosts
+        # POSTs {mid, host} to the local bus on every propagate pass (the bus dedups durably)
+        self._fleet_stub()
+        store = jd.load_goals(SID)
+        store["seq"] = store.get("seq", 0) + 1
+        nid = "%s:g%d" % (SID, store["seq"])
+        store["nodes"][nid] = jd.GuardedNode({
+            "id": nid, "text": "own the exporter work", "parentId": None,
+            "nodeComplete": True, "blocked": False, "cleared": False, "trail": [],
+            "t": T0, "log": [],
+            "origin": {"peer": "ffffffff-0000-1111-2222-333333333333",
+                       "msgId": "px-9.mail.TESTHOST-A", "peerHost": "TESTHOST-A"}})
+        jd.save_goals(SID, store)
+        posted = []
+        with mock.patch.object(jd, "_post_handoff_receipt",
+                               side_effect=lambda mid, host: posted.append((mid, host))):
+            jd.run_propagate(now=T0 + 100)
+        self.assertIn(("px-9.mail.TESTHOST-A", "TESTHOST-A"), posted,
+                      "the completion reports home with the delegate's own mid")
+
+    def test_one_receipt_completes_exactly_its_own_delegation(self):
+        # the v1.3.16 audit's P1.3 repro: two incomplete delegated tasks + one report produced
+        # two completed tasks under the per-peer heuristic. The receipt joins on the mid.
+        self._fleet_stub()
+        rows = [self._xrow(1, T0 + 10), self._xrow(2, T0 + 20, body="own the importer too")]
+        self._log(rows)
+        jd.run_courier(now=T0 + 100)
+        self.assertEqual(len(self._handoffs()), 2)
+        rows.append(json.dumps({"id": "px-1.mail.TESTHOST-A", "ev": "handoff-done",
+                                "t": T0 + 300, "from_host": self.RHOST}))
+        self._log(rows)
+        jd._HANDOFF_DONE_MEMO["key"] = None
+        jd.run_propagate(now=T0 + 400)
+        done = sorted(bool(nd.get("nodeComplete")) for nd in self._handoffs())
+        self.assertEqual(done, [False, True],
+                         "one receipt completes ONE delegation — its own, never the sibling's")
+
+    def test_a_coordinate_after_the_reply_never_hides_the_answer(self):
+        # the v1.3.16 audit's P2.11 repro: question@10 -> reply@150 -> coordinate@200 read as
+        # peer_answered=0, because the answered-clock was the newest outbound of ANY kind
+        self._fleet_stub()
+        peer = "eeeeeeee-1111-2222-3333-444444444444"
+        self._log([json.dumps({"id": "q1", "ev": "sent", "from": "api", "from_id": SID,
+                               "to_id": peer, "t": T0 + 10, "kind": "question", "body": "port?"}),
+                   json.dumps({"id": "r1", "ev": "sent", "from": "peer", "from_id": peer,
+                               "to_id": SID, "t": T0 + 150, "kind": "coordinate", "body": "8080"}),
+                   json.dumps({"id": "c1", "ev": "sent", "from": "api", "from_id": SID,
+                               "to_id": peer, "t": T0 + 200, "kind": "coordinate",
+                               "body": "fyi shipping"})])
+        km._POSTAL_WAIT_CACHE[0] = None
+        self.assertEqual(km._peer_answered_at(SID), T0 + 150,
+                         "a coordinate requests nothing — it must not reset the answered-clock")
+
+    def test_the_stable_sid_join_survives_a_remote_rename(self):
+        # the v1.3.16 audit's P1.5: the recipient renamed before its first reply, so the
+        # name-keyed alias never joined — the sent row's to_sid snapshot is rename-proof
+        self._fleet_stub()
+        ask = json.dumps({"id": "px-7.mail.TESTHOST-A", "ev": "sent", "from": "api",
+                          "from_id": SID, "to_id": "peer:%s" % self.RHOST,
+                          "toName": "%s:%s" % (self.RHOST, self.RNAME),
+                          "to_sid": self.RSID, "t": T0 + 10, "kind": "question",
+                          "body": "QUESTION: the staging port?"})
+        reply = json.dumps({"id": "rx-7.mail.%s" % self.RHOST, "ev": "sent", "from": "worker",
+                            "from_id": self.RSID, "from_host": self.RHOST, "to_id": SID,
+                            "t": T0 + 300, "kind": "coordinate", "body": "8080"})
+        self._log([ask, reply])
+        km._POSTAL_WAIT_CACHE[0] = None
+        self.assertEqual(km._peer_answered_at(SID), T0 + 300,
+                         "the reply's from_id matches the to_sid snapshot whatever the rename")
+        self._log([ask])                              # without the reply the ask is an open edge
+        km._POSTAL_WAIT_CACHE[0] = None
+        self.assertEqual(km._peer_answered_at(SID), 0)
 
     def test_an_unrelated_peers_reply_never_completes(self):
         self._fleet_stub()
