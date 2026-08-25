@@ -72,44 +72,60 @@ test("the icon drawers survive (they render inside the menu now): ON = romp blue
   assert.match(SRC, /t\.icon\(!on, 8\.5, 8\.5, on \? ROMP_BLUE : MODEL_FG\)/);
 });
 
-test("setSessionFlag still posts via the web host hook, with a Node-fs fallback for Obsidian", () => {
+test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for locked replay", () => {
   assert.match(SRC, /_setSessionFlag\(s, flag, value\)/);
   assert.match(SRC, /window\.__rompTimelineSetFlag === 'function'/);
   assert.match(SRC, /window\.__rompTimelineSetFlag\(s\.id, flag, value\)/);
-  assert.match(SRC, /session-flags\.json/, "Obsidian/headless writes the same file the kernel reads");
-  {
-    // anchored INSIDE the _setSessionFlag fallback: the file-wide match was satisfied by the
-    // order/views guards with this one deleted (the r43 mutant hunt)
-    const at = SRC.indexOf("'session-flags.json'");
-    assert.ok(at > 0, "the fallback names its file");
-    assert.match(SRC.slice(Math.max(0, at - 900), at), /process\.versions\.electron/,
-      "plain node can never write real user state — THIS writer carries its own guard");
-  }
   {
     // KERNEL-FIRST (the v1.3.16 audit's P1.6): the flag write rides the kernel's locked,
-    // canonicalizing POST /flag; the raw file replace is the kernel-down last resort only —
-    // it undid concurrent mutes and postal ISOLATION and recreated migrated TIDs
+    // canonicalizing POST /flag. Kernel down: the gesture is QUEUED (the v1.3.17 audit's P1.5)
+    // — the old direct whole-file replace raced OTHER Electron processes even with the kernel
+    // down, losing a concurrent writer's hideFromFeed/postalServiceOff and able to recreate
+    // migrated TIDs after settlement.
     const fn = SRC.indexOf("_setSessionFlag(s, flag, value)");
     const win = SRC.slice(fn, fn + 2200);
     const kp = win.indexOf("_kernelPost('/flag'");
-    const fw = win.indexOf("writeFileSync");
+    const sp = win.indexOf("_spoolOp({ op: 'flag'");
     assert.ok(kp > 0, "the flag writer posts through the kernel");
-    assert.ok(fw > kp, "…and touches the file only after the kernel POST failed");
-    assert.match(win.slice(kp, fw), /if \(ok !== false\) return;/,
-      "a kernel-accepted OR kernel-REFUSED write never falls back to the raw file — only a " +
+    assert.ok(sp > kp, "…and QUEUES for replay only after the kernel POST failed");
+    assert.match(win.slice(kp, sp), /if \(ok !== false\) return;/,
+      "a kernel-accepted OR kernel-REFUSED write never falls back — only a " +
       "network-level failure means kernel-down (the r44 verification)");
+    assert.ok(win.indexOf("writeFileSync") < 0 && win.indexOf("session-flags.json") < 0,
+      "no direct state-file write survives in the flag path (P1.5)");
   }
   {
-    // the same discipline for the order + views fallbacks (P2.17): merge/normalize in the
-    // kernel first, whole-file writes only kernel-down
-    for (const [route, anchor] of [["/order", "_persistOrder(order)"], ["/views", "_setViews(v)"]]) {
-      const fn = SRC.indexOf(anchor);
-      const win = SRC.slice(fn, fn + 2600);
-      const kp = win.indexOf("_kernelPost('" + route + "'");
-      const fw = win.indexOf("writeFileSync");
-      assert.ok(kp > 0, anchor + " posts through the kernel");
-      assert.ok(fw > kp, anchor + " touches the file only after the kernel POST failed");
-    }
+    // the spool itself: Electron-gated append to the kernel's replay queue
+    const fn = SRC.indexOf("_spoolOp(op) {");
+    assert.ok(fn > 0, "the spool helper exists");
+    const win = SRC.slice(fn, fn + 900);
+    assert.match(win, /!process\.versions \|\| !process\.versions\.electron/,
+      "plain node can never queue into real user state — the spool carries its own guard");
+    assert.match(win, /appendFileSync\([\s\S]*'pending-ui-ops\.jsonl'/,
+      "append-only: an append can lose no concurrent writer's field");
+  }
+  {
+    // views edits ride the kernel's TARGETED ops and spool the same grammar kernel-down
+    const fn = SRC.indexOf("_setViews(v, ops)");
+    assert.ok(fn > 0, "_setViews names its ops");
+    const win = SRC.slice(fn, fn + 1800);
+    const kp = win.indexOf("_kernelPost('/views'");
+    const sp = win.indexOf("_spoolOp({ op: 'views'");
+    assert.ok(kp > 0 && sp > kp, "views: kernel first, spool on network failure only");
+    assert.ok(win.indexOf("writeFileSync") < 0 && win.indexOf("timeline-views.json") < 0,
+      "no direct views-file write survives (P1.5)");
+  }
+  {
+    // the Obsidian ORDER is viewer-local now (the v1.3.17 audit's P2.16): one drag there must
+    // never rewrite the shared arrival-order seed every other surface reads
+    const fn = SRC.indexOf("_persistOrder(order)");
+    const win = SRC.slice(fn, fn + 1400);
+    assert.match(win, /localStorage\.setItem\('romp:tl-vieworder'/,
+      "the arrangement lives in the viewer's own storage");
+    assert.ok(win.indexOf("session-order.json") < 0 && win.indexOf("_kernelPost('/order'") < 0,
+      "neither the seed file nor POST /order is touched by an Obsidian drag");
+    assert.match(win, /process\.versions\.electron/,
+      "plain node can never write real state — the guard survives (the 2026-07-02 lesson)");
   }
   // tag names are USER text: the {}-indexed union builder crashed on __proto__/constructor
   // (the v1.3.16 audit's P2.15)
@@ -118,18 +134,21 @@ test("setSessionFlag still posts via the web host hook, with a Node-fs fallback 
     // fan-out tag edits initiate every REMOTE half first; a refused initiation skips the local
     // commit (P2.16: the repro deleted the local tag while the remote edit returned false)
     const fn = SRC.indexOf("_editTagUnion(g, edit)");
-    const win = SRC.slice(fn, fn + 3400);
+    const win = SRC.slice(fn, fn + 4200);
     assert.ok(win.indexOf("removeOk") > 0 && win.indexOf("fanOk") > 0);
     assert.ok(win.indexOf("removeOk = this._editRemoteTag") < win.indexOf("if (removeOk && g.localId)"),
       "remove: remotes initiate before the local half commits");
     assert.ok(win.indexOf("fanOk = this._editRemoteTag") < win.indexOf("if (fanOk && g.localId)"),
       "rename/color/delete: remotes initiate before the local half commits");
+    // …and an ASYNC refusal compensates the committed local half (the v1.3.17 audit's P2.11)
+    assert.ok(win.indexOf("_noteUnionOp") > 0, "each dispatched remote half records its inverse");
   }
-  assert.match(SRC, /process\.env\.ROMP_STATE_DIR \|\| path\.join\(base, 'romp'\)/,
-    "the fallback honors the selected kernel state root");
-  assert.match(SRC, /tmp = fp \+ '\.tmp'/);
-  assert.match(SRC, /fs\.unlinkSync\(tmp\)[\s\S]*fs\.writeFileSync\(tmp,[\s\S]*fs\.renameSync\(tmp, fp\)/,
-    "the fallback never exposes a torn JSON file or a planted staging FIFO");
+  {
+    const fn = SRC.indexOf("tagEditFailed(m) {");
+    const win = SRC.slice(fn, fn + 1600);
+    assert.ok(win.indexOf("_applyLocalOp(o.inverse)") > 0,
+      "the refusing host's entries roll the local half back — the union never stays split");
+  }
 });
 
 test("the sticky-flag machinery survives: pendingFlags reconcile on every update (no flicker-back)", () => {

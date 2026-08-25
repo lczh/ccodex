@@ -1503,6 +1503,8 @@ class TimelinePanel {
     if (Array.isArray(data.palette) && data.palette.length) this._palette = data.palette;
     this._reconcilePendingFlags();   // hold an optimistic eye-toggle sticky until THIS push (or a later one) confirms it
     this._reconcileDismissed();      // ...and a Cleared dead lane, so a stale/merged push can't pop it back
+    this._reconcileUnionOps();       // age out union-edit compensations the owner has since applied
+    this._applyLocalOrder();         // Obsidian: the viewer's own arrangement over the seed (P2.16)
     this._reconcileViews();          // ...and an optimistic view edit, until the kernel echoes it
     this._reconcileTagEdits();       // ...and any remote-tag edits, until the owner's poll echoes them
     this._signalReady();             // first lanes are about to paint → let the shell drop the boot splash
@@ -1763,33 +1765,39 @@ class TimelinePanel {
     const oidx = new Map(full.map((id, i) => [id, i]));
     this.data.sessions.sort((a, b) => ((oidx.has(a.id) ? oidx.get(a.id) : Infinity) - (oidx.has(b.id) ? oidx.get(b.id) : Infinity)));
   }
-  // Persist the full SID order to ~/.local/state/romp/session-order.json. VS Code webview has no Node →
-  // hand it to the extension host (which writes atomically); Obsidian desktop writes directly (tmp+rename).
+  // Persist the viewer's arrangement. VS Code/web hand it to the host (romp:vieworder — already
+  // viewer-local there); Obsidian keeps its OWN localStorage arrangement under the same rule:
+  // order is a property of how you are LOOKING at the sessions, not of the sessions — one
+  // Obsidian drag must never rewrite the shared arrival-order seed every other surface reads
+  // (the v1.3.17 audit's P2.16; the seed file and POST /order are no longer touched here).
   _persistOrder(order) {
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineWriteOrder === 'function') {
         window.__rompTimelineWriteOrder(order); return;
       }
-      // The direct write is the OBSIDIAN DESKTOP path — an Electron app. Under PLAIN node with a window
-      // shim (the `node --test` runner) there is no romp UI at all, so never touch the real state file:
-      // the lane-drag test used to land here and WIPE ~/.local/state/romp/session-order.json to its
-      // two fixture sids on every `npm test`, which is exactly the "tabs keep reordering themselves"
-      // bug the order-audit log finally pinned (the user 2026-07-02). Electron-or-nothing, no heuristic.
+      // Electron-or-nothing, as before, so a plain-node test shim never touches real state
+      // (the 2026-07-02 lesson).
       if (typeof process === 'undefined' || !process.versions || !process.versions.electron) return;
-      // requires sit DIRECTLY in the try body: esbuild only tolerates unbundlable require()
-      // there, and inside the .then callback it hard-errors the production webview bundle (r44)
-      const fs = require('fs'), path = require('path'), os = require('os');
-      this._kernelPost('/order', { order: order }).then((ok) => {
-        if (ok !== false) return;                    // merged, or refused (kernel up — see /flag)
-        const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
-        const root = process.env.ROMP_STATE_DIR || path.join(base, 'romp');   // per-kernel state root (plans/multi-kernel.md)
-        const f = path.join(root, 'session-order.json'), tmp = f + '.tmp';
-        try { fs.unlinkSync(tmp); } catch (e) { /* absent is fine */ }   // a planted FIFO at the
-        //                                     fixed staging name froze the renderer (v1.3.13 audit)
-        fs.writeFileSync(tmp, JSON.stringify(order));
-        fs.renameSync(tmp, f);
-      }).catch(() => { /* can't persist */ });
-    } catch (e) { /* no host hook + no Node → can't persist; the drag still reordered visually until next poll */ }
+      if (typeof localStorage !== 'undefined')
+        localStorage.setItem('romp:tl-vieworder', JSON.stringify(order));
+    } catch (e) { /* quota / private mode → the drag lives until reload */ }
+  }
+
+  // Order the incoming seed by this viewer's stored arrangement (view-first, seed remainder —
+  // the web shell's applyViewOrder rule). Obsidian only: with a host hook the shell already
+  // ordered the payload.
+  _applyLocalOrder() {
+    try {
+      if (typeof window !== 'undefined' && typeof window.__rompTimelineWriteOrder === 'function') return;
+      if (typeof process === 'undefined' || !process.versions || !process.versions.electron) return;
+      if (typeof localStorage === 'undefined' || !this.data || !this.data.sessions) return;
+      const view = JSON.parse(localStorage.getItem('romp:tl-vieworder') || '[]');
+      if (!Array.isArray(view) || !view.length) return;
+      const idx = new Map(view.filter((x) => typeof x === 'string').map((id, i) => [id, i]));
+      const seed = this.data.sessions.slice();
+      const placed = seed.filter((s) => idx.has(s.id)).sort((a, b) => idx.get(a.id) - idx.get(b.id));
+      this.data.sessions = placed.concat(seed.filter((s) => !idx.has(s.id)));
+    } catch (e) { /* unreadable arrangement → the seed order stands */ }
   }
 
   // ── feed→timeline locate ────────────────────────────────────────────────
@@ -2467,9 +2475,52 @@ class TimelinePanel {
   tagEditFailed(m) {
     for (const id of Object.keys(this._pendingTagEdits || {}))
       if (id.split(':')[0] === m.host) delete this._pendingTagEdits[id];   // edits are name-addressed per host — revert them all
+    // COMPENSATE the local half (the v1.3.17 audit's P2.11): the union edit committed locally
+    // the moment the remote DISPATCH succeeded, but this refusal says the owner never applied
+    // it — without the rollback the tag is split (deleted here, alive there). Only entries for
+    // the refusing host+name fire; entries already confirmed by polls have aged out.
+    const ops = (this._unionOps || []).filter((o) => o.host === (m.host || '')
+      && (!m.name || o.name === m.name));
+    this._unionOps = (this._unionOps || []).filter((o) => ops.indexOf(o) < 0);
+    for (const o of ops) this._applyLocalOp(o.inverse);
     this._tagEditErr = { host: m.host || '', name: m.name || '', error: m.error || 'refused' };
     if (this._viewsDialog && this._viewsDialogBuild) this._viewsDialogBuild();
     this.draw();
+  }
+
+  // one pending compensation per dispatched remote half: applied on that host's tagEditFailed,
+  // aged out (3 polls, the optimistic-overlay convention) once the owner presumably applied it
+  _noteUnionOp(rt, name, inverse) {
+    if (!this._unionOps) this._unionOps = [];
+    this._unionOps.push({ host: rt.host || '', name: name || '', inverse: inverse, age: 0 });
+  }
+
+  _reconcileUnionOps() {
+    if (!this._unionOps || !this._unionOps.length) return;
+    for (const o of this._unionOps) o.age = (o.age || 0) + 1;
+    this._unionOps = this._unionOps.filter((o) => o.age < 3);
+  }
+
+  // apply one targeted op to the LOCAL store: the optimistic clone mutates and the same op
+  // persists through _setViews — the rollback path reuses the exact grammar the edits use
+  _applyLocalOp(op) {
+    if (!op) return;
+    const nv = JSON.parse(JSON.stringify(this._curViews()));
+    if (op.create && op.create.id) {
+      if (!viewTags(nv).some((t) => t.id === op.create.id)) {
+        nv.tags = viewTags(nv).concat([{ id: op.create.id, name: op.create.name || 'tag',
+          color: op.create.color || '', members: (op.create.members || []).slice() }]);
+        delete nv.groups;
+      }
+    } else {
+      const t = viewTags(nv).find((x) => x.id === op.tag || x.name === op.tag);
+      if (!t) return;
+      if (op.add) t.members = Array.from(new Set((t.members || []).concat(op.add)));
+      if (op.remove) t.members = (t.members || []).filter((m) => op.remove.indexOf(m) < 0);
+      if (op.rename) t.name = op.rename;
+      if (op.color) t.color = op.color;
+    }
+    this._setViews(nv, [op]);
   }
 
   // ── the NAME-KEYED tag editor (user ruling 2026-08-24), shared by the dialog and the lane gear ──
@@ -2483,7 +2534,10 @@ class TimelinePanel {
       if (g.localId) {
         const nv = JSON.parse(JSON.stringify(this._curViews()));
         const t = viewTags(nv).find((x) => x.id === g.localId);
-        if (t) { t.members = Array.from(new Set((t.members || []).concat(edit.add))); this._setViews(nv); }
+        if (t) {
+          t.members = Array.from(new Set((t.members || []).concat(edit.add)));
+          this._setViews(nv, [{ tag: g.localId, add: edit.add.slice() }]);
+        }
       } else if (g.remotes.length) this._editRemoteTag(g.remotes[0], { add: edit.add.slice() });
     }
     if (edit.remove && edit.remove.length) {
@@ -2491,15 +2545,24 @@ class TimelinePanel {
       // local half committed — "a removal never half-works" (the v1.3.16 audit's P2.16 repro
       // deleted the local copy while the remote edit returned false)
       let removeOk = true;
+      const dispatched = [];
       for (const rt of g.remotes)
-        if ((rt.members || []).some((m) => edit.remove.indexOf(m) >= 0))
+        if ((rt.members || []).some((m) => edit.remove.indexOf(m) >= 0)) {
           removeOk = this._editRemoteTag(rt, { remove: edit.remove.slice() }) && removeOk;
+          dispatched.push(rt);
+        }
       if (removeOk && g.localId) {
         const nv = JSON.parse(JSON.stringify(this._curViews()));
         const t = viewTags(nv).find((x) => x.id === g.localId);
         if (t && (t.members || []).some((m) => edit.remove.indexOf(m) >= 0)) {
+          const had = (t.members || []).filter((m) => edit.remove.indexOf(m) >= 0);
           t.members = (t.members || []).filter((m) => edit.remove.indexOf(m) < 0);
-          this._setViews(nv);
+          this._setViews(nv, [{ tag: g.localId, remove: edit.remove.slice() }]);
+          // an ASYNC refusal from any dispatched owner must restore this local half — a sync
+          // dispatch success only means the request left (the v1.3.17 audit's P2.11: the local
+          // deletion stayed committed while the remote member survived, splitting the union)
+          for (const rt of dispatched)
+            this._noteUnionOp(rt, g.name, { tag: g.localId, add: had });
         }
       }
     }
@@ -2510,14 +2573,24 @@ class TimelinePanel {
                                           delete: !!edit.delete }) && fanOk;
       if (fanOk && g.localId) {
         const nv = JSON.parse(JSON.stringify(this._curViews()));
+        const before = viewTags(this._curViews()).find((x) => x.id === g.localId) || {};
+        let op, inverse;
         if (edit.delete) {
           nv.tags = viewTags(nv).filter((x) => x.id !== g.localId); delete nv.groups;
           if (nv.active === g.localId) nv.active = 'all';
+          op = { tag: g.localId, delete: true };
+          inverse = { create: { id: g.localId, name: before.name, color: before.color,
+                                members: (before.members || []).slice() } };
         } else {
           const t = viewTags(nv).find((x) => x.id === g.localId);
           if (t) { if (edit.rename) t.name = edit.rename; if (edit.color) t.color = edit.color; }
+          op = { tag: g.localId };
+          inverse = { tag: g.localId };
+          if (edit.rename) { op.rename = edit.rename; inverse.rename = before.name; }
+          if (edit.color) { op.color = edit.color; inverse.color = before.color; }
         }
-        this._setViews(nv);
+        this._setViews(nv, [op]);
+        for (const rt of g.remotes) this._noteUnionOp(rt, g.name, inverse);
       }
     }
   }
@@ -2569,11 +2642,12 @@ class TimelinePanel {
       const nv = JSON.parse(JSON.stringify(this._curViews()));
       const used = new Set(viewTags(nv).map((t) => t.color));
       const color = (this._palette || []).find((c) => !used.has(c)) || (this._palette || [])[0] || '#1EA1EB';
-      nv.tags = viewTags(nv).concat([{ id: 'g' + Date.now().toString(36),
-        name: ni.value.trim().slice(0, 40), color, members: rowIds.slice() }]);
+      const tg = { id: 'g' + Date.now().toString(36),
+        name: ni.value.trim().slice(0, 40), color, members: rowIds.slice() };
+      nv.tags = viewTags(nv).concat([tg]);
       delete nv.groups;
       this._tagAddFor = null;
-      this._setViews(nv); rebuild();
+      this._setViews(nv, [{ create: tg }]); rebuild();
     });
     box.appendChild(ni);
     ni.focus();
@@ -2590,34 +2664,31 @@ class TimelinePanel {
     if (++this._pendingViewsAge >= 3) { this._pendingViews = null; this._pendingViewsAge = 0; }
   }
 
-  // Persist the whole views blob. Web/VS Code: the host WS hook (→ kernel setTimelineViews, which
-  // normalizes + rebroadcasts). Obsidian/headless fallback: write the same timeline-views.json the
-  // kernel reads (it re-normalizes on read). Optimistic + sticky, like the lane flags.
-  _setViews(v) {
+  // Persist a views edit. Web/VS Code: the host WS hook (→ kernel setTimelineViews; the blob is a
+  // clone of the pushed payload, so its rev rides along and the kernel compare-and-sets against
+  // it — a stale write is refused, never a lost tag; the v1.3.17 audit's P2.15). Obsidian: the
+  // kernel's POST /views takes the TARGETED ops (`ops`) when the caller names them — concurrent
+  // editors compose server-side — and the whole blob (rev-gated) otherwise. Kernel down: the ops
+  // are QUEUED for the kernel's locked replay (_spoolOp); the direct whole-file write is gone —
+  // it raced other Electron processes and could recreate migrated TIDs (the audit's P1.5).
+  // Optimistic + sticky, like the lane flags.
+  _setViews(v, ops) {
     this._pendingViews = v; this._pendingViewsAge = 0;
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineSetViews === 'function') {
         window.__rompTimelineSetViews(v);
       } else if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
-        // Obsidian only — the Electron guard keeps a bare-node test run from ever touching the real
-        // file (the 2026-07-02 _persistOrder lesson). The kernel's POST /views is the SAME
-        // whole-blob last-write-wins the WS op has, through the locked + canonicalizing +
-        // normalizing setter (the v1.3.16 audit's P2.17); the direct file write is the
-        // kernel-down last resort only.
-        const fs = require('fs'), os = require('os'), path = require('path');   // try-scope: see _persistOrder
-        this._kernelPost('/views', { views: v }).then((ok) => {
-          if (ok !== false) return;                  // normalized, or refused (kernel up)
-          const root = process.env.ROMP_STATE_DIR
-            || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'romp');
-          fs.mkdirSync(root, { recursive: true });
-          const fp = path.join(root, 'timeline-views.json');
-          try { fs.unlinkSync(fp + '.tmp'); } catch (e) { /* absent is fine */ }   // same rule as
-          //                                                    _persistOrder (v1.3.13 audit)
-          fs.writeFileSync(fp + '.tmp', JSON.stringify(v));
-          fs.renameSync(fp + '.tmp', fp);
+        // Obsidian only — the Electron guard keeps a bare-node test run from ever touching real
+        // state (the 2026-07-02 _persistOrder lesson).
+        const body = (ops && ops.length) ? { ops: ops }
+          : { ops: [{ active: (v && v.active) || 'all' }] };   // callers without a grammar are
+        //                                                        the active-view picks
+        this._kernelPost('/views', body).then((ok) => {
+          if (ok !== false) return;                  // applied, or refused (kernel up)
+          this._spoolOp({ op: 'views', ops: body.ops });
         }).catch(() => { /* can't persist */ });
       }
-    } catch (e) { /* no host hook + no Node fs → session-local only */ }
+    } catch (e) { /* no host hook + no Node → session-local only */ }
     this.draw();
   }
 
@@ -2767,7 +2838,7 @@ class TimelinePanel {
       const tg = { id: 'g' + Date.now().toString(36), name: 'tag ' + (viewTags(nv).length + 1), color, members: [] };
       nv.tags = viewTags(nv).concat([tg]); delete nv.groups;
       nv.active = tg.id;                     // a new tag opens ACTIVE so its edits take effect live
-      this._setViews(nv);
+      this._setViews(nv, [{ create: tg }, { active: tg.id }]);
       this._closeViewsMenu();
       this._openViewsDialog(tg.id);
     });
@@ -3157,6 +3228,23 @@ class TimelinePanel {
     } catch (e) { return Promise.resolve(false); }
   }
 
+  // Queue one targeted op for the KERNEL to replay through its locked, canonicalizing setters
+  // (the v1.3.17 audit's P1.5): with the kernel down, a direct whole-file write still raced
+  // OTHER Electron/Obsidian processes — losing a concurrent writer's safety field
+  // (hideFromFeed vs postalServiceOff) and able to recreate migrated TID rows after
+  // settlement. An append can lose neither: the kernel applies each op against current state
+  // at boot and every supervisor pass. Electron-only, like every direct state path here.
+  _spoolOp(op) {
+    try {
+      if (typeof process === 'undefined' || !process.versions || !process.versions.electron) return;
+      const fs = require('fs'), os = require('os'), path = require('path');   // try-scope: see _persistOrder
+      const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
+      const root = process.env.ROMP_STATE_DIR || path.join(base, 'romp');
+      fs.mkdirSync(root, { recursive: true });
+      fs.appendFileSync(path.join(root, 'pending-ui-ops.jsonl'), JSON.stringify(op) + '\n');
+    } catch (e) { /* can't queue — the gesture stays optimistic-only until the kernel returns */ }
+  }
+
   // Persist a per-session flag. Web dashboard: the host WS hook (→ kernel setSessionFlag → rebuild feed).
   // Obsidian/headless: the kernel's POST /flag (locked + canonicalized); the direct
   // session-flags.json write only when the kernel is unreachable.
@@ -3168,23 +3256,13 @@ class TimelinePanel {
       // Direct state access is an Obsidian/Electron fallback only. A plain-node test process with
       // a window shim must never touch the user's real flags, just as for order and views above.
       if (typeof process === 'undefined' || !process.versions || !process.versions.electron) return;
-      const fs = require('fs'), os = require('os'), path = require('path');   // try-scope: see _persistOrder
       this._kernelPost('/flag', { target: s.id, flag: flag, value: !!value }).then((ok) => {
         if (ok !== false) return;                    // took it, or REFUSED it (kernel up: never
         //                                              race its writers with a raw file write)
-        // kernel unreachable → the last-resort direct write (its racing writers are down too)
-        const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
-        const dir = process.env.ROMP_STATE_DIR || path.join(base, 'romp');
-        const fp = path.join(dir, 'session-flags.json'), tmp = fp + '.tmp';
-        let cur = {};
-        try { cur = JSON.parse(fs.readFileSync(fp, 'utf8')) || {}; } catch (e) {}
-        const f = (cur[s.id] && typeof cur[s.id] === 'object') ? cur[s.id] : {};
-        if (value) f[flag] = true; else delete f[flag];
-        if (Object.keys(f).length) cur[s.id] = f; else delete cur[s.id];
-        fs.mkdirSync(dir, { recursive: true });
-        try { fs.unlinkSync(tmp); } catch (e) { /* absent is fine */ }
-        fs.writeFileSync(tmp, JSON.stringify(cur));
-        fs.renameSync(tmp, fp);
+        // kernel unreachable → QUEUE the gesture for the kernel's locked replay: even with the
+        // kernel down, a raw whole-file write raced other Electron processes and could undo a
+        // concurrent mute or recreate a migrated TID (the v1.3.17 audit's P1.5)
+        this._spoolOp({ op: 'flag', target: s.id, flag: flag, value: !!value });
       }).catch(() => { /* can't persist */ });
     } catch (e) { /* no host hook + no Node fs → can't persist */ }
   }

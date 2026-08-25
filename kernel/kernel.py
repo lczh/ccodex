@@ -1745,6 +1745,63 @@ def _set_timeline_views(blob, base_rev=None):
         return True, currev + 1
 
 
+def _replay_ui_op_spool():
+    """Apply queued UI ops from Electron surfaces that found the kernel DOWN (the v1.3.17
+    audit's P1.5): the old fallback REPLACED whole state files with no lock and no
+    canonicalization — losing a concurrent writer's hideFromFeed/postalServiceOff and able to
+    recreate migrated TID rows after settlement. The spool (pending-ui-ops.jsonl) is
+    append-only; ops replay here through the SAME locked, canonicalizing setters the routes
+    use — a TID written while the kernel was down canonicalizes to its SID at replay, after
+    migration. Crash-safe: the spool is renamed aside first, so a replay that dies re-runs its
+    idempotent ops (set-flag, add/remove/rename) next pass instead of losing them. A torn last
+    line (a writer that died mid-append) is dropped loudly."""
+    sp = jd.STATE / "pending-ui-ops.jsonl"
+    work = jd.STATE / "pending-ui-ops.replay.jsonl"
+    try:
+        if not work.exists():
+            if not sp.exists():
+                return
+            os.replace(sp, work)
+    except OSError:
+        return
+    try:
+        lines = work.read_text(errors="replace").splitlines()
+    except OSError:
+        return
+    applied = 0
+    for ln in lines:
+        if not ln.strip():
+            continue
+        try:
+            op = json.loads(ln)
+        except ValueError:
+            sys.stderr.write("ui-op spool: dropping a torn line (%d bytes)\n" % len(ln))
+            continue
+        if not isinstance(op, dict):
+            continue
+        try:
+            if op.get("op") == "flag":
+                tsid = str(op.get("target") or "")
+                flag = str(op.get("flag") or "")
+                if tsid and flag and isinstance(op.get("value"), bool):
+                    if flag == "notify":
+                        _set_notify_session(tsid, op["value"])
+                    else:
+                        _set_session_flag(tsid, flag, op["value"])
+                    applied += 1
+            elif op.get("op") == "views" and isinstance(op.get("ops"), list):
+                _apply_views_ops(op["ops"])
+                applied += 1
+        except Exception:
+            sys.stderr.write("ui-op spool replay: %s\n" % traceback.format_exc())
+    try:
+        work.unlink()
+    except OSError:
+        pass
+    if applied:
+        _mark_views_dirty()
+
+
 def _apply_views_ops(ops):
     """Targeted, name-or-id-keyed view-tag operations applied against the CURRENT blob under the
     identity lock — two concurrent editors COMPOSE instead of last-writer-wins, and a kernel-down
@@ -14210,6 +14267,7 @@ def _tunnel_supervisor():
                 # Once per (host, level); a failed push retries next pass.
                 _push_origin_trust_rows()
             _pr_watch_tick(now)          # PR-landing watches (rate-gated per row; loud on gh failure)
+            _replay_ui_op_spool()        # kernel-down Electron gestures queued for locked replay (P1.5)
             # Everything above is the supervisor's own state (status, fails, next_try, kernel_sha, detail).
             # None of it used to reach disk — only the act routes saved — so the file could sit frozen on a
             # failure long after the row recovered. Signature-gated: a steady fleet writes nothing.
@@ -32720,6 +32778,8 @@ def main():
     _known_load()                                              # remembered past hosts (popover's re-attach rows)
     _remotes_load()                                            # re-attach remote kernels from a prior run
     _pr_watches_load()                                         # re-arm PR-landing watches (same intent rule)
+    _replay_ui_op_spool()                                      # gestures queued while no kernel ran — applied
+    #                                                            through the locked setters, post-migration (P1.5)
     _consume_update_report()                                   # last self-update's outcome → the Log, once
     threading.Thread(target=_update_check_loop, daemon=True).start()   # newer release? boot + every 6h (mode-gated inside)
     threading.Thread(target=_ensure_postal_bus, daemon=True).start()   # a sessionless machine still needs its bus

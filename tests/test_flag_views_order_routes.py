@@ -312,3 +312,62 @@ class FeedJsonIsAPureRead(unittest.TestCase):
         finally:
             km.build_feed = saved[0]
             km._built_feed[:] = saved[1]
+
+
+class UiOpSpoolReplay(unittest.TestCase):
+    """the v1.3.17 audit's P1.5, kernel half: gestures an Electron surface queued while no
+    kernel ran replay through the locked, canonicalizing setters at boot and every supervisor
+    pass — never a raw whole-file write."""
+
+    def setUp(self):
+        for name in ("pending-ui-ops.jsonl", "pending-ui-ops.replay.jsonl",
+                     "session-flags.json", "timeline-views.json"):
+            try:
+                (km.jd.STATE / name).unlink()
+            except OSError:
+                pass
+        km._flags_cache.clear()
+        self._dirty = km._mark_views_dirty
+        km._mark_views_dirty = lambda: None
+
+    def tearDown(self):
+        km._mark_views_dirty = self._dirty
+
+    def test_flag_and_views_ops_replay_through_the_locked_setters(self):
+        sp = km.jd.STATE / "pending-ui-ops.jsonl"
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        with sp.open("a") as fh:
+            fh.write(json.dumps({"op": "flag", "target": SID, "flag": "postalServiceOff",
+                                 "value": True}) + "\n")
+            fh.write(json.dumps({"op": "views", "ops": [{"create": {
+                "id": "sp1", "name": "spooled", "color": "", "members": [SID]}}]}) + "\n")
+        km._replay_ui_op_spool()
+        flags = json.loads((km.jd.STATE / "session-flags.json").read_text())
+        self.assertTrue(flags[SID]["postalServiceOff"])
+        v = km._timeline_views()
+        self.assertEqual([t_["name"] for t_ in v["tags"]], ["spooled"])
+        self.assertEqual(v["tags"][0]["members"], [{"host": "", "sid": SID}])
+        self.assertFalse(sp.exists(), "a replayed spool is consumed")
+        self.assertFalse((km.jd.STATE / "pending-ui-ops.replay.jsonl").exists())
+
+    def test_a_crashed_replay_resumes_and_a_torn_line_drops(self):
+        work = km.jd.STATE / "pending-ui-ops.replay.jsonl"
+        work.parent.mkdir(parents=True, exist_ok=True)
+        with work.open("a") as fh:
+            fh.write(json.dumps({"op": "flag", "target": SID, "flag": "hideFromFeed",
+                                 "value": True}) + "\n")
+            fh.write('{"op": "flag", "target": "')   # a writer died mid-append
+        km._replay_ui_op_spool()
+        flags = json.loads((km.jd.STATE / "session-flags.json").read_text())
+        self.assertTrue(flags[SID]["hideFromFeed"],
+                        "a replay that died before unlink re-runs its idempotent ops")
+        self.assertFalse(work.exists())
+
+    def test_a_string_boolean_never_replays(self):
+        sp = km.jd.STATE / "pending-ui-ops.jsonl"
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        sp.write_text(json.dumps({"op": "flag", "target": SID, "flag": "hideFromFeed",
+                                  "value": "false"}) + "\n")
+        km._replay_ui_op_spool()
+        self.assertFalse((km.jd.STATE / "session-flags.json").exists(),
+                         "the replay is a boundary too — string booleans are refused (P2.13)")

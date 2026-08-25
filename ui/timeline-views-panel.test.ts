@@ -223,13 +223,15 @@ test("the two display toggles write the host's own romp:settings — reachable i
   assert.match(SRC, /localStorage\.setItem\('romp:settings', JSON\.stringify\(s\)\);/);
 });
 
-test("_setViews posts through the host hook with a GUARDED, atomic Obsidian fallback", () => {
+test("_setViews posts through the host hook; Obsidian rides targeted kernel ops + the replay spool", () => {
   assert.match(SRC, /window\.__rompTimelineSetViews === 'function'/);
-  // Electron-gated (a bare-node test run must never touch the real file — the 2026-07-02 lesson),
-  // env-aware state root, tmp+rename so a reader never sees a torn blob
+  // Electron-gated (a bare-node test run must never touch real state — the 2026-07-02 lesson);
+  // the direct timeline-views.json write is GONE (the v1.3.17 audit's P1.5): kernel-down
+  // gestures queue as targeted ops the kernel replays through its locked setters
   assert.match(SRC, /process\.versions && process\.versions\.electron/);
-  assert.match(SRC, /process\.env\.ROMP_STATE_DIR\n?\s*\|\| path\.join\(process\.env\.XDG_STATE_HOME \|\| path\.join\(os\.homedir\(\), '\.local', 'state'\), 'romp'\)/);
-  assert.match(SRC, /fs\.renameSync\(fp \+ '\.tmp', fp\);/);
+  assert.match(SRC, /_setViews\(v, ops\)/);
+  assert.match(SRC, /_kernelPost\('\/views', body\)/);
+  assert.match(SRC, /_spoolOp\(\{ op: 'views', ops: body\.ops \}\)/);
   assert.match(SRC, /this\._pendingViews = v; this\._pendingViewsAge = 0;/);
   assert.match(SRC, /this\._reconcileViews\(\);\s*\/\/ \.\.\.and an optimistic view edit/);
 });
