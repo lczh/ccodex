@@ -165,7 +165,8 @@ class TimelineViews(unittest.TestCase):
         self.assertEqual(v["active"], "all")
         src = open(os.path.join(BIN, "romp-kernel")).read()
         self.assertIn('msg.get("type") == "setTimelineViews"', src)
-        self.assertIn('_set_timeline_views(msg["views"])', src)
+        self.assertIn('_set_timeline_views(_wv, base_rev=_wbr)', src,
+                      "the WS write is compare-and-set against the echoed rev (v1.3.17 P2.15)")
 
     def test_payloads_echo_the_views_blob(self):
         src = open(os.path.join(BIN, "romp-kernel")).read()

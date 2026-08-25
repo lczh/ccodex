@@ -79,28 +79,22 @@ class OtherStagingWriters(unittest.TestCase):
 
 
 class ElectronStagingWriters(unittest.TestCase):
-    def test_the_timeline_writers_unlink_the_plant_first(self):
-        # the v1.3.13 audit's P2: _persistOrder and _setViews open fixed .tmp names
-        # synchronously — a writerless FIFO froze the renderer
+    def test_the_direct_state_writers_are_gone_entirely(self):
+        # the v1.3.13 audit's P2 pinned staging hygiene (unlink-the-plant-first) on the
+        # timeline's direct state writers. The v1.3.17 audit's P1.5 removed those writers
+        # outright — kernel-down gestures append to the pending-ui-ops spool for the kernel's
+        # locked replay, and the Obsidian order went viewer-local — so the STRONGER property
+        # holds now: no direct state-file write exists to need hygiene at all.
         src = open(os.path.join(ROOT, "ui", "romp-timeline-view.js")).read()
-        for anchor, target in (("'session-order.json'", "fs.unlinkSync(tmp)"),
-                               ("'timeline-views.json'", "fs.unlinkSync(fp + '.tmp')"),
-                               ("'session-flags.json'", "fs.unlinkSync(tmp)")):
-            i = src.index(anchor)
-            window = src[i:i + 500]
-            self.assertIn(target, window,
-                          "%s must unlink the STAGING path — a wrong-path unlink deleted the "
-                          "good state file instead and left the plant in place (the r37 mutant "
-                          "hunt)" % anchor)
-            self.assertLess(window.index(target), window.index("fs.writeFileSync"), anchor)
-        # and the STAGING BINDING itself is pinned: rebinding tmp to the real file made the
-        # unlink delete the good state before rewriting it (the r38 mutant hunt)
-        i = src.index("'session-order.json'")
-        self.assertIn("tmp = f + '.tmp'", src[i:i + 300],
-                      "_persistOrder's staging name derives from the target + .tmp")
-        i = src.index("'session-flags.json'")
-        self.assertIn("tmp = fp + '.tmp'", src[i:i + 300],
-                      "_setSessionFlag's staging name derives from the target + .tmp")
+        for gone in ("'session-order.json'", "'timeline-views.json'", "'session-flags.json'"):
+            self.assertNotIn(gone, src,
+                             "%s: no direct state-file path may reappear in the timeline — "
+                             "gestures ride the kernel routes or the replay spool" % gone)
+        self.assertIn("'pending-ui-ops.jsonl'", src, "the spool is the ONLY fallback surface")
+        i = src.index("'pending-ui-ops.jsonl'")
+        self.assertIn("appendFileSync", src[max(0, i - 300):i + 300],
+                      "the spool is append-only — an append needs no staging hygiene and can "
+                      "lose no concurrent writer's field")
 
 
 if __name__ == "__main__":
