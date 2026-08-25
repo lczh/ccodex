@@ -30620,8 +30620,14 @@ class Handler(BaseHTTPRequestHandler):
                     b = json.loads(raw_body or b"{}")
                 except Exception:
                     b = {}
-                target = str((b or {}).get("target") or "").strip()
-                nm = str((b or {}).get("name") or "").strip()
+                if not isinstance(b, dict):
+                    # arrays/strings/numbers crashed .get() into a 500 traceback with an absolute
+                    # path in it (the v1.3.16 audit — the same shape /fork closed in v1.3.9)
+                    return self._send(400, json.dumps({"ok": False,
+                                                       "error": "the body must be a JSON object"}),
+                                      "application/json")
+                target = str(b.get("target") or "").strip()
+                nm = str(b.get("name") or "").strip()
                 if not target or not nm:
                     return self._send(400, json.dumps({"ok": False, "error": "target and name required"}),
                                       "application/json")
@@ -30629,10 +30635,6 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, json.dumps({"ok": False, "error":
                         "session names use letters, digits, . _ - only"}), "application/json")
                 live = _live_names(_tmux_sessions())
-                if nm in live:
-                    return self._send(200, json.dumps({"ok": False, "error":
-                        'a session named "%s" is already running — pick another name' % nm}),
-                                      "application/json")
                 tsid = live.get(target) or ""
                 if not tsid and re.fullmatch(r"[0-9a-fA-F-]{32,36}", target):
                     tsid = target
@@ -30640,8 +30642,25 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, json.dumps({"ok": False, "error":
                         'no live session named "%s" (a dormant one can be renamed by sid)' % target}),
                                       "application/json")
-                be = Sessions.backend_for(tsid)
-                if not (be and be.rename(tsid, nm)):      # live → backend reg; dead → names file
+                if live.get(nm) == tsid:              # its own name: idempotent success, no claim
+                    return self._send(200, json.dumps({"ok": True, "id": tsid, "name": nm}),
+                                      "application/json")
+                if not _claim_name(nm):
+                    # snapshot-check-rename raced: two concurrent renames onto one name BOTH
+                    # returned ok and one session went unaddressable (the v1.3.16 audit's P1) —
+                    # the ATOMIC reservation the WS path, create, fork and promotion all take
+                    return self._send(200, json.dumps({"ok": False, "error": _NAME_TAKEN % nm}),
+                                      "application/json")
+                try:
+                    be = Sessions.backend_for(tsid)
+                    with _rename_serial:
+                        renamed = bool(be and be.rename(tsid, nm))   # live → backend reg; dead → names file
+                except Exception as e:
+                    renamed = False
+                    sys.stderr.write("rename '%s': %s\n" % (tsid, e))
+                finally:
+                    _release_name(nm)
+                if not renamed:
                     return self._send(200, json.dumps({"ok": False, "error":
                         "the rename did not take — is that session known to this kernel?"}),
                                       "application/json")
@@ -30659,8 +30678,14 @@ class Handler(BaseHTTPRequestHandler):
                     b = json.loads(raw_body or b"{}")
                 except Exception:
                     b = {}
-                target = str((b or {}).get("target") or "").strip()
-                bg = str((b or {}).get("bg") or "").strip()
+                if not isinstance(b, dict):
+                    # arrays/strings/numbers crashed .get() into a 500 traceback with an absolute
+                    # path in it (the v1.3.16 audit — the same shape /fork closed in v1.3.9)
+                    return self._send(400, json.dumps({"ok": False,
+                                                       "error": "the body must be a JSON object"}),
+                                      "application/json")
+                target = str(b.get("target") or "").strip()
+                bg = str(b.get("bg") or "").strip()
                 if not target or not bg:
                     return self._send(400, json.dumps({"ok": False, "error": "target and bg required"}),
                                       "application/json")
@@ -30694,6 +30719,12 @@ class Handler(BaseHTTPRequestHandler):
                     b = json.loads(raw_body or b"{}")
                 except Exception:
                     b = {}
+                if not isinstance(b, dict):
+                    # arrays/strings/numbers crashed .get() into a 500 traceback with an absolute
+                    # path in it (the v1.3.16 audit — the same shape /fork closed in v1.3.9)
+                    return self._send(400, json.dumps({"ok": False,
+                                                       "error": "the body must be a JSON object"}),
+                                      "application/json")
                 try:
                     prn = int(b.get("pr"))
                 except Exception:
@@ -30727,9 +30758,21 @@ class Handler(BaseHTTPRequestHandler):
                     b = json.loads(raw_body or b"{}")
                 except Exception:
                     b = {}
-                name = str((b or {}).get("name") or "").strip()
+                if not isinstance(b, dict):
+                    # arrays/strings/numbers crashed .get() into a 500 traceback with an absolute
+                    # path in it (the v1.3.16 audit — the same shape /fork closed in v1.3.9)
+                    return self._send(400, json.dumps({"ok": False,
+                                                       "error": "the body must be a JSON object"}),
+                                      "application/json")
+                name = str(b.get("name") or "").strip()
                 if not name:
                     return self._send(400, json.dumps({"ok": False, "error": "name required"}),
+                                      "application/json")
+                if "delete" in b and not isinstance(b.get("delete"), bool):
+                    # bool("false") is True: the string spelling DELETED the tag it was asked to
+                    # keep (the v1.3.16 audit) — a destructive flag takes a real JSON boolean only
+                    return self._send(400, json.dumps({"ok": False, "error":
+                        "delete must be a JSON boolean (true/false), not a string"}),
                                       "application/json")
                 # --host (tag federation v0, the user 2026-08-24): the edit targets an ATTACHED
                 # kernel's store, through the tunnel it already holds — Model A home-kernel

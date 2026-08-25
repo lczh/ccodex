@@ -50,8 +50,10 @@ class RenameRoute(unittest.TestCase):
         self._saved = (km.Sessions.backend_for, km._tmux_sessions, km._live_names, km._mark_views_dirty)
         km.Sessions.backend_for = staticmethod(lambda sid: BE())
         km._tmux_sessions = lambda: {}
-        km._live_names = lambda tm: {"web": SID}
+        km._live_names = lambda tm: {"web": SID,
+                                     "api": "22222222-3333-4444-5555-666666666666"}
         km._mark_views_dirty = lambda: None
+        km._NAME_CLAIMS.clear()
 
     def tearDown(self):
         (km.Sessions.backend_for, km._tmux_sessions, km._live_names, km._mark_views_dirty) = self._saved
@@ -81,10 +83,56 @@ class RenameRoute(unittest.TestCase):
         self.assertEqual(self.renames[0][0], SID)
 
     def test_the_poisoning_guard_refuses_a_live_new_name(self):
-        st, r = self._post({"target": SID, "name": "web"})
+        st, r = self._post({"target": SID, "name": "api"})   # another session's live name
         self.assertFalse(r.get("ok"))
         self.assertIn("already running", r.get("error") or "")
         self.assertEqual(self.renames, [])
+
+    def test_renaming_to_its_own_name_is_an_idempotent_success(self):
+        st, r = self._post({"target": SID, "name": "web"})
+        self.assertTrue(r.get("ok"), "the WS path's own-name semantics: ok, nothing to claim")
+        self.assertEqual(self.renames, [], "no backend rename for a no-op")
+
+    def test_two_concurrent_renames_to_one_name_admit_exactly_one(self):
+        # the v1.3.16 audit's P1: snapshot-check-rename raced — both got ok and one session went
+        # unaddressable. The route now takes the same ATOMIC reservation as the WS path.
+        import time as _time
+        renames = self.renames
+
+        class SlowBE:
+            def rename(self, sid, name):
+                _time.sleep(0.15)                     # hold the claim across the second request
+                renames.append((sid, name))
+                return True
+        km.Sessions.backend_for = staticmethod(lambda sid: SlowBE())
+        results = []
+
+        def go(target):
+            results.append(self._post({"target": target, "name": "same"})[1])
+
+        a = threading.Thread(target=go, args=(SID,))
+        b = threading.Thread(target=go, args=("22222222-3333-4444-5555-666666666666",))
+        a.start(); b.start(); a.join(10); b.join(10)
+        oks = [r for r in results if r.get("ok")]
+        self.assertEqual(len(oks), 1, "exactly one rename may win the name: %r" % results)
+        self.assertIn("already running", next(r for r in results if not r.get("ok"))["error"])
+        self.assertEqual(len(renames), 1)
+
+    def test_a_non_object_body_is_a_400_not_a_traceback(self):
+        # the v1.3.16 audit: [1] crashed .get() into a traceback-bearing 500 with an absolute path
+        for path in ("/rename", "/color", "/tag", "/watch-pr"):
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d%s" % (self.port, path), data=b"[1]",
+                headers={"Content-Type": "application/json",
+                         "X-Romp-Token": os.environ["ROMP_SERVE_TOKEN"]})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    st, body = r.status, r.read().decode()
+            except urllib.error.HTTPError as e:
+                st, body = e.code, e.read().decode()
+            self.assertEqual(st, 400, "%s: %s" % (path, body))
+            self.assertIn("JSON object", body)
+            self.assertNotIn("Traceback", body)
 
     def test_bad_names_and_unknown_targets_are_loud(self):
         st, r = self._post({"target": "web", "name": "bad name!"})

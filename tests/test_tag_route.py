@@ -364,5 +364,13 @@ class GroupAliasSurvives(TagRoute):
         self.assertEqual(resp["tag"]["members"], [SID], "a live name resolved through the alias route too")
 
 
+    def test_a_string_false_never_deletes(self):
+        # the v1.3.16 audit: bool("false") is True — the string spelling deleted the tag it was
+        # asked to keep. A destructive flag takes a real JSON boolean only.
+        st, r = self._post({"name": "roster", "delete": "false"})
+        self.assertEqual(st, 400, r)
+        self.assertIn("boolean", json.dumps(r))
+
+
 if __name__ == "__main__":
     unittest.main()
