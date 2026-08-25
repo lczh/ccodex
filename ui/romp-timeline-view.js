@@ -45,7 +45,9 @@ function viewTags(views) { return (views && (views.tags || views.groups)) || [];
 // stored duplicates stay separate under the hood (no automatic store merges — the anti-clobber
 // rule); this is PRESENTATION, and the mirrors (session-views.ts, kernel _view_visible) agree.
 function viewTagUnion(views) {
-  const out = [], byName = {};
+  const out = [], byName = Object.create(null);   // tag names are USER text: "__proto__",
+  //                                                 "constructor" and "toString" each crashed the
+  //                                                 {}-indexed builder (the v1.3.16 audit's P2.15)
   for (const t of viewTags(views)) {
     const g = byName[t.name] || (byName[t.name] = { name: t.name || 'tag', color: '', members: [],
                                                     ids: [], localId: null, homes: [], remotes: [] });
@@ -1774,14 +1776,17 @@ class TimelinePanel {
       // two fixture sids on every `npm test`, which is exactly the "tabs keep reordering themselves"
       // bug the order-audit log finally pinned (the user 2026-07-02). Electron-or-nothing, no heuristic.
       if (typeof process === 'undefined' || !process.versions || !process.versions.electron) return;
-      const fs = require('fs'), path = require('path'), os = require('os');
-      const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
-      const root = process.env.ROMP_STATE_DIR || path.join(base, 'romp');   // per-kernel state root (plans/multi-kernel.md)
-      const f = path.join(root, 'session-order.json'), tmp = f + '.tmp';
-      try { fs.unlinkSync(tmp); } catch (e) { /* absent is fine */ }   // a planted FIFO at the
-      //                                     fixed staging name froze the renderer (v1.3.13 audit)
-      fs.writeFileSync(tmp, JSON.stringify(order));
-      fs.renameSync(tmp, f);
+      this._kernelPost('/order', { order: order }).then((ok) => {
+        if (ok) return;                              // the kernel's locked MERGE kept untouched slots
+        const fs = require('fs'), path = require('path'), os = require('os');
+        const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
+        const root = process.env.ROMP_STATE_DIR || path.join(base, 'romp');   // per-kernel state root (plans/multi-kernel.md)
+        const f = path.join(root, 'session-order.json'), tmp = f + '.tmp';
+        try { fs.unlinkSync(tmp); } catch (e) { /* absent is fine */ }   // a planted FIFO at the
+        //                                     fixed staging name froze the renderer (v1.3.13 audit)
+        fs.writeFileSync(tmp, JSON.stringify(order));
+        fs.renameSync(tmp, f);
+      }).catch(() => { /* can't persist */ });
     } catch (e) { /* no host hook + no Node → can't persist; the drag still reordered visually until next poll */ }
   }
 
@@ -2480,7 +2485,14 @@ class TimelinePanel {
       } else if (g.remotes.length) this._editRemoteTag(g.remotes[0], { add: edit.add.slice() });
     }
     if (edit.remove && edit.remove.length) {
-      if (g.localId) {
+      // REMOTE halves first: an initiation that cannot even reach its owner must not leave the
+      // local half committed — "a removal never half-works" (the v1.3.16 audit's P2.16 repro
+      // deleted the local copy while the remote edit returned false)
+      let removeOk = true;
+      for (const rt of g.remotes)
+        if ((rt.members || []).some((m) => edit.remove.indexOf(m) >= 0))
+          removeOk = this._editRemoteTag(rt, { remove: edit.remove.slice() }) && removeOk;
+      if (removeOk && g.localId) {
         const nv = JSON.parse(JSON.stringify(this._curViews()));
         const t = viewTags(nv).find((x) => x.id === g.localId);
         if (t && (t.members || []).some((m) => edit.remove.indexOf(m) >= 0)) {
@@ -2488,12 +2500,13 @@ class TimelinePanel {
           this._setViews(nv);
         }
       }
-      for (const rt of g.remotes)
-        if ((rt.members || []).some((m) => edit.remove.indexOf(m) >= 0))
-          this._editRemoteTag(rt, { remove: edit.remove.slice() });
     }
     if (edit.rename || edit.color || edit.delete) {
-      if (g.localId) {
+      let fanOk = true;                              // remote halves FIRST (P2.16, as above)
+      for (const rt of g.remotes)
+        fanOk = this._editRemoteTag(rt, { rename: edit.rename, color: edit.color,
+                                          delete: !!edit.delete }) && fanOk;
+      if (fanOk && g.localId) {
         const nv = JSON.parse(JSON.stringify(this._curViews()));
         if (edit.delete) {
           nv.tags = viewTags(nv).filter((x) => x.id !== g.localId); delete nv.groups;
@@ -2504,8 +2517,6 @@ class TimelinePanel {
         }
         this._setViews(nv);
       }
-      for (const rt of g.remotes)
-        this._editRemoteTag(rt, { rename: edit.rename, color: edit.color, delete: !!edit.delete });
     }
   }
 
@@ -2587,18 +2598,22 @@ class TimelinePanel {
         window.__rompTimelineSetViews(v);
       } else if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
         // Obsidian only — the Electron guard keeps a bare-node test run from ever touching the real
-        // file (the 2026-07-02 _persistOrder lesson). Resolve the state root the way the kernel does
-        // (ROMP_STATE_DIR, then XDG_STATE_HOME, then the default), write tmp+rename so a reader never
-        // sees a torn blob.
-        const fs = require('fs'), os = require('os'), path = require('path');
-        const root = process.env.ROMP_STATE_DIR
-          || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'romp');
-        fs.mkdirSync(root, { recursive: true });
-        const fp = path.join(root, 'timeline-views.json');
-        try { fs.unlinkSync(fp + '.tmp'); } catch (e) { /* absent is fine */ }   // same rule as
-        //                                                    _persistOrder (v1.3.13 audit)
-        fs.writeFileSync(fp + '.tmp', JSON.stringify(v));
-        fs.renameSync(fp + '.tmp', fp);
+        // file (the 2026-07-02 _persistOrder lesson). The kernel's POST /views is the SAME
+        // whole-blob last-write-wins the WS op has, through the locked + canonicalizing +
+        // normalizing setter (the v1.3.16 audit's P2.17); the direct file write is the
+        // kernel-down last resort only.
+        this._kernelPost('/views', { views: v }).then((ok) => {
+          if (ok) return;
+          const fs = require('fs'), os = require('os'), path = require('path');
+          const root = process.env.ROMP_STATE_DIR
+            || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'romp');
+          fs.mkdirSync(root, { recursive: true });
+          const fp = path.join(root, 'timeline-views.json');
+          try { fs.unlinkSync(fp + '.tmp'); } catch (e) { /* absent is fine */ }   // same rule as
+          //                                                    _persistOrder (v1.3.13 audit)
+          fs.writeFileSync(fp + '.tmp', JSON.stringify(v));
+          fs.renameSync(fp + '.tmp', fp);
+        }).catch(() => { /* can't persist */ });
       }
     } catch (e) { /* no host hook + no Node fs → session-local only */ }
     this.draw();
@@ -3108,8 +3123,35 @@ class TimelinePanel {
     if (this._dismissed.size) this.data.sessions = this.data.sessions.filter((s) => !this._dismissed.has(s.id));
   }
 
+  // Route one state write through the KERNEL's locked, canonicalizing writers (the v1.3.16
+  // audit's P1.6/P2.17: the raw fs fallbacks replaced whole files with no lock and could undo a
+  // concurrent mute/isolation or recreate a migrated TID). Electron/Obsidian only. Resolves false
+  // when the kernel is unreachable, so the caller may fall back to the direct file write — with
+  // the kernel down, the writers this lock serializes against are down too.
+  _kernelPost(route, body) {
+    try {
+      if (typeof process === 'undefined' || !process.versions || !process.versions.electron)
+        return Promise.resolve(false);
+      const fs = require('fs'), os = require('os'), path = require('path');
+      const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
+      const root = process.env.ROMP_STATE_DIR || path.join(base, 'romp');
+      let tok = '';
+      try { tok = fs.readFileSync(path.join(root, 'serve-token'), 'utf8').trim(); } catch (e) { /* no token file */ }
+      const port = parseInt(process.env.ROMP_KERNEL_PORT || '29855', 10);
+      if (typeof fetch !== 'function') return Promise.resolve(false);
+      return fetch('http://127.0.0.1:' + port + route, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Romp-Token': tok },
+        body: JSON.stringify(body),
+      }).then((r) => {
+        if (!r.ok) return false;
+        return r.json().then((j) => j && j.ok !== false).catch(() => true);
+      }).catch(() => false);
+    } catch (e) { return Promise.resolve(false); }
+  }
+
   // Persist a per-session flag. Web dashboard: the host WS hook (→ kernel setSessionFlag → rebuild feed).
-  // Obsidian/headless fallback: write the same session-flags.json the kernel's build_feed reads.
+  // Obsidian/headless: the kernel's POST /flag (locked + canonicalized); the direct
+  // session-flags.json write only when the kernel is unreachable.
   _setSessionFlag(s, flag, value) {
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineSetFlag === 'function') {
@@ -3118,19 +3160,23 @@ class TimelinePanel {
       // Direct state access is an Obsidian/Electron fallback only. A plain-node test process with
       // a window shim must never touch the user's real flags, just as for order and views above.
       if (typeof process === 'undefined' || !process.versions || !process.versions.electron) return;
-      const fs = require('fs'), os = require('os'), path = require('path');
-      const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
-      const dir = process.env.ROMP_STATE_DIR || path.join(base, 'romp');
-      const fp = path.join(dir, 'session-flags.json'), tmp = fp + '.tmp';
-      let cur = {};
-      try { cur = JSON.parse(fs.readFileSync(fp, 'utf8')) || {}; } catch (e) {}
-      const f = (cur[s.id] && typeof cur[s.id] === 'object') ? cur[s.id] : {};
-      if (value) f[flag] = true; else delete f[flag];
-      if (Object.keys(f).length) cur[s.id] = f; else delete cur[s.id];
-      fs.mkdirSync(dir, { recursive: true });
-      try { fs.unlinkSync(tmp); } catch (e) { /* absent is fine */ }
-      fs.writeFileSync(tmp, JSON.stringify(cur));
-      fs.renameSync(tmp, fp);
+      this._kernelPost('/flag', { target: s.id, flag: flag, value: !!value }).then((ok) => {
+        if (ok) return;                              // the kernel's locked writer took it
+        // kernel unreachable → the last-resort direct write (its racing writers are down too)
+        const fs = require('fs'), os = require('os'), path = require('path');
+        const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
+        const dir = process.env.ROMP_STATE_DIR || path.join(base, 'romp');
+        const fp = path.join(dir, 'session-flags.json'), tmp = fp + '.tmp';
+        let cur = {};
+        try { cur = JSON.parse(fs.readFileSync(fp, 'utf8')) || {}; } catch (e) {}
+        const f = (cur[s.id] && typeof cur[s.id] === 'object') ? cur[s.id] : {};
+        if (value) f[flag] = true; else delete f[flag];
+        if (Object.keys(f).length) cur[s.id] = f; else delete cur[s.id];
+        fs.mkdirSync(dir, { recursive: true });
+        try { fs.unlinkSync(tmp); } catch (e) { /* absent is fine */ }
+        fs.writeFileSync(tmp, JSON.stringify(cur));
+        fs.renameSync(tmp, fp);
+      }).catch(() => { /* can't persist */ });
     } catch (e) { /* no host hook + no Node fs → can't persist */ }
   }
 

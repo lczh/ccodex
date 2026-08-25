@@ -30754,6 +30754,84 @@ class Handler(BaseHTTPRequestHandler):
                         'no session answers to "%s"' % who}), "application/json")
                 row = add_pr_watch(prn, repo, tsid)
                 return self._send(200, json.dumps({"ok": True, "watch": row}), "application/json")
+            if u.path == "/flag":
+                # The Obsidian timeline's flag writer, routed through the kernel's LOCKED,
+                # canonicalizing setter (the v1.3.16 audit's P1.6: the raw fs fallback replaced
+                # the whole unlocked flags file — a lost concurrent field, a deleted sibling
+                # row, a recreated migrated TID; muting and postal ISOLATION are safety state).
+                # Body: {"target": <live name or sid>, "flag": <name>, "value": true|false}.
+                try:
+                    b = json.loads(raw_body or b"{}")
+                except Exception:
+                    b = {}
+                if not isinstance(b, dict):
+                    return self._send(400, json.dumps({"ok": False,
+                                                       "error": "the body must be a JSON object"}),
+                                      "application/json")
+                target = str(b.get("target") or "").strip()
+                flag = str(b.get("flag") or "").strip()
+                if not target or not flag:
+                    return self._send(400, json.dumps({"ok": False, "error": "target and flag required"}),
+                                      "application/json")
+                if not isinstance(b.get("value"), bool):
+                    return self._send(400, json.dumps({"ok": False, "error":
+                        "value must be a JSON boolean (true/false), not a string"}),
+                                      "application/json")
+                live = _live_names(_tmux_sessions())
+                tsid = live.get(target) or ""
+                if not tsid and re.fullmatch(r"[0-9a-fA-F-]{32,36}", target):
+                    tsid = target
+                if not tsid:
+                    return self._send(200, json.dumps({"ok": False, "error":
+                        'no live session named "%s" (a dormant one goes by sid)' % target}),
+                                      "application/json")
+                if flag == "notify":
+                    _set_notify_session(tsid, b["value"])    # tri-state override: its own setter
+                else:
+                    _set_session_flag(tsid, flag, b["value"])
+                _mark_views_dirty()
+                return self._send(200, json.dumps({"ok": True, "id": tsid, "flag": flag,
+                                                   "value": b["value"]}), "application/json")
+            if u.path == "/views":
+                # The Obsidian timeline's views writer — the WS setTimelineViews op as a POST:
+                # the SAME whole-blob last-write-wins semantics every dashboard has, but through
+                # _set_timeline_views' identity lock + canonicalization + normalization (the
+                # v1.3.16 audit's P2.17: the raw fs write bypassed all three and could recreate
+                # migrated TIDs or clobber a concurrent kernel tag edit mid-write).
+                try:
+                    b = json.loads(raw_body or b"{}")
+                except Exception:
+                    b = {}
+                if not isinstance(b, dict):
+                    return self._send(400, json.dumps({"ok": False,
+                                                       "error": "the body must be a JSON object"}),
+                                      "application/json")
+                if not isinstance(b.get("views"), dict):
+                    return self._send(400, json.dumps({"ok": False, "error": "views (object) required"}),
+                                      "application/json")
+                _set_timeline_views(b["views"])
+                _mark_views_dirty()
+                return self._send(200, json.dumps({"ok": True}), "application/json")
+            if u.path == "/order":
+                # The Obsidian timeline's lane-drag writer — the WS reorderTabs op as a POST: the
+                # locked MERGE that keeps untouched lanes' slots (the raw whole-file overwrite
+                # dropped every slot the drag didn't carry — the exact bug class the merge
+                # exists for; the v1.3.16 audit's P2.17).
+                try:
+                    b = json.loads(raw_body or b"{}")
+                except Exception:
+                    b = {}
+                if not isinstance(b, dict):
+                    return self._send(400, json.dumps({"ok": False,
+                                                       "error": "the body must be a JSON object"}),
+                                      "application/json")
+                order = b.get("order")
+                if not isinstance(order, list) or not all(isinstance(x, str) for x in order):
+                    return self._send(400, json.dumps({"ok": False, "error":
+                        "order (a list of session ids) required"}), "application/json")
+                _merge_and_write_session_order(order)
+                _mark_views_dirty()
+                return self._send(200, json.dumps({"ok": True}), "application/json")
             if u.path in ("/tag", "/group"):
                 # Headless tag edit (`romp tag`, the user 2026-08-23, the manager/worker workflow:
                 # the worker roster IS a session tag, so an agent needs to keep one current — and can

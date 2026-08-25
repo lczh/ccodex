@@ -85,6 +85,44 @@ test("setSessionFlag still posts via the web host hook, with a Node-fs fallback 
     assert.match(SRC.slice(Math.max(0, at - 900), at), /process\.versions\.electron/,
       "plain node can never write real user state — THIS writer carries its own guard");
   }
+  {
+    // KERNEL-FIRST (the v1.3.16 audit's P1.6): the flag write rides the kernel's locked,
+    // canonicalizing POST /flag; the raw file replace is the kernel-down last resort only —
+    // it undid concurrent mutes and postal ISOLATION and recreated migrated TIDs
+    const fn = SRC.indexOf("_setSessionFlag(s, flag, value)");
+    const win = SRC.slice(fn, fn + 2200);
+    const kp = win.indexOf("_kernelPost('/flag'");
+    const fw = win.indexOf("writeFileSync");
+    assert.ok(kp > 0, "the flag writer posts through the kernel");
+    assert.ok(fw > kp, "…and touches the file only after the kernel POST failed");
+    assert.match(win.slice(kp, fw), /if \(ok\) return;/, "a kernel-accepted write never double-writes");
+  }
+  {
+    // the same discipline for the order + views fallbacks (P2.17): merge/normalize in the
+    // kernel first, whole-file writes only kernel-down
+    for (const [route, anchor] of [["/order", "_persistOrder(order)"], ["/views", "_setViews(v)"]]) {
+      const fn = SRC.indexOf(anchor);
+      const win = SRC.slice(fn, fn + 2600);
+      const kp = win.indexOf("_kernelPost('" + route + "'");
+      const fw = win.indexOf("writeFileSync");
+      assert.ok(kp > 0, anchor + " posts through the kernel");
+      assert.ok(fw > kp, anchor + " touches the file only after the kernel POST failed");
+    }
+  }
+  // tag names are USER text: the {}-indexed union builder crashed on __proto__/constructor
+  // (the v1.3.16 audit's P2.15)
+  assert.match(SRC, /const out = \[\], byName = Object\.create\(null\)/);
+  {
+    // fan-out tag edits initiate every REMOTE half first; a refused initiation skips the local
+    // commit (P2.16: the repro deleted the local tag while the remote edit returned false)
+    const fn = SRC.indexOf("_editTagUnion(g, edit)");
+    const win = SRC.slice(fn, fn + 3400);
+    assert.ok(win.indexOf("removeOk") > 0 && win.indexOf("fanOk") > 0);
+    assert.ok(win.indexOf("removeOk = this._editRemoteTag") < win.indexOf("if (removeOk && g.localId)"),
+      "remove: remotes initiate before the local half commits");
+    assert.ok(win.indexOf("fanOk = this._editRemoteTag") < win.indexOf("if (fanOk && g.localId)"),
+      "rename/color/delete: remotes initiate before the local half commits");
+  }
   assert.match(SRC, /process\.env\.ROMP_STATE_DIR \|\| path\.join\(base, 'romp'\)/,
     "the fallback honors the selected kernel state root");
   assert.match(SRC, /tmp = fp \+ '\.tmp'/);
