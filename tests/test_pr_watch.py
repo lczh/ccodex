@@ -37,11 +37,25 @@ class Verdict(unittest.TestCase):
         self.assertEqual(km._pr_watch_verdict({"state": "MERGED"}), ("merged", ""))
         self.assertEqual(km._pr_watch_verdict({"state": "CLOSED"}), ("closed", ""))
 
-    def test_a_failed_check_is_terminal_with_its_name(self):
+    def test_a_red_rollup_row_alone_is_never_terminal(self):
+        # the v1.3.17 audit's P2.9: the rollup does not mark required-ness — an optional lint
+        # failure was mailed "will not land" and the watch retired while the PR went on to merge.
         d = {"state": "OPEN", "statusCheckRollup": [
             {"name": "Python 3.12", "status": "COMPLETED", "conclusion": "SUCCESS"},
-            {"name": "Shell (bats)", "status": "COMPLETED", "conclusion": "FAILURE"}]}
-        self.assertEqual(km._pr_watch_verdict(d), ("failed", "Shell (bats)"))
+            {"name": "optional lint", "status": "COMPLETED", "conclusion": "FAILURE"}]}
+        self.assertEqual(km._pr_watch_verdict(d), (None, ""),
+                         "without required-check rows the watch keeps watching")
+
+    def test_a_failing_required_check_is_terminal_with_its_name(self):
+        d = {"state": "OPEN", "statusCheckRollup": [
+            {"name": "optional lint", "status": "COMPLETED", "conclusion": "FAILURE"}]}
+        req = [{"name": "Shell (bats)", "bucket": "fail"}]
+        self.assertEqual(km._pr_watch_verdict(d, required=req), ("failed", "Shell (bats)"))
+        req_ok = [{"name": "build", "bucket": "pass"}]
+        self.assertEqual(km._pr_watch_verdict(d, required=req_ok), (None, ""),
+                         "all required green + optional red -> still in flight")
+        req_pend = [{"name": "build", "bucket": "pending"}]
+        self.assertEqual(km._pr_watch_verdict(d, required=req_pend), (None, "busy"))
 
     def test_in_flight_says_busy_for_the_cadence_hint(self):
         d = {"state": "OPEN", "statusCheckRollup": [
@@ -161,6 +175,40 @@ class Tick(unittest.TestCase):
         self.assertIn("could not read", self.mail[0][1])
         self.assertIn("auth required", self.mail[0][1])
         self.assertEqual(km._pr_watches, [])
+
+    def test_a_failed_delivery_keeps_the_watch_for_retry(self):
+        # the v1.3.17 audit's P2.10 (half 1): the tick retired the watch even when delivery
+        # returned False — the landing mail was simply lost
+        km.add_pr_watch(11, "TESTORG/testrepo", SID, now=0)
+        km._pr_watch_read = lambda pr, repo: ("merged", "")
+        km._pr_watch_deliver = lambda sid, text: False
+        km._pr_watch_tick(100.0)
+        self.assertEqual(len(km._pr_watches), 1, "a known delivery failure keeps the watch")
+        self.assertNotIn("sent", km._pr_watches[0], "the stamp is cleared on a KNOWN failure")
+        km._pr_watch_deliver = lambda sid, text: self.mail.append((sid, text)) or True
+        km._pr_watch_tick(100.0 + km.PR_WATCH_EVERY)
+        self.assertEqual(len(self.mail), 1, "the retry delivers")
+        self.assertEqual(km._pr_watches, [])
+
+    def test_a_stamped_row_retires_without_a_second_mail(self):
+        # the v1.3.17 audit's P2.10 (half 2): a crash between deliver and retire re-mailed the
+        # landing notice on restart. The verdict is stamped durably BEFORE the injection, and a
+        # stamped row retires silently.
+        km.add_pr_watch(12, "TESTORG/testrepo", SID, now=0)
+        km._pr_watches[0]["sent"] = "merged"          # the crash left the stamp
+        km._pr_watch_read = lambda pr, repo: ("merged", "")
+        km._pr_watch_tick(100.0)
+        self.assertEqual(self.mail, [], "no duplicate mail after the crash window")
+        self.assertEqual(km._pr_watches, [], "the stamped row still retires")
+
+    def test_the_stamp_survives_the_watch_file_roundtrip(self):
+        km.add_pr_watch(13, "TESTORG/testrepo", SID, now=0)
+        km._pr_watches[0]["sent"] = "merged"
+        km._pr_watches_save()
+        km._pr_watches[:] = []
+        km._pr_watches_load()
+        self.assertEqual(km._pr_watches[0].get("sent"), "merged",
+                         "the delivery stamp is durable across a kernel restart")
 
     def test_in_flight_backs_off_while_checks_run(self):
         km.add_pr_watch(10, "TESTORG/testrepo", SID, now=0)

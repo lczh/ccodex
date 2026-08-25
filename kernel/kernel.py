@@ -1694,6 +1694,7 @@ def _timeline_views():
         d = json.loads(p.read_text())
     except Exception:
         d = {}
+    _rev = int(d.get("rev") or 0) if isinstance(d, dict) else 0
     # ONE-TIME MIGRATION (the user 2026-08-24, retiring hide-from-chat outright: "we want to get
     # rid of that hide from chat thing"): a stored blob still carrying hidden entries maps them
     # into an "archived" TAG on THIS kernel — preserving the user's intent record and keeping them
@@ -1713,14 +1714,92 @@ def _timeline_views():
         d = dict(d); d["tags"] = tags; d.pop("groups", None); d.pop("hidden", None)
         _set_timeline_views(d)                       # persist the mapping; the fresh mtime re-keys the cache
     d = _norm_timeline_views(d)
+    d["rev"] = _rev        # the write counter rides every read (and every client payload clone),
+    #                        so a whole-blob writer naturally declares the base it edited from
     _flags_cache[str(p)] = (key, d)
     return d
 
 
-def _set_timeline_views(blob):
+def _set_timeline_views(blob, base_rev=None):
+    """Locked, canonicalizing whole-blob write with an optional compare-and-set: a writer that
+    read rev N commits only against rev N (the v1.3.17 audit's P2.15 — the lock serialized two
+    stale whole-blob writes and the second still erased the first writer's tag). base_rev None
+    is unconditional (the hidden-migration writer, pre-rev clients). Returns (ok, rev)."""
     with jd._identity_file_lock():
+        try:
+            cur = json.loads(_views_path().read_text())
+        except Exception:
+            cur = {}
+        currev = int(cur.get("rev") or 0) if isinstance(cur, dict) else 0
+        if base_rev is not None:
+            try:
+                stale = int(base_rev) != currev
+            except (TypeError, ValueError):
+                stale = True
+            if stale:
+                return False, currev
         blob = jd.canonicalize_timeline_views(blob)
-        _atomic_write(_views_path(), json.dumps(_norm_timeline_views(blob), sort_keys=True))
+        d = _norm_timeline_views(blob)
+        d["rev"] = currev + 1
+        _atomic_write(_views_path(), json.dumps(d, sort_keys=True))
+        return True, currev + 1
+
+
+def _apply_views_ops(ops):
+    """Targeted, name-or-id-keyed view-tag operations applied against the CURRENT blob under the
+    identity lock — two concurrent editors COMPOSE instead of last-writer-wins, and a kernel-down
+    spool can replay the exact gesture later (the v1.3.17 audit's P2.15/P1.5). Per op:
+    {"tag": <name or id>, "add": [sid...], "remove": [sid...], "rename": s, "color": s,
+    "delete": true}, {"create": {"id","name","color","members"}}, or {"active": <view id>}.
+    Unknown tags and malformed ops drop quietly: a replayed gesture over a deleted tag has
+    nothing left to do. Returns the new rev."""
+    with jd._identity_file_lock():
+        try:
+            raw = json.loads(_views_path().read_text())
+        except Exception:
+            raw = {}
+        currev = int(raw.get("rev") or 0) if isinstance(raw, dict) else 0
+        d = _norm_timeline_views(raw)
+        pair = lambda s: {"host": "", "sid": str(s)}
+        for op in ops if isinstance(ops, list) else []:
+            if not isinstance(op, dict):
+                continue
+            if isinstance(op.get("active"), str):
+                d["active"] = op["active"]
+                continue
+            cr = op.get("create")
+            if isinstance(cr, dict):
+                cid = str(cr.get("id") or "")
+                if cid and not any(t["id"] == cid for t in d["tags"]):
+                    d["tags"].append({"id": cid, "name": str(cr.get("name") or "tag"),
+                                      "color": str(cr.get("color") or ""),
+                                      "members": [pair(s) for s in (cr.get("members") or [])
+                                                  if isinstance(s, str)]})
+                continue
+            key = str(op.get("tag") or "")
+            t = next((x for x in d["tags"] if x.get("name") == key or x.get("id") == key), None)
+            if t is None:
+                continue
+            if isinstance(op.get("add"), list):
+                have = {(m["host"], m["sid"]) for m in t["members"]}
+                t["members"] = t["members"] + [pair(s) for s in op["add"]
+                                               if isinstance(s, str) and ("", s) not in have]
+            if isinstance(op.get("remove"), list):
+                gone = {str(s) for s in op["remove"] if isinstance(s, str)}
+                t["members"] = [m for m in t["members"]
+                                if not (m.get("host") == "" and m.get("sid") in gone)]
+            if isinstance(op.get("rename"), str) and op["rename"].strip():
+                t["name"] = op["rename"].strip()
+            if isinstance(op.get("color"), str):
+                t["color"] = op["color"]
+            if op.get("delete") is True:
+                d["tags"] = [x for x in d["tags"] if x is not t]
+                if d.get("active") == t.get("id"):
+                    d["active"] = "all"
+        d = _norm_timeline_views(jd.canonicalize_timeline_views(d))
+        d["rev"] = currev + 1
+        _atomic_write(_views_path(), json.dumps(d, sort_keys=True))
+        return currev + 1
 
 
 def _remote_tag_member_str(owner_host, m):
@@ -12107,7 +12186,8 @@ def _pr_watches_load():
 
 def _pr_watches_save():
     with _pr_watch_lock:
-        rows = [{k: r[k] for k in ("pr", "repo", "sid", "at")} for r in _pr_watches]
+        rows = [{k: r[k] for k in ("pr", "repo", "sid", "at", "sent") if k in r}
+                for r in _pr_watches]
     try:
         _atomic_write(PR_WATCH_FILE, json.dumps(rows))
     except Exception:
@@ -12129,12 +12209,15 @@ def add_pr_watch(pr, repo, sid, now=None):
     return {k: row[k] for k in ("pr", "repo", "sid", "at")}
 
 
-def _pr_watch_verdict(d):
-    """(verdict, detail) from a `gh pr view --json state,statusCheckRollup` payload, PURE for tests:
-    ("merged"|"closed"|"failed"|None, detail). A FAILURE/TIMED_OUT check conclusion is terminal —
-    in this repo every check is required, so a red check means the auto-merge will never fire (the
-    approximation is named here: gh's rollup does not mark required-ness). None = still in flight;
-    detail then says whether checks are visibly running (the cadence hint)."""
+def _pr_watch_verdict(d, required=None):
+    """(verdict, detail) from `gh pr view --json state,statusCheckRollup` plus, optionally, the
+    REQUIRED-check rows from `gh pr checks --required --json bucket,name` — PURE for tests:
+    ("merged"|"closed"|"failed"|None, detail). Only a failing REQUIRED check is terminal: the
+    rollup does not mark required-ness, and treating any red row as terminal mailed "will not
+    land" for an optional lint failure while the required build was green, then retired the
+    watch on a PR that went on to merge (the v1.3.17 audit's P2.9). With no required rows
+    (none configured, or an older gh) the only terminal states are MERGED/CLOSED — the watch
+    keeps watching; detail still says whether checks are visibly running (the cadence hint)."""
     state = str((d or {}).get("state") or "").upper()
     if state == "MERGED":
         return "merged", ""
@@ -12145,9 +12228,15 @@ def _pr_watch_verdict(d):
         if not isinstance(c, dict):
             continue
         con = str(c.get("conclusion") or "").upper()
-        if con in ("FAILURE", "TIMED_OUT"):
-            return "failed", str(c.get("name") or c.get("context") or "a check")
         if str(c.get("status") or "").upper() in ("IN_PROGRESS", "QUEUED", "PENDING") or con == "":
+            busy = True
+    for c in required or []:
+        if not isinstance(c, dict):
+            continue
+        b = str(c.get("bucket") or "").lower()
+        if b == "fail":
+            return "failed", str(c.get("name") or "a required check")
+        if b in ("pending", ""):
             busy = True
     return None, ("busy" if busy else "")
 
@@ -12181,7 +12270,23 @@ def _pr_watch_read(pr, repo):
                            capture_output=True, text=True, timeout=25)
         if r.returncode != 0:
             return "error", (r.stderr or r.stdout or "gh failed").strip()[:200]
-        return _pr_watch_verdict(json.loads(r.stdout or "{}"))
+        d = json.loads(r.stdout or "{}")
+        if str((d or {}).get("state") or "").upper() in ("MERGED", "CLOSED"):
+            return _pr_watch_verdict(d)
+        required = None
+        try:
+            # `gh pr checks` exits non-zero for failing/pending checks BY DESIGN — parse the
+            # JSON regardless of rc; unparseable output (an older gh without --json/--required)
+            # degrades to state-only watching, never to a false terminal (P2.9)
+            rc = subprocess.run(["gh", "pr", "checks", str(pr), "--repo", repo,
+                                 "--required", "--json", "bucket,name"],
+                                capture_output=True, text=True, timeout=25)
+            rows = json.loads(rc.stdout) if (rc.stdout or "").strip() else None
+            if isinstance(rows, list):
+                required = rows
+        except Exception:
+            required = None
+        return _pr_watch_verdict(d, required=required)
     except Exception as e:
         return "error", str(e)[:200]
 
@@ -12197,6 +12302,24 @@ def _pr_watch_deliver(sid, text):
         return False
 
 
+def _pr_watch_stamped_deliver(r, verdict, detail):
+    """Deliver a watch's terminal mail AT MOST ONCE across crashes (the v1.3.17 audit's P2.10):
+    the verdict is stamped into the durable watch file BEFORE the injection, so a crash between
+    deliver and retire retires the stamped row on restart instead of mailing a duplicate. A
+    delivery that reports failure clears the stamp and retries next pass — the row is only
+    retired (True) once an injection was confirmed, or once a stamp says one may already have
+    landed."""
+    if r.get("sent") == verdict:
+        return True                                   # stamped: delivered (or crashed mid-window)
+    r["sent"] = verdict
+    _pr_watches_save()
+    if _pr_watch_deliver(r["sid"], _pr_watch_notice(verdict, r["repo"], r["pr"], detail)):
+        return True
+    r.pop("sent", None)                               # a KNOWN failure — retry next pass
+    _pr_watches_save()
+    return False
+
+
 def _pr_watch_tick(now):
     """One supervisor-pass sweep over the registered watches (rate-gated per row)."""
     with _pr_watch_lock:
@@ -12210,15 +12333,19 @@ def _pr_watch_tick(now):
             r["_fails"] = int(r.get("_fails") or 0) + 1
             r["_next"] = now + PR_WATCH_EVERY
             if r["_fails"] >= PR_WATCH_MAX_FAILS:
-                _pr_watch_deliver(r["sid"], _pr_watch_notice("error", r["repo"], r["pr"], detail))
-                done.append(r)
+                if _pr_watch_stamped_deliver(r, "error", detail):
+                    done.append(r)
+                else:
+                    r["_next"] = now + PR_WATCH_EVERY
             continue
         r["_fails"] = 0
         if verdict is None:
             r["_next"] = now + (PR_WATCH_BUSY_EVERY if detail == "busy" else PR_WATCH_EVERY)
             continue
-        _pr_watch_deliver(r["sid"], _pr_watch_notice(verdict, r["repo"], r["pr"], detail))
-        done.append(r)
+        if _pr_watch_stamped_deliver(r, verdict, detail):
+            done.append(r)
+        else:
+            r["_next"] = now + PR_WATCH_EVERY
     if done:
         with _pr_watch_lock:
             for r in done:
@@ -30017,8 +30144,13 @@ class Handler(BaseHTTPRequestHandler):
                 # from the pusher's warmed build (the connect semantics: never triggers a rebuild;
                 # a cold kernel builds once, a read like any client connect). Token-gated like its
                 # stateful siblings; read-only, no side effects.
-                return self._send(200, json.dumps(_cached_feed(time.time(), _tmux_sessions(), None,
-                                                               connect=True)),
+                e = _built_feed
+                feed = e[1] if e[1] is not None else build_feed(time.time(), _tmux_sessions())
+                # a COLD kernel builds once WITHOUT _cached_feed's supervisor transitions — the
+                # notification baseline advance, badge pushes and notify-cards prune are the
+                # PUSHER's job, and a read-only GET was rewriting notify-cards.json (the v1.3.17
+                # audit's P2.12). The warmed build serves as-is, exactly as before.
+                return self._send(200, json.dumps(feed),
                                   "application/json", cache="no-cache")
             if p == "/classify":
                 # One session's LIVE classification as the kernel derives it right now (both teams'
@@ -30454,9 +30586,14 @@ class Handler(BaseHTTPRequestHandler):
                 # a separate, best-effort leg on top. Every connected shell repaints at once, and
                 # the dirty mark rebuilds the feed so per-card bells show their new effective state.
                 try:
-                    _on = bool(json.loads(raw_body or b"{}").get("on"))
+                    _nb = json.loads(raw_body or b"{}")
                 except (ValueError, AttributeError):
                     return self._send(400, "bad json", "text/plain")
+                _on = _nb.get("on") if isinstance(_nb, dict) else None
+                if _on is not True and _on is not False:
+                    # never coerce: bool("false") is True (the v1.3.17 audit's P2.13)
+                    return self._send(400, json.dumps({"ok": False, "error":
+                        "on must be a JSON boolean (true/false)"}), "application/json")
                 _set_notify_all(_on)
                 _mark_views_dirty()
                 _send_to_app("shell", {"type": "notifyAll", "on": _on})
@@ -30656,8 +30793,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not nm or not NAME_RE.match(nm):
                     return self._send(400, json.dumps({"ok": False, "error":
                         "session names use letters, digits, . _ - only"}), "application/json")
+                _mk = b.get("mkdir")
+                if _mk is not None and _mk is not True and _mk is not False:
+                    return self._send(400, json.dumps({"ok": False, "error":
+                        "mkdir must be a JSON boolean (true/false)"}), "application/json")
                 # mkdir:true makes a missing dir (the WS op's "create it" answer, available headlessly too)
-                cwd, derr = _resolve_create_dir(b.get("dir"), create=bool(b.get("mkdir")))
+                cwd, derr = _resolve_create_dir(b.get("dir"), create=_mk is True)
                 if derr:
                     return self._send(200, json.dumps({"ok": False, "error": derr,
                                                        "dirStatus": _dir_status(b.get("dir"))}),
@@ -30936,12 +31077,25 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(400, json.dumps({"ok": False,
                                                        "error": "the body must be a JSON object"}),
                                       "application/json")
+                if isinstance(b.get("ops"), list):
+                    # targeted operations (the v1.3.17 audit's P1.5/P2.15): applied server-side
+                    # against the CURRENT blob, so concurrent editors compose — and the exact
+                    # grammar the kernel-down spool replays
+                    rev = _apply_views_ops(b["ops"])
+                    _mark_views_dirty()
+                    return self._send(200, json.dumps({"ok": True, "rev": rev}), "application/json")
                 if not isinstance(b.get("views"), dict):
-                    return self._send(400, json.dumps({"ok": False, "error": "views (object) required"}),
+                    return self._send(400, json.dumps({"ok": False, "error":
+                        "views (object) required — or ops (list) for targeted edits"}),
                                       "application/json")
-                _set_timeline_views(b["views"])
+                _bv = dict(b["views"])
+                _bbr = _bv.pop("baseRev", _bv.pop("rev", None))
+                ok, rev = _set_timeline_views(_bv, base_rev=_bbr)
                 _mark_views_dirty()
-                return self._send(200, json.dumps({"ok": True}), "application/json")
+                if not ok:
+                    return self._send(409, json.dumps({"ok": False, "error":
+                        "stale baseRev — re-read and re-apply", "rev": rev}), "application/json")
+                return self._send(200, json.dumps({"ok": True, "rev": rev}), "application/json")
             if u.path == "/order":
                 # The Obsidian timeline's lane-drag writer — the WS reorderTabs op as a POST: the
                 # locked MERGE that keeps untouched lanes' slots (the raw whole-file overwrite
@@ -31201,8 +31355,12 @@ class Handler(BaseHTTPRequestHandler):
                 host = str((body or {}).get("host") or "").strip() if isinstance(body, dict) else ""
                 if not host:
                     return self._send(400, json.dumps({"ok": False, "error": "host required"}), "application/json")
+                _con = body.get("on") if isinstance(body, dict) else None
+                if _con is not True and _con is not False:
+                    return self._send(400, json.dumps({"ok": False, "error":
+                        "on must be a JSON boolean (true/false)"}), "application/json")
                 try:
-                    pub = checkin_set(host, bool((body or {}).get("on")))
+                    pub = checkin_set(host, _con)
                 except PermissionError as e:
                     return self._send(403, json.dumps({"ok": False, "error": str(e)}), "application/json")
                 if pub is None:
@@ -31234,7 +31392,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, json.dumps(fw), "application/json")
                 if not isinstance(body, dict) or "on" not in body:
                     return self._send(400, json.dumps({"ok": False, "error": "on required"}), "application/json")
-                _set_auto_update_remotes(bool(body.get("on")))
+                if body.get("on") is not True and body.get("on") is not False:
+                    return self._send(400, json.dumps({"ok": False, "error":
+                        "on must be a JSON boolean (true/false)"}), "application/json")
+                _set_auto_update_remotes(body.get("on") is True)
                 _tunnel_wake.set()   # apply on the NEXT pass, not up to 3s later — turning it on acts at once
                 return self._send(200, json.dumps({"ok": True, "on": _auto_update_remotes_on()}), "application/json")
             if u.path == "/tunnels/forget":
@@ -31508,9 +31669,14 @@ class Handler(BaseHTTPRequestHandler):
                 _set_session_flag(str(msg["id"]), str(msg["flag"]), bool(msg.get("value")))
             _mark_views_dirty()
         elif msg and msg.get("type") == "setTimelineViews" and isinstance(msg.get("views"), dict):
-            # timeline corner panel → replace the whole views blob (tiny; last-write-wins across
-            # dashboards, like colormap). Validation/normalization happens in the setter.
-            _set_timeline_views(msg["views"])
+            # timeline corner panel → replace the whole views blob. Every client edits a CLONE of
+            # the pushed payload, which carries the store's rev — so the echoed rev (or an explicit
+            # baseRev) is the compare-and-set base, and a stale write is refused instead of erasing
+            # a concurrent editor's tag (the v1.3.17 audit's P2.15). Refused or taken, the dirty
+            # mark repaints every dashboard with the store's truth.
+            _wv = dict(msg["views"])
+            _wbr = _wv.pop("baseRev", _wv.pop("rev", None))
+            _set_timeline_views(_wv, base_rev=_wbr)
             _mark_views_dirty()
         elif msg and msg.get("type") == "editTag" and isinstance(msg.get("edit"), dict):
             # tag federation v1 (the user 2026-08-24): a REMOTE tag edited in the dialog/menu routes
@@ -31719,11 +31885,15 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 # the session dir is fixed at creation — validate now. mkdir: the user already saw the
                 # "that folder doesn't exist" dialog and chose to make it (see createDirMissing below).
-                cwd, derr = _resolve_create_dir(msg.get("dir"), create=bool(msg.get("mkdir")))
+                _mk = msg.get("mkdir")
+                _mk_bad = _mk is not None and _mk is not True and _mk is not False
+                cwd, derr = ((None, "mkdir must be a JSON boolean (true/false), not a string.")
+                             if _mk_bad else
+                             _resolve_create_dir(msg.get("dir"), create=_mk is True))
                 live = _live_names(_tmux_sessions())
                 if derr:
                     st = _dir_status(msg.get("dir"))
-                    if st["canCreate"] and not msg.get("mkdir"):
+                    if not _mk_bad and st["canCreate"] and _mk is not True:
                         # A missing directory is a QUESTION, not a failure: the client raises "create it or
                         # edit it" and comes back with mkdir set. Before this the create just warned and the
                         # "Opening…" cue span for 30s over a session that was never going to exist (the user

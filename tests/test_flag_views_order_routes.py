@@ -49,7 +49,7 @@ class StateWriteRoutes(unittest.TestCase):
         km._mark_views_dirty = lambda: None
         km._set_session_flag = lambda sid, flag, value: self.flags.append((sid, flag, value))
         km._set_notify_session = lambda sid, value: self.flags.append((sid, "notify", value))
-        km._set_timeline_views = lambda v: self.views.append(v)
+        km._set_timeline_views = lambda v, base_rev=None: (self.views.append(v), (True, 1))[1]
         km._merge_and_write_session_order = lambda o: self.orders.append(o)
 
     def tearDown(self):
@@ -111,3 +111,204 @@ class StateWriteRoutes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ViewsRevisionAndOps(unittest.TestCase):
+    """the v1.3.17 audit's P2.15 (whole-blob last-writer-wins even through the lock) and the
+    P1.5 replay grammar: rev-gated blobs and server-applied targeted ops, against the REAL
+    setter and state file."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), km.Handler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def setUp(self):
+        self._dirty = km._mark_views_dirty
+        km._mark_views_dirty = lambda: None
+        try:
+            km._views_path().unlink()
+        except OSError:
+            pass
+        km._flags_cache.clear()
+
+    def tearDown(self):
+        km._mark_views_dirty = self._dirty
+
+    def _post(self, path, body):
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d%s" % (self.port, path), data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json",
+                     "X-Romp-Token": os.environ["ROMP_SERVE_TOKEN"]})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read().decode())
+            except Exception:
+                return e.code, {}
+
+    def test_a_stale_whole_blob_write_is_refused_not_merged_over(self):
+        # writer A commits a tag at rev 0; writer B, still holding the rev-0 world, posts a
+        # blob WITHOUT A's tag — the audit's exact lost-update schedule. B must be refused.
+        a = {"active": "all", "tags": [{"id": "ta", "name": "alpha", "color": "",
+                                        "members": [SID]}], "baseRev": 0}
+        st, r = self._post("/views", {"views": a})
+        self.assertEqual((st, r.get("ok")), (200, True))
+        b = {"active": "all", "tags": [], "baseRev": 0}   # stale: never saw A's write
+        st, r = self._post("/views", {"views": b})
+        self.assertEqual(st, 409, "a stale baseRev is refused, never last-writer-wins")
+        v = km._timeline_views()
+        self.assertEqual([t_["name"] for t_ in v["tags"]], ["alpha"],
+                         "writer A's tag survives the stale writer")
+
+    def test_the_payload_clone_carries_the_rev_and_commits_against_it(self):
+        st, r = self._post("/views", {"views": {"active": "all", "tags": [], "baseRev": 0}})
+        self.assertEqual(st, 200)
+        cur = km._timeline_views()                     # rev rides every read
+        self.assertEqual(cur.get("rev"), 1)
+        clone = json.loads(json.dumps(cur))            # a client edits its payload clone
+        clone["tags"] = [{"id": "tb", "name": "beta", "color": "", "members": []}]
+        st, r = self._post("/views", {"views": clone})   # echoed rev = the CAS base
+        self.assertEqual((st, r.get("rev")), (200, 2))
+
+    def test_targeted_ops_compose_instead_of_overwriting(self):
+        self._post("/views", {"views": {"active": "all",
+                                        "tags": [{"id": "tc", "name": "gamma", "color": "",
+                                                  "members": []}]}})
+        st, r = self._post("/views", {"ops": [{"tag": "gamma", "add": [SID]}]})
+        self.assertEqual((st, r.get("ok")), (200, True))
+        st, r = self._post("/views", {"ops": [{"tag": "gamma", "rename": "delta",
+                                               "color": "#123456"}]})
+        self.assertEqual(st, 200)
+        v = km._timeline_views()
+        t_ = v["tags"][0]
+        self.assertEqual((t_["name"], t_["color"]), ("delta", "#123456"))
+        self.assertEqual(t_["members"], [{"host": "", "sid": SID}],
+                         "both editors' gestures landed — nothing overwrote")
+        st, r = self._post("/views", {"ops": [{"tag": "delta", "remove": [SID]},
+                                              {"tag": "delta", "delete": True}]})
+        self.assertEqual(st, 200)
+        self.assertEqual(km._timeline_views()["tags"], [])
+
+    def test_an_op_on_a_deleted_tag_drops_quietly(self):
+        st, r = self._post("/views", {"ops": [{"tag": "ghost", "add": [SID]}]})
+        self.assertEqual((st, r.get("ok")), (200, True),
+                         "a replayed gesture over a deleted tag has nothing to do")
+
+
+class BoolGates(unittest.TestCase):
+    """the v1.3.17 audit's P2.13: bool("false") is True — four route boundaries coerced instead
+    of rejecting."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), km.Handler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def _post(self, path, body):
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d%s" % (self.port, path), data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json",
+                     "X-Romp-Token": os.environ["ROMP_SERVE_TOKEN"]})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    def test_notify_all_rejects_a_string_false(self):
+        recorded = []
+        saved = km._set_notify_all
+        km._set_notify_all = lambda on: recorded.append(on)
+        try:
+            st, _ = self._post("/notify-all", {"on": "false"})
+            self.assertEqual(st, 400)
+            self.assertEqual(recorded, [], "the string never reached the setter")
+            st, _ = self._post("/notify-all", {"on": True})
+            self.assertEqual(st, 200)
+            self.assertEqual(recorded, [True])
+        finally:
+            km._set_notify_all = saved
+
+    def test_autoupdate_rejects_a_string_false(self):
+        st, body = self._post("/tunnels/autoupdate", {"on": "false"})
+        self.assertEqual(st, 400)
+        self.assertIn("boolean", body)
+
+    def test_checkin_rejects_a_string_false(self):
+        st, body = self._post("/tunnels/checkin", {"host": "TESTHOST", "on": "false"})
+        self.assertEqual(st, 400)
+        self.assertIn("boolean", body)
+
+    def test_new_session_rejects_a_string_mkdir(self):
+        st, body = self._post("/new", {"name": "wontexist", "dir": "/tmp", "mkdir": "true"})
+        self.assertEqual(st, 400)
+        self.assertIn("boolean", body)
+
+
+class FeedJsonIsAPureRead(unittest.TestCase):
+    """the v1.3.17 audit's P2.12: a cold GET /feed.json entered the stateful cold-build path —
+    advancing notification baselines, pushing badges, pruning notify-cards.json — despite its
+    read-only contract."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), km.Handler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def _get(self, path):
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d%s" % (self.port, path),
+            headers={"X-Romp-Token": os.environ["ROMP_SERVE_TOKEN"]})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read().decode())
+
+    def test_a_cold_get_builds_without_supervisor_transitions(self):
+        saved = (km.build_feed, km._cached_feed, km._tmux_sessions, list(km._built_feed))
+        km._built_feed[:] = [None, None, 0, 0]        # cold kernel
+        km._tmux_sessions = lambda: {}
+        km.build_feed = lambda now, tmux: {"items": [], "marker": "pure-build"}
+
+        def poisoned(*a, **kw):
+            raise AssertionError("GET /feed.json must never enter the stateful cold-build path")
+
+        km._cached_feed = poisoned
+        try:
+            st, body = self._get("/feed.json")
+            self.assertEqual(st, 200)
+            self.assertEqual(body.get("marker"), "pure-build")
+        finally:
+            km.build_feed, km._cached_feed, km._tmux_sessions = saved[0], saved[1], saved[2]
+            km._built_feed[:] = saved[3]
+
+    def test_a_warmed_build_serves_as_is(self):
+        saved = (km.build_feed, list(km._built_feed))
+        km._built_feed[:] = ["sig", {"items": [], "marker": "warmed"}, 1.0, 1.0]
+
+        def poisoned(*a, **kw):
+            raise AssertionError("a warmed kernel never rebuilds for a GET")
+
+        km.build_feed = poisoned
+        try:
+            st, body = self._get("/feed.json")
+            self.assertEqual((st, body.get("marker")), (200, "warmed"))
+        finally:
+            km.build_feed = saved[0]
+            km._built_feed[:] = saved[1]
