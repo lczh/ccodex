@@ -211,8 +211,28 @@ if cur8 not in lines:
         #                                parsed as one line and was moot-removed into serving)
     os.remove(latch)                   # intent-only mismatch: the move never landed — moot,
     sys.exit(0)                        # and the line's channel token dies with it
+import shutil as _sh
+def snap_install(commit):
+    # the SNAPSHOT installer (the v1.3.16 audit's P1.1; the r44 verification extended it to
+    # every leg): the COMMIT's complete tree executes — never live-tree bytes a racing writer
+    # could swap mid-install; ROMP_INSTALL_TARGET aims outputs at the real checkout
+    _snap = os.path.join(gdir, "romp-install-snap")
+    _sh.rmtree(_snap, ignore_errors=True)
+    os.makedirs(_snap)
+    _a = subprocess.run(["git", "-C", root, "archive", commit], capture_output=True)
+    if _a.returncode or not _a.stdout:
+        return False
+    if subprocess.run(["tar", "-x", "-C", _snap], input=_a.stdout).returncode \
+            or not os.path.exists(os.path.join(_snap, "install.sh")):
+        _sh.rmtree(_snap, ignore_errors=True)
+        return False
+    _env = dict(os.environ, ROMP_INSTALL_TARGET=root)
+    _rc = subprocess.run(["bash", os.path.join(_snap, "install.sh")], cwd=root, env=_env,
+                         pass_fds=(fd,)).returncode
+    _sh.rmtree(_snap, ignore_errors=True)
+    return _rc == 0
 sys.stderr.write("romp-serve: this checkout's last install never finished — running install.sh before the kernel starts\n")
-if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root, pass_fds=(fd,)).returncode:
+if not snap_install(cur8):
     sys.exit(70)                       # latch stays armed for the next retry
 cur_line = next(ln for ln in rawlines if ln.split()[0][:8] == cur8)
 if len(cur_line.split()) < 2 and cur_line == rawlines[0] and len(rawlines) > 1 \

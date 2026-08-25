@@ -368,6 +368,11 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
         #                                              no header, no prose (the recipient reads nothing)
     if from_host:
         ev["from_host"] = from_host                  # additive (consumer contract above)
+    if relay_mid and relay_via:
+        ev["relay_mid"] = relay_mid                  # additive: the SENDER-bus mid + the direct
+        ev["relay_via"] = relay_via                  # peer it arrived from — the join the
+        #                                              handoff-done receipt translates through
+        #                                              (the r44 verification's P1)
     _tl_append("messages.jsonl", ev)
     return name   # the message id (maildir filename); joins to the log + status-bar prefix
 
@@ -1371,19 +1376,43 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/handoff-done":
             # The recipient KERNEL reports a cross-host delegation's planted goal COMPLETE —
             # the per-message ending event the sender's tracking node completes on (the v1.3.16
-            # audit's P1.3: the per-peer reply heuristic completed every outstanding delegation
-            # to that peer). Idempotent: the kernel re-posts on every pass; RECEIPTS_DONE makes
-            # a confirmed receipt a no-op, the receiptbox makes an unconfirmed one at-least-once.
+            # audit's P1.3). The kernel posts the DELIVERY id it holds (the planted goal's
+            # origin.msgId); this bus owns the delivery row and translates it into the SENDER's
+            # relay mid — the id the sender's tracking node actually carries — and parks the
+            # receipt toward the direct peer the delegate arrived from (the r44 verification's
+            # P1: the raw ids live in two disjoint spaces and never matched; and relay_via, not
+            # the origin label, is the reachable park target under a hub). Idempotent: the
+            # kernel re-posts every pass; RECEIPTS_DONE (keyed by the delivery id) silences it.
             if not isinstance(data, dict):
                 return self._send({"error": "the body must be a JSON object"}, 400)
             mid = str(data.get("mid") or "")
-            host = str(data.get("host") or "")
-            if not (_safe_id(mid) and _safe_id(host)):
-                return self._send({"error": "mid and host (both path-safe ids) required"}, 400)
+            if not _safe_id(mid):
+                return self._send({"error": "mid (a path-safe id) required"}, 400)
             if mid in _receipts_done():
                 return self._send({"ok": True, "already": True})
-            receiptbox_put(host, mid)
-            return self._send({"ok": True, "queued": host})
+            row = None
+            try:
+                for line in (TLDIR / "messages.jsonl").read_text(errors="replace").splitlines():
+                    try:
+                        o = json.loads(line)
+                    except Exception:
+                        continue
+                    if o.get("ev") == "sent" and o.get("id") == mid:
+                        row = o
+                        break
+            except OSError:
+                row = None
+            if row is None:
+                _receipts_done_add(mid)              # unknowable forever — silence the re-posts
+                return self._send({"ok": True, "unknown": True})
+            relay_mid = str(row.get("relay_mid") or "")
+            relay_via = str(row.get("relay_via") or "")
+            if not (relay_mid and relay_via and _safe_id(relay_mid) and _safe_id(relay_via)):
+                _receipts_done_add(mid)              # a LOCAL delivery: the origin back-link owns
+                return self._send({"ok": True, "local": True})   # it — nothing to relay
+            origin = str(row.get("from_host") or "")
+            receiptbox_put(relay_via, relay_mid, origin=(origin if _safe_id(origin) else ""))
+            return self._send({"ok": True, "queued": relay_via})
         if u.path == "/send":
             to = data.get("to", "")
             frm, frm_id = data.get("from", "unknown"), data.get("from_id", "")
@@ -2391,17 +2420,23 @@ def _receipts_done_add(mid):
             d.pop(k, None)
     _atomic_json_put(RECEIPTS_DONE, d)
 
-def receiptbox_put(host, mid):
+def receiptbox_put(host, mid, origin=""):
     """Park one handoff-done receipt for `host` (receiptbox/<host>/<mid>.json). Same
     at-least-once + idempotent-apply contract as the readbox: it survives a bus restart and
     re-sends until the peer confirms; the recipient kernel re-POSTs /handoff-done on every
-    pass, and RECEIPTS_DONE is what makes the re-post a no-op after confirmation."""
-    if not (_safe_id(host) and _safe_id(mid)):
-        _log("receiptbox_put: refusing unsafe host/mid %r/%r" % (host, mid))
+    pass, and RECEIPTS_DONE is what makes the re-post a no-op after confirmation. `origin`
+    names the SENDER's host so an intermediate hub can forward the receipt one hop (the r44
+    verification: receipts for hub-forwarded delegations parked under a host that is not an
+    exchange peer, stranded forever)."""
+    if not (_safe_id(host) and _safe_id(mid)) or (origin and not _safe_id(origin)):
+        _log("receiptbox_put: refusing unsafe host/mid/origin %r/%r/%r" % (host, mid, origin))
         return
     d = RECEIPTBOX / host
     d.mkdir(parents=True, exist_ok=True)
-    _atomic_json_put(d / (mid + ".json"), {"mid": mid})
+    row = {"mid": mid}
+    if origin:
+        row["origin"] = origin
+    _atomic_json_put(d / (mid + ".json"), row)
     _peer_wake(host).set()
 
 def receiptbox_list(host, limit=None):
@@ -2415,7 +2450,10 @@ def receiptbox_list(host, limit=None):
             try:
                 row = json.loads(f.read_text())
                 if isinstance(row, dict) and _safe_id(row.get("mid") or ""):
-                    out.append({"mid": row["mid"]})
+                    keep = {"mid": row["mid"]}
+                    if _safe_id(str(row.get("origin") or "")):
+                        keep["origin"] = str(row["origin"])
+                    out.append(keep)
             except Exception as e:
                 _quarantine_corrupt_json(f, "receiptbox", e, None)
         return out
@@ -2438,7 +2476,10 @@ def _receipt_rows(value):
     out = []
     for row in value[:PEER_LIST_LIMITS["handoffDone"]]:
         if isinstance(row, dict) and _safe_id(str(row.get("mid") or "")):
-            out.append({"mid": str(row["mid"])})
+            keep = {"mid": str(row["mid"])}
+            if _safe_id(str(row.get("origin") or "")):
+                keep["origin"] = str(row["origin"])
+            out.append(keep)
     return out
 
 _HANDOFF_DONE_MEMO = {"key": None, "ids": set()}
@@ -2470,9 +2511,20 @@ def _handoff_done_ids():
     return _HANDOFF_DONE_MEMO["ids"]
 
 def _handoff_done_arrived(host, row):
-    """One peer-confirmed completion landed: record it durably (idempotent by mid)."""
+    """One peer-confirmed completion landed. If the ORIGIN is a direct peer other than where
+    this arrived from, this bus is an intermediate hub: forward the receipt one hop (the ack/
+    bounce backward-relay's shape — the r44 verification: hub-forwarded delegations' receipts
+    stranded at the hub). Otherwise record it durably (idempotent by mid) — recording is the
+    safe fallback: an alias mismatch on the sender's own bus still lands the join locally."""
     mid = str((row or {}).get("mid") or "")
-    if not _safe_id(mid) or mid in _handoff_done_ids():
+    if not _safe_id(mid):
+        return
+    origin = str((row or {}).get("origin") or "")
+    if (origin and _safe_id(origin) and origin != host and origin != self_host()
+            and (PEERS.get(origin) or {}).get("port")):
+        receiptbox_put(origin, mid, origin=origin)
+        return
+    if mid in _handoff_done_ids():
         return
     _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "handoff-done", "id": mid,
                                   "from_host": host})
@@ -3173,8 +3225,12 @@ def peer_exchange_apply(host, req_sent, resp):
                                 if not isinstance(a, dict) or a.get("mid") not in sent_hd_acks]
     for r in _peer_read_rows(req_sent.get("reads")):
         readbox_del(host, r)
-    for hd in _receipt_rows(req_sent.get("handoffDone")):
-        receiptbox_del(host, hd["mid"])              # a response = the whole request was processed
+    if isinstance(resp.get("handoffDone"), list):    # a lane-aware peer ALWAYS includes the key;
+        for hd in _receipt_rows(req_sent.get("handoffDone")):   # a v1.3.16 response ignored the
+            receiptbox_del(host, hd["mid"])          # field entirely, and confirming on its 200
+    #                                                  destroyed every parked receipt (the r44
+    #                                                  verification) — unconfirmed rows stay
+    #                                                  parked and retry against the upgraded peer
     PEER_STATE[host] = {"presence": _peer_presence_rows(resp.get("presence")),
                         "epoch": _peer_epoch(resp.get("epoch")),
                         "holds": _peer_hold_rows(resp.get("holds")), "seenAt": int(time.time())}
@@ -3229,9 +3285,14 @@ def peer_route(to):
         for a in st.get("presence") or []:
             # name OR stable id: the uuid is documented as a rename-proof address, but remote
             # presence only matched names — the same remote uuid 404'd while its name relayed
-            # (the v1.3.16 audit). host:uuid works exactly like host:name.
-            if (a.get("name") != to and (a.get("id") or "") != to) \
-                    or _via_duplicate(a, direct_bus):
+            # (the v1.3.16 audit). host:uuid works exactly like host:name, and the 8+ char id
+            # PREFIX every list_agents row prints addresses too (the local resolver's rule —
+            # the r44 verification: the row's short id could not act on the row it labeled).
+            aid = str(a.get("id") or "")
+            id_hit = aid == to or (
+                len(to) >= 8 and re.fullmatch(r"[0-9a-fA-F][0-9a-fA-F-]{7,35}", to) is not None
+                and aid.rsplit(":", 1)[-1].startswith(to))
+            if (a.get("name") != to and not id_hit) or _via_duplicate(a, direct_bus):
                 continue
             sid = a.get("id") or ""
             if sid and sid in seen_ids:                # one session, two gossip paths → one candidate;

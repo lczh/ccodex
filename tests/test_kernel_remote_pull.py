@@ -111,6 +111,12 @@ class PullRemote(unittest.TestCase):
         # and every later test in the process got the MagicMock (km.subprocess IS the shared
         # stdlib module)
         self.addCleanup(lambda real=km.subprocess.Popen: setattr(km.subprocess, "Popen", real))
+        # the snapshot staging is stubbed (r44): its archive/tar run against the REAL repo,
+        # which these fixtures do not have — the entry path just needs to contain install.sh
+        # so the spawn-shape pins keep reading
+        self._saved_stage = km._stage_pull_snapshot
+        km._stage_pull_snapshot = lambda commit: "/tmp/romp-test-snap/install.sh"
+        self.addCleanup(lambda: setattr(km, "_stage_pull_snapshot", self._saved_stage))
         km.subprocess.Popen = fake_popen
 
         def fake(argv, **kw):

@@ -414,10 +414,10 @@ class CrossHostDelegation(_Base):
         jd.save_goals(SID, store)
         posted = []
         with mock.patch.object(jd, "_post_handoff_receipt",
-                               side_effect=lambda mid, host: posted.append((mid, host))):
+                               side_effect=lambda mid: posted.append(mid)):
             jd.run_propagate(now=T0 + 100)
-        self.assertIn(("px-9.mail.TESTHOST-A", "TESTHOST-A"), posted,
-                      "the completion reports home with the delegate's own mid")
+        self.assertIn("px-9.mail.TESTHOST-A", posted,
+                      "the completion reports its DELIVERY id — the bus translates (r44)")
 
     def test_one_receipt_completes_exactly_its_own_delegation(self):
         # the v1.3.16 audit's P1.3 repro: two incomplete delegated tasks + one report produced

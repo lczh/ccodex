@@ -345,8 +345,16 @@ class ConvergeFunctional(unittest.TestCase):
 
         env = dict(km.os.environ, ROMP_MANAGER_TOKEN="tok-abc12", ROMP_MANAGER_PORT="1",
                    HTTP_PROXY="http://127.0.0.1:9")   # a proxy that must NEVER be consulted
+        def fake_snap(commit, lock_fd=None, timeout=600):
+            # the CONTRACT seam (r44): _converge_install now installs through the snapshot
+            # helper — record the same "install" step the old subprocess interception saw,
+            # honoring the `fail` list
+            calls.append(("install", ["bash", "install.sh", str(commit)]))
+            return ("install" not in fail), ("boom" if "install" in fail else "")
+
         with mock.patch.object(km, "_update_channel", return_value=channel or "dev"), \
              mock.patch.object(km.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(km, "_snap_install_local", side_effect=fake_snap), \
              mock.patch.object(km, "_kernel_code_changed", return_value=not ui_only), \
              mock.patch.object(km, "_kernel_sha", return_value="cur-sha"), \
              mock.patch.object(km, "_sync_notice",
@@ -501,8 +509,20 @@ class ConvergeFunctional(unittest.TestCase):
         # rc!=0 with empty stdout+stderr counted as SUCCESS in the first cut (the why-string was
         # the success test) — the user's audit, 2026-08-17
         import subprocess as sp
-        with mock.patch.object(km.subprocess, "run",
-                               return_value=sp.CompletedProcess([], 2, stdout="", stderr="")), \
+        real_run = km.subprocess.run
+
+        def fake(argv, **kw):
+            if argv and argv[0] == "bash":            # the snapshot's install.sh: rc!=0, silent
+                return sp.CompletedProcess(argv, 2, stdout="", stderr="")
+            return real_run(argv, **kw)               # archive/tar run for real against HEAD
+
+        with mock.patch.object(km.subprocess, "run", side_effect=fake):
+            ok, why = km._snap_install_local("HEAD")
+        self.assertFalse(ok)
+        self.assertEqual(why, "exit 2 with no output",
+                         "rc!=0 with empty output is a FAILURE with an honest why (2026-08-17)")
+        with mock.patch.object(km, "_snap_install_local",
+                               return_value=(False, "exit 2 with no output")), \
              mock.patch.object(km, "_sync_notice",
                                side_effect=lambda m, ok=True: self.notices.append(m)):
             self.assertFalse(km._converge_install("f" * 8))
@@ -664,6 +684,10 @@ class ConvergeFunctional(unittest.TestCase):
             out = self.FULL + "\n" if step == "rev-parse" else ""
             return sp.CompletedProcess(argv, 0, stdout=out, stderr="")
 
+        def fake_snap(commit, lock_fd=None, timeout=600):
+            calls.append("install")                   # the snapshot seam (r44)
+            return True, ""
+
         class Conn:
             def __init__(self, *a, **k): pass
             def request(self, *a, **k): pass
@@ -673,6 +697,7 @@ class ConvergeFunctional(unittest.TestCase):
 
         with mock.patch.object(km, "_update_channel", return_value="dev"), \
              mock.patch.object(km.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(km, "_snap_install_local", side_effect=fake_snap), \
              mock.patch.object(km, "_sync_notice", side_effect=lambda m, ok=True: None), \
              mock.patch.object(km.http.client, "HTTPConnection", Conn):
             km._run_main_update("pull", target=self.FULL)
@@ -968,16 +993,12 @@ class IntentPublish(unittest.TestCase):
                 km._set_install_failed("")
 
     def _heal(self, gd, cur="abcd1234", install_rc=0):
-        import subprocess as sp
-        real = km.subprocess.run
-
-        def fake(argv, **kw):
-            if any("install.sh" in str(a) for a in argv):
-                return sp.CompletedProcess(argv, install_rc, stdout="", stderr="")
-            return real(argv, **kw)
+        def fake_snap(commit, lock_fd=None, timeout=600):
+            # the contract seam (r44): the heal installs through the snapshot helper now
+            return (install_rc == 0), ("" if install_rc == 0 else "boom")
         with mock.patch.object(km, "_update_git_dir", return_value=gd):
             with mock.patch.object(km, "_checkout_sha", return_value=cur):
-                with mock.patch.object(km.subprocess, "run", side_effect=fake):
+                with mock.patch.object(km, "_snap_install_local", side_effect=fake_snap):
                     with mock.patch.object(km, "_converge_note"):
                         km._boot_heal()
 

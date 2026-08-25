@@ -685,6 +685,91 @@ class UpdateRemote(unittest.TestCase):
             self.assertEqual((gd / "romp-install-failed").read_text().strip(), "deadbee2",
                              "the latch stays armed on ANY uncertainty (the audit's requirement)")
 
+    def test_the_launch_probes_unlocked_and_synced_requires_a_healthy_kernel(self):
+        # the r44 verification's P1: the locked probe deadlocked against the new kernel's own
+        # boot gate (it polls the SAME update flock before /version ever binds) — every real
+        # sync reported RESTARTFAIL. The fixture kernel WAITS ON THE FLOCK exactly like the
+        # real gate, so SYNCED here is only reachable if the wrapper releases before probing.
+        # And the negative leg: with no kernel ever answering, SYNCED must NOT appear — the
+        # healthy() verdict has executed coverage (the r44 mutant lens: killing the probe
+        # survived 262 textual tests).
+        import socket
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+        km._remotes = {"TESTHOST": {"host": "TESTHOST", "kernel_port": port}}
+        calls = self._wire(apply_out="SYNCED:1111111")
+        km._update_remote("TESTHOST")
+        km._remotes = {}
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        with tempfile.TemporaryDirectory() as td:
+            fix = pathlib.Path(td) / "romp"
+            gd = fix / ".git"
+            (fix / "bin").mkdir(parents=True)
+            gd.mkdir(parents=True)
+            (gd / "romp-update-channel").write_text("dev\n")
+            fakebin = pathlib.Path(td) / "bin"
+            fakebin.mkdir()
+            commitdir = pathlib.Path(td) / "committed-tree"
+            commitdir.mkdir()
+            (commitdir / "install.sh").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "git").write_text(
+                "#!/bin/sh\ncase \" $* \" in\n"
+                "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
+                "  *' merge-base '*) exit 0;;\n"
+                "  *' archive '*) tar -c -C '%s' install.sh;;\n"
+                "  *' rev-parse --short=8 '*) echo 11111111;;\n"
+                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "esac\nexit 0\n" % (gd, commitdir))
+            (fakebin / "git").chmod(0o755)
+            # NEVER the real pkill: this executed leg reaches the kill line
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
+            (fix / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "bin" / "romp-serve").chmod(0o755)
+            # the fixture kernel: a gate-faithful /version server — it BLOCKS on the update
+            # flock first, exactly like bin/romp-serve's pre-exec gate, then binds
+            serve_py = pathlib.Path(td) / "serve.py"
+            serve_py.write_text(
+                "import fcntl,json,http.server,sys\n"
+                "lockp,port,sha=sys.argv[1],int(sys.argv[2]),sys.argv[3]\n"
+                "f=open(lockp,'a+')\n"
+                "fcntl.flock(f,fcntl.LOCK_EX)\n"
+                "fcntl.flock(f,fcntl.LOCK_UN)\n"
+                "class H(http.server.BaseHTTPRequestHandler):\n"
+                "    def do_GET(self):\n"
+                "        b=json.dumps({'kernel_sha':sha,'boot':'boot-2'}).encode()\n"
+                "        self.send_response(200)\n"
+                "        self.send_header('Content-Length',str(len(b)))\n"
+                "        self.end_headers()\n"
+                "        self.wfile.write(b)\n"
+                "    def log_message(self,*a):\n"
+                "        pass\n"
+                "http.server.HTTPServer(('127.0.0.1',port),H).serve_forever()\n")
+            (fix / "bin" / "romp-manager").write_text(
+                "#!/bin/sh\n[ \"$1\" = ensure ] || exit 0\n"
+                "(setsid python3 '%s' '%s' %d 11111111 >/dev/null 2>&1 &)\nexit 0\n"
+                % (serve_py, gd / "romp-update.lock", port))
+            (fix / "bin" / "romp-manager").chmod(0o755)
+            env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")),
+                       ROMP_LAUNCH_TRIES="8")
+            apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
+            try:
+                a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True,
+                              timeout=90)
+                self.assertIn("SYNCED:", a.stdout,
+                              "a gate-faithful kernel comes up ONLY if the wrapper released the "
+                              "flock before probing — RESTARTFAIL here is the r44 deadlock")
+                # negative leg: a manager that starts nothing → no healthy verdict → no SYNCED
+                (fix / "bin" / "romp-manager").write_text("#!/bin/sh\nexit 0\n")
+                env["ROMP_LAUNCH_TRIES"] = "1"
+                a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True,
+                              timeout=90)
+                self.assertIn("RESTARTFAIL", a.stdout)
+                self.assertNotIn("SYNCED", a.stdout,
+                                 "SYNCED without a healthy() verdict is the exact dishonesty "
+                                 "the probe exists to prevent")
+            finally:
+                subprocess.run(["pkill", "-f", str(serve_py)], capture_output=True)
+
     def test_a_swapped_child_script_never_executes(self):
         # the v1.3.16 audit's P1.1 repro (pinned_parent=yes observed=CHILD_V2): install.sh's
         # bytes were pinned, but it executed its shell CHILDREN from the live tree — a racing
@@ -1327,9 +1412,17 @@ class UpdateRemote(unittest.TestCase):
                         "ends before the spawn (the v1.3.16 audit's P1.2)")
         self.assertIn("if not ks or len(ks)<7 or not bid:", apply,
                       "a /version with no boot id must fail healthy() (r43; python-side r44)")
-        self.assertEqual(apply.count("for i in range(12):"), 2,
+        self.assertEqual(apply.count("for i in range(tries):"), 2,
                          "both restart waits fit a real (~17s) manager boot — 8s read a landed "
-                         "install as RESTARTFAIL (r43)")
+                         "install as RESTARTFAIL (r43); default 12, env-tunable for tests")
+        self.assertIn('int(os.environ.get("ROMP_LAUNCH_TRIES") or 12)', apply)
+        self.assertIn("fcntl.flock(fd,fcntl.LOCK_UN)", apply)
+        self.assertLess(apply.index('[mgr,"ensure"]'), apply.index("fcntl.flock(fd,fcntl.LOCK_UN)"),
+                        "the kill + spawn request run INSIDE the lock…")
+        self.assertLess(apply.index("fcntl.flock(fd,fcntl.LOCK_UN)"), apply.index("for i in range(tries):"),
+                        "…and the probe runs UNLOCKED: the new kernel's boot gate polls this "
+                        "same flock, so a locked probe deadlocked into RESTARTFAIL (the r44 "
+                        "verification's P1)")
         self.assertIn('subprocess.Popen([os.path.join(r,"bin","romp-serve")]', apply,
                       "bare romp-serve only as a last resort — spawned detached, no lock fd")
         self.assertIn("start_new_session=True", apply)

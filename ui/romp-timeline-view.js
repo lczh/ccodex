@@ -1777,7 +1777,7 @@ class TimelinePanel {
       // bug the order-audit log finally pinned (the user 2026-07-02). Electron-or-nothing, no heuristic.
       if (typeof process === 'undefined' || !process.versions || !process.versions.electron) return;
       this._kernelPost('/order', { order: order }).then((ok) => {
-        if (ok) return;                              // the kernel's locked MERGE kept untouched slots
+        if (ok !== false) return;                    // merged, or refused (kernel up — see /flag)
         const fs = require('fs'), path = require('path'), os = require('os');
         const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
         const root = process.env.ROMP_STATE_DIR || path.join(base, 'romp');   // per-kernel state root (plans/multi-kernel.md)
@@ -2603,7 +2603,7 @@ class TimelinePanel {
         // normalizing setter (the v1.3.16 audit's P2.17); the direct file write is the
         // kernel-down last resort only.
         this._kernelPost('/views', { views: v }).then((ok) => {
-          if (ok) return;
+          if (ok !== false) return;                  // normalized, or refused (kernel up)
           const fs = require('fs'), os = require('os'), path = require('path');
           const root = process.env.ROMP_STATE_DIR
             || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'romp');
@@ -3139,12 +3139,18 @@ class TimelinePanel {
       try { tok = fs.readFileSync(path.join(root, 'serve-token'), 'utf8').trim(); } catch (e) { /* no token file */ }
       const port = parseInt(process.env.ROMP_KERNEL_PORT || '29855', 10);
       if (typeof fetch !== 'function') return Promise.resolve(false);
-      return fetch('http://127.0.0.1:' + port + route, {
+      // the token rides the URL: the CORS preflight authorizes from the query (do_OPTIONS),
+      // and a header-only token 403'd the OPTIONS — the kernel-first writers silently never
+      // engaged and the audited raw-write races stayed open (the r44 verification)
+      return fetch('http://127.0.0.1:' + port + route + '?token=' + encodeURIComponent(tok), {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Romp-Token': tok },
         body: JSON.stringify(body),
       }).then((r) => {
-        if (!r.ok) return false;
-        return r.json().then((j) => j && j.ok !== false).catch(() => true);
+        // a 4xx/refusal means the kernel is UP and said no — falling back to the raw file
+        // write would race the very writers the refusal protects (the r44 verification);
+        // only a NETWORK failure (the catch below) reads as kernel-down
+        if (!r.ok) return 'refused';
+        return r.json().then((j) => (j && j.ok === false) ? 'refused' : true).catch(() => true);
       }).catch(() => false);
     } catch (e) { return Promise.resolve(false); }
   }
@@ -3161,7 +3167,8 @@ class TimelinePanel {
       // a window shim must never touch the user's real flags, just as for order and views above.
       if (typeof process === 'undefined' || !process.versions || !process.versions.electron) return;
       this._kernelPost('/flag', { target: s.id, flag: flag, value: !!value }).then((ok) => {
-        if (ok) return;                              // the kernel's locked writer took it
+        if (ok !== false) return;                    // took it, or REFUSED it (kernel up: never
+        //                                              race its writers with a raw file write)
         // kernel unreachable → the last-resort direct write (its racing writers are down too)
         const fs = require('fs'), os = require('os'), path = require('path');
         const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');

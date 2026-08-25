@@ -2529,10 +2529,23 @@ def _run_update(tag):
         return False
     latch = q(str(latch_path))
     marker = q(str(latch_path.parent / "romp-update-channel"))
+    snapdir = q(str(latch_path.parent / "romp-install-snap"))
     script = (
         "cd %s || exit 1\n" % q(str(ROOT))
         + "{ echo; echo \"== romp self-update to %s ==\"; date; } >> %s 2>&1\n" % (tag, log)
         + "OK=0\n"
+        # the SNAPSHOT installer (the v1.3.16 audit's P1.1, extended to this leg by the r44
+        # verification): the COMMIT's complete tree executes, never live-tree bytes a racing
+        # writer could swap mid-install; ROMP_INSTALL_TARGET aims outputs at the real checkout
+        + "snap_install() {\n"
+        + "  rm -rf %s && mkdir -p %s || return 1\n" % (snapdir, snapdir)
+        + "  git archive \"$1\" | tar -x -C %s || { rm -rf %s; return 1; }\n" % (snapdir, snapdir)
+        + "  [ -e %s/install.sh ] || { rm -rf %s; return 1; }\n" % (snapdir, snapdir)
+        + "  ROMP_INSTALL_TARGET=\"$(pwd)\" bash %s/install.sh\n" % snapdir
+        + "  SIRC=$?\n"
+        + "  rm -rf %s\n" % snapdir
+        + "  return $SIRC\n"
+        + "}\n"
         # a healed or completed move publishes any staged CHANNEL INTENT for its commit before
         # the latch is spent (the v1.3.8 audit: a healer reviving a crashed bootstrap's stable
         # target under the stale dev marker followed unsigned main); pub_intent returns nonzero
@@ -2581,7 +2594,7 @@ def _run_update(tag):
         + "elif [ \"$SETTLED\" = 1 ] && [ -s %s ] && [ -n \"$CUR\" ]; then\n" % latch
         + "  if grep -q \"^$CUR\" %s 2>/dev/null; then\n" % latch
         + "    CURLINE=$(grep \"^$CUR\" %s | head -1)\n" % latch
-        + "    if ./install.sh >> %s 2>&1 && pub_line \"$(pick_pub \"$CURLINE\" %s)\"; then rm -f %s; "
+        + "    if snap_install \"$CUR\" >> %s 2>&1 && pub_line \"$(pick_pub \"$CURLINE\" %s)\"; then rm -f %s; "
           "else\n" % (log, latch, latch)
         + "      CARRY=\"$CURLINE\"\n"
         # a plain surviving line MERGES the other line's pending token — a lossy carry destroyed
@@ -2619,7 +2632,7 @@ def _run_update(tag):
         + "    if [ \"$(sed -n 1p %s 2>/dev/null | awk '{print $1}' | head -c 8)\" = \"$NEW8\" ] "
           "&& git merge --ff-only %s >> %s 2>&1 "
           "&& [ \"$(git rev-parse --short=8 HEAD | head -c 8)\" = \"$NEW8\" ] "
-          "&& ./install.sh >> %s 2>&1; then\n"
+          "&& snap_install \"$NEW8\" >> %s 2>&1; then\n"
           % (latch, tag, log, log)
         + "      if pub_line \"$(pick_pub \"$(sed -n 1p %s 2>/dev/null)\" %s)\"; then rm -f %s; OK=1; fi\n"
           % (latch, latch, latch)
@@ -3540,6 +3553,43 @@ def _settle_prior_latch(lock_fd):
     return "", ""
 
 
+def _snap_install_local(commit, lock_fd=None, timeout=600):
+    """Materialize `commit`'s COMPLETE tracked tree under the git dir and run ITS install.sh
+    with ROMP_INSTALL_TARGET pointing at the real checkout — so no shell child executes live-
+    tree bytes a racing writer could swap mid-install (the v1.3.16 audit's P1.1; the r44
+    verification: the p2p leg alone had this, and the repro passed on every other leg).
+    Returns (ok, why); the snapshot is removed either way."""
+    import shutil as _sh
+    gd = _update_git_dir()
+    if not gd:
+        return False, "cannot resolve the git dir for the install snapshot"
+    snap = os.path.join(gd, "romp-install-snap")
+    try:
+        _sh.rmtree(snap, ignore_errors=True)
+        os.makedirs(snap)
+        ar = subprocess.run(["git", "-C", str(ROOT), "archive", str(commit)],
+                            capture_output=True, timeout=120)
+        if ar.returncode or not ar.stdout:
+            return False, "git archive %s failed" % str(commit)[:12]
+        tr = subprocess.run(["tar", "-x", "-C", snap], input=ar.stdout, timeout=120)
+        if tr.returncode or not os.path.exists(os.path.join(snap, "install.sh")):
+            return False, "unpacking the install snapshot failed"
+        env = dict(os.environ, ROMP_INSTALL_TARGET=str(ROOT))
+        inst = subprocess.run(["bash", os.path.join(snap, "install.sh")], cwd=str(ROOT),
+                              env=env, capture_output=True, text=True, timeout=timeout,
+                              pass_fds=(lock_fd,) if lock_fd is not None else ())
+        ok = inst.returncode == 0
+        why = "" if ok else ((inst.stderr or inst.stdout or "").strip()[-200:]
+                             or "exit %d with no output" % inst.returncode)
+        return ok, why
+    except subprocess.TimeoutExpired:
+        return False, "timed out after %ds" % timeout
+    except Exception as e:
+        return False, str(e)[:200]
+    finally:
+        _sh.rmtree(snap, ignore_errors=True)
+
+
 def _converge_install(sha8, lock_fd=None):
     """Run install.sh for a converge; True means EXIT 0 — nothing else does (an rc!=0 with empty
     output counted as success in the first cut; the user's audit, 2026-08-17). A failure or timeout
@@ -3554,12 +3604,7 @@ def _converge_install(sha8, lock_fd=None):
     boot heal acquired the freed lock and ran a SECOND install.sh over the orphan, the exact
     interleaving the lock exists to prevent (the adversarial review, 2026-08-17)."""
     try:
-        inst = subprocess.run(["bash", str(ROOT / "install.sh")], cwd=str(ROOT),
-                              capture_output=True, text=True, timeout=600,
-                              pass_fds=(lock_fd,) if lock_fd is not None else ())
-        ok = inst.returncode == 0
-        why = "" if ok else ((inst.stderr or inst.stdout or "").strip()[-200:]
-                             or "exit %d with no output" % inst.returncode)
+        ok, why = _snap_install_local(sha8, lock_fd=lock_fd)   # the snapshot leg (v1.3.16 P1.1)
     except subprocess.TimeoutExpired:
         ok, why = False, "timed out after 600s"
     except Exception as e:
@@ -12858,15 +12903,18 @@ def _update_remote(host):
         "if not pub_line(pick_pub(body.splitlines()[0],body.splitlines())):\n"
         "    sys.exit(30)\n"
         "os.remove(lp)\n"
-        # the LAUNCH runs INSIDE the lock (the v1.3.16 audit's P1.2: the transaction ended
-        # before the spawn, so a writer could swap bin/romp-serve between the verify and the
-        # launch). Manager-first exactly as before (the user 2026-07-04), bare romp-serve as
-        # the last resort, the /version probe (kernel_sha prefix of the installed target + a
-        # boot id different from the pre-kill one) as the only healthy verdict (2026-08-24).
-        # Spawned children do NOT inherit the lock fd (close_fds default; only the pinned
-        # installs pass it), so nothing outlives the transaction holding the flock. The pkill
-        # self-match guard (romp-kern[e]l, the user 2026-07-22) keeps this wrapper from
-        # matching itself.
+        # the KILL and the SPAWN REQUEST run INSIDE the lock (the v1.3.16 audit's P1.2: the
+        # transaction used to end before the spawn, so a writer could swap bin/romp-serve
+        # between the verify and the launch) — then the lock is EXPLICITLY RELEASED before the
+        # health probe: the new kernel's own boot gate polls this very flock (bin/romp-serve's
+        # pre-exec gate + _boot_heal take it before /version ever binds), so a probe held under
+        # the lock can never see healthy — every real sync deadlocked into RESTARTFAIL and the
+        # freed lock then let two kernels race the port (the r44 verification's P1). Manager-
+        # first exactly as before (the user 2026-07-04), bare romp-serve as the unlocked last
+        # resort, the /version probe (kernel_sha prefix of the installed target + a boot id
+        # different from the pre-kill one) as the only healthy verdict. Spawned children never
+        # inherit the lock fd; the pkill self-match guard (romp-kern[e]l, the user 2026-07-22)
+        # keeps this wrapper from matching itself.
         'if not os.access(os.path.join(r,"bin","romp-serve"),os.X_OK):\n'
         "    sys.exit(33)\n"
         "import urllib.request\n"
@@ -12886,11 +12934,14 @@ def _update_remote(host):
         "    return not old_boot or bid!=old_boot\n"
         'subprocess.run(["pkill","-f","bin/romp-kern[e]l"])\n'
         'mgr=os.path.join(r,"bin","romp-manager")\n'
-        "up=False\n"
         'lf=open(os.path.join(logdir,"update.log"),"a")\n'
         'if shutil.which("node") and os.access(mgr,os.X_OK):\n'
         '    subprocess.run([mgr,"ensure"],stdout=lf,stderr=lf)\n'
-        "for i in range(12):\n"
+        "fcntl.flock(fd,fcntl.LOCK_UN)\n"
+        "os.close(fd)\n"
+        "up=False\n"
+        'tries=int(os.environ.get("ROMP_LAUNCH_TRIES") or 12)\n'
+        "for i in range(tries):\n"
         "    time.sleep(1)\n"
         "    if healthy():\n"
         "        up=True\n"
@@ -12899,7 +12950,7 @@ def _update_remote(host):
         '    kl=open(os.path.join(logdir,"kernel.log"),"a")\n'
         '    subprocess.Popen([os.path.join(r,"bin","romp-serve")],stdout=kl,stderr=kl,\n'
         "                     stdin=subprocess.DEVNULL,start_new_session=True)\n"
-        "    for i in range(12):\n"
+        "    for i in range(tries):\n"
         "        time.sleep(1)\n"
         "        if healthy():\n"
         "            up=True\n"
@@ -13088,6 +13139,29 @@ def _local_branch():
         r = subprocess.run(["git", "-C", str(ROOT), "symbolic-ref", "--quiet", "--short", "HEAD"],
                            capture_output=True, text=True, timeout=3)
         return (r.stdout or "").strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _stage_pull_snapshot(commit):
+    """Materialize `commit`'s complete tree under the git dir for the pull leg's install (the
+    v1.3.16 audit's P1.1); returns the snapshot's install.sh path, '' on any failure."""
+    import shutil as _sh
+    gd = _update_git_dir()
+    if not gd:
+        return ""
+    snap = os.path.join(gd, "romp-install-snap")
+    try:
+        _sh.rmtree(snap, ignore_errors=True)
+        os.makedirs(snap)
+        ar = subprocess.run(["git", "-C", str(ROOT), "archive", str(commit)],
+                            capture_output=True, timeout=120)
+        if ar.returncode or not ar.stdout:
+            return ""
+        tr = subprocess.run(["tar", "-x", "-C", snap], input=ar.stdout, timeout=120)
+        if tr.returncode or not os.path.exists(os.path.join(snap, "install.sh")):
+            return ""
+        return os.path.join(snap, "install.sh")
     except Exception:
         return ""
 
@@ -13308,15 +13382,24 @@ def _pull_remote(host, expected_sha=None):
             # v1.3.9 audit). Downgrades are WRITTEN under this lock, so one hold linearizes the
             # decision with the launch; the lock is released the moment the child exists — never
             # held across the install's runtime.
+            # the SNAPSHOT (the v1.3.16 audit's P1.1, extended to this leg by the r44
+            # verification): archive the merged commit's complete tree OUTSIDE the lock hold
+            # (slow), spawn ITS install.sh inside it (the spawn-in-the-hold discipline stands)
+            _pull_snap_entry = _stage_pull_snapshot(fetched_sha)
+            if not _pull_snap_entry:
+                return False, ("pulled and merged, but staging the install snapshot failed — "
+                               "the install latch stays armed; the boot heal settles it")
             proc, spawn_err = None, ""
             with _remotes_lock:
                 _cur4 = _remotes.get(host)
                 if bool(_cur4 and not _cur4.get("checkin_peer")
                         and _cur4.get("trust") == "trusted"):
                     try:
-                        proc = subprocess.Popen(["bash", str(ROOT / "install.sh")],
+                        proc = subprocess.Popen(["bash", _pull_snap_entry],
                                                 cwd=str(ROOT), stdout=subprocess.PIPE,
                                                 stderr=subprocess.STDOUT, text=True,
+                                                env=dict(os.environ,
+                                                         ROMP_INSTALL_TARGET=str(ROOT)),
                                                 pass_fds=(lock_fd,) if lock_fd is not None else ())
                     except Exception as e:
                         spawn_err = str(e)[:200] or "spawn failed"

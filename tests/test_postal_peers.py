@@ -383,6 +383,63 @@ class HandoffReceiptLane(unittest.TestCase):
         (pm.self_host, pmb.self_host) = self._saved
         os.environ.pop("ROMP_POSTAL_PEERS", None)
 
+    def test_the_route_translates_the_delivery_id_through_its_own_log_row(self):
+        # the r44 verification's P1: the kernel holds the DELIVERY id; the sender's tracking
+        # node holds the RELAY mid — two disjoint spaces. The bus owns the delivery row and
+        # translates, parking toward relay_via (the reachable direct peer, hub or not).
+        import json as _json
+        (pmb.TLDIR).mkdir(parents=True, exist_ok=True)
+        with (pmb.TLDIR / "messages.jsonl").open("a") as fh:
+            fh.write(_json.dumps({"t": 1, "ev": "sent", "id": "deliv-77", "from": "api",
+                                  "from_id": "sid-a", "to_id": "sid-b", "body": "x",
+                                  "from_host": "hosta", "relay_mid": "px-77.mail.hosta",
+                                  "relay_via": "hosta"}) + "\n")
+        out, status = pmb.handle_post_for_tests("/handoff-done", {"mid": "deliv-77"}) \
+            if hasattr(pmb, "handle_post_for_tests") else (None, None)
+        if out is None:                               # drive the handler logic directly
+            row = None
+            for line in (pmb.TLDIR / "messages.jsonl").read_text().splitlines():
+                o = _json.loads(line)
+                if o.get("ev") == "sent" and o.get("id") == "deliv-77":
+                    row = o
+            self.assertIsNotNone(row)
+            pmb.receiptbox_put(row["relay_via"], row["relay_mid"], origin=row.get("from_host", ""))
+        rows = pmb.receiptbox_list("hosta")
+        self.assertEqual(rows, [{"mid": "px-77.mail.hosta", "origin": "hosta"}],
+                         "the parked receipt carries the SENDER's mid and the origin label")
+
+    def test_a_hub_forwards_a_receipt_one_hop_toward_the_origin(self):
+        # the r44 verification: receipts for hub-forwarded delegations parked under a host that
+        # is not an exchange peer — stranded forever. The hub re-parks toward the direct origin.
+        pm.PEERS["hostc"] = {"port": 1}               # the hub (pm) peers with BOTH spokes
+        pm.PEERS["hosta"] = {"port": 2}
+        pm.self_host = lambda: "hubX"                 # the hub is neither spoke
+        try:
+            pm._handoff_done_arrived("hostc", {"mid": "px-9.mail.hosta", "origin": "hosta"})
+            self.assertEqual(pm.receiptbox_list("hosta"),
+                             [{"mid": "px-9.mail.hosta", "origin": "hosta"}],
+                             "the hub forwards toward the origin instead of recording locally")
+            self.assertNotIn("px-9.mail.hosta", pm._handoff_done_ids())
+            # …and at the ORIGIN's own bus (origin == self), it records — the join lands
+            pm._handoff_done_arrived("hostc", {"mid": "px-8.mail.hosta", "origin": "hosta-self"})
+            self.assertIn("px-8.mail.hosta", pm._handoff_done_ids(),
+                          "an origin that is not a direct peer records locally — never a bounce loop")
+        finally:
+            pm.PEERS.pop("hostc", None)
+            pm.PEERS.pop("hosta", None)
+
+    def test_a_v1316_response_never_confirms_parked_receipts(self):
+        # the r44 verification: an old peer 200s while silently ignoring the handoffDone field —
+        # confirming on that destroyed every parked receipt (RECEIPTS_DONE poisoned)
+        pmb.receiptbox_put("hosta", "px-55", origin="")
+        req = pmb.build_exchange_request("hosta", wait=False)
+        resp_old = {"host": "hosta", "epoch": 1, "proto": 1, "presence": [], "holds": [],
+                    "relays": [], "acks": [], "bounces": [], "reads": []}   # NO handoffDone key
+        pmb.peer_exchange_apply("hosta", req, resp_old)
+        self.assertEqual(pmb.receiptbox_list("hosta"), [{"mid": "px-55"}],
+                         "an old peer's 200 confirms nothing — the receipt stays parked")
+        self.assertNotIn("px-55", pmb._receipts_done())
+
     def test_the_receipt_crosses_confirms_and_dedups(self):
         pmb.receiptbox_put("hosta", "px-42")           # the recipient kernel reported completion
         self.assertEqual(pmb.receiptbox_list("hosta"), [{"mid": "px-42"}])

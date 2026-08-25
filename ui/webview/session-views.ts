@@ -25,7 +25,9 @@ export interface SessionViews {
 // The chat's tab-menu Tags section reads and edits through this exact shape.
 export interface TagUnion { name: string; color: string; members: string[]; ids: string[]; localId: string | null; remotes: SessionTag[] }
 export function viewTagUnion(views: SessionViews | null | undefined): TagUnion[] {
-  const out: TagUnion[] = [], byName: Record<string, TagUnion> = {};
+  // tag names are USER text: "__proto__"/"constructor" crashed the {}-indexed builder in the
+  // timeline twin (the v1.3.16 audit's P2.15) — same guard here
+  const out: TagUnion[] = [], byName: Record<string, TagUnion> = Object.create(null);
   for (const t of viewTags(views)) {
     const key = t.name || "tag";
     const g = byName[key] || (byName[key] = { name: key, color: "", members: [], ids: [], localId: null, remotes: [] });

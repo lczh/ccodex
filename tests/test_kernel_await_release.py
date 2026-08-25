@@ -53,24 +53,35 @@ class AwaitRelease(unittest.TestCase):
             {"from_id": A, "to_id": B, "t": 100, "kind": "delegate", "body": "own this now"},
             {"from_id": B, "to_id": A, "t": 200, "kind": "coordinate", "body": "done, shipped"},
         ])
-        last_any, last_ask = km._postal_wait_maps()
+        last_any, last_ask, _aw = km._postal_wait_maps()
         self.assertNotIn((A, B), last_ask, "a DELEGATE still makes no chip edge — ownership transferred")
         self.assertEqual(km._peer_answered_at(A), 200, "…but the reply IS the stamp's ending event again")
 
-    def test_a_reply_older_than_the_newest_outbound_does_not_supersede(self):
+    def test_a_reply_older_than_the_newest_ASK_does_not_supersede(self):
+        # the clock is the newest reply-REQUIRING outbound (question|delegate): a later
+        # COORDINATE requests nothing and must not hide the answer that already arrived
+        # (the v1.3.16 audit's P2.11 reversed the any-kind clock this test used to pin)
+        self._write([
+            {"from_id": A, "to_id": B, "t": 100, "kind": "delegate", "body": "own this"},
+            {"from_id": B, "to_id": A, "t": 150, "kind": "coordinate", "body": "ack"},
+            {"from_id": A, "to_id": B, "t": 300, "kind": "delegate", "body": "and this too"},
+        ])
+        self.assertEqual(km._peer_answered_at(A), 0,
+                         "the newest ASK is unanswered — nothing supersedes")
         self._write([
             {"from_id": A, "to_id": B, "t": 100, "kind": "delegate", "body": "own this"},
             {"from_id": B, "to_id": A, "t": 150, "kind": "coordinate", "body": "ack"},
             {"from_id": A, "to_id": B, "t": 300, "kind": "coordinate", "body": "one more thing"},
         ])
-        self.assertEqual(km._peer_answered_at(A), 0, "the newest outbound is unanswered — nothing supersedes")
+        self.assertEqual(km._peer_answered_at(A), 150,
+                         "a coordinate after the reply never hides the answer (P2.11)")
 
     def test_question_release_unchanged(self):
         self._write([
             {"from_id": A, "to_id": B, "t": 100, "kind": "question", "body": "which port?"},
             {"from_id": B, "to_id": A, "t": 180, "kind": "coordinate", "body": "8080"},
         ])
-        last_any, last_ask = km._postal_wait_maps()
+        last_any, last_ask, _aw = km._postal_wait_maps()
         self.assertIn((A, B), last_ask, "a QUESTION still makes the chip edge")
         self.assertEqual(km._peer_answered_at(A), 180)
 
@@ -81,7 +92,7 @@ class AwaitRelease(unittest.TestCase):
             {"from_id": A, "to_id": "peer:TESTHOST", "toName": "TESTHOST:api", "t": 120,
              "kind": "question", "body": "status of the api thing?"},
         ])
-        _any, last_ask = km._postal_wait_maps()
+        _any, last_ask, _aw = km._postal_wait_maps()
         self.assertIn((A, "peer:TESTHOST:web"), last_ask, "the earlier ask survives")
         self.assertIn((A, "peer:TESTHOST:api"), last_ask, "…beside the later one — no overwrite")
 
@@ -93,7 +104,7 @@ class AwaitRelease(unittest.TestCase):
             {"from_id": W, "to_id": A, "t": 150, "kind": "coordinate", "body": "all good",
              "from_host": "TESTHOST", "from": "web"},
         ])
-        _any, last_ask = km._postal_wait_maps()
+        _any, last_ask, _aw = km._postal_wait_maps()
         self.assertIn((A, W), last_ask, "the maps rebuild from the full log — the row re-keys to the real sid")
         self.assertNotIn((A, "peer:TESTHOST:web"), last_ask)
         self.assertEqual(km._peer_answered_at(A), 150, "and the reply releases the wait")

@@ -6037,7 +6037,10 @@ def _migrate_codex_identity_locked():
         except Exception:
             pass                                      # no marker → the next entry re-runs; never wrong
     else:
-        marker.unlink(missing_ok=True)                # a failed pass RETRACTS any prior certificate:
+        try:
+            marker.unlink(missing_ok=True)            # a failed pass RETRACTS any prior certificate:
+        except OSError:
+            pass                                      # an unwritable dir must degrade, not crash boot
         #                                               the next entry must re-run the rewrites (the
         #                                               v1.3.16 audit — the marker certified a pass
         #                                               whose per-file failure was swallowed)
@@ -11850,31 +11853,33 @@ def _handoff_done_ids():
 _RECEIPTS_POSTED = set()   # in-process fast path; the bus's RECEIPTS_DONE is the durable dedup
 
 
-def _post_handoff_receipt(mid, host):
-    """Report a cross-host delegation's planted goal COMPLETE to the local postal bus, which
-    relays the receipt to the sender's bus over the peer exchange. Best-effort and idempotent:
-    this fires on every propagate pass for every completed cross-host-origin node, and the bus's
-    durable RECEIPTS_DONE makes a confirmed receipt a no-op."""
-    if not mid or not host or (mid, host) in _RECEIPTS_POSTED:
+def _post_handoff_receipt(mid):
+    """Report a completed delegation-planted goal to the local postal bus by its DELIVERY id —
+    the bus owns the delivery row and translates it into the sender's relay mid (or answers
+    "local", which the origin back-link owns). Best-effort and idempotent: this fires on every
+    propagate pass, and the bus's durable RECEIPTS_DONE makes a confirmed receipt a no-op.
+    The token comes from the ENVIRONMENT first (the r44 verification: env-token deployments
+    403'd every receipt silently), then the state file."""
+    if not mid or mid in _RECEIPTS_POSTED:
         return
     try:
         import http.client
-        import urllib.parse
-        tok = ""
-        try:
-            tok = (STATE / "serve-token").read_text().strip()
-        except OSError:
-            pass
+        tok = os.environ.get("ROMP_SERVE_TOKEN") or ""
+        if not tok:
+            try:
+                tok = (STATE / "serve-token").read_text().strip()
+            except OSError:
+                pass
         c = http.client.HTTPConnection(
             "127.0.0.1", int(os.environ.get("ROMP_POSTAL_PORT", "25302")), timeout=3)
         c.request("POST", "/handoff-done",
-                  body=json.dumps({"mid": mid, "host": host}),
+                  body=json.dumps({"mid": mid}),
                   headers={"Content-Type": "application/json", "X-Romp-Token": tok})
         r = c.getresponse()
         r.read()
         c.close()
         if r.status == 200:
-            _RECEIPTS_POSTED.add((mid, host))
+            _RECEIPTS_POSTED.add(mid)
     except Exception:
         pass                                          # the bus is down: the next pass retries
 
@@ -11895,11 +11900,15 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
             if not nd.get("nodeComplete"):
                 continue                                # B hasn't finished it yet
             o = nd.get("origin")
-            if isinstance(o, dict) and o.get("msgId") and o.get("peerHost"):
-                # a CROSS-HOST delegation completed here: its origin back-link can never fire
-                # (the sender's store lives on another kernel) — report the per-message receipt
-                # home instead (the v1.3.16 audit's P1.3)
-                _post_handoff_receipt(str(o["msgId"]), str(o["peerHost"]))
+            for ref in ([o] if isinstance(o, dict) else []) + [
+                    l for l in (nd.get("links") or []) if isinstance(l, dict)]:
+                if ref.get("msgId"):
+                    # a delegation-planted (or courier-linked) goal completed here: report the
+                    # per-message receipt by its DELIVERY id — the bus translates relayed ones
+                    # into the sender's mid and answers "local" for the rest (the v1.3.16
+                    # audit's P1.3; the r44 verification: keying on origin.peerHost missed
+                    # planner-first placements, whose reference rides links[])
+                    _post_handoff_receipt(str(ref["msgId"]))
             refs = ([o] if (isinstance(o, dict) and o.get("peer") and o.get("goalId")) else [])
             refs += [l for l in (nd.get("links") or [])
                      if isinstance(l, dict) and l.get("peer") and l.get("goalId")]

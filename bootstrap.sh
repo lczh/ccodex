@@ -257,6 +257,28 @@ if precheck != "-":
     if subprocess.run(["git", "-C", root, "merge-base", "--is-ancestor", precheck, target]).returncode:
         sys.exit(7)
 latch = os.path.join(gdir, "romp-install-failed")
+import shutil as _sh
+def snap_install(commit, extra_env=None):
+    # the SNAPSHOT installer (the v1.3.16 audit's P1.1; the r44 verification extended it to
+    # every leg): the COMMIT's complete tree executes — never live-tree bytes a racing writer
+    # could swap mid-install; ROMP_INSTALL_TARGET aims outputs at the real checkout
+    _snap = os.path.join(gdir, "romp-install-snap")
+    _sh.rmtree(_snap, ignore_errors=True)
+    os.makedirs(_snap)
+    _a = subprocess.run(["git", "-C", root, "archive", commit], capture_output=True)
+    if _a.returncode or not _a.stdout:
+        return False
+    if subprocess.run(["tar", "-x", "-C", _snap], input=_a.stdout).returncode \
+            or not os.path.exists(os.path.join(_snap, "install.sh")):
+        _sh.rmtree(_snap, ignore_errors=True)
+        return False
+    _env = dict(os.environ, ROMP_INSTALL_TARGET=root)
+    _env.update(extra_env or {})
+    _rc = subprocess.run(["bash", os.path.join(_snap, "install.sh")], cwd=root, env=_env,
+                         pass_fds=(fd,)).returncode
+    _sh.rmtree(_snap, ignore_errors=True)
+    return _rc == 0
+
 
 
 def head8():
@@ -342,8 +364,7 @@ if lines:
                 return cur_line
             o = rawlines[1].split()
             return cur_line + " " + o[1] if len(o) > 1 and o[1] in ("stable", "dev") else cur_line
-        if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root,
-                          pass_fds=(fd,)).returncode:
+        if not snap_install(cur_line.split()[0][:8]):
             carry = merged_carry()
         elif not publish_line(pub_pick):
             carry = merged_carry()           # healed, but its channel could not be recorded: the
@@ -471,9 +492,7 @@ except OSError:
     #                                         a build wearing the OLD marker (a stable checkout
     #                                         following unsigned main); 13 = even the quarantine
     #                                         could not be recorded, and the exit says so
-env = dict(os.environ, ROMP_INSIDE_UPDATE_TXN=str(os.getpid()))
-if subprocess.run(["bash", os.path.join(root, "install.sh")], cwd=root, pass_fds=(fd,),
-                  env=env).returncode:
+if not snap_install(target, extra_env={"ROMP_INSIDE_UPDATE_TXN": str(os.getpid())}):
     sys.exit(4)                        # latch stays armed: nothing runs this build until install passes
 os.remove(latch)
 sys.exit(0)

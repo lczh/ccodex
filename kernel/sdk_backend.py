@@ -4714,7 +4714,8 @@ class SdkBackend:
             # the codex twin's rule (the v1.3.13 audit's P2): a raising names publish rolls the
             # registry back so the stores stay agreed under the caller's "keeps its old name"
             try:
-                self._update_reg(sid, name=old_name)
+                self._update_reg(sid, name=old_name, renameNote="")   # the failed rename must not
+                #                                                       still ping the NEW name (r44)
             except Exception:
                 self._log("sdk rename compensation failed for %s: the registry alone holds the "
                           "new name and will apply it at the next load" % sid)

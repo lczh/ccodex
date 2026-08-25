@@ -95,7 +95,9 @@ test("setSessionFlag still posts via the web host hook, with a Node-fs fallback 
     const fw = win.indexOf("writeFileSync");
     assert.ok(kp > 0, "the flag writer posts through the kernel");
     assert.ok(fw > kp, "…and touches the file only after the kernel POST failed");
-    assert.match(win.slice(kp, fw), /if \(ok\) return;/, "a kernel-accepted write never double-writes");
+    assert.match(win.slice(kp, fw), /if \(ok !== false\) return;/,
+      "a kernel-accepted OR kernel-REFUSED write never falls back to the raw file — only a " +
+      "network-level failure means kernel-down (the r44 verification)");
   }
   {
     // the same discipline for the order + views fallbacks (P2.17): merge/normalize in the
