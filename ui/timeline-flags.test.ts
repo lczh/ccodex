@@ -217,7 +217,7 @@ test("source: union-op entries carry rt + gesture id + pre-edit name/color at no
 
 test("source: tagEditFailed compensates SIBLING hosts — inverse remote edits; delete is loud, never silent", () => {
   const fn = SRC.indexOf("tagEditFailed(m) {");
-  const win = SRC.slice(fn, fn + 3800);
+  const win = SRC.slice(fn, fn + 4700);
   assert.ok(win.indexOf("_applyLocalOp(o.inverse)") > 0, "the local rollback survives untouched");
   // a refusal carrying the opId the edit was stamped with compensates EXACTLY that gesture (the
   // 2026-08-26 audit's Finding C — the kernel echoes it); an opId-less frame (an old kernel)
@@ -233,8 +233,11 @@ test("source: tagEditFailed compensates SIBLING hosts — inverse remote edits; 
   assert.match(win, /if \(e\.rename\) inv\.rename = o\.oldName;/);
   assert.match(win, /if \(e\.color\) inv\.color = o\.oldColor;/);
   // a rename that landed re-keyed the tag on that host (edits are name-addressed): the inverse
-  // must address the NEW name to rename it back
-  assert.match(win, /this\._editRemoteTag\(e\.rename \? Object\.assign\(\{\}, o\.rt, \{ name: e\.rename \}\) : o\.rt, inv\);/);
+  // must address the NEW name to rename it back — and the dispatch mints its OWN gesture id (the
+  // r47 verification: an opId-less inverse wire's refusal fell into the newest-gid fallback and
+  // swept an unrelated gesture; with a fresh id that matches no entry, a failed rollback is loud
+  // via _tagEditErr and never a second rollback cascade)
+  assert.match(win, /this\._editRemoteTag\(e\.rename \? Object\.assign\(\{\}, o\.rt, \{ name: e\.rename \}\) : o\.rt, inv,\s*\n\s*\+\+unionGestureSeq\);/);
   // an applied delete has no remote inverse — the by-hand note rides the loud error slot
   assert.ok(win.indexOf("if (e.delete) { undead.push(o.host || 'unknown'); continue; }") > 0,
     "delete siblings are collected for the loud note, never dispatched blind");
@@ -589,5 +592,56 @@ test("executed: a refusal carrying an opId rolls back EXACTLY that gesture — e
   assert.deepEqual(panel._unionOps.map((o: any) => [o.host, o.gid]),
     [["TESTHOST-A", gid2], ["TESTHOST-B", gid2]],
     "gesture 2's entries survive untouched for their own verdicts");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews;
+});
+
+test("executed: the compensation's INVERSE dispatch carries its OWN opId — its refusal is loud, never a second rollback (r47)", () => {
+  // Finding C's sibling leg: the rollback's inverse remote edit was the one _editRemoteTag call
+  // without a gid, so it rode the wire opId-less — and when the sibling refused the INVERSE (the
+  // owner went down mid-sequence), the echoed frame carried no opId either, fell into the
+  // newest-gid fallback, and swept whichever unrelated gesture was newest by then: its local half
+  // reverted and an uncalled-for counter-inverse dispatched — a rollback cascading into a gesture
+  // nothing refused. The inverse now mints a fresh gesture id; no _unionOps entry rides it, so its
+  // refusal matches nothing and lands as the loud _tagEditErr alone.
+  const wires: any[] = [];
+  g.__rompTimelineEditTag = (e: any) => wires.push(e);
+  g.__rompTimelineSetViews = () => {};
+  const panel = new TimelinePanel(makeNode("div"));
+  panel.update({
+    now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+    turns: {}, messages: [], judging: [],
+    views: {
+      active: "all",
+      tags: [{ id: "g1", name: "pool", color: "#DD42FF", members: ["s1", "s2"] }],
+      remoteTags: [
+        { id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool", color: "#7aa2f7", members: ["s1", "s2"] },
+        { id: "TESTHOST-B:r2", host: "TESTHOST-B", name: "pool", color: "#4EC9B0", members: ["s1", "s2"] },
+      ],
+    },
+  });
+  // gesture 1 removes s1, gesture 2 removes s2 — both fan to owners A and B, both unconfirmed
+  panel._editTagUnion(viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool"), { remove: ["s1"] });
+  panel._editTagUnion(viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool"), { remove: ["s2"] });
+  const gid1 = panel._unionOps[0].gid, gid2 = panel._unionOps[2].gid;
+  assert.equal(wires.length, 4, "two gestures × two owners");
+  // B refuses gesture 1 → the rollback dispatches the inverse {add:[s1]} to sibling A
+  panel.tagEditFailed({ host: "TESTHOST-B", name: "pool", opId: String(gid1), error: "kernel refused" });
+  assert.equal(wires.length, 5, "exactly one inverse dispatch to the still-unconfirmed sibling");
+  const inv = wires[4];
+  assert.equal(inv.host, "TESTHOST-A");
+  assert.deepEqual(inv.add, ["s1"]);
+  assert.ok(inv.opId && inv.opId !== String(gid1) && inv.opId !== String(gid2),
+    "the inverse rides the wire with a FRESH opId of its own — never opId-less, never a live gesture's");
+  // A refuses the INVERSE. The kernel echoes exactly what the wire carried — pre-fix nothing, and
+  // the opId-less frame's newest-gid fallback swept gesture 2 (reverting s2's removal and
+  // counter-dispatching an uncalled-for {add:[s2]} to B).
+  const before = panel._unionOps.map((o: any) => [o.host, o.gid]);
+  panel.tagEditFailed({ host: "TESTHOST-A", name: "pool", opId: inv.opId, error: "owner down" });
+  assert.equal(wires.length, 5, "a failed rollback dispatches NOTHING — no second rollback cascade");
+  assert.deepEqual(panel._curViews().tags.find((t: any) => t.id === "g1").members, ["s1"],
+    "gesture 2's local removal of s2 STANDS — the inverse's refusal compensates no one");
+  assert.deepEqual(panel._unionOps.map((o: any) => [o.host, o.gid]), before,
+    "gesture 2's entries survive untouched for their own verdicts");
+  assert.match(panel._tagEditErr.error, /owner down/);   // the failed rollback is LOUD, not silent
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews;
 });

@@ -498,8 +498,9 @@ function captureViews(v: SessionViews | null) {
   // the deferred first-tab bounce never fires (its fire-time revalidation re-checks tabInView).
   if (activeId) assertPeekFor(activeId);
 }
-// (postViews below runs the same re-derivation for the LOCAL optimistic edit — both views-arrival
-// paths keep the active session's peek state current.)
+// (postViews below runs the same re-derivation for the LOCAL optimistic edit, and the viewsAck
+// refusal handler runs it after dropping the overlay — EVERY path that changes effViews() keeps
+// the active session's peek state current.)
 // postViews writes through the SHARED writer (views-writer.ts, the 2026-08-26 audit's Finding A):
 // the raw setTimelineViews post re-echoed the payload's rev, so the second of two quick gestures
 // always declared a stale CAS base and was refused — the writer stamps an advancing baseRev and
@@ -11395,8 +11396,17 @@ window.addEventListener("message", (e: MessageEvent) => {
   else if (m.type === "imgData" && typeof m.path === "string") onImgData(m.path, typeof m.url === "string" ? m.url : null, typeof m.sid === "string" ? m.sid : null);
   else if (m.type === "tabOrder") { captureViews(m.views || null); applyTabOrder(m.order, m.tabs); }
   // the kernel's per-write CAS answer to our setTimelineViews posts → the shared writer re-anchors;
-  // a refusal (ok:false) drops the KNOWN-refused optimistic overlay now, not after three silent pushes
-  else if (m.type === "viewsAck") consumeViewsAck(m, () => { pendingSessionViews = null; pendingViewsAge = 0; renderTabs(); });
+  // a refusal (ok:false) drops the KNOWN-refused optimistic overlay now, not after three silent pushes.
+  // Dropping the overlay changes effViews() exactly like a views arrival, so the ACTIVE session's
+  // peek re-derives here too (the r47 verification: the lens edit that revealed the active session
+  // cleared its peek; the refusal restored the hiding blob with peekId still null, and the active
+  // tab vanished from the strip until an unrelated push — the refused write changed nothing
+  // kernel-side, so no healing tabOrder frame was ever coming).
+  else if (m.type === "viewsAck") consumeViewsAck(m, () => {
+    pendingSessionViews = null; pendingViewsAge = 0;
+    if (activeId) assertPeekFor(activeId);
+    renderTabs();
+  });
   else if (m.type === "renamed" && m.id && typeof m.name === "string") {
     notePendingMeta(pendingTabMeta, m.id, { name: m.name });   // kernel truth — hold it against a push built pre-rename
     const s = sessions.get(m.id);

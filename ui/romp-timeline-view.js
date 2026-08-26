@@ -2705,8 +2705,15 @@ class TimelinePanel {
       if (e.color) inv.color = o.oldColor;
       if (!Object.keys(inv).length) continue;
       // a rename that landed re-keyed the tag on that host, and edits are name-addressed — the
-      // inverse must address the NEW name to rename it back to the recorded old one
-      this._editRemoteTag(e.rename ? Object.assign({}, o.rt, { name: e.rename }) : o.rt, inv);
+      // inverse must address the NEW name to rename it back to the recorded old one.
+      // The inverse dispatch mints its OWN gesture id (the r47 verification of Finding C): an
+      // opId-less wire's refusal falls into the newest-gid fallback below and sweeps whichever
+      // UNRELATED gesture is newest by then — a rollback rolling back a gesture nothing refused.
+      // No _noteUnionOp rides this id, deliberately: a compensation is never itself compensated,
+      // so its refusal matches no entry and lands as the LOUD _tagEditErr alone, never a second
+      // rollback cascade.
+      this._editRemoteTag(e.rename ? Object.assign({}, o.rt, { name: e.rename }) : o.rt, inv,
+                          ++unionGestureSeq);
     }
     // the un-restorable deletes ride the SAME loud slot as the refusal (honest > silent): the
     // user must redo those by hand, and a silent skip would hide exactly that
