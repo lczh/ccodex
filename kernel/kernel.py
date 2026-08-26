@@ -8330,16 +8330,9 @@ def _comments_frame(sid, tmux=None):
         unread = any(m["who"] == "agent" and m["t"] > seen for m in msgs)
         events = [] if status == "promoted" else _thread_events(tsid, str(th.get("cutUuid") or ""), now, tmux)
         reg = _thread_reg(tsid)
-        # the settle count (see _comment_settle_step): raw_busy mirrors the client's threadInFlight
-        # (comments.ts) exactly — live work or an owed reply, on an open unstuck thread
-        tid = str(th.get("tid") or "")
-        raw_busy = (status == "open" and not err and state not in ("permission", "picker")
-                    and (state in ("working", "retrying", "compacting")
-                         or bool(msgs and msgs[-1]["who"] == "you")))
-        quiet = _comment_settle_step(_comment_settle.get(tid), raw_busy, status != "open" or bool(err))
-        _comment_settle[tid] = quiet
-        if len(_comment_settle) > 512:
-            _comment_settle.clear()
+        # (T102: the push-count settle — settledPushes — is RETIRED. The client's pulse is exchange-
+        # scoped now: latched at the send gesture, cleared by the reply RECORD arriving in msgs; the
+        # frame's msgs already carry that event, so no per-push counter rides here anymore.)
         # sinceEpoch (MILLISECONDS, the client convention): when the thread's current state began —
         # the popover's working chip counts from it, exactly as the chat's statusline does
         since_ms = 0
@@ -8363,7 +8356,7 @@ def _comments_frame(sid, tmux=None):
                         "unread": unread, "promotedName": th.get("promotedName") or "",
                         "model": (reg.get("liveModel") or reg.get("model") or "") if reg else "",
                         "effort": (reg.get("effort") or "") if reg else "",
-                        "settledPushes": quiet, "sinceEpoch": since_ms,
+                        "sinceEpoch": since_ms,
                         "mode": str(meta.get("mode") or ""), "fast": str(meta.get("fast") or ""),
                         # the same rank tints the chat statusline's badges wear (the user 2026-08-25,
                         # color rider: the popover's model/effort rendered plain gray — metaColor
@@ -8374,26 +8367,6 @@ def _comments_frame(sid, tmux=None):
                                                      cm.stops_for(_colormap())),
                         "msgs": msgs, "events": events})
     return {"type": "comments", "id": sid, "threads": threads}
-
-
-# The client's green→yellow settle needs TWO CONFIRMING PUSHES (comments.ts latchBusy), but
-# _send_client's dedup withholds unchanged frames — so after a reply landed, the second confirming
-# frame never arrived and the passage stayed green until some unrelated change minted one (the user
-# 2026-08-25: it didn't flip until clicking back into the main chat). The frame now carries the
-# count ITSELF: pushes since the thread last read busy, clamped at 2 — each step is a real pusher
-# cycle (an event, never a timer), the frame changes at most twice after settling, and then the
-# dedup resumes. tid → count; pure step logic split out for the test.
-_comment_settle = {}
-
-
-def _comment_settle_step(prev, raw_busy, decided):
-    """One pusher cycle's step of the settle count: busy → 0; a decided status (closed/errored)
-    settles immediately; otherwise count up, clamped at 2 (the client's SETTLE_CONFIRM_PUSHES)."""
-    if decided:
-        return 2
-    if raw_busy:
-        return 0
-    return min(2, (2 if prev is None else prev) + 1)
 
 
 def _comment_markers(sid):

@@ -18,7 +18,6 @@ export type CommentThread = {
   state: string;              // the thread session's live state ("working"/"waiting"/…, "" when dormant)
   error?: string;             // the thread CLI's launch error, when it could not start
   unread: boolean;            // an agent reply newer than the read watermark
-  settledPushes?: number;     // kernel pushes since the thread last read busy, clamped at 2 (settleConfirmed)
   sinceEpoch?: number;        // ms epoch the thread's current state began — the popover chip's timer
   mode?: string;              // the thread's permission mode — the popover statusline's Auto badge
   fast?: string;              // fast-mode state ("on"/"off"/"cooldown"; "" = unknown → no badge)
@@ -60,43 +59,20 @@ export function replyOwed(th: CommentThread): boolean {
   const last = th.msgs.length ? th.msgs[th.msgs.length - 1] : null;
   return !!last && last.who === "you";
 }
-// The ONE in-flight predicate every busy surface reads (the passage mark, the rail tick): live work
-// OR an owed reply, on an open, non-errored thread that isn't blocked on the user — a stuck thread's
-// reply is NOT on the way, and green would lie.
-export function threadInFlight(th: CommentThread): boolean {
-  return th.status === "open" && !th.error && !threadStuck(th.state)
-    && (threadBusy(th.state) || replyOwed(th));
-}
-// SETTLE LATCH (the user 2026-08-24, second report: the passage went green, blipped YELLOW for a
-// second mid-churn, then back to green). At a turn boundary inside a continuing thread, one push can
-// read quiet-state + agent-tail — frame-locally indistinguishable from the true end, so no predicate
-// over a single frame can avoid the flap. The repo rule: transient states latch until the deciding
-// event. Here the deciding evidence is CONSECUTIVE confirming pushes (the pendingSessionViews idiom:
-// pushes are events, never timers): the green holds until TWO pushes in a row read settled; any busy
-// or owed reading resets the count; a status flip (resolved/merged/error) decides IMMEDIATELY — those
-// are real events, never held. The state changes at most once per deciding event by construction.
-export type BusyLatch = { green: boolean; quiet: number };
-export const SETTLE_CONFIRM_PUSHES = 2;
-export function latchBusy(prev: BusyLatch | undefined, th: CommentThread, alsoBusy = false): BusyLatch {
-  if (th.status !== "open" || th.error) return { green: false, quiet: 0 };
-  const raw = alsoBusy || (!threadStuck(th.state) && (threadBusy(th.state) || replyOwed(th)));
-  if (raw) return { green: true, quiet: 0 };
-  if (!prev || !prev.green) return { green: false, quiet: 0 };
-  const quiet = prev.quiet + 1;
-  return quiet >= SETTLE_CONFIRM_PUSHES ? { green: false, quiet: 0 } : { green: true, quiet };
+// THE EXCHANGE LATCH (T102, the user 2026-08-26 — replacing the push-count settle): the busy pulse
+// is exchange-scoped. It LATCHES at the user's SEND gesture (client-side, optimistic — before any
+// kernel round-trip; thread-open must never be the start trigger) and CLEARS only on the
+// REPLY-ARRIVED event for that send: the agent's reply RECORD landing in the thread's projected
+// msgs — concretely, th.msgs holding MORE who==="agent" entries than it held at the send. Counts of
+// the exchange's own records: never wall clocks (cross-host transcripts skew) and never push counts
+// (the banned proxy — the old two-quiet-pushes settle counter killed the create-window green
+// while the fork booted, and any stall in its 0→1→2 stepping parked green forever with no event to
+// clear it). agentCount is the reply-arrived detector's datum; render.ts holds the per-send base.
+export function agentCount(th: CommentThread): number {
+  return (th.msgs || []).filter((m) => m.who === "agent").length;
 }
 export function threadStuck(state: string): boolean {
   return state === "permission" || state === "picker";
-}
-// The kernel-carried settle confirmation (2026-08-25): the latch above needs two confirming PUSHES,
-// but the wire dedup withholds unchanged frames — the second confirm never arrived, and the green
-// held until an unrelated change minted a frame (the user: it didn't flip until clicking back into
-// the main chat). The kernel now counts pushes-since-busy on the frame itself (settledPushes,
-// clamped at SETTLE_CONFIRM_PUSHES so dedup resumes once decided). null = an older kernel without
-// the field — callers fall back to the client latch.
-export function settleConfirmed(th: CommentThread): boolean | null {
-  const sp = (th as { settledPushes?: number }).settledPushes;
-  return typeof sp === "number" ? sp >= SETTLE_CONFIRM_PUSHES : null;
 }
 
 // ── exact-text re-anchoring ────────────────────────────────────────────────────────────────────

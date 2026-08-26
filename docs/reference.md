@@ -176,7 +176,10 @@ every init, permanently. Declaring the intent fixes it: set
 on the declared side is quiet while one landing on the other side is flagged,
 naming the declaration. The check inverts rather than disappearing; unset (or
 any other value), it compares against what the session was launched with, as
-before.
+before. One explicit gear **Billing** pick supersedes the declaration from then
+on: the remembered pick becomes the box's expectation and the env var goes
+inert (it described the unpicked design), so re-seeded spawns are judged
+against your pick, never against stale doctrine.
 
 The usage rail reflects a mixed machine: the window bars (5 hours / 7 days /
 Fable 5) are drawn once, aggregated across every connected host's login as the

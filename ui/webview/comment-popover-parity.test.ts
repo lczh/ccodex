@@ -45,7 +45,7 @@ test("the popover's bottom row IS a statusline: the chat's chip anatomy + counti
   assert.ok(!/\.cmt-meta \{/.test(CSSs), "no popover-local meta dress");
   assert.match(CSSs, /\.cmt-pop \.statusline \{[^}]*font-family: var\(--vscode-font-family\); font-size: var\(--vscode-font-size, 13px\); \}/);
   // …and the comments frame carries the epoch (milliseconds, the client convention)
-  assert.match(KERNEL, /"settledPushes": quiet, "sinceEpoch": since_ms,/);
+  assert.match(KERNEL, /"sinceEpoch": since_ms,/);   // (the push-count field is retired — T102)
   // the in-place refresh keeps chip + timer live per frame (chips carry no listeners — click-safe)
   assert.match(RENDER, /if \(th && cs\) cs\.replaceWith\(cmtStateChip\(th\)\);/);
 });
@@ -73,26 +73,23 @@ test("a fresh thread boots on the romp loader, then renders its final format ONC
   // …with the can't-trap backstop: past it, the hold releases and the projection paints after all
   assert.match(RENDER, /const CMT_BOOT_BACKSTOP_MS = 8000;/);
   assert.match(RENDER, /window\.setTimeout\(\(\) => \{ if \(openCommentKey\?\.tid === tid\) refillOpenCommentPop\(\); \}, CMT_BOOT_BACKSTOP_MS \+ 50\);/);
-  // the user's own pending sends still acknowledge under the loader
+  // the user's own pending sends still acknowledge under the loader — through the CHAT'S queued
+  // idiom (T104: the one-off gray pill is gone; cmtPendingQueued IS renderQueued's bare group)
   const gate = RENDER.split("cmtBootHolds(th.tid)) {")[1].split("return;")[0];
-  assert.ok(gate.includes('commentMsgEl("you", pb.text)'), "pending bubbles ride the boot view");
+  assert.ok(gate.includes("cmtPendingQueued(pend)"), "pending bubbles ride the boot view, chat-idiom");
 });
 
-test("green→yellow settles LIVE: the kernel carries the confirm the dedup used to withhold", () => {
-  // the client latch needed two confirming FRAMES; unchanged frames never arrive (wire dedup), so
-  // the flip waited for an unrelated change (the user: it didn't flip until clicking back). The
-  // kernel counts pushes-since-busy on the frame, clamped so dedup resumes once decided.
-  assert.match(KERNEL, /def _comment_settle_step\(prev, raw_busy, decided\):/);
-  assert.match(COMMENTS, /export function settleConfirmed\(th: CommentThread\): boolean \| null \{/);
-  assert.match(COMMENTS, /return typeof sp === "number" \? sp >= SETTLE_CONFIRM_PUSHES : null;/);
-  // commentInFlight prefers the kernel's confirm; the client latch stays as the old-kernel fallback
-  assert.match(RENDER, /const confirmed = settleConfirmed\(th\);/);
-  assert.match(RENDER, /if \(confirmed !== null\) return raw \|\| \(th\.status === "open" && !th\.error && !confirmed\);/);
-  assert.match(RENDER, /return raw \|\| !!commentBusyLatch\.get\(th\.tid\)\?\.green;/);
+test("the pulse is exchange-scoped (T102): send-gesture latch, reply-record clear — no push counts", () => {
+  // the old kernel-carried confirm counter is retired root and branch: its all-quiet fork-birth
+  // frames killed the create-window green, and a stall in its stepping parked green forever. The
+  // pulse now latches at the SEND gesture and clears on the agent's reply RECORD in msgs
+  // (comments.test.ts carries the full lifecycle pins; this guards the retirement on this surface).
+  assert.doesNotMatch(KERNEL, /_comment_settle/);
+  assert.doesNotMatch(RENDER, /settleConfirmed|commentBusyLatch/);
+  assert.match(RENDER, /const cmtAwaitBase = new Map<string, number>\(\);/);
   // the frame handler already repaints marks AND the open popover per frame — the live wire
   assert.match(RENDER, /applyCommentMarks\(sid\);\s*\n\s*if \(openCommentKey && openCommentKey\.sid === sid\) \{/);
 });
-
 test("the model meta-menu exposes VERSIONS: submenu, remembered default, keyboard (the user 2026-08-25)", () => {
   // families with >1 live version wear a side submenu (leftward — the menu anchors bottom-right):
   // hover or an arrow key reveals every version, each pickable with the current-✓; clicking the

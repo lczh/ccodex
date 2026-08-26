@@ -160,6 +160,65 @@ class AllKeyedUsageLineHonorsTheDeclaration(_Declared):
         self.assertTrue(self._usage_problems(), "undeclared all-keyed stays the surprising case")
 
 
+class GearPickMakesTheDeclarationInert(_Declared):
+    """Q3 (2026-08-26): ONE explicit gear Billing pick supersedes ROMP_EXPECTED_AUTH from then on —
+    the env var described the box's UNPICKED design, and once billing is hand-managed its per-init
+    alarms fought the user's own choice on every spawn re-seeded from the remembered default. The
+    pick's durable trace is the remembered auth default (set_auth is its only writer), so inertness
+    keys on the PICK EVENT — a spawn's seeded reg.auth never counts as explicit."""
+
+    def test_the_pick_supersedes_the_env_declaration(self):
+        os.environ["ROMP_EXPECTED_AUTH"] = "key"
+        sb.write_sdk_default(Path(self.d), auth="login")   # set_auth's durable trace — the gear pick
+        s = self._sess(11)
+        s._launched_keyed = True
+        self.be._note_auth_source(s, "none")               # a login landing: contradicts the ENV, honors the PICK
+        self.assertFalse([t for t in self._problem_texts() if "billing" in t],
+                         "the env declaration is INERT after the pick — no false alarm")
+        s2 = self._sess(12)
+        s2._launched_keyed = False
+        self.be._note_auth_source(s2, "apiKeyHelper")      # a keyed landing: contradicts the PICK
+        texts = self._problem_texts()
+        self.assertTrue(any("the remembered Billing pick is login" in t and "billing the API key" in t
+                            for t in texts),
+                        "a landing contradicting the pick rings, NAMING THE PICK not the env var: %r" % texts)
+        self.assertFalse(any("ROMP_EXPECTED_AUTH" in t for t in texts),
+                         "the env var no longer speaks anywhere once picked")
+
+    def test_a_seeded_spawn_never_makes_the_declaration_inert(self):
+        # the remembered default SEEDS reg.auth on a spawn — that seed must not count as explicit:
+        # with no pick trace in the defaults, the env declaration still governs
+        os.environ["ROMP_EXPECTED_AUTH"] = "key"
+        s = self._sess(13, auth="key")                     # a spawn re-seeded from some remembered default
+        s._launched_keyed = True
+        self.be._note_auth_source(s, "none")               # lands on login — contradicts its own seed
+        texts = self._problem_texts()
+        self.assertTrue(any("billing the login" in t for t in texts),
+                        "the seeded session is still judged (against its own pick side): %r" % texts)
+        self.assertFalse(any("remembered Billing pick" in t for t in texts),
+                         "…but nothing pretends a remembered default was an explicit box-wide pick")
+
+    def test_all_keyed_gate_follows_the_pick(self):
+        os.environ["ROMP_EXPECTED_AUTH"] = "login"
+        sb.write_sdk_default(Path(self.d), auth="key")     # the user picked key billing by hand
+        be2 = sb.SdkBackend(self.d, "/bin/true", lambda *a, **k: None, log=self.logs.append)
+        s = sb.SdkSession(be2, {"sid": "11111111-2222-3333-4444-%012d" % 14, "name": "s14", "cwd": "/tmp"})
+        s.connected = True
+        s.api_key_auth = True
+        be2.sessions[s.sid] = s
+        be2.refresh_usage()
+        probs = [p for p in be2.problems(20) if "telemetry is unavailable" in p["text"]]
+        self.assertFalse(probs, "all-keyed under a KEY pick is the design — an info line, not a problem "
+                                "(the env =login is inert)")
+
+    def test_the_real_set_auth_leaves_the_trace(self):
+        # end to end: the gear pick itself writes the durable trace _declared_auth keys on
+        sb.write_reg(Path(self.d), "11111111-2222-3333-4444-%012d" % 15,
+                     {"sid": "11111111-2222-3333-4444-%012d" % 15, "name": "s15", "cwd": "/tmp"})
+        self.assertTrue(self.be.set_auth("11111111-2222-3333-4444-%012d" % 15, "login"))
+        self.assertEqual(sb._declared_auth(Path(self.d)), ("login", "pick"))
+
+
 class PickOutranksTheDeclaration(_Declared):
     """An explicit per-session Billing pick (sess.auth) beats the box-wide declaration: the
     declaration describes the box's UNPICKED design, and set_auth's contract is that the next

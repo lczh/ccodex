@@ -9535,6 +9535,28 @@ def _look_stamp(nd):
     mint — so the FIRST post-upgrade pass re-nominates every already-orphaned candidate exactly once
     (its child verdicts were filed after its mint by construction)."""
     return int(nd.get("closerLookT") or nd.get("t") or 0)
+
+
+def _intr_paused_only(nd):
+    """True when this node's standing block is ONLY the interrupt machinery's stop-bookkeeping —
+    the newest block-family diary state is an src='interrupt' block with no later unblock. Such a
+    block is romp recording "the user paused this session", not a question owed to the user, so it
+    must not SEAL the goal out of the completion channels (2026-08-26, the Completed→Working
+    sighting): a goal that finished while interrupt-blocked was uncompletable — every closer
+    nomination skips blocked nodes, and the interrupt block only lifts on re-engagement — so it
+    rested in Needs-You looking done and bounced to Working on every user touch. An ask-shaped
+    block (planner/nudge/closer) keeps the seal exactly: blocked stays the unblocker's."""
+    if not nd.get("blocked"):
+        return False
+    last = None
+    for e in nd.get("log") or []:
+        if e.get("kind") == "block":
+            last = e
+        elif e.get("kind") == "unblock":
+            last = None
+    return bool(last and last.get("src") == "interrupt")
+
+
 def _subtree_done_candidates(store):
     """OPEN nodes whose every direct child is complete/cleared but which carry NO verdict of their own —
     the trigger population for the closer's steps-finished ruling (the user 2026-07-15, the
@@ -9554,8 +9576,12 @@ def _subtree_done_candidates(store):
         children.setdefault(nd.get("parentId"), []).append(nid)
     out = []
     for nid, nd in nodes.items():
-        if nd.get("nodeComplete") or nd.get("cleared") or nd.get("blocked") or nd.get("settledDone"):
+        if nd.get("nodeComplete") or nd.get("cleared") or nd.get("settledDone"):
             continue
+        if nd.get("blocked") and not _intr_paused_only(nd):
+            continue                                   # an ask-shaped block seals; an interrupt PAUSE does not
+            #                                            (2026-08-26 — a finished goal must not be uncompletable
+            #                                            just because the user stopped the session)
         if nd.get("umbrella"):
             continue                                   # a pure container completes structurally (is_complete's
             #                                            umbrella carve-out) — nothing to ask the closer
@@ -9685,8 +9711,10 @@ def _status_report_candidates(store, turn):
     for nid, nd in nodes.items():
         if nd.get("parentId") is not None:
             continue                                   # tops only: the cards the board actually shows
-        if nd.get("nodeComplete") or nd.get("cleared") or nd.get("blocked") or nd.get("settledDone"):
+        if nd.get("nodeComplete") or nd.get("cleared") or nd.get("settledDone"):
             continue
+        if nd.get("blocked") and not _intr_paused_only(nd):
+            continue                                   # ask-shaped blocks seal; an interrupt pause rides (2026-08-26)
         if nd.get("umbrella") or _task_open_below(nodes, children, nid):
             continue
         out.append(nd)

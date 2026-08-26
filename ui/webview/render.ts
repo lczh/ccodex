@@ -48,7 +48,7 @@ import { initStrip, fmtReset } from "./strip";
 import { apiErrorReason } from "./api-error-reason";
 import { mathBlock, mathInline } from "./math";
 import { queuedCancelKey } from "./cancel-key";
-import { threadInFlight, latchBusy, settleConfirmed, type BusyLatch, threadsByAnchor, threadBusy, threadStuck, findAnchorRange, sliceRanges, prunePending, type CommentThread } from "./comments";
+import { agentCount, replyOwed, threadsByAnchor, threadBusy, threadStuck, findAnchorRange, sliceRanges, prunePending, type CommentThread } from "./comments";
 
 for (const [name, lang] of Object.entries({
   bash, sh: bash, shell: bash, python, py: python, javascript, js: javascript,
@@ -6126,19 +6126,20 @@ function showForkPrompt(sid: string, uuid: string): void {
 // re-render (the transcript rebuilds constantly) reapplies it — the openFolds pattern.
 const commentThreads = new Map<string, CommentThread[]>();          // parent sid → last frame's threads
 const commentPending = new Map<string, { text: string; t: number }[]>(); // tid → optimistic sends
-// the one busy answer for the mark + rail tick: the LIVE reading (the pure predicate plus this
-// pane's own optimistic sends) OR the settle latch — a turn boundary inside a continuing thread can
-// read settled for one push, and the green must not blip yellow on it (the user 2026-08-24, second
-// report; comments.ts latchBusy has the rule). The latch advances once per comments FRAME (the
-// event); the live OR keeps optimistic sends instant between frames.
-const commentBusyLatch = new Map<string, BusyLatch>();
+// THE EXCHANGE LATCH (T102, the user 2026-08-26): tid → the agent-message count at the newest SEND.
+// Set at the send GESTURE (create seeds 0 under the synth tid, transferred on adopt; a reply stamps
+// the count at its send), cleared ONLY by the reply-arrived event — the agent's reply record landing
+// in th.msgs (agentCount rising past the base; see the comments frame handler). Follow-ups re-latch
+// identically, each until ITS reply arrives. No push counting, no thread-state proxy: the old
+// push-count settle killed the create-window green while the fork booted (its frames read
+// all-quiet) and any stall in its stepping parked green forever — both ends of the reported bug.
+const cmtAwaitBase = new Map<string, number>();
+// the one busy answer for the mark + rail tick: an in-flight EXCHANGE (the gesture latch above), or
+// — after a reload lost the client latch — the exchange's own records still saying a reply is owed
+// (msgs ending with the user's message). A stuck/errored/closed thread never pulses: green would lie.
 const commentInFlight = (th: CommentThread): boolean => {
-  const raw = threadInFlight(th) || (th.status === "open" && !!(commentPending.get(th.tid) || []).length);
-  // the kernel-carried confirm makes the settle LIVE (the user 2026-08-25: green→yellow waited for a
-  // click): green holds until the frame says two pushes read settled; older kernels → the client latch
-  const confirmed = settleConfirmed(th);
-  if (confirmed !== null) return raw || (th.status === "open" && !th.error && !confirmed);
-  return raw || !!commentBusyLatch.get(th.tid)?.green;
+  if (th.status !== "open" || !!th.error || threadStuck(th.state)) return false;
+  return cmtAwaitBase.has(th.tid) || replyOwed(th);
 };
 const commentDrafts = new Map<string, string>();                    // draft key → unsent popover text
 // The popover-boot hold (fillCommentMsgs): tid → when the loader first held the list. Held until the
@@ -6471,6 +6472,10 @@ function openCommentPopover(sid: string, tid: string, _x?: number, _y?: number):
  *  kernel sends the frame first, then the ack naming the tid). When the frame hasn't landed yet
  *  (a dropped/reordered leg), the tid parks in pendingAdoptTid and the next frame adopts it. */
 function adoptCommentThread(sid: string, tid: string): void {
+  // the create's gesture latch carries onto the real thread (the synth tid retires with the anchor)
+  for (const k of Array.from(cmtAwaitBase.keys())) {
+    if (k.startsWith("pending:")) { cmtAwaitBase.set(tid, cmtAwaitBase.get(k)!); cmtAwaitBase.delete(k); }
+  }
   if (pendingCommentAnchor && pendingCommentAnchor.sid === sid) {
     commentDrafts.delete("new:" + pendingCommentAnchor.uuid);
     commentDrafts.delete("newname:" + pendingCommentAnchor.uuid);
@@ -6481,6 +6486,18 @@ function adoptCommentThread(sid: string, tid: string): void {
   vscodeApi?.postMessage({ type: "commentSeen", id: sid, tid });
   renderCommentPopover();
   applyCommentMarks(sid);
+}
+
+/** The popover's unconfirmed sends, rendered through the CHAT'S OWN queued idiom — renderQueued's
+ *  bare optimistic group, the exact component an unconfirmed chat send wears (T104, the user
+ *  2026-08-26: the thread-local echo was a washed-gray one-off pill, the "third look" the chat
+ *  killed 2026-07-16 reborn in the popover; "I really want to be inheriting all the stuff for how
+ *  the chat normally renders"). Inherited, never restyled: the dashed bubble, the sent-just-now
+ *  title, the no-header bare form all come from the one code path. */
+function cmtPendingQueued(pend: { text: string; t: number }[]): HTMLElement {
+  return renderQueued({ kind: "queued", bare: true,
+    texts: pend.map((p) => ({ md: p.text, optimistic: true, cancelable: false })),
+    uuid: OPT_PREFIX + pend[0].t } as Extract<ChatEvent, { kind: "queued" }>);
 }
 
 function commentMsgEl(who: "you" | "agent", text: string): HTMLElement {
@@ -6521,11 +6538,7 @@ function fillCommentMsgs(list: HTMLElement, th: CommentThread, sid: string): voi
     const boot = el("div", "cmt-boot");
     boot.appendChild(rompLoaderInner("opening the thread…", { wordmark: false }));
     list.appendChild(boot);
-    for (const pb of pend) {
-      const n = commentMsgEl("you", pb.text);
-      n.classList.add("pending");
-      list.appendChild(n);
-    }
+    if (pend.length) list.appendChild(cmtPendingQueued(pend));
     list.scrollTop = list.scrollHeight;
     return;
   }
@@ -6592,11 +6605,7 @@ function fillCommentMsgs(list: HTMLElement, th: CommentThread, sid: string): voi
       list.closest(".cmt-pop")?.querySelector(":scope > .cmt-quote")?.remove();
     }
   } else for (const m of th.msgs) list.appendChild(commentMsgEl(m.who, m.text));
-  for (const p of pend) {
-    const n = commentMsgEl("you", p.text);
-    n.classList.add("pending");
-    list.appendChild(n);
-  }
+  if (pend.length) list.appendChild(cmtPendingQueued(pend));
   // (the typing dots that rendered here while the thread was busy are RETIRED — the user 2026-08-24:
   // the await-green highlight carries the in-flight signal, and the reply's arrival is announced by
   // the green→yellow settle; the pending bubble still acknowledges the user's own send)
@@ -6768,6 +6777,7 @@ function commentSendFromPop(pop: HTMLElement): void {
       unread: false, promotedName: "", msgs: [], name: nm || "comment", color: create.color || "" };
     const cur0 = commentThreads.get(create.sid) || [];
     commentThreads.set(create.sid, [...cur0.filter((t) => t.tid !== synth.tid), synth]);
+    cmtAwaitBase.set(synth.tid, 0);   // the SEND gesture latches the pulse — before any kernel round-trip (T102)
     applyCommentMarks(create.sid);
     vscodeApi.postMessage({ type: "commentCreate", id: create.sid, uuid: create.uuid, exact: create.exact,
       text, name: nm, model: create.model || "", effort: create.effort || "",
@@ -6777,7 +6787,8 @@ function commentSendFromPop(pop: HTMLElement): void {
   const cur = openCommentThread();
   if (!cur) return;
   vscodeApi.postMessage({ type: "commentReply", id: cur.sid, tid: cur.th.tid, text });
-  cur.th.state = "working";                     // optimistic: the ants march on the SEND, not the
+  cmtAwaitBase.set(cur.th.tid, agentCount(cur.th));   // a follow-up RE-LATCHES at its own send, until ITS reply (T102)
+  cur.th.state = "working";                     // optimistic: the pulse rides the SEND, not the
   applyCommentMarks(cur.sid);                   // round-trip (the kernel's next frame confirms)
   const pl = commentPending.get(cur.th.tid) || [];
   pl.push({ text, t: Date.now() / 1000 });
@@ -11432,9 +11443,16 @@ window.addEventListener("message", (e: MessageEvent) => {
     const sid = String(m.id);
     const threads = (m.threads || []) as CommentThread[];
     commentThreads.set(sid, threads);
-    // the settle latch steps ONCE per frame — the deciding events are pushes (see comments.ts)
-    for (const t of threads) commentBusyLatch.set(t.tid, latchBusy(commentBusyLatch.get(t.tid), t, !!(commentPending.get(t.tid) || []).length));
-    for (const k of Array.from(commentBusyLatch.keys())) if (!threads.some((t) => t.tid === k)) commentBusyLatch.delete(k);
+    // THE REPLY-ARRIVED EVENT (T102): a frame whose msgs hold MORE agent records than the send's
+    // base means THAT send's reply landed — the exchange latch clears here and nowhere else. A
+    // thread that left "open" (or errored) drops its latch too: green would lie about a reply
+    // that is no longer on the way.
+    for (const t of threads) {
+      const base = cmtAwaitBase.get(t.tid);
+      if (base !== undefined && (agentCount(t) > base || t.status !== "open" || !!t.error)) cmtAwaitBase.delete(t.tid);
+    }
+    for (const k of Array.from(cmtAwaitBase.keys()))
+      if (!k.startsWith("pending:") && !threads.some((t) => t.tid === k)) cmtAwaitBase.delete(k);
     const live = new Set(threads.filter((t) => t.status !== "promoted").map((t) => t.tid));
     for (const k of Array.from(commentPending.keys())) if (!live.has(k)) commentPending.delete(k);
     for (const k of Array.from(commentDrafts.keys())) if (!k.startsWith("new:") && !live.has(k)) commentDrafts.delete(k);

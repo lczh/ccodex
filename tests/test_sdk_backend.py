@@ -1886,12 +1886,69 @@ class SpendRecord(unittest.TestCase):
         self.assertLessEqual(len(kept), 90)
         self.assertIn(self._today(), kept)
 
+    def test_by_sid_attribution_with_keyed_split(self):
+        # T100 (the nightly optimizer's accepted ask): key-billed cost PER SESSION. Two sids, one
+        # keyed and one login — the bucket totals stay whole, and each sid carries its own keyed
+        # dimension. Private synthetic sids (the goal-store fixture rule).
+        self.be._record_spend(0.02, {"input_tokens": 100, "output_tokens": 40}, keyed=True,
+                              sid="aaaa1111-spend-attr-1")
+        self.be._record_spend(0.03, {"input_tokens": 10, "output_tokens": 5}, keyed=False,
+                              sid="aaaa1111-spend-attr-2")
+        self.be._record_spend(0.05, {"input_tokens": 1, "output_tokens": 1}, keyed=True,
+                              sid="aaaa1111-spend-attr-1")
+        d = json.loads(self.p.read_text())["days"][self._today()]
+        self.assertAlmostEqual(d["usd"], 0.10)
+        by = d["bySid"]
+        s1, s2 = by["aaaa1111-spend-attr-1"], by["aaaa1111-spend-attr-2"]
+        self.assertAlmostEqual(s1["usd"], 0.07)
+        self.assertEqual((s1["turns"], s1["tok"]), (2, 142))
+        self.assertAlmostEqual(s1["key"]["usd"], 0.07, msg="the keyed split rides the sid — the optimizer's dimension")
+        self.assertEqual((s1["key"]["turns"], s1["key"]["tok"]), (2, 142))
+        self.assertAlmostEqual(s2["usd"], 0.03)
+        self.assertNotIn("key", s2, "a login-only sid carries no keyed split — its cost is dollars nobody is billed")
+        h = json.loads(self.p.read_text())["hours"][time.strftime("%Y-%m-%dT%H")]
+        self.assertAlmostEqual(h["bySid"]["aaaa1111-spend-attr-1"]["usd"], 0.07, msg="the hour buckets attribute too")
+
+    def test_legacy_rows_and_sidless_folds_stay_lossless(self):
+        # a pre-T100 bucket (no bySid) folds cleanly, and a sid-less fold never drops attribution
+        # already there (lossless legacy, the T18 discipline)
+        self.p.write_text(json.dumps({"days": {self._today(): {"usd": 1.0, "turns": 3}}}))
+        self.be._record_spend(0.02, keyed=True, sid="aaaa1111-spend-attr-3")
+        d = json.loads(self.p.read_text())["days"][self._today()]
+        self.assertAlmostEqual(d["usd"], 1.02)
+        self.assertAlmostEqual(d["bySid"]["aaaa1111-spend-attr-3"]["usd"], 0.02,
+                               msg="attribution begins mid-history without touching the legacy totals")
+        self.be._record_spend(0.01)   # a sid-less caller
+        d = json.loads(self.p.read_text())["days"][self._today()]
+        self.assertAlmostEqual(d["usd"], 1.03)
+        self.assertAlmostEqual(d["bySid"]["aaaa1111-spend-attr-3"]["usd"], 0.02,
+                               msg="the sid-less fold carried the existing bySid forward")
+
+    def test_by_sid_prunes_with_its_bucket(self):
+        # the maps live INSIDE the buckets, so the 90d prune takes them with it — no second ledger
+        # to sweep and no orphaned attribution
+        days = {"2020-04-%02d" % (i % 30 + 1): {"usd": 1, "turns": 1,
+                                                "bySid": {"aaaa1111-spend-attr-4": {"usd": 1, "turns": 1, "tok": 0}}}
+                for i in range(30)}
+        days.update({"2020-%02d-01" % (m + 1): {"usd": 1, "turns": 1} for m in range(12)})
+        days.update({"2021-%02d-01" % (m + 1): {"usd": 1, "turns": 1} for m in range(12)})
+        days.update({"2022-%02d-%02d" % (m + 1, d + 1): {"usd": 1, "turns": 1}
+                     for m in range(12) for d in range(4)})
+        self.assertGreater(len(days), 90, "the fixture really overflows the window")
+        self.p.write_text(json.dumps({"days": days}))
+        self.be._record_spend(0.01, sid="aaaa1111-spend-attr-5")
+        kept = json.loads(self.p.read_text())["days"]
+        self.assertLessEqual(len(kept), 90)
+        self.assertIn(self._today(), kept)
+        self.assertNotIn("2020-04-01", kept, "the oldest bucket left — and its bySid map with it, atomically")
+        self.assertIn("bySid", kept[self._today()])
+
     def test_result_message_records_and_the_kernel_serves_it(self):
         src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
                                 "kernel", "sdk_backend.py")).read()
-        self.assertIn("self.backend._record_spend(delta, turn_u, keyed=self.api_key_auth)", src,
+        self.assertIn("self.backend._record_spend(delta, turn_u, keyed=self.api_key_auth, sid=self.sid)", src,
                       "the settle folds THIS turn's DELTAS — cost AND tokens are cumulative per process — "
-                      "tagged with the session's own auth so the API sum stays honest on a mixed host")
+                      "tagged with the session's own auth AND its sid (T100: per-session attribution)")
         self.assertIn("self._last_cost_total = 0.0   # a fresh CLI process starts its cumulative cost at zero",
                       src, "each connect resets the watermark with its new process")
         self.assertIn("self._last_usage_totals = {}  # …and its cumulative token counters", src,

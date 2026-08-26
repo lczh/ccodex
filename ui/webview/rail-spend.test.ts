@@ -47,7 +47,8 @@ test("the kernel serves spend windows for BOTH payload shapes, keyed-only beside
   // the accumulator: cumulative-per-process DELTAS, and each bucket splits out the key's own turns
   assert.ok(BACKEND.includes("delta = total - self._last_cost_total if total >= self._last_cost_total else total"));
   assert.ok(BACKEND.includes("turn_u[k] = v - last if v >= last else v"));
-  assert.ok(BACKEND.includes("self.backend._record_spend(delta, turn_u, keyed=self.api_key_auth)"));
+  assert.ok(BACKEND.includes("self.backend._record_spend(delta, turn_u, keyed=self.api_key_auth, sid=self.sid)"),
+    "the settle threads the session sid — per-session attribution (T100)");
   assert.ok(BACKEND.includes("if keyed or ke:   # carry an existing key split forward even on a login turn"));
   assert.ok(BACKEND.includes("_fold(days, day, 90)"));
   assert.ok(BACKEND.includes("_fold(hours, hour, 192)"), "8 days of hour buckets feed the rolling windows");

@@ -2777,7 +2777,6 @@ mark.cmt-hl.hl-last { border-top-right-radius: 2px; border-bottom-right-radius: 
 .cmt-msg.agent { background: rgba(255, 255, 255, 0.05); align-self: flex-start; max-width: 96%; }
 .cmt-msg.agent > *:first-child { margin-top: 0; }
 .cmt-msg.agent > *:last-child { margin-bottom: 0; }
-.cmt-msg.pending { opacity: 0.55; }
 .cmt-note { font-size: 0.92em; opacity: 0.7; padding: 2px 6px; }
 /* the popover's message row mirrors the CHAT composer (the user 2026-08-17): clip left, ➤ right,
    pill input — the attach/send buttons share the chat's own selectors above, so they stay in sync */
