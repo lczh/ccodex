@@ -1917,12 +1917,13 @@ def _replay_ui_op_spool():
     # verification: the inline path was still delete-on-failure — the audited P1 alive for
     # pre-upgrade writers). Converted names sort BEFORE every Date.now()-named op (0-prefix),
     # so legacy gestures keep their place in line.
-    for legacy in (jd.STATE / "pending-ui-ops.replay.jsonl", jd.STATE / "pending-ui-ops.jsonl"):
+    _gseq = 0
+    for _li, legacy in enumerate((jd.STATE / "pending-ui-ops.replay.jsonl",
+                                  jd.STATE / "pending-ui-ops.jsonl")):
         try:
             lines = legacy.read_text(errors="replace").splitlines()
         except OSError:
             continue
-        seq = 0
         converted = []
         failed_at = None
         for i, ln in enumerate(lines):
@@ -1933,12 +1934,19 @@ def _replay_ui_op_spool():
             except ValueError:
                 sys.stderr.write("ui-op spool: dropping a torn legacy line (%d bytes)\n" % len(ln))
                 continue
-            seq += 1
+            _gseq += 1
             try:
                 spdir.mkdir(parents=True, exist_ok=True)
-                tmp = spdir / ("0legacy-%d-%d.json.tmp" % (os.getpid(), seq))
+                # ONE sequence spanning both inputs, file-qualified, published no-overwrite
+                # (the v1.3.19 audit's P1: per-file seq reset collided the two legacy files on
+                # the same name and os.replace silently discarded the first op)
+                dst = spdir / ("0legacy-%d-%d-%d.json" % (os.getpid(), _li, _gseq))
+                while dst.exists():
+                    _gseq += 1
+                    dst = spdir / ("0legacy-%d-%d-%d.json" % (os.getpid(), _li, _gseq))
+                tmp = spdir / (dst.name + ".tmp")
                 tmp.write_text(ln)
-                os.replace(tmp, spdir / ("0legacy-%d-%d.json" % (os.getpid(), seq)))
+                os.replace(tmp, dst)
                 converted.append(i)
             except OSError:
                 failed_at = i
@@ -2917,6 +2925,17 @@ def _run_update(tag):
         + "  rm -rf %s\n" % snapdir
         + "  return $SIRC\n"
         + "}\n"
+        # the RUNTIME GENERATION for the verified commit, REQUIRED before the latch is spent
+        # (the v1.3.19 audit's P1): serve/manager resolve romp-run-<sha8> per spawn, and the tag
+        # updater built none — /restart-all then launched live checkout bytes on the normal
+        # signed-release path. Idempotent per commit; atomically published (tmp + mv).
+        + "gen_build() {\n"
+        + "  GBGD=$(git rev-parse --absolute-git-dir 2>/dev/null) || return 1\n"
+        + "  [ -d \"$GBGD/romp-run-$1\" ] && return 0\n"
+        + "  rm -rf \"$GBGD/romp-run-$1.tmp.$$\" && mkdir -p \"$GBGD/romp-run-$1.tmp.$$\" || return 1\n"
+        + "  git archive \"$1\" | tar -x -C \"$GBGD/romp-run-$1.tmp.$$\" || { rm -rf \"$GBGD/romp-run-$1.tmp.$$\"; return 1; }\n"
+        + "  mv \"$GBGD/romp-run-$1.tmp.$$\" \"$GBGD/romp-run-$1\" 2>/dev/null || { rm -rf \"$GBGD/romp-run-$1.tmp.$$\"; [ -d \"$GBGD/romp-run-$1\" ]; }\n"
+        + "}\n"
         # a healed or completed move publishes any staged CHANNEL INTENT for its commit before
         # the latch is spent (the v1.3.8 audit: a healer reviving a crashed bootstrap's stable
         # target under the stale dev marker followed unsigned main); pub_intent returns nonzero
@@ -3003,8 +3022,9 @@ def _run_update(tag):
         + "    if [ \"$(sed -n 1p %s 2>/dev/null | awk '{print $1}' | head -c 8)\" = \"$NEW8\" ] "
           "&& git merge --ff-only %s >> %s 2>&1 "
           "&& [ \"$(git rev-parse --short=8 HEAD | head -c 8)\" = \"$NEW8\" ] "
-          "&& snap_install \"$NEW8\" >> %s 2>&1; then\n"
-          % (latch, tag, log, log)
+          "&& snap_install \"$NEW8\" >> %s 2>&1 "
+          "&& gen_build \"$NEW8\" >> %s 2>&1; then\n"
+          % (latch, tag, log, log, log)
         + "      if pub_line \"$(pick_pub \"$(sed -n 1p %s 2>/dev/null)\" %s)\"; then rm -f %s; OK=1; fi\n"
           % (latch, latch, latch)
         + "    fi\n"
@@ -13487,7 +13507,8 @@ def _update_remote(host):
         # heal, no restart — before the channel gate, so a stable host at the target commit
         # reads in-sync (the r43 P1's exact shape)
         'hh=subprocess.run(["git","-C",r,"rev-parse","HEAD"],capture_output=True,text=True)\n'
-        'if hh.returncode==0 and (hh.stdout or "").strip()==target and not os.path.exists(lp):\n'
+        'if (hh.returncode==0 and (hh.stdout or "").strip()==target and not os.path.exists(lp)\n'
+        '        and not os.path.exists(os.path.join(os.path.dirname(lp),"romp-restart-needed"))):\n'
         "    sys.exit(36)\n"
         "if v is not None:\n"
         '    if v!="dev":\n'

@@ -381,6 +381,16 @@ class RunUpdate(Fresh):
         self.assertNotIn("git pull", script, "a pull takes whatever the branch has gained past the tag")
         self.assertIn('snap_install "$NEW8"', script,
                       "the install runs the snapshot, never ./install.sh from the live tree")
+        # the v1.3.19 audit's P1: the tag updater spent the latch and restarted with NO runtime
+        # generation for the verified commit — serve/manager then resolved LIVE checkout bytes
+        # (executed MUTATED_LIVE_BYTES on the normal signed-release path)
+        self.assertIn('gen_build "$NEW8"', script,
+                      "the runtime generation for the verified commit is REQUIRED")
+        self.assertLess(script.index('snap_install "$NEW8"'), script.index('&& gen_build "$NEW8"'),
+                        "…built inside the transaction, after the install")
+        self.assertLess(script.index('&& gen_build "$NEW8"'), script.index("if pub_line"),
+                        "…and BEFORE the latch is spent: a missing generation fails the update")
+        self.assertIn('romp-run-$1', script, "the per-commit generation name the resolvers read")
         self.assertIn("update-report.json", script)
         # the restart rides the SUCCESS branch only: everything after `if` up to `else` has it,
         # the failure branch does not

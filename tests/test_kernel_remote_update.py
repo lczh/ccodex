@@ -209,6 +209,22 @@ class UpdateRemote(unittest.TestCase):
         self.assertLess(apply.index("sys.exit(36)"), apply.index('["pkill","-f"'),
                         "…and before any kill: an up-to-date healthy kernel is never restarted")
 
+    def test_an_armed_restart_marker_bypasses_insync(self):
+        # the v1.3.19 audit's P1: the equal-HEAD shortcut checked only the install latch, so a
+        # FAILED launch's armed romp-restart-needed marker looped "already up to date" forever
+        # while the old kernel kept running. Any marker at all fails closed into the full
+        # transaction (which restages the generation and retries the launch).
+        calls = self._wire(disc_out="DIR:/home/u/romp\nHEAD:%s\nDIRTY:\nLATCH:0" % self.LFULL,
+                           apply_out="INSTALLFAIL")
+        km._update_remote("TESTHOST")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        self.assertIn('"romp-restart-needed"))', apply.replace("\n", ""),
+                      "the marker is one of the no-op's REQUIRED-clear facts")
+        i = apply.index("sys.exit(36)")
+        cond = apply[max(0, i - 400):i]
+        self.assertIn("romp-restart-needed", cond,
+                      "…read in the same locked condition as HEAD and the latch")
+
     def test_an_insync_report_must_name_the_pushed_commit(self):
         self._wire(disc_out="DIR:/home/u/romp\nHEAD:%s\nDIRTY:\nLATCH:0" % self.LFULL,
                    apply_out="INSYNC:9999999")

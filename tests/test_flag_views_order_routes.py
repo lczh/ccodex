@@ -589,6 +589,19 @@ class PerFileOpSpool(unittest.TestCase):
         flags = json.loads((km.jd.STATE / "session-flags.json").read_text())
         self.assertTrue(flags[SID]["postalServiceOff"], "…which then applies")
 
+    def test_both_legacy_spools_convert_without_collision(self):
+        # the v1.3.19 audit's P1: each legacy file reset seq, so .replay.jsonl and .jsonl
+        # collided on 0legacy-<pid>-1.json and os.replace silently discarded a SAFETY op —
+        # of two independent writes (hideFromFeed, postalServiceOff), only one survived
+        (km.jd.STATE / "pending-ui-ops.replay.jsonl").write_text(json.dumps(
+            {"op": "flag", "target": SID, "flag": "hideFromFeed", "value": True}) + "\n")
+        (km.jd.STATE / "pending-ui-ops.jsonl").write_text(json.dumps(
+            {"op": "flag", "target": SID, "flag": "postalServiceOff", "value": True}) + "\n")
+        km._replay_ui_op_spool()
+        flags = json.loads((km.jd.STATE / "session-flags.json").read_text())
+        self.assertTrue(flags[SID].get("hideFromFeed"), "the first file's op survived")
+        self.assertTrue(flags[SID].get("postalServiceOff"), "…and the second's — no overwrite")
+
     def test_the_legacy_append_spool_is_still_consumed_once(self):
         (km.jd.STATE / "pending-ui-ops.jsonl").write_text(json.dumps(
             {"op": "flag", "target": SID, "flag": "hideFromFeed", "value": True}) + "\n")
