@@ -712,9 +712,50 @@ class ReceiptDurability(unittest.TestCase):
         rows = [json.loads(l) for l in (pm.TLDIR / "messages.jsonl").read_text().splitlines()]
         row = [r for r in rows if r.get("ev") == "sent" and r.get("relay_mid") == "px-cw1"]
         self.assertTrue(row, "the translation row is durable before the publish point")
-        payload, status = pm.handoff_done_apply({"mid": row[0]["id"]})
-        self.assertEqual(status, 200)
-        self.assertEqual(payload.get("queued"), "hosta")
+        # what that row means for the receipt lane when the publish RAISED lives in
+        # test_a_failed_publish_compensates_and_never_mints_a_receipt
+
+    def test_a_failed_publish_compensates_and_never_mints_a_receipt(self):
+        # the v1.3.18 audit: the sent row is logged before the publish rename BY DESIGN
+        # (the durability above), so a rename that raises left a permanent phantom —
+        # handoff_done_apply translated it into a receipt for mail that never existed.
+        # The fix compensates with an ev:"unpublished" row that voids the sent row.
+        import pathlib
+
+        pm._HDA_MISS.clear()
+        try:
+            pm.RECEIPTS_DONE.unlink()
+        except OSError:
+            pass
+
+        def boom(self2, target):
+            raise OSError(5, "publish failed")
+
+        with mock.patch.object(pathlib.Path, "rename", boom):
+            with self.assertRaises(OSError):
+                pm.deliver("sid-ph", "peer", "sid-p", "task", kind="delegate",
+                           from_host="hosta", relay_mid="px-ph1", relay_via="hosta")
+        rows = [json.loads(l) for l in (pm.TLDIR / "messages.jsonl").read_text().splitlines()]
+        sent = [r for r in rows if r.get("ev") == "sent" and r.get("relay_mid") == "px-ph1"]
+        self.assertTrue(sent, "the sent row stays durable — compensation, not suppression")
+        mid = sent[0]["id"]
+        self.assertTrue([r for r in rows
+                         if r.get("ev") == "unpublished" and r.get("id") == mid],
+                        "the raising publish leaves its compensating row in the same log")
+        payload, status = pm.handoff_done_apply({"mid": mid})
+        self.assertEqual(status, 404, "a voided sent row reads as absent")
+        self.assertTrue(payload.get("retry"),
+                        "phantom -> retryable-unknown, never a queued receipt")
+        self.assertNotIn({"mid": "px-ph1", "origin": "hosta"}, pm.receiptbox_list("hosta"),
+                         "no receipt is ever minted for mail that never existed")
+
+    def test_a_clean_publish_logs_no_compensation(self):
+        mid = pm.deliver("sid-ok", "peer", "sid-p", "hello", kind="coordinate")
+        self.assertTrue((pm.MAILROOT / "sid-ok" / "new" / mid).exists())
+        rows = [json.loads(l) for l in (pm.TLDIR / "messages.jsonl").read_text().splitlines()]
+        self.assertFalse([r for r in rows
+                          if r.get("ev") == "unpublished" and r.get("id") == mid],
+                         "a published mail never wears a compensating row")
 
     def test_maildir_headers_recover_a_lost_row(self):
         mb = pm._mailbox("sid-hr")
@@ -861,3 +902,46 @@ class AliasHistory(unittest.TestCase):
         rows = [json.loads(l) for l in (pm.TLDIR / "messages.jsonl").read_text().splitlines()]
         n = sum(1 for r in rows if r.get("ev") == "peer-alias" and r.get("from_host") == "hosty")
         self.assertEqual(n, 1)
+
+    def test_a_failed_append_retries_until_the_row_lands(self):
+        # the v1.3.18 audit: the memo advanced BEFORE the best-effort append, so one
+        # failed write suppressed every retry and the binding never became durable —
+        # the memo may only advance once the row actually lands
+        import pathlib
+        pm._ALIAS_LOGGED.clear()
+        pm.PEER_STATE["hostr"] = {"presence": [{"name": "web", "id": "sid-r9"}]}
+        self.addCleanup(lambda: pm.PEER_STATE.pop("hostr", None))
+        base = pathlib.Path(tempfile.mkdtemp())
+        (base / "blocker").write_text("")               # a FILE where a dir must go: mkdir
+        with mock.patch.object(pm, "TLDIR", base / "blocker" / "tl"):   # and open both fail
+            pm._log_peer_aliases("hostr")
+        self.assertNotIn(("hostr", "web"), pm._ALIAS_LOGGED,
+                         "a failed append must leave the memo unadvanced")
+        pm._log_peer_aliases("hostr")
+        rows = [json.loads(l) for l in (pm.TLDIR / "messages.jsonl").read_text().splitlines()]
+        binds = [(r["from"], r["from_id"]) for r in rows
+                 if r.get("ev") == "peer-alias" and r.get("from_host") == "hostr"]
+        self.assertEqual(binds, [("web", "sid-r9")], "the next call retries and lands the row")
+        self.assertEqual(pm._ALIAS_LOGGED.get(("hostr", "web")), "sid-r9",
+                         "the memo advances on the append that succeeded")
+
+    def test_same_second_rebindings_carry_strictly_increasing_seq(self):
+        # readers resolve the latest binding as max over (t, seq), missing seq = 0: two
+        # rebindings inside one epoch second otherwise tie-break lexicographically by
+        # SID, so a rebind DOWN the sort order (sid-v9 -> sid-v1 here) resurrected the
+        # stale holder. seq restores JSONL order; the reader-side tuple is fixed apart.
+        pm._ALIAS_LOGGED.clear()
+        self.addCleanup(lambda: pm.PEER_STATE.pop("hostv", None))
+        with mock.patch.object(pm.time, "time", lambda: 1700000000.0):
+            for aid in ("sid-v9", "sid-v1"):
+                pm.PEER_STATE["hostv"] = {"presence": [{"name": "w", "id": aid}]}
+                pm._log_peer_aliases("hostv")
+        rows = [json.loads(l) for l in (pm.TLDIR / "messages.jsonl").read_text().splitlines()]
+        mine = [r for r in rows if r.get("ev") == "peer-alias" and r.get("from_host") == "hostv"]
+        self.assertEqual([r["from_id"] for r in mine], ["sid-v9", "sid-v1"])
+        self.assertEqual(len({r["t"] for r in mine}), 1,
+                         "the collision under test: both rows in one epoch second")
+        seqs = [r["seq"] for r in mine]
+        self.assertTrue(all(isinstance(s, int) for s in seqs), seqs)
+        self.assertTrue(all(b > a for a, b in zip(seqs, seqs[1:])),
+                        "strictly increasing seq is the readers' (t, seq) tie-break: %r" % seqs)

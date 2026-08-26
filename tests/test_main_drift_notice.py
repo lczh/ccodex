@@ -1608,6 +1608,22 @@ class DistGenerationPublish(unittest.TestCase):
             gens = list(pub.glob("dist.gen.*"))
             self.assertEqual(len(gens), 1, "the swap prunes everything but the live generation")
 
+    def test_a_crashed_first_conversion_heals_on_the_next_publish(self):
+        # the v1.3.18 audit: the one-time real-dir conversion moves dist aside before the
+        # symlink lands — a death in that window left NO dist at all
+        import pathlib
+        with tempfile.TemporaryDirectory() as td:
+            pub = pathlib.Path(td) / "vscode-extension"
+            src = pathlib.Path(td) / "src"
+            src.mkdir(parents=True)
+            pub.mkdir()
+            (src / "feed.js").write_text("new")
+            (pub / ".dist.old.999").mkdir()            # the crash's leftovers: dist moved aside,
+            (pub / ".dist.old.999" / "feed.js").write_text("old")   # no symlink ever landed
+            km._publish_dist_generation(str(src), pub=pub)
+            self.assertEqual((pub / "dist" / "feed.js").read_text(), "new",
+                             "the publish completes and the crash leftovers are absorbed")
+
     def test_a_failed_copy_leaves_the_old_generation_serving(self):
         import pathlib
         import shutil
@@ -1705,6 +1721,17 @@ class UiOnlyConverge(unittest.TestCase):
         self.assertTrue(any(not ok and "esbuild boom" in m for m, ok in self.notices))
         self.assertEqual([b.get("drift") for b in self.banners], ["restart"],
                          "the normal restart offer still fires")
+
+    def test_an_armed_latch_stops_the_ui_converge(self):
+        # the v1.3.18 audit: the UI-only converge ignored an armed install latch and published
+        # assets from a mid-install checkout
+        km._main_drift_verdict = lambda o, c, k: ("restart", "cccc1234" + "0" * 32)
+        km._kernel_code_changed = lambda a, b: False
+        km._checkout_sha = lambda: "cccc1234" + "0" * 32
+        km._rebuild_dist = lambda commit: self.fail("a mid-install checkout must never be built")
+        with mock.patch.object(km, "_install_latch_lines", return_value=["cccc1234"]):
+            km._main_drift_check()
+        self.assertEqual(km._REBUILT_FOR[0], "", "nothing latched — the boot heal owns it")
 
     def test_a_checkout_moved_under_the_lock_is_never_built(self):
         # the v1.3.17 audit's P2.7 repro: classification ran unlocked, an updater moved the

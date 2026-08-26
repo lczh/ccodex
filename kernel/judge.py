@@ -9304,18 +9304,27 @@ def _postal_ask_maps():
             if o.get("from_host") and o.get("from") and o.get("from_id"):
                 key = str(o["from_host"]) + ":" + str(o["from"])
                 alias[key] = str(o["from_id"])
-                ahist.setdefault(key, []).append((int(o.get("t") or 0), str(o["from_id"])))
+                try:
+                    _seq = int(o.get("seq") or 0)
+                except (TypeError, ValueError):
+                    _seq = 0
+                ahist.setdefault(key, []).append((int(o.get("t") or 0), _seq, str(o["from_id"])))
+        unpub = {str(o["id"]) for o in rows if o.get("ev") == "unpublished" and o.get("id")}
 
         def _alias_at(key, when):
-            # the binding ACTIVE when the row was sent (the r45 verification; the kernel's
-            # _postal_wait_maps applies the identical rule — the two readers must not disagree)
+            # the binding ACTIVE when the row was sent, ordered by (t, seq) — same-second
+            # rebindings resolve in JSONL order (the v1.3.18 audit); the kernel's
+            # _postal_wait_maps applies the identical rule — the two readers must not disagree
             hist = ahist.get(key) or []
             before = [e for e in hist if e[0] <= when]
             if before:
-                return max(before)[1]
+                return max(before)[2]
             after = [e for e in hist if e[0] > when]
-            return min(after)[1] if after else ""
+            return min(after)[2] if after else ""
         for o in rows:
+            if o.get("ev") == "sent" and str(o.get("id") or "") in unpub:
+                continue                               # a failed publish's phantom row (the
+            #                                            v1.3.18 audit) — same rule as the kernel
             f, t_, ts = o.get("from_id"), o.get("to_id"), o.get("t")
             if not (f and t_ and ts):
                 continue

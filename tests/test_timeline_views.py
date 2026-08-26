@@ -205,6 +205,17 @@ class TimelineViews(unittest.TestCase):
         self.assertIn('_set_timeline_views(_wv, base_rev=_wbr)', src,
                       "the WS write is compare-and-set against the echoed rev (v1.3.17 P2.15)")
 
+    def test_the_ws_write_acks_to_its_sender(self):
+        # the v1.3.18 audit: the CAS protocol had no acknowledgement — the client guessed the
+        # server revision after a refusal, and a guessed rev later coincided with a foreign
+        # write's, accepting a stale blob
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        i = src.index('msg.get("type") == "setTimelineViews"')
+        win = src[i:i + 1400]
+        self.assertIn('"type": "viewsAck"', win)
+        self.assertIn('"ok": bool(_wok), "rev": _wrev', win,
+                      "accepted or refused, the sender re-anchors to the server's actual rev")
+
     def test_payloads_echo_the_views_blob(self):
         src = open(os.path.join(BIN, "romp-kernel")).read()
         self.assertIn('"views": _views_client(),', src, "the timeline payload carries the RENDERED shape")

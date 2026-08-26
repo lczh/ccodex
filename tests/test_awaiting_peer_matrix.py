@@ -514,6 +514,41 @@ class CrossHostDelegation(_Base):
         self.assertEqual(km._peer_answered_at(SID), T0 + 300,
                          "the ask resolves through the binding active WHEN IT WAS SENT")
 
+    def test_a_phantom_sent_row_never_mints_an_awaiting_edge(self):
+        # the v1.3.18 audit: deliver() logs its row before publishing, and a failed publish
+        # compensates with an ev:"unpublished" row — the wait maps must honor it
+        self._fleet_stub()
+        rows = [json.dumps({"id": "ph-1", "ev": "sent", "from": "api", "from_id": SID,
+                            "to_id": "eeeeeeee-1111-2222-3333-444444444444",
+                            "t": T0 + 10, "kind": "question", "body": "QUESTION: alive?"}),
+                json.dumps({"t": T0 + 10, "ev": "unpublished", "id": "ph-1"})]
+        self._log(rows)
+        km._POSTAL_WAIT_CACHE[0] = None
+        last_any, last_ask, last_await = km._postal_wait_maps()
+        self.assertEqual(last_await, {}, "the mail never existed — no edge, no debt")
+
+    def test_same_second_rebindings_resolve_in_log_order(self):
+        # the v1.3.18 audit: (t, id) tuples tie-broke lexicographically by sid — the bus stamps
+        # seq, and the readers order by (t, seq)
+        self._fleet_stub()
+        other = "ffffffff-9999-8888-7777-666666666666"   # lexicographically ABOVE self.RSID:
+        #                                                  the old (t, id) tie-break picks IT
+        rows = [json.dumps({"t": T0 + 5, "ev": "peer-alias", "seq": 1, "from_host": self.RHOST,
+                            "from": "w", "from_id": other}),
+                json.dumps({"t": T0 + 5, "ev": "peer-alias", "seq": 2, "from_host": self.RHOST,
+                            "from": "w", "from_id": self.RSID}),
+                json.dumps({"id": "px-31.mail.TESTHOST-A", "ev": "sent", "from": "api",
+                            "from_id": SID, "to_id": "peer:%s" % self.RHOST,
+                            "toName": "%s:w" % self.RHOST,
+                            "t": T0 + 10, "kind": "question", "body": "the port?"}),
+                json.dumps({"id": "rx-31.mail.%s" % self.RHOST, "ev": "sent", "from": "w",
+                            "from_id": self.RSID, "from_host": self.RHOST, "to_id": SID,
+                            "t": T0 + 300, "kind": "coordinate", "body": "8080"})]
+        self._log(rows)
+        km._POSTAL_WAIT_CACHE[0] = None
+        self.assertEqual(km._peer_answered_at(SID), T0 + 300,
+                         "seq 2 is the binding at ask time — JSONL order, not sid order")
+
     def test_an_unrelated_peers_reply_never_completes(self):
         self._fleet_stub()
         self._log([self._xrow(1, T0 + 10)])

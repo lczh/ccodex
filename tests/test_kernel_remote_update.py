@@ -191,18 +191,30 @@ class UpdateRemote(unittest.TestCase):
                         "an unreadable latch is never presumed clear")
 
     def test_equal_heads_with_a_clear_latch_are_a_true_no_op(self):
-        # the r43 verification's P1: the unconditional settle transaction turned Start into a
-        # STABLENOW refusal on an up-to-date stable-channel host (and restarted a healthy kernel
-        # for nothing). With the latch affirmatively CLEAR, nothing needs healing: answer
-        # "already up to date" and leave the remote alone.
-        calls = self._wire(disc_out="DIR:/home/u/romp\nHEAD:%s\nDIRTY:\nLATCH:0" % self.LFULL)
+        # the r43 verification's P1 (no restart, no STABLENOW on an up-to-date stable host),
+        # DECIDED INSIDE THE WRAPPER'S FLOCK now (the v1.3.18 audit: a latch could arm between
+        # the local discovery and the local return, bypassing the settle). The wrapper reads
+        # HEAD + the latch fresh under its lock and exits INSYNC before the channel gate and
+        # before any kill; the local report maps it back to "already up to date".
+        calls = self._wire(disc_out="DIR:/home/u/romp\nHEAD:%s\nDIRTY:\nLATCH:0" % self.LFULL,
+                           apply_out="INSYNC:1111111")
         ok, detail = km._update_remote("TESTHOST")
-        self.assertTrue(ok)
+        self.assertTrue(ok, detail)
         self.assertIn("already up to date", detail)
-        self.assertFalse(any(a[0] == "git" and "push" in a for a in calls),
-                         "a no-op never force-pushes")
-        self.assertFalse(any(isinstance(a[-1], str) and "merge-base" in a[-1] for a in calls),
-                         "a no-op never runs the apply transaction (no install, no restart)")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "merge-base" in a[-1])
+        self.assertIn("sys.exit(36)", apply, "the in-sync verdict is the wrapper's, under flock")
+        self.assertLess(apply.index("sys.exit(36)"), apply.index("if v is not None:"),
+                        "…decided BEFORE the channel gate: a stable host at the target commit "
+                        "reads in-sync, never STABLENOW-unbootable (the r43 P1)")
+        self.assertLess(apply.index("sys.exit(36)"), apply.index('["pkill","-f"'),
+                        "…and before any kill: an up-to-date healthy kernel is never restarted")
+
+    def test_an_insync_report_must_name_the_pushed_commit(self):
+        self._wire(disc_out="DIR:/home/u/romp\nHEAD:%s\nDIRTY:\nLATCH:0" % self.LFULL,
+                   apply_out="INSYNC:9999999")
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("not the pushed one", detail)
 
     def test_the_discover_step_reports_the_latch_state(self):
         calls = self._wire()
@@ -338,7 +350,8 @@ class UpdateRemote(unittest.TestCase):
             (fakebin / "git").write_text(
                 "#!/bin/sh\necho \"$*\" >> '%s'\ncase \" $* \" in\n"
                 "  *' status '*) echo 'fatal: index corrupt' >&2; exit 128;;\n"
-                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge '*) touch \"$(dirname \"$0\")/.head-moved\";;\n"
+                "  *' rev-parse HEAD'*) if [ -e \"$(dirname \"$0\")/.head-moved\" ]; then echo 1111111111111111111111111111111111111111; else echo 0000000000000000000000000000000000000000; fi;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
                 "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % log)
@@ -378,7 +391,8 @@ class UpdateRemote(unittest.TestCase):
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
-                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge '*) touch \"$(dirname \"$0\")/.head-moved\";;\n"
+                "  *' rev-parse HEAD'*) if [ -e \"$(dirname \"$0\")/.head-moved\" ]; then echo 1111111111111111111111111111111111111111; else echo 0000000000000000000000000000000000000000; fi;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
                 "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % gd)
@@ -425,7 +439,7 @@ class UpdateRemote(unittest.TestCase):
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
-                "  *' merge-base '*) exit 0;;\n"
+                "  *' merge-base '*) rm -f \"$(dirname \"$0\")/.head-moved\"; exit 0;;\n"
                 "  *' status '*) echo ' M peer-edit.py';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
@@ -460,10 +474,11 @@ class UpdateRemote(unittest.TestCase):
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
-                "  *' merge-base '*) exit 0;;\n"
+                "  *' merge-base '*) rm -f \"$(dirname \"$0\")/.head-moved\"; exit 0;;\n"
                 "  *' status '*) echo x >> '%s'; [ $(wc -l < '%s') -ge 3 ] && echo ' M raced.py';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
-                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge '*) touch \"$(dirname \"$0\")/.head-moved\";;\n"
+                "  *' rev-parse HEAD'*) if [ -e \"$(dirname \"$0\")/.head-moved\" ]; then echo 1111111111111111111111111111111111111111; else echo 0000000000000000000000000000000000000000; fi;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
                 "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
@@ -487,10 +502,11 @@ class UpdateRemote(unittest.TestCase):
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
-                "  *' merge-base '*) exit 0;;\n"
+                "  *' merge-base '*) rm -f \"$(dirname \"$0\")/.head-moved\"; exit 0;;\n"
                 "  *' status '*) echo x >> '%s'; [ $(wc -l < '%s') -ge 4 ] && echo ' M raced.py';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
-                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge '*) touch \"$(dirname \"$0\")/.head-moved\";;\n"
+                "  *' rev-parse HEAD'*) if [ -e \"$(dirname \"$0\")/.head-moved\" ]; then echo 1111111111111111111111111111111111111111; else echo 0000000000000000000000000000000000000000; fi;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
                 "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
@@ -510,10 +526,11 @@ class UpdateRemote(unittest.TestCase):
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
-                "  *' merge-base '*) exit 0;;\n"
+                "  *' merge-base '*) rm -f \"$(dirname \"$0\")/.head-moved\"; exit 0;;\n"
                 "  *' status '*) echo x >> '%s'; [ $(wc -l < '%s') -ge 4 ] && exit 1;;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
-                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge '*) touch \"$(dirname \"$0\")/.head-moved\";;\n"
+                "  *' rev-parse HEAD'*) if [ -e \"$(dirname \"$0\")/.head-moved\" ]; then echo 1111111111111111111111111111111111111111; else echo 0000000000000000000000000000000000000000; fi;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
                 "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % (gd, nstat, nstat))
@@ -637,11 +654,12 @@ class UpdateRemote(unittest.TestCase):
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
-                "  *' merge-base '*) exit 0;;\n"
+                "  *' merge-base '*) rm -f \"$(dirname \"$0\")/.head-moved\"; exit 0;;\n"
                 "  *' show '*) cat '%s';;\n"
                 "  *' archive '*) tar -c -C '%s' install.sh;;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
-                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge '*) touch \"$(dirname \"$0\")/.head-moved\";;\n"
+                "  *' rev-parse HEAD'*) if [ -e \"$(dirname \"$0\")/.head-moved\" ]; then echo 1111111111111111111111111111111111111111; else echo 0000000000000000000000000000000000000000; fi;;\n"
                 "esac\nexit 0\n" % (gd, committed, commitdir))
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\necho RACED >> '%s'\nexit 0\n" % ops)
@@ -671,12 +689,13 @@ class UpdateRemote(unittest.TestCase):
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
-                "  *' merge-base '*) exit 0;;\n"
+                "  *' merge-base '*) rm -f \"$(dirname \"$0\")/.head-moved\"; exit 0;;\n"
                 "  *' show '*) cat '%s';;\n"
                 "  *' archive '*) tar -c -C '%s' install.sh;;\n"
                 "  *' status '*) [ -e '%s' ] && echo ' M mid-install-edit';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
-                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge '*) touch \"$(dirname \"$0\")/.head-moved\";;\n"
+                "  *' rev-parse HEAD'*) if [ -e \"$(dirname \"$0\")/.head-moved\" ]; then echo 1111111111111111111111111111111111111111; else echo 0000000000000000000000000000000000000000; fi;;\n"
                 "esac\nexit 0\n" % (gd, committed, commitdir, fix / "mid-install-edit"))
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("DIRTYPOSTINSTALL", a.stdout)
@@ -714,10 +733,11 @@ class UpdateRemote(unittest.TestCase):
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
-                "  *' merge-base '*) exit 0;;\n"
+                "  *' merge-base '*) rm -f \"$(dirname \"$0\")/.head-moved\"; exit 0;;\n"
                 "  *' archive '*) tar -c -C '%s' install.sh bin;;\n"
                 "  *' rev-parse --short=8 '*) echo 11111111;;\n"
-                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge '*) touch \"$(dirname \"$0\")/.head-moved\";;\n"
+                "  *' rev-parse HEAD'*) if [ -e \"$(dirname \"$0\")/.head-moved\" ]; then echo 1111111111111111111111111111111111111111; else echo 0000000000000000000000000000000000000000; fi;;\n"
                 "esac\nexit 0\n" % (gd, commitdir))
             (fakebin / "git").chmod(0o755)
             # the wrapper execs the SNAPSHOT manager via `node` (the pinned byte stream, the
@@ -821,10 +841,11 @@ class UpdateRemote(unittest.TestCase):
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
-                "  *' merge-base '*) exit 0;;\n"
+                "  *' merge-base '*) rm -f \"$(dirname \"$0\")/.head-moved\"; exit 0;;\n"
                 "  *' archive '*) tar -c -C '%s' install.sh bin/child.sh;;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
-                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge '*) touch \"$(dirname \"$0\")/.head-moved\";;\n"
+                "  *' rev-parse HEAD'*) if [ -e \"$(dirname \"$0\")/.head-moved\" ]; then echo 1111111111111111111111111111111111111111; else echo 0000000000000000000000000000000000000000; fi;;\n"
                 "esac\nexit 0\n" % (gd, commitdir))
             (fakebin / "git").chmod(0o755)
             # the RACING WRITER's replacements sit in the live tree, both parent and child
@@ -877,10 +898,11 @@ class UpdateRemote(unittest.TestCase):
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
-                "  *' merge-base '*) exit 0;;\n"
+                "  *' merge-base '*) rm -f \"$(dirname \"$0\")/.head-moved\"; exit 0;;\n"
                 "  *' show '*) exit 0;;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
-                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge '*) touch \"$(dirname \"$0\")/.head-moved\";;\n"
+                "  *' rev-parse HEAD'*) if [ -e \"$(dirname \"$0\")/.head-moved\" ]; then echo 1111111111111111111111111111111111111111; else echo 0000000000000000000000000000000000000000; fi;;\n"
                 "esac\nexit 0\n" % gd)
             (fakebin / "git").chmod(0o755)
             (fix / "install.sh").write_text("#!/bin/sh\necho TREE_RAN >> '%s'\nexit 0\n" % ops)
@@ -915,7 +937,8 @@ class UpdateRemote(unittest.TestCase):
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
-                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge '*) touch \"$(dirname \"$0\")/.head-moved\";;\n"
+                "  *' rev-parse HEAD'*) if [ -e \"$(dirname \"$0\")/.head-moved\" ]; then echo 1111111111111111111111111111111111111111; else echo 0000000000000000000000000000000000000000; fi;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
                 "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
@@ -947,7 +970,8 @@ class UpdateRemote(unittest.TestCase):
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' config --get romp.updateChannel'*) echo dev;;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
-                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge '*) touch \"$(dirname \"$0\")/.head-moved\";;\n"
+                "  *' rev-parse HEAD'*) if [ -e \"$(dirname \"$0\")/.head-moved\" ]; then echo 1111111111111111111111111111111111111111; else echo 0000000000000000000000000000000000000000; fi;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s';;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
                 "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
@@ -1072,7 +1096,8 @@ class UpdateRemote(unittest.TestCase):
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
-                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge '*) touch \"$(dirname \"$0\")/.head-moved\";;\n"
+                "  *' rev-parse HEAD'*) if [ -e \"$(dirname \"$0\")/.head-moved\" ]; then echo 1111111111111111111111111111111111111111; else echo 0000000000000000000000000000000000000000; fi;;\n"
                 "  *' merge --ff-only '*) echo MOVED >> '%s/ops.log';;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
                 "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
@@ -1111,7 +1136,8 @@ class UpdateRemote(unittest.TestCase):
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
-                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge '*) touch \"$(dirname \"$0\")/.head-moved\";;\n"
+                "  *' rev-parse HEAD'*) if [ -e \"$(dirname \"$0\")/.head-moved\" ]; then echo 1111111111111111111111111111111111111111; else echo 0000000000000000000000000000000000000000; fi;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
                 "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % gd)
@@ -1160,7 +1186,8 @@ class UpdateRemote(unittest.TestCase):
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
-                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge '*) touch \"$(dirname \"$0\")/.head-moved\";;\n"
+                "  *' rev-parse HEAD'*) if [ -e \"$(dirname \"$0\")/.head-moved\" ]; then echo 1111111111111111111111111111111111111111; else echo 0000000000000000000000000000000000000000; fi;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
                 "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % gd)
@@ -1332,7 +1359,7 @@ class UpdateRemote(unittest.TestCase):
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
-                "  *' merge-base '*) exit 0;;\n"
+                "  *' merge-base '*) rm -f \"$(dirname \"$0\")/.head-moved\"; exit 0;;\n"
                 "  *' status '*) if [ -e '%s' ]; then echo ' M raced-edit.py'; else touch '%s'; fi;;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
@@ -1352,10 +1379,11 @@ class UpdateRemote(unittest.TestCase):
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
-                "  *' merge-base '*) exit 0;;\n"
+                "  *' merge-base '*) rm -f \"$(dirname \"$0\")/.head-moved\"; exit 0;;\n"
                 "  *' rev-parse --short=8 HEAD'*) echo 01dbd11d;;\n"
                 "  *' rev-parse --short=8 '*) echo deadbee2;;\n"
-                "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
+                "  *' merge '*) touch \"$(dirname \"$0\")/.head-moved\";;\n"
+                "  *' rev-parse HEAD'*) if [ -e \"$(dirname \"$0\")/.head-moved\" ]; then echo 1111111111111111111111111111111111111111; else echo 0000000000000000000000000000000000000000; fi;;\n"
                 "  *' show '*) cat \"$2/install.sh\";;\n"
                 "  *' archive '*) tar -c -C \"$2\" install.sh;;\n"
                 "esac\nexit 0\n" % gd)

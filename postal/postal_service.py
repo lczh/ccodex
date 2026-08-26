@@ -39,6 +39,7 @@ import base64
 import fcntl
 import hashlib
 import hmac
+import itertools
 import json
 import os
 import random
@@ -300,13 +301,17 @@ def _mark_pending(sid):
         pass
 
 def _tl_append(fname, obj):
-    """Append one JSON line to a timeline log (best-effort; never raises)."""
+    """Append one JSON line to a timeline log (best-effort; never raises).
+    Returns True when the row landed, False otherwise — a caller that memos
+    "already logged" (e.g. _log_peer_aliases) must key its memo on the return,
+    or one failed append suppresses every retry and the row never lands."""
     try:
         TLDIR.mkdir(parents=True, exist_ok=True)
         with open(TLDIR / fname, "a") as fh:
             fh.write(json.dumps(obj) + "\n")
+        return True
     except Exception:
-        pass
+        return False
 
 def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
             relay_mid="", relay_via="", tracked=False):
@@ -357,8 +362,8 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
     # Logged BEFORE the rename publishes the mail (the v1.3.17 audit's P1.3): this row is the
     # only record /handoff-done can translate a delivery id through, and publishing first left
     # a crash window where durable mail existed with no row — the receipt was then lost
-    # permanently. A row for mail whose publish then fails reads as an attempted send: the
-    # receipt lane keys on the mail's own id, so an unpublished mail's row completes nothing.
+    # permanently. A publish that then RAISES is compensated below with an ev:"unpublished"
+    # row, so the sent row for mail that never existed can't translate into a receipt.
     ev = {"t": int(time.time()), "ev": "sent", "id": name,
           "from": from_name, "from_id": from_id, "to_id": to_id, "body": body}
     if park:
@@ -377,7 +382,15 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
         #                                              handoff-done receipt translates through
         #                                              (the r44 verification's P1)
     _tl_append("messages.jsonl", ev)
-    tmp.rename(mb / "new" / name)   # atomic within the same filesystem — the PUBLISH point
+    try:
+        tmp.rename(mb / "new" / name)   # atomic within the same filesystem — the PUBLISH point
+    except Exception:
+        # The sent row above is already durable; left alone it is a permanent phantom —
+        # handoff_done_apply would translate it into a receipt for mail that never existed,
+        # and the wait-map readers can mint an Awaiting edge from it. Best-effort: a lost
+        # compensating row re-opens only the crash window this write ordering accepts.
+        _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "unpublished", "id": name})
+        raise
     _mark_pending(to_id)            # new/ is now non-empty -> raise the marker (covers park + live)
     return name   # the message id (maildir filename); joins to the log + status-bar prefix
 
@@ -416,9 +429,17 @@ def handoff_done_apply(data):
                 o = json.loads(line)
             except Exception:
                 continue
-            if o.get("ev") == "sent" and o.get("id") == mid:
-                row = o
+            if o.get("id") != mid:
+                continue
+            if o.get("ev") == "unpublished":
+                # deliver()'s publish raised after its sent row landed: the mail never
+                # existed, so its sent row is a phantom — treat it as absent and fall
+                # through to maildir recovery, then the 404-retryable path. No early
+                # break on the sent row above it: the compensation is logged AFTER it.
+                row = None
                 break
+            if o.get("ev") == "sent" and row is None:
+                row = o
     except OSError:
         row = None
     if row is None:
@@ -1929,7 +1950,11 @@ def peer_update(data):
     prev = PEERS.get(host) or {}
     tok = str(data.get("token") or "") or prev.get("token") or ""
     trust = str(data.get("trust") or "") or prev.get("trust") or "directed"
-    PEERS[host] = {"port": port, "up": bool(data.get("up")), "at": int(time.time()),
+    if data.get("up") is not None and data.get("up") is not True and data.get("up") is not False:
+        # never coerce: bool("false") read a down tunnel as UP and mail relayed into the void
+        # (the v1.3.18 audit's boolean sweep)
+        return {"error": "up must be a JSON boolean (true/false)"}, 400
+    PEERS[host] = {"port": port, "up": data.get("up") is True, "at": int(time.time()),
                    "token": tok, "trust": trust}
     _peer_threads_reconcile(host)                    # an up peer gets its dialer; a down one is woken to exit
     return {"ok": True, "up": sum(1 for p in PEERS.values() if p["up"])}, 200
@@ -2196,6 +2221,11 @@ _ALIAS_LOGGED = {}                         # (host, name) -> last id logged this
 #                                            RETURNING to a prior holder must re-log, or the log's
 #                                            last word for that name stays the middle holder
 #                                            (the r45 verification)
+_ALIAS_SEQ = itertools.count(int(time.time()))   # per-row seq for peer-alias rows: strictly
+#                                            increasing in-process (count.__next__ is atomic under
+#                                            CPython, and dialer threads call _log_peer_aliases
+#                                            concurrently); time-seeded so a restart's rows keep
+#                                            growing past the prior process's in the common case
 
 
 def _log_peer_aliases(host):
@@ -2214,9 +2244,15 @@ def _log_peer_aliases(host):
             key = (host, name)
             if _ALIAS_LOGGED.get(key) == aid:
                 continue
-            _ALIAS_LOGGED[key] = aid
-            _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "peer-alias",
-                                          "from_host": host, "from": name, "from_id": aid})
+            # seq: same-second rebindings otherwise tie-break by SID, not log order — the
+            # readers resolve the latest binding as max over (t, seq), missing seq = 0.
+            # The memo advances only AFTER the append lands: _tl_append is best-effort,
+            # and memoing first turned one failed write into a forever-suppressed retry,
+            # so the binding never became durable.
+            if _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "peer-alias",
+                                             "from_host": host, "from": name, "from_id": aid,
+                                             "seq": next(_ALIAS_SEQ)}):
+                _ALIAS_LOGGED[key] = aid
     except Exception:
         pass
 _peer_wakes = {}                           # host -> threading.Event (long-poll release + dialer poke)

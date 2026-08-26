@@ -12,6 +12,7 @@ import threading
 import unittest
 import urllib.request
 import urllib.error
+from unittest import mock
 from http.server import ThreadingHTTPServer
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -200,6 +201,20 @@ class Tick(unittest.TestCase):
         km._pr_watch_tick(100.0)
         self.assertEqual(self.mail, [], "no duplicate mail after the crash window")
         self.assertEqual(km._pr_watches, [], "the stamped row still retires")
+
+    def test_an_unsaved_stamp_never_delivers(self):
+        # the v1.3.18 audit: a swallowed save failure left the stamp in memory only — a crash
+        # after delivery re-mailed the notice on restart. No durable stamp, no injection.
+        km.add_pr_watch(14, "TESTORG/testrepo", SID, now=0)
+        km._pr_watch_read = lambda pr, repo: ("merged", "")
+        with mock.patch.object(km, "_pr_watches_save", return_value=False):
+            km._pr_watch_tick(100.0)
+        self.assertEqual(self.mail, [], "no durable stamp -> no injection this pass")
+        self.assertEqual(len(km._pr_watches), 1)
+        self.assertNotIn("sent", km._pr_watches[0])
+        km._pr_watch_tick(100.0 + km.PR_WATCH_EVERY)   # save works again -> delivers once
+        self.assertEqual(len(self.mail), 1)
+        self.assertEqual(km._pr_watches, [])
 
     def test_the_stamp_survives_the_watch_file_roundtrip(self):
         km.add_pr_watch(13, "TESTORG/testrepo", SID, now=0)

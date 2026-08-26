@@ -1810,7 +1810,10 @@ def _timeline_views():
         d = json.loads(p.read_text())
     except Exception:
         d = {}
-    _rev = int(d.get("rev") or 0) if isinstance(d, dict) else 0
+    try:
+        _rev = int(d.get("rev") or 0) if isinstance(d, dict) else 0
+    except (TypeError, ValueError):
+        _rev = 0               # a malformed stored rev is a reset, never a crash (the v1.3.18 audit)
     # ONE-TIME MIGRATION (the user 2026-08-24, retiring hide-from-chat outright: "we want to get
     # rid of that hide from chat thing"): a stored blob still carrying hidden entries maps them
     # into an "archived" TAG on THIS kernel — preserving the user's intent record and keeping them
@@ -1828,7 +1831,10 @@ def _timeline_views():
             tags = tags + [arch]
         arch["members"] = [m for m in (arch.get("members") or []) if m] + hid
         d = dict(d); d["tags"] = tags; d.pop("groups", None); d.pop("hidden", None)
-        _set_timeline_views(d)                       # persist the mapping; the fresh mtime re-keys the cache
+        # CAS'd against the rev THIS read holds (the v1.3.18 audit: the migration was an
+        # unconditional stale writer — a concurrent editor's commit between this read and the
+        # write was silently erased); a refusal just retries on the next read
+        _set_timeline_views(d, base_rev=_rev)
     d = _norm_timeline_views(d)
     d["rev"] = _rev        # the write counter rides every read (and every client payload clone),
     #                        so a whole-blob writer naturally declares the base it edited from
@@ -1846,7 +1852,10 @@ def _set_timeline_views(blob, base_rev=None):
             cur = json.loads(_views_path().read_text())
         except Exception:
             cur = {}
-        currev = int(cur.get("rev") or 0) if isinstance(cur, dict) else 0
+        try:
+            currev = int(cur.get("rev") or 0) if isinstance(cur, dict) else 0
+        except (TypeError, ValueError):
+            currev = 0
         if base_rev is not None:
             try:
                 stale = int(base_rev) != currev
@@ -1963,7 +1972,10 @@ def _apply_views_ops(ops):
             raw = json.loads(_views_path().read_text())
         except Exception:
             raw = {}
-        currev = int(raw.get("rev") or 0) if isinstance(raw, dict) else 0
+        try:
+            currev = int(raw.get("rev") or 0) if isinstance(raw, dict) else 0
+        except (TypeError, ValueError):
+            currev = 0
         d = _norm_timeline_views(raw)
         # _member_pair, not a bare-sid wrapper (the r45 verification): clients post the
         # viewer-relative "host:sid" spelling for REMOTE members — wrapping it as a home sid
@@ -3465,6 +3477,17 @@ def _publish_dist_generation(srcdir, pub=None):
         except OSError:
             return ""
 
+    if not dist.exists() and not dist.is_symlink():
+        # CRASH RECOVERY (the v1.3.18 audit): the one-time real-dir conversion moves dist aside
+        # before the symlink lands — a death in that window left NO dist at all. The moved-aside
+        # copy is still here; restore it before publishing so a second crash cannot widen the
+        # outage and readers regain assets even if the copy below fails.
+        for old_dir in sorted(pub.glob(".dist.old.*")):
+            try:
+                os.rename(old_dir, dist)
+                break
+            except OSError:
+                continue
     _DIST_GEN_SEQ[0] += 1
     gen = pub / ("dist.gen.%d.%d" % (os.getpid(), _DIST_GEN_SEQ[0]))
     while gen.name == _live() or gen.exists():
@@ -3562,6 +3585,11 @@ def _main_drift_check():
         if lk is None:
             return
         try:
+            if _install_latch_lines() != []:
+                # an ARMED (or unreadable) install latch: the checkout is MID-INSTALL — bundles
+                # built from it would publish a half-installed build (the v1.3.18 audit). The
+                # boot heal owns the latch; this pass simply yields.
+                return
             # REVALIDATE under the lock (the v1.3.17 audit's P2.7): the classification above ran
             # unlocked, and an updater that moved the checkout between it and acquisition had
             # this branch build the WRONG commit's bundles (the executed repro classified
@@ -9611,8 +9639,12 @@ def _drive(msg, client):
     elif t == "mcpAction" and msg.get("server"):
         # enable / disable / reconnect ONE MCP server (SDK control requests). The panel refetches after,
         # so the truth on screen is always the CLI's own status — never an optimistic guess.
-        err = be.mcp_action(sid, str(msg["server"]), str(msg.get("action") or "toggle"),
-                            bool(msg.get("enabled", True)))
+        _men = msg.get("enabled", True)
+        if _men is not True and _men is not False:
+            client["send"](json.dumps({"type": "warn",
+                                       "text": "enabled must be a JSON boolean (true/false)."}))
+            return
+        err = be.mcp_action(sid, str(msg["server"]), str(msg.get("action") or "toggle"), _men)
         client["send"](json.dumps({"type": "mcpResult", "id": sid, "server": str(msg["server"]),
                                    "error": err or ""}))
         _push_soon()
@@ -12677,12 +12709,17 @@ def _pr_watches_load():
 
 def _pr_watches_save():
     with _pr_watch_lock:
+        # the WRITE sits under the lock too (the v1.3.18 audit: two concurrent saves could land
+        # out of order, resurrecting a retired watch or losing a fresh one — the snapshot alone
+        # serialized nothing)
         rows = [{k: r[k] for k in ("pr", "repo", "sid", "at", "sent") if k in r}
                 for r in _pr_watches]
-    try:
-        _atomic_write(PR_WATCH_FILE, json.dumps(rows))
-    except Exception:
-        sys.stderr.write("pr-watches save: %s\n" % traceback.format_exc())
+        try:
+            _atomic_write(PR_WATCH_FILE, json.dumps(rows))
+        except Exception:
+            sys.stderr.write("pr-watches save: %s\n" % traceback.format_exc())
+            return False
+    return True
 
 
 def add_pr_watch(pr, repo, sid, now=None):
@@ -12803,7 +12840,11 @@ def _pr_watch_stamped_deliver(r, verdict, detail):
     if r.get("sent") == verdict:
         return True                                   # stamped: delivered (or crashed mid-window)
     r["sent"] = verdict
-    _pr_watches_save()
+    if not _pr_watches_save():
+        # the stamp is NOT durable — delivering now would re-mail after a crash (the v1.3.18
+        # audit: a swallowed save failure turned the at-most-once stamp into a duplicate)
+        r.pop("sent", None)
+        return False
     if _pr_watch_deliver(r["sid"], _pr_watch_notice(verdict, r["repo"], r["pr"], detail)):
         return True
     r.pop("sent", None)                               # a KNOWN failure — retry next pass
@@ -13265,13 +13306,12 @@ def _update_remote(host):
                        "state is unknown" % host)
     if rdirty:
         return False, "remote %s has uncommitted changes — commit or discard them there first (won't clobber)" % host
-    if rhead and rhead == lfull and rlatch == "0":
-        # A clean tree at the exact pushed commit with an affirmatively CLEAR install latch is a
-        # true no-op: nothing to move, nothing to heal. Running the full transaction here
-        # restarted a healthy kernel for nothing and, on a stable-channel host, turned Start into
-        # a STABLENOW refusal that left a downed up-to-date kernel unbootable (the r43
-        # verification's P1). Any OTHER latch answer still runs the settle transaction.
-        return True, "already up to date (%s)" % (_local_head(short=True) or lfull[:8])
+    # the equal-heads no-op is DECIDED INSIDE the wrapper's flock now (the v1.3.18 audit: a
+    # latch could arm between this discovery and a local return, and the report bypassed the
+    # settle entirely — the pull leg's P2.8 class). The wrapper exits INSYNC (36) before the
+    # channel gate and before any kill, keeping the r43 semantics: a healthy up-to-date kernel
+    # is never restarted, and a stable-channel host at the pushed commit reads in-sync rather
+    # than STABLENOW-unbootable.
     # (2) push local HEAD to a scratch ref on the remote (non-checked-out → no denyCurrentBranch issue)
     env = dict(os.environ, GIT_SSH_COMMAND="%s %s" % (SSH_BIN, " ".join(_SSH_OPTS)))
     push_url = "%s:%s" % (host, rdir)
@@ -13365,6 +13405,13 @@ def _update_remote(host):
         "    v=None\n"
         "except (OSError,ValueError):\n"
         "    sys.exit(14)\n"
+        # the in-sync no-op, decided UNDER the flock with the latch read fresh (the v1.3.18
+        # audit): HEAD at the exact target and NO armed latch -> nothing to move, nothing to
+        # heal, no restart — before the channel gate, so a stable host at the target commit
+        # reads in-sync (the r43 P1's exact shape)
+        'hh=subprocess.run(["git","-C",r,"rev-parse","HEAD"],capture_output=True,text=True)\n'
+        'if hh.returncode==0 and (hh.stdout or "").strip()==target and not os.path.exists(lp):\n'
+        "    sys.exit(36)\n"
         "if v is not None:\n"
         '    if v!="dev":\n'
         "        sys.exit(13)\n"
@@ -13680,6 +13727,7 @@ def _update_remote(host):
         'if [ "$RRC" = 32 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; NEW="$(git -C "$R" rev-parse --short HEAD)"; echo "RESTARTFAIL:$NEW"; exit 0; fi; '
         'if [ "$RRC" = 34 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo LAUNCHSNAPFAIL; exit 0; fi; '
         'if [ "$RRC" = 35 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo MARKERFAIL; exit 0; fi; '
+        'if [ "$RRC" = 36 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; NEW="$(git -C "$R" rev-parse --short HEAD)"; echo "INSYNC:$NEW"; exit 0; fi; '
         'if [ "$RRC" != 0 ]; then git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; fi; '
         'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; '
         'NEW="$(git -C "$R" rev-parse --short HEAD)"; '
@@ -13691,7 +13739,8 @@ def _update_remote(host):
          _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
          _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
          _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
-         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF)
+         _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
+         _P2P_REF)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -13778,6 +13827,11 @@ def _update_remote(host):
     if tag == "RESTOREFAIL":
         return False, ("the push did not land, and restoring the prior install record failed — "
                        "the armed latch stays; the remote's boot heal settles it")
+    if tag == "INSYNC":
+        if not re.fullmatch(r"[0-9a-f]{7,40}", rest or "") or not lfull.startswith(rest):
+            return False, ("the remote reported in-sync on a commit that is not the pushed one; "
+                           "expected %s, got %s" % (lfull[:8], rest or "no commit"))
+        return True, "already up to date (%s)" % (_local_head(short=True) or lfull[:8])
     if tag == "LAUNCHSNAPFAIL":
         return False, ("pushed and installed on %s, but staging the pinned launch snapshot "
                        "(git archive of the verified commit's bin/) failed — the restart was "
@@ -21597,17 +21651,29 @@ def _postal_wait_maps():
                 continue
             rows.append(o)
             if o.get("from_host") and o.get("from") and o.get("from_id"):
+                try:
+                    _seq = int(o.get("seq") or 0)
+                except (TypeError, ValueError):
+                    _seq = 0
                 ahist.setdefault(str(o["from_host"]) + ":" + str(o["from"]), []).append(
-                    (int(o.get("t") or 0), str(o["from_id"])))
+                    (int(o.get("t") or 0), _seq, str(o["from_id"])))
+        unpub = {str(o["id"]) for o in rows if o.get("ev") == "unpublished" and o.get("id")}
 
         def _alias_at(key, when):
+            # ordered by (t, seq): the bus stamps a strictly-increasing seq per alias row, so
+            # same-second rebindings resolve in JSONL order, never by lexicographic sid (the
+            # v1.3.18 audit)
             hist = ahist.get(key) or []
             before = [e for e in hist if e[0] <= when]
             if before:
-                return max(before)[1]
+                return max(before)[2]
             after = [e for e in hist if e[0] > when]   # the peer first spoke after the ask —
-            return min(after)[1] if after else ""      # the earliest binding is the ask's world
+            return min(after)[2] if after else ""      # the earliest binding is the ask's world
         for o in rows:
+            if o.get("ev") == "sent" and str(o.get("id") or "") in unpub:
+                continue                               # the publish FAILED after the row landed —
+            #                                            a phantom must not mint an Awaiting edge
+            #                                            (the v1.3.18 audit)
             f, t_, ts = o.get("from_id"), o.get("to_id"), o.get("t")
             if not (f and t_ and ts):
                 continue
@@ -32258,7 +32324,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     body = None
                 res = _apply_judge_settings(body if isinstance(body, dict) else {})
-                if isinstance(body, dict) and body.get("propagate"):
+                if isinstance(body, dict) and body.get("propagate") is True:
                     fwd = {k: v for k, v in body.items() if k != "propagate"}
                     threading.Thread(target=_propagate_judge_settings, args=(fwd,), daemon=True).start()
                 return self._send(200, json.dumps(res), "application/json")
@@ -32320,6 +32386,12 @@ class Handler(BaseHTTPRequestHandler):
                 sys.stderr.write("loadEpisode: %s\n" % traceback.format_exc())
             return
         if msg and msg.get("type") == "setGlobalRetryPaused":
+            if msg.get("value") is not True and msg.get("value") is not False:
+                # never coerce: bool("false") is True, and this pauses retries FLEET-WIDE
+                # (the v1.3.18 audit's boolean sweep)
+                client["send"](json.dumps({"type": "warn",
+                                           "text": "value must be a JSON boolean (true/false)."}))
+                return
             _set_retry_paused(msg.get("value"))
             _mark_views_dirty()
             return
@@ -32351,10 +32423,15 @@ class Handler(BaseHTTPRequestHandler):
             # timeline lane gear → toggle a per-session view flag (e.g. hideFromFeed). Persisted +
             # re-broadcast so the feed drops/restores that session's cards immediately. The notify
             # bell is tri-state (an override on the master default) → its own setter.
-            if str(msg["flag"]) == "notify":
-                _set_notify_session(str(msg["id"]), bool(msg.get("value")))
+            if msg.get("value") is not True and msg.get("value") is not False:
+                # muting and postal ISOLATION are safety state — a string "false" armed them
+                # (the v1.3.18 audit's boolean sweep)
+                client["send"](json.dumps({"type": "warn",
+                                           "text": "value must be a JSON boolean (true/false)."}))
+            elif str(msg["flag"]) == "notify":
+                _set_notify_session(str(msg["id"]), msg["value"])
             else:
-                _set_session_flag(str(msg["id"]), str(msg["flag"]), bool(msg.get("value")))
+                _set_session_flag(str(msg["id"]), str(msg["flag"]), msg["value"])
             _mark_views_dirty()
         elif msg and msg.get("type") == "setTimelineViews" and isinstance(msg.get("views"), dict):
             # timeline corner panel → replace the whole views blob. Every client edits a CLONE of
@@ -32364,8 +32441,16 @@ class Handler(BaseHTTPRequestHandler):
             # mark repaints every dashboard with the store's truth.
             _wv = dict(msg["views"])
             _wbr = _wv.pop("baseRev", _wv.pop("rev", None))
-            _set_timeline_views(_wv, base_rev=_wbr)
+            _wok, _wrev = _set_timeline_views(_wv, base_rev=_wbr)
             _mark_views_dirty()
+            try:
+                # the ACK the CAS protocol was missing (the v1.3.18 audit): the WRITING client
+                # re-anchors its optimistic counter to the server's actual rev — accepted or
+                # refused — instead of guessing (a guessed rev later coincided with a foreign
+                # write's and a stale blob was accepted)
+                client["send"](json.dumps({"type": "viewsAck", "ok": bool(_wok), "rev": _wrev}))
+            except Exception:
+                pass
         elif msg and msg.get("type") == "openTagsDialog":
             # any pane's "Configure tags…" opens THE tags dialog — which lives on the timeline pane
             # (one dialog, one implementation; the user 2026-08-25). Routed to the SAME dashboard's
@@ -32406,7 +32491,11 @@ class Handler(BaseHTTPRequestHandler):
             # completes). Persisted to notify-cards.json; build_feed echoes it back as ask.notify.
             # sid rides so the override can be resolved against the card's own default (session, else
             # the master) and deleted when it merely restates it.
-            _set_notify_card(str(msg["itemId"]), bool(msg.get("value")), str(msg.get("sid") or ""))
+            if msg.get("value") is not True and msg.get("value") is not False:
+                client["send"](json.dumps({"type": "warn",
+                                           "text": "value must be a JSON boolean (true/false)."}))
+                return
+            _set_notify_card(str(msg["itemId"]), msg["value"], str(msg.get("sid") or ""))
             _mark_views_dirty()
         elif msg and msg.get("type") == "setSessionColor" and msg.get("id") and msg.get("bg"):
             # tab right-click color picker → override the session's identity color (persisted to the names

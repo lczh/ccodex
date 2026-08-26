@@ -661,6 +661,12 @@ function mediaUrl(name) {
   return ((typeof window !== 'undefined' && window.__rompMediaBase) || '/media') + '/' + name;
 }
 
+// One id per tag-union GESTURE, shared by every remote half it dispatches: a refusal from any
+// single owner must be able to find the gesture's OTHER halves and compensate them too (the
+// v1.3.18 audit's P2 — partial multi-host tag edits still split state). Starts at 1 so a
+// recorded gid is always truthy; entries noted before this counter existed can never match.
+let unionGestureSeq = 0;
+
 class TimelinePanel {
   constructor(host) {
     this.host = host;
@@ -2650,7 +2656,35 @@ class TimelinePanel {
       && (!m.name || o.name === m.name));
     this._unionOps = (this._unionOps || []).filter((o) => ops.indexOf(o) < 0);
     for (const o of ops) this._applyLocalOp(o.inverse);
-    this._tagEditErr = { host: m.host || '', name: m.name || '', error: m.error || 'refused' };
+    // ...AND the same gesture's SIBLING remote halves (the v1.3.18 audit's P2: partial
+    // multi-host tag edits still split state — fanned to owners A and B with only B refusing,
+    // the local rollback above left A holding the applied edit: A changed, B/local reverted).
+    // Every entry sharing a refused entry's gesture id on ANOTHER host is still unconfirmed
+    // (_reconcileUnionOps already dropped confirmed ones), so it gets the inverse REMOTE edit
+    // and is dropped as compensated.
+    const gids = new Set();
+    for (const o of ops) if (o.gid) gids.add(o.gid);
+    const sibs = (this._unionOps || []).filter((o) => o.gid && gids.has(o.gid)
+      && o.host !== (m.host || ''));
+    this._unionOps = (this._unionOps || []).filter((o) => sibs.indexOf(o) < 0);
+    const undead = [];   // hosts holding an applied DELETE — no remote edit can restore a tag
+    for (const o of sibs) {
+      const e = o.edit || {};
+      if (e.delete) { undead.push(o.host || 'unknown'); continue; }
+      const inv = {};
+      if (e.remove) inv.add = e.remove.slice();
+      if (e.rename) inv.rename = o.oldName;
+      if (e.color) inv.color = o.oldColor;
+      if (!Object.keys(inv).length) continue;
+      // a rename that landed re-keyed the tag on that host, and edits are name-addressed — the
+      // inverse must address the NEW name to rename it back to the recorded old one
+      this._editRemoteTag(e.rename ? Object.assign({}, o.rt, { name: e.rename }) : o.rt, inv);
+    }
+    // the un-restorable deletes ride the SAME loud slot as the refusal (honest > silent): the
+    // user must redo those by hand, and a silent skip would hide exactly that
+    this._tagEditErr = { host: m.host || '', name: m.name || '', error: (m.error || 'refused')
+      + (undead.length ? ' — the delete already sent to ' + undead.join(', ') + ' cannot be'
+         + ' undone from here; recreate the tag there by hand (romp tag --host <kernel>)' : '') };
     if (this._viewsDialog && this._viewsDialogBuild) this._viewsDialogBuild();
     this.draw();
   }
@@ -2659,10 +2693,15 @@ class TimelinePanel {
   // dropped when the owner's store CONFIRMS the edit (never a push counter — a slow refusal can
   // outlive any count of pushes; the r45 verification: the 3-push age-out raced the forward
   // path's 8s timeout and slow refusals got no rollback at all)
-  _noteUnionOp(rt, name, inverse, edit) {
+  _noteUnionOp(rt, name, inverse, edit, gid) {
     if (!this._unionOps) this._unionOps = [];
+    // rt + gid + the PRE-edit name/color ride the entry (the v1.3.18 audit's P2): a SIBLING
+    // host's refusal compensates this host by dispatching the inverse REMOTE edit, and by that
+    // moment the polled rt may already echo the applied edit — the inverse targets are only
+    // knowable at note time
     this._unionOps.push({ host: rt.host || '', name: name || '', inverse: inverse,
-                          edit: edit || {} });
+                          edit: edit || {}, rt: rt, gid: gid || 0,
+                          oldName: rt.name || '', oldColor: rt.color || '' });
   }
 
   _reconcileUnionOps() {
@@ -2714,6 +2753,8 @@ class TimelinePanel {
   // delete fan out to every home the same way. Local writes post the whole blob (unchanged);
   // remote writes ride _editRemoteTag (optimistic overlay + loud tagEditFailed, federation v1).
   _editTagUnion(g, edit) {
+    const gid = ++unionGestureSeq;   // ties every remote half below to THIS gesture, so one
+    //                                  owner's refusal can compensate the others (v1.3.18 P2)
     if (edit.add && edit.add.length) {
       if (g.localId) {
         const nv = JSON.parse(JSON.stringify(this._curViews()));
@@ -2747,7 +2788,7 @@ class TimelinePanel {
           // deletion stayed committed while the remote member survived, splitting the union)
           for (const rt of dispatched)
             this._noteUnionOp(rt, g.name, { tag: g.localId, add: had },
-                              { remove: edit.remove.slice() });
+                              { remove: edit.remove.slice() }, gid);
         }
       }
     }
@@ -2777,7 +2818,8 @@ class TimelinePanel {
         this._setViews(nv, [op]);
         for (const rt of g.remotes)
           this._noteUnionOp(rt, g.name, inverse,
-                            { rename: edit.rename, color: edit.color, delete: !!edit.delete });
+                            { rename: edit.rename, color: edit.color, delete: !!edit.delete },
+                            gid);
       }
     }
   }
@@ -2869,6 +2911,20 @@ class TimelinePanel {
     const base = (this._views && typeof this._views.rev === 'number') ? this._views.rev : 0;
     this._optViewsRev = Math.max(this._optViewsRev || 0, base) + 1;
     return this._optViewsRev - 1;
+  }
+
+  // The kernel's per-write acknowledgement for setTimelineViews — {type:'viewsAck', ok, rev},
+  // sent to the client that issued the write (the v1.3.18 audit's P2: the views CAS had no
+  // acknowledgement, so a refused write left the optimistic overlay pinned and the counter
+  // drifted until a full push happened to arrive). rev re-anchors the counter either way; a
+  // refusal (ok:false) also drops the overlay, which is now KNOWN-refused rather than merely
+  // unconfirmed — waiting out _reconcileViews's three pushes would show stale state meanwhile.
+  viewsAck(m) {
+    this._optViewsRev = (typeof m.rev === 'number') ? m.rev : 0;
+    if (m.ok === false) {
+      this._pendingViews = null; this._pendingViewsAge = 0;
+      this.draw();
+    }
   }
 
   _setViews(v, ops) {
