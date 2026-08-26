@@ -202,6 +202,14 @@ class Tick(unittest.TestCase):
         self.assertEqual(self.mail, [], "no duplicate mail after the crash window")
         self.assertEqual(km._pr_watches, [], "the stamped row still retires")
 
+    def test_a_nondurable_registration_is_refused(self):
+        # the v1.3.19 audit: add_pr_watch acked a watch a restart would forget
+        with mock.patch.object(km, "_pr_watches_save", return_value=False):
+            row = km.add_pr_watch(15, "TESTORG/testrepo", SID, now=0)
+        self.assertIsNone(row, "no durable save, no acknowledgement")
+        self.assertEqual([r for r in km._pr_watches if r["pr"] == 15], [],
+                         "…and the in-memory row is rolled back too")
+
     def test_an_unsaved_stamp_never_delivers(self):
         # the v1.3.18 audit: a swallowed save failure left the stamp in memory only — a crash
         # after delivery re-mailed the notice on restart. No durable stamp, no injection.

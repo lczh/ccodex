@@ -1608,6 +1608,20 @@ class DistGenerationPublish(unittest.TestCase):
             gens = list(pub.glob("dist.gen.*"))
             self.assertEqual(len(gens), 1, "the swap prunes everything but the live generation")
 
+    def test_the_conversion_hard_death_heals_at_boot(self):
+        # the v1.3.19 audit: v1.3.19 healed only on the NEXT publish — the window until one
+        # arrived served 404s for every asset. Boot is the earliest healer every install reaches.
+        import pathlib
+        with tempfile.TemporaryDirectory() as td:
+            pub = pathlib.Path(td) / "vscode-extension"
+            pub.mkdir(parents=True)
+            (pub / ".dist.old.777").mkdir()
+            (pub / ".dist.old.777" / "feed.js").write_text("old")
+            with mock.patch.object(km, "ROOT", pathlib.Path(td)):
+                km._heal_dist_conversion()
+            self.assertEqual((pub / "dist" / "feed.js").read_text(), "old",
+                             "the moved-aside dist is back before any publish runs")
+
     def test_a_crashed_first_conversion_heals_on_the_next_publish(self):
         # the v1.3.18 audit: the one-time real-dir conversion moves dist aside before the
         # symlink lands — a death in that window left NO dist at all

@@ -2221,7 +2221,10 @@ _ALIAS_LOGGED = {}                         # (host, name) -> last id logged this
 #                                            RETURNING to a prior holder must re-log, or the log's
 #                                            last word for that name stays the middle holder
 #                                            (the r45 verification)
-_ALIAS_SEQ = itertools.count(int(time.time()))   # per-row seq for peer-alias rows: strictly
+_ALIAS_SEQ = itertools.count(int(time.time() * 1000))   # ms seed: two bus restarts in one
+#                                                         second collided seq at equal t and the
+#                                                         readers fell back to the lexicographic
+#                                                         tie (the v1.3.19 audit's residual)   # per-row seq for peer-alias rows: strictly
 #                                            increasing in-process (count.__next__ is atomic under
 #                                            CPython, and dialer threads call _log_peer_aliases
 #                                            concurrently); time-seeded so a restart's rows keep

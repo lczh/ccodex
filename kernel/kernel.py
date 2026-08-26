@@ -1840,7 +1840,11 @@ def _timeline_views():
         # CAS'd against the rev THIS read holds (the v1.3.18 audit: the migration was an
         # unconditional stale writer — a concurrent editor's commit between this read and the
         # write was silently erased); a refusal just retries on the next read
-        _set_timeline_views(d, base_rev=_rev)
+        _mok, _mrev = _set_timeline_views(d, base_rev=_rev)
+        if _mok:
+            _rev = _mrev                             # the read reports the rev it LEAVES behind —
+        #                                              a stale one CAS-failed the first client
+        #                                              write for nothing (the v1.3.19 audit)
     d = _norm_timeline_views(d)
     d["rev"] = _rev        # the write counter rides every read (and every client payload clone),
     #                        so a whole-blob writer naturally declares the base it edited from
@@ -2003,10 +2007,12 @@ def _replay_ui_op_spool():
                                  % (n, _SPOOL_FAILS[n], traceback.format_exc()))
                 try:
                     os.replace(p, spdir / (n + ".failed"))
+                    _SPOOL_FAILS.pop(n, None)
+                    continue
                 except OSError:
-                    pass
-                _SPOOL_FAILS.pop(n, None)
-                continue
+                    break                             # quarantine failed: the queue HOLDS — later
+                #                                       ops passing a stuck head re-orders gestures
+                #                                       (the v1.3.19 audit's residual)
             sys.stderr.write("ui-op spool: op %s FAILED — retained at the queue head\n%s"
                              % (n, traceback.format_exc()))
             break
@@ -12735,6 +12741,27 @@ _pr_watches = []             # [{pr, repo, sid, at} + runtime {_next, _fails, _b
 _pr_watch_lock = threading.Lock()
 
 
+def _heal_dist_conversion():
+    """A hard death between the first real-dir dist conversion's two renames leaves NO dist at
+    all until the next publish heals it (the v1.3.19 audit: v1.3.19 heals on a later publish,
+    but the window until one arrives served 404s for every asset). Boot is the earliest healer
+    every install reaches; same recovery the publisher runs."""
+    pub = ROOT / "vscode-extension"
+    dist = pub / "dist"
+    try:
+        if dist.exists() or dist.is_symlink():
+            return
+        for old_dir in sorted(pub.glob(".dist.old.*")):
+            try:
+                os.rename(old_dir, dist)
+                sys.stderr.write("dist conversion healed at boot from %s\n" % old_dir.name)
+                return
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
 def _prune_stale_generations():
     """Drop romp-run-* generations that are neither the RUNNING one nor the current HEAD's —
     at boot, under the update flock (skip when held: an in-flight transaction owns the dir).
@@ -12830,7 +12857,12 @@ def add_pr_watch(pr, repo, sid, now=None):
         row = {"pr": pr, "repo": repo, "sid": sid, "at": int(now if now is not None else time.time()),
                "_next": 0, "_fails": 0, "_busy": False}
         _pr_watches.append(row)
-    _pr_watches_save()
+    if not _pr_watches_save():
+        # never acknowledge a registration that would not survive a restart (the v1.3.19 audit)
+        with _pr_watch_lock:
+            if row in _pr_watches:
+                _pr_watches.remove(row)
+        return None
     return {k: row[k] for k in ("pr", "repo", "sid", "at")}
 
 
@@ -31891,6 +31923,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, json.dumps({"ok": False, "error":
                         'no session answers to "%s"' % who}), "application/json")
                 row = add_pr_watch(prn, repo, tsid)
+                if row is None:
+                    # registration is durable-or-refused (the v1.3.19 audit): acking a watch
+                    # the restart would forget silently dropped the landing mail
+                    return self._send(200, json.dumps({"ok": False, "error":
+                        "the watch could not be saved durably — check disk/permissions and retry"}),
+                                      "application/json")
                 return self._send(200, json.dumps({"ok": True, "watch": row}), "application/json")
             if u.path == "/flag":
                 # The Obsidian timeline's flag writer, routed through the kernel's LOCKED,
@@ -32581,6 +32619,7 @@ class Handler(BaseHTTPRequestHandler):
             e = msg["edit"]
             host = str(e.get("host") or "").strip()
             nm = str(e.get("name") or "").strip()
+            op_id = str(e.get("opId") or "")
             if host and nm:
                 tail = lambda x: x.rsplit(":", 1)[-1]
                 body = {"name": nm}
@@ -32591,11 +32630,13 @@ class Handler(BaseHTTPRequestHandler):
                     body["color"] = e["color"]
                 if isinstance(e.get("rename"), str):
                     body["rename"] = e["rename"]
-                if e.get("delete"):
+                if e.get("delete") is True:
+                    # never coerce: string "false" DELETED a remote tag (the v1.3.19 audit)
                     body["delete"] = True
                 ans, err = _forward_tag_edit(host, body)
                 if err or not (ans or {}).get("ok", False):
                     _send_to_view("timeline", {"type": "tagEditFailed", "host": host, "name": nm,
+                                               **({"opId": op_id} if op_id else {}),
                                                "error": err or (ans or {}).get("error") or "refused"},
                                   (client or {}).get("wid") or "")
                 _mark_views_dirty()
@@ -32616,7 +32657,11 @@ class Handler(BaseHTTPRequestHandler):
             if _set_session_color(str(msg["id"]), str(msg["bg"])):
                 _mark_views_dirty()
         elif msg and msg.get("type") == "setAutoNudge" and msg.get("enabled") is not None:
-            _set_auto_nudge(bool(msg["enabled"]))   # feed gear → server-side Auto Nudge on/off
+            if msg.get("enabled") is not True and msg.get("enabled") is not False:
+                client["send"](json.dumps({"type": "warn",
+                                           "text": "enabled must be a JSON boolean (true/false)."}))
+                return
+            _set_auto_nudge(msg["enabled"])         # feed gear → server-side Auto Nudge on/off
             # act immediately on turn-on (don't wait 4s) — but skip the dead-wait sweep: the
             # death transition has ONE observer (the pusher's tick; see _auto_nudge_tick), and
             # this WS thread racing its prev-swap could spend a transition uncorroborated
@@ -32626,7 +32671,11 @@ class Handler(BaseHTTPRequestHandler):
         elif msg and msg.get("type") == "setFileEditing" and msg.get("enabled") is not None:
             # The viewer's Edit consent popup (the user 2026-08-22) — a kernel-side setting like
             # setAutoNudge, broadcast by federation.ts KERNEL_SETTING so one yes answers the mesh.
-            _set_file_editing(bool(msg["enabled"]))
+            if msg.get("enabled") is not True and msg.get("enabled") is not False:
+                client["send"](json.dumps({"type": "warn",
+                                           "text": "enabled must be a JSON boolean (true/false)."}))
+                return
+            _set_file_editing(msg["enabled"])
         elif msg and msg.get("type") == "askClear" and msg.get("itemId"):
             # a cleared card drops any composer citation chip pointing INTO it (the user 2026-07-01) — the
             # goal is gone, so following up on it makes no sense. Chips can cite a SUB-goal of the card
@@ -33629,6 +33678,7 @@ def main():
     _pr_watches_load()                                         # re-arm PR-landing watches (same intent rule)
     _clear_restart_marker_if_current()                         # this boot IS the restart the marker wanted (P1.2)
     _prune_stale_generations()                                 # rr/pull hosts have no wrapper prune (r46)
+    _heal_dist_conversion()                                    # the conversion's hard-death window (r47)
     _replay_ui_op_spool()                                      # gestures queued while no kernel ran — applied
     #                                                            through the locked setters, post-migration (P1.5)
     _consume_update_report()                                   # last self-update's outcome → the Log, once
