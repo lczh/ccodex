@@ -1037,6 +1037,14 @@ class TimelinePanel {
     // marks on that event — fired by federation.js only when the reachable set actually changes.
     this._onHosts = () => this.draw();
     window.addEventListener('romp-hosts', this._onHosts);
+    // The kernel's setTimelineViews acknowledgement ({type:'viewsAck', ok, rev}) on WS hosts (the
+    // r46 verification): the VS Code boot routes it through dispatchFrame, but the kernel-served
+    // browser page boots from the kernel's inline script, which predates the frame — so the panel
+    // listens for it directly (the shim/federation manager re-dispatches every kernel frame as a
+    // window "message" event). A boot that ALSO routes it merely delivers the same ack twice
+    // back-to-back in one task; re-anchoring to the same rev is a no-op, so that is harmless.
+    this._onWinMsg = (e) => { const m = e && e.data; if (m && m.type === 'viewsAck') this.viewsAck(m); };
+    window.addEventListener('message', this._onWinMsg);
     // Trackpad gestures over the plot: two-finger horizontal scroll pans the offset, pinch/expand
     // zooms the window width (anchored at the cursor). Pinch reaches us as a ctrlKey wheel event in
     // Chromium/Electron. Non-passive so we can preventDefault.
@@ -1128,6 +1136,7 @@ class TimelinePanel {
   destroy() {
     window.removeEventListener('resize', this._onResize);
     if (this._onHosts) window.removeEventListener('romp-hosts', this._onHosts);
+    if (this._onWinMsg) window.removeEventListener('message', this._onWinMsg);
     if (this.wrap) { this.wrap.removeEventListener('wheel', this._onWheel); this.wrap.removeEventListener('keydown', this._onKey); this.wrap.removeEventListener('mousedown', this._focusWrap); this.wrap.removeEventListener('mousemove', this._onTipSweep); this.wrap.removeEventListener('mouseleave', this._onPtrOut);
       this.wrap.removeEventListener('touchstart', this._onTouchStart); this.wrap.removeEventListener('touchmove', this._onTouchMove); this.wrap.removeEventListener('touchend', this._onTouchEnd); this.wrap.removeEventListener('touchcancel', this._onTouchEnd); }
     if (this._drawRAF) cancelAnimationFrame(this._drawRAF);
@@ -2652,8 +2661,15 @@ class TimelinePanel {
     // the moment the remote DISPATCH succeeded, but this refusal says the owner never applied
     // it — without the rollback the tag is split (deleted here, alive there). Only entries for
     // the refusing host+name fire; entries already confirmed by polls have aged out.
-    const ops = (this._unionOps || []).filter((o) => o.host === (m.host || '')
+    const matched = (this._unionOps || []).filter((o) => o.host === (m.host || '')
       && (!m.name || o.name === m.name));
+    // ...and of those, ONLY the most-recent gesture's (the max gid group; the r46 verification):
+    // the refusal carries no gesture id, so host+name alone also swept OTHER gestures' entries
+    // into this rollback, reverting and inverse-dispatching edits the refusal said nothing
+    // about. Older groups keep their entries and settle on their own evidence — the owner's
+    // polled confirm (_reconcileUnionOps) or their own refusal.
+    const newestGid = matched.reduce((g, o) => Math.max(g, o.gid || 0), 0);
+    const ops = matched.filter((o) => (o.gid || 0) === newestGid);
     this._unionOps = (this._unionOps || []).filter((o) => ops.indexOf(o) < 0);
     for (const o of ops) this._applyLocalOp(o.inverse);
     // ...AND the same gesture's SIBLING remote halves (the v1.3.18 audit's P2: partial
@@ -2940,8 +2956,14 @@ class TimelinePanel {
         const body = (ops && ops.length) ? { ops: ops }
           : { ops: [{ active: (v && v.active) || 'all' }] };   // callers without a grammar are
         //                                                        the active-view picks
-        this._kernelPost('/views', body).then((ok) => {
-          if (ok !== false) return;                  // applied, or refused (kernel up)
+        this._kernelPost('/views', body, true).then((r) => {
+          // the POST twin of the WS viewsAck (the r46 verification): the response body carries
+          // the store's actual rev — 200 and 409 alike — so the counter re-anchors here exactly
+          // as when a WS host's ack frame arrives. Kernel unreachable → no rev: the counter
+          // holds its optimistic value and the op spools below.
+          if (r.ok !== false && r.json && typeof r.json.rev === 'number')
+            this.viewsAck({ ok: r.ok === true, rev: r.json.rev });
+          if (r.ok !== false) return;                // applied, or refused (kernel up)
           this._spoolOp({ op: 'views', ops: body.ops });
         }).catch(() => { /* can't persist */ });
       }
@@ -3733,17 +3755,22 @@ class TimelinePanel {
   // concurrent mute/isolation or recreate a migrated TID). Electron/Obsidian only. Resolves false
   // when the kernel is unreachable, so the caller may fall back to the direct file write — with
   // the kernel down, the writers this lock serializes against are down too.
-  _kernelPost(route, body) {
+  // `wantJson` (the r46 verification): resolve `{ ok, json }` instead of the bare verdict — ok is
+  // the same true/'refused'/false the bare form folds to, json the parsed response body (null when
+  // unreachable/unparseable). The /views caller needs the body: the kernel's response carries the
+  // store's actual rev — 200 and 409 alike — the POST twin of the WS viewsAck frame.
+  _kernelPost(route, body, wantJson) {
+    const fold = (ok, json) => (wantJson ? { ok: ok, json: json || null } : ok);
     try {
       if (typeof process === 'undefined' || !process.versions || !process.versions.electron)
-        return Promise.resolve(false);
+        return Promise.resolve(fold(false));
       const fs = require('fs'), os = require('os'), path = require('path');
       const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
       const root = process.env.ROMP_STATE_DIR || path.join(base, 'romp');
       let tok = '';
       try { tok = fs.readFileSync(path.join(root, 'serve-token'), 'utf8').trim(); } catch (e) { /* no token file */ }
       const port = parseInt(process.env.ROMP_KERNEL_PORT || '29855', 10);
-      if (typeof fetch !== 'function') return Promise.resolve(false);
+      if (typeof fetch !== 'function') return Promise.resolve(fold(false));
       // the token rides the URL: the CORS preflight authorizes from the query (do_OPTIONS),
       // and a header-only token 403'd the OPTIONS — the kernel-first writers silently never
       // engaged and the audited raw-write races stayed open (the r44 verification)
@@ -3754,10 +3781,10 @@ class TimelinePanel {
         // a 4xx/refusal means the kernel is UP and said no — falling back to the raw file
         // write would race the very writers the refusal protects (the r44 verification);
         // only a NETWORK failure (the catch below) reads as kernel-down
-        if (!r.ok) return 'refused';
-        return r.json().then((j) => (j && j.ok === false) ? 'refused' : true).catch(() => true);
-      }).catch(() => false);
-    } catch (e) { return Promise.resolve(false); }
+        return r.json().catch(() => null).then((j) =>
+          fold((!r.ok || (j && j.ok === false)) ? 'refused' : true, j));
+      }).catch(() => fold(false));
+    } catch (e) { return Promise.resolve(fold(false)); }
   }
 
   // Queue one targeted op for the KERNEL to replay through its locked, canonicalizing setters

@@ -28,6 +28,23 @@ done
 ROMP_DIR="${ROMP_SERVE_ROOT:-$(cd "$(dirname "$src")/.." && pwd)}"
 # ROMP_KERNEL_BIN is the test seam (same pattern as ROMP_*_BIN elsewhere).
 KERNEL="${ROMP_KERNEL_BIN:-$ROMP_DIR/bin/romp-kernel}"
+# RUNTIME GENERATION, resolved AT SPAWN TIME (the v1.3.18 audit's P1, redesigned per the r46
+# verification): when a durable per-commit generation (<gitdir>/romp-run-<sha8>, built by the
+# update transactions) matches the checkout's CURRENT HEAD, its kernel — the verified commit's
+# exact bytes, modules included — executes, with ROMP_CHECKOUT keeping every state/git/dist
+# operation on the real checkout. No generation for HEAD (a local edit, a local update, a
+# classic install) runs the checkout's own kernel, exactly as before. Per-spawn resolution
+# replaced a per-manager-lifetime env pin, which froze every respawn on the pinning update's
+# build: later LOCAL updates became silent no-ops running old bytes under a fresh sha.
+# An explicit ROMP_KERNEL_BIN still wins (the seam above).
+if [ -z "${ROMP_KERNEL_BIN:-}" ]; then
+    _RGD="$(git -C "$ROMP_DIR" rev-parse --absolute-git-dir 2>/dev/null || true)"
+    _RH8="$(git -C "$ROMP_DIR" rev-parse --short=8 HEAD 2>/dev/null || true)"
+    if [ -n "$_RGD" ] && [ -n "$_RH8" ] && [ -x "$_RGD/romp-run-$_RH8/bin/romp-kernel" ]; then
+        KERNEL="$_RGD/romp-run-$_RH8/bin/romp-kernel"
+        export ROMP_CHECKOUT="$ROMP_DIR"
+    fi
+fi
 
 # Port: the manager passes --port; fall back to the env, then the kernel default.
 #

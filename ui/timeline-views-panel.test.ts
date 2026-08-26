@@ -284,7 +284,9 @@ test("_setViews posts through the host hook; Obsidian rides targeted kernel ops 
   // gestures queue as targeted ops the kernel replays through its locked setters
   assert.match(SRC, /process\.versions && process\.versions\.electron/);
   assert.match(SRC, /_setViews\(v, ops\)/);
-  assert.match(SRC, /_kernelPost\('\/views', body\)/);
+  // `true` = wantJson: the POST response's body carries the store's rev — the counter re-anchor
+  // (the r46 verification); the bare-verdict form the other callers use is unchanged
+  assert.match(SRC, /_kernelPost\('\/views', body, true\)/);
   assert.match(SRC, /_spoolOp\(\{ op: 'views', ops: body\.ops \}\)/);
   assert.match(SRC, /this\._pendingViews = v; this\._pendingViewsAge = 0;/);
   assert.match(SRC, /this\._reconcileViews\(\);\s*\/\/ \.\.\.and an optimistic view edit/);

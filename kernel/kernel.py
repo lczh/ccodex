@@ -451,8 +451,14 @@ def _kernel_sha():
             r = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
                                capture_output=True, text=True, timeout=2)
             sha = (r.stdout.strip() or "") if r.returncode == 0 else ""
-            if sha and os.environ.get("ROMP_CHECKOUT"):
-                _SHA = sha                            # pinned generation: exactly HEAD-at-boot
+            if os.environ.get("ROMP_CHECKOUT"):
+                # the RUNNING build's identity is the GENERATION's, never the checkout's HEAD
+                # (the r46 verification: a respawn after the checkout moved reported the new
+                # sha while executing the old generation's bytes — green verifiers over stale
+                # code). The generation dir is named for its commit; the checkout HEAD is only
+                # the fallback for a manual ROMP_CHECKOUT use outside a generation.
+                nm = HERE.parent.name
+                _SHA = nm[len("romp-run-"):] if nm.startswith("romp-run-") else (sha or None)
                 return _SHA
             if sha:
                 d = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain"],
@@ -1870,6 +1876,9 @@ def _set_timeline_views(blob, base_rev=None):
         return True, currev + 1
 
 
+_SPOOL_FAILS = {}   # op-file name -> consecutive failures this process (the quarantine bound)
+
+
 def _apply_one_ui_op(op):
     """One spooled gesture through the locked, canonicalizing setters. True = applied."""
     if not isinstance(op, dict):
@@ -1903,34 +1912,54 @@ def _replay_ui_op_spool():
     and unlink re-applies an idempotent op next pass. The legacy single-file spool
     (pending-ui-ops.jsonl + its .replay twin) is still consumed once for upgrade."""
     applied = 0
-    # legacy single-file spools (pre-v1.3.19 writers, and a crashed pre-upgrade replay)
+    spdir = jd.STATE / "pending-ui-ops"
+    # legacy single-file spools CONVERT to per-op files instead of applying inline (the r46
+    # verification: the inline path was still delete-on-failure — the audited P1 alive for
+    # pre-upgrade writers). Converted names sort BEFORE every Date.now()-named op (0-prefix),
+    # so legacy gestures keep their place in line.
     for legacy in (jd.STATE / "pending-ui-ops.replay.jsonl", jd.STATE / "pending-ui-ops.jsonl"):
         try:
             lines = legacy.read_text(errors="replace").splitlines()
         except OSError:
             continue
+        seq = 0
         for ln in lines:
             if not ln.strip():
                 continue
             try:
-                op = json.loads(ln)
+                json.loads(ln)
             except ValueError:
                 sys.stderr.write("ui-op spool: dropping a torn legacy line (%d bytes)\n" % len(ln))
                 continue
+            seq += 1
             try:
-                applied += 1 if _apply_one_ui_op(op) else 0
-            except Exception:
-                sys.stderr.write("ui-op spool replay (legacy): %s\n" % traceback.format_exc())
-        try:
-            legacy.unlink()
-        except OSError:
-            pass
-    spdir = jd.STATE / "pending-ui-ops"
+                spdir.mkdir(parents=True, exist_ok=True)
+                tmp = spdir / ("0legacy-%d-%d.json.tmp" % (os.getpid(), seq))
+                tmp.write_text(ln)
+                os.replace(tmp, spdir / ("0legacy-%d-%d.json" % (os.getpid(), seq)))
+            except OSError:
+                sys.stderr.write("ui-op spool: legacy line %d could not convert — kept in place\n" % seq)
+                seq = -1
+                break
+        if seq >= 0:
+            try:
+                legacy.unlink()
+            except OSError:
+                pass
     try:
-        names = sorted(n for n in os.listdir(spdir) if n.endswith(".json"))
+        entries = sorted(os.listdir(spdir))
     except OSError:
-        names = []
-    for n in names:
+        entries = []
+    finals = {n for n in entries if n.endswith(".json")}
+    for n in entries:
+        # a .tmp with no published twin is a writer that died mid-stage: the gesture never
+        # existed; sweep it so the dir stays bounded (the r46 verification)
+        if n.endswith(".json.tmp") and n[:-4] not in finals:
+            try:
+                (spdir / n).unlink()
+            except OSError:
+                pass
+    for n in sorted(finals):
         p = spdir / n
         try:
             op = json.loads(p.read_text(errors="replace"))
@@ -1946,10 +1975,24 @@ def _replay_ui_op_spool():
         try:
             ok = _apply_one_ui_op(op)
         except Exception:
-            sys.stderr.write("ui-op spool: op %s FAILED — retained for retry\n%s"
+            # RETAINED, and the QUEUE HOLDS (the r46 verification: retrying a failed op after
+            # newer gestures applied re-ordered the user's actions — a later un-mute replayed
+            # under an older mute). Strict FIFO with head-of-line retry; a persistently failing
+            # op quarantines to .failed after 5 passes so it can never wedge the queue forever.
+            _SPOOL_FAILS[n] = _SPOOL_FAILS.get(n, 0) + 1
+            if _SPOOL_FAILS[n] >= 5:
+                sys.stderr.write("ui-op spool: op %s failed %d passes — quarantined to .failed\n%s"
+                                 % (n, _SPOOL_FAILS[n], traceback.format_exc()))
+                try:
+                    os.replace(p, spdir / (n + ".failed"))
+                except OSError:
+                    pass
+                _SPOOL_FAILS.pop(n, None)
+                continue
+            sys.stderr.write("ui-op spool: op %s FAILED — retained at the queue head\n%s"
                              % (n, traceback.format_exc()))
-            continue                                  # the file stays: a failed gesture is never
-        #                                               silently deleted (the v1.3.18 audit's P1)
+            break
+        _SPOOL_FAILS.pop(n, None)
         applied += 1 if ok else 0
         try:
             p.unlink()
@@ -13664,14 +13707,15 @@ def _update_remote(host):
         "    if not target.startswith(ks):\n"
         "        return False\n"
         "    return not old_boot or bid!=old_boot\n"
-        # the MANAGER dies too (the v1.3.18 audit's P1): a surviving manager's exit handler
-        # respawned the killed kernel through the LIVE checkout's serve before the pinned
-        # ensure below could — the fresh manager runs generation bytes and carries the pinned
-        # env for every later respawn
-        'subprocess.run(["pkill","-f","bin/romp-manage[r]"])\n'
+        # the manager SURVIVES (redesigned per the r46 verification): serve and manager now
+        # resolve the generation matching the checkout's CURRENT HEAD at every spawn, so a
+        # surviving manager's respawn of the killed kernel lands on the generation this
+        # transaction just built — no env pin to go stale (the pinned-manager variant made
+        # every later LOCAL update a silent no-op running old bytes under a fresh sha), no
+        # manager kill to ripple across sibling checkouts or race its own drain window, and
+        # the supervised (launchd/systemd) respawn takes the identical path.
         'subprocess.run(["pkill","-f","bin/romp-kern[e]l"])\n'
-        'env=dict(os.environ,ROMP_DIR=r,ROMP_SERVE_ROOT=r,ROMP_CHECKOUT=r,\n'
-        '         ROMP_SERVE_BIN=sv,ROMP_KERNEL_BIN=os.path.join(gen,"bin","romp-kernel"))\n'
+        'env=dict(os.environ,ROMP_DIR=r,ROMP_SERVE_ROOT=r)\n'
         'lf=open(os.path.join(logdir,"update.log"),"a")\n'
         # the ensure's exit status is CAUGHT now (P1.2): a failed manager launch used to burn
         # the whole probe window on nothing and then read as RESTARTFAIL with no cause on record
@@ -13681,6 +13725,12 @@ def _update_remote(host):
         '        mgr_ok=subprocess.run(["node",mg,"ensure"],stdout=lf,stderr=lf,env=env).returncode==0\n'
         "    except Exception:\n"
         "        mgr_ok=False\n"
+        # prune OTHER generations UNDER the flock (the r46 verification: an unlocked prune
+        # raced a sibling transaction's freshly-built generation). The kernel being replaced is
+        # already killed; a straggler process's open fds outlive the unlink (POSIX).
+        'for g in os.listdir(os.path.dirname(lp)):\n'
+        '    if g.startswith("romp-run-") and os.path.join(os.path.dirname(lp),g)!=gen:\n'
+        "        shutil.rmtree(os.path.join(os.path.dirname(lp),g),ignore_errors=True)\n"
         "fcntl.flock(fd,fcntl.LOCK_UN)\n"
         "os.close(fd)\n"
         "up=False\n"
@@ -13705,11 +13755,6 @@ def _update_remote(host):
         "            break\n"
         "if not up:\n"
         "    sys.exit(32)\n"
-        # the generation is DURABLE (the manager's respawns exec it for this build's lifetime) —
-        # only OTHER generations are pruned, and only after this launch proved healthy
-        'for g in os.listdir(os.path.dirname(lp)):\n'
-        '    if g.startswith("romp-run-") and os.path.join(os.path.dirname(lp),g)!=gen:\n'
-        "        shutil.rmtree(os.path.join(os.path.dirname(lp),g),ignore_errors=True)\n"
         "try:\n"
         "    os.remove(mk)\n"
         "except OSError:\n"
@@ -14423,26 +14468,27 @@ def _restart_remote_kernel(host):
     apply_cmd = (
         'LOGDIR="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}"; mkdir -p "$LOGDIR"; R=%s; '
         'if [ ! -x "$R/bin/romp-serve" ]; then echo NOLAUNCH; exit 0; fi; '
-        # the DURABLE runtime generation (the v1.3.18 audit's P1 + the r45 rr-races): the
-        # detached processes the ensure spawns re-read their script files, so a same-run rm of
-        # a temp snapshot raced them — the per-commit generation persists (pruned only here, on
-        # the NEXT restart, when its processes are the ones being killed). A generation failure
-        # falls back to the live path: this leg's restart was always best-effort.
-        'pkill -f "bin/romp-manage[r]" 2>/dev/null; pkill -f "bin/romp-kern[e]l" 2>/dev/null; '
+        # the DURABLE runtime generation (the v1.3.18 audit's P1, redesigned per the r46
+        # verification): this leg only BUILDS the per-commit generation — serve and manager
+        # resolve it themselves at spawn time, so no env-pin literals ride this script. The
+        # first cut's ROMP_KERNEL_BIN="$GEN/bin/romp-kernel" literal MATCHED the kernel pkill's
+        # own bracket pattern and the apply shell SIGTERM'd itself before doing anything (the
+        # 2026-07-22 self-kill bug reintroduced; the manager pkill's pattern matched the MGR=
+        # literal the same way). The manager survives and is never killed here; pruning is the
+        # p2p wrapper's job, under its flock. A generation failure just means the live path
+        # runs — this leg's restart was always best-effort. NOTE for editors: no contiguous
+        # "bin/romp-kernel" or "bin/romp-manager" text may appear in this script (the GN split
+        # keeps the manager path non-contiguous).
+        'pkill -f "bin/romp-kern[e]l" 2>/dev/null; '
         'LGD="$(git -C "$R" rev-parse --absolute-git-dir 2>/dev/null)"; '
-        'H8="$(git -C "$R" rev-parse --short=8 HEAD 2>/dev/null)"; MGR="$R/bin/romp-manager"; GEN=""; '
+        'H8="$(git -C "$R" rev-parse --short=8 HEAD 2>/dev/null)"; '
         'if [ -n "$LGD" ] && [ -n "$H8" ]; then GEN="$LGD/romp-run-$H8"; '
         'if [ ! -d "$GEN" ]; then rm -rf "$GEN.tmp.$$"; mkdir -p "$GEN.tmp.$$"; '
-        'if git -C "$R" archive HEAD 2>/dev/null | tar -x -C "$GEN.tmp.$$" 2>/dev/null; then mv "$GEN.tmp.$$" "$GEN" 2>/dev/null || rm -rf "$GEN.tmp.$$"; else rm -rf "$GEN.tmp.$$"; fi; fi; '
-        'for g in "$LGD"/romp-run-*; do [ -e "$g" ] || continue; [ "$g" = "$GEN" ] || rm -rf "$g"; done; '
-        '[ -r "$GEN/bin/romp-manager" ] || GEN=""; fi; '
-        '[ -n "$GEN" ] && MGR="$GEN/bin/romp-manager"; '
-        'if command -v node >/dev/null 2>&1 && [ -r "$MGR" ]; then '
-        'if [ -n "$GEN" ]; then ROMP_DIR="$R" ROMP_SERVE_ROOT="$R" ROMP_CHECKOUT="$R" ROMP_SERVE_BIN="$GEN/bin/romp-serve" ROMP_KERNEL_BIN="$GEN/bin/romp-kernel" node "$MGR" ensure >>"$LOGDIR/update.log" 2>&1 || true; '
-        'else ROMP_DIR="$R" ROMP_SERVE_ROOT="$R" node "$MGR" ensure >>"$LOGDIR/update.log" 2>&1 || true; fi; fi; '
+        'if git -C "$R" archive HEAD 2>/dev/null | tar -x -C "$GEN.tmp.$$" 2>/dev/null; then mv "$GEN.tmp.$$" "$GEN" 2>/dev/null || rm -rf "$GEN.tmp.$$"; else rm -rf "$GEN.tmp.$$"; fi; fi; fi; '
+        'GN="romp-manage"; GN="${GN}r"; MGR="$R/bin/$GN"; '
+        'if command -v node >/dev/null 2>&1 && [ -r "$MGR" ]; then ROMP_DIR="$R" ROMP_SERVE_ROOT="$R" node "$MGR" ensure >>"$LOGDIR/update.log" 2>&1 || true; fi; '
         'UP=0; for i in 1 2 3 4 5 6 7 8; do sleep 1; if bash -c "exec 3<>/dev/tcp/127.0.0.1/%d" 2>/dev/null; then UP=1; break; fi; done; '
-        'if [ "$UP" = 0 ]; then SRV="$R/bin/romp-serve"; [ -n "$GEN" ] && [ -x "$GEN/bin/romp-serve" ] && SRV="$GEN/bin/romp-serve"; '
-        'ROMP_SERVE_ROOT="$R" ROMP_CHECKOUT="$R" nohup "$SRV" >>"$LOGDIR/kernel.log" 2>&1 </dev/null & '
+        'if [ "$UP" = 0 ]; then ROMP_SERVE_ROOT="$R" nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null & '
         'for i in 1 2 3 4 5 6 7 8; do sleep 1; if bash -c "exec 3<>/dev/tcp/127.0.0.1/%d" 2>/dev/null; then UP=1; break; fi; done; fi; '
         'echo "RESTARTED:$UP"'
     ) % (shlex.quote(rdir), kport, kport)
@@ -17277,6 +17323,9 @@ def _postal_index():
             o = json.loads(ln)
         except Exception:
             continue
+        if o.get("ev") == "unpublished" and o.get("id"):
+            idx.pop(str(o["id"]), None)                # a failed publish's phantom (the r46
+            continue                                   # verification): the mail never existed
         if o.get("ev") == "sent" and o.get("id"):
             idx[o["id"]] = {"id": o["id"], "from": o.get("from", "?"), "fromId": o.get("from_id", ""),
                             "fromHost": o.get("from_host", ""),
@@ -23365,6 +23414,9 @@ def _postal_messages(now, alive_sids, id2name, live_sids=None):
             o = json.loads(ln)
         except Exception:
             continue
+        if o.get("ev") == "unpublished" and o.get("id"):
+            sent.pop(str(o["id"]), None)               # a failed publish's phantom (the r46
+            continue                                   # verification): never a pending arc
         if o.get("ev") == "sent" and o.get("id"):
             sent[o["id"]] = o
         elif o.get("ev") == "exec" and o.get("id"):

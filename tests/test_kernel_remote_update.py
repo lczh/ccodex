@@ -1459,15 +1459,17 @@ class UpdateRemote(unittest.TestCase):
         self.assertIn('["git","-C",r,"archive",target]', apply,
                       "the generation is the COMPLETE verified tree — manager, serve, kernel and "
                       "modules, never live files")
-        self.assertIn("ROMP_SERVE_ROOT=r,ROMP_CHECKOUT=r", apply,
-                      "the pinned scripts serve and operate on the REAL checkout")
-        self.assertIn("ROMP_SERVE_BIN=sv", apply,
-                      "the manager's respawns exec the generation's serve for this build's lifetime")
-        self.assertIn('ROMP_KERNEL_BIN=os.path.join(gen,"bin","romp-kernel")', apply,
-                      "…and the kernel byte stream is the generation's too")
-        self.assertIn('["pkill","-f","bin/romp-manage[r]"]', apply,
-                      "the surviving manager dies: its exit handler respawned the kernel through "
-                      "the LIVE serve before the pinned ensure could (the v1.3.18 audit's P1)")
+        self.assertIn("ROMP_DIR=r,ROMP_SERVE_ROOT=r", apply,
+                      "the launch env roots serve and manager on the REAL checkout; the "
+                      "generation itself is resolved PER SPAWN by serve/manager (the r46 "
+                      "verification: an env pin froze every respawn on the pinning build)")
+        self.assertNotIn("ROMP_SERVE_BIN=", apply,
+                         "no per-manager-lifetime pin — later LOCAL updates must not respawn "
+                         "old bytes under a fresh sha")
+        self.assertNotIn("ROMP_KERNEL_BIN=", apply)
+        self.assertNotIn("romp-manage[r]", apply,
+                         "the manager SURVIVES: killing it rippled across sibling checkouts, "
+                         "raced its own drain, and the supervised respawn undid it anyway")
         self.assertIn('"romp-restart-needed"', apply)
         self.assertLess(apply.index('"romp-restart-needed"'), apply.index("os.remove(lp)\ngen="),
                         "durable restart intent is armed BEFORE the latch is spent (the earlier "
@@ -1796,14 +1798,24 @@ class RestartVerdictHonesty(unittest.TestCase):
 
     def test_the_rr_leg_uses_a_durable_generation_and_never_rms_it_same_run(self):
         _, _, cmd = self._run("RESTARTED:1\n")
-        self.assertIn("romp-run-$H8", cmd, "the per-commit durable generation")
-        self.assertIn("ROMP_KERNEL_BIN=", cmd)
-        self.assertIn("ROMP_CHECKOUT=", cmd)
+        self.assertIn("romp-run-$H8", cmd, "the per-commit durable generation is BUILT here")
         self.assertNotIn("RRSNAP", cmd)
         self.assertNotIn('rm -rf "$GEN"', cmd,
                          "the generation the detached processes exec is never deleted same-run "
-                         "(the r45 rr race); other generations prune instead")
-        self.assertIn('[ "$g" = "$GEN" ] || rm -rf "$g"', cmd)
+                         "(the r45 rr race)")
+        self.assertNotIn("romp-run-*", cmd,
+                         "no pruning here at all — that is the p2p wrapper's job, under its flock")
+
+    def test_the_rr_script_never_matches_its_own_pkill_patterns(self):
+        # the r46 verification's P1: the first cut's env-pin literals
+        # (ROMP_KERNEL_BIN="$GEN/bin/romp-kernel", MGR="$R/bin/romp-manager") matched the
+        # script's own pkill bracket patterns — the apply shell SIGTERM'd itself and the host
+        # was left with no manager and no kernels (the 2026-07-22 self-kill bug reintroduced)
+        import re as _re
+        _, _, cmd = self._run("RESTARTED:1\n")
+        for pat in _re.findall(r'pkill -f "([^"]+)"', cmd):
+            self.assertIsNone(_re.search(pat, cmd),
+                              "pkill pattern %r matches the apply script's own text" % pat)
 
 
 class KernelRunsFromAGeneration(unittest.TestCase):

@@ -63,9 +63,9 @@ class ApplyScriptPkillPattern(unittest.TestCase):
     def test_no_pattern_matches_its_own_text(self):
         script = _apply_script()
         pats = re.findall(r'\["pkill","-f","([^"]+)"\]', script)
-        self.assertGreaterEqual(len(pats), 2, "the apply kills the manager AND the old kernel "
-                                "(inside the locked python since r44; manager since the "
-                                "v1.3.18 audit's P1)")
+        self.assertGreaterEqual(len(pats), 1, "the apply kills the old KERNEL (inside the "
+                                "locked python since r44); the manager survives — per-spawn "
+                                "generation resolution replaced the kill (the r46 verification)")
         for pat in pats:
             # THE bug: a pattern, applied to the script that carries it, must find nothing.
             self.assertIsNone(re.search(pat, script),
@@ -75,11 +75,16 @@ class ApplyScriptPkillPattern(unittest.TestCase):
     def test_the_patterns_still_match_the_real_command_lines(self):
         script = _apply_script()
         pats = re.findall(r'\["pkill","-f","([^"]+)"\]', script)
+        # KERNEL command lines only: the manager SURVIVES updates now (the r46 verification —
+        # killing it rippled across sibling checkouts and raced its own drain; per-spawn
+        # generation resolution replaced the env pin that motivated the kill)
         for real in ("/usr/bin/python3 /home/u/GitRepos/romp/bin/romp-kernel",
-                     "python3.12 /home/u/romp/bin/romp-kernel --port 29855",
-                     "node /home/u/romp/bin/romp-manager ensure"):
+                     "python3.12 /home/u/romp/bin/romp-kernel --port 29855"):
             self.assertTrue(any(re.search(p, real) for p in pats),
                             "patterns %r must still kill the real process (%r)" % (pats, real))
+        for spared in ("node /home/u/romp/bin/romp-manager ensure",):
+            self.assertFalse(any(re.search(p, spared) for p in pats),
+                             "the manager must never match — it survives the update")
 
 
 @unittest.skipUnless(sys.platform.startswith("linux") or sys.platform == "darwin",

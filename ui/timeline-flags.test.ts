@@ -216,7 +216,7 @@ test("source: union-op entries carry rt + gesture id + pre-edit name/color at no
 
 test("source: tagEditFailed compensates SIBLING hosts — inverse remote edits; delete is loud, never silent", () => {
   const fn = SRC.indexOf("tagEditFailed(m) {");
-  const win = SRC.slice(fn, fn + 3200);
+  const win = SRC.slice(fn, fn + 3800);
   assert.ok(win.indexOf("_applyLocalOp(o.inverse)") > 0, "the local rollback survives untouched");
   // gid-matched entries on OTHER hosts (still unconfirmed — _reconcileUnionOps already dropped
   // confirmed ones) get the inverse REMOTE edit and are dropped as compensated

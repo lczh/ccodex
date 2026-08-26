@@ -262,6 +262,41 @@ class AwaitingAssertEvidenceGate(unittest.TestCase):
         self.assertIsNone(nd.get("awaitingWhy"), "the done's evidence postdates the stale segment")
         self.assertEqual(len(nd["log"]), 3, "nothing filed")
 
+    # ---- the r46 verification: EVERY sweep-lift row must carry endEv, whichever leg files it —
+    # a peer-supersede / rolledUp / agents-orphan lift journaled without one falls to the legacy
+    # arrival bound here and a row merely FILED late swallows a genuinely newer wait ----
+    def test_a_late_filed_peer_supersede_lift_with_its_reply_as_evidence_yields_to_a_newer_wait(self):
+        # the peer-supersede shape: the sweep retires a kind=peer stamp because the awaited peer
+        # REPLIED (T0+200), but the tick that files the lift runs after a kernel gap (arrival
+        # T0+400). This turn (T0+250) dispatched anew and waits — newer than the reply the lift
+        # cited, so the new wait must stamp; the row's late filing time says nothing.
+        nd = self._apply([{"ev_t": T0 + 100, "src": "closer", "kind": "awaiting",
+                           "why": "the delegated peer's report", "awaitKind": "peer",
+                           "awaitPeers": ["33333333-4444-5555-6666-777777777777"], "at": T0 + 105},
+                          {"ev_t": T0 + 100, "src": "romp", "kind": "awaiting", "lift": True,
+                           "at": T0 + 400, "endEv": T0 + 200}],
+                         ev=T0 + 250)
+        self.assertEqual(nd.get("awaitingWhy"), self.WHY,
+                         "the new wait stamps: the lift's cited reply (T0+200) predates this "
+                         "turn's evidence (T0+250)")
+
+    def test_the_same_peer_supersede_row_without_endEv_suppresses_the_newer_wait(self):
+        # the residual defect the sweep's unfixed legs still journal (the r46 verification:
+        # peer-supersede, rolledUp and agents-orphan lifts file no endEv): the row falls to the
+        # legacy ARRIVAL bound (T0+400), which outranks this turn's evidence (T0+250), and the
+        # genuinely newer wait never stamps — pinned as exactly what each leg's end_ev= fix
+        # removes. Legacy rows keep the arrival bound BY DESIGN (a settled stand-down must not
+        # re-derive), so this test outlives the leg fixes.
+        nd = self._apply([{"ev_t": T0 + 100, "src": "closer", "kind": "awaiting",
+                           "why": "the delegated peer's report", "awaitKind": "peer",
+                           "awaitPeers": ["33333333-4444-5555-6666-777777777777"], "at": T0 + 105},
+                          {"ev_t": T0 + 100, "src": "romp", "kind": "awaiting", "lift": True,
+                           "at": T0 + 400}],
+                         ev=T0 + 250)
+        self.assertIsNone(nd.get("awaitingWhy"),
+                          "no endEv → the arrival bound holds and the newer wait is swallowed")
+        self.assertEqual(len(nd["log"]), 2, "nothing filed")
+
 
 class DeadlockedChainHeals(unittest.TestCase):
     def test_a_pre_upgrade_orphan_re_nominates_via_the_default_stamp(self):

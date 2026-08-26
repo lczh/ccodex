@@ -121,6 +121,23 @@ function log(msg) { process.stderr.write('[romp-manager] ' + msg + '\n'); }
 // same way the other consumers do: $ROMP_SERVE_BIN → $ROMP_DIR/bin → next to this script → the
 // conventional checkout → PATH.
 function rompServeBin() {
+  // per-spawn RUNTIME-GENERATION resolution (the v1.3.18 audit's P1, redesigned per the r46
+  // verification): when the checkout's CURRENT HEAD has a durable generation, its serve — the
+  // verified commit's byte stream — launches the kernel (and resolves the generation kernel
+  // itself); otherwise the checkout's own serve, exactly as before. Resolved fresh at EVERY
+  // spawn, so a respawn after the checkout moves runs the build that matches it — the env-pin
+  // variant froze the manager on the pinning update's build for its whole lifetime.
+  const dir = process.env.ROMP_SERVE_ROOT || process.env.ROMP_DIR;
+  if (!process.env.ROMP_SERVE_BIN && dir) {
+    try {
+      const gd = execFileSync('git', ['-C', dir, 'rev-parse', '--absolute-git-dir'],
+                              { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+      const h8 = execFileSync('git', ['-C', dir, 'rev-parse', '--short=8', 'HEAD'],
+                              { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+      const cand = path.join(gd, 'romp-run-' + h8, 'bin', 'romp-serve');
+      if (gd && h8 && fs.existsSync(cand)) return cand;
+    } catch (e) { /* no git / no checkout -> the classic chain below */ }
+  }
   const cands = [
     process.env.ROMP_SERVE_BIN,
     process.env.ROMP_DIR && path.join(process.env.ROMP_DIR, 'bin', 'romp-serve'),
@@ -286,7 +303,13 @@ function spawnKernel(spec) {
   const env = specEnv(spec, process.env, { managerPid: process.pid, controlPort: CONTROL_PORT,
                                            managerToken: managerControlToken });
   // stdio inherited → the kernel's own logs surface in this foreground terminal (visible owner).
-  const child = spawn(rompServeBin(), ['--port', String(spec.port)], { stdio: 'inherit', env });
+  const serveBin = rompServeBin();
+  if (serveBin.indexOf('romp-run-') >= 0) {
+    // a GENERATION serve must still root at the checkout: its path-derived default would root
+    // at the generation and scatter state there (the r46 verification)
+    env.ROMP_SERVE_ROOT = process.env.ROMP_SERVE_ROOT || process.env.ROMP_DIR || env.ROMP_SERVE_ROOT;
+  }
+  const child = spawn(serveBin, ['--port', String(spec.port)], { stdio: 'inherit', env });
   kernels.set(spec.id, {
     spec, child,
     restarts: prev ? prev.restarts : 0,

@@ -480,6 +480,79 @@ class PerFileOpSpool(unittest.TestCase):
         flags = json.loads((km.jd.STATE / "session-flags.json").read_text())
         self.assertTrue(flags[SID]["postalServiceOff"])
 
+    def test_a_failed_head_op_holds_the_queue_in_order(self):
+        # the r46 verification: retrying a failed op AFTER newer gestures applied re-ordered
+        # the user's actions — strict FIFO with head-of-line retry
+        (self.spdir / "100-hh.json").write_text(json.dumps(
+            {"op": "flag", "target": SID, "flag": "hideFromFeed", "value": True}))
+        (self.spdir / "200-ii.json").write_text(json.dumps(
+            {"op": "flag", "target": SID, "flag": "hideFromFeed", "value": False}))
+
+        def boom(*a, **kw):
+            raise OSError(5, "setter died")
+
+        saved = km._set_session_flag
+        km._set_session_flag = boom
+        try:
+            km._replay_ui_op_spool()
+        finally:
+            km._set_session_flag = saved
+        self.assertTrue((self.spdir / "100-hh.json").exists())
+        self.assertTrue((self.spdir / "200-ii.json").exists(),
+                        "the LATER op never applied around the failed head — order holds")
+        km._replay_ui_op_spool()
+        flags = json.loads((km.jd.STATE / "session-flags.json").read_text())
+        self.assertNotIn(SID, flags, "both applied in order: the un-hide is the last word")
+
+    def test_a_persistently_failing_op_quarantines_after_five_passes(self):
+        (self.spdir / "100-qq.json").write_text(json.dumps(
+            {"op": "flag", "target": SID, "flag": "hideFromFeed", "value": True}))
+
+        def boom(*a, **kw):
+            raise OSError(5, "always")
+
+        saved = km._set_session_flag
+        km._set_session_flag = boom
+        km._SPOOL_FAILS.clear()
+        try:
+            for _ in range(5):
+                km._replay_ui_op_spool()
+        finally:
+            km._set_session_flag = saved
+        self.assertFalse((self.spdir / "100-qq.json").exists())
+        self.assertTrue((self.spdir / "100-qq.json.failed").exists(),
+                        "quarantined loudly, never silently deleted — and the queue unwedges")
+
+    def test_a_dead_writers_tmp_is_swept(self):
+        (self.spdir / "100-tt.json.tmp").write_text('{"half": ')
+        km._replay_ui_op_spool()
+        self.assertFalse((self.spdir / "100-tt.json.tmp").exists())
+
+    def test_legacy_ops_convert_to_files_and_survive_a_failure(self):
+        # the r46 verification: the inline legacy path was still delete-on-failure — the
+        # audited P1 alive for pre-upgrade writers. Conversion makes them ordinary queue
+        # members with the same retained-failure rights.
+        (km.jd.STATE / "pending-ui-ops.jsonl").write_text(json.dumps(
+            {"op": "flag", "target": SID, "flag": "postalServiceOff", "value": True}) + "\n")
+
+        def boom(*a, **kw):
+            raise OSError(5, "setter died")
+
+        saved = km._set_session_flag
+        km._set_session_flag = boom
+        km._SPOOL_FAILS.clear()
+        try:
+            km._replay_ui_op_spool()
+        finally:
+            km._set_session_flag = saved
+        self.assertFalse((km.jd.STATE / "pending-ui-ops.jsonl").exists(),
+                         "the legacy file converted away")
+        self.assertTrue(list(self.spdir.glob("0legacy-*.json")),
+                        "…into a retained per-op file, not a deleted gesture")
+        km._replay_ui_op_spool()
+        flags = json.loads((km.jd.STATE / "session-flags.json").read_text())
+        self.assertTrue(flags[SID]["postalServiceOff"], "…which then applies")
+
     def test_the_legacy_append_spool_is_still_consumed_once(self):
         (km.jd.STATE / "pending-ui-ops.jsonl").write_text(json.dumps(
             {"op": "flag", "target": SID, "flag": "hideFromFeed", "value": True}) + "\n")

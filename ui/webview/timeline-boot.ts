@@ -43,6 +43,12 @@ export function dispatchFrame(panel: any, m: any): boolean {
   // round trip back into the pane the user is already looking at. revealEvent pans + pulses only.
   if (m.type === "revealEvent" && panel.revealEvent) { panel.revealEvent(m.sid, m.t, m.id); return true; }
   if (m.type === "tagEditFailed" && panel.tagEditFailed) { panel.tagEditFailed(m); return true; }
+  // the kernel's per-write acknowledgement for setTimelineViews — {type:"viewsAck", ok, rev}. The
+  // kernel sent it and the panel defined viewsAck(), but no router dispatched it, so the audited
+  // guessed-rev hole persisted on every WS host (the r46 verification). The panel also listens for
+  // the frame itself (the browser boot is the kernel's inline script); viewsAck is idempotent, so
+  // the double delivery here is harmless.
+  if (m.type === "viewsAck" && panel.viewsAck) { panel.viewsAck(m); return true; }
   return false;
 }
 
