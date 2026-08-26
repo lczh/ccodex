@@ -5573,10 +5573,19 @@ def _lift_spent_awaiting(now, tmux):
                 _aw = [e for e in (nd.get("log") or []) if e.get("kind") == "awaiting"]
                 _last_lift = max((e.get("at") or e.get("ev_t") or 0 for e in _aw if e.get("lift")), default=0)
                 _last_assert = max((e.get("at") or e.get("ev_t") or 0 for e in _aw if not e.get("lift")), default=0)
+                # the lifts' epistemic boundary is their EVIDENCE, never their arrival (the v1.3.18
+                # audit): a closer lift files a whole audit-lag after the turn it ruled from, so
+                # bounding at its `at` swallowed returns that landed in between — a delayed lift
+                # kept a spent wait alive with no reviver but the 6h wake. jd._wait_end_ev: a
+                # closer lift bounds at its audited turn (ev_t); a sweep lift at the newest return
+                # it cited (endEv, journaled below; arrival for legacy rows — the pre-audit bound,
+                # so settled stand-downs don't re-derive). The re-assert TRIGGER above stays on
+                # filing order (`at`): "re-affirmed after the lift" is about what the diary held.
+                _lift_ev = max((jd._wait_end_ev(e) for e in _aw if e.get("lift")), default=0)
                 _evidence = max((max(t.get("endT") or 0, t.get("t") or 0, t.get("deadline") or 0,
                                      sp if t.get("id") in dead else 0)
                                  for t in own), default=0)
-                if _last_lift and _last_assert > _last_lift and _evidence <= _last_lift:
+                if _last_lift and _last_assert > _last_lift and _evidence <= _lift_ev:
                     continue                          # every citable return was already ruled on by that
                     #                                   lift — re-lifting off it is the flap. A return
                     #                                   NEWER than the last lift is new information even
@@ -5585,7 +5594,13 @@ def _lift_spent_awaiting(now, tmux):
                     #                                   landed (2026-08-25 audit — a watcher's stamp written
                     #                                   17s after its merge notification stood 9.5h because
                     #                                   write-time was read as the epistemic boundary)
-                if jd.record_verdict(store, nd, "romp", "awaiting", _lift_ev_t(nd, now), lift=True):
+                # journal WHAT this lift ruled on (the v1.3.18 audit): the newest citable return,
+                # clamped to now — a completed Monitor still carries its future deadline, and a
+                # lift cannot cite evidence from after the moment it ruled. Read back by
+                # jd._wait_end_ev at both evidence gates (this stand-down, and the closer's
+                # awaiting-assert gate), so this lift's late ARRIVAL can never outrank newer waits.
+                if jd.record_verdict(store, nd, "romp", "awaiting", _lift_ev_t(nd, now), lift=True,
+                                     end_ev=min(_evidence, int(now)) or None):
                     changed = True
                     # The lift is NEW INFORMATION for the escalation ladder: the wait this goal's last
                     # nudge/wake episode ended on has returned. Drop the goal's spent ledger record

@@ -200,6 +200,69 @@ class LiftRiders(unittest.TestCase):
         self.assertNotEqual(s["status"].get(SID + ":g1"), "completed")
 
 
+class AwaitingAssertEvidenceGate(unittest.TestCase):
+    """The closer's awaiting-assert stand-down compares EVIDENCE against evidence (the v1.3.18
+    audit). It used to read the prior ending row's ARRIVAL (`at`), so a lift merely FILED late —
+    a sweep tick after a kernel gap, a lagging closer — outranked a turn that genuinely dispatched
+    anew and waited: the newer wait never stamped, the card wore no awaiting box, and its nudge
+    exemption vanished. A stale re-assert (a closer auditing a pre-ending segment) still stands
+    down, off the ending's own evidence: the sweep lift's endEv (the newest return it cited, the
+    field the sweep journals since the same audit) or the done's resolving turn. SYNTHETIC."""
+
+    WHY = "waiting on the rebuilt watcher; acts when it reports"
+
+    def _apply(self, log, ev):
+        s = _store()
+        nd = _node(s, "g1", "regenerate the shard index", log=log)
+        jd.apply_close(s, [nd], {"awaiting": {1: {"why": self.WHY, "kind": "task"}}},
+                       t=ev, touched=1)
+        return nd
+
+    def test_a_new_wait_lands_over_a_late_filed_sweep_lift(self):
+        # the sweep's lift of the OLD stamp landed at T0+300 (a tick after a kernel gap), citing a
+        # return at T0+200. The new turn (T0+250) dispatched anew and waits — genuinely newer than
+        # everything the lift ruled on, whatever its filing time says.
+        nd = self._apply([_row("awaiting", T0 + 100, why="the old watch", at=T0 + 105),
+                          {"ev_t": T0 + 100, "src": "romp", "kind": "awaiting", "lift": True,
+                           "at": T0 + 300, "endEv": T0 + 200}],
+                         ev=T0 + 250)
+        self.assertEqual(nd.get("awaitingWhy"), self.WHY,
+                         "the new wait stamps: the lift's cited return (T0+200) predates this "
+                         "turn's evidence (T0+250)")
+
+    def test_a_new_wait_lands_over_a_delayed_closer_lift(self):
+        # the closer's lift ruled from turn T0+180 and filed at T0+300 (audit lag); the new turn
+        # (T0+250) postdates its audited evidence
+        nd = self._apply([_row("awaiting", T0 + 100, why="the old watch", at=T0 + 105),
+                          {"ev_t": T0 + 180, "src": "closer", "kind": "awaiting", "lift": True,
+                           "at": T0 + 300}],
+                         ev=T0 + 250)
+        self.assertEqual(nd.get("awaitingWhy"), self.WHY,
+                         "a judge lift bounds at its audited turn (ev_t), not its filing time")
+
+    def test_a_stale_reassert_still_stands_down_off_the_lifts_cited_return(self):
+        # the 2026-08-25 shape survives the evidence flip: a closer auditing a PRE-return segment
+        # (T0+150) re-asserts a wait the sweep already ended off a T0+200 return — the writer's
+        # world is older than the diary's evidence, so nothing files
+        nd = self._apply([_row("awaiting", T0 + 100, why="the old watch", at=T0 + 105),
+                          {"ev_t": T0 + 100, "src": "romp", "kind": "awaiting", "lift": True,
+                           "at": T0 + 210, "endEv": T0 + 200}],
+                         ev=T0 + 150)
+        self.assertIsNone(nd.get("awaitingWhy"), "the wait ended AFTER this turn's evidence — yield")
+        self.assertEqual(len(nd["log"]), 2, "nothing filed in either direction")
+
+    def test_a_stale_reassert_still_stands_down_off_a_dones_resolving_turn(self):
+        # the incident's other row: the goal's done (resolving turn T0+190) also outranks the
+        # stale segment's evidence (T0+150) — by its ev_t now, not its filing time
+        nd = self._apply([_row("awaiting", T0 + 100, why="the old watch", at=T0 + 105),
+                          {"ev_t": T0 + 100, "src": "romp", "kind": "awaiting", "lift": True,
+                           "at": T0 + 145, "endEv": T0 + 140},
+                          _row("done", T0 + 190, at=T0 + 400)],
+                         ev=T0 + 150)
+        self.assertIsNone(nd.get("awaitingWhy"), "the done's evidence postdates the stale segment")
+        self.assertEqual(len(nd["log"]), 3, "nothing filed")
+
+
 class DeadlockedChainHeals(unittest.TestCase):
     def test_a_pre_upgrade_orphan_re_nominates_via_the_default_stamp(self):
         # the live g7 shape: a working top whose open descendant chain deadlocked the old channels —

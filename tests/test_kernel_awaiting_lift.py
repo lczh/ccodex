@@ -590,6 +590,52 @@ class LiftStandsDown(unittest.TestCase):
         self._tick(now=BACK + 120)
         self.assertIsNone(self._stamp(), "first-stamp audit-lag lift preserved")
 
+    # ---- the lift's boundary is its EVIDENCE, never its arrival (the v1.3.18 audit) ----
+    def test_a_delayed_closer_lift_does_not_swallow_newer_returns(self):
+        # a closer lift FILES a whole audit-lag after the turn it ruled from: it audited turn 500
+        # and filed at 900. A later turn re-asserted the wait (anchor 600) and its own dispatch
+        # returned at 800 — inside the lag. The old stand-down bounded the lift at its ARRIVAL
+        # (900), so the 800 return read as "already ruled on" and the spent wait sat stamped with
+        # no reviver but the 6h wake. The lift's boundary is its audited turn (ev_t 500); the 800
+        # return postdates it — new information, so the lift proceeds.
+        self._transcript([_launch("t1", 650), _notification("t1", 800)])
+        why = "the regenerated index build; verifies when it lands"
+        nd = {"id": self.gid, "text": "a goal", "parentId": None, "nodeComplete": False,
+              "blocked": False, "cleared": False, "trail": [], "t": BORN, "mt": BORN,
+              "awaitingWhy": why, "awaitingAt": 600, "log": [
+                  {"ev_t": STAMP, "src": "closer", "kind": "awaiting", "why": why, "at": STAMP + 5},
+                  {"ev_t": 500, "src": "closer", "kind": "awaiting", "lift": True, "at": 900},
+                  {"ev_t": 600, "src": "closer", "kind": "awaiting", "why": why, "at": 950}]}
+        (km.jd.GOALDIR / (SID + ".json")).write_text(json.dumps({
+            "rompUuid": SID, "seq": 1, "placements": {}, "status": {}, "nodes": {self.gid: nd}}))
+        self._tick(now=1000)
+        self.assertIsNone(self._stamp(),
+                          "the return (800) postdates the lift's audited turn (500) — the lift "
+                          "never ruled on it, whatever its filing time says")
+
+    def test_the_sweeps_lift_journals_the_return_it_cited(self):
+        # (the v1.3.18 audit) the lift row carries its own evidence horizon (endEv = the newest
+        # cited return), so the evidence gates never fall back to its arrival on new rows
+        self._transcript([_launch("t1", LAUNCH), _launch("t2", LAUNCH + 5),
+                          _notification("t1", BACK), _notification("t2", BACK + 5)])
+        self._seed()
+        self._tick(now=BACK + 5000)
+        log = json.loads((km.jd.GOALDIR / (SID + ".json")).read_text())["nodes"][self.gid]["log"]
+        lift = [e for e in log if e.get("kind") == "awaiting" and e.get("lift")][0]
+        self.assertEqual(lift.get("endEv"), BACK + 5,
+                         "the newest cited return — not the anchor, not the arrival")
+
+    def test_a_cited_future_deadline_is_clamped_to_the_ruling_moment(self):
+        # a completed Monitor still carries its recorded deadline, possibly far in the future — a
+        # lift cannot cite evidence from after the moment it ruled, or it would suppress waits
+        # asserted between now and that deadline
+        self._transcript([_monitor("t1", LAUNCH, timeout_ms=3_000_000), _notification("t1", BACK)])
+        self._seed()
+        self._tick(now=BACK + 100)
+        log = json.loads((km.jd.GOALDIR / (SID + ".json")).read_text())["nodes"][self.gid]["log"]
+        lift = [e for e in log if e.get("kind") == "awaiting" and e.get("lift")][0]
+        self.assertEqual(lift.get("endEv"), BACK + 100, "clamped to the tick — never future evidence")
+
 
 class LiftKeepsLiveLedgerRecords(unittest.TestCase):
     """A lift drops only SPENT ledger records (failed/moot/answered latches — the 2026-08-16

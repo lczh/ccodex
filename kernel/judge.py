@@ -7269,7 +7269,7 @@ def may_apply(store, nd, src, kind, ev_t=None):
 LOG_CAP = 64                             # per-node verdict-log bound (a node rarely sees >10 verdicts; the cap
 #                                          is a runaway backstop — oldest drop, logTrunc marks the loss)
 def record_verdict(store, nd, src, kind, ev_t=None, why=None, seg=None, msg=False, undo=False, lift=False,
-                   await_kind=None, await_peers=None):
+                   await_kind=None, await_peers=None, end_ev=None):
     """P3.1 DUAL-WRITE (the user 2026-07-06): the gate AND the recorder, fused into the one seam every
     verdict write goes through. Asks may_apply; when allowed, appends the event to the node's
     append-only verdict LOG and returns True — the caller then writes the flags exactly as before
@@ -7301,6 +7301,12 @@ def record_verdict(store, nd, src, kind, ev_t=None, why=None, seg=None, msg=Fals
                     # open-ask keys, so the supersede can match the awaited pair's answer and stop
                     # letting unrelated mail from the same log end unrelated waits. Absent = legacy.
                     **({"awaitPeers": sorted(await_peers)} if await_peers else {}),
+                    # the newest RETURN a sweep lift cited — its own EVIDENCE horizon (the v1.3.18
+                    # audit): a sweep lift's ev_t is deliberately the retracted stamp's ANCHOR
+                    # (fold ordering, see _lift_ev_t), so without this field the readers had only
+                    # its arrival, and a lift merely WRITTEN late outranked genuinely newer
+                    # evidence. Optional; rows without it fall back per _wait_end_ev.
+                    **({"endEv": int(end_ev)} if end_ev else {}),
                     "at": int(time.time())})
         if len(log) > LOG_CAP:
             del log[:len(log) - LOG_CAP]
@@ -7322,6 +7328,24 @@ def _done_since(nd):
     legacy nodes. The done twin of _block_since."""
     ts = [(e.get("ev_t") or e.get("at") or 0) for e in (nd.get("log") or []) if e.get("kind") == "done"]
     return max(ts) if ts else (nd.get("mt") or nd.get("t") or 0)
+def _wait_end_ev(e):
+    """The EVIDENCE horizon of a diary row that ENDED something — a done, or an awaiting LIFT — for
+    comparing against other EVIDENCE clocks (the v1.3.18 audit: two awaiting gates compared these
+    rows' ARRIVAL (`at`, filing time — "forensics only" per record_verdict) against evidence times,
+    so a row merely WRITTEN late outranked genuinely newer evidence: the closer's assert gate
+    suppressed a real new wait behind a late-filed prior lift, and the sweep's stand-down let a
+    delayed closer lift swallow returns its audit never saw, keeping a spent wait alive with no
+    reviver but the 6h wake).
+      * a judge row carries its evidence in ev_t (a done's resolving turn; a closer lift's audited
+        turn) — arrival only when no evidence time exists (a legacy row).
+      * a sweep ("romp") lift's ev_t is deliberately the RETRACTED stamp's anchor (_lift_ev_t's
+        fold-ordering rule), never its own evidence; its evidence is the newest return it cited,
+        journaled as endEv since the v1.3.18 audit. A legacy row without endEv falls back to
+        arrival — the sweep rules on the live world at write, so arrival bounds its evidence from
+        above (the pre-audit bound, unchanged for old rows so settled waits don't re-derive)."""
+    if e.get("lift") and e.get("src") == "romp":
+        return int(e.get("endEv") or e.get("at") or e.get("ev_t") or 0)
+    return int(e.get("ev_t") or e.get("at") or 0)
 def _brief_superseded(nodes, sub, prev_bm):
     """True when a KEPT decision brief predates a later unblock/reopen anywhere in the card's subtree —
     the asks it presents were ANSWERED after it was written, so keeping it re-surfaces decisions the
@@ -9854,12 +9878,18 @@ def apply_close(store, menu, verdicts, t=None, touched=None, t_overrides=None):
                 # (a stand-down is not new information in either direction).
                 continue
             if any(e.get("kind") in ("awaiting", "done") and (e.get("lift") or e.get("kind") == "done")
-                   and (e.get("at") or e.get("ev_t") or 0) > (ev or 0) for e in nd.get("log") or []):
+                   and _wait_end_ev(e) > (ev or 0) for e in nd.get("log") or []):
                 # the wait this assert describes already ENDED in the diary AFTER this turn's evidence
                 # (2026-08-25 audit: a closer auditing the pre-merge segment re-asserted a watch whose
                 # lift AND whose goal's done were both already filed — the stamp then stood for hours
                 # with the job kind exempt from every mail retire). The writer's world is older than
                 # the diary: stand down; a REAL new wait re-asserts from the next pass's fresh evidence.
+                # EVIDENCE against evidence (the v1.3.18 audit): this gate read the ending row's
+                # ARRIVAL, so a prior lift merely FILED late (a sweep tick after a kernel gap, a
+                # lagging closer) outranked a turn that genuinely dispatched anew and waited — the
+                # newer wait never stamped, and the card sat with no awaiting box and no nudge
+                # exemption. _wait_end_ev reads each row's evidence horizon, arrival only when no
+                # evidence time exists.
                 continue
             if nd.get("awaitingWhy") != aw_why:
                 # a changed why is a real event → new row, new anchor (as ever)
