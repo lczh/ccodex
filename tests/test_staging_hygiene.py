@@ -92,7 +92,10 @@ class ElectronStagingWriters(unittest.TestCase):
                              "gestures ride the kernel routes or the replay spool" % gone)
         self.assertIn("'pending-ui-ops'", src, "the spool dir is the ONLY fallback surface")
         i = src.index("'pending-ui-ops'")
-        win = src[max(0, i - 300):i + 600]
+        win = src[max(0, i - 300):i + 900]
+        self.assertIn("'pending-ui-ops.stage'", win,
+                      "staged in the SIBLING dir (the r46 re-verify: an in-dir tmp raced the "
+                      "kernel's sweep and the gesture was silently lost)")
         self.assertIn("renameSync", win,
                       "one atomically-published FILE per op (the v1.3.18 audit's P1: the shared "
                       "append file's rename-aside handoff lost a racing writer's gesture)")

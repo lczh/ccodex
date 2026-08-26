@@ -105,8 +105,9 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
     assert.match(win, /'pending-ui-ops'/,
       "one FILE per op in the spool dir (the v1.3.18 audit's P1: the shared append file's "
       + "rename-aside handoff raced a writer onto an unlinked inode)");
-    assert.match(win, /writeFileSync\([\s\S]*\.tmp/, "staged…");
-    assert.match(win, /renameSync\(/, "…and atomically published");
+    assert.match(win, /'pending-ui-ops\.stage'/,
+      "staged in the SIBLING dir — an in-dir tmp raced the kernel's sweep (the r46 re-verify)");
+    assert.match(win, /renameSync\(/, "…and atomically published across");
   }
   {
     // views edits ride the kernel's TARGETED ops and spool the same grammar kernel-down
