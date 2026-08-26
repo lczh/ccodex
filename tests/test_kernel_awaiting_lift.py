@@ -636,6 +636,55 @@ class LiftStandsDown(unittest.TestCase):
         lift = [e for e in log if e.get("kind") == "awaiting" and e.get("lift")][0]
         self.assertEqual(lift.get("endEv"), BACK + 100, "clamped to the tick — never future evidence")
 
+    # ---- the r46 verification: the stand-down's evidence boundary spans EVERY lift row, so every
+    # sweep-lift leg must journal endEv — a peer-supersede / rolledUp / agents-orphan lift filed
+    # without one falls to the legacy arrival bound here and swallows returns it never ruled on ----
+    def test_a_peer_supersede_shaped_lift_bounds_at_its_cited_reply_not_its_arrival(self):
+        # the retracted stamp was a peer wait; its lift cites the peer's REPLY (endEv 450) but
+        # FILES at 900 (a sweep tick after a kernel gap). The re-asserted wait's own dispatch
+        # returned at 800 — after everything that lift ruled on — so the lift proceeds: new
+        # information, whatever the row's filing time says.
+        self._transcript([_launch("t1", 650), _notification("t1", 800)])
+        why = "the follow-up dispatch; acts when it reports"
+        nd = {"id": self.gid, "text": "a goal", "parentId": None, "nodeComplete": False,
+              "blocked": False, "cleared": False, "trail": [], "t": BORN, "mt": BORN,
+              "awaitingWhy": why, "awaitingAt": 600, "log": [
+                  {"ev_t": 300, "src": "closer", "kind": "awaiting", "awaitKind": "peer",
+                   "awaitPeers": ["33333333-4444-5555-6666-777777777777"],
+                   "why": "the delegated peer's report", "at": 310},
+                  {"ev_t": 300, "src": "romp", "kind": "awaiting", "lift": True,
+                   "at": 900, "endEv": 450},
+                  {"ev_t": 600, "src": "closer", "kind": "awaiting", "why": why, "at": 950}]}
+        (km.jd.GOALDIR / (SID + ".json")).write_text(json.dumps({
+            "rompUuid": SID, "seq": 1, "placements": {}, "status": {}, "nodes": {self.gid: nd}}))
+        self._tick(now=1000)
+        self.assertIsNone(self._stamp(),
+                          "the return (800) postdates the reply the lift cited (450) — the lift "
+                          "never ruled on it, whatever its filing time (900) says")
+
+    def test_the_same_row_without_endEv_keeps_the_arrival_bound_and_stands_down(self):
+        # the residual defect the sweep's unfixed legs still journal (the r46 verification): with
+        # no endEv the row falls to the legacy arrival bound (900), the 800 return reads as
+        # already-ruled-on, and the spent wait survives with no reviver but the 6h wake. Legacy
+        # rows keep this bound BY DESIGN (settled stand-downs never re-derive), so this pin
+        # outlives the per-leg end_ev= fixes; every NEW sweep lift must journal its evidence.
+        self._transcript([_launch("t1", 650), _notification("t1", 800)])
+        why = "the follow-up dispatch; acts when it reports"
+        nd = {"id": self.gid, "text": "a goal", "parentId": None, "nodeComplete": False,
+              "blocked": False, "cleared": False, "trail": [], "t": BORN, "mt": BORN,
+              "awaitingWhy": why, "awaitingAt": 600, "log": [
+                  {"ev_t": 300, "src": "closer", "kind": "awaiting", "awaitKind": "peer",
+                   "awaitPeers": ["33333333-4444-5555-6666-777777777777"],
+                   "why": "the delegated peer's report", "at": 310},
+                  {"ev_t": 300, "src": "romp", "kind": "awaiting", "lift": True, "at": 900},
+                  {"ev_t": 600, "src": "closer", "kind": "awaiting", "why": why, "at": 950}]}
+        (km.jd.GOALDIR / (SID + ".json")).write_text(json.dumps({
+            "rompUuid": SID, "seq": 1, "placements": {}, "status": {}, "nodes": {self.gid: nd}}))
+        self._tick(now=1000)
+        self.assertIsNotNone(self._stamp(),
+                             "no endEv → the arrival bound (900) outranks the 800 return and the "
+                             "stand-down holds — the pre-audit legacy bound, unchanged")
+
 
 class LiftKeepsLiveLedgerRecords(unittest.TestCase):
     """A lift drops only SPENT ledger records (failed/moot/answered latches — the 2026-08-16

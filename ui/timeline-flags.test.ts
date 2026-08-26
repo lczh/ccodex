@@ -218,6 +218,10 @@ test("source: tagEditFailed compensates SIBLING hosts — inverse remote edits; 
   const fn = SRC.indexOf("tagEditFailed(m) {");
   const win = SRC.slice(fn, fn + 3800);
   assert.ok(win.indexOf("_applyLocalOp(o.inverse)") > 0, "the local rollback survives untouched");
+  // the r46 verification: the refusal carries no gesture id, so of the host+name matches only the
+  // MOST-RECENT gesture's entries (the max gid group) compensate — never other gestures' entries
+  assert.match(win, /const newestGid = matched\.reduce\(\(g, o\) => Math\.max\(g, o\.gid \|\| 0\), 0\);/);
+  assert.match(win, /const ops = matched\.filter\(\(o\) => \(o\.gid \|\| 0\) === newestGid\);/);
   // gid-matched entries on OTHER hosts (still unconfirmed — _reconcileUnionOps already dropped
   // confirmed ones) get the inverse REMOTE edit and are dropped as compensated
   assert.match(win, /o\.gid && gids\.has\(o\.gid\)/);
@@ -384,4 +388,105 @@ test("viewsAck: the kernel's write acknowledgement re-anchors the rev counter; a
   assert.ok(panel._pendingViews, "an accepted write keeps the overlay until the echoing push");
   panel.viewsAck({ ok: true });
   assert.equal(panel._optViewsRev, 0, "a malformed rev anchors at 0, never NaN");
+});
+
+test("viewsAck is ROUTED on every WS host (the r46 verification): the boot router case + the panel's own frame listener", () => {
+  // The kernel sent the frame and the panel defined viewsAck(), but no inbound router dispatched
+  // it — dead code on every shipped host, the audited guessed-rev hole intact. VS Code: the boot's
+  // dispatchFrame gains the case (executed in timeline-boot.test.ts). The kernel-served browser
+  // page boots from the kernel's inline script, so the panel listens for the frame itself — the
+  // shim/federation manager re-dispatches every kernel frame as a window "message" event.
+  const BOOT = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "timeline-boot.ts"), "utf8");
+  assert.match(BOOT, /if \(m\.type === "viewsAck" && panel\.viewsAck\) \{ panel\.viewsAck\(m\); return true; \}/);
+  assert.match(SRC, /this\._onWinMsg = \(e\) => \{ const m = e && e\.data; if \(m && m\.type === 'viewsAck'\) this\.viewsAck\(m\); \};/);
+  assert.match(SRC, /window\.addEventListener\('message', this\._onWinMsg\);/);
+  assert.match(SRC, /window\.removeEventListener\('message', this\._onWinMsg\);/, "destroy unhooks it");
+  // executed: a window message frame re-anchors the counter; foreign frames pass by untouched
+  const panel = drawnPanel();
+  panel._optViewsRev = 99;
+  panel._onWinMsg({ data: { type: "viewsAck", ok: true, rev: 12 } });
+  assert.equal(panel._optViewsRev, 12, "the frame reaches viewsAck through the listener");
+  panel._onWinMsg({ data: { type: "data" } });
+  panel._onWinMsg(null);
+  assert.equal(panel._optViewsRev, 12, "non-ack frames (and junk) change nothing");
+});
+
+test("executed: the Obsidian POST /views path re-anchors the counter from the response rev (the r46 verification)", async () => {
+  // The WS ack never reaches this host — it writes via POST /views, whose response body carries
+  // {ok, rev} (409 bodies too). Without parsing it the counter kept guessing there.
+  delete (g as any).__rompTimelineSetViews;              // no WS hook → the Electron POST branch
+  (process.versions as any).electron = "30.0.0";
+  try {
+    const panel = drawnPanel();
+    panel._spoolOp = () => { throw new Error("a kernel-up answer must never spool"); };
+    const posts: any[] = [];
+    // accepted: 200 {ok:true, rev} — the counter re-anchors; the overlay stays until the echoing push
+    panel._kernelPost = (route: string, body: any) => { posts.push([route, body]); return Promise.resolve({ ok: true, json: { ok: true, rev: 41 } }); };
+    panel._optViewsRev = 99;
+    const nv = JSON.parse(JSON.stringify(panel._curViews()));
+    panel._setViews(nv, [{ active: "all" }]);
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(posts[0], ["/views", { ops: [{ active: "all" }] }], "the write went through the kernel");
+    assert.equal(panel._optViewsRev, 41, "the response rev re-anchors the counter — no more guessing");
+    assert.ok(panel._pendingViews, "an accepted write keeps the overlay until the echoing push");
+    // refused (409 {ok:false, rev}): re-anchor AND drop the known-refused overlay; nothing spools
+    panel._kernelPost = () => Promise.resolve({ ok: "refused", json: { ok: false, rev: 7 } });
+    panel._setViews(nv, [{ active: "all" }]);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(panel._optViewsRev, 7, "the refusal's rev re-anchors too");
+    assert.equal(panel._pendingViews, null, "a KNOWN-refused overlay drops now, not after three pushes");
+    // kernel unreachable: no rev to anchor to — the counter holds and the op spools for replay
+    const spooled: any[] = [];
+    panel._spoolOp = (op: any) => spooled.push(op);
+    panel._kernelPost = () => Promise.resolve({ ok: false, json: null });
+    panel._optViewsRev = 55;
+    panel._setViews(nv, [{ active: "all" }]);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(panel._optViewsRev, 56, "no server rev → the optimistic counter stands (baseRev consumed one)");
+    assert.deepEqual(spooled, [{ op: "views", ops: [{ active: "all" }] }], "kernel-down still spools");
+  } finally {
+    delete (process.versions as any).electron;
+  }
+});
+
+test("executed: a refusal compensates ONLY the newest gesture's entries for that host+name (the r46 verification)", () => {
+  // Two gestures fanned to the same host+name: the refusal carries no gesture id, and matching by
+  // host+name alone rolled back and inverse-dispatched the OLDER gesture's entries too — edits the
+  // refusal said nothing about. Only the max-gid group compensates; older groups settle on their
+  // own acks/reconciles.
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  const panel = new TimelinePanel(makeNode("div"));
+  panel.update({
+    now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+    turns: {}, messages: [], judging: [],
+    views: {
+      active: "all",
+      tags: [{ id: "g1", name: "pool", color: "#DD42FF", members: ["s1", "s2"] }],
+      remoteTags: [
+        { id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool", color: "#7aa2f7", members: ["s1", "s2"] },
+        { id: "TESTHOST-B:r2", host: "TESTHOST-B", name: "pool", color: "#4EC9B0", members: ["s1", "s2"] },
+      ],
+    },
+  });
+  // gesture 1 removes s1, gesture 2 removes s2 — each dispatches to A and B and notes an entry per host
+  panel._editTagUnion(viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool"), { remove: ["s1"] });
+  panel._editTagUnion(viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool"), { remove: ["s2"] });
+  assert.equal(panel._unionOps.length, 4, "two gestures × two dispatched hosts");
+  const gid1 = panel._unionOps[0].gid, gid2 = panel._unionOps[2].gid;
+  assert.ok(gid2 > gid1, "gestures mint increasing ids");
+  assert.deepEqual(panel._curViews().tags.find((t: any) => t.id === "g1").members, [],
+    "both local halves committed on dispatch success");
+  const inverse: any[] = [];
+  panel._editRemoteTag = (rt: any, edit: any) => { inverse.push({ rt, edit }); return true; };
+  panel.tagEditFailed({ host: "TESTHOST-B", name: "pool", error: "kernel refused" });
+  assert.deepEqual(panel._curViews().tags.find((t: any) => t.id === "g1").members, ["s2"],
+    "only the newest gesture's local half rolled back — s1's removal (the older gesture) stands");
+  assert.equal(inverse.length, 1, "one sibling inverse — the older gesture's A entry stays quiet");
+  assert.equal(inverse[0].rt.host, "TESTHOST-A");
+  assert.deepEqual(inverse[0].edit, { add: ["s2"] }, "the inverse restores the newest gesture's members only");
+  assert.deepEqual(panel._unionOps.map((o: any) => [o.host, o.gid]),
+    [["TESTHOST-A", gid1], ["TESTHOST-B", gid1]],
+    "the older gesture's entries survive for their own ack/reconcile");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews;
 });

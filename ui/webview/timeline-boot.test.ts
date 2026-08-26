@@ -189,6 +189,17 @@ test("the view exposes revealEvent, and it never drives the chat", () => {
   assert.doesNotMatch(body, /openChat/, "but never calls back into the chat the click came from");
 });
 
+test("dispatchFrame routes viewsAck to the panel — the setTimelineViews write acknowledgement (the r46 verification)", () => {
+  // the kernel sent {type:"viewsAck", ok, rev} and the panel defined viewsAck(), but no router
+  // dispatched it — the frame died here and the audited guessed-rev hole persisted (r46).
+  const got: any[] = [];
+  const panel = { viewsAck: (m: any) => got.push(m) };
+  assert.equal(dispatchFrame(panel, { type: "viewsAck", ok: false, rev: 5 }), true);
+  assert.deepEqual(got, [{ type: "viewsAck", ok: false, rev: 5 }]);
+  assert.equal(dispatchFrame({}, { type: "viewsAck", ok: true, rev: 1 }), false,
+    "an older panel is skipped, never thrown at");
+});
+
 test("dispatchFrame routes tagEditFailed to the panel — the LOUD half of remote-tag edits (federation v1)", () => {
   const got: any[] = [];
   const panel = { tagEditFailed: (m: any) => got.push(m) };

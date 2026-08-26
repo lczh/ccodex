@@ -5497,9 +5497,12 @@ def _lift_spent_awaiting(now, tmux):
             # on purpose (2026-08-23) and owns that ending.
             answered = _peer_answered(sid)
             for nd in (list(stamped) if answered[0] else ()):
-                if not _peer_stamp_superseded(nd, answered):
+                _sup = _peer_stamp_superseded(nd, answered)
+                if not _sup:
                     continue
-                if jd.record_verdict(store, nd, "romp", "awaiting", _lift_ev_t(nd, now), lift=True):
+                # a lift cannot cite future evidence: clamp to the ruling moment (the endEv rule)
+                if jd.record_verdict(store, nd, "romp", "awaiting", _lift_ev_t(nd, now), lift=True,
+                                     end_ev=min(int(_sup), int(now)) or None):
                     changed = True
                     stamped.remove(nd)
                     _drop_auto_nudge_rec(_top_of(nd.get("id")))
@@ -5577,7 +5580,13 @@ def _lift_spent_awaiting(now, tmux):
                                  # dispatches — the misread-peer-as-agents shape needs no respawn to
                                  # prove the notification can never arrive; the pairing already did
                                  or not any(t.get("status") == "running" for t in every))):
-                        if jd.record_verdict(store, nd, "romp", "awaiting", _lift_ev_t(nd, now), lift=True):
+                        # evidence: the (re)spawn that proved the death, or the newest terminal
+                        # record when the transcript itself shows nothing running; clamped — a
+                        # lift cannot cite future evidence (the r46 verification: this leg filed
+                        # no endEv and fell to the legacy arrival bound at both gates)
+                        _oev = max(sp, max((int(t.get("endT") or 0) for t in every), default=0))
+                        if jd.record_verdict(store, nd, "romp", "awaiting", _lift_ev_t(nd, now), lift=True,
+                                             end_ev=min(_oev, int(now)) or None):
                             changed = True
                             _drop_auto_nudge_rec(top)
                     continue
@@ -21878,7 +21887,12 @@ def _peer_stamp_superseded(nd, answered):
         #                                      it carries no pair map to match an identity against
     peers = nd.get("awaitingPeers")
     ans = (max((per.get(pk, 0) for pk in peers), default=0) if (peers and per is not None) else any_t)
-    return bool((nd.get("awaitingAt") or 0) and ans and _stamp_written_at(nd) < ans)
+    # the REPLY TIME is the return value (0 = not superseded): truthiness for every reader, and
+    # the sweep's lift journals it as endEv — its epistemic boundary at the stand-down gates is
+    # the reply it cited, never the row's late arrival (the v1.3.18 audit, the r46 verification)
+    if (nd.get("awaitingAt") or 0) and ans and _stamp_written_at(nd) < ans:
+        return int(ans)
+    return 0
 
 
 # ───────────────────────── view-builder: goals → feed (parity: feed = ADAPT; minimal here) ─────────────────────────
@@ -27784,6 +27798,7 @@ else if(m.type==="hover"&&panel.setHover)panel.setHover(m);
 // timeline-boot.test.ts pins the pair.
 else if(m.type==="revealEvent"&&panel.revealEvent)panel.revealEvent(m.sid,m.t,m.id);
 else if(m.type==="tagEditFailed"&&panel.tagEditFailed)panel.tagEditFailed(m);
+else if(m.type==="viewsAck"&&panel.viewsAck)panel.viewsAck(m);
 else if(m.type==="openViewsDialog"&&panel._openViewsDialog)panel._openViewsDialog(null);});
 window.__rompTimelineOpenExternal=function(url){try{var u=new URL(url);if(u.protocol==="vscode:"){var q=u.searchParams;
 post({type:"deepLink",session:q.get("session"),anchor:q.get("anchor")||undefined,anchorT:Number(q.get("anchorT"))||undefined,anchorKind:q.get("anchorKind")||undefined,compose:q.get("compose")==="1"});
