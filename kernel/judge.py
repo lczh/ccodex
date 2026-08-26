@@ -6126,11 +6126,16 @@ _MIG_JOURNALS = ("cleared.jsonl", "nudge-events.jsonl")
 def _mig_shared_fps():
     """Content hash per keyed shared file (absent -> None). CONTENT, not (size, mtime): a write
     landing between the pass's own rewrite and a stat would be CERTIFIED as settled (absorbed,
-    the r45 verification), and mtime granularity is filesystem-dependent."""
+    the r45 verification), and mtime granularity is filesystem-dependent. RAW BYTES, never a
+    decode (the v1.3.18 audit's P1): this runs at kernel AND judge startup, before any error
+    boundary — a shared file containing invalid UTF-8 raised UnicodeDecodeError here and took
+    the whole process down. Undecodable content still fingerprints (and so still voids the
+    settle when it changes); the rewrite pass is where its corruption surfaces, loudly, inside
+    the migration's own boundary."""
     fps = {}
     for name in _MIG_FP_FILES:
         try:
-            fps[name] = _mig_sha(_mig_read_text(STATE / name))
+            fps[name] = _mig_sha(_mig_read_bytes(STATE / name))
         except OSError:
             fps[name] = None
     return fps
@@ -6206,7 +6211,8 @@ def _migrate_shared_identity_files(tid_to_sid, goal_tid_to_sid=None, only=None):
                 else:
                     text = raw
                 if name in _MIG_FP_FILES:
-                    fps[name] = _mig_sha(text)        # the bytes this pass wrote / read-verified
+                    fps[name] = _mig_sha(text.encode())   # the BYTES this pass wrote / read-verified
+                    #                                       (the settle compare hashes raw bytes)
         except FileNotFoundError:
             if name in _MIG_FP_FILES:
                 fps[name] = None

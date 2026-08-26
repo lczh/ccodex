@@ -709,17 +709,16 @@ class UpdateRemote(unittest.TestCase):
             fakebin = pathlib.Path(td) / "bin"
             fakebin.mkdir()
             commitdir = pathlib.Path(td) / "committed-tree"
-            commitdir.mkdir()
+            (commitdir / "bin").mkdir(parents=True)
             (commitdir / "install.sh").write_text("#!/bin/sh\nexit 0\n")
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
                 "  *' merge-base '*) exit 0;;\n"
-                "  *' archive '*' bin'*) tar -c -C '%s' bin;;\n"
-                "  *' archive '*) tar -c -C '%s' install.sh;;\n"
+                "  *' archive '*) tar -c -C '%s' install.sh bin;;\n"
                 "  *' rev-parse --short=8 '*) echo 11111111;;\n"
                 "  *' rev-parse HEAD'*) echo 1111111111111111111111111111111111111111;;\n"
-                "esac\nexit 0\n" % (gd, fix, commitdir))
+                "esac\nexit 0\n" % (gd, commitdir))
             (fakebin / "git").chmod(0o755)
             # the wrapper execs the SNAPSHOT manager via `node` (the pinned byte stream, the
             # v1.3.17 audit's P1.2); the fixture manager is a shell stub, so the fixture node
@@ -731,6 +730,8 @@ class UpdateRemote(unittest.TestCase):
             (fakebin / "pkill").chmod(0o755)
             (fix / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
             (fix / "bin" / "romp-serve").chmod(0o755)
+            (commitdir / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (commitdir / "bin" / "romp-serve").chmod(0o755)
             # the fixture kernel: a gate-faithful /version server — it BLOCKS on the update
             # flock first, exactly like bin/romp-serve's pre-exec gate, then binds
             serve_py = pathlib.Path(td) / "serve.py"
@@ -750,14 +751,15 @@ class UpdateRemote(unittest.TestCase):
                 "    def log_message(self,*a):\n"
                 "        pass\n"
                 "http.server.HTTPServer(('127.0.0.1',port),H).serve_forever()\n")
-            (fix / "bin" / "romp-manager").write_text(
+            (commitdir / "bin" / "romp-manager").write_text(
                 "#!/bin/sh\n[ \"$1\" = ensure ] || exit 0\n"
                 # nohup, not setsid: macOS has no setsid, and the fixture kernel silently never
                 # started there — both macOS python gate jobs read the r44 deadlock's RESTARTFAIL
                 # from a healthy wrapper (the v1.3.17 first gate attempt)
                 "nohup python3 '%s' '%s' %d 11111111 >/dev/null 2>&1 &\nexit 0\n"
                 % (serve_py, gd / "romp-update.lock", port))
-            (fix / "bin" / "romp-manager").chmod(0o755)
+            (commitdir / "bin" / "romp-manager").chmod(0o755)
+            (gd / "romp-run-deadbeef").mkdir()          # a STALE generation: pruned on success
             env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")),
                        ROMP_LAUNCH_TRIES="8")
             apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
@@ -769,10 +771,17 @@ class UpdateRemote(unittest.TestCase):
                               "flock before probing — RESTARTFAIL here is the r44 deadlock")
                 self.assertFalse((gd / "romp-restart-needed").exists(),
                                  "a verified healthy launch clears the durable restart intent")
-                self.assertEqual(list(gd.glob("romp-launch-snap*")), [],
-                                 "the pinned launch snapshot is cleaned up")
-                # negative leg: a manager that starts nothing → no healthy verdict → no SYNCED
-                (fix / "bin" / "romp-manager").write_text("#!/bin/sh\nexit 0\n")
+                self.assertTrue((gd / "romp-run-11111111" / "bin" / "romp-serve").exists(),
+                                 "the runtime generation is DURABLE — the manager's respawns "
+                                 "exec it for this build's lifetime (the v1.3.18 audit's P1)")
+                self.assertFalse((gd / "romp-run-deadbeef").exists(),
+                                 "…and stale generations are pruned only after a healthy launch")
+                # negative leg: a manager that starts nothing → no healthy verdict → no SYNCED.
+                # The generation is idempotent per commit, so the stale one (whose manager DOES
+                # start the server) must be dropped for the rebuilt one to carry the new stub.
+                import shutil as _sh
+                _sh.rmtree(gd / "romp-run-11111111", ignore_errors=True)
+                (commitdir / "bin" / "romp-manager").write_text("#!/bin/sh\nexit 0\n")
                 env["ROMP_LAUNCH_TRIES"] = "1"
                 a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True,
                               timeout=90)
@@ -1418,13 +1427,21 @@ class UpdateRemote(unittest.TestCase):
                       "kills the running kernel (self-match-guarded, the user 2026-07-22)")
         self.assertIn('["node",mg,"ensure"]', apply,
                       "prefers the manager (ensure = idempotent supervised start) — exec'd from "
-                      "the PINNED launch snapshot (the v1.3.17 audit's P1.2)")
-        self.assertIn('["git","-C",r,"archive",target,"bin"]', apply,
-                      "the launch byte streams come from the verified commit, never live files")
-        self.assertIn("ROMP_SERVE_ROOT=r", apply,
-                      "the pinned scripts serve the REAL checkout, not the temp snapshot")
+                      "the DURABLE runtime generation (the v1.3.18 audit's P1)")
+        self.assertIn('["git","-C",r,"archive",target]', apply,
+                      "the generation is the COMPLETE verified tree — manager, serve, kernel and "
+                      "modules, never live files")
+        self.assertIn("ROMP_SERVE_ROOT=r,ROMP_CHECKOUT=r", apply,
+                      "the pinned scripts serve and operate on the REAL checkout")
+        self.assertIn("ROMP_SERVE_BIN=sv", apply,
+                      "the manager's respawns exec the generation's serve for this build's lifetime")
+        self.assertIn('ROMP_KERNEL_BIN=os.path.join(gen,"bin","romp-kernel")', apply,
+                      "…and the kernel byte stream is the generation's too")
+        self.assertIn('["pkill","-f","bin/romp-manage[r]"]', apply,
+                      "the surviving manager dies: its exit handler respawned the kernel through "
+                      "the LIVE serve before the pinned ensure could (the v1.3.18 audit's P1)")
         self.assertIn('"romp-restart-needed"', apply)
-        self.assertLess(apply.index('"romp-restart-needed"'), apply.index("os.remove(lp)\nlsnap="),
+        self.assertLess(apply.index('"romp-restart-needed"'), apply.index("os.remove(lp)\ngen="),
                         "durable restart intent is armed BEFORE the latch is spent (the earlier "
                         "os.remove(lp) occurrences are the heal branch's)")
         self.assertIn("if mgr_ok:", apply,
@@ -1435,7 +1452,7 @@ class UpdateRemote(unittest.TestCase):
         self.assertIn("old_ks,old_boot=probe()", apply,
                       "a surviving old kernel process cannot satisfy the restart")
         self.assertIn("bid!=old_boot", apply)
-        self.assertLess(apply.index("os.remove(lp)\nlsnap="),
+        self.assertLess(apply.index("os.remove(lp)\ngen="),
                         apply.index('["pkill","-f"'),
                         "the launch runs INSIDE the locked python — the transaction no longer "
                         "ends before the spawn (the v1.3.16 audit's P1.2)")
@@ -1720,3 +1737,79 @@ class DriftWordingUI(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from unittest import mock
+
+
+class RestartVerdictHonesty(unittest.TestCase):
+    """the v1.3.18 audit: RESTARTED:0 — the port never answered even after the fallback — was
+    reported as a successful restart on the tag alone."""
+
+    def _run(self, out):
+        with mock.patch.object(km, "_discover_remote_clone",
+                               return_value=("/x/repo", "a" * 40, "", "0", None)), \
+             mock.patch.object(km.subprocess, "run") as r:
+            km._remotes = {"TESTHOST": {"host": "TESTHOST", "kernel_port": 1}}
+            r.return_value = mock.Mock(stdout=out, stderr="", returncode=0)
+            ok, detail = km._restart_remote_kernel("TESTHOST")
+            cmd = r.call_args[0][0][-1]
+            km._remotes = {}
+        return ok, detail, cmd
+
+    def test_restarted_zero_is_not_success(self):
+        ok, detail, _ = self._run("RESTARTED:0\n")
+        self.assertFalse(ok)
+        self.assertIn("never answered", detail)
+
+    def test_restarted_one_is_success(self):
+        ok, detail, _ = self._run("RESTARTED:1\n")
+        self.assertTrue(ok, detail)
+
+    def test_the_rr_leg_uses_a_durable_generation_and_never_rms_it_same_run(self):
+        _, _, cmd = self._run("RESTARTED:1\n")
+        self.assertIn("romp-run-$H8", cmd, "the per-commit durable generation")
+        self.assertIn("ROMP_KERNEL_BIN=", cmd)
+        self.assertIn("ROMP_CHECKOUT=", cmd)
+        self.assertNotIn("RRSNAP", cmd)
+        self.assertNotIn('rm -rf "$GEN"', cmd,
+                         "the generation the detached processes exec is never deleted same-run "
+                         "(the r45 rr race); other generations prune instead")
+        self.assertIn('[ "$g" = "$GEN" ] || rm -rf "$g"', cmd)
+
+
+class KernelRunsFromAGeneration(unittest.TestCase):
+    """the v1.3.18 audit's P1: the kernel's CODE loads from the pinned generation while every
+    ROOT-relative operation stays on the checkout ROMP_CHECKOUT names."""
+
+    def test_romp_checkout_overrides_root(self):
+        import subprocess as sp
+        ksrc = os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")
+        with tempfile.TemporaryDirectory() as td:
+            out = sp.run(
+                ["python3", "-c",
+                 "import os, pathlib, re\n"
+                 "src = open(os.environ['KSRC']).read()\n"
+                 "m = re.search(r'ROOT = .*', src)\n"
+                 "HERE = pathlib.Path(os.environ['KSRC']).resolve().parent\n"
+                 "Path = pathlib.Path\n"
+                 "ROOT = eval(m.group(0).split('= ', 1)[1])\n"
+                 "print(ROOT)"],
+                env=dict(os.environ, KSRC=ksrc, ROMP_CHECKOUT=td),
+                capture_output=True, text=True, timeout=20)
+            self.assertEqual(out.stdout.strip(), str(pathlib.Path(td).resolve()),
+                             out.stderr[:300])
+            out2 = sp.run(
+                ["python3", "-c",
+                 "import os, pathlib, re\n"
+                 "os.environ.pop('ROMP_CHECKOUT', None)\n"
+                 "src = open(os.environ['KSRC']).read()\n"
+                 "m = re.search(r'ROOT = .*', src)\n"
+                 "HERE = pathlib.Path(os.environ['KSRC']).resolve().parent\n"
+                 "Path = pathlib.Path\n"
+                 "ROOT = eval(m.group(0).split('= ', 1)[1])\n"
+                 "print(ROOT)"],
+                env=dict(os.environ, KSRC=ksrc),
+                capture_output=True, text=True, timeout=20)
+            self.assertEqual(out2.stdout.strip(), str(pathlib.Path(ksrc).resolve().parent.parent),
+                             "unset = the classic layout, byte-identical behavior")

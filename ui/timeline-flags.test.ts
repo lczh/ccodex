@@ -98,11 +98,14 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
     // the spool itself: Electron-gated append to the kernel's replay queue
     const fn = SRC.indexOf("_spoolOp(op) {");
     assert.ok(fn > 0, "the spool helper exists");
-    const win = SRC.slice(fn, fn + 900);
+    const win = SRC.slice(fn, fn + 1600);
     assert.match(win, /!process\.versions \|\| !process\.versions\.electron/,
       "plain node can never queue into real user state — the spool carries its own guard");
-    assert.match(win, /appendFileSync\([\s\S]*'pending-ui-ops\.jsonl'/,
-      "append-only: an append can lose no concurrent writer's field");
+    assert.match(win, /'pending-ui-ops'/,
+      "one FILE per op in the spool dir (the v1.3.18 audit's P1: the shared append file's "
+      + "rename-aside handoff raced a writer onto an unlinked inode)");
+    assert.match(win, /writeFileSync\([\s\S]*\.tmp/, "staged…");
+    assert.match(win, /renameSync\(/, "…and atomically published");
   }
   {
     // views edits ride the kernel's TARGETED ops and spool the same grammar kernel-down

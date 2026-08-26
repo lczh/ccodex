@@ -90,11 +90,12 @@ class ElectronStagingWriters(unittest.TestCase):
             self.assertNotIn(gone, src,
                              "%s: no direct state-file path may reappear in the timeline — "
                              "gestures ride the kernel routes or the replay spool" % gone)
-        self.assertIn("'pending-ui-ops.jsonl'", src, "the spool is the ONLY fallback surface")
-        i = src.index("'pending-ui-ops.jsonl'")
-        self.assertIn("appendFileSync", src[max(0, i - 300):i + 300],
-                      "the spool is append-only — an append needs no staging hygiene and can "
-                      "lose no concurrent writer's field")
+        self.assertIn("'pending-ui-ops'", src, "the spool dir is the ONLY fallback surface")
+        i = src.index("'pending-ui-ops'")
+        win = src[max(0, i - 300):i + 600]
+        self.assertIn("renameSync", win,
+                      "one atomically-published FILE per op (the v1.3.18 audit's P1: the shared "
+                      "append file's rename-aside handoff lost a racing writer's gesture)")
 
 
 if __name__ == "__main__":

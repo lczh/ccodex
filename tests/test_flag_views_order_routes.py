@@ -408,3 +408,76 @@ class UiOpSpoolReplay(unittest.TestCase):
         km._replay_ui_op_spool()
         self.assertFalse((km.jd.STATE / "session-flags.json").exists(),
                          "the replay is a boundary too — string booleans are refused (P2.13)")
+
+
+class PerFileOpSpool(unittest.TestCase):
+    """the v1.3.18 audit's P1 pair: the single append-file's rename-aside handoff raced a
+    writer onto an unlinked inode, and a replay failure unlinked EVERY queued op. One file per
+    op now: only successfully applied ops are consumed; a failed op's file is retained."""
+
+    def setUp(self):
+        import shutil
+        self.spdir = km.jd.STATE / "pending-ui-ops"
+        shutil.rmtree(self.spdir, ignore_errors=True)
+        self.spdir.mkdir(parents=True, exist_ok=True)
+        for name in ("session-flags.json", "timeline-views.json",
+                     "pending-ui-ops.jsonl", "pending-ui-ops.replay.jsonl"):
+            try:
+                (km.jd.STATE / name).unlink()
+            except OSError:
+                pass
+        km._flags_cache.clear()
+        self._dirty = km._mark_views_dirty
+        km._mark_views_dirty = lambda: None
+
+    def tearDown(self):
+        km._mark_views_dirty = self._dirty
+
+    def test_op_files_apply_in_name_order_and_are_consumed(self):
+        (self.spdir / "100-aa.json").write_text(json.dumps(
+            {"op": "views", "ops": [{"create": {"id": "s1", "name": "first", "color": "",
+                                                "members": []}}]}))
+        (self.spdir / "200-bb.json").write_text(json.dumps(
+            {"op": "views", "ops": [{"tag": "first", "rename": "renamed"}]}))
+        km._replay_ui_op_spool()
+        v = km._timeline_views()
+        self.assertEqual([x["name"] for x in v["tags"]], ["renamed"],
+                         "ordered replay: the create landed before the rename")
+        self.assertEqual(list(self.spdir.glob("*.json")), [], "applied ops are consumed")
+
+    def test_a_failed_op_is_retained_and_retries(self):
+        (self.spdir / "100-cc.json").write_text(json.dumps(
+            {"op": "flag", "target": SID, "flag": "hideFromFeed", "value": True}))
+
+        def boom(*a, **kw):
+            raise OSError(5, "setter died")
+
+        saved = km._set_session_flag
+        km._set_session_flag = boom
+        try:
+            km._replay_ui_op_spool()
+        finally:
+            km._set_session_flag = saved
+        self.assertTrue((self.spdir / "100-cc.json").exists(),
+                        "a failed gesture is never silently deleted (the v1.3.18 audit's P1)")
+        km._replay_ui_op_spool()
+        self.assertFalse((self.spdir / "100-cc.json").exists(), "…and it retries to success")
+        flags = json.loads((km.jd.STATE / "session-flags.json").read_text())
+        self.assertTrue(flags[SID]["hideFromFeed"])
+
+    def test_an_unparseable_op_file_drops_loudly_and_blocks_nothing(self):
+        (self.spdir / "100-dd.json").write_text('{"op": "fl')
+        (self.spdir / "200-ee.json").write_text(json.dumps(
+            {"op": "flag", "target": SID, "flag": "postalServiceOff", "value": True}))
+        km._replay_ui_op_spool()
+        self.assertEqual(list(self.spdir.glob("*.json")), [])
+        flags = json.loads((km.jd.STATE / "session-flags.json").read_text())
+        self.assertTrue(flags[SID]["postalServiceOff"])
+
+    def test_the_legacy_append_spool_is_still_consumed_once(self):
+        (km.jd.STATE / "pending-ui-ops.jsonl").write_text(json.dumps(
+            {"op": "flag", "target": SID, "flag": "hideFromFeed", "value": True}) + "\n")
+        km._replay_ui_op_spool()
+        flags = json.loads((km.jd.STATE / "session-flags.json").read_text())
+        self.assertTrue(flags[SID]["hideFromFeed"])
+        self.assertFalse((km.jd.STATE / "pending-ui-ops.jsonl").exists())

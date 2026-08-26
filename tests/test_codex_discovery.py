@@ -1071,6 +1071,23 @@ class MigrationTransaction(unittest.TestCase):
         self.assertNotIn(TID, flags, "the external write was re-canonicalized")
         self.assertIn(SID, flags)
 
+    def test_invalid_utf8_shared_state_never_escapes_startup(self):
+        # the v1.3.18 audit's P1: _mig_shared_fps decoded files before any error boundary — a
+        # session-flags.json containing invalid UTF-8 raised UnicodeDecodeError and took kernel
+        # AND judge startup down. Raw-byte fingerprints keep startup alive; the corruption
+        # surfaces inside the migration's own boundary (no certificate lands).
+        self._state(goals=True)
+        (jd.STATE / "session-flags.json").write_bytes(b'{"x": "\xff\xfe broken"}')
+        jd.migrate_codex_identity()                    # must not raise
+        marker = jd.CODEXDIR / "migrated" / "shared.state"
+        self.assertFalse(marker.exists(),
+                         "undecodable state is never certified settled")
+        (jd.STATE / "session-flags.json").write_text(json.dumps({TID: {"hideFromFeed": True}}))
+        jd.migrate_codex_identity()
+        self.assertTrue(marker.exists(), "the repaired file certifies")
+        flags = json.loads((jd.STATE / "session-flags.json").read_text())
+        self.assertIn(SID, flags)
+
     def test_a_journal_append_never_voids_the_settle(self):
         # the r45 verification: fingerprinting the journals made the settle a near-permanent
         # miss — every clear event re-parsed the unbounded cleared.jsonl at the next boot.

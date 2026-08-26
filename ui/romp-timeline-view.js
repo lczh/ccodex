@@ -3716,8 +3716,15 @@ class TimelinePanel {
       const fs = require('fs'), os = require('os'), path = require('path');   // try-scope: see _persistOrder
       const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
       const root = process.env.ROMP_STATE_DIR || path.join(base, 'romp');
-      fs.mkdirSync(root, { recursive: true });
-      fs.appendFileSync(path.join(root, 'pending-ui-ops.jsonl'), JSON.stringify(op) + '\n');
+      // ONE FILE PER OP, atomically published (the v1.3.18 audit's P1): the shared append file's
+      // rename-aside handoff raced this writer — an fd opened just before the kernel's rename
+      // appended to the unlinked inode, and the gesture existed under neither name. A rename
+      // into the spool dir cannot lose against the consumer's per-file unlink.
+      const dir = path.join(root, 'pending-ui-ops');
+      fs.mkdirSync(dir, { recursive: true });
+      const name = Date.now() + '-' + Math.random().toString(36).slice(2, 10) + '.json';
+      fs.writeFileSync(path.join(dir, name + '.tmp'), JSON.stringify(op));
+      fs.renameSync(path.join(dir, name + '.tmp'), path.join(dir, name));
     } catch (e) { /* can't queue — the gesture stays optimistic-only until the kernel returns */ }
   }
 

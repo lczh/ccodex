@@ -19,7 +19,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote, urlencode
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
+# ROMP_CHECKOUT (the v1.3.18 audit's P1): an updater launches this kernel from an IMMUTABLE
+# runtime generation (git archive of the verified commit, under the checkout's git dir) — the
+# CODE loads from the generation (HERE-relative), while every ROOT-relative operation (git,
+# state, dist serving, spawning bin/ children) stays on the real checkout this env names.
+# Unset = the classic layout: the kernel runs where it lives.
+ROOT = Path(os.environ["ROMP_CHECKOUT"]).resolve() if os.environ.get("ROMP_CHECKOUT") else HERE.parent
 BIN = ROOT / "bin"
 em = SourceFileLoader("romp_event_model", str(HERE / "event_model.py")).load_module()
 jd = SourceFileLoader("romp_judge", str(HERE / "judge.py")).load_module()
@@ -434,15 +439,21 @@ _SHA = None                                  # lazily-resolved git short-sha of 
 
 
 def _kernel_sha():
-    """git short-sha of HEAD, plus '-dirty' if the working tree has uncommitted edits — the kernel
-    loads bin/*.py straight from the worktree, so a dirty tree means it's running code that isn't at
-    any commit. Resolved once (a restart re-reads it). None outside a git checkout."""
+    """git short-sha of HEAD, plus '-dirty' if the working tree has uncommitted edits — a
+    checkout-launched kernel loads its code straight from the worktree, so a dirty tree means
+    it's running code that isn't at any commit. A GENERATION-launched kernel (ROMP_CHECKOUT set)
+    runs the verified commit's exact bytes, so the dirty probe is skipped: the checkout's later
+    edits are not the RUNNING build's state (the v1.3.18 audit's P1). Resolved once (a restart
+    re-reads it). None outside a git checkout."""
     global _SHA
     if _SHA is None:
         try:
             r = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
                                capture_output=True, text=True, timeout=2)
             sha = (r.stdout.strip() or "") if r.returncode == 0 else ""
+            if sha and os.environ.get("ROMP_CHECKOUT"):
+                _SHA = sha                            # pinned generation: exactly HEAD-at-boot
+                return _SHA
             if sha:
                 d = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain"],
                                    capture_output=True, text=True, timeout=2)
@@ -1850,59 +1861,91 @@ def _set_timeline_views(blob, base_rev=None):
         return True, currev + 1
 
 
+def _apply_one_ui_op(op):
+    """One spooled gesture through the locked, canonicalizing setters. True = applied."""
+    if not isinstance(op, dict):
+        return False
+    if op.get("op") == "flag":
+        tsid = str(op.get("target") or "")
+        flag = str(op.get("flag") or "")
+        if tsid and flag and isinstance(op.get("value"), bool):
+            if flag == "notify":
+                _set_notify_session(tsid, op["value"])
+            else:
+                _set_session_flag(tsid, flag, op["value"])
+            return True
+        return False
+    if op.get("op") == "views" and isinstance(op.get("ops"), list):
+        _apply_views_ops(op["ops"])
+        return True
+    return False
+
+
 def _replay_ui_op_spool():
     """Apply queued UI ops from Electron surfaces that found the kernel DOWN (the v1.3.17
     audit's P1.5): the old fallback REPLACED whole state files with no lock and no
-    canonicalization — losing a concurrent writer's hideFromFeed/postalServiceOff and able to
-    recreate migrated TID rows after settlement. The spool (pending-ui-ops.jsonl) is
-    append-only; ops replay here through the SAME locked, canonicalizing setters the routes
-    use — a TID written while the kernel was down canonicalizes to its SID at replay, after
-    migration. Crash-safe: the spool is renamed aside first, so a replay that dies re-runs its
-    idempotent ops (set-flag, add/remove/rename) next pass instead of losing them. A torn last
-    line (a writer that died mid-append) is dropped loudly."""
-    sp = jd.STATE / "pending-ui-ops.jsonl"
-    work = jd.STATE / "pending-ui-ops.replay.jsonl"
-    try:
-        if not work.exists():
-            if not sp.exists():
-                return
-            os.replace(sp, work)
-    except OSError:
-        return
-    try:
-        lines = work.read_text(errors="replace").splitlines()
-    except OSError:
-        return
+    canonicalization. ONE FILE PER OP now, atomically published by the writer (tmp + rename
+    into pending-ui-ops/) and consumed here individually — the v1.3.18 audit's P1 pair: the
+    single append-file's rename-aside handoff raced a writer whose freshly-opened fd then
+    appended to the unlinked inode (the gesture existed under neither name), and a replay
+    failure used to unlink the WHOLE file, deleting every queued op with it. Now a failed op's
+    file is RETAINED (loud, retried next pass); only successfully applied ops are unlinked.
+    Ordering: writers name files <millis>-<rand>.json, consumed sorted. Crash between apply
+    and unlink re-applies an idempotent op next pass. The legacy single-file spool
+    (pending-ui-ops.jsonl + its .replay twin) is still consumed once for upgrade."""
     applied = 0
-    for ln in lines:
-        if not ln.strip():
-            continue
+    # legacy single-file spools (pre-v1.3.19 writers, and a crashed pre-upgrade replay)
+    for legacy in (jd.STATE / "pending-ui-ops.replay.jsonl", jd.STATE / "pending-ui-ops.jsonl"):
         try:
-            op = json.loads(ln)
-        except ValueError:
-            sys.stderr.write("ui-op spool: dropping a torn line (%d bytes)\n" % len(ln))
+            lines = legacy.read_text(errors="replace").splitlines()
+        except OSError:
             continue
-        if not isinstance(op, dict):
-            continue
+        for ln in lines:
+            if not ln.strip():
+                continue
+            try:
+                op = json.loads(ln)
+            except ValueError:
+                sys.stderr.write("ui-op spool: dropping a torn legacy line (%d bytes)\n" % len(ln))
+                continue
+            try:
+                applied += 1 if _apply_one_ui_op(op) else 0
+            except Exception:
+                sys.stderr.write("ui-op spool replay (legacy): %s\n" % traceback.format_exc())
         try:
-            if op.get("op") == "flag":
-                tsid = str(op.get("target") or "")
-                flag = str(op.get("flag") or "")
-                if tsid and flag and isinstance(op.get("value"), bool):
-                    if flag == "notify":
-                        _set_notify_session(tsid, op["value"])
-                    else:
-                        _set_session_flag(tsid, flag, op["value"])
-                    applied += 1
-            elif op.get("op") == "views" and isinstance(op.get("ops"), list):
-                _apply_views_ops(op["ops"])
-                applied += 1
-        except Exception:
-            sys.stderr.write("ui-op spool replay: %s\n" % traceback.format_exc())
+            legacy.unlink()
+        except OSError:
+            pass
+    spdir = jd.STATE / "pending-ui-ops"
     try:
-        work.unlink()
+        names = sorted(n for n in os.listdir(spdir) if n.endswith(".json"))
     except OSError:
-        pass
+        names = []
+    for n in names:
+        p = spdir / n
+        try:
+            op = json.loads(p.read_text(errors="replace"))
+        except ValueError:
+            sys.stderr.write("ui-op spool: dropping an unparseable op file %s\n" % n)
+            try:
+                p.unlink()
+            except OSError:
+                pass
+            continue
+        except OSError:
+            continue
+        try:
+            ok = _apply_one_ui_op(op)
+        except Exception:
+            sys.stderr.write("ui-op spool: op %s FAILED — retained for retry\n%s"
+                             % (n, traceback.format_exc()))
+            continue                                  # the file stays: a failed gesture is never
+        #                                               silently deleted (the v1.3.18 audit's P1)
+        applied += 1 if ok else 0
+        try:
+            p.unlink()
+        except OSError:
+            pass
     if applied:
         _mark_views_dirty()
 
@@ -13499,29 +13542,35 @@ def _update_remote(host):
         "except OSError:\n"
         "    sys.exit(35)\n"
         "os.remove(lp)\n"
-        # LAUNCH SNAPSHOT (P1.2): the byte streams THIS WRAPPER EXECS — the manager-ensure
-        # entry and the fallback serve — come from the EXACT verified commit, immune to a
-        # post-verify swap of the live files; ROMP_DIR / ROMP_SERVE_ROOT point them at the real
-        # checkout. BOUNDARY, named plainly (the r45 verification): a manager that is ALREADY
-        # running (ensure then spawns nothing) respawns the kernel through the live checkout's
-        # bin/romp-serve, and a manager the snapshot entry STARTS resolves the live serve for
-        # every later respawn too — the durable supervisor must run the durable install, never
-        # a temp snapshot this wrapper deletes (the romp-service unit boundary, v1.3.16). The
-        # pin covers the transaction's own execs; the runtime supervisor's files are the
-        # checkout's, guarded by the verified-clean tree + the flock-cooperating writers.
-        # a UNIQUE staging name (the r45 verification): the remote-restart leg shares this git
-        # dir and cleans ITS snapshot without the flock — a fixed shared name let it delete the
-        # scripts this wrapper was about to exec
-        'lsnap=os.path.join(os.path.dirname(lp),"romp-launch-snap-%%d"%%os.getpid())\n'
-        "shutil.rmtree(lsnap,ignore_errors=True)\n"
-        'ar=subprocess.run(["git","-C",r,"archive",target,"bin"],capture_output=True)\n'
-        "if ar.returncode or not ar.stdout:\n"
-        "    sys.exit(34)\n"
-        "os.makedirs(lsnap)\n"
-        'tr=subprocess.run(["tar","-x","-C",lsnap],input=ar.stdout)\n'
-        "if tr.returncode:\n"
-        "    shutil.rmtree(lsnap,ignore_errors=True)\n"
-        "    sys.exit(34)\n"
+        # RUNTIME GENERATION (the v1.3.18 audit's P1, superseding the r45 bin/-only snapshot):
+        # the COMPLETE verified tree materializes as a durable, per-commit generation under the
+        # git dir, and the whole launch chain — manager, serve, kernel and its modules — execs
+        # the GENERATION's bytes while ROMP_DIR/ROMP_SERVE_ROOT/ROMP_CHECKOUT point every state,
+        # git and child-spawn operation at the real checkout. The manager is KILLED and
+        # restarted from the generation (a surviving manager respawned the kernel through the
+        # live checkout's serve — the audited hole), and the env it holds (ROMP_SERVE_BIN /
+        # ROMP_KERNEL_BIN into the generation) makes every later respawn run the same verified
+        # bytes: the generation is durable, not a temp dir. Old generations are pruned only
+        # AFTER a healthy launch. Idempotent per commit (romp-run-<sha8>), atomically published
+        # (tmp dir + rename).
+        'gen=os.path.join(os.path.dirname(lp),"romp-run-"+target[:8])\n'
+        "if not os.path.isdir(gen):\n"
+        '    gtmp=gen+".tmp.%%d"%%os.getpid()\n'
+        "    shutil.rmtree(gtmp,ignore_errors=True)\n"
+        '    ar=subprocess.run(["git","-C",r,"archive",target],capture_output=True)\n'
+        "    if ar.returncode or not ar.stdout:\n"
+        "        sys.exit(34)\n"
+        "    os.makedirs(gtmp)\n"
+        '    tr=subprocess.run(["tar","-x","-C",gtmp],input=ar.stdout)\n'
+        "    if tr.returncode:\n"
+        "        shutil.rmtree(gtmp,ignore_errors=True)\n"
+        "        sys.exit(34)\n"
+        "    try:\n"
+        "        os.rename(gtmp,gen)\n"
+        "    except OSError:\n"
+        "        shutil.rmtree(gtmp,ignore_errors=True)\n"
+        "        if not os.path.isdir(gen):\n"
+        "            sys.exit(34)\n"
         # the KILL and the SPAWN REQUEST run INSIDE the lock (the v1.3.16 audit's P1.2: the
         # transaction used to end before the spawn, so a writer could swap bin/romp-serve
         # between the verify and the launch) — then the lock is EXPLICITLY RELEASED before the
@@ -13534,8 +13583,8 @@ def _update_remote(host):
         # different from the pre-kill one) as the only healthy verdict. Spawned children never
         # inherit the lock fd; the pkill self-match guard (romp-kern[e]l, the user 2026-07-22)
         # keeps this wrapper from matching itself.
-        'sv=os.path.join(lsnap,"bin","romp-serve")\n'
-        'mg=os.path.join(lsnap,"bin","romp-manager")\n'
+        'sv=os.path.join(gen,"bin","romp-serve")\n'
+        'mg=os.path.join(gen,"bin","romp-manager")\n'
         "if not os.access(sv,os.X_OK):\n"
         "    sys.exit(33)\n"
         "import urllib.request\n"
@@ -13553,8 +13602,14 @@ def _update_remote(host):
         "    if not target.startswith(ks):\n"
         "        return False\n"
         "    return not old_boot or bid!=old_boot\n"
+        # the MANAGER dies too (the v1.3.18 audit's P1): a surviving manager's exit handler
+        # respawned the killed kernel through the LIVE checkout's serve before the pinned
+        # ensure below could — the fresh manager runs generation bytes and carries the pinned
+        # env for every later respawn
+        'subprocess.run(["pkill","-f","bin/romp-manage[r]"])\n'
         'subprocess.run(["pkill","-f","bin/romp-kern[e]l"])\n'
-        'env=dict(os.environ,ROMP_DIR=r,ROMP_SERVE_ROOT=r)\n'
+        'env=dict(os.environ,ROMP_DIR=r,ROMP_SERVE_ROOT=r,ROMP_CHECKOUT=r,\n'
+        '         ROMP_SERVE_BIN=sv,ROMP_KERNEL_BIN=os.path.join(gen,"bin","romp-kernel"))\n'
         'lf=open(os.path.join(logdir,"update.log"),"a")\n'
         # the ensure's exit status is CAUGHT now (P1.2): a failed manager launch used to burn
         # the whole probe window on nothing and then read as RESTARTFAIL with no cause on record
@@ -13580,18 +13635,19 @@ def _update_remote(host):
         "        subprocess.Popen([sv],stdout=kl,stderr=kl,env=env,\n"
         "                         stdin=subprocess.DEVNULL,start_new_session=True)\n"
         "    except OSError:\n"
-        "        shutil.rmtree(lsnap,ignore_errors=True)\n"
         "        sys.exit(32)\n"
         "    for i in range(tries):\n"
         "        time.sleep(1)\n"
         "        if healthy():\n"
         "            up=True\n"
         "            break\n"
-        # the spawned scripts hold open fds to the snapshot files; the unlinked inodes outlive
-        # the rmtree (POSIX), so cleanup here strands nothing
-        "shutil.rmtree(lsnap,ignore_errors=True)\n"
         "if not up:\n"
         "    sys.exit(32)\n"
+        # the generation is DURABLE (the manager's respawns exec it for this build's lifetime) —
+        # only OTHER generations are pruned, and only after this launch proved healthy
+        'for g in os.listdir(os.path.dirname(lp)):\n'
+        '    if g.startswith("romp-run-") and os.path.join(os.path.dirname(lp),g)!=gen:\n'
+        "        shutil.rmtree(os.path.join(os.path.dirname(lp),g),ignore_errors=True)\n"
         "try:\n"
         "    os.remove(mk)\n"
         "except OSError:\n"
@@ -14298,20 +14354,29 @@ def _restart_remote_kernel(host):
     apply_cmd = (
         'LOGDIR="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}"; mkdir -p "$LOGDIR"; R=%s; '
         'if [ ! -x "$R/bin/romp-serve" ]; then echo NOLAUNCH; exit 0; fi; '
-        'pkill -f "bin/romp-kern[e]l" 2>/dev/null; '
-        # pin the exec'd manager bytes to the just-verified HEAD (the v1.3.17 audit's P1.2): a
-        # snapshot failure falls back to the live path — this leg's restart was always
-        # best-effort (|| true), and a degraded restart beats none
-        'LGD="$(git -C "$R" rev-parse --absolute-git-dir 2>/dev/null)"; MGR="$R/bin/romp-manager"; RRSNAP="$LGD/romp-launch-snap-rr.$$"; '
-        'if [ -n "$LGD" ]; then rm -rf "$RRSNAP"; mkdir -p "$RRSNAP"; '
-        'if git -C "$R" archive HEAD bin 2>/dev/null | tar -x -C "$RRSNAP" 2>/dev/null '
-        '&& [ -r "$RRSNAP/bin/romp-manager" ]; then MGR="$RRSNAP/bin/romp-manager"; fi; fi; '
-        'if command -v node >/dev/null 2>&1 && [ -r "$MGR" ]; then ROMP_DIR="$R" ROMP_SERVE_ROOT="$R" node "$MGR" ensure >>"$LOGDIR/update.log" 2>&1 || true; fi; '
-        '[ -n "$LGD" ] && rm -rf "$RRSNAP"; '
+        # the DURABLE runtime generation (the v1.3.18 audit's P1 + the r45 rr-races): the
+        # detached processes the ensure spawns re-read their script files, so a same-run rm of
+        # a temp snapshot raced them — the per-commit generation persists (pruned only here, on
+        # the NEXT restart, when its processes are the ones being killed). A generation failure
+        # falls back to the live path: this leg's restart was always best-effort.
+        'pkill -f "bin/romp-manage[r]" 2>/dev/null; pkill -f "bin/romp-kern[e]l" 2>/dev/null; '
+        'LGD="$(git -C "$R" rev-parse --absolute-git-dir 2>/dev/null)"; '
+        'H8="$(git -C "$R" rev-parse --short=8 HEAD 2>/dev/null)"; MGR="$R/bin/romp-manager"; GEN=""; '
+        'if [ -n "$LGD" ] && [ -n "$H8" ]; then GEN="$LGD/romp-run-$H8"; '
+        'if [ ! -d "$GEN" ]; then rm -rf "$GEN.tmp.$$"; mkdir -p "$GEN.tmp.$$"; '
+        'if git -C "$R" archive HEAD 2>/dev/null | tar -x -C "$GEN.tmp.$$" 2>/dev/null; then mv "$GEN.tmp.$$" "$GEN" 2>/dev/null || rm -rf "$GEN.tmp.$$"; else rm -rf "$GEN.tmp.$$"; fi; fi; '
+        'for g in "$LGD"/romp-run-*; do [ -e "$g" ] || continue; [ "$g" = "$GEN" ] || rm -rf "$g"; done; '
+        '[ -r "$GEN/bin/romp-manager" ] || GEN=""; fi; '
+        '[ -n "$GEN" ] && MGR="$GEN/bin/romp-manager"; '
+        'if command -v node >/dev/null 2>&1 && [ -r "$MGR" ]; then '
+        'if [ -n "$GEN" ]; then ROMP_DIR="$R" ROMP_SERVE_ROOT="$R" ROMP_CHECKOUT="$R" ROMP_SERVE_BIN="$GEN/bin/romp-serve" ROMP_KERNEL_BIN="$GEN/bin/romp-kernel" node "$MGR" ensure >>"$LOGDIR/update.log" 2>&1 || true; '
+        'else ROMP_DIR="$R" ROMP_SERVE_ROOT="$R" node "$MGR" ensure >>"$LOGDIR/update.log" 2>&1 || true; fi; fi; '
         'UP=0; for i in 1 2 3 4 5 6 7 8; do sleep 1; if bash -c "exec 3<>/dev/tcp/127.0.0.1/%d" 2>/dev/null; then UP=1; break; fi; done; '
-        'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null &  sleep 1; fi; '
+        'if [ "$UP" = 0 ]; then SRV="$R/bin/romp-serve"; [ -n "$GEN" ] && [ -x "$GEN/bin/romp-serve" ] && SRV="$GEN/bin/romp-serve"; '
+        'ROMP_SERVE_ROOT="$R" ROMP_CHECKOUT="$R" nohup "$SRV" >>"$LOGDIR/kernel.log" 2>&1 </dev/null & '
+        'for i in 1 2 3 4 5 6 7 8; do sleep 1; if bash -c "exec 3<>/dev/tcp/127.0.0.1/%d" 2>/dev/null; then UP=1; break; fi; done; fi; '
         'echo "RESTARTED:$UP"'
-    ) % (shlex.quote(rdir), kport)
+    ) % (shlex.quote(rdir), kport, kport)
     guarded = ('APPLY=%s; if command -v setsid >/dev/null 2>&1; then exec setsid bash -c "$APPLY"; '
                'else exec bash -c "$APPLY"; fi' % shlex.quote(apply_cmd))
     try:
@@ -14321,8 +14386,12 @@ def _restart_remote_kernel(host):
     except Exception as e:
         return False, "restart failed: " + str(e)[:150]
     out = (a.stdout or "").strip()
-    if out.startswith("RESTARTED"):
+    if out == "RESTARTED:1":
         return True, "restarted (same build)"
+    if out.startswith("RESTARTED"):
+        # the port never answered even after the fallback launcher (the v1.3.18 audit: this
+        # used to read as success on the tag alone)
+        return False, "the restart launched but the kernel never answered its port — check the host"
     if out == "NOLAUNCH":
         return False, "found no romp/romp-serve launcher to restart the kernel"
     return False, (_ssh_err(a.stderr) or out or "remote restart failed").strip()[:180]
