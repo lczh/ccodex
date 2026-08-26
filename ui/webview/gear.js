@@ -247,6 +247,125 @@ function initGear(post) {
   });
   if (fe) fe.addEventListener('change', function () { post({ type: 'setFileEditing', enabled: fe.checked }); });
   if (upm) upm.addEventListener('change', function () { post({ type: 'setUpdateMode', mode: upm.value }); });
+  // The judge MODEL pickers mirror the session pickers (the user 2026-08-25): families top-level,
+  // clicking a family sends its /models `default` (the user's remembered version), hover or
+  // ArrowRight reveals a side submenu of versions. The native select stays (hidden) as the VALUE
+  // holder — fill()/mixed marks keep working — and the button+menu is the visible control. The
+  // caret ALWAYS faces right (▸); the submenu PREFERS the right side, falling left only when the
+  // right edge would clip (measured, never assumed).
+  function versionMenu(sel, extraFirst) {
+    if (!sel) return;
+    sel.style.display = 'none';
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'rs-vermenu-btn';
+    btn.setAttribute('style', 'background:#1e1e1e;color:#ccc;border:1px solid rgba(255,255,255,0.25);'
+      + 'border-radius:5px;padding:2px 8px;cursor:pointer;font:inherit;');
+    sel.parentNode.insertBefore(btn, sel.nextSibling);
+    var labelOf = function (val) {
+      var o = sel.querySelector('option[value="' + val + '"]');
+      return o ? o.textContent : val;
+    };
+    var syncBtn = function () { btn.textContent = labelOf(sel.value) + ' \u25BE'; };
+    var mo = new MutationObserver(syncBtn);
+    mo.observe(sel, { childList: true });
+    sel.addEventListener('change', syncBtn);
+    setTimeout(syncBtn, 0);
+    var menu = null, sub = null;
+    var closeAll = function () { if (sub) { sub.remove(); sub = null; } if (menu) { menu.remove(); menu = null; } };
+    document.addEventListener('click', closeAll);
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeAll(); });
+    try { window.addEventListener('storage', function (e) { if (e.key === 'romp:menu-echo' && e.newValue) closeAll(); }); } catch (e) {}
+    var pick = function (val) { sel.value = val; sel.dispatchEvent(new Event('change')); syncBtn(); closeAll(); };
+    var MSTYLE = 'position:fixed;z-index:1001;min-width:130px;padding:4px;background:#252526;'
+      + 'border:1px solid rgba(255,255,255,0.12);border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.35);'
+      + 'font-size:12px;line-height:1.4;color:#cccccc;user-select:none;';
+    var rowStyle = 'padding:4px 22px 4px 8px;border-radius:4px;cursor:pointer;position:relative;white-space:nowrap;display:flex;align-items:center;';
+    btn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (menu) { closeAll(); return; }
+      menu = document.createElement('div');
+      menu.setAttribute('style', MSTYLE);
+      menu.addEventListener('click', function (e2) { e2.stopPropagation(); });
+      (extraFirst || []).concat(choices && choices.models || []).forEach(function (fam) {
+        var row = document.createElement('div');
+        row.setAttribute('style', rowStyle);
+        row.tabIndex = 0;
+        row.appendChild(document.createTextNode(fam.label));
+        var versions = fam.versions || [];
+        var famCur = sel.value === fam.value || versions.some(function (v) { return v.value === sel.value; });
+        if (famCur) {
+          var ck = document.createElement('span'); ck.textContent = '\u2713';
+          ck.setAttribute('style', 'position:absolute;right:6px;top:50%;transform:translateY(-50%);background:#1EA1EB;color:#fff;border-radius:50%;width:13px;height:13px;font-size:9px;font-weight:900;display:inline-flex;align-items:center;justify-content:center;line-height:1;');
+          row.appendChild(ck);
+        }
+        var openSub = versions.length > 1 ? function () {
+          if (sub) { sub.remove(); sub = null; }
+          sub = document.createElement('div');
+          sub.setAttribute('style', MSTYLE + 'z-index:1002;');
+          versions.forEach(function (v) {
+            var r2 = document.createElement('div');
+            r2.setAttribute('style', rowStyle);
+            r2.tabIndex = 0;
+            r2.appendChild(document.createTextNode(v.label));
+            if (sel.value === v.value) {
+              var c2 = document.createElement('span'); c2.textContent = '\u2713';
+              c2.setAttribute('style', 'position:absolute;right:6px;top:50%;transform:translateY(-50%);background:#1EA1EB;color:#fff;border-radius:50%;width:13px;height:13px;font-size:9px;font-weight:900;display:inline-flex;align-items:center;justify-content:center;line-height:1;');
+              r2.appendChild(c2);
+            }
+            r2.addEventListener('mouseenter', function () { r2.style.background = 'rgba(255,255,255,0.09)'; });
+            r2.addEventListener('mouseleave', function () { r2.style.background = 'transparent'; });
+            r2.addEventListener('click', function (e2) { e2.stopPropagation(); pick(v.value); });
+            r2.addEventListener('keydown', function (e2) {
+              if (e2.key === 'Enter' || e2.key === ' ') { e2.preventDefault(); e2.stopPropagation(); pick(v.value); }
+              else if (e2.key === 'ArrowLeft') { e2.preventDefault(); sub.remove(); sub = null; row.focus(); }
+            });
+            sub.appendChild(r2);
+          });
+          document.body.appendChild(sub);
+          var rr = row.getBoundingClientRect();
+          // the side rule: PREFER right; fall left only when the right edge would clip (measured)
+          var sw = sub.offsetWidth || 130;
+          if (rr.right + 4 + sw <= window.innerWidth - 8) sub.style.left = Math.round(rr.right + 4) + 'px';
+          else sub.style.left = Math.max(8, Math.round(rr.left) - sw - 4) + 'px';
+          var sh = sub.offsetHeight || 0;
+          sub.style.top = Math.min(Math.round(rr.top), Math.max(8, window.innerHeight - sh - 8)) + 'px';
+          return sub;
+        } : null;
+        if (openSub) {
+          var caret = document.createElement('span');
+          caret.textContent = '\u25B8';   // ALWAYS right-facing — it marks "expandable", not the side
+          caret.setAttribute('style', 'margin-left:auto;padding-left:10px;opacity:0.55;');
+          row.appendChild(caret);
+          row.addEventListener('mouseenter', function () { row.style.background = 'rgba(255,255,255,0.09)'; openSub(); });
+        } else {
+          row.addEventListener('mouseenter', function () { row.style.background = 'rgba(255,255,255,0.09)'; if (sub) { sub.remove(); sub = null; } });
+        }
+        row.addEventListener('mouseleave', function () { row.style.background = 'transparent'; });
+        row.addEventListener('click', function (e2) { e2.stopPropagation(); pick(fam.default || fam.value); });
+        row.addEventListener('keydown', function (e2) {
+          if (e2.key === 'Enter' || e2.key === ' ') { e2.preventDefault(); e2.stopPropagation(); pick(fam.default || fam.value); }
+          else if ((e2.key === 'ArrowRight' || e2.key === 'ArrowLeft') && openSub) {
+            e2.preventDefault();
+            var s = openSub();
+            var first = s && s.querySelector('[tabindex]');
+            if (first) first.focus();
+          }
+        });
+        menu.appendChild(row);
+      });
+      document.body.appendChild(menu);
+      var br = btn.getBoundingClientRect();
+      menu.style.left = Math.max(8, Math.min(Math.round(br.left), window.innerWidth - (menu.offsetWidth || 140) - 8)) + 'px';
+      var mh = menu.offsetHeight || 0;
+      menu.style.top = (br.bottom + 4 + mh > window.innerHeight - 8 ? Math.max(8, Math.round(br.top) - mh - 4) : Math.round(br.bottom + 4)) + 'px';
+    });
+  }
+  fillChoices().then(function () {
+    versionMenu(jm);
+    versionMenu(im);
+    versionMenu(dm, [{ value: 'triage', label: 'Follow triage', versions: [] }]);
+  });
   if (jm) jm.addEventListener('change', function () { post({ type: 'setJudgeModel', model: jm.value }); });
   if (im) im.addEventListener('change', function () { post({ type: 'setIndexModel', model: im.value }); });
   if (je) je.addEventListener('change', function () { post({ type: 'setJudgeEffort', effort: je.value }); });
@@ -310,7 +429,10 @@ function initGear(post) {
     if (choices) return Promise.resolve(choices);
     return fetch(ku('/models'), { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (d) {
       choices = d || { models: [], efforts: [] };
-      var mo = (choices.models || []).map(function (m) { return '<option value="' + m.value + '">' + m.label + '</option>'; }).join('');
+      var mo = (choices.models || []).map(function (m) {
+        var vs = (m.versions || []).map(function (v) { return '<option value="' + v.value + '">' + v.label + '</option>'; }).join('');
+        return '<option value="' + m.value + '">' + m.label + '</option>' + vs;   // versions ride as options too — the hidden select stays the value holder for any pick
+      }).join('');
       var eff = (choices.efforts || []).map(function (m) { return '<option value="' + m.value + '">' + m.label + '</option>'; }).join('');
       var eo = '<option value="">Default</option>' + eff;
       if (jm) jm.innerHTML = mo; if (im) im.innerHTML = mo;

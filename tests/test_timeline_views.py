@@ -29,6 +29,41 @@ jd = km.jd
 G1 = {"id": "g1", "name": "pool", "color": "#DD42FF", "members": ["s2", "s3"]}
 
 
+class TagOrderRoundTrip(unittest.TestCase):
+    """The union DISPLAY order (the user 2026-08-25): a NAME list on the views blob, viewer-side —
+    so a dragged remote-homed tag holds its position without any cross-kernel write. The normalizer
+    passes it through (clamped, deduped); pre-order blobs round-trip without the key."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.saved = jd.STATE
+        jd.STATE = Path(self.td.name)
+        km._flags_cache.clear()
+
+    def tearDown(self):
+        jd.STATE = self.saved
+        self.td.cleanup()
+
+    def test_order_survives_normalize_and_store(self):
+        blob = {"active": "all", "tags": [G1], "tagOrder": ["experiments", "pool", "remotename"]}
+        n = km._norm_timeline_views(blob)
+        self.assertEqual(n["tagOrder"], ["experiments", "pool", "remotename"],
+                         "names pass through unvalidated — a remote-homed name is unknowable here by design")
+        km._set_timeline_views(blob)
+        self.assertEqual(km._timeline_views()["tagOrder"], ["experiments", "pool", "remotename"],
+                         "the drag persists: the stored blob re-reads with the order intact")
+        self.assertEqual(km._views_client()["tagOrder"], ["experiments", "pool", "remotename"],
+                         "…and the rendered blob every client holds carries it")
+
+    def test_absent_stays_absent_and_junk_drops(self):
+        n = km._norm_timeline_views({"active": "all", "tags": [G1]})
+        self.assertNotIn("tagOrder", n, "pre-order blobs round-trip without the key")
+        n = km._norm_timeline_views({"tags": [G1], "tagOrder": [3, "", None, "pool", "pool"]})
+        self.assertEqual(n["tagOrder"], ["pool"], "junk entries drop quietly; duplicates collapse")
+        n = km._norm_timeline_views({"tags": [G1], "tagOrder": "pool"})
+        self.assertNotIn("tagOrder", n, "a wrong-typed order drops whole, never raises")
+
+
 class TimelineViews(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
@@ -44,7 +79,8 @@ class TimelineViews(unittest.TestCase):
         # fresh blobs open on "all" — and since 2026-08-24 that sentinel means truly-ALL, so a
         # legacy blob persisted when "all" meant untagged lands on the new default automatically
         v = km._timeline_views()
-        self.assertEqual(v, {"active": "all", "tags": []})
+        self.assertEqual(v, {"active": "all", "tags": [],
+                         "actives": {"chat": {"all": True}, "timeline": {"all": True}, "outline": {"all": True}}})   # per-surface lenses seed from the scalar (2026-08-25)
         self.assertTrue(km._view_visible(v, "anything"))
 
     def test_all_shows_every_session_and_untagged_the_tagless_ones(self):
@@ -87,7 +123,8 @@ class TimelineViews(unittest.TestCase):
                                      "tags": [{"id": "g1", "name": "x" * 99, "members": ["m", 3]},
                                               {"noid": True}, "junk"]})
         self.assertEqual(km._norm_timeline_views({"hidden": 7, "tags": "nope"}),
-                         {"active": "all", "tags": []},
+                         {"active": "all", "tags": [],
+                          "actives": {"chat": {"all": True}, "timeline": {"all": True}, "outline": {"all": True}}},
                          "wrong-TYPED fields drop instead of raising")
         self.assertEqual(km._norm_timeline_views({"tags": [{"id": "g", "members": 3}]})["tags"][0]["members"],
                          [], "a wrong-typed members list drops, never raises")
@@ -313,6 +350,56 @@ class TimelineViews(unittest.TestCase):
             self.assertFalse(km._view_visible(v, "locsid"))
         finally:
             km._remotes.clear(); km._remotes.update(saved)
+
+    def test_per_surface_lenses_the_truth_table(self):
+        # the multi-select decision (the user 2026-08-25): union over selected buckets, none = in
+        # no tag home (name-keyed, remote included), All admits everything, surfaces independent
+        views = {"active": "all",
+                 "actives": {"chat": {"tags": ["workers"]},
+                             "timeline": {"none": True, "tags": ["infra"]}},
+                 "tags": [{"id": "g1", "name": "workers", "members": ["s1"]},
+                          {"id": "g2", "name": "infra", "members": ["s2"]}],
+                 "remoteTags": [{"id": "alpha:g9", "host": "alpha", "name": "workers",
+                                 "members": ["alpha:r1"]}]}
+        # chat: workers only — name-keyed union pulls the remote member in too
+        self.assertTrue(km._view_visible(views, "s1", surface="chat"))
+        self.assertTrue(km._view_visible(views, "alpha:r1", surface="chat"))
+        self.assertFalse(km._view_visible(views, "s2", surface="chat"))
+        self.assertFalse(km._view_visible(views, "loose", surface="chat"))
+        # timeline: infra ∪ no-tags — arbitrary combinations, independent of chat's pick
+        self.assertTrue(km._view_visible(views, "s2", surface="timeline"))
+        self.assertTrue(km._view_visible(views, "loose", surface="timeline"))
+        self.assertFalse(km._view_visible(views, "s1", surface="timeline"), "tagged, not selected")
+        # a missing lens falls open (a surface never named yet)
+        self.assertTrue(km._view_visible(views, "anything", surface="feed"))
+        # the scalar path is untouched — legacy callers and their pins keep working
+        self.assertTrue(km._view_visible(views, "anything"))
+
+    def test_migration_seeds_every_surface_from_the_scalar_active(self):
+        # lossless legacy (the user 2026-08-25): a blob without `actives` reads as if each surface
+        # had selected the old shared view — untagged seeds the none bucket, a tag id its NAME
+        v = km._norm_timeline_views({"active": "untagged"})
+        self.assertEqual(v["actives"], {"chat": {"none": True}, "timeline": {"none": True},
+                                        "outline": {"none": True}})
+        v = km._norm_timeline_views({"active": "g1",
+                                     "tags": [{"id": "g1", "name": "workers", "members": []}]})
+        self.assertEqual(v["actives"], {"chat": {"tags": ["workers"]},
+                                        "timeline": {"tags": ["workers"]},
+                                        "outline": {"tags": ["workers"]}})
+        # once a blob CARRIES actives, they win — and a surface absent from it reads All, never
+        # a re-seed (the scalar may lag the lenses; seeding again would resurrect a stale pick)
+        v = km._norm_timeline_views({"active": "untagged",
+                                     "actives": {"chat": {"tags": ["workers"]}}})
+        self.assertEqual(v["actives"]["chat"], {"tags": ["workers"]})
+        self.assertEqual(v["actives"]["timeline"], {"all": True})
+
+    def test_lens_normalization_never_strands_an_empty_selection(self):
+        v = km._norm_timeline_views({"actives": {"chat": {"tags": []}, "timeline": {"none": False}}})
+        self.assertEqual(v["actives"]["chat"], {"all": True})
+        self.assertEqual(v["actives"]["timeline"], {"all": True})
+        # unknown names are KEPT — they may live on a linked kernel (name-keyed federation)
+        v = km._norm_timeline_views({"actives": {"chat": {"tags": ["only-on-alpha"]}}})
+        self.assertEqual(v["actives"]["chat"], {"tags": ["only-on-alpha"]})
 
     def test_focus_never_mutates_the_views_blob(self):
         # A focus is a PEEK, not a view edit (the user 2026-08-24, superseding the 2026-08-18/19/23

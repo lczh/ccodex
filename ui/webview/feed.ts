@@ -10,9 +10,10 @@ import { distillText, distillInputs, applyDistillLine, distillPending, distillSt
 import { spinFor, KIND_WORD, waitedSuffix } from "./spin-caption";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { searchMatches, searchSids } from "./feed-search";
-import { cardInView, outsideView, outsideViewCount, viewLabel } from "./feed-view";
-import { SessionViews, viewsKey } from "./session-views";
-import { freezeDiff } from "./feed-freeze";
+import { TagLens, lensAll, lensLabel, lensVisible, lensUnions } from "./tag-lens";
+import { openTagMenu, tagMenuButton, syncTagFilter } from "./tag-menu";
+import { SessionViews } from "./session-views";
+import { freezeDiff, contentSig } from "./feed-freeze";
 import { hostNameNodes, hostPartsNodes, hostIsDown, hostDownNote, hostOf } from "./host-prefix";
 import { extHoverMatches } from "./card-key";
 import { provenanceRows, provenanceGroupRows, rootStart, type ProvFmt, type ProvRow } from "./provenance";
@@ -470,14 +471,59 @@ let sessionOrder: string[] = [];
 // menu lists exactly the tabs (the user 2026-08-08) — a session with no cards still appears, and
 // filtering to it shows an empty board. Federation prefixes sid+name per host and concatenates.
 let sessionsMeta: { sid: string; name: string; color: { bg: string; fg: string } | null }[] = [];
-// The ACTIVE session view (the user 2026-08-24): the same views blob every tabOrder push carries,
-// riding the feed payload — the board's cards gate on it (feed-view.ts / viewFiltered). The pending
-// copy is the tab strip's own optimistic convention (render.ts pendingSessionViews): a view switch
-// from THIS page applies at once and holds until the kernel's echo matches by shape (viewsKey) or
-// three pushes pass — a push count, never a timer.
-let feedViews: SessionViews | null = null;
-let feedViewsPending: SessionViews | null = null;
-let feedViewsPendingAge = 0;
+// Attached hosts whose CARD payload hasn't merged yet (the user 2026-08-25: sessions land via the
+// faster channels, cards trail with no cue) — the federation merge names them (pendingHosts), the
+// board hints per host, and the hint retires ONLY on the real events: that host's first contribution
+// (an empty one included) or its detach. The 45s mark ESCALATES the copy ("still waiting…"), never
+// hides — the first cut's backstop RETIRED the hint while the host genuinely still pended (the user
+// 2026-08-25, round two: the dots vanished, the cards still hadn't come; the signal knew, the
+// backstop overrode it — a backstop must never make the board lie about a true wait). A DEAD link
+// (pendingDead, from the merge's socket truth) names itself instead of waiting open-endedly.
+let pendingHosts: string[] = [];
+let pendingDead: string[] = [];
+const hostloadTimers = new Map<string, number>();
+const hostloadLong = new Set<string>();
+function syncHostloadBackstops(): void {
+  for (const h of pendingHosts) {
+    if (!hostloadTimers.has(h)) {
+      hostloadTimers.set(h, window.setTimeout(() => { hostloadLong.add(h); render(); }, 45000));
+    }
+  }
+  for (const [h, t] of Array.from(hostloadTimers)) {
+    if (!pendingHosts.includes(h)) {   // the payload landed (or the host detached) — the ONLY removals
+      window.clearTimeout(t);
+      hostloadTimers.delete(h);
+      hostloadLong.delete(h);
+    }
+  }
+}
+// The feed's LOCAL tag lens (the user 2026-08-25, T70): the shared TagLens model (tag-lens.ts, the
+// multi-select every surface speaks) applied as THIS board's own deliberate narrowing — never the
+// shared blob's `active` (the decoupling ruling stands); the payload's views blob feeds tag
+// DEFINITIONS only (lensUnions). Persistence is sessionStorage, the feed's storage-split convention
+// (romp:feedOnly's reasoning): reload-proof, but a fresh window starts on All — a lens persisting
+// for days would read as silently missing cards, and the disclosure line only mitigates. The tags
+// dialog's "set for all surfaces" writes localStorage romp:feedTags-set {lens,t}; the storage
+// listener below adopts it into this pane's own lens (the PR-B adoption contract).
+let feedTagViews: SessionViews | null = null;
+let feedLens: TagLens = { all: true };
+try { feedLens = JSON.parse(sessionStorage.getItem("romp:feedTags") || "") || { all: true }; } catch { /* default All */ }
+function setFeedLens(l: TagLens): void {
+  feedLens = l;
+  try {
+    if (lensAll(l)) sessionStorage.removeItem("romp:feedTags");
+    else sessionStorage.setItem("romp:feedTags", JSON.stringify(l));
+  } catch { /* storage blocked */ }
+}
+try {
+  window.addEventListener("storage", (e) => {
+    if (e.key !== "romp:feedTags-set" || !e.newValue) return;
+    try {
+      const v = JSON.parse(e.newValue);
+      if (v && v.lens) { setFeedLens(v.lens as TagLens); render(); }
+    } catch { /* malformed set-for-all — ignore */ }
+  });
+} catch { /* no storage events */ }
 // The one session the board is filtered to, or null — the DEFAULT, nothing selected, everything shows.
 // sessionStorage, deliberately: it survives this tab's reloads (webviews reload on updates) but a fresh
 // window always starts unfiltered — a filter that persisted for days would read as silently lost cards.
@@ -886,14 +932,7 @@ function makeAskCard(it: AskItem): HTMLElement {
   // against the chips whenever it does fit on the one line.
   const origin = el("a", "fask-origin"); origin.style.display = "none";
   origin.title = "this work was delegated from another session — click to open it";
-  // ↪ BREAKTHROUGH cue (the user 2026-08-24): this card's session is OUTSIDE the active view — it
-  // shows anyway because it needs you (the interrupt rule); the cue says why it's here. Quiet, the
-  // ↪ provenance family, never a status colour.
-  const viewbreak = el("span", "fask-viewbreak"); viewbreak.style.display = "none";
-  viewbreak.textContent = "\u21aa outside this view";
-  viewbreak.title = "the active view hides this session — this card shows because it needs you";
-  idwrap.append(name);   // the cue is a DIRECT row2 child below: grouped mode hides idwrap wholesale,
-  //                        and a breakthrough under a session header still needs its why
+  idwrap.append(name);
   const actions = el("div", "fask-actions");
   // (the "reopened" chip was DELETED 2026-07-07: dead since cleared-is-sealed-forever made a follow-up
   // to a cleared card a FRESH goal (2026-06-22) — the kernel never produced the flag again.)
@@ -1017,7 +1056,7 @@ function makeAskCard(it: AskItem): HTMLElement {
   // direct children they render in BOTH modes, count toward row2's grouped-mode liveness, and the
   // API badge stays immediately before its Retry button — one visual unit. idwrap keeps only the
   // name. Placement only; every badge's mint/retire semantics are untouched.
-  row2.append(idwrap, retryBadge, apiBadge, apiRetry, jauthBadge, blkBadge, origin, viewbreak, fupBadge, dcBadge, nfBadge, intingBadge, intBadge, warnChip, waitOnBadge);
+  row2.append(idwrap, retryBadge, apiBadge, apiRetry, jauthBadge, blkBadge, origin, fupBadge, dcBadge, nfBadge, intingBadge, intBadge, warnChip, waitOnBadge);
   // the bell BUTTON (the user 2026-07-28): INLINE in row1's metadata cluster, right after the
   // timestamp (the last line's tail), the one spot that never shoves the title — and in-flow, so it
   // cannot overlap the floated Clear. It hides with VISIBILITY, so its slot is reserved whether or
@@ -1192,6 +1231,7 @@ function makeAskCard(it: AskItem): HTMLElement {
     pending = window.setTimeout(() => {
       pending = undefined;
       fullscreenAskId = it.itemId;
+      vscodeApi?.postMessage({ type: "cardOpened", itemId: it.itemId, sid: it.sid });   // the open-metric row (2026-08-25)
       vscodeApi?.postMessage({ type: "showAskPath", itemId: it.itemId, sid: it.sid, locate: false });
       render();
     }, 220);
@@ -1238,7 +1278,6 @@ function makeAskCard(it: AskItem): HTMLElement {
   a._taskBtn = taskBtn; a._taskLbl = taskLbl;
   a._awaitSpin = awaitSpin; a._awaitWhy = awaitWhy;
   a._origin = origin;
-  a._viewbreak = viewbreak;
   return card;
 }
 
@@ -1607,8 +1646,6 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
   a._name.replaceChildren(...hostNameNodes(it.name, it.sid));   // remote "host:" prefix = quiet metadata
   if (it.color) a._name.style.color = it.color.bg;
   setWorkDot(a._name, dotFor(it.name));   // working/awaiting dot before the session name
-  // a card on the board whose session the active view HIDES is a breakthrough — say why it's here
-  (a._viewbreak as HTMLElement).style.display = outsideView(feedViews, it.sid) ? "" : "none";
   // ↪ courier handoff: planted by a peer's message → "↪ from <sender>", click opens the sender
   const og = a._origin as HTMLElement;
   if (it.origin && it.origin.peer) {
@@ -2225,9 +2262,6 @@ function makeGroupCard(g: AskGroup): HTMLElement {
   const row2 = el("div", "fask-row2");
   const idwrap = el("div", "fask-id");
   const name = el("a", "fname"); name.title = "open this session";
-  const gviewbreak = el("span", "fask-viewbreak"); gviewbreak.style.display = "none";
-  gviewbreak.textContent = "\u21aa outside this view";   // breakthrough cue — same dress as the ask card's
-  gviewbreak.title = "the active view hides this session — this card shows because it needs you";
   idwrap.append(name);   // no "· N parts" label — the member checklist below already shows the count
   const clr = el("button", "fdismiss"); clr.textContent = "Clear"; clr.title = "clear ALL sub-asks of this request (inbox-zero)";
   // Clear rides row1's action corner in every mode (the user 2026-08-08) — matches the ask card. Same
@@ -2236,7 +2270,7 @@ function makeGroupCard(g: AskGroup): HTMLElement {
   const btns = el("span", "fask-btns");
   btns.append(clr);
   row1.append(btns);
-  row2.append(idwrap, gviewbreak);   // the cue is a row2 SIBLING: grouped mode hides idwrap wholesale
+  row2.append(idwrap);
   const memberList = el("div", "fgroup-members");   // no row3: the group card has no time-row content left
   main.append(row1, row2, memberList);
   card.append(main);
@@ -2284,7 +2318,8 @@ function makeGroupCard(g: AskGroup): HTMLElement {
     pending = window.setTimeout(() => {
       pending = undefined;
       fullscreenAskId = fkey;
-      const m = m0(); if (m) vscodeApi?.postMessage({ type: "showAskPath", itemId: m.itemId, sid: m.sid, locate: false });
+      const m = m0(); if (m) vscodeApi?.postMessage({ type: "cardOpened", itemId: m.itemId, sid: m.sid });   // the open-metric row (2026-08-25)
+      if (m) vscodeApi?.postMessage({ type: "showAskPath", itemId: m.itemId, sid: m.sid, locate: false });
       render();
     }, 220);
   });
@@ -2319,9 +2354,6 @@ function updateGroupCard(card: HTMLElement, g: AskGroup) {
   a._name.replaceChildren(...hostNameNodes(g.name, g.sid));
   if (g.color) a._name.style.color = g.color.bg;
   setWorkDot(a._name, dotFor(g.name));   // working/awaiting dot before the session name
-  const gbroke = outsideView(feedViews, g.sid);   // shown AND view-hidden = a breakthrough
-  const gvb = card.querySelector(".fask-viewbreak") as HTMLElement | null;
-  if (gvb) gvb.style.display = gbroke ? "" : "none";   // breakthrough cue
   a._time.textContent = relAge(hostNow - g.t);
   wireAgeTip(a._time, () => provenanceGroupRows(g.members.map(rootStart), g.t, hostNow, PROV_FMT));
   // member lines — rebuilt only when the member set or any member's status changes
@@ -2341,8 +2373,7 @@ function updateGroupCard(card: HTMLElement, g: AskGroup) {
   // user 2026-08-08 — no re-home between renders.)
   const gmode = feedPrefs().grouped;
   ((a._name as HTMLElement).parentElement as HTMLElement).style.display = gmode ? "none" : "";
-  (a._row2 as HTMLElement).style.display = gmode && !gbroke ? "none" : "";   // the group's row2 is only the
-  //   name now — except a BREAKTHROUGH's cue (grouped hides the name via idwrap; the cue stays)
+  (a._row2 as HTMLElement).style.display = gmode ? "none" : "";   // the group's row2 is only the name now
 }
 
 // Transient hover-highlight signal: hovering a modal line emits its event id(s);
@@ -3320,6 +3351,45 @@ function ensureClearAll(): HTMLElement {
   return b;
 }
 
+// The feed's mount of the SHARED tag-lens menu (tag-menu.ts — one component every surface mounts;
+// the user's generalized design). The button is the shared monochrome tag glyph; active (a narrowed
+// lens) wears the accent like every footer .on state. The menu inherits cross-pane dismissal free
+// (romp:menu-echo). Configure routes to the tags dialog through the kernel (openTagsDialog).
+function ensureTagLensBtn(): HTMLElement {
+  let b = document.getElementById("feed-taglens") as HTMLElement | null;
+  if (!b) {
+    b = tagMenuButton("filter this board by tag — combinations union; All shows everything", (btn) => {
+      openTagMenu(btn, {
+        lens: () => feedLens,
+        unions: () => lensUnions(feedTagViews),
+        onApply: (l) => { setFeedLens(l); render(); },
+        onConfigure: () => vscodeApi?.postMessage({ type: "openTagsDialog" }),
+      });
+    });
+    b.id = "feed-taglens";
+    // FOOTER DRESS (the user 2026-08-25, round two: at rest the button outlined blue, and All faded
+    // it darker than its neighbours): the shared component ships its own inline style, and inline
+    // beats every class rule — strip it and wear the EXACT sibling vocabulary, so the resting state
+    // is the neighbours' computed style by construction and can never drift dark again. Active is
+    // the standard .on accent ONLY — the class the siblings use, never an inline colour.
+    b.removeAttribute("style");
+    b.className = "fdismiss ffollow feed-modetoggle";
+    (document.getElementById("feed-foot") || document.body).appendChild(b);
+  }
+  // THE BUTTON CONVENTION (the user 2026-08-25), shared renderer — subsumes the 696 instance
+  // toggle: same .on class mechanics (mode "class", so the footer's sibling dress stands), plus
+  // the chips of everything selected beside the button, identical to every other mount
+  let ch = document.getElementById("feed-tagchips") as HTMLElement | null;
+  if (!ch) {
+    ch = document.createElement("span");
+    ch.id = "feed-tagchips";
+    ch.setAttribute("style", "display:inline-flex;gap:5px;align-items:center;margin-left:2px;");
+    b.after(ch);
+  }
+  syncTagFilter(b, ch, feedLens, lensUnions(feedTagViews) as never, (l) => { setFeedLens(l); render(); }, "class");
+  return b;
+}
+
 // The footer VIEW MENU (the user 2026-08-24): the three view controls — sort direction, single-column
 // layout, by-session grouping — live behind ONE monochrome icon button now, a popup wearing the shared
 // .ctx-menu vocabulary, where three word-buttons crowded the footer and the labels can breathe.
@@ -3543,6 +3613,22 @@ function openSessList(): void {
     r.setAttribute("role", "option");
     if (pick !== null) r.setAttribute("data-sid", pick);
     if (name !== null) r.setAttribute("data-name", name);
+    // TAG CHIPS inline (the user 2026-08-25 — the unification call's smaller variant): the session's
+    // name-keyed union tags as compact outline chips, the dialog's own one-chip-per-name vocabulary,
+    // NON-interactive (grouping made visible; the two controls stay separate and the pick is
+    // untouched). The strip ellipsizes in the row's leftover space so names stay primary.
+    // (Deliberately NOT built, decided: search matching tag names — the pick list stays sessions-only.)
+    if (pick !== null) {
+      const chips = el("span", "fsm-chips");
+      for (const g of lensUnions(feedTagViews)) {
+        if (!g.members.includes(pick)) continue;
+        const c = el("i", "fsm-chip-tag");
+        c.textContent = g.name;
+        if (g.color) { c.style.color = g.color; c.style.borderColor = g.color; }
+        chips.appendChild(c);
+      }
+      if (chips.childElementCount) r.appendChild(chips);
+    }
     r.onclick = (ev) => {   // pick = the exact filter, worn as the bar's chip; the list closes, the bar stays
       ev.stopPropagation();
       const already = (r.getAttribute("data-sid") || null) === feedOnlySid;
@@ -4078,20 +4164,72 @@ function paintJudgeLimit(): void {
 // per-card label does, so a just-died session's cards keep matching after the meta list drops it).
 // Shared by render() and the hover-freeze badge painter, so the deferred-churn hint counts exactly
 // what the user would see move.
-function viewFiltered(list: AskItem[]): AskItem[] {
-  // the ACTIVE session view gates the board FIRST (the user 2026-08-24): the same union-aware
-  // decider the tabs read (feed-view.ts cardInView -> session-views.ts viewVisible — never a fourth
-  // fork), with the BREAKTHROUGH GUARD: a needs-you card always shows, wearing the outside-view cue.
-  // Inside this helper like every display filter — the hover-freeze churn badges count through it.
-  let shown = feedViews ? list.filter((a) => cardInView(feedViews, a.sid, askColumn(a) === "needsInput")) : list;
-  // A tracked delegation's satellite lives under its delegator's PRIMARY card: the default board
-  // hides it, and picking its session in the filter is the one-click path back. INSIDE this helper
-  // on purpose — the hover-freeze churn badges count through it, so they see exactly what the
-  // board shows (a filter outside would paint +N for cards that never appear).
-  shown = feedOnlySid ? shown.filter((a) => a.sid === feedOnlySid) : shown.filter((a) => !a.satellite);
+function viewScope(list: AskItem[]): AskItem[] {
+  // The board shows EVERY session's cards, whatever tag view the tabs/timeline hold (the user's
+  // 2026-08-25 ruling, superseding the 2026-08-24 feed-follows-the-view coupling after living with
+  // it): the feed is the attention/clearing surface — hidden-elsewhere work still lands and clears
+  // here. Its ONLY narrowing is its own local scoping (this combobox exact filter + search) and
+  // the feed-local TAG LENS (viewBase). A tracked
+  // delegation's satellite lives under its delegator's PRIMARY card: the default board hides it,
+  // and picking its session in the filter is the one-click path back.
+  let shown = feedOnlySid ? list.filter((a) => a.sid === feedOnlySid) : list.filter((a) => !a.satellite);
   const sMatch = searchSids(feedSearchQ, sessionsMeta);
   if (sMatch) shown = shown.filter((a) => sMatch.has(a.sid) || searchMatches(feedSearchQ, (a as { name?: string }).name));
   return shown;
+}
+
+// The feed-local TAG LENS slot (the user 2026-08-25, T70; disclosure lineage: the 665 outside-view
+// treatments, retired with the shared-view coupling, live again here under the user's OWN lens).
+// Needs-you always passes — the same interrupt rule the satellite and internals lens wear: a
+// view-hidden session that needs the human is this board's whole job.
+function viewBase(list: AskItem[]): AskItem[] {
+  const s = viewScope(list);
+  if (lensAll(feedLens)) return s;   // default All = today's board, byte-identical
+  const u = lensUnions(feedTagViews);
+  return s.filter((a) => lensVisible(feedLens, u, a.sid) || a.column === "needs_input");
+}
+
+// The disclosure count: what the TAG LENS alone hides (breakthroughs already show; counting them
+// would double-speak) — viewScope minus viewBase, by construction.
+function outsideLensCount(list: AskItem[]): number {
+  return lensAll(feedLens) ? 0 : viewScope(list).length - viewBase(list).length;
+}
+
+// The board's final display view. (The 2026-08-25 team-internals lens lived in this slot for a
+// day and RETIRED the same day on the user's verdict: team-internal cards must not be CREATED —
+// chain-rooted minting in the courier owns that now — rather than created-then-foldable. No
+// display class, no footer toggle; the slot family stays so future lenses layer the same way.)
+// INSIDE this helper on purpose — the hover-freeze churn badges count through it, so they see
+// exactly what the board shows (a filter outside would paint +N for cards that never appear).
+function viewFiltered(list: AskItem[]): AskItem[] {
+  return viewBase(list);
+}
+
+// The per-host loading strip (the user 2026-08-25): while an attached host's cards are pending,
+// one quiet line per host — the romp loader family scoped to a strip, never a board takeover; the
+// cards already present stay fully live. Retires per host on the exact event of its first merged
+// contribution (pendingHosts, federation.ts) or on the standing can't-trap backstop; the lines are
+// non-interactive, so a per-render rebuild is click-safe by construction.
+function ensureHostLoad(list: HTMLElement): void {
+  let strip = document.getElementById("feed-hostload");
+  if (!pendingHosts.length) { strip?.remove(); return; }   // the real events emptied the list — the only way off
+  if (!strip) {
+    strip = el("div", "");
+    strip.id = "feed-hostload";
+  }
+  list.appendChild(strip);   // last child in either board state (cards or the empty wordmark)
+  strip.replaceChildren(...pendingHosts.map((h) => {
+    const line = el("div", "hostload-line");
+    const swirl = el("span", "fask-awaiting-swirl");   // the shared reverse-spin glyph, LEFT of the text
+    const txt = el("span", "");
+    txt.textContent = pendingDead.includes(h)
+      ? "can\u2019t reach " + h + " \u2014 its cards return when it reconnects"
+      : hostloadLong.has(h)
+        ? "still waiting on " + h + "\u2026"
+        : "loading cards from " + h + "\u2026";
+    line.append(swirl, txt);
+    return line;
+  }));
 }
 
 function render() {
@@ -4104,6 +4242,7 @@ function render() {
   // footer pane (below the cards, no overlap): view menu · Session filter · Search | Clear all · Undo
   const showCA = !!asks.length;
   ensureViewMenuBtn().style.display = showCA ? "" : "none";       // sort + layout menu (the user 2026-08-24)
+  ensureTagLensBtn().style.display = showCA ? "" : "none";        // the feed-local tag lens (the user 2026-08-25, T70)
   ensureSessionBox().style.display = showCA ? "" : "none";        // session combobox: type-or-pick filter (the user 2026-08-24)
   ensureClearAll().style.display = showCA ? "" : "none";
   ensureUndoClear().style.display = canUndoClear ? "" : "none";
@@ -4126,6 +4265,7 @@ function render() {
       e.setAttribute("role", "img"); e.setAttribute("aria-label", "All tasks complete");
       list.appendChild(e);
     }
+    ensureHostLoad(list);   // an attached host's cards may be the ONLY thing coming — say so here too
     return;
   }
 
@@ -4241,41 +4381,29 @@ function render() {
   }
   for (const tid of Array.from(groupEls.keys())) if (!desired.has("g:" + tid) && undismissed(groupEls.get(tid))) { groupEls.get(tid)?.remove(); groupEls.delete(tid); }
 
-  // "N cards outside this view" (the user 2026-08-24; the 2026-08-11 rule: what a view filters
-  // away stays one glance from reach, never silently omitted). Dim, one line, after the columns;
-  // the click switches the active view to All — optimistically (the board reflows NOW, the
-  // click-safety acknowledgement), the kernel echo reconciling through the pending-copy above.
-  const outN = feedViews ? outsideViewCount(feedViews,
-    asks.map((a) => ({ sid: a.sid, needsYou: askColumn(a) === "needsInput" }))) : 0;
-  let vmore = document.getElementById("feed-viewmore");
-  if (!vmore) {
-    vmore = el("div", "");
-    vmore.id = "feed-viewmore";
-    vmore.title = "cards from sessions the active view hides — click to switch the view to All";
-    vmore.onclick = () => {
-      if (!feedViews) return;
-      feedViewsPending = { ...feedViews, active: "all" };
-      feedViewsPendingAge = 0;
-      feedViews = feedViewsPending;
-      vscodeApi?.postMessage({ type: "setTimelineViews", views: feedViewsPending });
-      render();
-    };
-    list.appendChild(vmore);
+  // The tag lens's disclosure line (the user 2026-08-25, T70; lineage: the 665 outside-view line +
+  // promoted banner, retired with the shared-view coupling, revived under the user's OWN lens —
+  // what a filter hides stays one glance from reach, never silent, the 2026-08-11 rule). The click
+  // resets to All, purely local (no kernel round-trip: sessionStorage + render).
+  const lensOutN = outsideLensCount(asks);
+  let lmore = document.getElementById("feed-lensmore");
+  if (!lmore) {
+    lmore = el("div", "");
+    lmore.id = "feed-lensmore";
+    lmore.title = "cards the tag filter hides — click to show all";
+    lmore.onclick = () => { setFeedLens({ all: true }); render(); };
+    list.appendChild(lmore);
   }
-  // PROMOTION (the user 2026-08-25, who read a view-narrowed board as "the feed is broken": one card
-  // showed, twenty hid, and the dim line went unseen): when the view hides MORE than the board shows,
-  // the line trades the whisper for the judge-limit banner's card chrome and NAMES the view — the
-  // near-empty board must state plainly which view it is showing and how to widen. Exact rule, no
-  // heuristics: outN > (cards on the board).
-  const shownN = viewFiltered(asks).length;
-  vmore.classList.toggle("prominent", outN > shownN);
-  vmore.style.display = outN ? "" : "none";
-  if (outN) {
-    vmore.textContent = outN > shownN
-      ? "Showing the \u201c" + viewLabel(feedViews) + "\u201d view — " + outN
-        + (outN === 1 ? " card is" : " cards are") + " in other views · show all"
-      : outN + (outN === 1 ? " card" : " cards") + " outside this view — show all";
+  const lensShownN = viewFiltered(asks).length;
+  lmore.classList.toggle("prominent", lensOutN > lensShownN);
+  lmore.style.display = lensOutN ? "" : "none";
+  if (lensOutN) {
+    lmore.textContent = lensOutN > lensShownN
+      ? "Showing \u201c" + lensLabel(feedLens) + "\u201d \u2014 " + lensOutN
+        + (lensOutN === 1 ? " card is" : " cards are") + " outside this filter \u00b7 show all"
+      : lensOutN + (lensOutN === 1 ? " card" : " cards") + " outside this tag filter \u2014 show all";
   }
+  ensureHostLoad(list);
   list.scrollTop = prevScroll;
   // Stale-freeze heal (hover-freeze): a LOCAL render can detach or re-key the hovered element with
   // no mouseleave — a removed element never fires leave events (typing in search filters the card
@@ -4566,11 +4694,35 @@ function paintFreezeParts(b: HTMLElement, c: { add: number; del: number }): void
   if (c.add) { const i = el("i", "fz-add"); i.textContent = "+" + c.add; b.appendChild(i); }
   if (c.add && c.del) b.appendChild(document.createTextNode("/"));
   if (c.del) { const i = el("i", "fz-del"); i.textContent = "-" + c.del; b.appendChild(i); }
+  // the explicit reading (the user 2026-08-25, liking the +N/−N but wanting it to say what it
+  // means): a parenthetical in the accent dress, well under their verbosity ceiling
+  const note = el("i", "fz-note");
+  note.textContent = " (" + (c.add + c.del) + " changed — mouse away to apply)";
+  b.appendChild(note);
   b.title = "updates waiting while you hover — they apply when the pointer leaves the card";
+}
+// Has the FROZEN card's own content changed in the withheld payload? Churn elsewhere and a stale
+// card under the pointer are different facts (the user 2026-08-25) — this one gets its own line,
+// shown WITH the churn badges when both are true. Group keys compare the turn's member set
+// (itemId-sorted, so payload order can never fake a change); ask keys compare the one item.
+function pendingSelfChanged(key: string): boolean {
+  if (!pendingFeedPayload) return false;
+  const pend = payloadView(pendingFeedPayload);
+  const byId = (a: AskItem, b2: AskItem) => (a.itemId < b2.itemId ? -1 : 1);
+  // CONTENT-projected compares only (contentSig — the user 2026-08-25): the whole-item compare
+  // flagged the per-build recency-tint recompute as "this card updated" on nearly every card
+  if (key.startsWith("g:")) {
+    const tid = key.slice(2);
+    const cur = asks.filter((a) => a.turnId === tid).slice().sort(byId).map((a) => contentSig(a as any)).join("|");
+    const nxt = pend.filter((a) => a.turnId === tid).slice().sort(byId).map((a) => contentSig(a as any)).join("|");
+    return cur !== nxt;
+  }
+  return contentSig(asks.find((a) => a.itemId === key) as any) !== contentSig(pend.find((a) => a.itemId === key) as any);
 }
 function paintFreezeBadges(): void {
   if (!pendingFeedPayload) {
     document.querySelectorAll(".freeze-badge").forEach((n) => n.remove());
+    document.getElementById("freeze-selfnote")?.remove();
     return;
   }
   const toItems = (list: AskItem[]) => viewFiltered(list).map((a) => ({ id: a.itemId, col: askColumn(a) as string, sid: a.sid }));
@@ -4589,6 +4741,25 @@ function paintFreezeBadges(): void {
   document.querySelectorAll<HTMLElement>(".feed-sess-head").forEach((h) => {
     put(h, groupedNow ? d.sess[h.getAttribute("data-fsid") || ""] : undefined);
   });
+  // the hovered/keyed card's OWN pending update — its own line, independent of the churn badges
+  // (both show when both are true). Body-mounted and pointer-inert: it must never affect hover,
+  // and the frozen card's rect is stable by construction (that is the freeze's whole contract).
+  const selfKey = freezeKey || tabScopeKey;
+  const selfCard = selfKey ? cardElByKey(selfKey) : null;
+  let selfNote = document.getElementById("freeze-selfnote");
+  if (!selfKey || !selfCard || !pendingSelfChanged(selfKey)) {
+    selfNote?.remove();
+  } else {
+    if (!selfNote) {
+      selfNote = el("div", "");
+      selfNote.id = "freeze-selfnote";
+      selfNote.textContent = "(this card updated — mouse away to refresh)";
+      document.body.appendChild(selfNote);
+    }
+    const r = selfCard.getBoundingClientRect();
+    selfNote.style.left = Math.round(r.left + 12) + "px";
+    selfNote.style.top = Math.round(r.bottom - 24) + "px";
+  }
 }
 
 // ── CARD KEYBOARD SCOPE (the user 2026-08-24) ──────────────────────────────────────────────────
@@ -4727,13 +4898,10 @@ function applyFeedPayload(m: any): void {
   unknownSet = new Set(Array.isArray(m.stateUnknown) ? m.stateUnknown : []);   // listed-but-unreadable → gray ring, never a blank
   bgServicesMap = m.bgServices && typeof m.bgServices === "object" ? m.bgServices : {};   // session name -> judge-classified service descs → the session-header chip (2026-07-24)
   if (Array.isArray(m.order)) sessionOrder = m.order.filter((x: any) => typeof x === "string");   // grouped-mode session rank (tab/lane order)
-  if (m.views && typeof m.views === "object") {
-    const incoming = m.views as SessionViews;
-    if (feedViewsPending && (viewsKey(incoming) === viewsKey(feedViewsPending) || ++feedViewsPendingAge >= 3)) {
-      feedViewsPending = null; feedViewsPendingAge = 0;   // the echo landed (or three pushes said it never will)
-    }
-    feedViews = feedViewsPending || incoming;
-  }
+  pendingHosts = Array.isArray(m.pendingHosts) ? m.pendingHosts.filter((h: any) => typeof h === "string") : [];
+  pendingDead = Array.isArray(m.pendingDead) ? m.pendingDead.filter((h: any) => typeof h === "string") : [];
+  syncHostloadBackstops();
+  if (m.views && typeof m.views === "object") feedTagViews = m.views as SessionViews;   // tag DEFINITIONS only — never `active`
   if (Array.isArray(m.sessions)) {
     sessionsMeta = m.sessions.filter((s: any) => s && typeof s.sid === "string" && typeof s.name === "string");
     // a filter aimed at a session the tab strip no longer shows is moot — clear it (the deciding
@@ -4815,6 +4983,7 @@ window.addEventListener("message", (e: MessageEvent) => {
     // ask itemId, "i:<itemId>" standalone, "g:<turnId>" group). hl = the clicked
     // turn's event id: ring its row(s) and scroll the first one into view.
     fullscreenAskId = m.key;
+    vscodeApi?.postMessage({ type: "cardOpened", itemId: m.key, sid: "" });   // rail-dot opens count too (2026-08-25)
     if (typeof m.hl === "string" && m.hl) extHoverEid = m.hl;
     renderModal();
     applyExtHover();

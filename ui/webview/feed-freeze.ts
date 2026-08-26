@@ -14,6 +14,21 @@ export type FreezeCounts = {
   any: boolean;
 };
 
+// The hovered card's "did IT change?" compare projects CONTENT-BEARING fields only (the user
+// 2026-08-25: the whole-item compare flagged the recency tint — trgb recomputes every build as
+// cards age, at the top level AND inside every sub-goal node — as "this card updated" on nearly
+// every card). An EXPLICIT list, so a new volatile field can never silently rejoin the diff; the
+// sub-goal tree contributes its nodes' identity/text/status only, never their own aging channels.
+const SELF_CONTENT = ["text", "column", "summary", "blockSummary", "blocked", "warns", "retrying", "nudgeFailed"] as const;
+export function contentSig(a: Record<string, unknown> | undefined | null): string {
+  if (!a) return "";
+  const o: Record<string, unknown> = {};
+  for (const k of SELF_CONTENT) o[k] = a[k];
+  const tree = Array.isArray(a.tree) ? (a.tree as Record<string, unknown>[]) : [];
+  o.tree = tree.map((n) => [n.id, n.text, n.status, n.cleared]);
+  return JSON.stringify(o);
+}
+
 export function freezeDiff(displayed: FreezeItem[], pending: FreezeItem[]): FreezeCounts {
   const cols: Record<string, FreezeCount> = {};
   const sess: Record<string, FreezeCount> = {};

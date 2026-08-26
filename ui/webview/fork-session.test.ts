@@ -25,6 +25,18 @@ test("the fork affordance rides BELOW each response run — delegated, with the 
   assert.match(RENDER, /\.turn-assistant\[data-uuid="\$\{cssEscape\(anchor\)\}"\]/);
   // …applied on the marks' hooks, like the branch chips (the transcript DOM rebuilds constantly)
   assert.match(RENDER, /applyForkSpots\(sid, v\);/);
+});
+
+test("the fork button sits INLINE, right of the worked-seconds label — never its own row below it", () => {
+  // the user 2026-08-25: the elapsed footer is the flex host; a turn with no footer (the live tip)
+  // keeps the button on its own row exactly as before. The remover walks closest(.turn-assistant)
+  // because the spot may nest inside the elapsed row.
+  assert.match(RENDER, /const elapsed = turn\.querySelector\(":scope > \.turn-elapsed"\) as HTMLElement \| null;/);
+  assert.match(RENDER, /if \(elapsed\) elapsed\.appendChild\(row\);\s*\n\s*else turn\.appendChild\(row\);/);
+  assert.match(RENDER, /const anchor = \(old\.closest\("\.turn-assistant"\) as HTMLElement \| null\)\?\.dataset\.uuid \|\| "";/);
+  const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "styles.css"), "utf8");
+  assert.match(CSS, /\.turn-elapsed \{[^}]*display: flex; align-items: center; gap: 8px; min-width: 0;/s);
+  assert.match(CSS, /\.turn-elapsed \.fork-spot \{ margin-top: 0; \}/);
   // the OLD home is gone: the prompt's msg-acts row no longer carries a fork (the user 2026-08-19)
   assert.doesNotMatch(RENDER, /acts\.appendChild\(fk\);/);
   // click-safe: the button is DELEGATED (data-act), landing in the shared modal with the spot's own cut

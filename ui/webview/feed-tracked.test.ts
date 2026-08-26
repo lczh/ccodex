@@ -14,8 +14,7 @@ const SRC = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "
 
 test("the default board hides satellites; the session filter is the one-click path back", () => {
   // inside viewFiltered, so the hover-freeze churn badges count exactly what the board shows
-  // the view gate (2026-08-24) runs first, so the satellite split reads the staged `shown`
-  assert.match(SRC, /shown\.filter\(\(a\) => a\.sid === feedOnlySid\) : shown\.filter\(\(a\) => !a\.satellite\)/,
+  assert.match(SRC, /list\.filter\(\(a\) => a\.sid === feedOnlySid\) : list\.filter\(\(a\) => !a\.satellite\)/,
     "hidden ONLY on the unfiltered board — picking the worker's session still shows its copy");
 });
 

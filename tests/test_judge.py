@@ -3657,11 +3657,21 @@ class StatusReportMenu(unittest.TestCase):
         blocked = _mknode(store, "waiting on the user"); blocked["blocked"] = True
         owed = _mknode(store, "agent still owes work")
         owed["agentTask"] = {"key": "k1", "status": "open"}
-        sub = _mknode(store, "a sub, not a card", parent=g1["id"])
+        g1["umbrella"] = True                          # the cited goal is a CONTAINER here (see below)
+        cited_sub = _mknode(store, "the cited goals own open leaf", parent=g1["id"])
+        other_top = _mknode(store, "an unrelated top")
+        other_sub = _mknode(store, "a sub of an uncited top", parent=other_top["id"])
         captured = self._spy('{"done": []}')
         jd._close_turn(store, turn)
-        for absent in ("already finished", "waiting on the user", "agent still owes work", "a sub, not a card"):
+        for absent in ("already finished", "waiting on the user", "agent still owes work",
+                       "a sub of an uncited top"):
             self.assertNotIn(absent, captured["mt"], "%r must not ride the widened menu" % absent)
+        # a cited UMBRELLA's open descendants DO ride since 2026-08-25 (the re-asking umbrella):
+        # the reply accounts for the named goal's work, and a container's top is unrulable — its
+        # open leaf, the node holding it at working, was reachable by no channel at all. A PLAIN
+        # cited goal keeps the tops-only menu exactly (the closer rules the goal itself;
+        # tests/test_deleg_report_close.py pins that shape).
+        self.assertIn("the cited goals own open leaf", captured["mt"])
 
 
 class SweepSession(unittest.TestCase):
@@ -4421,7 +4431,7 @@ class DeltaScopedDistill(unittest.TestCase):
             store["nodes"][g]["deltaSince"] = deltaSince
         jd.save_goals(SID, store)
         captured = {}
-        jd.distill_llm = lambda goal_text, work_text, done_why="", prior_summary="", items=None: (
+        jd.distill_llm = lambda goal_text, work_text, done_why="", prior_summary="", items=None, frame=None: (
             captured.update(work=work_text, prior=prior_summary) or "BACKGROUND: b.\nTAKEAWAY: t.\nSOURCE: m2")
         jd._distill_session(SID, str(path), NOW)
         return captured.get("work", ""), jd.load_goals(SID)["nodes"][g]
@@ -4461,7 +4471,7 @@ class DeltaScopedDistill(unittest.TestCase):
                                "settledAt": T0 + 200, "deltaSince": T0 + 50, "doneWhy": "finished it"}}}
         jd.save_goals(SID, store)
         captured = {}
-        jd.distill_llm = lambda goal_text, work_text, done_why="", prior_summary="", items=None: (
+        jd.distill_llm = lambda goal_text, work_text, done_why="", prior_summary="", items=None, frame=None: (
             captured.update(work=work_text, prior=prior_summary) or "BACKGROUND: b.\nTAKEAWAY: t2.\nSOURCE: m1")
         jd._distill_session(SID, str(path), NOW)
         return captured, jd.load_goals(SID)["nodes"][g]
@@ -4518,7 +4528,7 @@ class DeltaScopedDistill(unittest.TestCase):
                  "status": {g: "completed"}, "nodes": nodes}
         jd.save_goals(SID, store)
         captured = {}
-        jd.distill_llm = lambda goal_text, work_text, done_why="", prior_summary="", items=None: (
+        jd.distill_llm = lambda goal_text, work_text, done_why="", prior_summary="", items=None, frame=None: (
             captured.update(work=work_text, prior=prior_summary, items=items)
             or "BACKGROUND: b.\nTAKEAWAY: t3.\nSOURCE: m1")
         jd._distill_session(SID, str(path), NOW)
@@ -4747,7 +4757,7 @@ class ProceduralBlockStillSpeaks(unittest.TestCase):
         jd.stall_llm = lambda goal_text, work_text, holding: (
             calls["stall"].append(holding) or
             ("BACKGROUND: b.\nTAKEAWAY: stall take.\nSOURCE: m1" if stall_ret is None else stall_ret))
-        jd.brief_llm = lambda goal_text, work_text, owed: (
+        jd.brief_llm = lambda goal_text, work_text, owed, frame=None: (
             calls["brief"].append(owed) or
             ("BACKGROUND: b.\nTAKEAWAY: brief take.\nSOURCE: m1" if brief_ret is None else brief_ret))
         jd._distill_session(SID, str(path), NOW)
@@ -4880,7 +4890,7 @@ class DeadBlockNeverPinsTheBrief(unittest.TestCase):
     def test_the_owed_decision_reaches_the_briefer_past_a_dead_interrupt(self):
         path, _store, top = self._store()
         calls = []
-        jd.brief_llm = lambda goal_text, work_text, owed: (
+        jd.brief_llm = lambda goal_text, work_text, owed, frame=None: (
             calls.append(owed) or "BACKGROUND: b.\nTAKEAWAY: decide the gate.\nSOURCE: m1")
         jd.stall_llm = lambda *a, **k: self.fail("the staller does not speak for a substantive block")
         jd._distill_session(SID, path, NOW)
@@ -5012,7 +5022,7 @@ class DistillSections(unittest.TestCase):
                                 "nodes": {gid: {"id": gid, "text": "Faster export", "parentId": None,
                                                 "nodeComplete": True, "blocked": False, "cleared": False,
                                                 "trail": [s1], "t": T0, "mt": T0 + 10}}})
-            jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None: ("BACKGROUND: You asked for a faster export.\n"
+            jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None, frame=None: ("BACKGROUND: You asked for a faster export.\n"
                                                   "TAKEAWAY: It ships gzip now.\nSOURCE: m1")
             self.assertEqual(jd.run_distill(now=now), 1)
             nd = jd.load_goals(SID)["nodes"][gid]
@@ -5035,7 +5045,7 @@ class DistillSections(unittest.TestCase):
                                 "nodes": {gid: {"id": gid, "text": "Ship the feature", "parentId": None,
                                                 "nodeComplete": False, "blocked": True, "cleared": False,
                                                 "blockWhy": "A or B?", "trail": [s1], "t": T0, "mt": T0 + 10}}})
-            jd.brief_llm = lambda g, w, ow="": "BACKGROUND: You asked to ship the feature.\nTAKEAWAY: Decide A or B."
+            jd.brief_llm = lambda g, w, ow="", frame=None: "BACKGROUND: You asked to ship the feature.\nTAKEAWAY: Decide A or B."
             self.assertEqual(jd.run_distill(now=now), 1)
             nd = jd.load_goals(SID)["nodes"][gid]
             self.assertEqual(nd["blockSummary"], "Decide A or B.")
@@ -5056,7 +5066,7 @@ class DistillSections(unittest.TestCase):
                                 "nodes": {gid: {"id": gid, "text": "Do it", "parentId": None,
                                                 "nodeComplete": True, "blocked": False, "cleared": False,
                                                 "trail": [s1], "t": T0, "mt": T0 + 10}}})
-            jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None: "Delivered."       # an older-style reply
+            jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None, frame=None: "Delivered."       # an older-style reply
             self.assertEqual(jd.run_distill(now=now), 1)
             nd = jd.load_goals(SID)["nodes"][gid]
             self.assertEqual(nd["summary"], "Delivered.")
@@ -5226,7 +5236,7 @@ class Distiller(unittest.TestCase):
                                             "doneWhy": "Both parts shipped and verified"}}})
         captured = {}
 
-        def fake_distill(goal_text, work_text, done_why="", prior_summary="", items=None):
+        def fake_distill(goal_text, work_text, done_why="", prior_summary="", items=None, frame=None):
             captured["goal"], captured["work"], captured["done"] = goal_text, work_text, done_why
             return "Part one and part two delivered."
         jd.distill_llm = fake_distill
@@ -5240,7 +5250,7 @@ class Distiller(unittest.TestCase):
         self.assertEqual(captured["done"], "Both parts shipped and verified",
                          "the closer's doneWhy is fed to the distiller as <completed> ground truth")
         calls = []                                          # event-gated: re-running distills nothing
-        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None: (calls.append(1), "x")[1]
+        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None, frame=None: (calls.append(1), "x")[1]
         self.assertEqual(jd.run_distill(now=now), 0)
         self.assertEqual(calls, [], "a goal already distilled at this mt is not re-distilled")
 
@@ -5264,7 +5274,7 @@ class Distiller(unittest.TestCase):
                                             "nodeComplete": True, "blocked": False, "cleared": False,
                                             "trail": trail, "t": T0, "mt": T0 + 210}}})
         seen = {}
-        def fake_distill(goal_text, work_text, done_why="", prior_summary="", items=None):
+        def fake_distill(goal_text, work_text, done_why="", prior_summary="", items=None, frame=None):
             seen["work"] = work_text
             return "Both parts delivered.\nSOURCE: m2"
         jd.distill_llm = fake_distill
@@ -5288,7 +5298,7 @@ class Distiller(unittest.TestCase):
                             "nodes": {gid: {"id": gid, "text": "Build the thing", "parentId": None,
                                             "nodeComplete": True, "blocked": False, "cleared": False,
                                             "trail": [s1], "t": T0, "mt": T0 + 10}}})
-        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None: "Delivered without a citation."
+        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None, frame=None: "Delivered without a citation."
         self.assertEqual(jd.run_distill(now=now), 1)
         nd = jd.load_goals(SID)["nodes"][gid]
         self.assertEqual(nd["summary"], "Delivered without a citation.")
@@ -5310,7 +5320,7 @@ class Distiller(unittest.TestCase):
                             "nodes": {gid: {"id": gid, "text": "Build the thing", "parentId": None,
                                             "nodeComplete": True, "blocked": False, "cleared": False,
                                             "trail": [s1], "t": T0, "mt": T0 + 10}}})
-        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None: "Delivered, but no citation line."
+        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None, frame=None: "Delivered, but no citation line."
         d = Path(tempfile.mkdtemp()); saved_errors = jd.ERRORS
         try:
             jd.ERRORS = d / "judge-errors.jsonl"
@@ -5343,7 +5353,7 @@ class Distiller(unittest.TestCase):
                             "nodes": {gid: {"id": gid, "text": "Build the thing", "parentId": None,
                                             "nodeComplete": True, "blocked": False, "cleared": False,
                                             "trail": [s1], "t": T0, "mt": T0 + 10}}})
-        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None: "Delivered.\nSOURCE: m99"
+        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None, frame=None: "Delivered.\nSOURCE: m99"
         d = Path(tempfile.mkdtemp()); saved_errors = jd.ERRORS
         try:
             jd.ERRORS = d / "judge-errors.jsonl"
@@ -5373,7 +5383,7 @@ class Distiller(unittest.TestCase):
                                             "trail": [s1], "t": T0, "mt": T0 + 10,
                                             "warns": [{"kind": "cite-miss", "t": T0, "msg": "m",
                                                        "detail": "d"}]}}})
-        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None: "Delivered.\nSOURCE: m1"
+        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None, frame=None: "Delivered.\nSOURCE: m1"
         self.assertEqual(jd.run_distill(now=now), 1)
         nd = jd.load_goals(SID)["nodes"][gid]
         self.assertEqual(nd["summaryAnchor"], "a1")
@@ -5395,7 +5405,7 @@ class Distiller(unittest.TestCase):
                                             "nodeComplete": False, "blocked": True, "cleared": False,
                                             "blockWhy": "Which approach?", "trail": [s1],
                                             "t": T0, "mt": T0 + 10}}})
-        jd.brief_llm = lambda g, w, ow="": "Decide the approach, options laid out."
+        jd.brief_llm = lambda g, w, ow="", frame=None: "Decide the approach, options laid out."
         d = Path(tempfile.mkdtemp()); saved_errors = jd.ERRORS
         try:
             jd.ERRORS = d / "judge-errors.jsonl"
@@ -5424,7 +5434,7 @@ class Distiller(unittest.TestCase):
                                             "nodeComplete": False, "blocked": True, "cleared": False,
                                             "blockWhy": "Which approach — A or B?", "trail": [s1],
                                             "t": T0, "mt": T0 + 10}}})
-        jd.brief_llm = lambda g, w, ow="": "Decide A or B.\nSOURCE: [m1]"
+        jd.brief_llm = lambda g, w, ow="", frame=None: "Decide A or B.\nSOURCE: [m1]"
         self.assertEqual(jd.run_distill(now=now), 1)
         nd = jd.load_goals(SID)["nodes"][gid]
         self.assertEqual(nd["blockSummary"], "Decide A or B.", "the SOURCE line is parsed off the brief")
@@ -5455,7 +5465,7 @@ class Distiller(unittest.TestCase):
         self.assertEqual(store["status"][gid], "blocked", "the open-todo block rolls the top to blocked")
         jd.save_goals(SID, store)
         seen = {}
-        def fake_brief(goal_text, work_text, block_why):
+        def fake_brief(goal_text, work_text, block_why, frame=None):
             seen["owed"] = block_why
             return "Provide the staging credentials so the migration can run."
         jd.brief_llm = fake_brief
@@ -5492,7 +5502,7 @@ class Distiller(unittest.TestCase):
         self.assertEqual(store["status"][gid], "blocked", "two blocked subs roll the top to blocked")
         jd.save_goals(SID, store)
         seen = {}
-        def fake_brief(goal_text, work_text, owed):
+        def fake_brief(goal_text, work_text, owed, frame=None):
             seen["owed"] = owed
             return "Decide the screencast: record it now.\n\nDecide the Internals: merge or leave."
         jd.brief_llm = fake_brief
@@ -5521,7 +5531,7 @@ class Distiller(unittest.TestCase):
                             "nodes": {gid: {"id": gid, "text": "Build the thing", "parentId": None,
                                             "nodeComplete": True, "blocked": False, "cleared": False,
                                             "trail": [s1], "t": T0, "mt": T0 + 10}}})
-        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None: ""             # the call always fails (empty)
+        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None, frame=None: ""             # the call always fails (empty)
         for i in range(1, jd.DISTILL_FAIL_CAP):             # the pre-cap passes: keep retrying, count climbs
             jd.run_distill(now=now)
             nd = jd.load_goals(SID)["nodes"][gid]
@@ -5534,7 +5544,7 @@ class Distiller(unittest.TestCase):
         self.assertEqual(nd.get("distilledMt"), T0 + 10, "distilledMt stamped → never re-enters")
         self.assertEqual(nd.get("distillFails"), 0, "counter reset for a future re-open")
         ran = []                                            # the sentinel is non-null → no more distills
-        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None: (ran.append(1), "late")[1]
+        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None, frame=None: (ran.append(1), "late")[1]
         jd.run_distill(now=now)
         self.assertEqual(ran, [], "a settled card is not re-distilled — the loop is broken")
 
@@ -5552,7 +5562,7 @@ class Distiller(unittest.TestCase):
                                             "nodeComplete": False, "blocked": True, "cleared": False,
                                             "blockWhy": "Which approach — A or B?", "trail": [s1],
                                             "t": T0, "mt": T0 + 10}}})
-        jd.brief_llm = lambda g, w, ow="": ""               # the brief call always fails
+        jd.brief_llm = lambda g, w, ow="", frame=None: ""               # the brief call always fails
         for i in range(1, jd.DISTILL_FAIL_CAP):
             jd.run_distill(now=now)
             nd = jd.load_goals(SID)["nodes"][gid]
@@ -5582,14 +5592,14 @@ class Distiller(unittest.TestCase):
                                             "blockWhy": "Which approach — A or B?", "trail": [s1],
                                             "t": T0, "mt": T0 + 10}}})
         # simulate a pause-skip exactly as _judge_run does: mark _judge_ctx.paused and return "" (API not asked)
-        jd.brief_llm = lambda g, w, ow="": (setattr(jd._judge_ctx, "paused", True), "")[1]
+        jd.brief_llm = lambda g, w, ow="", frame=None: (setattr(jd._judge_ctx, "paused", True), "")[1]
         for _ in range(jd.DISTILL_FAIL_CAP + 2):            # MORE passes than the cap — still must not give up
             jd.run_distill(now=now)
             nd = jd.load_goals(SID)["nodes"][gid]
             self.assertIsNone(nd.get("blockSummary"), "a pause-skip leaves the brief null → re-enters next pass")
             self.assertIn(nd.get("briefFails"), (None, 0), "a pause-skip never increments the give-up counter")
             self.assertIsNone(nd.get("briefedMt"), "never stamped → never a permanent give-up while paused")
-        jd.brief_llm = lambda g, w, ow="": (setattr(jd._judge_ctx, "paused", False), "Decide A or B.")[1]
+        jd.brief_llm = lambda g, w, ow="", frame=None: (setattr(jd._judge_ctx, "paused", False), "Decide A or B.")[1]
         jd.run_distill(now=now)                             # pause cleared → the brief lands normally
         self.assertEqual(jd.load_goals(SID)["nodes"][gid].get("blockSummary"), "Decide A or B.",
                          "once the pause clears the brief lands — the card was never permanently blanked")
@@ -5614,7 +5624,7 @@ class Distiller(unittest.TestCase):
         (jd.STATE).mkdir(parents=True, exist_ok=True)       # no maxed account window → the generic cause
         (jd.STATE / "usage.json").write_text(json.dumps({"five_hour": {"pct": 20}, "seven_day": {"pct": 40}}))
         gid, now = self._blocked_goal()
-        jd.brief_llm = lambda g, w, ow="": ""               # every call fails (real, not a pause-skip)
+        jd.brief_llm = lambda g, w, ow="", frame=None: ""               # every call fails (real, not a pause-skip)
         for _ in range(jd.DISTILL_FAIL_CAP):
             jd.run_distill(now=now)
         nd = jd.load_goals(SID)["nodes"][gid]
@@ -5634,7 +5644,7 @@ class Distiller(unittest.TestCase):
             "seven_day": {"pct": 40, "resets_at": FUT},
             "fable": {"pct": 100, "resets_at": FUT}}))
         gid, now = self._blocked_goal()
-        jd.brief_llm = lambda g, w, ow="": ""
+        jd.brief_llm = lambda g, w, ow="", frame=None: ""
         for _ in range(jd.DISTILL_FAIL_CAP):
             jd.run_distill(now=now)
         det = [w for w in jd.load_goals(SID)["nodes"][gid].get("warns") or []
@@ -5645,14 +5655,14 @@ class Distiller(unittest.TestCase):
 
     def test_a_successful_summary_clears_the_failed_warn(self):
         gid, now = self._blocked_goal()
-        jd.brief_llm = lambda g, w, ow="": ""
+        jd.brief_llm = lambda g, w, ow="", frame=None: ""
         for _ in range(jd.DISTILL_FAIL_CAP):
             jd.run_distill(now=now)
         self.assertTrue(any(w.get("kind") == "brief-failed"
                             for w in jd.load_goals(SID)["nodes"][gid].get("warns") or []))
         # re-arm + a working brief → the warn clears
         st = jd.load_goals(SID); st["nodes"][gid]["blockSummary"] = None; jd.save_goals(SID, st)
-        jd.brief_llm = lambda g, w, ow="": "Decide A or B."
+        jd.brief_llm = lambda g, w, ow="", frame=None: "Decide A or B."
         jd.run_distill(now=now)
         nd = jd.load_goals(SID)["nodes"][gid]
         self.assertEqual(nd.get("blockSummary"), "Decide A or B.")
@@ -5663,7 +5673,7 @@ class Distiller(unittest.TestCase):
         # the chip's hover/modal history (the user 2026-08-18): every failed try lands as when + model +
         # literal error, and the line's eventual success clears its rows
         gid, now = self._blocked_goal()
-        jd.brief_llm = lambda g, w, ow="": (setattr(jd._judge_ctx, "last_call_fail",
+        jd.brief_llm = lambda g, w, ow="", frame=None: (setattr(jd._judge_ctx, "last_call_fail",
             {"note": "API Error: Repeated 529 Overloaded errors.", "model": "opus"}), "")[1]
         for _ in range(jd.DISTILL_FAIL_CAP):
             jd.run_distill(now=now)
@@ -5672,7 +5682,7 @@ class Distiller(unittest.TestCase):
         self.assertTrue(all(e["model"] == "opus" and "529" in e["note"] and e["line"] == "brief"
                             for e in log), "each row carries the model and the literal error")
         st = jd.load_goals(SID); st["nodes"][gid]["blockSummary"] = None; jd.save_goals(SID, st)
-        jd.brief_llm = lambda g, w, ow="": (setattr(jd._judge_ctx, "last_call_fail", None), "Decide A or B.")[1]
+        jd.brief_llm = lambda g, w, ow="", frame=None: (setattr(jd._judge_ctx, "last_call_fail", None), "Decide A or B.")[1]
         jd.run_distill(now=now)
         self.assertNotIn("failLog", jd.load_goals(SID)["nodes"][gid],
                          "the landed brief clears its line's attempt history")
@@ -5682,14 +5692,14 @@ class Distiller(unittest.TestCase):
         # the whole suite still passed — so pin them through the REAL path: an auto-re-armed line whose
         # retry succeeds must drop its era mark, or the health edge is one-per-lifetime per card
         gid, now = self._blocked_goal()
-        jd.brief_llm = lambda g, w, ow="": ""
+        jd.brief_llm = lambda g, w, ow="", frame=None: ""
         for _ in range(jd.DISTILL_FAIL_CAP):
             jd.run_distill(now=now)
         st = jd.load_goals(SID)                          # the health edge re-armed it (as rearm would):
         st["nodes"][gid]["blockSummary"] = None          # line owed again, era spent
         st["nodes"][gid]["autoRearmed"] = {"brief-failed": True}
         jd.save_goals(SID, st)
-        jd.brief_llm = lambda g, w, ow="": "Decide A or B."
+        jd.brief_llm = lambda g, w, ow="", frame=None: "Decide A or B."
         jd.run_distill(now=now)
         nd = jd.load_goals(SID)["nodes"][gid]
         self.assertEqual(nd.get("blockSummary"), "Decide A or B.")
@@ -5698,7 +5708,7 @@ class Distiller(unittest.TestCase):
 
     def test_scan_counts_failures_and_rearm_reopens_only_warned_cards(self):
         gid, now = self._blocked_goal()
-        jd.brief_llm = lambda g, w, ow="": ""
+        jd.brief_llm = lambda g, w, ow="", frame=None: ""
         for _ in range(jd.DISTILL_FAIL_CAP):
             jd.run_distill(now=now)
         scan = jd.judge_failure_scan()
@@ -5726,7 +5736,7 @@ class Distiller(unittest.TestCase):
                             "nodes": {gid: {"id": gid, "text": "G", "parentId": None, "nodeComplete": True,
                                             "blocked": False, "cleared": False, "trail": [s1], "t": T0,
                                             "mt": T0 + 10, "distilledMt": T0 + 10, "summary": "old"}}})
-        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None: "fresh"
+        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None, frame=None: "fresh"
         self.assertEqual(jd.run_distill(now=now), 0, "already distilled at this mt -> no-op")
         st = jd.load_goals(SID); st["nodes"][gid]["mt"] = T0 + 999; jd.save_goals(SID, st)   # reopened + re-completed
         self.assertEqual(jd.run_distill(now=now), 1, "mt advanced (re-completed) -> re-distill")
@@ -5745,7 +5755,7 @@ class Distiller(unittest.TestCase):
                             "nodes": {gid: {"id": gid, "text": "Build and verify the feature", "parentId": None,
                                             "nodeComplete": True, "blocked": False, "cleared": False,
                                             "trail": [], "t": T0, "mt": T0 + 10}}})   # empty trail → no work
-        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None: (_ for _ in ()).throw(AssertionError("no work → distill_llm must not run"))
+        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None, frame=None: (_ for _ in ()).throw(AssertionError("no work → distill_llm must not run"))
         jd.run_distill(now=now)
         nd = jd.load_goals(SID)["nodes"][gid]
         self.assertEqual(nd["summary"], "", "no-work top settles to the \"\" sentinel, not a null/'(generating…)'")
@@ -5764,11 +5774,11 @@ class Distiller(unittest.TestCase):
                                             "nodeComplete": True, "blocked": False, "cleared": False,
                                             "trail": [], "t": T0, "mt": T0 + 10,
                                             "distilledMt": T0 + 10, "summary": None}}})   # stamped but null
-        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None: "should-not-run"
+        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None, frame=None: "should-not-run"
         jd.run_distill(now=now)
         self.assertEqual(jd.load_goals(SID)["nodes"][gid]["summary"], "", "stuck null summary heals to \"\"")
         calls = []
-        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None: (calls.append(1), "x")[1]
+        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None, frame=None: (calls.append(1), "x")[1]
         jd.run_distill(now=now)
         self.assertEqual(calls, [], "once settled to \"\" (non-null), the goal is not reprocessed")
 
@@ -5801,11 +5811,11 @@ class Distiller(unittest.TestCase):
                                             "blockWhy": "Redis or Postgres for sessions?"}}})
         captured = {}
 
-        def fake_brief(goal_text, work_text, owed):
+        def fake_brief(goal_text, work_text, owed, frame=None):
             captured["goal"], captured["work"], captured["owed"] = goal_text, work_text, owed
             return "Decide: Redis or Postgres for the session store."
         jd.brief_llm = fake_brief
-        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None: "should-not-run"
+        jd.distill_llm = lambda g, w, dw="", prior_summary="", items=None, frame=None: "should-not-run"
         self.assertEqual(jd.run_distill(now=now), 1, "the blocked top is briefed")
         nd = jd.load_goals(SID)["nodes"][gid]
         self.assertEqual(nd["blockSummary"], "Decide: Redis or Postgres for the session store.")
@@ -5814,7 +5824,7 @@ class Distiller(unittest.TestCase):
         self.assertEqual(captured["owed"], "Redis or Postgres for sessions?", "the owed question is fed in")
         self.assertIn("two options", captured["work"], "the goal's work history is fed in")
         calls = []                                          # event-gated: re-running briefs nothing
-        jd.brief_llm = lambda g, w, o: (calls.append(1), "x")[1]
+        jd.brief_llm = lambda g, w, o, frame=None: (calls.append(1), "x")[1]
         self.assertEqual(jd.run_distill(now=now), 0)
         self.assertEqual(calls, [], "a block already briefed at this mt is not re-briefed")
 
@@ -5830,7 +5840,7 @@ class Distiller(unittest.TestCase):
                             "nodes": {gid: {"id": gid, "text": "G", "parentId": None, "nodeComplete": False,
                                             "blocked": True, "cleared": False, "trail": [s1], "t": T0,
                                             "mt": T0 + 10, "blockWhy": "which way?"}}})
-        jd.brief_llm = lambda g, w, o: ""              # permanent failure
+        jd.brief_llm = lambda g, w, o, frame=None: ""              # permanent failure
         self.assertEqual(jd.run_distill(now=now), 0, "a failed brief produced nothing")
         nd = jd.load_goals(SID)["nodes"][gid]
         self.assertNotIn("blockSummary", nd, "NO fallback — blockSummary stays null")
@@ -6114,7 +6124,7 @@ class LivePickerBrief(unittest.TestCase):
 
     def test_live_picker_briefs_a_working_focus_top(self):
         path, g = self._setup("picker")
-        jd.brief_llm = lambda goal, work, owed: "Decide: option A or B. Context provided."
+        jd.brief_llm = lambda goal, work, owed, frame=None: "Decide: option A or B. Context provided."
         jd.distill_llm = lambda *a, **k: self.fail("a working goal must not take the DONE-distiller path")
         n = jd._distill_session(SID, path, NOW)
         nd = jd.load_goals(SID)["nodes"][g]
@@ -6126,14 +6136,14 @@ class LivePickerBrief(unittest.TestCase):
 
     def test_permission_also_briefs(self):
         path, g = self._setup("permission")
-        jd.brief_llm = lambda goal, work, owed: "Approve the edit to keep going?"
+        jd.brief_llm = lambda goal, work, owed, frame=None: "Approve the edit to keep going?"
         n = jd._distill_session(SID, path, NOW)
         self.assertEqual(n, 1, "a live PERMISSION prompt briefs its focus top too, like a picker")
 
     def test_idempotent_while_parked(self):
         path, g = self._setup("picker")
         calls = []
-        jd.brief_llm = lambda goal, work, owed: (calls.append(1), "brief")[1]
+        jd.brief_llm = lambda goal, work, owed, frame=None: (calls.append(1), "brief")[1]
         jd._distill_session(SID, path, NOW)
         jd._distill_session(SID, path, NOW)            # a 2nd pass while STILL parked
         self.assertEqual(len(calls), 1, "briefed ONCE per episode (promptBriefedT gate), not every producer pass")
@@ -6158,7 +6168,7 @@ class LivePickerBrief(unittest.TestCase):
         path, g = self._setup("picker")
         briefs = iter(["Pick the retry budget: 3 or 5?", "Name the config key: timeout or deadline?"])
         calls = []
-        jd.brief_llm = lambda goal, work, owed: (calls.append(1), next(briefs))[1]
+        jd.brief_llm = lambda goal, work, owed, frame=None: (calls.append(1), next(briefs))[1]
         jd._distill_session(SID, path, NOW)
         self._append_states((NOW - 15, "working"), (NOW - 10, "picker"))   # answered → NEW question
         jd._distill_session(SID, path, NOW)
@@ -6171,7 +6181,7 @@ class LivePickerBrief(unittest.TestCase):
     def test_one_park_spanning_picker_and_permission_is_one_episode(self):
         path, g = self._setup("picker")
         calls = []
-        jd.brief_llm = lambda goal, work, owed: (calls.append(1), "brief")[1]
+        jd.brief_llm = lambda goal, work, owed, frame=None: (calls.append(1), "brief")[1]
         jd._distill_session(SID, path, NOW)
         self._append_states((NOW - 15, "permission"))   # the same park, another prompt flavor — no exit between
         jd._distill_session(SID, path, NOW)
@@ -6190,7 +6200,7 @@ class LivePickerBrief(unittest.TestCase):
         store["status"][g] = "blocked"
         jd.save_goals(SID, store)
         calls = []
-        jd.brief_llm = lambda goal, work, owed: (calls.append(1), "Pick the port.")[1]
+        jd.brief_llm = lambda goal, work, owed, frame=None: (calls.append(1), "Pick the port.")[1]
         jd._distill_session(SID, path, NOW)
         jd._distill_session(SID, path, NOW)
         nd = jd.load_goals(SID)["nodes"][g]
@@ -7090,7 +7100,7 @@ class OrphanedHistory(unittest.TestCase):
                                "summary": None, "doneWhy": "finished it"}}}
         jd.save_goals(SID, store)
         captured = {}
-        jd.distill_llm = lambda goal_text, work_text, done_why="", prior_summary="", items=None: (
+        jd.distill_llm = lambda goal_text, work_text, done_why="", prior_summary="", items=None, frame=None: (
             captured.update(work=work_text) or "TAKEAWAY: t.\nSOURCE: m1")
         jd._distill_session(SID, str(path), NOW)
         return captured, jd.load_goals(SID)["nodes"][g]

@@ -782,6 +782,54 @@ def _write_palette_mirror():
 # model literals. The judge accepts only a value from here (setJudgeModel/setIndexModel validate against it).
 MODEL_CHOICES = [{"value": "fable", "label": "Fable"}, {"value": "opus", "label": "Opus"},
                  {"value": "sonnet", "label": "Sonnet"}, {"value": "haiku", "label": "Haiku"}]
+# Every version a family can pin (the user 2026-08-25: shorthand aliases resolve to the NEWEST —
+# opus became Opus 5 — silently losing the legacy versions that remain live on the API). Newest
+# first; values are the API's DATELESS aliases, verified against the claude-api reference
+# 2026-08-25 (deprecated 4.1/4.0-era models excluded on purpose — they are retiring). Clicking a
+# family in a picker sends that family's DEFAULT: the most recent version the user picked for it
+# (model-picks.json below), else the newest. Full ids ride every set path verbatim already — the
+# alias table stops at the family names, so a version pick needs no new transport.
+MODEL_VERSIONS = {
+    "fable":  [{"value": "claude-fable-5", "label": "Fable 5"}],
+    "opus":   [{"value": "claude-opus-5", "label": "Opus 5"},
+               {"value": "claude-opus-4-8", "label": "Opus 4.8"},
+               {"value": "claude-opus-4-7", "label": "Opus 4.7"},
+               {"value": "claude-opus-4-6", "label": "Opus 4.6"},
+               {"value": "claude-opus-4-5", "label": "Opus 4.5"}],
+    "sonnet": [{"value": "claude-sonnet-5", "label": "Sonnet 5"},
+               {"value": "claude-sonnet-4-6", "label": "Sonnet 4.6"},
+               {"value": "claude-sonnet-4-5", "label": "Sonnet 4.5"}],
+    "haiku":  [{"value": "claude-haiku-4-5", "label": "Haiku 4.5"}],
+}
+_VERSION_FAMILY = {v["value"]: fam for fam, vs in MODEL_VERSIONS.items() for v in vs}
+MODEL_PICKS_FILE_NAME = "model-picks.json"   # {family: full-id} — a viewer pref all surfaces read, like colormap
+
+
+def _model_picks():
+    """The per-family last-picked map. Only known version ids survive the read (a stale or hand-edited
+    entry falls back to the family's newest rather than poisoning the default)."""
+    try:
+        d = json.loads((jd.STATE / MODEL_PICKS_FILE_NAME).read_text())
+        return {f: v for f, v in d.items() if isinstance(v, str) and _VERSION_FAMILY.get(v) == f} \
+            if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _note_model_pick(value):
+    """Record a version pick as its family's new default (write-on-change). Family shorthands and
+    unknown strings record nothing — they are not version picks."""
+    fam = _VERSION_FAMILY.get(str(value or ""))
+    if not fam:
+        return
+    picks = _model_picks()
+    if picks.get(fam) == value:
+        return
+    picks[fam] = value
+    try:
+        _atomic_write(jd.STATE / MODEL_PICKS_FILE_NAME, json.dumps(picks))
+    except Exception:
+        sys.stderr.write("model-picks save: %s\n" % traceback.format_exc())
 # "ultracode" tops the ladder (the user 2026-08-04): the CLI's own /effort offers it — xhigh effort plus
 # standing dynamic-workflow orchestration, per session. tmux delivers the literal "/effort ultracode"; the
 # SDK backend maps it to effort=xhigh + the `ultracode` settings key (the CLI's documented per-session
@@ -1639,6 +1687,40 @@ def _member_str(m):
     return (h + ":" + m["sid"]) if h else m["sid"]
 
 
+_LENS_SURFACES = ("chat", "timeline", "outline")   # per-surface selections (the user 2026-08-25); the feed's is client-local
+
+
+def _norm_lens(x, tags):
+    """One surface's selection in the shared TagLens shape ({all} | {none?, tags?:[names]} — the
+    feed-authored model, manager-sanctioned as the shared shape 2026-08-25). Tag entries are NAMES
+    (name-keyed union; kernels are plumbing), and an unknown name is KEPT — it may exist only on a
+    linked kernel and match remoteTags at read time. An empty selection normalizes to All (the lens
+    never strands an empty selection)."""
+    if not isinstance(x, dict) or x.get("all"):
+        return {"all": True}
+    names = []
+    for n in (x.get("tags") if isinstance(x.get("tags"), list) else []):
+        if isinstance(n, str) and n[:_VIEWS_MAX_NAME] not in names:
+            names.append(n[:_VIEWS_MAX_NAME])
+    lens = {}
+    if x.get("none"):
+        lens["none"] = True
+    if names:
+        lens["tags"] = names[:_VIEWS_MAX_TAGS]
+    return lens or {"all": True}
+
+
+def _lens_seed(active, tags):
+    """A legacy scalar active as a lens — the migration seed for every surface's initial selection
+    (the user 2026-08-25: the current shared view becomes each surface's starting point). A tag id
+    seeds its NAME; an unresolvable id (a remote tag whose kernel is away) seeds All rather than a
+    view this kernel cannot name."""
+    if active == "untagged":
+        return {"none": True}
+    t = next((t for t in tags if t["id"] == active), None)
+    return {"tags": [t["name"]]} if t else {"all": True}
+
+
 def _norm_timeline_views(d):
     """Validate + normalize a views blob from disk or a client: always returns the full shape, drops
     junk quietly, clamps sizes, and falls back active→"all" when the named tag does not exist.
@@ -1678,7 +1760,30 @@ def _norm_timeline_views(d):
     if active not in ("all", "untagged") and ":" not in active \
             and not any(t["id"] == active for t in tags):
         active = "all"
-    return {"active": active, "tags": tags}
+    # PER-SURFACE SELECTIONS (the user 2026-08-25): each surface owns a multi-select lens under
+    # `actives`; the legacy scalar `active` STAYS — written, validated, echoed — so old clients and
+    # the federation poll keep working, and it SEEDS every surface's initial selection the first
+    # time a blob without `actives` is read (lossless migration, no store rewrite).
+    posted = d.get("actives") if isinstance(d.get("actives"), dict) else None
+    actives = {}
+    for sf in _LENS_SURFACES:
+        actives[sf] = _norm_lens(posted.get(sf), tags) if posted and isinstance(posted.get(sf), dict) \
+            else (_lens_seed(active, tags) if posted is None else {"all": True})
+    out = {"active": active, "actives": actives, "tags": tags}
+    # TAG ORDER (the user 2026-08-25): the union DISPLAY order — a NAME list, viewer-side, so a
+    # remote-homed tag holds its dragged position without any cross-kernel write (a display
+    # preference must not need another kernel up; the lane order's viewer-side philosophy). Local
+    # tags ALSO keep their array order (the drag rewrites both); this list extends the same order
+    # across the whole name-keyed union. Names are not validated against the local store — a
+    # remote name is unknowable here by design; junk entries cost nothing and age out on the next
+    # drag. Absent stays absent, so pre-order blobs round-trip byte-identical.
+    order = []
+    for n in _lst(d.get("tagOrder"))[:_VIEWS_MAX_TAGS * 2]:
+        if isinstance(n, str) and n and n[:_VIEWS_MAX_NAME] not in order:
+            order.append(n[:_VIEWS_MAX_NAME])
+    if order:
+        out["tagOrder"] = order
+    return out
 
 
 def _timeline_views():
@@ -1943,7 +2048,21 @@ def _views_client():
     return v
 
 
-def _view_visible(views, sid):
+def _lens_visible(views, lens, sid):
+    """The multi-select decision (the user 2026-08-25), kernel-authoritative and mirrored by
+    tag-lens.ts: All admits everything; `none` admits a session in NO tag home (the name-keyed
+    union — local and remote alike, my untagged rule); a selected tag NAME admits its union's
+    members; visibility is the UNION over the selected buckets."""
+    if not isinstance(lens, dict) or lens.get("all"):
+        return True
+    everything = list(views["tags"]) + list(views.get("remoteTags") or [])
+    if lens.get("none") and not any(sid in t["members"] for t in everything):
+        return True
+    picked = set(lens.get("tags") or [])
+    return any(t["name"] in picked and sid in t["members"] for t in everything)
+
+
+def _view_visible(views, sid, surface=None):
     """The one visibility decision, kernel-authoritative: mirrored by the chat renderer and the
     timeline for optimistic feedback — tests pin all three against this shape. Operates on the
     RENDERED blob (_views_client: string members + remoteTags) — the shape every client holds; a
@@ -1953,7 +2072,11 @@ def _view_visible(views, sid):
     system covers backgrounding, and existing hidden entries migrated into the "archived" tag).
     UNTAGGED keeps its meaning (the user 2026-08-23): tagging a session says "specialized — out of
     the untagged view, viewable under its tag", so membership itself excludes there. A tag view
-    shows exactly its members."""
+    shows exactly its members. With a SURFACE named (per-surface selections, the user 2026-08-25),
+    the decision is that surface's lens instead — the scalar path below stays for legacy callers
+    and the tests that pin it."""
+    if surface is not None:
+        return _lens_visible(views, (views.get("actives") or {}).get(surface), sid)
     if views["active"] == "all":
         return True                                  # All = literally everything (hidden retired 2026-08-24)
     if views["active"] == "untagged":
@@ -4785,16 +4908,22 @@ def _interrupt_block_tick(now, tmux):
         _push_all()
 
 
-def _log_nudge_event(sid, gid, t, count):
-    """Append one auto-nudge fire to STATE/nudge-events.jsonl — {sid, gid, t, count} — for the timeline's
-    DEBUG judging band to render a per-nudge ⚡ marker and escalate at high counts (the view is business's)."""
+def _log_nudge_event(sid, gid, t, count, verdict="fired", ev_t=None):
+    """Append one auto-nudge event to STATE/nudge-events.jsonl — {sid, gid, t, count, verdict, evT} —
+    for the timeline's DEBUG judging band (per-nudge ⚡ marker) AND the redundancy accounting (the
+    user 2026-08-25): every decision the gate takes is a row — fired / skipped-redundant /
+    held-fresh-re-judged / force-fired-at-cap — carrying the evidence snapshot's timestamp, so
+    redundant fires are countable from the log alone (this decides later whether the freshness
+    guard must extend to the cap path). Additive fields; older readers key on sid/gid/t/count."""
     try:
         p = jd.STATE / "nudge-events.jsonl"
         p.parent.mkdir(parents=True, exist_ok=True)
         with jd._identity_file_lock():
             row = {"sid": jd.canonicalize_session_identity(str(sid)),
                    "gid": jd.canonicalize_goal_identity(gid),
-                   "t": int(t), "count": count}
+                   "t": int(t), "count": count, "verdict": verdict}
+            if ev_t:
+                row["evT"] = int(ev_t)
             with p.open("a") as f:
                 f.write(json.dumps(row) + "\n")
     except Exception:
@@ -5684,6 +5813,49 @@ def _dead_wait_block(sid, gid, at, why, nudged, now, blk_why=None):
     return False
 
 
+def _file_wake_answer(store, sid, gid, now):
+    """The answered wake's outcome becomes a FILED event (the user 2026-08-25, closing the awaiting
+    audit's last live mechanism): the answer IS new information, and new information that files no
+    diary row is invisible to every reader that matters — the response segment was often placed
+    under NO goal, so the closer's filed-since re-nomination never fired and an answered wake
+    re-affirmed a dead wait forever (two live specimens, 12-13h). File a same-why re-assert on the
+    stamped node AT ITS OWN ANCHOR (the coalesce convention: the anchor freezes, so wake episodes
+    and patience never churn) — the row's arrival moves _newest_filed past closerLookT, so the
+    closer re-audits WITH the answer in view and rules it — done, lift, block, or keep — from real
+    evidence. Runs once per answer by construction (the answered leg itself runs once per record).
+    Returns True when the row landed."""
+    try:
+        nodes = store.get("nodes", {})
+        kids = {}
+        for x, n in nodes.items():
+            kids.setdefault(n.get("parentId"), []).append(x)
+        best, stack, seen = None, [gid], set()
+        while stack:
+            x = stack.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            n = nodes.get(x)
+            if not n:
+                continue
+            if n.get("awaitingWhy") and not n.get("rolledUp")                     and (best is None or (n.get("awaitingAt") or 0) > (best.get("awaitingAt") or 0)):
+                best = n
+            stack.extend(kids.get(x, []))
+        if best is None:
+            return False
+        if jd.record_verdict(store, best, "nudge", "awaiting",
+                             best.get("awaitingAt") or int(now),
+                             why=best.get("awaitingWhy"), await_kind=best.get("awaitingKind"),
+                             await_peers=best.get("awaitingPeers")):
+            jd.rollup_status(store, False)
+            jd.save_goals(sid, store)
+            _mark_views_dirty()
+            return True
+    except Exception:
+        sys.stderr.write("wake-answer filing (%s): %s\n" % (gid, traceback.format_exc()))
+    return False
+
+
 def _wake_goal(sid, gid, stamp, nudged, turns, store, now, lt, tmux):
     """The AWAITING branch of _auto_nudge_session's goal walk — one stamped top goal. The stamp is a
     judged wait, so the plain status nudge stays off; but a wait is not an exemption from the ladder
@@ -5732,7 +5904,8 @@ def _wake_goal(sid, gid, stamp, nudged, turns, store, now, lt, tmux):
             # the judges ruled on the answer and the stamp still stands → the wait was re-affirmed
             nudged[gid] = dict(rec, answeredAt=(resp.get("t") or int(now)))
             _put_nudged(gid, nudged[gid])
-            return False
+            _file_wake_answer(store, sid, gid, now)   # the answer becomes a FILED event → the closer
+            return False                              #   re-audits with it in view (see the helper)
         _sdefer = _revivers_pending(sid, store, turns, gid)
         if _sdefer and not _nudge_deferred_ok(gid, _sdefer, now, sid):
             return False                             # something else can still move it (judge pass, retry
@@ -5839,6 +6012,7 @@ def _awaiting_wake_outcomes(now, walked=None):
                 # answered and ruled — re-arm from the answer, exactly as the walk's eval would have (the
                 # walk never got to: its session gates held, e.g. an api-error AFTER the judged response)
                 _put_nudged(gid, dict(rec, answeredAt=(resp.get("t") or int(now))))
+                _file_wake_answer(store, sid, gid, now)   # …and the answer files, same as the walk's leg
                 continue
             if resp is not None:
                 continue                             # visible but not ruled yet — the judges own it
@@ -6207,9 +6381,18 @@ def _deferral_sweep_tick(now):
 
 
 def _last_assistant_text(path, cap=4000):
-    """The newest assistant message's text from the transcript TAIL — what the redundancy gate shows
-    the judge as "the session's most recent report". Tail-read only (the newest turn is always
-    recent); '' on any trouble, which fires the nudge as before."""
+    """The newest assistant message's text from the transcript TAIL — '' on any trouble."""
+    return _last_assistant_report(path, cap)[0]
+
+
+def _last_assistant_report(path, cap=4000):
+    """(text, epoch) of the newest assistant message from the transcript TAIL — what the redundancy
+    gate shows the judge as "the session's most recent report", WITH the record's own timestamp so
+    the fire-time freshness guard can tell whether the world moved while the judge deliberated
+    (the user 2026-08-25, the completion-vs-nudge collision: a due nudge and a completion report
+    meet at the end of every long autonomous run — the report landed 19s before a fire whose
+    redundancy check had read the PRE-report tail). Tail-read only; ('', 0) on any trouble, which
+    fires the nudge as before."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as f:
@@ -6228,10 +6411,16 @@ def _last_assistant_text(path, cap=4000):
             if isinstance(c, list):
                 txt = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
                 if txt.strip():
-                    return txt[-cap:]
-        return ""
+                    ts = 0
+                    try:
+                        ts = int(datetime.fromisoformat(
+                            (rec.get("timestamp") or "").replace("Z", "+00:00")).timestamp())
+                    except Exception:
+                        pass
+                    return txt[-cap:], ts
+        return "", 0
     except Exception:
-        return ""
+        return "", 0
 
 
 def _nudge_send_queued(sid, gid):
@@ -6536,6 +6725,9 @@ def _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids=None):
                         if _nudge_deferred_ok(f[0], _why, now, sid, ev_t=_ev or None)]
         except Exception:
             pass
+    _verdicts, recent_ts = {}, None                  # per-goal fire verdicts + the evidence snapshot's
+    #                                                  timestamp — both ride every nudge-events row so
+    #                                                  redundant fires are countable from the log alone
     if to_fire:
         # REDUNDANCY GATE (the user 2026-08-23, approved via the optimizer's audit): the session's
         # own LAST message may already report exactly the status this nudge would ask for — 2 of 3
@@ -6544,34 +6736,58 @@ def _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids=None):
         # report as the ANSWER (answeredAt: the ladder measures its next patience window from it,
         # exactly as it would from a real reply) and skips the fire. Any failure fires as before —
         # the gate is an optimization, the ladder is the job.
-        recent = _last_assistant_text(s["path"])
+        recent, recent_ts = _last_assistant_report(s["path"])
         if recent:
             try:
                 _nodes = jd.load_goals(sid).get("nodes", {})
             except Exception:
                 _nodes = {}
-            still = []
-            for f in to_fire:
-                gtxt = (_nodes.get(f[0]) or {}).get("text") or ""
-                rec0 = nudged.get(f[0]) or {}
-                skips = rec0.get("redundantSkips") or 0
-                try:
-                    # CAPPED at two consecutive skips (the user 2026-08-23, the same day the gate
-                    # shipped: on a status-heavy session every due nudge can read as redundant, and
-                    # each skip restarting the patience window is a forever-pause with no reviver —
-                    # the exact suppressed-without-reviver class the ladder exists to prevent). Past
-                    # the cap the nudge fires regardless; any real fire or answer resets the count.
-                    if skips < 2 and gtxt and jd.nudge_redundant(gtxt, recent):
-                        nudged[f[0]] = dict(rec0, answeredAt=int(now), redundantSkips=skips + 1)
+
+            def _judge_batch(cands, report, report_ts, held_pass):
+                keep = []
+                for f in cands:
+                    if held_pass and _verdicts.get(f[0], ("",))[0] == "force-fired-at-cap":
+                        keep.append(f)               # the cap path is UNCHANGED: it fires regardless,
+                        continue                     #   and never re-judges — only its log row says so
+                    gtxt = (_nodes.get(f[0]) or {}).get("text") or ""
+                    rec0 = nudged.get(f[0]) or {}
+                    skips = rec0.get("redundantSkips") or 0
+                    try:
+                        # CAPPED at two consecutive skips (the user 2026-08-23, the same day the gate
+                        # shipped: on a status-heavy session every due nudge can read as redundant, and
+                        # each skip restarting the patience window is a forever-pause with no reviver —
+                        # the exact suppressed-without-reviver class the ladder exists to prevent). Past
+                        # the cap the nudge fires regardless; any real fire or answer resets the count.
+                        if skips < 2 and gtxt and jd.nudge_redundant(gtxt, report):
+                            nudged[f[0]] = dict(rec0, answeredAt=int(now), redundantSkips=skips + 1)
+                            _put_nudged(f[0], nudged[f[0]])
+                            _v = "held-fresh-re-judged" if held_pass else "skipped-redundant"
+                            _log_nudge_event(sid, f[0], now, f[1], verdict=_v, ev_t=report_ts)
+                            continue
+                    except Exception:
+                        pass
+                    if skips >= 2:
+                        _verdicts[f[0]] = ("force-fired-at-cap", report_ts)
+                    if skips:
+                        nudged[f[0]] = dict(rec0, redundantSkips=0)   # firing (or an unjudgeable check) resets
                         _put_nudged(f[0], nudged[f[0]])
-                        continue
-                except Exception:
-                    pass
-                if skips:
-                    nudged[f[0]] = dict(rec0, redundantSkips=0)   # firing (or an unjudgeable check) resets
-                    _put_nudged(f[0], nudged[f[0]])
-                still.append(f)
-            to_fire = still
+                    keep.append(f)
+                return keep
+
+            to_fire = _judge_batch(to_fire, recent, recent_ts, held_pass=False)
+            # FIRE-TIME FRESHNESS GUARD (the user 2026-08-25, the completion-vs-nudge collision): a
+            # due nudge and a completion report meet at the end of every long autonomous run — the
+            # judge deliberated over a snapshot, and a report landing DURING that deliberation was
+            # invisible (the verified specimen: report 11:18:14, stop 11:18:32, fire 11:18:33). The
+            # writer-yields family, at the fire moment: the transcript's newest assistant timestamp
+            # having moved past the snapshot's IS the world outrunning the evidence — HOLD and
+            # re-judge ONCE against the fresh report (once by construction: one guarded re-read per
+            # tick, never a loop). A survivor fires; a fresh redundancy skips as held-fresh-re-judged.
+            if to_fire and recent_ts:
+                _fresh, _fresh_ts = _last_assistant_report(s["path"])
+                if _fresh and _fresh_ts and _fresh_ts > recent_ts:
+                    to_fire = _judge_batch(to_fire, _fresh, _fresh_ts, held_pass=True)
+                    recent_ts = _fresh_ts             # the fired rows carry the evidence they survived
     if len(to_fire) == 1:
         gid, count, stalled = to_fire[0]
         text = _nudge_text(count, stalled)             # variant by escalation count — a repeat re-asks in fresh words
@@ -6585,7 +6801,9 @@ def _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids=None):
         _nudge_deferred_ok(gid, "", now, sid)        # the hold is over — drop any deferral record so a stale
         #                                              why can never outlive the wait it described
         _mark_auto_nudged(gid, arm_id, count, len(arm.get("atoms") or []), at=now)   # {count, lastTurnId, armAtoms, at} → re-arm only on the next GENUINE ended-working turn; a fresh record resets `failed`
-        _log_nudge_event(sid, gid, now, count)       # timeline romp-logo dot + escalation count
+        _log_nudge_event(sid, gid, now, count,       # timeline romp-logo dot + escalation count; the row
+                         verdict=_verdicts.get(gid, ("fired",))[0],   # says HOW it fired and what evidence
+                         ev_t=recent_ts)             # it survived (the 2026-08-25 instrumentation)
         nudged[gid] = {"count": count, "lastTurnId": arm_id}   # mirror in-memory for the rest of this tick
         fired = True
     if not fired:
@@ -7964,6 +8182,32 @@ def _comments_frame(sid, tmux=None):
         unread = any(m["who"] == "agent" and m["t"] > seen for m in msgs)
         events = [] if status == "promoted" else _thread_events(tsid, str(th.get("cutUuid") or ""), now, tmux)
         reg = _thread_reg(tsid)
+        # the settle count (see _comment_settle_step): raw_busy mirrors the client's threadInFlight
+        # (comments.ts) exactly — live work or an owed reply, on an open unstuck thread
+        tid = str(th.get("tid") or "")
+        raw_busy = (status == "open" and not err and state not in ("permission", "picker")
+                    and (state in ("working", "retrying", "compacting")
+                         or bool(msgs and msgs[-1]["who"] == "you")))
+        quiet = _comment_settle_step(_comment_settle.get(tid), raw_busy, status != "open" or bool(err))
+        _comment_settle[tid] = quiet
+        if len(_comment_settle) > 512:
+            _comment_settle.clear()
+        # sinceEpoch (MILLISECONDS, the client convention): when the thread's current state began —
+        # the popover's working chip counts from it, exactly as the chat's statusline does
+        since_ms = 0
+        if be and status == "open" and hasattr(be, "session_since"):
+            try:
+                since_ms = int(be.session_since(tsid)) * 1000
+            except Exception:
+                since_ms = 0
+        # mode + fast ride too (the user 2026-08-25): the popover's statusline shows the chat's FULL
+        # element set — Auto/mode and the fast badge included, fork the one documented exemption
+        meta = {}
+        if be and status == "open" and hasattr(be, "session_meta"):
+            try:
+                meta = be.session_meta(tsid) or {}
+            except Exception:
+                meta = {}
         threads.append({"tid": th.get("tid"), "anchorUuid": th.get("anchorUuid"),
                         "name": th.get("name") or "", "color": th.get("color") or "",
                         "exact": str(th.get("exact") or "")[:500], "status": status,
@@ -7971,8 +8215,37 @@ def _comments_frame(sid, tmux=None):
                         "unread": unread, "promotedName": th.get("promotedName") or "",
                         "model": (reg.get("liveModel") or reg.get("model") or "") if reg else "",
                         "effort": (reg.get("effort") or "") if reg else "",
+                        "settledPushes": quiet, "sinceEpoch": since_ms,
+                        "mode": str(meta.get("mode") or ""), "fast": str(meta.get("fast") or ""),
+                        # the same rank tints the chat statusline's badges wear (the user 2026-08-25,
+                        # color rider: the popover's model/effort rendered plain gray — metaColor
+                        # reads these and the frame never carried them)
+                        "modelColor": _model_color((reg.get("liveModel") or reg.get("model") or "") if reg else "",
+                                                   cm.stops_for(_colormap())),
+                        "effortColor": _effort_color((reg.get("effort") or "") if reg else "",
+                                                     cm.stops_for(_colormap())),
                         "msgs": msgs, "events": events})
     return {"type": "comments", "id": sid, "threads": threads}
+
+
+# The client's green→yellow settle needs TWO CONFIRMING PUSHES (comments.ts latchBusy), but
+# _send_client's dedup withholds unchanged frames — so after a reply landed, the second confirming
+# frame never arrived and the passage stayed green until some unrelated change minted one (the user
+# 2026-08-25: it didn't flip until clicking back into the main chat). The frame now carries the
+# count ITSELF: pushes since the thread last read busy, clamped at 2 — each step is a real pusher
+# cycle (an event, never a timer), the frame changes at most twice after settling, and then the
+# dedup resumes. tid → count; pure step logic split out for the test.
+_comment_settle = {}
+
+
+def _comment_settle_step(prev, raw_busy, decided):
+    """One pusher cycle's step of the settle count: busy → 0; a decided status (closed/errored)
+    settles immediately; otherwise count up, clamped at 2 (the client's SETTLE_CONFIRM_PUSHES)."""
+    if decided:
+        return 2
+    if raw_busy:
+        return 0
+    return min(2, (2 if prev is None else prev) + 1)
 
 
 def _comment_markers(sid):
@@ -15591,6 +15864,24 @@ def _handoff_peer_identities(nodes, hnodes):
 _HANDOFF_LABEL_RE = re.compile(r"^\s*↪\s*delegated to (.+?): (.*)$", re.S)
 
 
+def _title_shaped(text, cap=120):
+    """One TITLE-SHAPED line from arbitrary prose (the user 2026-08-25, the whole-summary-as-title
+    card): every leg of a card-title fallback chain must produce a TITLE — the first sentence of the
+    source, one line, clamped at the card-title length convention (the planter's own 120) with an
+    honest ellipsis — never a paragraph the body then repeats. Already-title-shaped strings pass
+    through BYTE-IDENTICAL (one line, one sentence, inside the cap → untouched), so shaping is a
+    no-op everywhere titles were already titles."""
+    t = text or ""
+    if "\n" in t:
+        t = " ".join(t.split())
+    m = re.search(r"[.!?](?=\s)", t[12:])            # a terminator with more prose after it ends the
+    if m:                                            #   title at sentence one (offset 12: a leading
+        t = t[:12 + m.start() + 1]                   #   "e.g." or an initial never ends a real title)
+    if len(t) > cap:
+        t = t[:cap - 1].rstrip() + "…"
+    return t
+
+
 def _parked_rows(nodes, children):
     """{nid: N} for every OPEN row that newer sibling work has LEAPFROGGED: nothing has happened in
     nid's own subtree — no delegation edge, no witnessed verdict row — while N (>= 1) YOUNGER siblings
@@ -15688,7 +15979,10 @@ def _handoff_card_fields(nodes, nid):
     if not work or work == "(work)":
         work = ((nd.get("why") or "").strip() or (nd.get("summary") or "").strip()
                 or txt.replace("↪ ", "", 1).strip() or txt)
-    return badge, work
+    # EVERY leg title-shapes (the user 2026-08-25): the why and summary legs are unbounded prose —
+    # the specimen card's bold title was the entire stitched three-paragraph summary, repeated
+    # properly in the Summary section below it. One shared shaper, no per-leg clamps.
+    return badge, _title_shaped(work)
 
 
 def _session_delegated_why(sid):
@@ -18683,6 +18977,7 @@ def _set_model_or_park(be, sid, value):
     both show switching-dots immediately, from whichever surface the click came from (the user 2026-07-03)."""
     with _pending_ops_lock:
         _mark_model_pending(sid, value)
+        _note_model_pick(value)          # a version pick becomes its family's remembered default (2026-08-25)
         if _ops_gate(sid):
             _park_op(sid, ("model", value))
         else:
@@ -19476,6 +19771,15 @@ def _stamp_interrupt_causes(events):
                     # keeps it, where it IS feedback that the interrupt landed and the turn closed clean.
                     # Dropped SERVER-side: rendering it hidden would leave a zero-height turn whose rail
                     # time-marker restampMarkers still measures (at y=0), throwing off the spacing pass.
+                    # The dropped settle's uuid still ANSWERS on the seam (the user 2026-08-25): a cut
+                    # turn's settle atom is its last assistant atom, so verdicts/cards get anchored at
+                    # exactly this uuid — and with the event gone the click honest-failed "couldn't
+                    # locate" though the seam it closed is right there. The marker carries the alias;
+                    # the client lands data-uuids~= on it (event-based; the parent seam, never a
+                    # nearest-time guess).
+                    su = [x.get("uuid") for x in settles if x.get("uuid")]
+                    if su:
+                        ev["settleUuids"] = sorted(set(ev.get("settleUuids") or []) | set(su))
                     for s in settles:
                         s["_dropSettle"] = True
                 break                                     # romp's own notice decides, matched or not
@@ -21624,7 +21928,9 @@ def build_feed(now, tmux=None):
                     w, r = _seg_anchors(seg["atoms"])
                     seg_uuid[_seg_key(seg["id"])] = r or _seg_jump(seg["atoms"])   # timestamp-invariant key; landable
                     #                                  anchors only — never a thinking-only uuid (SDK echo/real drift)
-                    seg_trig[_seg_key(seg["id"])] = seg.get("trigger")
+                    seg_trig[_seg_key(seg["id"])] = jd._prompt_anchor_uuid(seg)   # attachment-safe: a
+                    #                                  title click must land on the USER message, never an
+                    #                                  attachment record no chat event carries (2026-08-25)
                     _lu, _lsub = _seg_last_text(seg["atoms"])
                     seg_best[_seg_key(seg["id"])] = (_lu, _lsub, seg.get("t", 0))   # latest prose → summary deep-link fallback
                     for _a in seg["atoms"]:              # citable-uuid set: gates the distiller's CITED anchor.
@@ -22425,6 +22731,7 @@ def build_feed(now, tmux=None):
     for _a in asks:
         _a["notify"] = True if _notify_card_effective(_ncards, _a["itemId"], str(_a.get("sid") or "")) else None
     return {"type": "feed", "asks": asks, "now": now,
+            "views": _views_client(),   # the rendered views blob — the outline + feed tag mounts read it (2026-08-25)
             # usage-limit-down latch (judge-limit.json): analysis is paused because the account
             # cannot bill judge calls — the dashboard must SAY so, never fail quietly into retries
             # (the user 2026-08-18); self-expires at the window reset, cleared by the next success
@@ -22440,10 +22747,6 @@ def build_feed(now, tmux=None):
             # the shared session order (session-order.json — the tab/lane order): grouped mode sorts each
             # column's session runs by it (the user 2026-07-13); federation prefixes + concatenates per host
             "order": _session_order(),
-            # the ACTIVE session view gates the board CLIENT-side (the user 2026-08-24): the same
-            # views blob every tabOrder push carries — feed.ts filters through its client mirror
-            # (session-views.ts viewVisible via feed-view.ts), needs-you cards breaking through
-            "views": _views_client(),
             # the chat tab strip's sessions, name+color resolved exactly as tab_meta resolves them: the
             # feed footer's session-filter menu lists precisely the tabs (the user 2026-08-08) — including
             # a session with no cards on the board, which filters to an empty board rather than being
@@ -23084,7 +23387,7 @@ def _seg_anchors(atoms):
     (isApiErrorMessage, tagged isApiError by em), so it carries text and would otherwise WIN the
     reply anchor — deep-linking a done/blocked goal to an 'API Error: …' line instead of its real
     reply. An error is a failure, not a reply, and is never a jump target (the user 2026-06-18)."""
-    work = reply = None
+    work = reply = settle = None
     for a in atoms:
         if a.get("type") != "assistant" or a.get("isApiError"):
             continue
@@ -23094,8 +23397,18 @@ def _seg_anchors(atoms):
         if isinstance(blocks, list) and any(
                 isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()
                 for b in blocks):
-            reply = a.get("uuid")
-    return work, reply
+            # the machine-cut NULL SETTLE ("No response requested." / model "<synthetic>") is an
+            # anchor of last resort, never the reply while a substantive atom exists (2026-08-25):
+            # verdicts anchored at a cut turn's settle deep-linked to a filler the chat renders as
+            # a seam marker — the alias belt covers residue, but the mint prefers the real reply
+            _txt = " ".join(b.get("text", "") for b in blocks
+                            if isinstance(b, dict) and b.get("type") == "text").strip()
+            if _txt == "No response requested." \
+                    or (a.get("message") or {}).get("model") == "<synthetic>":
+                settle = a.get("uuid")
+            else:
+                reply = a.get("uuid")
+    return work, (reply or settle)
 
 
 def _segs_seam(turn, store):
@@ -24863,8 +25176,11 @@ def _set_judge_state(fname, value, allowed, allow_empty=False):
             pass
 
 
-def _set_judge_model(v):  _set_judge_state("judge-model", v, _MODEL_VALUES)
-def _set_index_model(v):  _set_judge_state("index-model", v, _MODEL_VALUES)
+# judge tiers accept VERSION ids too (the user 2026-08-25: the settings pickers mirror the
+# family+version submenus) — a version rides the SDK model param verbatim, like session picks
+_JUDGE_MODEL_VALUES = _MODEL_VALUES | set(_VERSION_FAMILY)
+def _set_judge_model(v):  _set_judge_state("judge-model", v, _JUDGE_MODEL_VALUES)
+def _set_index_model(v):  _set_judge_state("index-model", v, _JUDGE_MODEL_VALUES)
 def _set_judge_effort(v): _set_judge_state("judge-effort", v, _EFFORT_VALUES, allow_empty=True)
 def _set_index_effort(v): _set_judge_state("index-effort", v, _EFFORT_VALUES, allow_empty=True)
 # The distilling pair accepts extra sentinels (resolved by jd._distill_model/_distill_effort at call
@@ -24872,7 +25188,7 @@ def _set_index_effort(v): _set_judge_state("index-effort", v, _EFFORT_VALUES, al
 # staller did before the split (the user 2026-08-14) — and effort's "none" pins no-flag. "none" exists
 # because "" cannot: _state_str folds an empty file into the default, so an allow_empty pin here would
 # read back as "follow" (caught by test_distill_tier before it shipped).
-def _set_distill_model(v):  _set_judge_state("distill-model", v, _MODEL_VALUES | {"triage"})
+def _set_distill_model(v):  _set_judge_state("distill-model", v, _JUDGE_MODEL_VALUES | {"triage"})
 def _set_distill_effort(v): _set_judge_state("distill-effort", v, _EFFORT_VALUES | {"triage", "none"})
 
 
@@ -27265,7 +27581,8 @@ else if(m.type==="hover"&&panel.setHover)panel.setHover(m);
 // this inline copy serves the browser, that one the VS Code webview. net-popover-known.test.ts's sibling
 // timeline-boot.test.ts pins the pair.
 else if(m.type==="revealEvent"&&panel.revealEvent)panel.revealEvent(m.sid,m.t,m.id);
-else if(m.type==="tagEditFailed"&&panel.tagEditFailed)panel.tagEditFailed(m);});
+else if(m.type==="tagEditFailed"&&panel.tagEditFailed)panel.tagEditFailed(m);
+else if(m.type==="openViewsDialog"&&panel._openViewsDialog)panel._openViewsDialog(null);});
 window.__rompTimelineOpenExternal=function(url){try{var u=new URL(url);if(u.protocol==="vscode:"){var q=u.searchParams;
 post({type:"deepLink",session:q.get("session"),anchor:q.get("anchor")||undefined,anchorT:Number(q.get("anchorT"))||undefined,anchorKind:q.get("anchorKind")||undefined,compose:q.get("compose")==="1"});
 if(window.parent!==window)window.parent.postMessage({romp:"reveal",pane:"chat"},"*");return;}}catch(e){}window.open(url,"_blank");};
@@ -30505,8 +30822,17 @@ class Handler(BaseHTTPRequestHandler):
                         cx_models = cx.model_catalog()
                     except Exception:
                         pass
+                # each family also carries its VERSIONS (newest first, the family's tint) and its
+                # DEFAULT — the last version the user picked for that family, else the newest (the
+                # user 2026-08-25: family click = remembered pick; the submenu holds the rest).
+                _picks = _model_picks()
                 return self._send(200, json.dumps(
-                    {"models": [dict(c, color=_model_color(c["value"], _stops)) for c in MODEL_CHOICES],
+                    {"models": [dict(c, color=_model_color(c["value"], _stops),
+                                     versions=[dict(v) for v in MODEL_VERSIONS.get(c["value"]) or []],
+                                     default=_picks.get(c["value"])
+                                         or ((MODEL_VERSIONS.get(c["value"]) or [{}])[0].get("value")
+                                             or c["value"]))
+                                for c in MODEL_CHOICES],
                      "efforts": [dict(c, color=_effort_color(c["value"], _stops)) for c in EFFORT_CHOICES],
                      "codex": {"models": cx_models,
                                "efforts": [{"value": v, "label": v}
@@ -31971,6 +32297,11 @@ class Handler(BaseHTTPRequestHandler):
             _wbr = _wv.pop("baseRev", _wv.pop("rev", None))
             _set_timeline_views(_wv, base_rev=_wbr)
             _mark_views_dirty()
+        elif msg and msg.get("type") == "openTagsDialog":
+            # any pane's "Configure tags…" opens THE tags dialog — which lives on the timeline pane
+            # (one dialog, one implementation; the user 2026-08-25). Routed to the SAME dashboard's
+            # timeline like tagEditFailed; an empty wid falls back to the broadcast.
+            _send_to_view("timeline", {"type": "openViewsDialog"}, (client or {}).get("wid") or "")
         elif msg and msg.get("type") == "editTag" and isinstance(msg.get("edit"), dict):
             # tag federation v1 (the user 2026-08-24): a REMOTE tag edited in the dialog/menu routes
             # to its HOME kernel through the same channel `romp tag --host` uses — the tag's host
@@ -32107,6 +32438,18 @@ class Handler(BaseHTTPRequestHandler):
                 _dok, _derr = False, (str(_e) or _e.__class__.__name__)
                 sys.stderr.write("redistill: %s\n" % traceback.format_exc())
             _send_to_app("feed", {"type": "redistillResult", "itemId": _dnid, "ok": _dok, "error": _derr})
+        elif msg and msg.get("type") == "cardOpened" and msg.get("itemId"):
+            # the card-open event (the user 2026-08-25, the metrics round): one append-only row per
+            # modal open, so cleared-WITHOUT-open — the confusion signal the clear log alone cannot
+            # see — becomes measurable. Best-effort: a failed write loses one metric row, never a
+            # gesture.
+            try:
+                p = jd.STATE / "card-opens.jsonl"
+                with open(p, "a") as f:
+                    f.write(json.dumps({"t": int(time.time()), "itemId": str(msg["itemId"])[:200],
+                                        "sid": str(msg.get("sid") or "")[:64]}) + "\n")
+            except OSError:
+                pass
         elif msg and msg.get("type") == "clearAll":
             d = build_feed(int(time.time()))
             _clear_all([a["itemId"] for a in d["asks"]] + [c["itemId"] for c in d["items"]])

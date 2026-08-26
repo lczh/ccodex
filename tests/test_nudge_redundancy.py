@@ -71,8 +71,11 @@ class NudgeRedundancy(unittest.TestCase):
 
     def test_the_fire_path_carries_the_gate_with_the_skip_cap(self):
         src = open(os.path.join(BIN, "romp-kernel")).read()
-        self.assertIn("jd.nudge_redundant(gtxt, recent)", src)
-        self.assertIn('recent = _last_assistant_text(s["path"])', src)
+        # the gate judges through _judge_batch since the fire-time freshness guard (2026-08-25):
+        # the snapshot read carries its timestamp so a report landing mid-deliberation holds the
+        # fire and re-judges once — the anchors below moved with it
+        self.assertIn("jd.nudge_redundant(gtxt, report)", src)
+        self.assertIn('recent, recent_ts = _last_assistant_report(s["path"])', src)
         self.assertIn("redundantSkips=skips + 1", src)
         self.assertIn("if skips < 2 and gtxt", src,
                       "two consecutive skips max — past that the nudge fires regardless, so the "

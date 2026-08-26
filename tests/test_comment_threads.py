@@ -203,6 +203,23 @@ class ThreadForkInvisibility(unittest.TestCase):
         self.assertEqual(reg.get("forkOf"), PARENT)
         self.assertEqual(reg.get("forkAt"), "a1")
 
+    def test_fast_mode_rides_the_fork_like_model_and_effort(self):
+        # the user 2026-08-25: a comment made from an Opus-high-FAST session came up slow — the fork
+        # reg seeded mode/effort/model from the parent but never fast; fast_opt reads reg["fast"] at
+        # connect, so inheriting it here makes the thread fast from its first frame
+        preg_path = Path(self.td) / "sdk" / (PARENT + ".json")
+        preg = json.loads(preg_path.read_text())
+        preg["fast"] = True
+        preg_path.write_text(json.dumps(preg))
+        self.be.fork("thread-x", PARENT, "a1", sid=THREAD, thread_of=PARENT)
+        reg = json.loads((Path(self.td) / "sdk" / (THREAD + ".json")).read_text())
+        self.assertTrue(reg.get("fast"), "a fast parent's new thread is fast")
+
+    def test_a_slow_parent_stays_slow(self):
+        self.be.fork("thread-x", PARENT, "a1", sid=THREAD, thread_of=PARENT)
+        reg = json.loads((Path(self.td) / "sdk" / (THREAD + ".json")).read_text())
+        self.assertNotIn("fast", reg, "no inherited fast key when the parent never asked for it")
+
     def test_a_plain_fork_still_writes_its_names_entry(self):
         self.be.fork("fork-x", PARENT, "a1", sid=THREAD)
         self.assertTrue((Path(self.td) / "names" / THREAD).exists())
@@ -684,6 +701,33 @@ class CommentOps(CommentBase):
         for op in ("commentCreate", "commentReply", "commentResolve", "commentDelete",
                    "commentSeen", "commentPromote"):
             self.assertIn('"%s"' % op, src)
+
+
+class SettleStepCarriesTheConfirm(unittest.TestCase):
+    """The client's green→yellow settle needs two confirming pushes, but the wire dedup withholds
+    unchanged frames — so the kernel counts pushes-since-busy ON the frame (_comment_settle_step),
+    clamped so the frame changes at most twice after settling and the dedup resumes (the user
+    2026-08-25: the passage stayed green until clicking back into the main chat)."""
+
+    def test_busy_pins_zero_and_settle_counts_up_clamped(self):
+        q = km._comment_settle_step(None, True, False)
+        self.assertEqual(q, 0, "busy → 0")
+        q = km._comment_settle_step(q, False, False)
+        self.assertEqual(q, 1, "first quiet push confirms once")
+        q = km._comment_settle_step(q, False, False)
+        self.assertEqual(q, 2, "second quiet push settles")
+        self.assertEqual(km._comment_settle_step(q, False, False), 2, "clamped — the frame stops changing")
+
+    def test_a_fresh_quiet_thread_is_settled_and_a_decided_status_settles_immediately(self):
+        self.assertEqual(km._comment_settle_step(None, False, False), 2, "never-busy starts settled")
+        self.assertEqual(km._comment_settle_step(0, False, True), 2, "resolved/errored decides at once")
+
+    def test_the_frame_carries_count_and_epoch(self):
+        src = open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read()
+        self.assertIn('"settledPushes": quiet, "sinceEpoch": since_ms,', src)
+        # raw_busy mirrors the client threadInFlight exactly: open + unstuck + (live work or owed reply)
+        self.assertIn('state in ("working", "retrying", "compacting")', src)
+        self.assertIn('bool(msgs and msgs[-1]["who"] == "you")', src)
 
 
 if __name__ == "__main__":

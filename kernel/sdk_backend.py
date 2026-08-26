@@ -873,6 +873,8 @@ BOOT_RESUME_SLOT_S = float(os.environ.get("ROMP_BOOT_RESUME_SLOT_S", "180"))
 # meaning), but MARKER-FREE: this line joins an EXISTING message, and the romp-injected marker
 # would re-author the host message's echo and transcript atom.
 RENAME_NUDGE = "[romp] This session was renamed: it is now '%s'. A note for your own records — carry on."
+# the dressed ping's detectable head — the drain's feed-hold keys on it (see _deliver_rename_ping)
+RENAME_PING_HEAD = "<!-- romp-injected --><!-- romp-system -->[romp] This session was renamed"
 
 # Same recovery, different death: the session's OWN claude process died mid-turn (killed or crashed)
 # while the kernel stayed up, so the kernel itself resumes it (_heal_cut_session) instead of waiting
@@ -1518,6 +1520,10 @@ class SdkSession:
         # so a kernel death can DELAY queued messages but never lose them; the boot reconcile
         # resumes any session with a non-empty persisted queue and this seed delivers it.
         self._pending: list[str] = [t for t in (reg.get("queue") or []) if isinstance(t, str) and t]
+        self._ping_feeding = False   # a rename ping was fed and its turn hasn't streamed yet: hold the
+        #                              queue so no message can share its pre-turn window (the CLI batches
+        #                              everything pre-start into ONE record — the 2026-08-25 fold); cleared
+        #                              by the turn's first streamed message, an exact event, or a reconnect
         # A RESTORED /compact must light the compacting bracket too (the user 2026-07-22). send() sets
         # _compacting when it enqueues a compact command, but a persisted queue lands here INSTEAD of
         # going through send() — any /compact still queued when the kernel died arrives this way. Without
@@ -2058,6 +2064,7 @@ class SdkSession:
                     # up (_rewind_armed, set by _options) — feeding the edit turn to the CURRENT client
                     # would land it on the un-rewound branch (the exact wrong-branch delivery this guards)
                     blocked = blocked or bool(self._rewind_to and not self._rewind_armed)
+                    blocked = blocked or self._ping_feeding   # the ping's record must not share its window
                     item = self._pending.pop(0) if (self._pending and not blocked) else None
                     fresh = item is not None and self.inflight == 0     # starting from idle, not mid-turn
                 if item is None:
@@ -2070,6 +2077,8 @@ class SdkSession:
                     self._intr_level = 0             #   ...and its escalation episode (a new stop starts polite)
                 self.inflight += 1
                 self._inflight_texts.append(item)   # the fed-turn twin — see its init comment
+                if item.startswith(RENAME_PING_HEAD):
+                    self._ping_feeding = True       # hold feeds until this turn's first streamed message
                 self._mark("working")
                 self.backend._poke()
                 yield {"type": "user",
@@ -2093,6 +2102,7 @@ class SdkSession:
         while not self.ended:
             self._wake.clear()
             self._reconnect = False
+            self._ping_feeding = False   # a reconnect restarts the feed — a stale hold must not wedge it
             # settle + recover anything the abandoned client stranded — see _reconcile_stranded
             self._reconcile_stranded()
             opts = self.backend._options(self, ClaudeAgentOptions)
@@ -2323,6 +2333,13 @@ class SdkSession:
         append_state(self.backend.state_dir, self.sid, state)
 
     def _on_message(self, msg, AssistantMessage, ResultMessage, SystemMessage):
+        if getattr(self, "_ping_feeding", False):   # getattr: __new__-built test doubles skip __init__
+            # the ping's turn is streaming — the CLI demonstrably started it, so a message fed from
+            # here on lands MID-TURN as its own record (the CLI's designed forward behavior); the
+            # queue can flow again
+            self._ping_feeding = False
+            if self._input_wake is not None:
+                self._input_wake.set()   # same-loop thread — the settle path sets it the same way
         if isinstance(msg, SystemMessage) and msg.subtype == "init":
             self._fire_boot_settled()   # the CLI is up and streaming — its transcript catch-up burst
             #                             is over, so the boot-stagger slot (if any) frees NOW
@@ -2561,6 +2578,9 @@ class SdkSession:
             self.backend._poke()
             if self._input_wake is not None:   # turn done → release the next queued turn, if any
                 self._input_wake.set()
+            # a pending rename ping delivers HERE, as its own turn (the user answered first; the
+            # empty-queue guard + the feed-hold make its record unfoldable — see _deliver_rename_ping)
+            self.backend._deliver_rename_ping(self)
             if self._reconnect_when_idle and not self.ended:   # an effort change waited for this turn to end
                 self._reconnect_when_idle = False
                 self._reconnect = True
@@ -4067,6 +4087,11 @@ class SdkBackend:
             reg["threadOf"] = thread_of
         if parent.get("model") and parent["model"] != "default":
             reg["model"] = parent["model"]
+        if parent.get("fast"):
+            # fast rides the fork like model/effort do (the user 2026-08-25: a comment made from an
+            # Opus-high-FAST session came up slow) — the reg's `fast` is the persisted ask fast_opt
+            # reads at connect, so the thread's first frame already reports it
+            reg["fast"] = True
         # Per-fork model/effort OVERRIDES (the user 2026-08-17: a comment thread on a different model
         # or effort, without touching the parent). Applied HERE, in the reg the first connect reads —
         # never via set_model, whose write_sdk_default side effect would make a thread's pick the seed
@@ -4251,19 +4276,6 @@ class SdkBackend:
         s = self._ensure(sid)
         if not s:
             return False
-        # RENAME PING (the user 2026-08-24): one line ahead of the next thing that enters the
-        # session, so it hears its own new name instead of inferring it. A slash-command send
-        # passes untouched (the CLI must see the bare command) and the note holds for the next
-        # real prompt. MARKER-FREE on purpose, unlike the standalone restart notices: this line
-        # joins an EXISTING message, and the romp-injected marker would re-author the host
-        # message's echo and transcript atom (a typed follow-up would render as a gray romp
-        # bubble). The [romp] prefix is the sanctioned family for mechanics notices — the session
-        # prompt's housekeeping note already tells every session what it means.
-        if not text.lstrip().startswith("/"):
-            _reg = read_reg(self.state_dir, sid) or {}
-            if _reg.get("renameNote"):
-                text = "%s\n\n%s" % (RENAME_NUDGE % _reg["renameNote"], text)
-                self._update_reg(sid, renameNote=None)
         if _is_compact_cmd(text):
             # Delivering /compact: mark the session compacting NOW (authoritative), covering the gap between
             # this send and the CLI actually starting the turn — so a drive op the producer tick checks in
@@ -4692,16 +4704,50 @@ class SdkBackend:
                 return ""
         return ""
 
+    def session_since(self, sid: str) -> int:
+        """Epoch seconds the sid's current state began (0 unknown) — session_state's twin, read by
+        the comments frame so the popover's working chip can carry the chat's counting timer."""
+        with self._lock:
+            s = self.sessions.get(sid)
+        if s and s.thread.is_alive():
+            try:
+                return int(float(s.snapshot().get("since") or 0))
+            except Exception:
+                return 0
+        return 0
+
+    def session_meta(self, sid: str) -> dict:
+        """{'mode','fast'} from the live snapshot ({} unknown) — the comments frame's statusline
+        parity: the popover shows the chat statusline's FULL element set (the user 2026-08-25)."""
+        with self._lock:
+            s = self.sessions.get(sid)
+        if s and s.thread.is_alive():
+            try:
+                snap = s.snapshot()
+                return {"mode": str(snap.get("mode") or ""), "fast": str(snap.get("fast") or "")}
+            except Exception:
+                return {}
+        return {}
+
     def rename(self, sid: str, new_name: str) -> bool:
         reg = read_reg(self.state_dir, sid)
         if not reg:
             return False
         old_name = reg.get("name", "")
-        # renameNote: the one-line "you were renamed" ping, delivered by send() ahead of whatever
-        # NEXT enters the session (the user 2026-08-24: a renamed worker learned its own new name
-        # only by inference from a peer's prose). Reg-persisted so it survives restarts; never a
-        # wake of its own — the queue wakes sessions, this rides a send that already happens.
-        self._update_reg(sid, name=new_name, renameNote=new_name)   # locked RMW — see set_effort's race note
+        # renameNote: the one-line "you were renamed" ping, delivered by send() as its OWN
+        # machine-dressed record ahead of whatever NEXT enters the session (the user 2026-08-24: a
+        # renamed worker learned its own new name only by inference from a peer's prose).
+        # Reg-persisted so it survives restarts; never a wake of its own — the queue wakes
+        # sessions, this rides a send that already happens. ONLY when prior turns exist under the
+        # old name (the transcript is the record of prior turns): a rename before the first turn
+        # has no stale self-knowledge to correct — the fresh session learns its name the normal
+        # way, and pinging it put bookkeeping ahead of the user's very first words (the user
+        # 2026-08-25).
+        _ls = reg.get("lastSid")
+        _tp = Path(transcript_path(reg.get("cwd") or "", _ls)) if _ls else None
+        _has_history = bool(_tp) and _tp.exists() and _tp.stat().st_size > 0
+        self._update_reg(sid, name=new_name,
+                         **({"renameNote": new_name} if _has_history else {}))   # locked RMW — see set_effort's race note
         # keep the shared names/ identity file in sync (preserve colours)
         try:
             parts = (Path(self.state_dir) / "names" / sid).read_text().rstrip("\n").split("\t")
@@ -5171,6 +5217,32 @@ class SdkBackend:
                         "echo": bool(a.get("_echo_text")), "command": bool(a.get("command")),
                         "apiError": bool(a.get("isApiError")), "hasText": bool(_atom_text(a).strip())})
         return out
+
+    def _deliver_rename_ping(self, s) -> bool:
+        """Deliver a pending rename ping (reg renameNote) as its OWN turn, at a turn's SETTLE — the
+        only window where its record cannot fold into anyone else's (the user 2026-08-25: the
+        enqueue-AHEAD form fed the ping and the user's message back-to-back, and the CLI batches
+        every message that arrives before a turn starts into ONE user record — the user's own words
+        rendered inside the ping's machine bubble, worse than the bug it replaced). Three gates make
+        the fold unreachable: delivery only at settle (the user is answered first), only when the
+        queue is EMPTY (a queued message would share the pre-turn window), and the drain's feed-hold
+        (RENAME_PING_HEAD) keeps the next item back until the ping's turn demonstrably starts — its
+        first streamed message, an exact event — after which a racing send lands mid-turn as its own
+        record by the CLI's own design. A held note simply waits for a later settle; it survives
+        restarts in the reg."""
+        try:
+            reg = read_reg(self.state_dir, s.sid) or {}
+        except Exception:
+            return False
+        note = reg.get("renameNote")
+        if not note:
+            return False
+        with s._lock:
+            if s._pending:
+                return False               # a queued turn would share the pre-turn window — hold the note
+        self._update_reg(s.sid, renameNote=None)
+        s.enqueue("<!-- romp-injected --><!-- romp-system -->" + RENAME_NUDGE % note)
+        return True
 
     def _update_reg(self, sid: str, **fields):
         with self._reg_lock:                       # kernel + loop threads both write (queue mirror);

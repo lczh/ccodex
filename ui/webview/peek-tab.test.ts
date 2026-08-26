@@ -18,7 +18,7 @@ test("peek OPEN: every activation routes the peek decision — setActive derives
   // nav-history's apply all land here), before its already-active early-return
   assert.match(RENDER, /function setActive\(id: string[\s\S]{0,500}?assertPeekFor\(id\);[\s\S]{0,400}?if \(activeId === id && anchor == null && anchorT == null\) return;/);
   // the derivation: in-view → no peek; out-of-view → THIS session is the peek
-  assert.match(RENDER, /const next = viewVisible\(effViews\(\), id\) \? null : id;\s*\n\s*if \(next !== peekId\) \{ peekId = next; renderTabs\(\); \}/);
+  assert.match(RENDER, /const next = chatVisible\(id\) \? null : id;\s*\n\s*if \(next !== peekId\) \{ peekId = next; renderTabs\(\); \}/);
 });
 
 test("peek AUTO-CLOSE: activating any other tab drops it — same derivation, no explicit close affordance", () => {
@@ -55,7 +55,7 @@ test("peek is FIRST-CLASS in nav history by storing only the sid — apply lands
 });
 
 test("the first-tab fallback never fires on an active peek: tabInView counts the peek as visible", () => {
-  assert.match(RENDER, /function tabInView\(id: string\): boolean \{ return id === peekId \|\| viewVisible\(effViews\(\), id\); \}/);
+  assert.match(RENDER, /function tabInView\(id: string\): boolean \{ return id === peekId \|\| chatVisible\(id\); \}/);
   // the #only=-era bounce reads visibleIds, which is built from tabInView — an active peek is in it
   assert.match(RENDER, /const inViewIds = ids\.filter\(tabInView\);/);
   assert.match(RENDER, /if \(activeId && ids\.includes\(activeId\) && !visibleIds\.includes\(activeId\) && visibleIds\.length\) \{/);

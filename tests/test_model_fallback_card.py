@@ -110,6 +110,9 @@ class SidechainNeverLearns(unittest.TestCase):
             def _update_reg(self, sid, **kw):
                 calls["reg"].append(kw)
 
+            def _deliver_rename_ping(self, s):
+                return False   # settle hook (2026-08-25); no ping in these worlds
+
             def _poke(self):
                 pass
 

@@ -595,6 +595,23 @@ class AwaitingWake(unittest.TestCase):
                          "the episode re-arms from the ANSWER — the anchor may never move (coalesced "
                          "re-asserts keep the original stamp), so it cannot be the episode key")
         self.assertFalse(km.jd.load_goals(SID)["nodes"][self.gid]["blocked"])
+        # THE ANSWER IS A FILED EVENT (the user 2026-08-25, C2 — closing the awaiting audit's last
+        # live mechanism): the response segment was often placed under NO goal, so an answered wake
+        # re-affirmed a dead wait forever with nothing ever re-nominating the closer. The answered
+        # leg now files a same-why re-assert AT THE ORIGINAL ANCHOR — the anchor never moves, but
+        # the row's ARRIVAL opens the closer's filed-since gate, so it re-audits with the answer in
+        # view; the re-affirm-forever shape is impossible by construction.
+        nd = km.jd.load_goals(SID)["nodes"][self.gid]
+        filed = [e for e in nd["log"] if e.get("src") == "nudge" and e.get("kind") == "awaiting"
+                 and not e.get("lift")]
+        self.assertEqual(len(filed), 1, "the answered wake filed its outcome into the diary")
+        self.assertEqual(filed[0].get("ev_t"), now - 20 * 3600, "…at the frozen anchor (no churn)")
+        self.assertEqual(nd.get("awaitingAt"), now - 20 * 3600, "the stamp's anchor never moved")
+        look = {"closerLookT": nd["log"][0]["at"]}    # the closer last looked when the stamp filed
+        kids = {None: [self.gid]}
+        self.assertTrue(km.jd._filed_since({self.gid: dict(nd, **look)}, kids, self.gid,
+                                           km.jd._look_stamp(dict(nd, **look))),
+                        "…and the filing re-nominates: the closer's gate opens on the answer")
         # ...and the next wake fires once the ANSWER goes stale, same stamp anchor throughout
         self.assertFalse(self._wake(now - 6 * 3600 + 60, rec=rec2), "still patient after the answer")
         self.assertTrue(self._wake(now + 3600, rec=rec2), "re-armed: 6h past the answer it asks again")

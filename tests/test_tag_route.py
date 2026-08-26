@@ -84,7 +84,8 @@ class TagRoute(unittest.TestCase):
     def test_get_views_serves_the_normalized_default(self):
         st, v = self._views()
         self.assertEqual(st, 200)
-        self.assertEqual(v, {"active": "all", "tags": []})
+        self.assertEqual(v, {"active": "all", "tags": [],
+                             "actives": {"chat": {"all": True}, "timeline": {"all": True}, "outline": {"all": True}}})   # per-surface lenses (2026-08-25)
 
     def test_create_resolves_a_live_name_and_mints_the_ui_id_shape(self):
         st, r = self._post({"name": "pool", "add": ["web"]})

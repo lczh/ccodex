@@ -3627,6 +3627,46 @@ def _restrict_retitle(ops, allowed):
     it may retitle (see plan_llm). A defensive floor against the model retitling some OTHER listed goal;
     `allowed=None` drops every retitle (no eligible goal this call)."""
     return [o for o in ops if o["do"] != "retitle" or o.get("goal") == allowed]
+
+
+def _strip_top_mints(ops):
+    """Drop every top-level `mint` op — and every op chained onto a dropped node — remapping the
+    surviving same-reply refs. The deterministic half of the bookkeeping-root gate (the user
+    2026-08-25, the provenance audit): a work-run whose segment was opened by romp's OWN line — a
+    restart/resume/tasks-died notice, or the CLI's '[Request interrupted…]' stop artifact — may
+    still file work under EXISTING goals (sub/done/block on menu targets pass through untouched),
+    but it never opens a fresh top-level card: our own bookkeeping is never an ask. The advisory
+    housekeeping note (plan_units, 2026-07-08) asked the model for this; the audit found a third
+    of one team's board rooted in exactly these records, so the floor is now mechanical.
+    Ref remapping matters: `ref` indexes the reply's CREATED nodes (mints and subs, in order), so
+    removing a mint shifts every later position — an unmapped ref would silently retarget a
+    neighbouring node, and a sub whose ref died would fall back to a TOP mint in apply_plan
+    (the exact hole this closes)."""
+    out, newpos, alive = [], [], 0        # newpos[i]: created-node i's new 1-based position (None = dropped)
+    for o in ops:
+        do, r = o.get("do"), o.get("ref")
+        dead_ref = bool(r) and (r > len(newpos) or newpos[r - 1] is None)
+        if do == "mint":
+            newpos.append(None)
+            continue
+        if do == "sub":
+            if dead_ref:                  # chained onto a dropped mint → drops with it
+                newpos.append(None)
+                continue
+            if r:
+                o = dict(o, ref=newpos[r - 1])
+            alive += 1
+            newpos.append(alive)
+            out.append(o)
+            continue
+        if dead_ref:                      # a verdict aimed at a dropped node evaporates with it
+            continue
+        if r:
+            o = dict(o, ref=newpos[r - 1])
+        out.append(o)
+    return out
+
+
 def _seg_spliced(seg):
     """True when this segment's TRIGGER is an ABSORBED atom — a prompt the CLI spliced into a
     RUNNING turn (a queued_command attachment; em._absorbed_atom marks the synthesized atom
@@ -6484,18 +6524,70 @@ def _session_settled(fsid, path, session, store):
     _session_closed alone read the 'ended' proxy; this keys the settle on the event it was
     approximating — the session actually handing back the floor."""
     return _session_closed(session) and not _awaiting_bg_hold(fsid, path, session, store)
-def _seg_anchor(seg):
-    """The segment's landable anchor uuid: its trigger when the event model recognized one, else the
-    first non-idle atom's uuid. A peer/system segment has no recognized trigger, and every node minted
-    from it stored promptUuid None — an unlinkable card summary that silently dead-ended on the feed
-    (the user 2026-07-20, the g200 federation card). Every landed uuid is landable (scrollToAnchor
-    expands the run holding it), so the segment head is its honest anchor. None only for a segment
-    with no landed uuids at all."""
+
+
+def _prompt_anchor_uuid(seg):
+    """The PROMPT anchor for a segment: its trigger uuid — unless that atom is an ATTACHMENT record
+    (2026-08-25, the settle-alias diagnosis): attachments never become chat events, so a title click
+    (prompt intent) on a card whose promptUuid names one can never land by id. Then the ENCLOSING
+    user MESSAGE owns the anchor — the segment's first user-typed, non-attachment atom. None only
+    when the segment has no trigger (callers keep their own fallbacks); the raw trigger survives as
+    the last resort when no user atom exists either (the chat's settle/alias belt covers residue)."""
     t = seg.get("trigger")
+    if not t:
+        return None
+    atoms = seg.get("atoms") or []
+    ta = next((a for a in atoms if a.get("uuid") == t), None)
+    if ta is None or ta.get("type") != "attachment":
+        return t
+    for a in atoms:
+        if a.get("type") == "user" and a.get("uuid"):
+            return a["uuid"]
+    return t
+
+
+def _seg_anchor(seg):
+    """The segment's landable anchor uuid: its trigger when the event model recognized one (routed
+    through the attachment-safe prompt rule above), else the first non-idle, non-attachment atom's
+    uuid. A peer/system segment has no recognized trigger, and every node minted from it stored
+    promptUuid None — an unlinkable card summary that silently dead-ended on the feed (the user
+    2026-07-20, the g200 federation card). Every landed uuid is landable (scrollToAnchor expands the
+    run holding it), so the segment head is its honest anchor. None only for a segment with no
+    landed uuids at all."""
+    t = _prompt_anchor_uuid(seg)
     if t:
         return t
     for a in seg.get("atoms") or []:
-        if a.get("type") != "idle" and a.get("uuid"):
+        if a.get("type") not in ("idle", "attachment") and a.get("uuid"):
+            return a["uuid"]
+    return None
+
+
+def _mint_anchor_uuid(seg):
+    """The anchor a MINT may claim as its ROOT (promptUuid) — the attachment-safe prompt anchor,
+    unless that record is one that must FILE NOTHING on the board (the user 2026-08-25, the
+    provenance audit): a coordinate/question peer mail (binding, no courier call — the audited
+    specimen was a to-do mirror top whose promptUuid named a kind=coordinate mail, so the chain
+    walk read peer chatter as the card's root), or romp's own bookkeeping (a romp-authored notice,
+    the CLI's interrupt artifact — _seg_bookkeeping's classes). Those records stay in the TRAIL as
+    ordinary history; only the ROOT claim is refused. Substitute: the segment's first assistant
+    atom — where the agent actually declared or did the work, still a landable deep-link — else
+    None (an anchorless mint beats a false confession; the chat's alias belt covers residue).
+    A DELEGATE mail keeps the anchor: the courier plants from that same record by design."""
+    t = _prompt_anchor_uuid(seg)
+    if not t:
+        return None
+    atoms = (seg or {}).get("atoms") or []
+    ta = next((a for a in atoms if a.get("uuid") == t), None)
+    if ta is None:
+        return t
+    author = ta.get("author")
+    files_nothing = (isinstance(author, dict)
+                     and (author.get("kind") or "") in ("coordinate", "question"))
+    if not files_nothing and not (author == "romp" or em.is_interrupt_record(ta)):
+        return t
+    for a in atoms:
+        if a.get("type") == "assistant" and a.get("uuid"):
             return a["uuid"]
     return None
 def plan_units(session, store=None):
@@ -8213,6 +8305,19 @@ def _plan_session(fsid, path, now):
                 save_goals(fsid, store)
                 continue
             ops = _coerce_place(menu, text, title=_prompt_gist(fsid, seg_id) or None)
+        if _seg_bookkeeping(seg_by_id.get(seg_id) or {}):
+            # DETERMINISTIC top-mint floor (the user 2026-08-25, the provenance audit): this stretch
+            # was opened by romp's own bookkeeping — a restart/resume/tasks-died notice or the CLI's
+            # interrupt artifact — so its work may advance EXISTING goals but never opens a fresh top
+            # card. The housekeeping note above asks the model for this; the floor makes it mechanical
+            # (the note sanctioned "a genuinely new thread", and a third of one team's audited board
+            # was rooted in exactly these records). Bookkeeping roots are never human (_seg_human
+            # excludes them), so an emptied reply retires like any other non-human no-op.
+            ops = _strip_top_mints(ops)
+            if not ops:
+                store["placements"][seg_id] = None
+                save_goals(fsid, store)
+                continue
         ops = _restrict_retitle(ops, pgi)              # only the segment's own prompt-run node is retitle-eligible
         ops = _card_route_subs(store, ops, menu)       # card-first: route subs to the card, then the placer
         if apply_plan_guarded(fsid, path, store, seg_id, seg_t, ops, menu, prompt_uuid=trig, quote=vq,
@@ -8238,7 +8343,13 @@ def _plan_session(fsid, path, now):
         _log_judge_error("planner", fsid, "rewind-stand-down",
                          note="plan-sync skipped this pass: the latest segment was rewound away mid-pass")
     elif _sync_declared_plan(store, session, (latest_seg or {}).get("id"), (latest_seg or {}).get("t") or now,
-                             prompt_uuid=_ls_trig):
+                             prompt_uuid=_mint_anchor_uuid(latest_seg) if latest_seg else None):
+        # ^ the VETTED anchor, not the raw trigger (the user 2026-08-25, the audited g-specimen): the
+        #   mirror stamps its promptUuid off whatever segment happens to be syncing, and when that
+        #   segment was opened by a coordinate/question mail or a romp notice, the raw trigger made
+        #   the mail/notice the CARD'S ROOT — a record that must file nothing confessing to an ask
+        #   it never made. The rewind check above stays on the RAW trigger: it asks about the
+        #   segment's chain liveness, not about anchor suitability.
         _group_store(store, fsid, now)
         save_goals(fsid, store)
     rollup_status(store, _session_settled(fsid, path, session, store))
@@ -9414,11 +9525,35 @@ def _subtree_done_candidates(store):
             continue
         if _sealed_above(nodes, nid) or _task_open_below(nodes, children, nid):
             continue
-        if not _filed_since(nodes, children, nid, _look_stamp(nd)):
+        if (not _filed_since(nodes, children, nid, _look_stamp(nd))
+                and not _deleg_unseen(nodes, children, nid, nd)):
             continue                                   # the closer already looked at this world
         out.append(nd)
     out.sort(key=lambda nd: nd.get("t", 0))
     return out
+
+
+def _deleg_unseen(nodes, children, nid, nd):
+    """A DONE handoff child whose completion filing no closer look has yet seen WITH the delegation
+    report in evidence (the user 2026-08-25, the re-asking umbrella): the closer used to omit a
+    delegated ask — its visible history was just the dispatch; the recipient's completion lived in
+    another session's store — and closerLookT then sealed it forever (nothing files in a finished
+    subtree again), leaving the ask open to feed the auto-nudge loop. delegLookT is the look that
+    HAD the report visible (_close_turn stamps it beside closerLookT now that the report rides the
+    menu), so every already-sealed specimen re-nominates exactly ONCE post-upgrade, and a future
+    handoff completion re-arms naturally by its own done filing. Event-keyed both ways; no clock."""
+    seen = int(nd.get("delegLookT") or 0)
+    for c in children.get(nid, []):
+        cd = nodes.get(c) or {}
+        if not (isinstance(cd.get("handoff"), dict) and cd.get("nodeComplete")):
+            continue
+        at = max((int(e.get("at") or 0) for e in (cd.get("log") or []) if e.get("kind") == "done"),
+                 default=0)
+        if at > seen:
+            return True
+    return False
+
+
 def _starved_candidates(store):
     """OPEN nodes that never received evidence after their mint — the trail holds at most the minting
     segment and the diary is empty — nominated to the closer once OTHER work in their top's subtree
@@ -9516,6 +9651,37 @@ def _status_report_candidates(store, turn):
         if nd.get("umbrella") or _task_open_below(nodes, children, nid):
             continue
         out.append(nd)
+    # CITED-UMBRELLA OPEN DESCENDANTS (the user 2026-08-25, the re-asking umbrella): a nudge/
+    # follow-up names its goal and the reply accounts for THAT goal's work — and when the named
+    # goal is an UMBRELLA, the top itself is unrulable (a structural container, skipped above)
+    # while the open LEAF actually holding it at working rides NO channel: the turn menu needs
+    # placements (a nudge spliced into a busy session's running turn strips its dones, so nothing
+    # ever places), steps-finished needs all-children-done, starved needs an empty diary. Three
+    # "it's finished" replies filed nothing on the audited specimen. So a cited UMBRELLA's open
+    # descendants ride this same closer call, with the sibling channels' skips — handoff trackers
+    # stay run_propagate's (their ending event is the recipient's completion, not this reply),
+    # blocked stays the unblocker's, and an agentTask-open subtree stays the agent's own. A PLAIN
+    # cited goal keeps the 2026-07-26 shape exactly: the closer rules the goal itself, and its
+    # subs never ride (the widened-menu pin in test_judge StatusReportMenu).
+    seen_ids = {nd["id"] for nd in out}
+    cited = set()
+    for s in _segs(turn, store):
+        for tgt in _seg_followup_all(s) or []:
+            if tgt in nodes and (nodes[tgt] or {}).get("umbrella"):
+                cited.add(tgt)
+    for top in sorted(cited):
+        stack = list(children.get(top, []))
+        while stack:
+            cid = stack.pop()
+            stack.extend(children.get(cid, []))
+            cd = nodes.get(cid) or {}
+            if (cid in seen_ids or cd.get("nodeComplete") or cd.get("cleared") or cd.get("blocked")
+                    or cd.get("settledDone") or cd.get("umbrella")
+                    or isinstance(cd.get("handoff"), dict)
+                    or _task_open_below(nodes, children, cid)):
+                continue
+            seen_ids.add(cid)
+            out.append(cd)
     out.sort(key=lambda nd: nd.get("t", 0))
     return out
 
@@ -9537,6 +9703,48 @@ def _reply_reopened_ids(menu):
         if any(e.get("kind") == "reopen" and e.get("src") == "user" and e.get("msg")
                and not e.get("undo") for e in rows[k + 1:]):
             out.add(nd["id"])
+    return out
+
+
+def _deleg_report_lines(store, nid):
+    """The completion evidence of nid's DONE handoff children, one line each — the cross-session
+    report the steps-finished ruling was blind to (the user 2026-08-25): a delegated ask's own
+    history is just the dispatch; the recipient's resolution lives on ANOTHER session's tree. The
+    substance comes from the tracking node's enriched done-why (run_propagate carries the
+    recipient's doneWhy/summary across since this fix); a pre-fix bare why falls back to a
+    read-only fetch from the recipient's store (origin/links msgId join — the same pointer
+    run_propagate follows). Capped like every quoted why; cross-host peers skip the fetch (their
+    stores live on another kernel) and report the bare completion."""
+    nodes = store["nodes"]
+    out = []
+    for cid, cd in nodes.items():
+        if cd.get("parentId") != nid or not cd.get("nodeComplete"):
+            continue
+        h = cd.get("handoff")
+        if not isinstance(h, dict) or not h.get("peer"):
+            continue
+        peer = str(h.get("peerName") or h.get("peer") or "a peer session")
+        sub = str(cd.get("doneWhy") or "").strip()
+        if sub.startswith("completed by") and ": " in sub:
+            sub = sub.split(": ", 1)[1]                # the enriched form → keep just the substance
+        elif sub.startswith("completed by") or sub.startswith("reported back by"):
+            sub = ""                                   # the bare pre-fix form carries none
+        if not sub and ":" not in str(h.get("peer") or ""):
+            try:                                       # read-only recipient join (local peers only)
+                r_nodes = dict(load_goal_archive(h["peer"]).get("nodes") or {})
+                r_nodes.update(load_goals(h["peer"]).get("nodes") or {})
+                for rn in r_nodes.values():
+                    o = rn.get("origin")
+                    refs = [o] if isinstance(o, dict) else []
+                    refs += [l for l in (rn.get("links") or []) if isinstance(l, dict)]
+                    if any(r.get("msgId") == h.get("msgId") for r in refs):
+                        sub = str(rn.get("doneWhy") or "").strip() \
+                            or (str(rn.get("summary") or "").strip().splitlines() or [""])[0]
+                        break
+            except Exception:
+                sub = ""
+        out.append("was delegated (\u21aa %s) and the recipient completed it%s"
+                   % (cd.get("text") or peer, (": " + sub[:220]) if sub else "."))
     return out
 
 
@@ -9582,7 +9790,29 @@ def apply_close(store, menu, verdicts, t=None, touched=None, t_overrides=None):
         # state row — so t_overrides carries that anchor. Anchoring a history ruling to the turn made
         # it pre-shadowed by the very lift that nominated it (the fold orders by evidence time).
         ev = (t_overrides or {}).get(i, t)
+        if i in done and isinstance(nd.get("handoff"), dict) and nd["handoff"].get("peer"):
+            # a '↪ delegated' tracking node's ending event is the RECIPIENT's completion
+            # (run_propagate, or the cross-host reply sweep) — never this session's own prose
+            # (2026-08-25, the re-asking umbrella): the closer done'd a tracker at DISPATCH time
+            # ("queued to the peer"), propagate's real completion then no-op'd on the already-done
+            # node, and the parent ask's nomination sealed on dispatched-only evidence. The
+            # stand-down files nothing in either direction; the authoritative writer's own filing
+            # lands untouched, and the same reply's verdicts on other menu nodes still apply.
+            continue
         if i in done:
+            if isinstance(nd.get("handoff"), dict):
+                # A '↪ delegated' TRACKING node's deciding event is the RECIPIENT's completion —
+                # run_propagate's back-link for a local peer, the reply sweep for a cross-host one —
+                # never this session's own dispatch-time prose (the user 2026-08-25, the re-asking
+                # umbrella): the closer done'd a tracker "queued to the peer" at send time, which
+                # CONSUMED the slot — propagate's real completion later no-op'd on the already-done
+                # node, so the recipient's resolution never filed, the parent ask's steps-finished
+                # nomination sealed on dispatched-only evidence, and the card above ping-ponged
+                # nudge-block ↔ unblocker-unblock for 75 minutes. Stand down at the write moment;
+                # the authoritative writer's filing carries the report and re-arms the parent's
+                # nomination for free. (Same posture as the peer-kind awaiting gate below: a claim
+                # whose ending event belongs to another writer is not this closer's to file.)
+                continue
             if not record_verdict(store, nd, "closer", "done", ev, why=done[i] or None):
                 continue                              # the user's follow-up/move postdates this turn's evidence
             if ev is not None:                        # (the event materialized the flags + doneWhy)
@@ -9675,6 +9905,19 @@ def _close_turn(store, turn, samples=None, seg_by_id=None):
                       % ("s" if len(flagged) > 1 else "",
                          ", ".join("#%d" % i for i in flagged),
                          "each" if len(flagged) > 1 else "it"))
+    dlines = []
+    for i, nd in enumerate(menu, 1):
+        if nd["id"] in cand_ids:
+            for line in _deleg_report_lines(store, nd["id"]):
+                dlines.append("Goal #%d %s" % (i, line))
+    if dlines:
+        # the cross-session completion evidence the steps-finished ruling was blind to (2026-08-25):
+        # its own marked section, like the lift whys — recipient-written text never rides romp's
+        # instruction prose
+        menu_text += ("\n\nDelegation reports (a goal above was handed to another session; that "
+                      "session finished and this is its report — completion evidence for the "
+                      "steps-finished rule, unless the goal's own history shows unfinished scope "
+                      "beyond what was delegated):\n" + "\n".join(dlines))
     starved_ids = {c["id"] for c in starved}
     sflagged = [i for i, nd in enumerate(menu, 1) if nd["id"] in starved_ids]
     if sflagged:
@@ -9791,6 +10034,12 @@ def _close_turn(store, turn, samples=None, seg_by_id=None):
     for nd in menu:
         if nd["id"] in store["nodes"]:
             nd["closerLookT"] = _newest_filed(store["nodes"], kidmap, nd["id"])
+            if any(isinstance((store["nodes"].get(c) or {}).get("handoff"), dict)
+                   and (store["nodes"].get(c) or {}).get("nodeComplete")
+                   for c in kidmap.get(nd["id"], [])):
+                # this look SAW the delegation report (the menu carries it now) — seal the
+                # _deleg_unseen re-arm the same way closerLookT seals filings (2026-08-25)
+                nd["delegLookT"] = int(time.time())
     segs = _segs(turn, store)                          # seam-aware: post-split, the recap lives in the tail
     if segs:                                           # anchor each resolved (done/blocked) TURN goal to the recap
         # …but ONLY the turn's own menu (i <= n_touched). The riders behind it — steps-finished,
@@ -10517,7 +10766,9 @@ DISTILL_SYS = (
     "work, never an early plan, analysis, or superseded attempt when a later message reflects how it "
     "actually ended, and never a line that merely announces or hands off work about to start, however "
     "closely it names the goal. This line is parsed off and never shown.")
-def distill_llm(goal_text, work_text, done_why="", prior_summary="", items=None):
+
+
+def distill_llm(goal_text, work_text, done_why="", prior_summary="", items=None, frame=None):
     """The distiller's key-takeaway for one completed goal from the TRIAGE-tier model (Sonnet). '' on
     failure. done_why = the closer's completion verdict (the node's doneWhy), fed as <completed> ground
     truth so the summary reflects what was ACCOMPLISHED even when the work history is thin or mostly the
@@ -10529,6 +10780,17 @@ def distill_llm(goal_text, work_text, done_why="", prior_summary="", items=None)
     count-match gate stamps per-paragraph ages only when the model actually split."""
     mk = _mark()
     user = "%s\n%s" % (_sec("goal", goal_text, mk), _sec("work", work_text, mk))
+    if frame:
+        # the delegating request's framing (the user 2026-08-25): the card belongs to work HANDED
+        # to this session, and <work> speaks in the worker's implementation nouns — the frame is
+        # how the request was actually put (usually the user's own phrasing). Marked section, like
+        # every quoted why: sender-written text never rides romp's instruction prose.
+        user += ("\n%s"
+                 "\n<note>The <delegating-request> is how this work was framed when it was handed "
+                 "to this session — usually the requester's own words. Open the takeaway in those "
+                 "terms: what the request asked for and how it ended. Keep implementation nouns to "
+                 "the supporting detail; never open with them.</note>"
+                 % _sec("delegating-request", frame, mk))
     if done_why:
         user += "\n%s" % _sec("completed", done_why, mk)
     if items and len(items) > 1:
@@ -10741,7 +11003,9 @@ BLOCK_BRIEF_SYS = (
     "line is parsed off and never shown.\n\n"
     "One last check before you send: if any [mN] labels appeared in <work>, the final line of your reply "
     "must be exactly SOURCE: mN. Do not stop at the takeaway; the SOURCE line always comes last.")
-def brief_llm(goal_text, work_text, owed):
+
+
+def brief_llm(goal_text, work_text, owed, frame=None):
     """The briefer's decision brief for one blocked goal from the TRIAGE-tier model (Sonnet). '' on
     failure. Logged as judge='briefer' — its own name, its own prompt (the user 2026-07-08). Its timeline
     mark still rides the distiller row: the kernel folds fine labels to role-family rows (_JUDGE_FAMILY),
@@ -10758,6 +11022,14 @@ def brief_llm(goal_text, work_text, owed):
     mk = _mark()
     user = "%s\n%s\n%s" % (_sec("goal", goal_text, mk), _sec("work", work_text, mk),
                            _sec("owed", owed_block, mk))
+    if frame:
+        # same enrichment as the distiller (the user 2026-08-25): state the owed decision in the
+        # delegating request's terms, not the worker's build vocabulary
+        user += ("\n%s"
+                 "\n<note>The <delegating-request> is how this work was framed when it was handed "
+                 "to this session — usually the requester's own words. State what is owed in those "
+                 "terms; keep implementation nouns to the supporting detail.</note>"
+                 % _sec("delegating-request", frame, mk))
     return _judge_run(_distill_model(), BLOCK_BRIEF_SYS, user, judge="briefer", tier="distill",
                       mark=mk).strip()   # caller splits SOURCE, then caps
 # The STALL note (the user 2026-07-23). A goal that is neither done nor blocked-on-you but that romp has
@@ -10881,6 +11153,35 @@ def _live_prompt_since(fsid):
     except OSError:
         return None
     return since
+
+
+def _deleg_frame(store, nid):
+    """The context a delegated goal's summary writer should open with (the user 2026-08-25): the
+    mint-time `frame` (the delegating mail's cleaned first line, stored by apply_courier), plus the
+    SENDER's linked-ask title — the goal the dispatch was filed under on the sender's board — when
+    the origin points at a LOCAL sender whose store still holds the chain. "" for a non-delegated
+    goal (the enrichment never touches a session's own work), for cross-host origins (that kernel's
+    stores are not ours to read), and for pre-fix nodes minted before the frame existed (they
+    re-distill unchanged — absent frame is byte-identical to today)."""
+    nd = store.get("nodes", {}).get(nid) or {}
+    o = nd.get("origin")
+    if not isinstance(o, dict) or not o.get("peer") or not nd.get("frame"):
+        return ""                                      # no mint-time frame → BYTE-IDENTICAL to today,
+        #                                                including pre-fix delegated nodes re-distilling
+    parts = [str(nd["frame"])]
+    if o.get("goalId") and not o.get("peerHost"):
+        try:
+            snodes = dict(load_goal_archive(o["peer"]).get("nodes") or {})
+            snodes.update(load_goals(o["peer"]).get("nodes") or {})
+            tr = snodes.get(o["goalId"]) or {}
+            ask = (snodes.get(tr.get("parentId") or "") or {}).get("text") or ""
+            if ask and not str(ask).startswith("\u21aa"):
+                parts.append("the sender filed it under: %s" % str(ask)[:120])
+        except Exception:
+            pass                                       # a missing sender store just means less context
+    return " | ".join(p for p in parts if p)[:360]
+
+
 def _distill_due_t(store, nid, blocked):
     """The authoritative "this goal (re)resolved" time the distiller/brief gate compares against —
     never `mt` (the user 2026-07-08, the Proton-card regression): since the diary flip an event-only
@@ -11208,7 +11509,8 @@ def _distill_session(fsid, path, now):
             # direction"), and STALL_BRIEF_SYS restates <holding> faithfully rather than inventing an owed
             # decision from <work>. Stored as the card's blockSummary through the same fail/retry path.
             out = (stall_llm(nodes[top].get("text", ""), work, proc_whys[-1]) if proc_only
-                   else brief_llm(nodes[top].get("text", ""), work, owed))
+                   else brief_llm(nodes[top].get("text", ""), work, owed,
+                                  frame=_deleg_frame(store, top)))
             if not out:
                 if getattr(_judge_ctx, "paused", False):   # the call was SKIPPED (global retry-pause on), not
                     continue                               # tried — never count a pause-skip toward give-up, else
@@ -11289,7 +11591,8 @@ def _distill_session(fsid, path, now):
             # real re-distills: filtering loses no post-boundary coverage.
             _dsubs = [d for d in _dsubs if _done_since(d) > boundary_t]
         out = distill_llm(nodes[top].get("text", ""), work, nodes[top].get("doneWhy") or "", prior_summary=prior,
-                          items=[(d.get("text", ""), d.get("doneWhy", "")) for d in _dsubs])
+                          items=[(d.get("text", ""), d.get("doneWhy", "")) for d in _dsubs],
+                          frame=_deleg_frame(store, top))
         if not out:
             if getattr(_judge_ctx, "paused", False):   # pause-skip, not a real failure — don't count it toward
                 continue                               # give-up (leave summary null → re-enters once unpaused)
@@ -11722,6 +12025,26 @@ def _seg_clearwrap(seg):
     atoms = seg.get("atoms") or []
     trig = next((a for a in atoms if a.get("uuid") == seg.get("trigger")), None) or (atoms[0] if atoms else None)
     return bool(trig and ROMP_CLEARWRAP_RE.search(_atom_text(trig)))
+
+
+def _seg_bookkeeping(seg):
+    """True if this segment was opened by romp's OWN BOOKKEEPING, never an ask (the user 2026-08-25,
+    the provenance audit): a romp-authored line (the romp-injected marker — restart/resume/tasks-died
+    notices, plus a nudge whose goal marker no longer resolves and so falls to the generic work-run),
+    or the CLI's '[Request interrupted by user…]' stop artifact (written for BOTH a user Esc and a
+    machine cut — either way it is the stop EVENT, not a request). The generic work-run strips top
+    mints from such a segment (_strip_top_mints): its work may advance existing goals, but a fresh
+    top card rooted here claims romp's own turn was an ask — the audit found restart-notice- and
+    interrupt-rooted tops a full third of one team's board. The clear wrap-up is EXEMPT by design:
+    its one blocked card is the needs-you escape the wrap-up exists for (the user 2026-07-29), and
+    its own prompt bounds it. Mirrors _seg_human's trigger lookup."""
+    if _seg_clearwrap(seg):
+        return False
+    atoms = seg.get("atoms") or []
+    trig = next((a for a in atoms if a.get("uuid") == seg.get("trigger")), None) or (atoms[0] if atoms else None)
+    return bool(trig and (trig.get("author") == "romp" or em.is_interrupt_record(trig)))
+
+
 def _parse_courier(raw, menu_len):
     """Parse the courier's {"verdict": "delegating"|"coordinating", "goal": n, "text": "..."} reply →
     {delegating, n, text}. n is the sender-goal link (1..menu_len) or None (0 / out-of-range / unclear).
@@ -11769,15 +12092,16 @@ def _postal_row(mid):
     consumer contract). The sender may be a session of ANOTHER kernel (federated mail), so the local
     names registry cannot resolve it; the log row carries the name the sender wore, the origin host
     the bus stamped on cross-host delivery (2026-07-26), and the tracked report-back flag
-    (2026-08-24 — read off the row, never off message prose). ("", "", False) for None/unknown mids.
-    Memoized on the log file's (mtime, size)."""
+    (2026-08-24 — read off the row, never off message prose), and since 2026-08-25 the BODY —
+    whose cleaned first line is the delegating frame the card enrichment stores at mint.
+    ("", "", False, "") for None/unknown mids. Memoized on the log file's (mtime, size)."""
     if not mid:
-        return ("", "", False)
+        return ("", "", False, "")
     try:
         st = os.stat(MESSAGES)
         key = (st.st_mtime, st.st_size)
     except OSError:
-        return ("", "", False)
+        return ("", "", False, "")
     if _postal_from_memo["key"] != key:
         mp = {}
         try:
@@ -11787,11 +12111,31 @@ def _postal_row(mid):
                 except Exception:
                     continue
                 if r.get("ev") == "sent" and r.get("id"):
-                    mp[r["id"]] = (r.get("from") or "", r.get("from_host") or "", bool(r.get("tracked")))
+                    mp[r["id"]] = (r.get("from") or "", r.get("from_host") or "", bool(r.get("tracked")),
+                                   str(r.get("body") or ""))
         except OSError:
-            return ("", "", False)
+            return ("", "", False, "")
         _postal_from_memo["key"], _postal_from_memo["map"] = key, mp
-    return _postal_from_memo["map"].get(mid, ("", "", False))
+    return _postal_from_memo["map"].get(mid, ("", "", False, ""))
+
+
+def _frame_head(s):
+    """The delegating request's FIRST LINE, cleaned for card use: romp markers stripped (plumbing,
+    never display — the _provisional_card rule), whitespace collapsed, capped. The framing a
+    delegating manager writes in its opening line is usually the USER's own phrasing of the round
+    ("user asks (dictated): …"), which is exactly what the recipient card's summary should open
+    with (the user 2026-08-25: worker cards read as insider jargon because the summary writer
+    never saw the delegating thread)."""
+    s = re.sub(r"<!--.*?-->", "", str(s or ""), flags=re.S)
+    line = next((l.strip() for l in s.splitlines() if l.strip()), "")
+    line = re.sub(r"^USER ASKED:\s*", "", line)       # the unit-text framing prefix (segment-fallback
+    #                                                    path) is plumbing, never the request's words
+    return " ".join(line.split())[:220]
+
+
+def _postal_body_head(mid):
+    """The delegating mail's cleaned first line from its ledger row, "" when the row is unknown."""
+    return _frame_head(_postal_row(mid)[3])
 
 
 def _postal_from(mid):
@@ -11799,11 +12143,15 @@ def _postal_from(mid):
     return _postal_row(mid)[:2]
 
 
-def apply_courier(store, seg_id, seg_t, text, origin, prompt_uuid=None):
+def apply_courier(store, seg_id, seg_t, text, origin, prompt_uuid=None, frame=None):
     """Plant a top-level goal in the recipient's tree for a delegating message, with origin
     provenance. Idempotent by seg_id and origin.msgId (one planted goal per message). Returns nid.
     `prompt_uuid` (the user 2026-07-20, g200): the peer segment's anchor (its head record), so the
-    planted card's summary is landable like any other card — None left it silently unlinkable."""
+    planted card's summary is landable like any other card — None left it silently unlinkable.
+    `frame` (the user 2026-08-25, the confusing-worker-cards round): the delegating mail's cleaned
+    first line — usually the USER's own phrasing of the round — stored as the ADDITIVE node field
+    `frame` so the distiller/briefer open the card's summary in the user's terms instead of the
+    worker's implementation nouns. Absent on non-delegated goals; old payloads render unchanged."""
     nodes, placements = store["nodes"], store["placements"]
     mid = origin.get("msgId")
     if mid:
@@ -11813,9 +12161,12 @@ def apply_courier(store, seg_id, seg_t, text, origin, prompt_uuid=None):
                 return nid
     store["seq"] = store.get("seq", 0) + 1
     nid = "%s:g%d" % (store["rompUuid"], store["seq"])
-    nodes[nid] = GuardedNode({"id": nid, "text": (text or "(delegation)")[:120], "parentId": None,
-                  "nodeComplete": False, "blocked": False, "cleared": False,
-                  "trail": [seg_id], "t": seg_t, "origin": origin, "promptUuid": prompt_uuid, "log": []})
+    payload = {"id": nid, "text": (text or "(delegation)")[:120], "parentId": None,
+               "nodeComplete": False, "blocked": False, "cleared": False,
+               "trail": [seg_id], "t": seg_t, "origin": origin, "promptUuid": prompt_uuid, "log": []}
+    if frame:
+        payload["frame"] = frame
+    nodes[nid] = GuardedNode(payload)
     placements[seg_id] = nid
     store["lastNode"] = nid                            # the delegation is now the active focus
     return nid
@@ -11981,6 +12332,72 @@ def _post_handoff_receipt(mid):
         pass                                          # the bus is down: the next pass retries
 
 
+def _session_user_prompt_record(sender, path, uuid, now):
+    """True only when `uuid` in the sender's session is a HUMAN prompt record — read from the
+    CACHED stitched parse (parsed_session: fork-aware, author-stamped with the SDK-human channel
+    applied), so the courier pays no extra parse. author 'human' minus the CLI's interrupt
+    artifacts is the rule the board audit used; an attachment record (a queued_command wrapping
+    what the user dictated mid-turn) counts as human exactly when it carries no postal or
+    romp-injected marker. Everything else — mail, romp's own lines, machine input, a record the
+    stitched chain no longer holds — is False."""
+    try:
+        s = parsed_session(sender, [str(path)], now)
+    except Exception:
+        return False
+    for turn in s.get("turns") or []:
+        for a in turn.get("atoms") or []:
+            if a.get("uuid") != uuid:
+                continue
+            if a.get("author") == "human":
+                return not em.is_interrupt_record(a)
+            if a.get("type") == "attachment":
+                txt = _atom_text(a) or str(a.get("text") or "")
+                if em.postal_pairs(txt) or NUDGE_MARKER_RE.search(txt):
+                    return False
+                return bool(txt.strip())
+            return False
+    return False
+
+
+def _delegate_user_rooted(sender, link_id, paths, now, _depth=0, _seen=None):
+    """MINT-TIME chain trace (the user 2026-08-25 ~19:4x, who wants team-internal cards not
+    CREATED rather than foldable behind a lens): True only when the SENDER's linked goal traces
+    to a HUMAN prompt — self-then-ancestors in the sender's store (live+archive merged), an
+    origin hop into a LOCAL grand-sender's chain first (a mid-chain worker's ask was itself
+    courier-planted), then the node's own promptUuid read against the sender's stitched parse
+    (_session_user_prompt_record). EVERYTHING ELSE IS FALSE — no link at all, a machine/mail/
+    romp root, a missing store/node/record, a cross-host hop (that kernel's stores are not ours
+    to read), a cycle, the depth cap: at mint time uncertainty files QUIET, the inverse of the
+    retired display split's default (uncertainty SHOWED there; the user's verdict is that the
+    card must not exist, so the burden of proof flips to the mint). The failure surface that
+    inversion accepts — a REAL user ask whose chain evidence is lossy files quietly on the
+    recipient — is bounded by what surfaces regardless of this trace: the SENDER-side tracking
+    node (planted either way, with the parked cue and the report-back closure), and every
+    needs-you state (the hard-block floor + placeholder synthesize a board card from the live
+    prompt with zero goal nodes; interrupt only when the human is the bottleneck)."""
+    if not link_id or _depth >= 8:
+        return False
+    seen = _seen if _seen is not None else set()
+    nodes = dict(load_goal_archive(sender).get("nodes") or {})
+    nodes.update(load_goals(sender).get("nodes") or {})
+    x = link_id
+    while x is not None and (sender, x) not in seen:
+        seen.add((sender, x))
+        nd = nodes.get(x)
+        if not isinstance(nd, dict):
+            return False
+        o = nd.get("origin")
+        if (isinstance(o, dict) and o.get("peer") and o.get("goalId")
+                and not o.get("peerHost") and o["peer"] in paths):
+            if _delegate_user_rooted(o["peer"], o["goalId"], paths, now, _depth + 1, seen):
+                return True
+        pu = nd.get("promptUuid")
+        if pu and sender in paths and _session_user_prompt_record(sender, paths[sender], pu, now):
+            return True
+        x = nd.get("parentId")
+    return False
+
+
 def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
     """DETERMINISTIC delegation completion link-back (the user 2026-06-22). When a courier-planted goal G
     (origin.peer + origin.goalId) is COMPLETE on the recipient B's tree, mark the SENDER's tracking node
@@ -11992,8 +12409,14 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
         now = int(time.time())
     n = 0
     for fsid, path, anchor, name in discover(now)[:sessions_cap]:
-        store = load_goals(fsid)
-        for nid, nd in list(store.get("nodes", {}).items()):
+        # live + ARCHIVE merged for the RECIPIENT-side scan (2026-08-26, the working-column audit):
+        # a recipient goal that completed and was then ARCHIVED (the user cleared the done card)
+        # vanished from the live-only scan, so the sender's tracker never checked off — a live
+        # specimen sat open seven hours with its completion event already fired and recorded.
+        # Read-only on this side: propagate writes SENDER stores only.
+        rnodes = dict(load_goal_archive(fsid).get("nodes") or {})
+        rnodes.update(load_goals(fsid).get("nodes") or {})
+        for nid, nd in list(rnodes.items()):
             if not nd.get("nodeComplete"):
                 continue                                # B hasn't finished it yet
             o = nd.get("origin")
@@ -12015,10 +12438,20 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
                 a_node = a_store.get("nodes", {}).get(a_gid)
                 if not a_node or a_node.get("nodeComplete"):
                     continue                            # sender's tracking node gone or already done → idempotent
-                record_verdict(a_store, a_store["nodes"][a_gid], "courier", "done", now,
-                               why="completed by %s (delegated)" % (name or fsid[:8]))
-                _mark_node_done(a_store, a_gid, "completed by %s (delegated)" % (name or fsid[:8]), now,
-                                src="courier")
+                # Carry the RECIPIENT'S OWN RESOLUTION across (the user 2026-08-25, the re-asking
+                # umbrella): the bare "completed by <peer>" why gave the sender-side closer nothing
+                # to rule a delegated ask done WITH — the steps-finished nomination saw an ask whose
+                # only visible history was the dispatch, omitted, and the look-stamp sealed it while
+                # the auto-nudge re-asked a finished question seven times in 75 minutes. The
+                # recipient's doneWhy (else its summary head) IS the report-back's substance; capped
+                # like every quoted why.
+                why = "completed by %s (delegated)" % (name or fsid[:8])
+                sub = str(nd.get("doneWhy") or "").strip() \
+                    or (str(nd.get("summary") or "").strip().splitlines() or [""])[0]
+                if sub:
+                    why += ": " + sub[:220]
+                record_verdict(a_store, a_store["nodes"][a_gid], "courier", "done", now, why=why)
+                _mark_node_done(a_store, a_gid, why, now, src="courier")
                 rollup_status(a_store, False)           # sender just had work close → recompute its columns
                 save_goals(a_sid, a_store)
                 n += 1
@@ -12031,6 +12464,27 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
     # to a peer whose bus predates the receipt lane stays visibly open (the nudge/debt machinery
     # surfaces it) rather than being silently fabricated done.
     done_mids = _handoff_done_ids()
+    # …and for the LOCAL enhancements below (dismissed-linked, quiet handoffs), the
+    # recipient's reply is the report-back event (upstream 2026-08-25/26):
+    last_any, _la, alias = _postal_ask_maps()
+    _rmemo = {}                                        # recipient sid -> merged nodes (per-pass, read-only)
+
+    def _ref_goal(peer_sid, mid):
+        """The recipient goal a tracker's msgId joins to (origin or links), live+archive merged."""
+        if peer_sid not in _rmemo:
+            m = dict(load_goal_archive(peer_sid).get("nodes") or {})
+            m.update(load_goals(peer_sid).get("nodes") or {})
+            _rmemo[peer_sid] = m
+        for rd in _rmemo[peer_sid].values():
+            if not isinstance(rd, dict):
+                continue
+            o = rd.get("origin")
+            refs = ([o] if isinstance(o, dict) else []) + [l for l in (rd.get("links") or [])
+                                                           if isinstance(l, dict)]
+            if any(r.get("msgId") == mid for r in refs):
+                return rd
+        return None
+
     for fsid, path, anchor, name in discover(now)[:sessions_cap]:
         store = load_goals(fsid)
         changed = False
@@ -12039,8 +12493,38 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
             if not (isinstance(h, dict) and h.get("peer") and not nd.get("nodeComplete")):
                 continue
             pk = str(h["peer"])
-            if ":" not in pk:                          # a LOCAL recipient: the origin back-link owns it
+            dismissed = False
+            if ":" not in pk and not h.get("quiet"):
+                # a LOCAL LINKED recipient: the origin back-link owns it — UNLESS the user DISMISSED
+                # the recipient's card without completion (upstream 2026-08-26, the working-column
+                # audit: two trackers sat open 8.3h and 2.6h under a Working hub because the cleared
+                # recipient goal could never reach nodeComplete). A dismissal kills the back-link's
+                # event forever, so the recipient's reply becomes the honest report-back ending. A
+                # LIVE linked recipient still defers to the back-link.
+                rg = _ref_goal(pk, h.get("msgId"))
+                if not (isinstance(rg, dict) and rg.get("cleared") and not rg.get("nodeComplete")):
+                    continue
+                dismissed = True
+            if ":" not in pk:
+                # a LOCAL QUIET handoff (chain-rooted minting, upstream 2026-08-25): no recipient
+                # goal exists BY DESIGN, so the back-link can never fire — the recipient's reply
+                # (any kind, at/after the send) is the report-back event. (The dismissed-linked
+                # shape above ends the same way.)
+                reply = last_any.get((pk, fsid), 0)
+                if reply and reply >= (nd.get("t") or 0):
+                    why = (("reported back by %s (delegated; the recipient's card was dismissed)" % pk[:8])
+                           if dismissed else
+                           "reported back by %s (delegated, quiet-filed)" % pk[:8])
+                    if record_verdict(store, nd, "courier", "done", reply, why=why):
+                        _mark_node_done(store, nid, why, reply, src="courier")
+                        changed = True
+                        n += 1
                 continue
+            # CROSS-HOST: the PER-MESSAGE receipt (the v1.3.16 audit's P1.3, this fork's lane) —
+            # never the per-peer reply heuristic, which completed every outstanding delegation to
+            # that peer on one unrelated reply, checking off undone work. A handoff to a peer
+            # whose bus predates the receipt lane stays visibly open (the nudge/debt machinery
+            # surfaces it) rather than being silently fabricated done.
             if str(h.get("msgId") or "") not in done_mids:
                 continue                               # no receipt: the work is not known done
             why = "reported done by %s (delegated cross-host; completion receipt)" % pk
@@ -12064,6 +12548,7 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
         now = int(time.time())
     fleet = discover(now)[:sessions_cap]
     id2name = {f: nm for f, p, a, nm in fleet}          # recipient id → name, for the sender's tracking-node label
+    paths_map = {f: str(p) for f, p, a, nm in fleet}    # sid → transcript, for the mint-time chain trace
     pending, closed = [], {}                           # pending: (seg_t, fsid, seg_id, text, mid, sender)
     for fsid, path, anchor, name in fleet:
         try:
@@ -12257,13 +12742,40 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
             # relay). A demoted tracked delegate reaches neither line: no primary, no satellite, no
             # orphan.
             trk = bool(_postal_row(mid)[2]) and sender in id2name
+            # CHAIN-ROOTED MINTING (the user 2026-08-25 ~19:4x, replacing the view-side split): a
+            # recipient top card mints ONLY when the sender's linked goal traces to a user prompt —
+            # the ask flowing down. An untraceable delegate files QUIET: the sender-side tracking
+            # node below still plants (the delegation stays one glance away on the sender's board,
+            # with the parked cue and the report-back closure), but the recipient gets NO standalone
+            # top — its work lives in that session's own view and transcript, and any needs-you
+            # state still reaches the board through the hard-block floor/placeholder, which need no
+            # goal node. Uncertainty quiets by design (the trace's docstring names the surface).
+            rooted = _delegate_user_rooted(sender, link_id, paths_map, now)
             # Mint the sender's precise '↪ delegated to <recipient>' tracking node (the user 2026-06-22) and
             # point B's goal at IT — so run_propagate checks off only the handed-off piece, never the sender's
             # broader linked goal. Saved to the sender's tree before planting G on the recipient's.
             track_id = _plant_handoff_track(sender_store, link_id, edit["text"], fsid, id2name.get(fsid), seg_t, mid,
-                                            tracked=trk)
+                                            tracked=trk and rooted)
+            if not rooted:
+                h = sender_store["nodes"][track_id].get("handoff")
+                if isinstance(h, dict) and not h.get("quiet"):
+                    # QUIET mark: no recipient goal will ever carry this msgId, so run_propagate's
+                    # origin back-link can never end this tracker — the recipient's REPLY (any kind,
+                    # at/after the send) is its report-back event instead, the same rule the
+                    # cross-host arm has always used. Also the breadcrumb for "where is the card?":
+                    # the delegation chose quiet filing because its chain roots in team-internal
+                    # work, not a user ask.
+                    h["quiet"] = True
             rollup_status(sender_store, False)
             save_goals(sender, sender_store)
+            if not rooted:
+                store["placements"][seg_id] = "fyi"    # quiet: processed, no recipient top (the #d
+                #                                        delegation phase retires on this, exactly the
+                #                                        coordinate treatment)
+                rollup_status(store, closed.get(fsid, False))
+                save_goals(fsid, store)
+                placed += 1
+                continue
             # Origin provenance snapshots the sender's NAME (and, for federated mail, HOST) at plant
             # time: a cross-host sender's sid resolves to nothing in this kernel's names registry, and
             # without the snapshot the "from" chip degrades to a bare sid prefix (the user 2026-07-26).
@@ -12276,7 +12788,11 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
                 origin["peerName"] = pn
             if frm_host:                               # stamped only on cross-host delivery
                 origin["peerHost"] = frm_host
-            apply_courier(store, seg_id, seg_t, edit["text"], origin, prompt_uuid=anchor_uuid)
+            apply_courier(store, seg_id, seg_t, edit["text"], origin, prompt_uuid=anchor_uuid,
+                          frame=_postal_body_head(mid) or _frame_head(text))
+            #             ^ the ledger row's body is authoritative; a row the local ledger lacks
+            #               (some cross-host deliveries) falls back to the delivered segment's own
+            #               head — same content, one hop later
         else:
             store["placements"][seg_id] = "fyi"        # coordinating: no goal, but mark processed
         rollup_status(store, closed.get(fsid, False))

@@ -95,6 +95,37 @@ class HandoffCardFields(_Base):
         _, title = km._handoff_card_fields(store["nodes"], nid)
         self.assertEqual(title, "the exporter now ships cards")
 
+    def test_every_fallback_leg_is_title_shaped(self):
+        # the 2026-08-25 specimen: the summary leg took the WHOLE stitched multi-paragraph summary
+        # as the bold title, which the Summary section below then repeated. Every leg produces a
+        # TITLE now — first sentence, one line, clamped with an honest ellipsis — via ONE shared
+        # shaper; the summary itself stays in the body untouched.
+        summary = ("The tracked change is verified and armed to land. Your board shows one card "
+                   "under the delegator wearing the recipient identity.\n\nSeparately, routing of "
+                   "remote edits was handed off and finished, so changes land where the note lives.")
+        store, nid = self._store_with_track(text="")   # planter writes "(work)" → falls through
+        store["nodes"][nid]["summary"] = summary
+        badge, title = km._handoff_card_fields(store["nodes"], nid)
+        self.assertEqual(title, "The tracked change is verified and armed to land.",
+                         "first sentence only — a title, not a paragraph")
+        self.assertEqual(store["nodes"][nid]["summary"], summary, "the body keeps the full summary")
+        # the why leg shapes the same way
+        store["nodes"][nid]["why"] = ("Port the exporter to the new schema. Then wire the tests "
+                                      "and clean the old paths out.")
+        store["nodes"][nid]["summary"] = None
+        _, title = km._handoff_card_fields(store["nodes"], nid)
+        self.assertEqual(title, "Port the exporter to the new schema.")
+
+    def test_title_shaping_is_a_no_op_on_titles_and_clamps_the_endless(self):
+        for already in ("Ship the exporter", "Rework Browse files: modal, menu bottom, icon",
+                        "Fix the y-axis labels?"):
+            self.assertEqual(km._title_shaped(already), already,
+                             "an already-title-shaped string passes through byte-identical")
+        long = "word " * 60
+        shaped = km._title_shaped(long)
+        self.assertLessEqual(len(shaped), 120)
+        self.assertTrue(shaped.endswith("…"), "the clamp is an honest ellipsis, never a silent cut")
+
     def test_a_plain_goal_is_untouched(self):
         nodes = {SID + ":g9": {"id": SID + ":g9", "text": "Ship the exporter", "parentId": None}}
         badge, title = km._handoff_card_fields(nodes, SID + ":g9")

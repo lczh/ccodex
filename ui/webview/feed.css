@@ -143,6 +143,15 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 .freeze-badge i { font-style: normal; }
 .freeze-badge .fz-add { color: var(--accent); }
 .freeze-badge .fz-del { color: var(--err); }
+/* the explicit reading (the user 2026-08-25): the parenthetical wears the accent — the blue they
+   asked for — at the badge's own scale and normal weight so the +N/−N stays the loudest part */
+.freeze-badge .fz-note { color: var(--accent); font-weight: 400; }
+/* the hovered card's OWN pending update: a floating pointer-inert accent line pinned inside the
+   frozen card's lower edge (the rect is stable — that is the freeze's contract). Page-bg pill so
+   it reads over card content; 10.5px is the footer's existing scale, no new sizes. */
+#freeze-selfnote { position: fixed; z-index: 6; pointer-events: none; color: var(--accent);
+  font-size: 10.5px; font-weight: 600; background: rgba(30, 30, 30, 0.85);
+  border-radius: 4px; padding: 1px 6px; }
 /* margin-top, NOT header padding: the liveness rings are outlines drawn ~2.5px
    OUTSIDE the first card's top edge, and the sticky header paints its padding as
    opaque background over them — only unpainted margin space lets them show */
@@ -319,23 +328,6 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 
 /* drop-point lines on an asks-column card: where the work is currently parked */
 
-/* ↪ BREAKTHROUGH cue (the user 2026-08-24): a needs-you card from a session the active view HIDES
-   still shows (the interrupt rule) — the cue says why it's here. The ↪ provenance family: dim,
-   quiet, the sub-line scale, never a status colour. */
-.fask-viewbreak { color: var(--dim); font-size: 0.82em; font-style: italic; white-space: nowrap; align-self: center; }
-/* "N cards outside this view" (the N-more idiom; the 2026-08-11 rule: filtered is never silent):
-   one dim line after the columns, click switches the view to All. */
-#feed-viewmore { padding: 4px 14px 10px; color: var(--dim); font-size: 0.82em; cursor: pointer; }
-#feed-viewmore:hover { color: var(--accent); text-decoration: underline; }
-/* PROMOTED (the user 2026-08-25, who read a view-narrowed board as broken): when the view hides
-   MORE than the board shows, the whisper trades up to the judge-limit banner's card chrome — same
-   #252526 card, hairline, 6px radius, 0.9em — and names the view. Neutral chrome, never a status
-   colour: a narrowed board is a choice, not an error. */
-#feed-viewmore.prominent { margin: 6px 8px 2px; padding: 10px 14px; background: #252526;
-  border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px;
-  color: var(--fg); font-size: 0.9em; }
-#feed-viewmore.prominent:hover { color: var(--fg); text-decoration: none;
-  border-color: var(--accent); }
 /* "↪ from <sender>" — courier handoff provenance beside the owning session: the "↪ from" reads as dim
    gray chrome, the peer name as a bold, identity-coloured session link (the user 2026-06-16). */
 /* a direct child of the WRAPPING name row, kept on one line — .fask-id's flex-grow pushes it to the
@@ -912,6 +904,28 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 #feed-undoclear .undo-dots i:nth-child(3) { animation-delay: 0.36s; }
 @keyframes undo-dot { 0%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { #feed-undoclear .undo-dots i { animation: none; opacity: 0.8; } }
+/* The tag lens's disclosure line (the user 2026-08-25, T70; lineage: the 665 outside-view whisper
+   + promoted banner, revived under the user's OWN lens): dim one-liner after the columns; when the
+   lens hides MORE than the board shows, the judge-limit banner's card chrome + the lens named.
+   Neutral chrome — a narrowed board is a choice, not an error. */
+/* the tag-glyph button sits flush with its word-button siblings: same .fdismiss dress (the shared
+   component's inline style is stripped at mount — the user 2026-08-25, whose resting button wore an
+   accent outline and an off-black All state); only the svg centering is its own. */
+#feed-taglens { display: inline-flex; align-items: center; }
+#feed-taglens svg { display: block; }
+#feed-lensmore { padding: 4px 14px 10px; color: var(--dim); font-size: 0.82em; cursor: pointer; }
+#feed-lensmore:hover { color: var(--accent); text-decoration: underline; }
+#feed-lensmore.prominent { margin: 6px 8px 2px; padding: 10px 14px; background: #252526;
+  border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px;
+  color: var(--fg); font-size: 0.9em; }
+#feed-lensmore.prominent:hover { color: var(--fg); text-decoration: none; border-color: var(--accent); }
+/* The per-host loading strip (the user 2026-08-25; round two same day): an attached host's sessions
+   are on the tabs but its cards haven't merged yet — one quiet line per pending host, the SHARED
+   reverse-spin swirl glyph (.fask-awaiting-swirl, the user's pick over the dots) LEFT of the text,
+   dim at the footer's own scale. Never a takeover, and never hidden while the wait is real: the 45s
+   mark escalates the copy, a dead link names itself, and only the payload/detach events remove. */
+#feed-hostload { display: flex; flex-direction: column; gap: 4px; padding: 8px 14px; }
+.hostload-line { display: flex; align-items: center; gap: 7px; color: var(--dim); font-size: 0.82em; }
 /* the footer MODE button (the session combobox's "Sessions ▴"): active (.on) wears the accent language
    (blue text + border + faint wash), the same selected-state look the card section toggles use (the
    user 2026-07-07) */
@@ -931,6 +945,14 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
   border-radius: 4px; cursor: pointer; font-size: 11.5px; white-space: nowrap; }
 .feed-sessmenu .fsm-row:hover { background: rgba(255, 255, 255, 0.07); }
 .feed-sessmenu .fsm-row.on { background: rgba(156, 210, 255, 0.12); }
+/* TAG CHIPS on the combobox's session rows (the user 2026-08-25 — the smaller unification variant):
+   the dialog's own outline-pill vocabulary at the row's scale, NON-interactive (grouping made
+   visible; the controls stay separate). The strip ellipsizes in the row's leftover space — names
+   stay primary and rows never wrap. */
+.fsm-chips { flex: 1 1 auto; min-width: 0; margin-left: 8px; text-align: right;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; pointer-events: none; }
+.fsm-chip-tag { display: inline-block; font-style: normal; padding: 0 6px; margin-left: 4px;
+  border: 1px solid var(--dim); border-radius: 9px; font-size: 0.82em; color: var(--dim); }
 /* the VIEW MENU (the user 2026-08-24): the sort + layout controls live behind one monochrome ordering
    glyph now (NOT a gear — the strip's ⛭ sits right below this footer on the kernel page). The popup
    wears the shared .ctx-menu vocabulary (chrome defined with the card menus below); these rules add

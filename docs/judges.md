@@ -124,7 +124,15 @@ and tagged follow-ups (file under the cited goal unless the reply starts a
 different thread — and even then the new goal groups with the cited card
 under one umbrella: the follow-up tie). A segment opened by an
 untargeted kernel notice (restart or resume) carries a housekeeping note:
-pure verification sweeps file nothing.
+pure verification sweeps file nothing. Since 2026-08-25 that is also a
+mechanical floor, not just a request: a work-run whose segment was opened by
+romp's own bookkeeping — a kernel notice, or the CLI's `[Request
+interrupted…]` stop artifact — never mints a fresh top-level goal (its
+menu-targeted ops still apply, so the work keeps advancing existing cards),
+and no mint anywhere roots its promptUuid at a record that files nothing (a
+coordinate/question mail, a bookkeeping record): the anchor substitutes the
+segment's first assistant atom. The clear wrap-up is exempt — its one
+blocked card is the designed needs-you escape.
 
 **placer.** The second, scoped call, only when the chosen card already has
 open sub-goals: it sees just that card's subtree and picks the spot, biased
@@ -142,7 +150,22 @@ to narrate it. The closer supplies the missing verdicts; the unblocker retires t
 ones; the distiller and the briefer write what you read on the resolved card.
 
 **closer.** The turn-end completion backstop; it exists because agents
-rarely say "done". It audits only the goals the turn actually touched;
+rarely say "done". Since 2026-08-25 a delegated goal's report-back rides its
+audit: when a "delegated to" tracking item completes, the recipient's own
+resolution travels into the sender's tree (run_propagate) and the
+steps-finished nomination shows it to the closer as a marked
+"Delegation reports" section — before that, a delegated ask's only visible
+history was the dispatch, the closer correctly omitted, and the look-stamp
+sealed a finished question open forever (the auto-nudge then re-asked it
+seven times in 75 minutes). Two guardrails ride the same fix: the closer
+never completes a "delegated to" tracking item itself (its ending event is
+the recipient's completion — a dispatch-time done consumed the slot and
+starved the report), and on a status-reporting turn (nudge / follow-up /
+wrap-up) a cited UMBRELLA's open descendants ride the audit too — the
+umbrella's open leaf was otherwise reachable by no channel, since a nudge
+spliced into a busy session's running turn strips its own resolutions (a
+plain cited goal keeps the tops-only shape: the closer rules it directly).
+It audits only the goals the turn actually touched;
 verdict done, blocked, or omit, with "when in doubt, omit". Idempotent per
 turn. Its diary events carry src `closer`, so planner and closer verdicts
 stay distinguishable, and both defer to the user floor: a verdict computed
@@ -229,11 +252,31 @@ completed. Gated by its own signature, logged under its own name.
 The courier owns peer-message segments; the planners skip them. The sender
 declared each message delegate, coordinate, or question at send time
 (schema-required); the courier takes that as a strong prior and reads the
-body for whether work actually changed hands. Delegating plants a real goal
-in the recipient's tree (origin-stamped) plus a "delegated to" tracking
-node in the sender's; coordinating makes no card. The companion
-`run_propagate` is deterministic: when the recipient completes the plant,
-the sender's tracker checks itself off through the origin pointer.
+body for whether work actually changed hands. Since 2026-08-25 minting is
+CHAIN-ROOTED (the user's verdict, replacing a one-day view-side split):
+delegating plants a real goal in the recipient's tree (origin-stamped) only
+when the sender's linked goal traces to a human prompt — self-then-ancestors
+in the sender's store, origin hops into a local grand-sender's chain, the
+root record read against the sender's own session. An untraceable delegate
+files quietly instead: no recipient top (its work lives in that session's
+view and transcript, and a needs-you state still surfaces through the
+goal-independent hard-block floor), while the sender's "delegated to"
+tracking node plants either way — so the delegation stays one glance away on
+the sender's board. At mint time uncertainty files quiet; the burden of
+proof is on the mint, the inverse of a display filter's. Coordinating makes
+no card, ever. A planted goal also stores the delegating mail's cleaned
+first line as the additive node field `frame` (2026-08-25, part of the
+goal-node consumer contract): the distiller and briefer prepend it — with
+the sender's linked-ask title — to their prompts as a marked
+`<delegating-request>` section, so a delegated card's summary opens in the
+requester's phrasing (usually the user's own words) instead of the worker's
+implementation nouns. A goal without a frame (a session's own work, or a
+node minted before the field existed) distills byte-identically to before.
+The companion `run_propagate` is deterministic: when the
+recipient completes the plant, the sender's tracker checks itself off
+through the origin pointer; a quiet-filed delegation's tracker (which no
+recipient goal can ever back-link) completes on the recipient's reply — the
+report-back event, the same rule cross-host handoffs have always used.
 
 ## When a judge fails
 

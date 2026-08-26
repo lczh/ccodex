@@ -8,7 +8,7 @@ import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { freezeDiff } from "./feed-freeze";
+import { freezeDiff, contentSig } from "./feed-freeze";
 
 const FEED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.ts"), "utf8");
 const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.css"), "utf8");
@@ -78,6 +78,33 @@ test("a local render that detaches or re-keys the hovered element heals the free
     "a re-keyed card under a stationary pointer re-arms to the element actually hovered");
 });
 
+test("the self-note flags CONTENT changes only — the aging tint can never cry update (2026-08-25)", () => {
+  // the live specimen: a Completed card with its brief ready differed between builds ONLY in trgb
+  // (top level + inside every tree node) — the recency ramp aging, not content — yet the whole-item
+  // compare flagged it. The projection is an explicit list; volatile fields cannot silently rejoin.
+  const done = { itemId: "TESTSID:g1", text: "confirm changes under version control", column: "completed",
+    summary: "the brief", blockSummary: null, blocked: false, warns: null,
+    t: 100, mt: 200, last: 200, trgb: [19, 166, 216],
+    tree: [{ id: "TESTSID:g2", text: "step", status: "done", cleared: false, t: 100, mt: 150, trgb: [32, 175, 153] }] };
+  const aged = { ...done, trgb: [19, 166, 215], mt: 260, last: 260,
+    tree: [{ ...done.tree[0], trgb: [32, 175, 152], mt: 260 }] };
+  assert.equal(contentSig(done), contentSig(aged), "the user's exact shape: Completed + brief ready, tint aged → NO flag");
+  assert.notEqual(contentSig(done), contentSig({ ...done, summary: "a NEW brief" }), "real content still flags");
+  assert.notEqual(contentSig(done), contentSig({ ...done, column: "needs_input" }), "a column move flags");
+  assert.notEqual(contentSig(done),
+    contentSig({ ...done, tree: [{ ...done.tree[0], status: "open" }] }), "a sub-goal status change flags");
+  // identity stays strict: the compare joins by itemId (ask) / turnId member-set (group) — a
+  // SIBLING's change never flags the hovered card (each side signs only its own found item)
+  assert.match(FEED, /return contentSig\(asks\.find\(\(a\) => a\.itemId === key\) as any\) !== contentSig\(pend\.find\(\(a\) => a\.itemId === key\) as any\);/);
+  assert.match(FEED, /\.sort\(byId\)\.map\(\(a\) => contentSig\(a as any\)\)\.join\("\|"\)/,
+    "group compare: member-set content signatures, itemId-sorted");
+  const FRZ = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed-freeze.ts"), "utf8");
+  assert.match(FRZ, /const SELF_CONTENT = \["text", "column", "summary", "blockSummary", "blocked", "warns", "retrying", "nudgeFailed"\] as const;/,
+    "the explicit content list — new volatile fields cannot silently rejoin");
+  assert.match(FRZ, /o\.tree = tree\.map\(\(n\) => \[n\.id, n\.text, n\.status, n\.cleared\]\);/,
+    "sub-goals contribute identity/text/status only — never their own aging channels");
+});
+
 test("the badge hint mirrors the optimistic-restore overlay — a card the flush restores is no departure", () => {
   // found in review 2026-08-24: the displayed board holds a pendingRestored card the queued payload
   // lacks; without the mirror the badge promised a -1 that the flush immediately took back
@@ -107,6 +134,27 @@ test("the badge hint counts the USER'S view and never mutates state computing it
   const pv = FEED.slice(FEED.indexOf("function payloadView"), FEED.indexOf("function paintFreezeParts"));
   assert.ok(!pv.includes("pendingCleared.delete") && !pv.includes("pruneViewStateTo"),
     "the hint path is side-effect free");
+});
+
+test("the badges say what they mean; the frozen card's own update gets its own line (2026-08-25)", () => {
+  // the explicit reading joins the +N/−N (the user liked the numbers, wanted the meaning): one
+  // phrasing everywhere a badge renders, well under their verbosity ceiling, in the accent dress
+  assert.match(FEED, /note\.textContent = " \(" \+ \(c\.add \+ c\.del\) \+ " changed — mouse away to apply\)";/);
+  assert.match(CSS, /\.freeze-badge \.fz-note \{ color: var\(--accent\); font-weight: 400; \}/,
+    "accent var, never re-hardcoded; the badge's own scale");
+  // the hovered card's OWN pending update is a different fact — its own line, INDEPENDENT of the
+  // churn badges (both render when both are true: the self block sits outside the per-header loop)
+  assert.match(FEED, /function pendingSelfChanged\(key: string\): boolean/);
+  assert.match(FEED, /const selfKey = freezeKey \|\| tabScopeKey;/, "the pointer's card or the keyboard-scoped one");
+  assert.match(FEED, /selfNote\.textContent = "\(this card updated — mouse away to refresh\)";/);
+  assert.match(FEED, /if \(!selfKey \|\| !selfCard \|\| !pendingSelfChanged\(selfKey\)\) \{\s*\n\s*selfNote\?\.remove\(\);/,
+    "churn-only: no self line; self-only: badges empty but the line shows; both: both");
+  // group keys compare the turn's member set itemId-sorted — payload order can never fake a change
+  assert.match(FEED, /asks\.filter\(\(a\) => a\.turnId === tid\)\.slice\(\)\.sort\(byId\)/);
+  assert.match(CSS, /#freeze-selfnote \{ position: fixed; z-index: 6; pointer-events: none; color: var\(--accent\);/,
+    "pointer-inert — the note must never affect the hover it describes");
+  assert.match(FEED, /document\.getElementById\("freeze-selfnote"\)\?\.remove\(\);/,
+    "nothing pending → the line comes off with the badges");
 });
 
 test("badges wear the header conventions: accent adds, block-red removes, the count's own scale", () => {

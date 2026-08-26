@@ -10,7 +10,7 @@ import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { viewVisible, viewsKey, revealIn } from "../../ui/webview/session-views";
+import { viewVisible, viewsKey, revealIn, viewTagUnion } from "../../ui/webview/session-views";
 
 const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
 
@@ -32,19 +32,23 @@ test("executed: All shows literally everything (hidden retired 2026-08-24); unta
   assert.equal(viewVisible({ active: "g1", groups: [G] }, "s2"), true);
 });
 
-test("executed: reveal SWITCHES views, never mutates membership (hideIn retired 2026-08-24)", () => {
-  // the hide gesture is GONE with the hidden set (the user 2026-08-24: the tag system covers
-  // backgrounding; the kernel migrated existing entries into "archived"). revealIn survives for the
-  // picker's jump: minimal move, membership untouched (2026-08-23 — a peek never strips a tag).
+test("executed: reveal ADDS to the chat lens, never mutates membership (per-surface, 2026-08-25)", () => {
+  // the reveal keys on the CHAT surface's lens now: the minimal move is ADDITIVE — the holder tag
+  // (or the none bucket) JOINS the selection, and what the user was looking at stays visible.
+  // Membership is still never touched (2026-08-23 — a peek never strips a tag), and the legacy
+  // scalar `active` is left alone entirely (old clients own it).
   const rev = revealIn({ active: "g1", tags: [G] }, "s1");
-  assert.equal(rev.active, "all", "tagless session from a tag view → land on All, the default");
+  assert.deepEqual(rev.actives!.chat, { none: true, tags: ["pool"] },
+    "tagless from a tag view: the none bucket JOINS — the pool selection stays visible");
+  assert.equal(rev.active, "g1", "the legacy scalar is never rewritten");
   const rev2 = revealIn({ active: "untagged", tags: [G] }, "s2");
-  assert.equal(rev2.active, "g1", "tagged → its holder tag is its home view");
+  assert.deepEqual(rev2.actives!.chat, { none: true, tags: ["pool"] },
+    "tagged: its holder tag joins the selection; the untagged pick stays");
   assert.deepEqual(rev2.tags![0].members, ["s2"], "membership untouched — the jump never strips a tag");
   const revAll = revealIn({ active: "all", tags: [G] }, "s2");
-  assert.equal(revAll.active, "all", "everything is visible under All → nothing changes at all");
+  assert.equal(revAll.actives?.chat, undefined, "everything visible under All: nothing changes at all");
   const rev4 = revealIn({ active: "g1", tags: [G] }, "s2");
-  assert.equal(rev4.active, "g1", "already visible in the active tag → nothing changes");
+  assert.equal(rev4.actives?.chat, undefined, "already visible in the active tag: nothing changes");
 });
 
 test("executed: the canonical key ignores list order AND which key the kernel used", () => {
@@ -143,3 +147,26 @@ test("executed: untagged excludes by the UNION — a remote-homed tag counts (th
   assert.equal(viewVisible(v, "other"), true);
 });
 
+
+test("executed: the union renders in the USER'S order — tagOrder governs, remote-homed names hold position (the user 2026-08-25)", () => {
+  const v = {
+    active: "all",
+    tags: [
+      { id: "g1", name: "alpha", color: "#DD42FF", members: [] },
+      { id: "g2", name: "beta", color: "#4EC9B0", members: [] },
+    ],
+    remoteTags: [{ id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "remotepool", color: "#7aa2f7", members: [] }],
+  };
+  assert.deepEqual(viewTagUnion(v).map((u) => u.name), ["alpha", "beta", "remotepool"],
+    "no order yet → natural (array, then remotes) order");
+  assert.deepEqual(viewTagUnion({ ...v, tagOrder: ["remotepool", "alpha"] }).map((u) => u.name),
+    ["remotepool", "alpha", "beta"],
+    "the dragged order governs — the remote-homed name holds its position, viewer-side; unlisted names follow naturally");
+  // the echo key carries the order, so an optimistic drag clears on the kernel's echo and never flaps
+  assert.notEqual(viewsKey({ ...v, tagOrder: ["remotepool", "alpha"] }), viewsKey(v),
+    "tagOrder is part of the canonical echo compare");
+  // a user-typed name CAN be a prototype key (adversarial review 2026-08-25): the name-keyed
+  // builder crashed on {}["constructor"] resolving to Function — null-prototype lookups now
+  assert.deepEqual(viewTagUnion({ tags: [{ id: "p1", name: "constructor", members: [] }], tagOrder: ["constructor"] })
+    .map((u) => u.name), ["constructor"], "a prototype-key tag name builds and orders cleanly");
+});
