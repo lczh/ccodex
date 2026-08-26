@@ -9,6 +9,7 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -523,10 +524,45 @@ class PerFileOpSpool(unittest.TestCase):
         self.assertTrue((self.spdir / "100-qq.json.failed").exists(),
                         "quarantined loudly, never silently deleted — and the queue unwedges")
 
-    def test_a_dead_writers_tmp_is_swept(self):
-        (self.spdir / "100-tt.json.tmp").write_text('{"half": ')
+    def test_a_stage_file_is_never_read_and_never_raced(self):
+        # the r46 re-verify: sweeping tmps INSIDE the spool dir raced a live writer mid-stage
+        # (its rename hit ENOENT — the gesture silently lost). Writers stage in the SIBLING
+        # dir now; the replay neither reads nor deletes there, so a mid-stage writer can
+        # always complete its rename.
+        stage = km.jd.STATE / "pending-ui-ops.stage"
+        stage.mkdir(parents=True, exist_ok=True)
+        (stage / "100-tt.json").write_text('{"half": ')
         km._replay_ui_op_spool()
-        self.assertFalse((self.spdir / "100-tt.json.tmp").exists())
+        self.assertTrue((stage / "100-tt.json").exists(),
+                        "a mid-stage writer's file is untouchable — no sweep race")
+        (stage / "100-tt.json").unlink()
+
+    def test_a_partial_legacy_conversion_keeps_only_the_remainder(self):
+        # the r46 re-verify: a partial conversion left the WHOLE file behind — the converted
+        # prefix re-converted next pass and already-applied gestures replayed over later state
+        (km.jd.STATE / "pending-ui-ops.jsonl").write_text(
+            json.dumps({"op": "flag", "target": SID, "flag": "hideFromFeed", "value": True}) + "\n"
+            + json.dumps({"op": "flag", "target": SID, "flag": "hideFromFeed", "value": False}) + "\n")
+        real_replace = km.os.replace
+        state = {"n": 0}
+
+        def failing_second(src, dst):
+            if "0legacy" in str(dst) and str(dst).endswith(".json"):
+                state["n"] += 1
+                if state["n"] == 2:
+                    raise OSError(28, "ENOSPC")
+            return real_replace(src, dst)
+
+        with mock.patch.object(km.os, "replace", side_effect=failing_second):
+            km._replay_ui_op_spool()
+        legacy = km.jd.STATE / "pending-ui-ops.jsonl"
+        self.assertTrue(legacy.exists(), "the unconverted remainder survives")
+        rows = [json.loads(l) for l in legacy.read_text().splitlines() if l.strip()]
+        self.assertEqual([r["value"] for r in rows], [False],
+                         "ONLY the remainder — the converted prefix never re-converts")
+        km._replay_ui_op_spool()
+        flags = json.loads((km.jd.STATE / "session-flags.json").read_text())
+        self.assertNotIn(SID, flags, "final order holds: the un-hide is the last word")
 
     def test_legacy_ops_convert_to_files_and_survive_a_failure(self):
         # the r46 verification: the inline legacy path was still delete-on-failure — the

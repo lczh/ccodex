@@ -1818,6 +1818,33 @@ class RestartVerdictHonesty(unittest.TestCase):
                               "pkill pattern %r matches the apply script's own text" % pat)
 
 
+class KernelShaAttribution(unittest.TestCase):
+    """the r46 verification: a generation kernel reported the CHECKOUT's HEAD as its running
+    build — green verifiers over stale bytes after any respawn past a checkout move. The
+    RUNNING build's identity is the generation's own name."""
+
+    def setUp(self):
+        self._saved = (km.HERE, km._SHA)
+        km._SHA = None
+
+    def tearDown(self):
+        km.HERE, km._SHA = self._saved
+        os.environ.pop("ROMP_CHECKOUT", None)
+
+    def test_a_generation_kernel_reports_its_generation(self):
+        km.HERE = pathlib.Path("/x/.git/romp-run-aabbccdd/kernel")
+        os.environ["ROMP_CHECKOUT"] = "/x"
+        self.assertEqual(km._kernel_sha(), "aabbccdd",
+                         "the RUNNING bytes' commit, never the checkout's moving HEAD")
+
+    def test_a_manual_checkout_use_outside_a_generation_falls_back(self):
+        km.HERE = pathlib.Path("/x/somewhere/kernel")
+        os.environ["ROMP_CHECKOUT"] = "/x"
+        with mock.patch.object(km.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout="1234abcd\n")):
+            self.assertEqual(km._kernel_sha(), "1234abcd")
+
+
 class KernelRunsFromAGeneration(unittest.TestCase):
     """the v1.3.18 audit's P1: the kernel's CODE loads from the pinned generation while every
     ROOT-relative operation stays on the checkout ROMP_CHECKOUT names."""

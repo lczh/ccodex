@@ -37,12 +37,34 @@ KERNEL="${ROMP_KERNEL_BIN:-$ROMP_DIR/bin/romp-kernel}"
 # replaced a per-manager-lifetime env pin, which froze every respawn on the pinning update's
 # build: later LOCAL updates became silent no-ops running old bytes under a fresh sha.
 # An explicit ROMP_KERNEL_BIN still wins (the seam above).
+# a STALE PIN into a pruned generation self-heals here (the r46 re-verify: managers spawned by
+# the v1.3.18 env-pin wrapper carry ROMP_KERNEL_BIN for life, and once the pinned generation is
+# pruned that seam made every respawn exit 1 forever — a permanent crash loop). Only pins INTO
+# a romp-run-* dir are second-guessed; an explicit test/dev seam to any other path still wins
+# unconditionally.
+case "${ROMP_KERNEL_BIN:-}" in
+    *romp-run-*) [ -x "$ROMP_KERNEL_BIN" ] || unset ROMP_KERNEL_BIN ;;
+esac
+# recomputed AFTER the unset (the r46 coverage pass: KERNEL was assigned from the pin BEFORE
+# the case above, so a stale pin with no generation for the current HEAD still exited 1 at the
+# pruned path — the exact crash loop the self-heal exists for)
+KERNEL="${ROMP_KERNEL_BIN:-$ROMP_DIR/bin/romp-kernel}"
 if [ -z "${ROMP_KERNEL_BIN:-}" ]; then
     _RGD="$(git -C "$ROMP_DIR" rev-parse --absolute-git-dir 2>/dev/null || true)"
     _RH8="$(git -C "$ROMP_DIR" rev-parse --short=8 HEAD 2>/dev/null || true)"
-    if [ -n "$_RGD" ] && [ -n "$_RH8" ] && [ -x "$_RGD/romp-run-$_RH8/bin/romp-kernel" ]; then
+    _RDIRTY="$(git -C "$ROMP_DIR" status --porcelain 2>/dev/null | head -c 1 || true)"
+    if [ -z "$_RDIRTY" ] && [ -n "$_RGD" ] && [ -n "$_RH8" ] \
+            && [ -x "$_RGD/romp-run-$_RH8/bin/romp-kernel" ]; then
+        # a DIRTY checkout always runs live (the r46 re-verify: the generation silently
+        # shadowed a developer's uncommitted kernel edits, with no -dirty marker and no drift
+        # banner — the generation is the verified COMMIT, and edits mean the commit is not
+        # what the user is running)
         KERNEL="$_RGD/romp-run-$_RH8/bin/romp-kernel"
         export ROMP_CHECKOUT="$ROMP_DIR"
+    else
+        # the LIVE leg never inherits a stale ROMP_CHECKOUT (the r46 re-verify: a leaked value
+        # made _kernel_sha attribute live bytes to a generation name)
+        unset ROMP_CHECKOUT
     fi
 fi
 

@@ -3804,10 +3804,15 @@ class TimelinePanel {
       // appended to the unlinked inode, and the gesture existed under neither name. A rename
       // into the spool dir cannot lose against the consumer's per-file unlink.
       const dir = path.join(root, 'pending-ui-ops');
+      const stage = path.join(root, 'pending-ui-ops.stage');
       fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(stage, { recursive: true });
       const name = Date.now() + '-' + Math.random().toString(36).slice(2, 10) + '.json';
-      fs.writeFileSync(path.join(dir, name + '.tmp'), JSON.stringify(op));
-      fs.renameSync(path.join(dir, name + '.tmp'), path.join(dir, name));
+      // staged in a SIBLING dir (the r46 re-verify): a tmp inside the spool dir raced the
+      // kernel's sweep — the rename hit ENOENT and the gesture was silently lost, exactly at
+      // boot when writers are deepest in the kernel-down fallback
+      fs.writeFileSync(path.join(stage, name), JSON.stringify(op));
+      fs.renameSync(path.join(stage, name), path.join(dir, name));
     } catch (e) { /* can't queue — the gesture stays optimistic-only until the kernel returns */ }
   }
 

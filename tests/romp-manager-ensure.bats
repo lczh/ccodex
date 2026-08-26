@@ -111,6 +111,58 @@ teardown() {
     grep -q '^ROMP_SERVE_BIN=' "$envdump"   # the dump is real: other env DID flow through
 }
 
+@test "spawnKernel: a generation serve gets ROMP_SERVE_ROOT; generation pins never ride into the child" {
+    command -v node >/dev/null 2>&1 || skip "node not available"
+    command -v git >/dev/null 2>&1 || skip "git not available"
+
+    # Runtime-generation resolution at spawn (the v1.3.18 audit's P1, per-spawn per the r46
+    # verification). Provenance: the r46 re-verify — reverting the resolution kept every suite
+    # green, so this EXECUTES it end to end: a real tiny git checkout whose <gitdir>/romp-run-<h8>
+    # generation holds a fake romp-serve that dumps its env. The manager must (1) spawn THAT serve,
+    # (2) thread ROMP_SERVE_ROOT=<checkout> so the generation roots state at the real checkout,
+    # and (3) STRIP inherited generation pins (ROMP_KERNEL_BIN / ROMP_SERVE_BIN naming romp-run-*
+    # paths) from the child env — a pre-r46 manager's pin pointed at bytes one prune away from
+    # gone, a permanent exit-1 crash loop on respawn.
+    local FIXDIR="$TEST_DIR/genfix"
+    mkdir -p "$FIXDIR/bin"
+    local LIVEDUMP="$TEST_DIR/live-ran" GENDUMP="$TEST_DIR/gen-env"
+    # the checkout's own serve: if resolution regressed to it, it leaves a marker we assert against
+    printf '#!/usr/bin/env bash\ntouch "$LIVE_MARK"\nexec sleep 30\n' > "$FIXDIR/bin/romp-serve"
+    chmod +x "$FIXDIR/bin/romp-serve"
+    git -C "$FIXDIR" init -q -b main
+    git -C "$FIXDIR" add -A
+    git -C "$FIXDIR" -c user.email=t@t -c user.name=t commit -qm x
+    local GD H8
+    GD="$(git -C "$FIXDIR" rev-parse --absolute-git-dir)"
+    H8="$(git -C "$FIXDIR" rev-parse --short=8 HEAD)"
+    mkdir -p "$GD/romp-run-$H8/bin"
+    printf '#!/usr/bin/env bash\nenv > "$GEN_ENV_DUMP"\nexec sleep 30\n' > "$GD/romp-run-$H8/bin/romp-serve"
+    chmod +x "$GD/romp-run-$H8/bin/romp-serve"
+
+    # Stale generation pins ride the manager's own env (the pre-r46 wrapper's leftovers): the
+    # ROMP_SERVE_BIN one must be IGNORED by resolution, and NEITHER may reach the child.
+    env LIVE_MARK="$LIVEDUMP" GEN_ENV_DUMP="$GENDUMP" \
+        ROMP_DIR="$FIXDIR" \
+        ROMP_KERNEL_BIN="$GD/romp-run-deadbeef/bin/romp-kernel" \
+        ROMP_SERVE_BIN="$GD/romp-run-deadbeef/bin/romp-serve" \
+        ROMP_MANAGER_PORT=7601 ROMP_SERVE_PORT=7602 \
+        node "$MGR" up >/dev/null 2>&1 &
+    MGR_PID=$!
+    local i
+    for i in $(seq 1 50); do [ -s "$GENDUMP" ] && break; sleep 0.1; done
+    mcurl -fsS -X POST "http://127.0.0.1:7601/stop" >/dev/null 2>&1 || true
+
+    [ -s "$GENDUMP" ]                              # the GENERATION serve is the one that ran
+    [ ! -e "$LIVEDUMP" ]                           # the checkout's own serve never spawned
+    grep -q "^ROMP_SERVE_ROOT=$FIXDIR\$" "$GENDUMP"   # rooted at the real checkout, not the generation
+    # `run` + status, NOT a bare `! grep`: `!` is exempt from set -e, so mid-test it asserts nothing.
+    run grep -q '^ROMP_KERNEL_BIN=' "$GENDUMP"
+    [ "$status" -ne 0 ]
+    run grep -q '^ROMP_SERVE_BIN=' "$GENDUMP"
+    [ "$status" -ne 0 ]
+    grep -q '^ROMP_SERVE_PORT=7602$' "$GENDUMP"    # the dump is real: the spawn contract DID flow through
+}
+
 @test "quiet-mode refresh defers while turns are in flight, coalesces, applies on the quiet event" {
     command -v node >/dev/null 2>&1 || skip "node not available"
     command -v python3 >/dev/null 2>&1 || skip "python3 not available"

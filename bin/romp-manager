@@ -127,19 +127,25 @@ function rompServeBin() {
   // itself); otherwise the checkout's own serve, exactly as before. Resolved fresh at EVERY
   // spawn, so a respawn after the checkout moves runs the build that matches it — the env-pin
   // variant froze the manager on the pinning update's build for its whole lifetime.
+  // a STALE PIN into a pruned generation is ignored, not honored (the r46 re-verify: managers
+  // spawned by the v1.3.18 env-pin wrapper carry ROMP_SERVE_BIN for life; once that generation
+  // was pruned the pin fell through to the live serve WITH a stale ROMP_KERNEL_BIN riding the
+  // child env — a permanent exit-1 crash loop). Non-generation pins stay authoritative.
+  const pin = process.env.ROMP_SERVE_BIN;
+  const pinLive = !pin || pin.indexOf('romp-run-') < 0 || fs.existsSync(pin);
   const dir = process.env.ROMP_SERVE_ROOT || process.env.ROMP_DIR;
-  if (!process.env.ROMP_SERVE_BIN && dir) {
+  if ((!pin || !pinLive) && dir) {
     try {
       const gd = execFileSync('git', ['-C', dir, 'rev-parse', '--absolute-git-dir'],
-                              { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+                              { stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).toString().trim();
       const h8 = execFileSync('git', ['-C', dir, 'rev-parse', '--short=8', 'HEAD'],
-                              { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+                              { stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).toString().trim();
       const cand = path.join(gd, 'romp-run-' + h8, 'bin', 'romp-serve');
       if (gd && h8 && fs.existsSync(cand)) return cand;
     } catch (e) { /* no git / no checkout -> the classic chain below */ }
   }
   const cands = [
-    process.env.ROMP_SERVE_BIN,
+    pinLive ? process.env.ROMP_SERVE_BIN : null,
     process.env.ROMP_DIR && path.join(process.env.ROMP_DIR, 'bin', 'romp-serve'),
     path.join(__dirname, 'romp-serve'),
     path.join(os.homedir(), 'GitRepos', 'romp', 'bin', 'romp-serve'),
@@ -304,6 +310,11 @@ function spawnKernel(spec) {
                                            managerToken: managerControlToken });
   // stdio inherited → the kernel's own logs surface in this foreground terminal (visible owner).
   const serveBin = rompServeBin();
+  // generation pins never ride into the child: serve resolves the CURRENT generation itself,
+  // and an inherited pin from a pre-r46 manager pointed at bytes one prune away from gone
+  // (the r46 re-verify)
+  if (env.ROMP_KERNEL_BIN && String(env.ROMP_KERNEL_BIN).indexOf('romp-run-') >= 0) delete env.ROMP_KERNEL_BIN;
+  if (env.ROMP_SERVE_BIN && String(env.ROMP_SERVE_BIN).indexOf('romp-run-') >= 0) delete env.ROMP_SERVE_BIN;
   if (serveBin.indexOf('romp-run-') >= 0) {
     // a GENERATION serve must still root at the checkout: its path-derived default would root
     // at the generation and scatter state there (the r46 verification)
@@ -686,7 +697,7 @@ function ensureUp() {
 // Exported for unit tests (restartGate = the pure storm-cap decision). The CLI dispatch runs only when this
 // file is executed directly, so require()-ing it from a test has no side effects.
 module.exports = { restartGate, quietGate, quietTick, loadSpecs, specEnv, fileStamp,
-  configuredPort, ensurePort, validControlToken };
+  configuredPort, ensurePort, validControlToken, rompServeBin };
 if (require.main === module) {
   const cmd = process.argv[2];
   // `restart-all` (the `romp refresh` deploy path) defers to the next quiet window by default —

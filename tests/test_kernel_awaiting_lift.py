@@ -118,6 +118,49 @@ class AwaitingLift(unittest.TestCase):
         nodes = json.loads((km.jd.GOALDIR / (SID + ".json")).read_text())["nodes"]
         return nodes[self.gid].get("awaitingWhy") or None
 
+    def _rows(self):
+        nodes = json.loads((km.jd.GOALDIR / (SID + ".json")).read_text())["nodes"]
+        return [e for e in (nodes[self.gid].get("log") or []) if e.get("kind") == "awaiting"]
+
+    def test_the_supersede_lift_journals_the_reply_it_cited(self):
+        # the r46 re-verify: the WRITER legs had no revert-detecting test — the four endEv
+        # tests hand-wrote rows and only exercised the readers. This drives the sweep itself.
+        self._seed(kind="peer", anchor=STAMP, written=STAMP)
+        self._transcript([])
+        saved = (km._peer_answered, km._peer_stamp_superseded)
+        km._peer_answered = lambda sid: (STAMP + 50, {})
+        km._peer_stamp_superseded = lambda nd, answered: STAMP + 50
+        try:
+            self._tick(now=STAMP + 500)
+        finally:
+            km._peer_answered, km._peer_stamp_superseded = saved
+        lifts = [e for e in self._rows() if e.get("lift")]
+        self.assertTrue(lifts, "the superseded stamp lifted")
+        self.assertEqual(lifts[-1].get("endEv"), STAMP + 50,
+                         "the lift journals the REPLY it cited — its epistemic boundary at the "
+                         "stand-down gates, never its late arrival (the v1.3.18 audit)")
+
+    def test_the_supersede_predicate_answers_with_the_reply_time(self):
+        nd = {"awaitingAt": STAMP, "awaitingKind": "peer",
+              "log": [{"kind": "awaiting", "ev_t": STAMP, "at": STAMP}]}
+        self.assertEqual(km._peer_stamp_superseded(nd, (STAMP + 50, None)), STAMP + 50,
+                         "truthiness for every reader, the evidence for the sweep's journal")
+        self.assertEqual(km._peer_stamp_superseded(nd, (STAMP - 5, None)), 0)
+
+    def test_the_orphan_lift_journals_the_respawn_that_proved_the_death(self):
+        self._seed(kind="agents", anchor=STAMP, written=STAMP)
+        self._transcript([])                           # transcript shows NOTHING running
+        saved = km._sdk_spawned_at
+        km._sdk_spawned_at = lambda sid: STAMP + 30
+        try:
+            km._lift_spent_awaiting(STAMP + 500, {SID: {"state": "", "bgTasks": []}})
+        finally:
+            km._sdk_spawned_at = saved
+        lifts = [e for e in self._rows() if e.get("lift")]
+        self.assertTrue(lifts, "the orphaned agents stamp lifted")
+        self.assertEqual(lifts[-1].get("endEv"), STAMP + 30,
+                         "the (re)spawn that proved the death is the journaled evidence")
+
     # ---- the bug ----
     def test_both_dispatches_returned_lifts_the_stamp(self):
         self._transcript([_launch("t1", LAUNCH), _launch("t2", LAUNCH + 5),

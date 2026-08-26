@@ -134,3 +134,97 @@ test('fileStamp changes when the file changes — the staleness detector', () =>
     assert.equal(fileStamp(f + '.missing'), '', 'a missing file stamps empty');
   });
 });
+
+// ── rompServeBin: per-spawn runtime-generation resolution (the v1.3.18 audit's P1, redesigned
+// per the r46 verification). Provenance for every test below: the r46 re-verify — reverting the
+// resolution kept every suite green, so these EXECUTE it. A real tiny git repo stands in for the
+// checkout; the generation lives at <gitdir>/romp-run-<sha8>/bin/romp-serve.
+const { rompServeBin } = require(path.join(__dirname, '..', 'bin', 'romp-manager'));
+const { execFileSync } = require('node:child_process');
+
+function withGenRepo(fn) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'romp-genrepo-'));
+  fs.mkdirSync(path.join(d, 'bin'));
+  fs.writeFileSync(path.join(d, 'bin', 'romp-serve'), '#!/bin/sh\n', { mode: 0o755 });
+  execFileSync('git', ['-C', d, 'init', '-q', '-b', 'main'], { stdio: 'ignore' });
+  execFileSync('git', ['-C', d, 'add', '-A'], { stdio: 'ignore' });
+  execFileSync('git', ['-C', d, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'x'],
+               { stdio: 'ignore' });
+  const out = (args) => execFileSync('git', ['-C', d, ...args],
+                                     { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+  const gd = out(['rev-parse', '--absolute-git-dir']);
+  const h8 = out(['rev-parse', '--short=8', 'HEAD']);
+  const gen = path.join(gd, 'romp-run-' + h8, 'bin', 'romp-serve');
+  fs.mkdirSync(path.dirname(gen), { recursive: true });
+  fs.writeFileSync(gen, '#!/bin/sh\n', { mode: 0o755 });
+  try { return fn({ d, gd, gen }); } finally { fs.rmSync(d, { recursive: true, force: true }); }
+}
+
+// rompServeBin reads process.env at call time; scope every case's env and restore after.
+function withEnv(vars, fn) {
+  const keys = ['ROMP_SERVE_BIN', 'ROMP_SERVE_ROOT', 'ROMP_DIR'];
+  const saved = {};
+  for (const k of keys) { saved[k] = process.env[k]; delete process.env[k]; }
+  Object.assign(process.env, vars);
+  try { return fn(); } finally {
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+    }
+  }
+}
+
+test('rompServeBin resolves the generation serve for the checkout HEAD (per spawn, via ROMP_DIR)', () => {
+  // the r46 re-verify: reverting the resolution kept every suite green
+  withGenRepo(({ d, gen }) => {
+    assert.equal(withEnv({ ROMP_DIR: d }, rompServeBin), gen);
+  });
+});
+
+test('rompServeBin: ROMP_SERVE_ROOT outranks ROMP_DIR (the snapshot-updater seam)', () => {
+  // the r46 re-verify: reverting the resolution kept every suite green
+  withGenRepo(({ d, gen }) => {
+    assert.equal(withEnv({ ROMP_SERVE_ROOT: d, ROMP_DIR: '/nonexistent-romp-dir' }, rompServeBin),
+                 gen);
+  });
+});
+
+test('rompServeBin: no generation for HEAD falls to the checkout\'s own serve, exactly as before', () => {
+  // the r46 re-verify: reverting the resolution kept every suite green
+  withGenRepo(({ d, gd, gen }) => {
+    fs.rmSync(path.join(gd, path.relative(gd, gen).split(path.sep)[0]),
+              { recursive: true, force: true });
+    assert.equal(withEnv({ ROMP_DIR: d }, rompServeBin), path.join(d, 'bin', 'romp-serve'));
+  });
+});
+
+test('rompServeBin: a STALE generation pin is ignored — resolution proceeds to HEAD\'s generation', () => {
+  // the r46 re-verify (reverting kept every suite green): managers spawned by the v1.3.18
+  // env-pin wrapper carry ROMP_SERVE_BIN for life; once that generation was pruned the pin
+  // fell through WITH a stale ROMP_KERNEL_BIN riding the child env — a permanent crash loop
+  withGenRepo(({ d, gd, gen }) => {
+    const stale = path.join(gd, 'romp-run-deadbeef', 'bin', 'romp-serve');
+    assert.equal(withEnv({ ROMP_SERVE_BIN: stale, ROMP_DIR: d }, rompServeBin), gen);
+  });
+});
+
+test('rompServeBin: a stale pin with NO generation at all falls to the live serve — never the pin', () => {
+  // the r46 re-verify: reverting the resolution kept every suite green
+  withGenRepo(({ d, gd, gen }) => {
+    fs.rmSync(path.dirname(path.dirname(gen)), { recursive: true, force: true });
+    const stale = path.join(gd, 'romp-run-deadbeef', 'bin', 'romp-serve');
+    assert.equal(withEnv({ ROMP_SERVE_BIN: stale, ROMP_DIR: d }, rompServeBin),
+                 path.join(d, 'bin', 'romp-serve'));
+  });
+});
+
+test('rompServeBin: a NON-generation pin stays authoritative even when a generation exists', () => {
+  // the r46 re-verify (reverting kept every suite green): only pins INTO a romp-run-* dir are
+  // second-guessed; the explicit test/dev seam keeps winning unconditionally
+  withGenRepo(({ d }) => {
+    const pin = path.join(os.tmpdir(), 'romp-explicit-serve-' + process.pid);
+    fs.writeFileSync(pin, '#!/bin/sh\n', { mode: 0o755 });
+    try {
+      assert.equal(withEnv({ ROMP_SERVE_BIN: pin, ROMP_DIR: d }, rompServeBin), pin);
+    } finally { fs.rmSync(pin, { force: true }); }
+  });
+});

@@ -281,6 +281,115 @@ HOLDPY
     [[ "$output" != *KERNEL_RAN* ]]
 }
 
+# ── runtime-generation resolution (the v1.3.18 audit's P1, per-spawn per the r46 verification) ──
+# When a durable per-commit generation (<gitdir>/romp-run-<sha8>, built by the update
+# transactions) matches the checkout's CURRENT HEAD, serve execs ITS kernel — the verified
+# commit's exact bytes — with ROMP_CHECKOUT pointing state/git/dist work at the real checkout.
+# A dirty checkout, or no generation for HEAD, runs the checkout's own kernel exactly as before.
+# Provenance for every test in this section: the r46 re-verify — reverting the resolution kept
+# every suite green, so these EXECUTE it. NOTE: setup() exports ROMP_KERNEL_BIN (the classic
+# stub seam), which bypasses this whole block, so each test here unsets or overrides it.
+
+_gen_fixture() {
+    unset ROMP_KERNEL_BIN               # setup()'s seam would win over the resolution
+    unset ROMP_CHECKOUT                 # never inherit one from the invoking environment
+    GENFIX="$TEST_DIR/genfix"
+    mkdir -p "$GENFIX/bin"
+    # the checkout's OWN kernel (committed, so the checkout is clean per `git status --porcelain`)
+    cat > "$GENFIX/bin/romp-kernel" << 'STUB'
+#!/usr/bin/env bash
+echo "LIVE_KERNEL_RAN"
+echo "LIVE_CHECKOUT=${ROMP_CHECKOUT:-<unset>}"
+STUB
+    chmod +x "$GENFIX/bin/romp-kernel"
+    echo tracked > "$GENFIX/tracked.txt"    # the file the dirty cases edit
+    git -C "$GENFIX" init -q -b main
+    git -C "$GENFIX" add -A
+    git -C "$GENFIX" -c user.email=t@t -c user.name=t commit -qm x
+    GENGD="$(git -C "$GENFIX" rev-parse --absolute-git-dir)"
+    GENH8="$(git -C "$GENFIX" rev-parse --short=8 HEAD)"
+    # the generation for HEAD, inside the git dir (invisible to `git status`)
+    mkdir -p "$GENGD/romp-run-$GENH8/bin"
+    cat > "$GENGD/romp-run-$GENH8/bin/romp-kernel" << 'STUB'
+#!/usr/bin/env bash
+echo "GEN_KERNEL_RAN"
+echo "GEN_CHECKOUT=${ROMP_CHECKOUT:-<unset>}"
+STUB
+    chmod +x "$GENGD/romp-run-$GENH8/bin/romp-kernel"
+    # point the REAL bin/romp-serve at the fixture checkout (the updater's snapshot seam)
+    export ROMP_SERVE_ROOT="$GENFIX"
+}
+
+@test "romp-serve: a CLEAN checkout with a generation for HEAD runs the GENERATION kernel, ROMP_CHECKOUT exported" {
+    # the r46 re-verify: reverting the resolution kept every suite green — this executes it
+    _gen_fixture
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"GEN_KERNEL_RAN"* ]]
+    [[ "$output" == *"GEN_CHECKOUT=$GENFIX"* ]]      # state/git/dist stay on the real checkout
+    [[ "$output" != *"LIVE_KERNEL_RAN"* ]]
+}
+
+@test "romp-serve: a DIRTY checkout skips the generation — the live kernel runs, no ROMP_CHECKOUT" {
+    # the r46 re-verify (reverting kept every suite green): the generation silently shadowed a
+    # developer's uncommitted kernel edits — the generation is the verified COMMIT, and edits
+    # mean the commit is not what the user is running
+    _gen_fixture
+    echo change >> "$GENFIX/tracked.txt"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"LIVE_KERNEL_RAN"* ]]
+    [[ "$output" == *"LIVE_CHECKOUT=<unset>"* ]]
+    [[ "$output" != *"GEN_KERNEL_RAN"* ]]
+}
+
+@test "romp-serve: the live leg UNSETS an inherited ROMP_CHECKOUT (never attribute live bytes to a generation)" {
+    # the r46 re-verify (reverting kept every suite green): a leaked value made _kernel_sha
+    # attribute live bytes to a generation name
+    _gen_fixture
+    echo change >> "$GENFIX/tracked.txt"             # dirty → the live leg
+    ROMP_CHECKOUT=/stale/inherited run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"LIVE_CHECKOUT=<unset>"* ]]
+}
+
+@test "romp-serve: a STALE generation pin self-heals to per-spawn resolution instead of exit 1" {
+    # the r46 re-verify (reverting kept every suite green): managers spawned by the v1.3.18
+    # env-pin wrapper carry ROMP_KERNEL_BIN for life; once the pinned generation was pruned
+    # that seam made every respawn exit 1 forever — a permanent crash loop
+    _gen_fixture
+    ROMP_KERNEL_BIN="$GENGD/romp-run-deadbeef/bin/romp-kernel" run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"GEN_KERNEL_RAN"* ]]            # healed into HEAD's own generation
+    [[ "$output" == *"GEN_CHECKOUT=$GENFIX"* ]]
+}
+
+@test "romp-serve: an explicit NON-generation ROMP_KERNEL_BIN still wins over a live generation" {
+    # the r46 re-verify (reverting kept every suite green): only pins INTO a romp-run-* dir are
+    # second-guessed; the explicit test/dev seam to any other path stays unconditional
+    _gen_fixture
+    cat > "$TEST_DIR/explicit-kernel" << 'STUB'
+#!/usr/bin/env bash
+echo "EXPLICIT_KERNEL_RAN"
+STUB
+    chmod +x "$TEST_DIR/explicit-kernel"
+    ROMP_KERNEL_BIN="$TEST_DIR/explicit-kernel" run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"EXPLICIT_KERNEL_RAN"* ]]
+    [[ "$output" != *"GEN_KERNEL_RAN"* ]]
+}
+
+@test "romp-serve: a MISSING non-generation ROMP_KERNEL_BIN fails loudly — never silently self-healed" {
+    # the r46 re-verify (reverting kept every suite green): the stale-pin second-guess is scoped
+    # to romp-run-* paths; a broken explicit seam must surface, not fall through to other bytes
+    _gen_fixture
+    ROMP_KERNEL_BIN="$TEST_DIR/no-such-kernel" run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"kernel not found"* ]]
+    [[ "$output" != *"GEN_KERNEL_RAN"* ]]
+    [[ "$output" != *"LIVE_KERNEL_RAN"* ]]
+}
+
 @test "romp-serve: INSIDE the install transaction (live marker) the gate stands down" {
     # gating against our own transaction deadlocked the fresh install's dashboard-link poll
     # (the adversarial review, 2026-08-18); the marker counts only while its pid is alive
@@ -301,4 +410,18 @@ HOLDPY
     [ "$st_live" -eq 0 ]
     [[ "$out_live" == *KERNEL_RAN* ]]
     [ "$st_stale" -eq 70 ]      # a DEAD holder's marker is stale: the gate is back
+}
+
+@test "romp-serve: a STALE generation pin over a generation-less HEAD heals to the LIVE kernel, never exit 1" {
+    # the r46 coverage pass: KERNEL was computed from the pin BEFORE the stale-pin unset, so a
+    # pre-r46 manager's lifetime pin crash-looped serve on a pruned/generation-less checkout.
+    # The heal must land on the LIVE kernel when no generation matches HEAD.
+    _gen_fixture
+    GD="$(git -C "$GENFIX" rev-parse --absolute-git-dir)"
+    rm -rf "$GD/romp-run-"*                     # no generation for HEAD at all
+    export ROMP_KERNEL_BIN="$GD/romp-run-deadbeef/bin/romp-kernel"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [[ "$output" == *LIVE_KERNEL_RAN* ]]
+    [[ "$output" == *"LIVE_CHECKOUT=<unset>"* ]]
 }

@@ -1923,7 +1923,9 @@ def _replay_ui_op_spool():
         except OSError:
             continue
         seq = 0
-        for ln in lines:
+        converted = []
+        failed_at = None
+        for i, ln in enumerate(lines):
             if not ln.strip():
                 continue
             try:
@@ -1937,28 +1939,36 @@ def _replay_ui_op_spool():
                 tmp = spdir / ("0legacy-%d-%d.json.tmp" % (os.getpid(), seq))
                 tmp.write_text(ln)
                 os.replace(tmp, spdir / ("0legacy-%d-%d.json" % (os.getpid(), seq)))
+                converted.append(i)
             except OSError:
-                sys.stderr.write("ui-op spool: legacy line %d could not convert — kept in place\n" % seq)
-                seq = -1
+                failed_at = i
                 break
-        if seq >= 0:
-            try:
+        try:
+            if failed_at is None:
                 legacy.unlink()
-            except OSError:
-                pass
+            else:
+                # a PARTIAL conversion must never leave the whole file behind (the r46
+                # re-verify: the converted prefix re-converted next pass and already-applied
+                # gestures replayed OVER later state — an un-mute reverted). The file shrinks
+                # to the unconverted remainder, atomically.
+                rest = "\n".join(lines[failed_at:]) + "\n"
+                rtmp = legacy.with_suffix(".rest")
+                rtmp.write_text(rest)
+                os.replace(rtmp, legacy)
+                sys.stderr.write("ui-op spool: legacy conversion stopped at line %d — the "
+                                 "remainder is kept, never the converted prefix\n" % failed_at)
+        except OSError:
+            pass
     try:
         entries = sorted(os.listdir(spdir))
     except OSError:
         entries = []
     finals = {n for n in entries if n.endswith(".json")}
-    for n in entries:
-        # a .tmp with no published twin is a writer that died mid-stage: the gesture never
-        # existed; sweep it so the dir stays bounded (the r46 verification)
-        if n.endswith(".json.tmp") and n[:-4] not in finals:
-            try:
-                (spdir / n).unlink()
-            except OSError:
-                pass
+    # NO tmp sweep here (the r46 re-verify): the sweep raced a LIVE writer mid-stage — the
+    # writer's rename hit ENOENT and the gesture was silently lost, exactly at boot when
+    # writers are deepest in the kernel-down fallback. Writers stage in the SIBLING
+    # pending-ui-ops.stage/ dir now and rename across; a crashed writer's stage file is inert
+    # bytes the replay never reads.
     for n in sorted(finals):
         p = spdir / n
         try:
@@ -12730,6 +12740,33 @@ PR_WATCH_BUSY_EVERY = 90     # …relaxed while checks are visibly still running
 PR_WATCH_MAX_FAILS = 3       # consecutive gh failures before the loud retire
 _pr_watches = []             # [{pr, repo, sid, at} + runtime {_next, _fails, _busy}]
 _pr_watch_lock = threading.Lock()
+
+
+def _prune_stale_generations():
+    """Drop romp-run-* generations that are neither the RUNNING one nor the current HEAD's —
+    at boot, under the update flock (skip when held: an in-flight transaction owns the dir).
+    The p2p wrapper prunes under its own flock, but rr/pull-updated hosts never run it, and
+    their generations accumulated in the git dir unboundedly (the r46 re-verify)."""
+    gd = _update_git_dir()
+    if not gd:
+        return
+    keep = {"romp-run-" + _sha8(_checkout_sha() or "")}
+    if os.environ.get("ROMP_CHECKOUT") and HERE.parent.name.startswith("romp-run-"):
+        keep.add(HERE.parent.name)
+    lk = _update_flock()
+    if lk is None:
+        return                                        # a live transaction owns the generations
+    try:
+        for g in os.listdir(gd):
+            if g.startswith("romp-run-") and g not in keep and not g.endswith(".tmp"):
+                shutil.rmtree(os.path.join(str(gd), g), ignore_errors=True)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(lk)
+        except OSError:
+            pass
 
 
 def _clear_restart_marker_if_current():
@@ -33597,6 +33634,7 @@ def main():
     _remotes_load()                                            # re-attach remote kernels from a prior run
     _pr_watches_load()                                         # re-arm PR-landing watches (same intent rule)
     _clear_restart_marker_if_current()                         # this boot IS the restart the marker wanted (P1.2)
+    _prune_stale_generations()                                 # rr/pull hosts have no wrapper prune (r46)
     _replay_ui_op_spool()                                      # gestures queued while no kernel ran — applied
     #                                                            through the locked setters, post-migration (P1.5)
     _consume_update_report()                                   # last self-update's outcome → the Log, once
