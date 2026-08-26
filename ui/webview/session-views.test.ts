@@ -77,7 +77,9 @@ test("every cycling path walks the VISIBLE order — keyboard can never land on 
 
 test("optimistic edits hold sticky and yield to the kernel after three silent pushes", () => {
   assert.match(RENDER, /function captureViews\(v: SessionViews \| null\) \{[\s\S]{0,600}\+\+pendingViewsAge >= 3/);
-  assert.match(RENDER, /function postViews\(v: SessionViews\) \{[\s\S]{0,300}setTimelineViews/);
+  // postViews routes through the SHARED writer (views-writer.ts, the 2026-08-26 audit's Finding
+  // A) — the raw setTimelineViews post re-echoed the payload rev and two quick gestures self-409'd
+  assert.match(RENDER, /function postViews\(v: SessionViews\) \{[\s\S]{0,300}postViewsWrite\(/);
 });
 
 test("a view-filtered session keeps one visible home: the picker's other-view section, and picking jumps views", () => {

@@ -6,6 +6,7 @@
 // so the colours are IDENTICAL to the ledger box.
 import { delegate } from "./actions";
 import { SessionViews, viewTagUnion } from "./session-views";
+import { anchorViewsRev, consumeViewsAck, postViewsWrite } from "./views-writer";
 import { lensVisible, surfaceLens } from "./tag-lens";
 import { openTagMenu, tagMenuButton, syncTagFilter } from "./tag-menu";
 import { fleetVisibleRoots } from "./fleet-roots";
@@ -632,12 +633,16 @@ function mountControls() {
 
 window.addEventListener("message", (e: MessageEvent) => {
   const m = e.data;
+  // the kernel's per-write CAS answer to our setTimelineViews posts (the 2026-08-26 audit's
+  // Finding A) → the shared writer re-anchors its optimistic counter; the next feed push repaints
+  // the outline with the store's truth either way, so a refusal needs no rollback of its own here
+  if (consumeViewsAck(m)) return;
   if (!m || m.type !== "feed") return;               // Fleet rides the FEED payload (proven channel); reads its `ledgers`
   // "loaded" means the kernel actually BUILT the fleet's ledgers (the key is present, even if []) — NOT merely
   // that some feed message arrived. A feed push can reach us before the (cold) ledger build finishes; treating
   // that as loaded would drop the loader onto an empty pane (the user 2026-06-29). Until ledgers land, keep the
   // loader up (render() bails, leaving the list empty so _pane_spin holds).
-  if (m.views && typeof m.views === "object") fleetViews = m.views as SessionViews;   // rides the feed payload (2026-08-25)
+  if (m.views && typeof m.views === "object") { fleetViews = m.views as SessionViews; anchorViewsRev(fleetViews); }   // rides the feed payload (2026-08-25)
   if (!Array.isArray(m.ledgers)) return;
   loaded = true;
   sessions = m.ledgers as FleetSession[];
@@ -839,7 +844,9 @@ function showHoverCard(row: HTMLElement, sid: string, nid: string): void {
           const v = JSON.parse(JSON.stringify(fleetViews || { active: "all", tags: [] }));
           v.actives = Object.assign({}, v.actives, { outline: l });
           fleetViews = v;                                        // optimistic: the next feed push echoes it
-          vscodeApi?.postMessage({ type: "setTimelineViews", views: v });
+          // the SHARED writer (views-writer.ts, Finding A): stamps an advancing baseRev so two
+          // quick lens picks don't both declare the same CAS base and lose the second
+          if (vscodeApi) postViewsWrite((msg) => vscodeApi.postMessage(msg), v);
           render();
         },
         onConfigure: () => { vscodeApi?.postMessage({ type: "openTagsDialog" }); },
@@ -855,7 +862,7 @@ function showHoverCard(row: HTMLElement, sid: string, nid: string): void {
       const v = JSON.parse(JSON.stringify(fleetViews || { active: "all", tags: [] }));
       v.actives = Object.assign({}, v.actives, { outline: l });
       fleetViews = v;
-      vscodeApi?.postMessage({ type: "setTimelineViews", views: v });
+      if (vscodeApi) postViewsWrite((msg) => vscodeApi.postMessage(msg), v);   // the shared writer, as above
       render();
     });
     syncFleetTagBtn();

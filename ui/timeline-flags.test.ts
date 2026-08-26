@@ -113,7 +113,7 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
     // views edits ride the kernel's TARGETED ops and spool the same grammar kernel-down
     const fn = SRC.indexOf("_setViews(v, ops)");
     assert.ok(fn > 0, "_setViews names its ops");
-    const win = SRC.slice(fn, fn + 1800);
+    const win = SRC.slice(fn, fn + 2400);
     const kp = win.indexOf("_kernelPost('/views'");
     const sp = win.indexOf("_spoolOp({ op: 'views'");
     assert.ok(kp > 0 && sp > kp, "views: kernel first, spool on network failure only");
@@ -150,7 +150,7 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
   }
   {
     const fn = SRC.indexOf("tagEditFailed(m) {");
-    const win = SRC.slice(fn, fn + 1600);
+    const win = SRC.slice(fn, fn + 2000);
     assert.ok(win.indexOf("_applyLocalOp(o.inverse)") > 0,
       "the refusing host's entries roll the local half back — the union never stays split");
   }
@@ -219,10 +219,12 @@ test("source: tagEditFailed compensates SIBLING hosts — inverse remote edits; 
   const fn = SRC.indexOf("tagEditFailed(m) {");
   const win = SRC.slice(fn, fn + 3800);
   assert.ok(win.indexOf("_applyLocalOp(o.inverse)") > 0, "the local rollback survives untouched");
-  // the r46 verification: the refusal carries no gesture id, so of the host+name matches only the
-  // MOST-RECENT gesture's entries (the max gid group) compensate — never other gestures' entries
+  // a refusal carrying the opId the edit was stamped with compensates EXACTLY that gesture (the
+  // 2026-08-26 audit's Finding C — the kernel echoes it); an opId-less frame (an old kernel)
+  // falls back to the newest-gid heuristic (the r46 verification: host+name alone also swept
+  // OTHER gestures' entries into the rollback)
   assert.match(win, /const newestGid = matched\.reduce\(\(g, o\) => Math\.max\(g, o\.gid \|\| 0\), 0\);/);
-  assert.match(win, /const ops = matched\.filter\(\(o\) => \(o\.gid \|\| 0\) === newestGid\);/);
+  assert.match(win, /const ops = matched\.filter\(\(o\) => m\.opId \? String\(o\.gid \|\| 0\) === String\(m\.opId\)\s*\n\s*: \(o\.gid \|\| 0\) === newestGid\);/);
   // gid-matched entries on OTHER hosts (still unconfirmed — _reconcileUnionOps already dropped
   // confirmed ones) get the inverse REMOTE edit and are dropped as compensated
   assert.match(win, /o\.gid && gids\.has\(o\.gid\)/);
@@ -489,5 +491,103 @@ test("executed: a refusal compensates ONLY the newest gesture's entries for that
   assert.deepEqual(panel._unionOps.map((o: any) => [o.host, o.gid]),
     [["TESTHOST-A", gid1], ["TESTHOST-B", gid1]],
     "the older gesture's entries survive for their own ack/reconcile");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews;
+});
+
+// ── the 2026-08-26 audit's Findings B + C ─────────────────────────────────────────────────────
+// B: the Obsidian/Electron no-ops branch reduced every blob write to {ops:[{active}]} — the
+// multi-select lens map (v.actives), the union drag order (v.tagOrder), and dialog-minted tags
+// all silently vanished on the POST path. A no-ops write posts the REV-GATED WHOLE BLOB now.
+// C: the kernel echoes the edit's opId on tagEditFailed, so a delayed refusal rolls back exactly
+// the gesture it refused — the newest-gid heuristic stays only for opId-less frames (old kernels).
+
+test("executed: a no-ops _setViews POSTs the whole rev-gated blob — actives/tagOrder/tags survive (Finding B)", async () => {
+  delete (g as any).__rompTimelineSetViews;              // no WS hook → the Electron POST branch
+  (process.versions as any).electron = "30.0.0";
+  try {
+    const panel = drawnPanel();
+    panel._spoolOp = () => { throw new Error("a kernel-up answer must never spool"); };
+    const posts: any[] = [];
+    panel._kernelPost = (route: string, body: any) => { posts.push([route, body]); return Promise.resolve({ ok: true, json: { ok: true, rev: 8 } }); };
+    panel._optViewsRev = 3;
+    const nv = JSON.parse(JSON.stringify(panel._curViews()));
+    nv.actives = { timeline: { tags: ["pool"] } };       // the multi-select lens map
+    nv.tagOrder = ["pool"];                              // the union drag order
+    panel._setViews(nv);                                 // NO ops — the exact shape that was reduced
+    await new Promise((r) => setImmediate(r));
+    assert.equal(posts[0][0], "/views");
+    const body = posts[0][1];
+    assert.ok(body.views && !body.ops, "no ops → the whole blob, never the {active} reduction");
+    assert.deepEqual(body.views.actives, { timeline: { tags: ["pool"] } }, "the lens map rides");
+    assert.deepEqual(body.views.tagOrder, ["pool"], "the drag order rides");
+    assert.ok(Array.isArray(body.views.tags) && body.views.tags.length, "tags ride (dialog mints)");
+    assert.equal(body.views.baseRev, 3, "the blob is REV-GATED — the optimistic counter's base");
+    assert.ok(!("rev" in body.views), "the stale payload rev never rides a write");
+    assert.equal(panel._optViewsRev, 8, "the response rev re-anchors via viewsAck (200 and 409 alike)");
+    // callers that NAME their ops still compose server-side — the ops path is untouched
+    panel._setViews(nv, [{ active: "all" }]);
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(posts[1][1], { ops: [{ active: "all" }] });
+    // kernel UNREACHABLE: the replay spool speaks only the op grammar — the blob write degrades
+    // to its active pick there only (the pre-existing reduction, confined to the offline spool)
+    const spooled: any[] = [];
+    panel._spoolOp = (op: any) => spooled.push(op);
+    panel._kernelPost = () => Promise.resolve({ ok: false, json: null });
+    panel._setViews(nv);
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(spooled, [{ op: "views", ops: [{ active: "all" }] }]);
+  } finally {
+    delete (process.versions as any).electron;
+  }
+});
+
+test("executed: _viewsKey sees actives — a dropped lens write is VISIBLE to the reconcile, never masked (Finding B)", () => {
+  const panel = drawnPanel();
+  const a = { active: "all", tags: [] };
+  const b = { active: "all", tags: [], actives: { timeline: { tags: ["pool"] } } };
+  assert.notEqual(panel._viewsKey(a), panel._viewsKey(b),
+    "blobs differing ONLY in actives hash apart — an echo missing the lens can't fake a confirm");
+  assert.equal(panel._viewsKey(JSON.parse(JSON.stringify(b))), panel._viewsKey(b), "same shape, same key");
+});
+
+test("executed: a refusal carrying an opId rolls back EXACTLY that gesture — even with a newer one live (Finding C)", () => {
+  const wires: any[] = [];
+  g.__rompTimelineEditTag = (e: any) => wires.push(e);
+  g.__rompTimelineSetViews = () => {};
+  const panel = new TimelinePanel(makeNode("div"));
+  panel.update({
+    now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+    turns: {}, messages: [], judging: [],
+    views: {
+      active: "all",
+      tags: [{ id: "g1", name: "pool", color: "#DD42FF", members: ["s1", "s2"] }],
+      remoteTags: [
+        { id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool", color: "#7aa2f7", members: ["s1", "s2"] },
+        { id: "TESTHOST-B:r2", host: "TESTHOST-B", name: "pool", color: "#4EC9B0", members: ["s1", "s2"] },
+      ],
+    },
+  });
+  // gesture 1 removes s1, gesture 2 removes s2 — each fans to owners A and B
+  panel._editTagUnion(viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool"), { remove: ["s1"] });
+  panel._editTagUnion(viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool"), { remove: ["s2"] });
+  const gid1 = panel._unionOps[0].gid, gid2 = panel._unionOps[2].gid;
+  assert.ok(gid2 > gid1, "gestures mint increasing ids");
+  // every dispatched remote edit is STAMPED with its gesture's id — the kernel echoes it back
+  assert.equal(wires.length, 4, "two gestures × two owners");
+  assert.deepEqual(wires.map((w) => w.opId), [String(gid1), String(gid1), String(gid2), String(gid2)],
+    "each wire edit carries ITS OWN gesture's opId");
+  const inverse: any[] = [];
+  panel._editRemoteTag = (rt: any, edit: any) => { inverse.push({ rt, edit }); return true; };
+  // the refusal names gesture 1 — the OLDER one. The newest-gid heuristic would have hit
+  // gesture 2 (the delayed-refusal cross-gesture rollback this kills for real).
+  panel.tagEditFailed({ host: "TESTHOST-B", name: "pool", opId: String(gid1), error: "kernel refused" });
+  assert.deepEqual(panel._curViews().tags.find((t: any) => t.id === "g1").members, ["s1"],
+    "gesture 1's local half rolled back (s1 restored); gesture 2's removal of s2 STANDS");
+  assert.equal(inverse.length, 1, "one sibling inverse — gesture 2's entries stay quiet");
+  assert.equal(inverse[0].rt.host, "TESTHOST-A");
+  assert.deepEqual(inverse[0].edit, { add: ["s1"] }, "the inverse restores gesture 1's members only");
+  assert.deepEqual(panel._unionOps.map((o: any) => [o.host, o.gid]),
+    [["TESTHOST-A", gid2], ["TESTHOST-B", gid2]],
+    "gesture 2's entries survive untouched for their own verdicts");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews;
 });

@@ -14,6 +14,7 @@ import yaml from "highlight.js/lib/languages/yaml";
 import type { ParsedAsk } from "../ask-types";
 import { TABBAR_H_KEY, TABBAR_H_DEFAULT, clampTabbarH, parseTabbarH } from "./tabbar-resize";
 import { SessionViews, viewVisible, viewsKey, revealIn, viewTagUnion, viewTags, type TagUnion, type SessionTag } from "./session-views";
+import { anchorViewsRev, consumeViewsAck, postViewsWrite } from "./views-writer";
 import { lensVisible, surfaceLens } from "./tag-lens";
 import { openTagMenu, tagMenuButton, syncTagFilter } from "./tag-menu";
 import { syncSessionsFromTabMeta, applyMetaToSession, notePendingMeta, PendingTabMeta } from "./tab-meta";
@@ -482,6 +483,7 @@ let allHiddenBlanked = false;   // the active transcript was blanked because EVE
 function effViews(): SessionViews | null { return pendingSessionViews ?? sessionViews; }
 function captureViews(v: SessionViews | null) {
   if (v) sessionViews = v;
+  anchorViewsRev(v);   // every payload's rev re-anchors the shared writer (the timeline's update() rule)
   // v null = a tabOrder frame WITHOUT the blob (an older kernel in a mixed-version mesh): it still
   // ages a pending edit, or the optimistic state would fake success forever against a kernel that
   // will never confirm it
@@ -498,10 +500,14 @@ function captureViews(v: SessionViews | null) {
 }
 // (postViews below runs the same re-derivation for the LOCAL optimistic edit — both views-arrival
 // paths keep the active session's peek state current.)
+// postViews writes through the SHARED writer (views-writer.ts, the 2026-08-26 audit's Finding A):
+// the raw setTimelineViews post re-echoed the payload's rev, so the second of two quick gestures
+// always declared a stale CAS base and was refused — the writer stamps an advancing baseRev and
+// the viewsAck frame (routed below) re-anchors it.
 function postViews(v: SessionViews) {
   pendingSessionViews = v; pendingViewsAge = 0;
   if (activeId) assertPeekFor(activeId);   // the optimistic edit re-derives the active session's peek too
-  if (vscodeApi) vscodeApi.postMessage({ type: "setTimelineViews", views: v });
+  if (vscodeApi) postViewsWrite((m) => vscodeApi.postMessage(m), v);
   renderTabs();
 }
 // ── EPHEMERAL PEEK TAB (the user 2026-08-24, superseding the kernel's reveal-rule view mutation):
@@ -11388,6 +11394,9 @@ window.addEventListener("message", (e: MessageEvent) => {
   else if (m.type === "working") { workingSet = new Set(Array.isArray(m.names) ? m.names : []); refreshPostalDots(); }
   else if (m.type === "imgData" && typeof m.path === "string") onImgData(m.path, typeof m.url === "string" ? m.url : null, typeof m.sid === "string" ? m.sid : null);
   else if (m.type === "tabOrder") { captureViews(m.views || null); applyTabOrder(m.order, m.tabs); }
+  // the kernel's per-write CAS answer to our setTimelineViews posts → the shared writer re-anchors;
+  // a refusal (ok:false) drops the KNOWN-refused optimistic overlay now, not after three silent pushes
+  else if (m.type === "viewsAck") consumeViewsAck(m, () => { pendingSessionViews = null; pendingViewsAge = 0; renderTabs(); });
   else if (m.type === "renamed" && m.id && typeof m.name === "string") {
     notePendingMeta(pendingTabMeta, m.id, { name: m.name });   // kernel truth — hold it against a push built pre-rename
     const s = sessions.get(m.id);

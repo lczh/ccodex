@@ -2604,6 +2604,9 @@ class TimelinePanel {
   // may clamp names, so compare shapes, not object identity
   _viewsKey(v) {
     return JSON.stringify({ active: v.active || 'all',
+      actives: v.actives || {}, // per-surface lenses are client-posted state — a dropped lens
+      //                           write must be VISIBLE to the reconcile, never masked (the
+      //                           2026-08-26 audit's Finding B; session-views.ts's viewsKey twin)
       order: v.tagOrder || [],   // the dragged union order is client-posted state (2026-08-25)
       hidden: (v.hidden || []).slice().sort(),
       tags: viewTags(v).map((t) => ({ id: t.id, name: t.name, color: t.color,
@@ -2629,8 +2632,11 @@ class TimelinePanel {
   // one remote-tag edit, dispatched to its HOME kernel and rendered optimistically meanwhile.
   // Ids ride viewer-relative; the kernel sends only the bare sid tails (sids are global) and the
   // owner resolves them into ITS frame. No hook (the Obsidian panel) → the tag stays read-only
-  // and the refusal is immediate and visible, never a silent drop.
-  _editRemoteTag(rt, edit) {
+  // and the refusal is immediate and visible, never a silent drop. `gid` (the 2026-08-26 audit's
+  // Finding C) stamps the dispatch with its GESTURE's id as edit.opId — the kernel echoes it on
+  // tagEditFailed, so a delayed refusal rolls back exactly the gesture it refused instead of
+  // whichever one is newest by then.
+  _editRemoteTag(rt, edit, gid) {
     if (typeof window === 'undefined' || typeof window.__rompTimelineEditTag !== 'function') {
       this._tagEditErr = { host: rt.host, name: rt.name,
                            error: 'this panel cannot reach ' + (rt.host || 'the owner') + " — edit with: romp tag --host " + (rt.host || '<kernel>') };
@@ -2645,9 +2651,11 @@ class TimelinePanel {
       if (edit.remove) next.members = next.members.filter((x) => edit.remove.indexOf(x) < 0);
     }
     this._pendingTagEdits[rt.id] = { tag: next, age: 0 };
-    window.__rompTimelineEditTag({ host: rt.host, name: rt.name, rename: edit.rename,
-                                   color: edit.color, add: edit.add, remove: edit.remove,
-                                   delete: !!edit.delete });
+    const wire = { host: rt.host, name: rt.name, rename: edit.rename,
+                   color: edit.color, add: edit.add, remove: edit.remove,
+                   delete: !!edit.delete };
+    if (gid) wire.opId = String(gid);   // the kernel echoes it back on this edit's refusal
+    window.__rompTimelineEditTag(wire);
     this.draw();
     return true;
   }
@@ -2663,13 +2671,17 @@ class TimelinePanel {
     // the refusing host+name fire; entries already confirmed by polls have aged out.
     const matched = (this._unionOps || []).filter((o) => o.host === (m.host || '')
       && (!m.name || o.name === m.name));
-    // ...and of those, ONLY the most-recent gesture's (the max gid group; the r46 verification):
-    // the refusal carries no gesture id, so host+name alone also swept OTHER gestures' entries
-    // into this rollback, reverting and inverse-dispatching edits the refusal said nothing
-    // about. Older groups keep their entries and settle on their own evidence — the owner's
-    // polled confirm (_reconcileUnionOps) or their own refusal.
+    // ...and of those, EXACTLY the refused gesture's when the frame carries the opId the edit
+    // was stamped with (the kernel echoes it since the 2026-08-26 audit's Finding C — a delayed
+    // refusal names the gesture it refused, ending the cross-gesture rollback for real). An
+    // opId-less frame (an old kernel) falls back to the newest-gid heuristic (the r46
+    // verification): host+name alone also swept OTHER gestures' entries into this rollback,
+    // reverting and inverse-dispatching edits the refusal said nothing about. Non-compensated
+    // groups keep their entries and settle on their own evidence — the owner's polled confirm
+    // (_reconcileUnionOps) or their own refusal.
     const newestGid = matched.reduce((g, o) => Math.max(g, o.gid || 0), 0);
-    const ops = matched.filter((o) => (o.gid || 0) === newestGid);
+    const ops = matched.filter((o) => m.opId ? String(o.gid || 0) === String(m.opId)
+                                             : (o.gid || 0) === newestGid);
     this._unionOps = (this._unionOps || []).filter((o) => ops.indexOf(o) < 0);
     for (const o of ops) this._applyLocalOp(o.inverse);
     // ...AND the same gesture's SIBLING remote halves (the v1.3.18 audit's P2: partial
@@ -2779,7 +2791,7 @@ class TimelinePanel {
           t.members = Array.from(new Set((t.members || []).concat(edit.add)));
           this._setViews(nv, [{ tag: g.localId, add: edit.add.slice() }]);
         }
-      } else if (g.remotes.length) this._editRemoteTag(g.remotes[0], { add: edit.add.slice() });
+      } else if (g.remotes.length) this._editRemoteTag(g.remotes[0], { add: edit.add.slice() }, gid);
     }
     if (edit.remove && edit.remove.length) {
       // REMOTE halves first: an initiation that cannot even reach its owner must not leave the
@@ -2789,7 +2801,7 @@ class TimelinePanel {
       const dispatched = [];
       for (const rt of g.remotes)
         if ((rt.members || []).some((m) => edit.remove.indexOf(m) >= 0)) {
-          removeOk = this._editRemoteTag(rt, { remove: edit.remove.slice() }) && removeOk;
+          removeOk = this._editRemoteTag(rt, { remove: edit.remove.slice() }, gid) && removeOk;
           dispatched.push(rt);
         }
       if (removeOk && g.localId) {
@@ -2812,7 +2824,7 @@ class TimelinePanel {
       let fanOk = true;                              // remote halves FIRST (P2.16, as above)
       for (const rt of g.remotes)
         fanOk = this._editRemoteTag(rt, { rename: edit.rename, color: edit.color,
-                                          delete: !!edit.delete }) && fanOk;
+                                          delete: !!edit.delete }, gid) && fanOk;
       if (fanOk && g.localId) {
         const nv = JSON.parse(JSON.stringify(this._curViews()));
         const before = viewTags(this._curViews()).find((x) => x.id === g.localId) || {};
@@ -2952,10 +2964,13 @@ class TimelinePanel {
         window.__rompTimelineSetViews(v);
       } else if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
         // Obsidian only — the Electron guard keeps a bare-node test run from ever touching real
-        // state (the 2026-07-02 _persistOrder lesson).
-        const body = (ops && ops.length) ? { ops: ops }
-          : { ops: [{ active: (v && v.active) || 'all' }] };   // callers without a grammar are
-        //                                                        the active-view picks
+        // state (the 2026-07-02 _persistOrder lesson). Named ops compose server-side; a caller
+        // WITHOUT ops posts the REV-GATED WHOLE BLOB (the 2026-08-26 audit's Finding B: the old
+        // {active} reduction silently dropped actives/tagOrder/new tags on this host — the
+        // multi-select lens, the union drag, and dialog edits all write blob-only fields).
+        let blob = null;
+        if (!ops || !ops.length) { blob = Object.assign({}, v, { baseRev: baseRev }); delete blob.rev; }
+        const body = blob ? { views: blob } : { ops: ops };
         this._kernelPost('/views', body, true).then((r) => {
           // the POST twin of the WS viewsAck (the r46 verification): the response body carries
           // the store's actual rev — 200 and 409 alike — so the counter re-anchors here exactly
@@ -2964,7 +2979,9 @@ class TimelinePanel {
           if (r.ok !== false && r.json && typeof r.json.rev === 'number')
             this.viewsAck({ ok: r.ok === true, rev: r.json.rev });
           if (r.ok !== false) return;                // applied, or refused (kernel up)
-          this._spoolOp({ op: 'views', ops: body.ops });
+          // the replay spool speaks only the targeted-op grammar, so a kernel-down blob write
+          // degrades to its active pick there (the pre-existing reduction, offline-only now)
+          this._spoolOp({ op: 'views', ops: body.ops || [{ active: (v && v.active) || 'all' }] });
         }).catch(() => { /* can't persist */ });
       }
     } catch (e) { /* no host hook + no Node → session-local only */ }

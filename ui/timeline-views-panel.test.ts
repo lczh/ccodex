@@ -287,7 +287,12 @@ test("_setViews posts through the host hook; Obsidian rides targeted kernel ops 
   // `true` = wantJson: the POST response's body carries the store's rev — the counter re-anchor
   // (the r46 verification); the bare-verdict form the other callers use is unchanged
   assert.match(SRC, /_kernelPost\('\/views', body, true\)/);
-  assert.match(SRC, /_spoolOp\(\{ op: 'views', ops: body\.ops \}\)/);
+  // kernel-down, the spool still speaks only the targeted-op grammar — a blob write (no ops)
+  // degrades to its active pick THERE ONLY (the 2026-08-26 audit's Finding B confined it)
+  assert.match(SRC, /_spoolOp\(\{ op: 'views', ops: body\.ops \|\| \[\{ active: \(v && v\.active\) \|\| 'all' \}\] \}\)/);
+  // …while a kernel-up no-ops write posts the REV-GATED WHOLE BLOB (actives/tagOrder/tags ride)
+  assert.match(SRC, /blob = Object\.assign\(\{\}, v, \{ baseRev: baseRev \}\); delete blob\.rev;/);
+  assert.match(SRC, /const body = blob \? \{ views: blob \} : \{ ops: ops \};/);
   assert.match(SRC, /this\._pendingViews = v; this\._pendingViewsAge = 0;/);
   assert.match(SRC, /this\._reconcileViews\(\);\s*\/\/ \.\.\.and an optimistic view edit/);
 });
