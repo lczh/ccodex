@@ -55,23 +55,31 @@ def _apply_script():
 
 
 class ApplyScriptPkillPattern(unittest.TestCase):
-    def test_the_pattern_does_not_match_its_own_text(self):
-        script = _apply_script()
-        self.assertIn('["pkill","-f",', script, "the apply still kills the old kernel "
-                      "(inside the locked python since r44)")
-        pat = re.search(r'\["pkill","-f","([^"]+)"\]', script).group(1)
-        # THE bug: the pattern, applied to the script that carries it, must find nothing.
-        self.assertIsNone(re.search(pat, script),
-                          "pkill pattern %r matches the apply script's own text — it would kill the "
-                          "apply shell mid-run, exactly the bug this guards" % pat)
+    # The apply now carries TWO pkills (the v1.3.18 audit's P1: the MANAGER dies first, or its
+    # exit handler respawns the killed kernel through the live checkout's serve before the pinned
+    # ensure runs). Every pattern gets the self-match guard; the SET must still cover both the
+    # real kernel and the real manager command lines.
 
-    def test_the_pattern_still_matches_a_real_kernel_command_line(self):
+    def test_no_pattern_matches_its_own_text(self):
         script = _apply_script()
-        pat = re.search(r'\["pkill","-f","([^"]+)"\]', script).group(1)
+        pats = re.findall(r'\["pkill","-f","([^"]+)"\]', script)
+        self.assertGreaterEqual(len(pats), 2, "the apply kills the manager AND the old kernel "
+                                "(inside the locked python since r44; manager since the "
+                                "v1.3.18 audit's P1)")
+        for pat in pats:
+            # THE bug: a pattern, applied to the script that carries it, must find nothing.
+            self.assertIsNone(re.search(pat, script),
+                              "pkill pattern %r matches the apply script's own text — it would kill "
+                              "the apply shell mid-run, exactly the bug this guards" % pat)
+
+    def test_the_patterns_still_match_the_real_command_lines(self):
+        script = _apply_script()
+        pats = re.findall(r'\["pkill","-f","([^"]+)"\]', script)
         for real in ("/usr/bin/python3 /home/u/GitRepos/romp/bin/romp-kernel",
-                     "python3.12 /home/u/romp/bin/romp-kernel --port 29855"):
-            self.assertIsNotNone(re.search(pat, real),
-                                 "pattern %r must still kill the real kernel (%r)" % (pat, real))
+                     "python3.12 /home/u/romp/bin/romp-kernel --port 29855",
+                     "node /home/u/romp/bin/romp-manager ensure"):
+            self.assertTrue(any(re.search(p, real) for p in pats),
+                            "patterns %r must still kill the real process (%r)" % (pats, real))
 
 
 @unittest.skipUnless(sys.platform.startswith("linux") or sys.platform == "darwin",
@@ -83,20 +91,21 @@ class RealPkillBehaviour(unittest.TestCase):
 
     def test_pgrep_does_not_match_a_process_merely_carrying_the_pattern(self):
         script = _apply_script()
-        pat = re.search(r'\["pkill","-f","([^"]+)"\]', script).group(1)
-        # a decoy that merely CONTAINS the pattern text, like the apply shell does
-        decoy = subprocess.Popen(["/bin/sh", "-c",
-                                  'echo "pkill -f \\"%s\\"" >/dev/null; sleep 5' % pat])
-        try:
-            time.sleep(0.4)
-            r = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True)
-            hits = [p for p in (r.stdout or "").split() if p.strip()]
-            self.assertNotIn(str(decoy.pid), hits,
-                             "the pattern matched a process that merely carries its text — that is the "
-                             "self-kill condition")
-        finally:
-            decoy.kill()
-            decoy.wait(timeout=5)
+        # every shipped pattern (kernel + manager since the v1.3.18 audit's P1) gets the check
+        for pat in re.findall(r'\["pkill","-f","([^"]+)"\]', script):
+            # a decoy that merely CONTAINS the pattern text, like the apply shell does
+            decoy = subprocess.Popen(["/bin/sh", "-c",
+                                      'echo "pkill -f \\"%s\\"" >/dev/null; sleep 5' % pat])
+            try:
+                time.sleep(0.4)
+                r = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True)
+                hits = [p for p in (r.stdout or "").split() if p.strip()]
+                self.assertNotIn(str(decoy.pid), hits,
+                                 "pattern %r matched a process that merely carries its text — that "
+                                 "is the self-kill condition" % pat)
+            finally:
+                decoy.kill()
+                decoy.wait(timeout=5)
 
 
 if __name__ == "__main__":

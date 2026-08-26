@@ -140,7 +140,8 @@ class OneHopNeverALoop(unittest.TestCase):
 
     def test_the_route_exists_and_only_fans_out_on_the_explicit_flag(self):
         self.assertIn('if u.path == "/judge-settings":', self.src)
-        self.assertIn('if isinstance(body, dict) and body.get("propagate"):', self.src)
+        # the v1.3.18 audit's boolean sweep: the flag is a real JSON True, never a truthy value
+        self.assertIn('if isinstance(body, dict) and body.get("propagate") is True:', self.src)
         self.assertIn('fwd = {k: v for k, v in body.items() if k != "propagate"}', self.src,
                       "a forwarded body never carries the flag — one hop, never a mesh loop")
 

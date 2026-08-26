@@ -281,13 +281,19 @@ class NotifyWiring(unittest.TestCase):
 
     def test_the_ws_handler_persists_the_card_toggle(self):
         self.assertIn('msg.get("type") == "cardNotify"', self.src)
+        # the v1.3.18 audit's boolean sweep: a non-boolean value warns and never reaches the
+        # store (bool("false") is True) — the gate precedes the setter, which takes the
+        # validated value as-is
+        self.assertIn('if msg.get("value") is not True and msg.get("value") is not False:', self.src)
         # sid rides so delete-if-default resolves against the card's own default
-        self.assertIn('_set_notify_card(str(msg["itemId"]), bool(msg.get("value")), str(msg.get("sid") or ""))',
+        self.assertIn('_set_notify_card(str(msg["itemId"]), msg["value"], str(msg.get("sid") or ""))',
                       self.src)
 
     def test_the_session_bell_routes_to_its_tristate_setter(self):
-        # setSessionFlag's pop-on-false is right for the view flags but would eat a mute
-        self.assertIn('_set_notify_session(str(msg["id"]), bool(msg.get("value")))', self.src)
+        # setSessionFlag's pop-on-false is right for the view flags but would eat a mute.
+        # The v1.3.18 audit's boolean sweep gates the value first (a real JSON boolean or a
+        # warn-and-refuse), so the setter receives it unwrapped
+        self.assertIn('_set_notify_session(str(msg["id"]), msg["value"])', self.src)
 
     def test_the_master_has_both_routes_and_broadcasts(self):
         # GET paints the bell at boot; POST flips it, rebuilds the feed (per-card bells repaint

@@ -30,7 +30,11 @@ class TabFlags(unittest.TestCase):
     def test_kernel_handles_a_chat_side_setSessionFlag(self):
         text = open(KPATH).read()
         self.assertIn('msg.get("type") == "setSessionFlag"', text)
-        self.assertIn("_set_session_flag(str(msg[\"id\"]), str(msg[\"flag\"]), bool(msg.get(\"value\")))", text)
+        # the v1.3.18 audit's boolean sweep: the handler refuses a non-boolean value (a string
+        # "false" would have armed muting/isolation via bool()); only a real JSON boolean
+        # reaches the setter, passed through as-is
+        self.assertIn('if msg.get("value") is not True and msg.get("value") is not False:', text)
+        self.assertIn("_set_session_flag(str(msg[\"id\"]), str(msg[\"flag\"]), msg[\"value\"])", text)
 
     def test_set_session_flag_round_trips(self):
         sid = "11111111-2222-3333-4444-555555555555"

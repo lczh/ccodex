@@ -25,7 +25,28 @@ os.environ["ROMP_KERNEL_NO_OPEN"] = "1"
 os.environ.setdefault("ROMP_SERVE_TOKEN", "test-token-DO-NOT-USE")
 km = SourceFileLoader("romp_kernel", os.path.join(BIN, "romp-kernel")).load_module()
 
-SID = "11111111-2222-3333-4444-555555555555"
+# PRIVATE synthetic sid (the goal-store fixture rule, tests/test_model_fallback_card.py
+# DedupeBackstop): at run time every module shares ONE state dir (each import of "romp_judge"/
+# "romp_kernel" re-executes the SAME module objects, so the last importer's tmpdir serves the
+# whole run). These tests arm hideFromFeed/postalServiceOff through the REAL setters — under the
+# shared placeholder sid, the leftover flags took the judge suite's sessions out of task tracking
+# (run_plan/sweep skip _hidden_from_feed sessions): 15 test_judge failures, full-suite only.
+SID = "66666666-7777-8888-9999-000000000000"
+
+
+def _scrub_state():
+    """Remove every state file these tests write through the REAL setters — leftovers leak into
+    the run-wide shared state dir (see the SID note above); writers call this in setUp AND
+    tearDown so nothing survives the module."""
+    import shutil
+    shutil.rmtree(km.jd.STATE / "pending-ui-ops", ignore_errors=True)
+    for name in ("pending-ui-ops.jsonl", "pending-ui-ops.replay.jsonl",
+                 "session-flags.json", "timeline-views.json"):
+        try:
+            (km.jd.STATE / name).unlink()
+        except OSError:
+            pass
+    km._flags_cache.clear()
 
 
 class StateWriteRoutes(unittest.TestCase):
@@ -131,14 +152,11 @@ class ViewsRevisionAndOps(unittest.TestCase):
     def setUp(self):
         self._dirty = km._mark_views_dirty
         km._mark_views_dirty = lambda: None
-        try:
-            km._views_path().unlink()
-        except OSError:
-            pass
-        km._flags_cache.clear()
+        _scrub_state()
 
     def tearDown(self):
         km._mark_views_dirty = self._dirty
+        _scrub_state()
 
     def _post(self, path, body):
         req = urllib.request.Request(
@@ -357,18 +375,13 @@ class UiOpSpoolReplay(unittest.TestCase):
     pass — never a raw whole-file write."""
 
     def setUp(self):
-        for name in ("pending-ui-ops.jsonl", "pending-ui-ops.replay.jsonl",
-                     "session-flags.json", "timeline-views.json"):
-            try:
-                (km.jd.STATE / name).unlink()
-            except OSError:
-                pass
-        km._flags_cache.clear()
+        _scrub_state()
         self._dirty = km._mark_views_dirty
         km._mark_views_dirty = lambda: None
 
     def tearDown(self):
         km._mark_views_dirty = self._dirty
+        _scrub_state()
 
     def test_flag_and_views_ops_replay_through_the_locked_setters(self):
         sp = km.jd.STATE / "pending-ui-ops.jsonl"
@@ -416,22 +429,15 @@ class PerFileOpSpool(unittest.TestCase):
     op now: only successfully applied ops are consumed; a failed op's file is retained."""
 
     def setUp(self):
-        import shutil
+        _scrub_state()
         self.spdir = km.jd.STATE / "pending-ui-ops"
-        shutil.rmtree(self.spdir, ignore_errors=True)
         self.spdir.mkdir(parents=True, exist_ok=True)
-        for name in ("session-flags.json", "timeline-views.json",
-                     "pending-ui-ops.jsonl", "pending-ui-ops.replay.jsonl"):
-            try:
-                (km.jd.STATE / name).unlink()
-            except OSError:
-                pass
-        km._flags_cache.clear()
         self._dirty = km._mark_views_dirty
         km._mark_views_dirty = lambda: None
 
     def tearDown(self):
         km._mark_views_dirty = self._dirty
+        _scrub_state()
 
     def test_op_files_apply_in_name_order_and_are_consumed(self):
         (self.spdir / "100-aa.json").write_text(json.dumps(
