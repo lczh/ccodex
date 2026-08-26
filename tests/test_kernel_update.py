@@ -391,6 +391,21 @@ class RunUpdate(Fresh):
         self.assertLess(script.index('&& gen_build "$NEW8"'), script.index("if pub_line"),
                         "…and BEFORE the latch is spent: a missing generation fails the update")
         self.assertIn('romp-run-$1', script, "the per-commit generation name the resolvers read")
+        # the r47 verification pair: the heal leg spends the latch only through gen_build too,
+        # and gen_build content-checks the unpacked tree then publishes by a rename that FAILS
+        # on an existing target (`mv` silently NESTED the tmp dir inside a concurrent winner)
+        self.assertIn('gen_build "$CUR"', script,
+                      "the settle heal builds the generation before spending the latch")
+        self.assertLess(script.index('gen_build "$CUR"'), script.index("pick_pub \"$CURLINE\""),
+                        "…as a REQUIRED link ahead of the heal's publish-then-spend")
+        self.assertIn('/bin/romp-"kernel ]', script,
+                      "gen_build refuses an archive that unpacks no executable kernel "
+                      "(non-contiguous spelling: this script rides in bash -c argv, where a "
+                      "contiguous name would match the restart pkill's bracket pattern)")
+        self.assertIn("os.rename(sys.argv[1], sys.argv[2])", script,
+                      "the publish rename fails on an existing generation — the loser blesses "
+                      "the winner instead of nesting into it")
+        self.assertNotIn('mv "$GBGD', script, "no mv publish anywhere in gen_build")
         self.assertIn("update-report.json", script)
         # the restart rides the SUCCESS branch only: everything after `if` up to `else` has it,
         # the failure branch does not
@@ -447,7 +462,8 @@ class RunUpdate(Fresh):
             self.assertIn("readable regular file", km._UPDATE_ERROR[0])
 
     def _execute_captured_updater(self, verify_rc, enforce=False, install_rc=0, manager_port=None,
-                                  pre_latch=None, latch_mode=None, pre_files=None):
+                                  pre_latch=None, latch_mode=None, pre_files=None,
+                                  archive_paths="install.sh bin"):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "repo"; root.mkdir()
             (root / ".git").mkdir()                   # the interprocess update flock lives here
@@ -464,18 +480,24 @@ class RunUpdate(Fresh):
             # harness's to pass), and an inherited $GIT_CALLS proved flaky under the full suite —
             # a fork occasionally saw it empty, crashing the stub before its exec and flipping
             # enforcement off (2026-08-16, three hits in one instrumented run).
+            # the archive carries bin/romp-kernel too: gen_build content-checks the unpacked
+            # generation for an executable kernel (the r47 verification) and an install.sh-only
+            # tree is exactly the "unpacked to nothing usable" failure it refuses
             git.write_text("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> '%s'\n"
                            "case \" $* \" in\n"
                            "  *' config '*) exec /usr/bin/git \"$@\";;\n"
                            "  *' verify-tag '*) exit %d;;\n"
                            "  *' rev-parse '*) echo deadbee1;;\n"
-                           "  *' archive '*) tar -c -C '%s' install.sh;;\n"
-                           "esac\nexit 0\n" % (calls, int(verify_rc), root))
+                           "  *' archive '*) tar -c -C '%s' %s;;\n"
+                           "esac\nexit 0\n" % (calls, int(verify_rc), root, archive_paths))
             git.chmod(0o755)
             install = root / "install.sh"
             install.write_text("#!/bin/sh\nprintf 'install\\n' >> '%s'\nexit %d\n"
                                % (calls, int(install_rc)))
             install.chmod(0o755)
+            (root / "bin").mkdir()
+            (root / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
+            (root / "bin" / "romp-kernel").chmod(0o755)
             spawned = []
             env = {k: v for k, v in km.os.environ.items()
                    if k not in ("ROMP_MANAGER_PORT", "ROMP_RELEASE_ALLOWED_SIGNERS",
@@ -532,6 +554,12 @@ class RunUpdate(Fresh):
             self._latch = latch.read_text().strip() if latch.exists() else None
             marker = root / ".git" / "romp-update-channel"
             self._marker = marker.read_text().strip() if marker.exists() else None
+            # gen_build resolves the git dir through the stub's rev-parse answer (deadbee1),
+            # a RELATIVE path under the script's cwd — so the generations it publishes land
+            # here, introspectable after the run (r47)
+            gd_alias = root / "deadbee1"
+            self._gen_dirs = (sorted(p.name for p in gd_alias.glob("romp-run-*"))
+                              if gd_alias.exists() else [])
             return ran.returncode, rows, report
 
     def test_the_report_states_what_the_restart_actually_did(self):
@@ -573,6 +601,30 @@ class RunUpdate(Fresh):
         mrg = next(i for i, row in enumerate(rows) if row.startswith("merge "))
         self.assertLess(rev, mrg, "the latch's sha resolves before the move")
         self.assertIsNone(self._latch, "...and a completed install spends it")
+
+    def test_the_settle_heal_builds_the_generation_before_spending_the_latch(self):
+        # the r47 verification: every heal leg spent the latch on install alone — one failed
+        # gen_build permanently downgraded a signed release to live-byte serving (serve/manager
+        # resolve romp-run-<sha8> per spawn and nothing would ever rebuild it). ENFORCED
+        # verify_rc=1 stops the round right after the settle (unsigned would proceed with a
+        # note), so any generation here is the HEAL's alone.
+        rc, rows, report = self._execute_captured_updater(1, enforce=True, pre_latch="deadbee1")
+        self.assertEqual(rc, 0)
+        self.assertFalse(report["ok"], "the round itself dies at verify — only the settle ran")
+        self.assertIsNone(self._latch, "the heal spent the latch")
+        self.assertIn("romp-run-deadbee1", self._gen_dirs,
+                      "…and only after building the runtime generation")
+
+    def test_a_heal_that_cannot_build_the_generation_keeps_the_latch(self):
+        # the archive unpacks no executable bin/romp-kernel, so gen_build's content check
+        # refuses: install PASSES yet the latch must survive for the retry — spending it here
+        # is exactly the permanent live-byte downgrade (r47)
+        rc, rows, report = self._execute_captured_updater(1, pre_latch="deadbee1",
+                                                          archive_paths="install.sh")
+        self.assertEqual(rc, 0)
+        self.assertFalse(report["ok"])
+        self.assertEqual(self._latch, "deadbee1", "install alone no longer spends the latch")
+        self.assertEqual(self._gen_dirs, [], "no generation published from a kernel-less tree")
 
     def test_a_failed_install_after_the_merge_leaves_the_intent_latch_armed(self):
         rc, rows, report = self._execute_captured_updater(0, install_rc=1)

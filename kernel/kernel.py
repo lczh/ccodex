@@ -1943,11 +1943,14 @@ def _replay_ui_op_spool():
                 spdir.mkdir(parents=True, exist_ok=True)
                 # ONE sequence spanning both inputs, file-qualified, published no-overwrite
                 # (the v1.3.19 audit's P1: per-file seq reset collided the two legacy files on
-                # the same name and os.replace silently discarded the first op)
-                dst = spdir / ("0legacy-%d-%d-%d.json" % (os.getpid(), _li, _gseq))
+                # the same name and os.replace silently discarded the first op). ZERO-PADDED:
+                # the replay consumes these names in lexicographic sort, where an unpadded
+                # '-10' orders before '-2' — past nine ops the user's later gestures replayed
+                # under earlier ones (the r47 verification, executed: a final un-mute lost).
+                dst = spdir / ("0legacy-%d-%d-%012d.json" % (os.getpid(), _li, _gseq))
                 while dst.exists():
                     _gseq += 1
-                    dst = spdir / ("0legacy-%d-%d-%d.json" % (os.getpid(), _li, _gseq))
+                    dst = spdir / ("0legacy-%d-%d-%012d.json" % (os.getpid(), _li, _gseq))
                 tmp = spdir / (dst.name + ".tmp")
                 tmp.write_text(ln)
                 os.replace(tmp, dst)
@@ -2940,7 +2943,17 @@ def _run_update(tag):
         + "  [ -d \"$GBGD/romp-run-$1\" ] && return 0\n"
         + "  rm -rf \"$GBGD/romp-run-$1.tmp.$$\" && mkdir -p \"$GBGD/romp-run-$1.tmp.$$\" || return 1\n"
         + "  git archive \"$1\" | tar -x -C \"$GBGD/romp-run-$1.tmp.$$\" || { rm -rf \"$GBGD/romp-run-$1.tmp.$$\"; return 1; }\n"
-        + "  mv \"$GBGD/romp-run-$1.tmp.$$\" \"$GBGD/romp-run-$1\" 2>/dev/null || { rm -rf \"$GBGD/romp-run-$1.tmp.$$\"; [ -d \"$GBGD/romp-run-$1\" ]; }\n"
+        # the CONTENT CHECK (the r47 verification): an archive that unpacked to nothing still
+        # published a directory serve would resolve and fail to exec forever. The kernel path is
+        # written non-contiguously — this script rides in a bash -c argv, and a contiguous
+        # "bin/romp-kernel" would match the restart pkill's bracket pattern (the 2026-07-22 class).
+        + "  [ -x \"$GBGD/romp-run-$1.tmp.$$/bin/romp-\"kernel ] || { rm -rf \"$GBGD/romp-run-$1.tmp.$$\"; return 1; }\n"
+        # PUBLISH via a rename that FAILS on an existing target (the r47 verification: `mv` moves
+        # the tmp dir INSIDE a concurrently-published generation — silent nested litter — and the
+        # loser's [ -d ] fallback never runs). os.rename raises EEXIST/ENOTEMPTY instead, and the
+        # loser blesses the winner's generation.
+        + "  python3 -c 'import os,sys; os.rename(sys.argv[1], sys.argv[2])' \"$GBGD/romp-run-$1.tmp.$$\" \"$GBGD/romp-run-$1\" 2>/dev/null "
+          "|| { rm -rf \"$GBGD/romp-run-$1.tmp.$$\"; [ -d \"$GBGD/romp-run-$1\" ]; }\n"
         + "}\n"
         # a healed or completed move publishes any staged CHANNEL INTENT for its commit before
         # the latch is spent (the v1.3.8 audit: a healer reviving a crashed bootstrap's stable
@@ -2990,8 +3003,12 @@ def _run_update(tag):
         + "elif [ \"$SETTLED\" = 1 ] && [ -s %s ] && [ -n \"$CUR\" ]; then\n" % latch
         + "  if grep -q \"^$CUR\" %s 2>/dev/null; then\n" % latch
         + "    CURLINE=$(grep \"^$CUR\" %s | head -1)\n" % latch
-        + "    if snap_install \"$CUR\" >> %s 2>&1 && pub_line \"$(pick_pub \"$CURLINE\" %s)\"; then rm -f %s; "
-          "else\n" % (log, latch, latch)
+        # the HEAL leg builds the generation too, REQUIRED before the latch is spent (the r47
+        # verification: every heal leg spent the latch on install alone, so one failed gen_build
+        # permanently downgraded a signed release to live-byte serving with all indicators green)
+        + "    if snap_install \"$CUR\" >> %s 2>&1 && gen_build \"$CUR\" >> %s 2>&1 "
+          "&& pub_line \"$(pick_pub \"$CURLINE\" %s)\"; then rm -f %s; "
+          "else\n" % (log, log, latch, latch)
         + "      CARRY=\"$CURLINE\"\n"
         # a plain surviving line MERGES the other line's pending token — a lossy carry destroyed
         # the pending stable and blinded the pull gate (the adversarial review, 2026-08-21)
@@ -4053,11 +4070,56 @@ def _settle_prior_latch(lock_fd):
     return "", ""
 
 
+def _gen_build_local(commit):
+    """Materialize `commit`'s complete tree as the durable runtime generation
+    (<gitdir>/romp-run-<sha8>) serve and the manager resolve per spawn. REQUIRED wherever an
+    install latch is about to be spent (the r47 verification: every heal leg spent the latch on
+    install alone, so one failed or interrupted build permanently downgraded a signed release to
+    live-byte serving with every indicator green). Idempotent per commit; content-checked (an
+    empty unpack is a failure, never a publishable generation); published by os.rename, which
+    FAILS on an existing target so a concurrent builder's win is blessed instead of `mv`
+    nesting the tmp dir inside it. Returns (ok, why)."""
+    import shutil as _sh
+    gd = _update_git_dir()
+    if not gd:
+        return False, "cannot resolve the git dir for the runtime generation"
+    gen = os.path.join(gd, "romp-run-" + str(commit)[:8])
+    if os.path.isdir(gen):
+        return True, ""
+    tmp = gen + ".tmp.%d" % os.getpid()
+    try:
+        _sh.rmtree(tmp, ignore_errors=True)
+        ar = subprocess.run(["git", "-C", str(ROOT), "archive", str(commit)],
+                            capture_output=True, timeout=120)
+        if ar.returncode or not ar.stdout:
+            return False, "git archive %s failed for the runtime generation" % str(commit)[:12]
+        os.makedirs(tmp)
+        tr = subprocess.run(["tar", "-x", "-C", tmp], input=ar.stdout, timeout=120)
+        if tr.returncode or not os.access(os.path.join(tmp, "bin", "romp-kernel"), os.X_OK):
+            _sh.rmtree(tmp, ignore_errors=True)
+            return False, "unpacking the runtime generation failed"
+        try:
+            os.rename(tmp, gen)
+        except OSError:
+            _sh.rmtree(tmp, ignore_errors=True)
+            if not os.path.isdir(gen):
+                return False, "publishing the runtime generation failed"
+        return True, ""
+    except subprocess.TimeoutExpired:
+        _sh.rmtree(tmp, ignore_errors=True)
+        return False, "building the runtime generation timed out"
+    except Exception as e:
+        _sh.rmtree(tmp, ignore_errors=True)
+        return False, str(e)[:200]
+
+
 def _snap_install_local(commit, lock_fd=None, timeout=600):
     """Materialize `commit`'s COMPLETE tracked tree under the git dir and run ITS install.sh
     with ROMP_INSTALL_TARGET pointing at the real checkout — so no shell child executes live-
     tree bytes a racing writer could swap mid-install (the v1.3.16 audit's P1.1; the r44
     verification: the p2p leg alone had this, and the repro passed on every other leg).
+    A passing install then REQUIRES the runtime generation (_gen_build_local) before success is
+    reported — every caller spends the install latch on this verdict (the r47 verification).
     Returns (ok, why); the snapshot is removed either way."""
     import shutil as _sh
     gd = _update_git_dir()
@@ -4081,6 +4143,10 @@ def _snap_install_local(commit, lock_fd=None, timeout=600):
         ok = inst.returncode == 0
         why = "" if ok else ((inst.stderr or inst.stdout or "").strip()[-200:]
                              or "exit %d with no output" % inst.returncode)
+        if ok:
+            gok, gwhy = _gen_build_local(commit)
+            if not gok:
+                return False, "install passed but " + gwhy
         return ok, why
     except subprocess.TimeoutExpired:
         return False, "timed out after %ds" % timeout
@@ -13502,6 +13568,34 @@ def _update_remote(host):
         '    rc=subprocess.run(["bash",os.path.join(sd,"install.sh")],cwd=r,env=env,pass_fds=(fd,)).returncode\n'
         "    shutil.rmtree(sd,ignore_errors=True)\n"
         "    return rc==0\n"
+        # the RUNTIME GENERATION builder, REQUIRED wherever this wrapper spends the latch (the
+        # r47 verification: the heal leg spent it on install alone — one failed build downgraded
+        # a signed release to live-byte serving for good). Content-checked (an empty unpack is a
+        # failure, never a publishable generation) and published by os.rename, which FAILS on an
+        # existing target — the loser of a concurrent build blesses the winner instead of `mv`
+        # nesting its tmp dir inside it. The kernel filename stays non-contiguous in this argv
+        # (the join) so the restart pkill's bracket pattern can never match this wrapper itself.
+        "def gen_build(commit):\n"
+        '    g=os.path.join(os.path.dirname(lp),"romp-run-"+commit[:8])\n'
+        "    if os.path.isdir(g):\n"
+        "        return g\n"
+        '    gt=g+".tmp.%%d"%%os.getpid()\n'
+        "    shutil.rmtree(gt,ignore_errors=True)\n"
+        '    ar=subprocess.run(["git","-C",r,"archive",commit],capture_output=True)\n'
+        "    if ar.returncode or not ar.stdout:\n"
+        "        return None\n"
+        "    os.makedirs(gt)\n"
+        '    tr=subprocess.run(["tar","-x","-C",gt],input=ar.stdout)\n'
+        '    if tr.returncode or not os.access(os.path.join(gt,"bin","romp-"+"kernel"),os.X_OK):\n'
+        "        shutil.rmtree(gt,ignore_errors=True)\n"
+        "        return None\n"
+        "    try:\n"
+        "        os.rename(gt,g)\n"
+        "    except OSError:\n"
+        "        shutil.rmtree(gt,ignore_errors=True)\n"
+        "        if not os.path.isdir(g):\n"
+        "            return None\n"
+        "    return g\n"
         "fd=os.open(lock,os.O_RDWR|os.O_CREAT,0o644)\n"
         "try:\n"
         "    fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
@@ -13611,7 +13705,8 @@ def _update_remote(host):
         "                return curline\n"
         "            o=rawlines[1].strip().split()\n"
         '            return curline+" "+o[1] if len(o)>1 and o[1] in ("stable","dev") else curline\n'
-        "        heal_fail=not snap_install(curfull)\n"
+        # install AND generation, or the heal failed — the latch survives for the retry (r47)
+        "        heal_fail=not (snap_install(curfull) and gen_build(curfull))\n"
         "        if heal_fail:\n"
         "            carry=merge_carry()\n"
         '            if len(carry.split())>1 and carry.split()[1]=="stable":\n'
@@ -13707,6 +13802,12 @@ def _update_remote(host):
         "    sys.exit(28)\n"
         'if (h3.stdout or "").strip()!=target:\n'
         "    sys.exit(29)\n"
+        # the generation is REQUIRED before the latch is spent, exactly like install (the r47
+        # verification: it used to build after os.remove(lp), so a failed build spent the latch
+        # and left nothing for serve to resolve — the heal path could never rebuild it either)
+        "gen=gen_build(target)\n"
+        "if not gen:\n"
+        "    sys.exit(34)\n"
         "if not pub_line(pick_pub(body.splitlines()[0],body.splitlines())):\n"
         "    sys.exit(30)\n"
         # DURABLE restart intent (the v1.3.17 audit's P1.2): armed BEFORE the latch is spent,
@@ -13721,33 +13822,12 @@ def _update_remote(host):
         "os.remove(lp)\n"
         # RUNTIME GENERATION (the v1.3.18 audit's P1, superseding the r45 bin/-only snapshot):
         # the COMPLETE verified tree materializes as a durable, per-commit generation under the
-        # git dir, and the whole launch chain — manager, serve, kernel and its modules — execs
-        # the GENERATION's bytes while ROMP_DIR/ROMP_SERVE_ROOT/ROMP_CHECKOUT point every state,
-        # git and child-spawn operation at the real checkout. The manager is KILLED and
-        # restarted from the generation (a surviving manager respawned the kernel through the
-        # live checkout's serve — the audited hole), and the env it holds (ROMP_SERVE_BIN /
-        # ROMP_KERNEL_BIN into the generation) makes every later respawn run the same verified
-        # bytes: the generation is durable, not a temp dir. Old generations are pruned only
-        # AFTER a healthy launch. Idempotent per commit (romp-run-<sha8>), atomically published
-        # (tmp dir + rename).
-        'gen=os.path.join(os.path.dirname(lp),"romp-run-"+target[:8])\n'
-        "if not os.path.isdir(gen):\n"
-        '    gtmp=gen+".tmp.%%d"%%os.getpid()\n'
-        "    shutil.rmtree(gtmp,ignore_errors=True)\n"
-        '    ar=subprocess.run(["git","-C",r,"archive",target],capture_output=True)\n'
-        "    if ar.returncode or not ar.stdout:\n"
-        "        sys.exit(34)\n"
-        "    os.makedirs(gtmp)\n"
-        '    tr=subprocess.run(["tar","-x","-C",gtmp],input=ar.stdout)\n'
-        "    if tr.returncode:\n"
-        "        shutil.rmtree(gtmp,ignore_errors=True)\n"
-        "        sys.exit(34)\n"
-        "    try:\n"
-        "        os.rename(gtmp,gen)\n"
-        "    except OSError:\n"
-        "        shutil.rmtree(gtmp,ignore_errors=True)\n"
-        "        if not os.path.isdir(gen):\n"
-        "            sys.exit(34)\n"
+        # git dir (gen_build above, REQUIRED before the latch was spent), and the whole launch
+        # chain — manager, serve, kernel and its modules — execs the GENERATION's bytes while
+        # ROMP_DIR/ROMP_SERVE_ROOT/ROMP_CHECKOUT point every state, git and child-spawn
+        # operation at the real checkout. Serve and manager resolve romp-run-<sha8> per spawn,
+        # so every later respawn runs the same verified bytes: the generation is durable, not a
+        # temp dir. Old generations are pruned only AFTER a healthy launch.
         # the KILL and the SPAWN REQUEST run INSIDE the lock (the v1.3.16 audit's P1.2: the
         # transaction used to end before the spawn, so a writer could swap bin/romp-serve
         # between the verify and the launch) — then the lock is EXPLICITLY RELEASED before the
@@ -14556,7 +14636,12 @@ def _restart_remote_kernel(host):
         'H8="$(git -C "$R" rev-parse --short=8 HEAD 2>/dev/null)"; '
         'if [ -n "$LGD" ] && [ -n "$H8" ]; then GEN="$LGD/romp-run-$H8"; '
         'if [ ! -d "$GEN" ]; then rm -rf "$GEN.tmp.$$"; mkdir -p "$GEN.tmp.$$"; '
-        'if git -C "$R" archive HEAD 2>/dev/null | tar -x -C "$GEN.tmp.$$" 2>/dev/null; then mv "$GEN.tmp.$$" "$GEN" 2>/dev/null || rm -rf "$GEN.tmp.$$"; else rm -rf "$GEN.tmp.$$"; fi; fi; fi; '
+        # content-checked, published by a rename that FAILS on an existing target (the r47
+        # verification: `mv` nested the tmp dir INSIDE a concurrently-published generation); the
+        # kernel filename stays non-contiguous per the NOTE above
+        'if git -C "$R" archive HEAD 2>/dev/null | tar -x -C "$GEN.tmp.$$" 2>/dev/null && [ -x "$GEN.tmp.$$/bin/romp-"kernel ]; then '
+        'python3 -c "import os,sys; os.rename(sys.argv[1],sys.argv[2])" "$GEN.tmp.$$" "$GEN" 2>/dev/null || rm -rf "$GEN.tmp.$$"; '
+        'else rm -rf "$GEN.tmp.$$"; fi; fi; fi; '
         'GN="romp-manage"; GN="${GN}r"; MGR="$R/bin/$GN"; '
         'if command -v node >/dev/null 2>&1 && [ -r "$MGR" ]; then ROMP_DIR="$R" ROMP_SERVE_ROOT="$R" node "$MGR" ensure >>"$LOGDIR/update.log" 2>&1 || true; fi; '
         'UP=0; for i in 1 2 3 4 5 6 7 8; do sleep 1; if bash -c "exec 3<>/dev/tcp/127.0.0.1/%d" 2>/dev/null; then UP=1; break; fi; done; '

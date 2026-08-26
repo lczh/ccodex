@@ -1574,6 +1574,85 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class GenBuildLocal(unittest.TestCase):
+    """the r47 verification: every latch-spending heal leg spent the latch on install alone —
+    one failed or interrupted gen_build permanently downgraded a signed release to live-byte
+    serving with all indicators green. _snap_install_local now reports success only once
+    _gen_build_local publishes (or blesses) the commit's romp-run-<sha8>, content-checked for
+    an executable kernel; every caller (converge, pull, settle, boot heal) spends the install
+    latch on that verdict."""
+
+    def _repo(self, with_kernel=True):
+        import shutil as _sh
+        import subprocess as sp
+        from pathlib import Path
+        td = tempfile.mkdtemp()
+        self.addCleanup(_sh.rmtree, td, ignore_errors=True)
+        root = Path(td) / "repo"
+        (root / "bin").mkdir(parents=True)
+        (root / "install.sh").write_text("#!/bin/sh\nexit 0\n")
+        (root / "install.sh").chmod(0o755)
+        if with_kernel:
+            (root / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
+            (root / "bin" / "romp-kernel").chmod(0o755)
+        sp.run(["git", "-C", str(root), "init", "-q", "-b", "main"], check=True)
+        sp.run(["git", "-C", str(root), "add", "-A"], check=True)
+        sp.run(["git", "-C", str(root), "-c", "user.email=t@t", "-c", "user.name=t",
+                "commit", "-qm", "x"], check=True)
+        sha8 = sp.run(["git", "-C", str(root), "rev-parse", "--short=8", "HEAD"],
+                      capture_output=True, text=True).stdout.strip()[:8]
+        return root, root / ".git", sha8
+
+    def test_gen_build_local_publishes_a_content_checked_generation(self):
+        root, gd, sha8 = self._repo()
+        with mock.patch.object(km, "ROOT", root):
+            ok, why = km._gen_build_local(sha8)
+            self.assertTrue(ok, why)
+            self.assertTrue(os.access(str(gd / ("romp-run-" + sha8) / "bin" / "romp-kernel"),
+                                      os.X_OK), "the generation carries the executable kernel")
+            self.assertEqual(km._gen_build_local(sha8), (True, ""),
+                             "idempotent: an existing generation is blessed")
+
+    def test_gen_build_local_refuses_a_kernel_less_tree_with_no_litter(self):
+        root, gd, sha8 = self._repo(with_kernel=False)
+        with mock.patch.object(km, "ROOT", root):
+            ok, why = km._gen_build_local(sha8)
+        self.assertFalse(ok, "an archive that unpacks no executable kernel must never publish")
+        self.assertIn("runtime generation", why)
+        self.assertEqual([p.name for p in gd.glob("romp-run-*")], [],
+                         "no half generation and no tmp litter left behind")
+
+    def test_gen_build_local_blesses_a_concurrent_winner_never_nests(self):
+        # the r47 verification's sibling finding: the shell legs' `mv` moved the tmp dir INSIDE
+        # a concurrently-published generation; os.rename fails on an existing target instead,
+        # and the loser blesses the winner's bytes untouched
+        root, gd, sha8 = self._repo()
+        gen = gd / ("romp-run-" + sha8)
+        gen.mkdir()
+        (gen / "sentinel").write_text("winner")
+        with mock.patch.object(km, "ROOT", root):
+            ok, why = km._gen_build_local(sha8)
+        self.assertTrue(ok, why)
+        self.assertEqual((gen / "sentinel").read_text(), "winner",
+                         "the winner's generation survives byte-for-byte, nothing nested into it")
+
+    def test_snap_install_local_requires_the_generation(self):
+        # THE revert-detector for the r47 finding: a passing install whose generation cannot
+        # build must NOT report success — every heal leg spends the install latch on this
+        # verdict, and success here re-opens the permanent live-byte downgrade
+        root, gd, sha8 = self._repo(with_kernel=False)
+        with mock.patch.object(km, "ROOT", root):
+            ok, why = km._snap_install_local(sha8)
+        self.assertFalse(ok)
+        self.assertIn("runtime generation", why)
+        root2, gd2, sha82 = self._repo()
+        with mock.patch.object(km, "ROOT", root2):
+            ok2, why2 = km._snap_install_local(sha82)
+        self.assertTrue(ok2, why2)
+        self.assertTrue((gd2 / ("romp-run-" + sha82)).is_dir(),
+                        "a passing install publishes the generation it will be served from")
+
+
 class DistGenerationPublish(unittest.TestCase):
     """the r45 verification's P1: dist.gen.<pid> was constant per process, so a long-lived
     kernel's second publish rmtree'd the generation the live symlink was serving — the exact

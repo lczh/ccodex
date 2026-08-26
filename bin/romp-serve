@@ -274,9 +274,38 @@ def snap_install(commit):
                          pass_fds=(fd,)).returncode
     _sh.rmtree(_snap, ignore_errors=True)
     return _rc == 0
+def gen_build(commit8):
+    # the runtime generation is REQUIRED before this heal spends the latch (the r47
+    # verification: every heal leg spent it on install alone — one failed or interrupted build
+    # permanently downgraded a signed release to live-byte serving, all indicators green).
+    # Content-checked (an empty unpack is a failure); published by os.rename, which FAILS on an
+    # existing target so a concurrent builder's win is blessed instead of `mv` nesting into it.
+    g = os.path.join(gdir, "romp-run-" + commit8[:8])
+    if os.path.isdir(g):
+        return True
+    gt = g + ".tmp.%d" % os.getpid()
+    _sh.rmtree(gt, ignore_errors=True)
+    _a = subprocess.run(["git", "-C", root, "archive", commit8], capture_output=True)
+    if _a.returncode or not _a.stdout:
+        return False
+    os.makedirs(gt)
+    if subprocess.run(["tar", "-x", "-C", gt], input=_a.stdout).returncode \
+            or not os.access(os.path.join(gt, "bin", "romp-kernel"), os.X_OK):
+        _sh.rmtree(gt, ignore_errors=True)
+        return False
+    try:
+        os.rename(gt, g)
+    except OSError:
+        _sh.rmtree(gt, ignore_errors=True)
+        return os.path.isdir(g)
+    return True
 sys.stderr.write("romp-serve: this checkout's last install never finished — running install.sh before the kernel starts\n")
 if not snap_install(cur8):
     sys.exit(70)                       # latch stays armed for the next retry
+if not gen_build(cur8):
+    sys.stderr.write("romp-serve: healed the install but the runtime generation could not be "
+                     "built — the latch stays armed for the next retry\n")
+    sys.exit(70)
 cur_line = next(ln for ln in rawlines if ln.split()[0][:8] == cur8)
 if len(cur_line.split()) < 2 and cur_line == rawlines[0] and len(rawlines) > 1 \
         and len(rawlines[1].split()) > 1:

@@ -602,6 +602,26 @@ class PerFileOpSpool(unittest.TestCase):
         self.assertTrue(flags[SID].get("hideFromFeed"), "the first file's op survived")
         self.assertTrue(flags[SID].get("postalServiceOff"), "…and the second's — no overwrite")
 
+    def test_legacy_conversion_preserves_order_past_nine_ops(self):
+        # the r47 verification, executed: the converted names' one sequence was UNPADDED and
+        # the replay consumes files in lexicographic sort, where '-10' orders before '-2' —
+        # past nine ops the user's later gestures replayed under earlier ones (the executed
+        # repro lost the final toggle). Zero-padding keeps sort order equal to write order.
+        legacy = km.jd.STATE / "pending-ui-ops.jsonl"
+        legacy.write_text("".join(
+            json.dumps({"op": "flag", "target": SID, "flag": "hideFromFeed",
+                        "value": bool(i % 2), "i": i}) + "\n"
+            for i in range(12)))
+        order = []
+        saved = km._apply_one_ui_op
+        km._apply_one_ui_op = lambda op: (order.append(op["i"]), True)[1]
+        try:
+            km._replay_ui_op_spool()
+        finally:
+            km._apply_one_ui_op = saved
+        self.assertEqual(order, list(range(12)),
+                         "twelve legacy ops replay in write order, not lexicographic-unpadded")
+
     def test_the_legacy_append_spool_is_still_consumed_once(self):
         (km.jd.STATE / "pending-ui-ops.jsonl").write_text(json.dumps(
             {"op": "flag", "target": SID, "flag": "hideFromFeed", "value": True}) + "\n")

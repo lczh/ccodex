@@ -194,12 +194,15 @@ _latch_fixture() {
     printf '#!/bin/sh\necho INSTALL_RAN\n[ -e "${ROMP_INSTALL_TARGET:-.}/.install-broken" ] && exit 1\nexit 0\n' \
         > "$FIX/install.sh"
     chmod +x "$FIX/install.sh"
-    git -C "$FIX" add install.sh
+    # the kernel stub is COMMITTED: the gate heal's gen_build archives the commit and
+    # content-checks the unpacked generation for an executable bin/romp-kernel (r47) — an
+    # install.sh-only commit would fail the heal it used to pass
+    printf '#!/usr/bin/env bash\necho KERNEL_RAN\n' > "$FIX/bin/romp-kernel"
+    chmod +x "$FIX/bin/romp-kernel"
+    git -C "$FIX" add install.sh bin/romp-kernel
     git -C "$FIX" -c user.email=t@t -c user.name=t commit -qm x
     GD="$(git -C "$FIX" rev-parse --absolute-git-dir)"
     CUR="$(git -C "$FIX" rev-parse --short=8 HEAD | head -c 8)"
-    printf '#!/usr/bin/env bash\necho KERNEL_RAN\n' > "$FIX/bin/romp-kernel"
-    chmod +x "$FIX/bin/romp-kernel"
     export ROMP_KERNEL_BIN="$FIX/bin/romp-kernel"   # outrank the suite-wide stub from setup()
 }
 
@@ -221,6 +224,34 @@ _latch_fixture() {
     [ "$status" -eq 0 ]
     [[ "$output" == *KERNEL_RAN* ]]
     [ ! -e "$GD/romp-install-failed" ]
+}
+
+@test "romp-serve: the gate heal BUILDS the runtime generation before spending the latch" {
+    # the r47 verification: every heal leg spent the latch on install alone — one failed
+    # gen_build permanently downgraded a signed release to live-byte serving (serve resolves
+    # romp-run-<sha8> per spawn and nothing would ever rebuild it)
+    _latch_fixture
+    printf '%s' "$CUR" > "$GD/romp-install-failed"
+    run "$FIX/bin/romp-serve"
+    [ "$status" -eq 0 ]
+    [ -x "$GD/romp-run-$CUR/bin/romp-kernel" ]
+    [ ! -e "$GD/romp-install-failed" ]
+}
+
+@test "romp-serve: a heal whose generation cannot be built keeps the latch armed (exit 70)" {
+    # the commit lacks an executable bin/romp-kernel, so gen_build's content check refuses —
+    # install PASSES yet the latch must survive for the retry, and no generation publishes
+    _latch_fixture
+    git -C "$FIX" rm -q --cached bin/romp-kernel
+    git -C "$FIX" -c user.email=t@t -c user.name=t commit -qm no-kernel
+    CUR="$(git -C "$FIX" rev-parse --short=8 HEAD | head -c 8)"
+    printf '%s' "$CUR" > "$GD/romp-install-failed"
+    run "$FIX/bin/romp-serve"
+    [ "$status" -eq 70 ]
+    [[ "$output" == *INSTALL_RAN* ]]
+    [[ "$output" == *"runtime generation"* ]]
+    [ -s "$GD/romp-install-failed" ]
+    [ ! -d "$GD/romp-run-$CUR" ]
 }
 
 @test "romp-serve: a latch naming some OTHER commit is moot — cleared, kernel starts, no install" {
