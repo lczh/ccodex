@@ -387,9 +387,17 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
     except Exception:
         # The sent row above is already durable; left alone it is a permanent phantom —
         # handoff_done_apply would translate it into a receipt for mail that never existed,
-        # and the wait-map readers can mint an Awaiting edge from it. Best-effort: a lost
-        # compensating row re-opens only the crash window this write ordering accepts.
-        _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "unpublished", "id": name})
+        # and the wait-map readers can mint an Awaiting edge from it. _tl_append is
+        # best-effort (returns False, never raises), so a failed compensation is retried
+        # once and then said OUT LOUD instead of swallowed (the v1.3.20 audit's P2: publish
+        # and compensation both failing left the phantom standing silently, forever). The
+        # durable backstop is _reconcile_phantom_sent at the next bus boot, which finds the
+        # sent row with no mail on disk and files this same row.
+        comp = {"t": int(time.time()), "ev": "unpublished", "id": name}
+        if not _tl_append("messages.jsonl", comp) and not _tl_append("messages.jsonl", comp):
+            sys.stderr.write("postal: publish of %s FAILED and its compensating 'unpublished' "
+                             "row could not be appended — phantom sent row until the next bus "
+                             "boot reconciles it\n" % name)
         raise
     _mark_pending(to_id)            # new/ is now non-empty -> raise the marker (covers park + live)
     return name   # the message id (maildir filename); joins to the log + status-bar prefix
@@ -1064,6 +1072,8 @@ def _sent_receipts(mid):
             execs[e["id"]] = e["t"]
         elif ev == "unexec":                         # a claimed-then-rolled-back drain (see restore):
             execs.pop(e["id"], None)                 # it was never read, so the receipt goes back to pending
+        elif ev == "unpublished":                    # deliver()'s compensation / boot reconcile: the mail
+            sent.pop(e.get("id"), None)              # never existed — no receipt to await (v1.3.20 P2)
         elif ev == "recall":
             recalls[e["id"]] = e["t"]
         elif ev == "relayed":                        # peer-bus: the far host's end-to-end delivery ack
@@ -1734,6 +1744,75 @@ def _retry_loop():
         except Exception:
             pass
 
+# Boot reconciliation of phantom "sent" rows (the v1.3.20 audit's P2). deliver() logs
+# ev:"sent" BEFORE the maildir rename publishes (deliberate — the v1.3.17 audit's P1.3:
+# receipts must never be lost) and compensates a failed publish with ev:"unpublished". When
+# publish AND compensation both fail (or the process dies between them), the log's last word
+# stays "sent" for mail that never existed — and the log's readers (handoff_done_apply,
+# _sent_receipts, the kernel's wait-map) mint receipts/awaiting state from it. The MAILDIR is
+# the authoritative store, so each bus boot reconciles the log's TAIL against it. BOUNDED on
+# purpose (the r45 verification forbids unbounded rescans): only the last PHANTOM_TAIL_BYTES
+# of the log, and only rows younger than PHANTOM_WINDOW.
+PHANTOM_WINDOW = 48 * 3600
+PHANTOM_TAIL_BYTES = 512 * 1024
+_TERMINAL_EVS = ("exec", "unexec", "unpublished", "recall", "bounced")
+
+def _reconcile_phantom_sent(now=None):
+    """Append the missing ev:"unpublished" for each recent LOCAL sent row that has no
+    terminal row and no file in the recipient's maildir (tmp/new/cur). Files nothing for
+    mail that exists: unread and parked mail sit in new/, consumed mail in cur/, a crashed
+    mid-write in tmp/ — none of those are phantoms and none are touched. Peer-relay rows
+    (to_id "peer:<host>") are skipped: their mail lives in the outbox, never a local
+    maildir. Idempotent (the appended row is itself terminal). Returns the count filed."""
+    log = TLDIR / "messages.jsonl"
+    try:
+        size = log.stat().st_size
+    except OSError:
+        return 0                                     # no log -> no sent rows -> nothing owed
+    try:
+        with open(log, "rb") as fh:
+            if size > PHANTOM_TAIL_BYTES:
+                fh.seek(size - PHANTOM_TAIL_BYTES)
+                fh.readline()                        # drop the partial line at the cut
+            lines = fh.read().decode(errors="replace").splitlines()
+    except OSError:
+        return 0
+    now = int(now if now is not None else time.time())
+    sent, terminal = {}, set()
+    # terminal rows are always appended AFTER their sent row, so a sent row inside the tail
+    # has its terminal (if any) inside the tail too — tail-scanning loses nothing
+    for ln in lines:
+        try:
+            o = json.loads(ln)
+        except Exception:
+            continue
+        mid, ev = o.get("id"), o.get("ev")
+        if not isinstance(mid, str):
+            continue
+        if ev == "sent":
+            sent[mid] = o
+        elif ev in _TERMINAL_EVS:
+            terminal.add(mid)
+    fixed = 0
+    for mid, o in sent.items():
+        if mid in terminal or not _safe_id(mid):
+            continue
+        if not isinstance(o.get("t"), int) or o["t"] < now - PHANTOM_WINDOW:
+            continue                                 # bounded: old rows are history, not work
+        to_id = str(o.get("to_id") or "")
+        if not _safe_id(to_id):
+            continue                                 # a peer-relay row — no local maildir to check
+        mb = MAILROOT / to_id
+        try:
+            if any((mb / d / mid).exists() for d in ("tmp", "new", "cur")):
+                continue                             # the mail exists — not a phantom
+        except OSError:
+            continue                                 # can't PROVE absence -> leave the row alone
+        if _tl_append("messages.jsonl", {"t": now, "ev": "unpublished", "id": mid}):
+            fixed += 1
+            _log("boot reconcile: sent row %s has no mail on disk — marked unpublished" % mid)
+    return fixed
+
 def _reconcile_markers():
     """One-time sync of every pending-mail marker to the actual new/ boxes — so mail
     that predates the marker feature (or any drift) is corrected on bus startup."""
@@ -1761,6 +1840,10 @@ def serve():
         PIDFILE.write_text(str(os.getpid()))
     except Exception:
         pass
+    try:
+        _reconcile_phantom_sent()      # after the bind (only the bus that owns the port), before
+    except Exception as e:             # serving: no request sees a phantom this boot can retire
+        _log("phantom-sent reconcile failed: %s" % e)
     _log("bus up on %s (pid %d)" % (BASE, os.getpid()))
     boot_fp = _source_fingerprint()                              # so the monitor can reload if the code changes under us
     threading.Thread(target=_monitor, args=(httpd, boot_fp), daemon=True).start()

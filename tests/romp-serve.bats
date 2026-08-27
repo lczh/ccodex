@@ -199,7 +199,9 @@ _latch_fixture() {
     # install.sh-only commit would fail the heal it used to pass
     printf '#!/usr/bin/env bash\necho KERNEL_RAN\n' > "$FIX/bin/romp-kernel"
     chmod +x "$FIX/bin/romp-kernel"
-    git -C "$FIX" add install.sh bin/romp-kernel
+    # the serve copy is committed too: the validated content check requires kernel AND serve
+    # in the archived tree (the v1.3.20 audit's P2)
+    git -C "$FIX" add install.sh bin/romp-kernel bin/romp-serve
     git -C "$FIX" -c user.email=t@t -c user.name=t commit -qm x
     GD="$(git -C "$FIX" rev-parse --absolute-git-dir)"
     CUR="$(git -C "$FIX" rev-parse --short=8 HEAD | head -c 8)"
@@ -333,13 +335,22 @@ echo "LIVE_KERNEL_RAN"
 echo "LIVE_CHECKOUT=${ROMP_CHECKOUT:-<unset>}"
 STUB
     chmod +x "$GENFIX/bin/romp-kernel"
+    # the committed serve stub: gen_build's validated content check requires kernel AND serve
+    # in the archived tree (the v1.3.20 audit's P2)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$GENFIX/bin/romp-serve"
+    chmod +x "$GENFIX/bin/romp-serve"
+    printf '#!/bin/sh\nexit 0\n' > "$GENFIX/install.sh"
+    chmod +x "$GENFIX/install.sh"
     echo tracked > "$GENFIX/tracked.txt"    # the file the dirty cases edit
     git -C "$GENFIX" init -q -b main
     git -C "$GENFIX" add -A
     git -C "$GENFIX" -c user.email=t@t -c user.name=t commit -qm x
     GENGD="$(git -C "$GENFIX" rev-parse --absolute-git-dir)"
     GENH8="$(git -C "$GENFIX" rev-parse --short=8 HEAD)"
-    # the generation for HEAD, inside the git dir (invisible to `git status`)
+    GENFULL="$(git -C "$GENFIX" rev-parse HEAD)"
+    # the generation for HEAD, inside the git dir (invisible to `git status`) — carrying the
+    # .romp-gen full-sha manifest and executable serve the validated resolution requires (the
+    # v1.3.20 audit's P2: a manifest-less or empty directory must never be selected)
     mkdir -p "$GENGD/romp-run-$GENH8/bin"
     cat > "$GENGD/romp-run-$GENH8/bin/romp-kernel" << 'STUB'
 #!/usr/bin/env bash
@@ -347,8 +358,81 @@ echo "GEN_KERNEL_RAN"
 echo "GEN_CHECKOUT=${ROMP_CHECKOUT:-<unset>}"
 STUB
     chmod +x "$GENGD/romp-run-$GENH8/bin/romp-kernel"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$GENGD/romp-run-$GENH8/bin/romp-serve"
+    chmod +x "$GENGD/romp-run-$GENH8/bin/romp-serve"
+    printf '%s\n' "$GENFULL" > "$GENGD/romp-run-$GENH8/.romp-gen"
     # point the REAL bin/romp-serve at the fixture checkout (the updater's snapshot seam)
     export ROMP_SERVE_ROOT="$GENFIX"
+}
+
+@test "romp-serve: a manifest-less generation is never selected — the live kernel runs (validated bless)" {
+    # the v1.3.20 audit's P2, executed at the spawn leg: an EMPTY or torn generation directory
+    # used to be selected by bare existence and exec'd forever
+    _gen_fixture
+    rm -f "$GENGD/romp-run-$GENH8/.romp-gen"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"LIVE_KERNEL_RAN"* ]]
+    [[ "$output" != *"GEN_KERNEL_RAN"* ]]
+}
+
+@test "romp-serve: an armed update marker forces the VERIFIED generation over a dirty tree" {
+    # the v1.3.20 audit's P1.2, executed: one tracked edit landing between an update and its
+    # restart switched the freshly signed release to mutable live bytes — while the marker
+    # names HEAD, the generation runs, edits or not
+    _gen_fixture
+    echo change >> "$GENFIX/tracked.txt"
+    printf '%s\n' "$GENFULL" > "$GENGD/romp-restart-needed"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"GEN_KERNEL_RAN"* ]]
+    [[ "$output" != *"LIVE_KERNEL_RAN"* ]]
+    [[ "$output" == *"tracked edits in the checkout are ignored"* ]]
+}
+
+@test "romp-serve: an armed update marker BUILDS the missing generation before starting (N−1 backfill)" {
+    # the v1.3.20 audit's P1.1 belt: an old updater that spent the latch without building a
+    # generation leaves only the marker — the first spawn builds it from the committed tree
+    # and starts the verified bytes, never live files
+    _gen_fixture
+    rm -rf "$GENGD/romp-run-$GENH8"
+    printf '%s\n' "$GENFULL" > "$GENGD/romp-restart-needed"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [ -x "$GENGD/romp-run-$GENH8/bin/romp-kernel" ]
+    [ "$(cat "$GENGD/romp-run-$GENH8/.romp-gen")" = "$GENFULL" ]
+    # the committed kernel stub prints LIVE_* text, but a generation launch exports
+    # ROMP_CHECKOUT — that is the tell that the built generation's bytes ran
+    [[ "$output" == *"LIVE_CHECKOUT=$GENFIX"* ]]
+}
+
+@test "romp-serve: an armed update marker with an unbuildable generation refuses to start (exit 70)" {
+    # fail closed: under the marker, live bytes are never an acceptable fallback
+    _gen_fixture
+    git -C "$GENFIX" rm -q --cached bin/romp-serve
+    git -C "$GENFIX" -c user.email=t@t -c user.name=t commit -qm no-serve
+    GENFULL="$(git -C "$GENFIX" rev-parse HEAD)"
+    GENH8="$(git -C "$GENFIX" rev-parse --short=8 HEAD)"
+    rm -rf "$GENGD/romp-run-"*
+    printf '%s\n' "$GENFULL" > "$GENGD/romp-restart-needed"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 70 ]
+    [[ "$output" != *"KERNEL_RAN"* ]]
+    [[ "$output" == *"refusing to start live bytes under the update marker"* ]]
+}
+
+@test "romp-serve: an armed update marker REBUILDS an empty generation directory (validated bless)" {
+    # the v1.3.20 audit's P2 executed end-to-end: the full transaction used to report success
+    # and spend the latch on an EMPTY romp-run directory
+    _gen_fixture
+    rm -rf "$GENGD/romp-run-$GENH8"
+    mkdir -p "$GENGD/romp-run-$GENH8"                  # empty: no manifest, no binaries
+    printf '%s\n' "$GENFULL" > "$GENGD/romp-restart-needed"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [ -x "$GENGD/romp-run-$GENH8/bin/romp-kernel" ]
+    [ "$(cat "$GENGD/romp-run-$GENH8/.romp-gen")" = "$GENFULL" ]
+    [[ "$output" == *"LIVE_CHECKOUT=$GENFIX"* ]]
 }
 
 @test "romp-serve: a CLEAN checkout with a generation for HEAD runs the GENERATION kernel, ROMP_CHECKOUT exported" {

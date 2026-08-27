@@ -203,12 +203,76 @@ class Tick(unittest.TestCase):
         self.assertEqual(km._pr_watches, [], "the stamped row still retires")
 
     def test_a_nondurable_registration_is_refused(self):
-        # the v1.3.19 audit: add_pr_watch acked a watch a restart would forget
-        with mock.patch.object(km, "_pr_watches_save", return_value=False):
+        # the v1.3.19 audit: add_pr_watch acked a watch a restart would forget (the save now
+        # runs INSIDE the registration's lock — _pr_watches_save_locked — so the mock moved)
+        with mock.patch.object(km, "_pr_watches_save_locked", return_value=False):
             row = km.add_pr_watch(15, "TESTORG/testrepo", SID, now=0)
         self.assertIsNone(row, "no durable save, no acknowledgement")
         self.assertEqual([r for r in km._pr_watches if r["pr"] == 15], [],
                          "…and the in-memory row is rolled back too")
+
+    def test_registration_is_one_locked_transaction_disk_never_leads_memory(self):
+        # the v1.3.20 audit, executed interleave: with the save OUTSIDE the lock, a competing
+        # registration could persist the first caller's PENDING row while its save was failing —
+        # memory ended [22], disk [21, 22], and the refused 21 resurrected at the next boot.
+        # Under the one-lock transaction the competitor BLOCKS until 21 rolls back.
+        import threading as th
+        import time as _t
+        real_locked = km._pr_watches_save_locked
+        started = th.Event()
+
+        def locked_failing_for_21():
+            if any(r["pr"] == 21 for r in km._pr_watches):
+                started.set()                          # wake the competitor mid-transaction
+                _t.sleep(0.08)                         # give it time to try to interleave
+                return False                           # 21's save fails -> rollback
+            return real_locked()
+
+        t2 = th.Thread(target=lambda: (started.wait(2),
+                                       km.add_pr_watch(22, "TESTORG/testrepo", SID, now=0)))
+        t2.start()
+        try:
+            with mock.patch.object(km, "_pr_watches_save_locked",
+                                   side_effect=locked_failing_for_21):
+                self.assertIsNone(km.add_pr_watch(21, "TESTORG/testrepo", SID, now=0))
+        finally:
+            t2.join(timeout=5)
+        self.assertEqual([r["pr"] for r in km._pr_watches], [22], "memory holds only the survivor")
+        rows = json.loads(km.PR_WATCH_FILE.read_text())
+        self.assertEqual([r["pr"] for r in rows], [22],
+                         "disk agrees — the refused row was never persisted by the competitor "
+                         "(the v1.3.20 audit's resurrection)")
+
+    def test_a_known_failure_whose_stamp_clear_also_fails_still_retries_after_restart(self):
+        # the v1.3.20 audit: delivery FAILED and clearing the durable `sent` stamp failed too —
+        # after a restart the stale stamp read as possible-success and the notification was
+        # silently retired. The durable failure marker outlives the crash and forces the retry.
+        km.add_pr_watch(23, "TESTORG/testrepo", SID, now=0)
+        km._pr_watch_read = lambda pr, repo: ("merged", "")
+        km._pr_watch_deliver = lambda sid, text: False
+        calls = [0]
+        real_save = km._pr_watches_save
+
+        def stamp_saves_clear_fails():
+            calls[0] += 1
+            return real_save() if calls[0] == 1 else False   # the stamp lands; the CLEAR fails
+
+        with mock.patch.object(km, "_pr_watches_save", side_effect=stamp_saves_clear_fails):
+            km._pr_watch_tick(100.0)
+        self.assertEqual(self.mail, [], "the delivery failed")
+        km._pr_watches[:] = []                        # the crash
+        km._pr_watches_load()
+        self.assertEqual(km._pr_watches[0].get("sent"), "merged",
+                         "the stale stamp survived the restart — exactly the audited state")
+        km._pr_watch_deliver = lambda sid, text: self.mail.append((sid, text)) or True
+        km._pr_watch_tick(200.0)
+        self.assertEqual(len(self.mail), 1,
+                         "the failure marker outranks the stale stamp: the notification is "
+                         "retried, never silently retired (the v1.3.20 audit)")
+        self.assertEqual(km._pr_watches, [])
+        self.assertFalse(km._pr_watch_fail_marker(
+            {"repo": "TESTORG/testrepo", "pr": 23, "sid": SID}, "merged").exists(),
+            "the confirmed delivery spends the marker")
 
     def test_an_unsaved_stamp_never_delivers(self):
         # the v1.3.18 audit: a swallowed save failure left the stamp in memory only — a crash

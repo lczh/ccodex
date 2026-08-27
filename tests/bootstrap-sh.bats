@@ -513,6 +513,7 @@ HOLDPY
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
@@ -531,6 +532,7 @@ HOLDPY
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
@@ -553,6 +555,7 @@ HOLDPY
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
@@ -593,6 +596,7 @@ PYEOF
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm one
     git -C "$root" -c user.email=t@t -c user.name=t commit -q --allow-empty -m two
@@ -639,6 +643,7 @@ PYEOF
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm one
     git -C "$root" -c user.email=t@t -c user.name=t commit -q --allow-empty -m two
@@ -683,6 +688,7 @@ PYEOF
     printf '#!/usr/bin/env bash\n[ -e "${ROMP_INSTALL_TARGET:-.}/.install-broken" ] && exit 1\nexit 0\n' \
         > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm one
     git -C "$root" -c user.email=t@t -c user.name=t commit -q --allow-empty -m two
@@ -721,6 +727,7 @@ PYEOF
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
@@ -742,6 +749,7 @@ PYEOF
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
@@ -768,6 +776,7 @@ PYEOF
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm one
     git -C "$root" -c user.email=t@t -c user.name=t commit -q --allow-empty -m two
@@ -791,6 +800,7 @@ PYEOF
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 1\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm one
     git -C "$root" -c user.email=t@t -c user.name=t commit -q --allow-empty -m two
@@ -813,6 +823,7 @@ $t8 stable" ]                              # the new arm carries the MERGED pend
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
@@ -842,6 +853,7 @@ $t8 stable" ]                              # the new arm carries the MERGED pend
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
@@ -859,6 +871,7 @@ $t8 stable" ]                              # the new arm carries the MERGED pend
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
@@ -877,6 +890,7 @@ $t8 stable" ]                              # the new arm carries the MERGED pend
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
@@ -894,6 +908,7 @@ $t8 stable" ]                              # the new arm carries the MERGED pend
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
@@ -912,6 +927,7 @@ $t8 stable" ]                              # the new arm carries the MERGED pend
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
@@ -936,6 +952,7 @@ $t8 stable" ]                              # the new arm carries the MERGED pend
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
@@ -951,6 +968,7 @@ $t8 stable" ]                              # the new arm carries the MERGED pend
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
@@ -970,6 +988,7 @@ $t8 stable" ]                              # the new arm carries the MERGED pend
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
@@ -993,6 +1012,7 @@ $t8 stable" ]                              # the new arm carries the MERGED pend
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
@@ -1051,6 +1071,7 @@ PYEOF
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"
@@ -1072,6 +1093,7 @@ PYEOF
     git -C "$root" init -q -b main .
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/install.sh"
     mkdir -p "$root/bin"; printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-kernel"; chmod +x "$root/bin/romp-kernel"   # the gate heal content-checks the generation for an executable kernel (r47)
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/bin/romp-serve"; chmod +x "$root/bin/romp-serve"   # …and serve (the v1.3.20 audit's validated bless)
     git -C "$root" add -A
     git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
     gd="$(git -C "$root" rev-parse --absolute-git-dir)"

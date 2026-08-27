@@ -362,6 +362,8 @@ class UpdateRemote(unittest.TestCase):
             (fix / ".git").mkdir(parents=True)
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             log = Path(td) / "ops"
             (fakebin / "git").write_text(
                 "#!/bin/sh\necho \"$*\" >> '%s'\ncase \" $* \" in\n"
@@ -403,6 +405,8 @@ class UpdateRemote(unittest.TestCase):
             (gd / "romp-update-channel").write_text("dev\n")   # a dev remote: mechanics under test
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
@@ -418,6 +422,8 @@ class UpdateRemote(unittest.TestCase):
             (fix / "bin").mkdir(exist_ok=True)
             (fix / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (fix / "bin" / "romp-kernel").chmod(0o755)
+            (fix / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "bin" / "romp-serve").chmod(0o755)
             env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
             apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
@@ -485,6 +491,8 @@ class UpdateRemote(unittest.TestCase):
             (gd / "romp-update-channel").write_text("dev\n")
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             nstat = Path(td) / "status-count"
             ops = Path(td) / "ops.log"
             # the tree turns dirty at the THIRD status read — the shell prefix probes once, the
@@ -508,6 +516,8 @@ class UpdateRemote(unittest.TestCase):
             (fix / "bin").mkdir(exist_ok=True)
             (fix / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (fix / "bin" / "romp-kernel").chmod(0o755)
+            (fix / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "bin" / "romp-serve").chmod(0o755)
             env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
             apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
             (gd / "romp-install-failed").write_text("deadbee2 dev")   # a prior to settle-heal
@@ -578,6 +588,8 @@ class UpdateRemote(unittest.TestCase):
             gd.mkdir(parents=True)
             fakebin = pathlib.Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             moved = pathlib.Path(td) / "head-moved"
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
@@ -595,6 +607,8 @@ class UpdateRemote(unittest.TestCase):
             (fix / "bin").mkdir(exist_ok=True)
             (fix / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (fix / "bin" / "romp-kernel").chmod(0o755)
+            (fix / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "bin" / "romp-serve").chmod(0o755)
             (gd / "romp-update-channel").write_text("dev\n")
             (gd / "romp-install-failed").write_text("aaaaaaaa stable")
             env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep,
@@ -617,6 +631,8 @@ class UpdateRemote(unittest.TestCase):
             gd.mkdir(parents=True)
             fakebin = pathlib.Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             moved = pathlib.Path(td) / "head-moved"
             installed = pathlib.Path(td) / "install-finished"
             (fakebin / "git").write_text(
@@ -636,6 +652,8 @@ class UpdateRemote(unittest.TestCase):
             (fix / "bin").mkdir(exist_ok=True)
             (fix / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (fix / "bin" / "romp-kernel").chmod(0o755)
+            (fix / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "bin" / "romp-serve").chmod(0o755)
             (gd / "romp-update-channel").write_text("dev\n")
             (gd / "romp-install-failed").write_text("aaaaaaaa stable")
             env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep,
@@ -665,6 +683,8 @@ class UpdateRemote(unittest.TestCase):
             (gd / "romp-update-channel").write_text("dev\n")
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             commitdir = Path(td) / "committed-tree"
             commitdir.mkdir()
             (commitdir / "install.sh").write_text("#!/bin/sh\nexit 0\n")
@@ -703,6 +723,8 @@ class UpdateRemote(unittest.TestCase):
             (gd / "romp-update-channel").write_text("dev\n")
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             commitdir = Path(td) / "committed-tree"
             commitdir.mkdir()
             (commitdir / "install.sh").write_text("#!/bin/sh\nexit 0\n")
@@ -727,6 +749,8 @@ class UpdateRemote(unittest.TestCase):
             (commitdir / "bin").mkdir()
             (commitdir / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (commitdir / "bin" / "romp-kernel").chmod(0o755)
+            (commitdir / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (commitdir / "bin" / "romp-serve").chmod(0o755)
             (fakebin / "git").write_text(stub % "install.sh bin")
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
             self.assertIn("STABLENOW", a.stdout)
@@ -751,6 +775,8 @@ class UpdateRemote(unittest.TestCase):
             (gd / "romp-update-channel").write_text("dev\n")
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             ops = Path(td) / "ops.log"
             commitdir = Path(td) / "committed-tree"
             commitdir.mkdir()
@@ -760,6 +786,8 @@ class UpdateRemote(unittest.TestCase):
             (commitdir / "bin").mkdir()
             (commitdir / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (commitdir / "bin" / "romp-kernel").chmod(0o755)
+            (commitdir / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (commitdir / "bin" / "romp-serve").chmod(0o755)
             committed = commitdir / "install.sh"
             # the committed bytes prove WHERE they ran from and WHAT they were told to install:
             # the snapshot installer executes them from an immutable staging under the git dir
@@ -787,6 +815,8 @@ class UpdateRemote(unittest.TestCase):
             (fix / "bin").mkdir(exist_ok=True)
             (fix / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (fix / "bin" / "romp-kernel").chmod(0o755)
+            (fix / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "bin" / "romp-serve").chmod(0o755)
             env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
             apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
@@ -850,12 +880,16 @@ class UpdateRemote(unittest.TestCase):
             (gd / "romp-update-channel").write_text("dev\n")
             fakebin = pathlib.Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             commitdir = pathlib.Path(td) / "committed-tree"
             (commitdir / "bin").mkdir(parents=True)
             (commitdir / "install.sh").write_text("#!/bin/sh\nexit 0\n")
             # gen_build content-checks the generation for an executable kernel (r47)
             (commitdir / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (commitdir / "bin" / "romp-kernel").chmod(0o755)
+            (commitdir / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (commitdir / "bin" / "romp-serve").chmod(0o755)
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
@@ -957,6 +991,8 @@ class UpdateRemote(unittest.TestCase):
             (gd / "romp-update-channel").write_text("dev\n")
             fakebin = pathlib.Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             ops = pathlib.Path(td) / "ops.log"
             commitdir = pathlib.Path(td) / "committed-tree"
             (commitdir / "bin").mkdir(parents=True)
@@ -1020,6 +1056,8 @@ class UpdateRemote(unittest.TestCase):
             (gd / "romp-update-channel").write_text("dev\n")
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             ops = Path(td) / "ops.log"
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
@@ -1036,6 +1074,8 @@ class UpdateRemote(unittest.TestCase):
             (fix / "bin").mkdir(exist_ok=True)
             (fix / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (fix / "bin" / "romp-kernel").chmod(0o755)
+            (fix / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "bin" / "romp-serve").chmod(0o755)
             env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
             apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
@@ -1061,6 +1101,8 @@ class UpdateRemote(unittest.TestCase):
             gd.mkdir(parents=True)
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             ops = Path(td) / "ops.log"
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
@@ -1078,6 +1120,8 @@ class UpdateRemote(unittest.TestCase):
             (fix / "bin").mkdir(exist_ok=True)
             (fix / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (fix / "bin" / "romp-kernel").chmod(0o755)
+            (fix / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "bin" / "romp-serve").chmod(0o755)
             env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
             apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
             (gd / "romp-update-channel").write_text("stable\n")
@@ -1129,6 +1173,8 @@ class UpdateRemote(unittest.TestCase):
             (gd / "romp-update-channel").write_text("dev\n")
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             ops = Path(td) / "ops.log"
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
@@ -1145,6 +1191,8 @@ class UpdateRemote(unittest.TestCase):
             (fix / "bin").mkdir(exist_ok=True)
             (fix / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (fix / "bin" / "romp-kernel").chmod(0o755)
+            (fix / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "bin" / "romp-serve").chmod(0o755)
             env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
             apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
@@ -1227,6 +1275,8 @@ class UpdateRemote(unittest.TestCase):
             gd.mkdir(parents=True)
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
@@ -1243,6 +1293,8 @@ class UpdateRemote(unittest.TestCase):
             (fix / "bin").mkdir(exist_ok=True)
             (fix / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (fix / "bin" / "romp-kernel").chmod(0o755)
+            (fix / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "bin" / "romp-serve").chmod(0o755)
             env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
             apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
             (gd / "romp-install-failed").write_text("deadbee2 stable")
@@ -1270,6 +1322,8 @@ class UpdateRemote(unittest.TestCase):
             gd.mkdir(parents=True)
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
@@ -1285,6 +1339,8 @@ class UpdateRemote(unittest.TestCase):
             (fix / "bin").mkdir(exist_ok=True)
             (fix / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (fix / "bin" / "romp-kernel").chmod(0o755)
+            (fix / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "bin" / "romp-serve").chmod(0o755)
             (gd / "romp-update-channel").write_text("dev\n")   # a dev remote: mechanics under test
             shim = Path(td) / "shim"
             shim.mkdir()
@@ -1323,6 +1379,8 @@ class UpdateRemote(unittest.TestCase):
             gd.mkdir(parents=True)
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             (fakebin / "git").write_text(
                 "#!/bin/sh\ncase \" $* \" in\n"
                 "  *' rev-parse --absolute-git-dir'*) echo '%s';;\n"
@@ -1338,6 +1396,8 @@ class UpdateRemote(unittest.TestCase):
             (fix / "bin").mkdir(exist_ok=True)
             (fix / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (fix / "bin" / "romp-kernel").chmod(0o755)
+            (fix / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "bin" / "romp-serve").chmod(0o755)
             env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
             apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
             (gd / "romp-install-failed").write_text("deadbee2 stable")
@@ -1496,6 +1556,8 @@ class UpdateRemote(unittest.TestCase):
             gd.mkdir(parents=True)
             fakebin = Path(td) / "bin"
             fakebin.mkdir()
+            (fakebin / "pkill").write_text("#!/bin/sh\nexit 0\n")
+            (fakebin / "pkill").chmod(0o755)
             (gd / "romp-update-channel").write_text("dev\n")   # a dev remote: mechanics under test
             marker = Path(td) / "status-called"
             # exit-8: the OUTER status probe (call 1) reports clean; the wrapper's under-lock
@@ -1515,6 +1577,8 @@ class UpdateRemote(unittest.TestCase):
             (fix / "bin").mkdir(exist_ok=True)
             (fix / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (fix / "bin" / "romp-kernel").chmod(0o755)
+            (fix / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (fix / "bin" / "romp-serve").chmod(0o755)
             env = dict(os.environ, PATH="%s%s%s" % (fakebin, os.pathsep, os.environ.get("PATH", "")))
             apply_r = apply.replace("R=/home/u/romp;", "R=%s;" % fix)
             a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
@@ -1542,10 +1606,14 @@ class UpdateRemote(unittest.TestCase):
                              ["deadbee2", "01dbd11d"],
                              "the arm names the new intent AND CARRIES the prior — never overwritten")
             (fix / "install.sh").write_text("#!/bin/sh\nexit 0\n")
-            a = self._run(["bash", "-c", apply_r], env=env, capture_output=True, text=True, timeout=60)
-            self.assertIn("NOLAUNCH", a.stdout,
-                          "the fixture has no launcher — reaching the launch check proves the "
-                          "heal+reset+install transaction completed")
+            env_fast = dict(env, ROMP_LAUNCH_TRIES="1")
+            a = self._run(["bash", "-c", apply_r], env=env_fast, capture_output=True, text=True,
+                          timeout=60)
+            self.assertIn("RESTARTFAIL", a.stdout,
+                          "no kernel answers the probe in this fixture — reaching the launch "
+                          "verdict proves the heal+reset+install transaction completed (the "
+                          "generation now carries the serve stub, so the r47-era NOLAUNCH "
+                          "short-circuit no longer fires)")
             self.assertFalse((gd / "romp-install-failed").exists(),
                              "healed + reset + installed: everything spent")
 

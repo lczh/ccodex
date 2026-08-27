@@ -498,6 +498,8 @@ class RunUpdate(Fresh):
             (root / "bin").mkdir()
             (root / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (root / "bin" / "romp-kernel").chmod(0o755)
+            (root / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (root / "bin" / "romp-serve").chmod(0o755)
             spawned = []
             env = {k: v for k, v in km.os.environ.items()
                    if k not in ("ROMP_MANAGER_PORT", "ROMP_RELEASE_ALLOWED_SIGNERS",
@@ -560,6 +562,13 @@ class RunUpdate(Fresh):
             gd_alias = root / "deadbee1"
             self._gen_dirs = (sorted(p.name for p in gd_alias.glob("romp-run-*"))
                               if gd_alias.exists() else [])
+            mkf = gd_alias / "romp-restart-needed"
+            self._restart_marker = mkf.read_text().strip() if mkf.exists() else None
+            self._gen_manifest = None
+            for g in self._gen_dirs:
+                mf = gd_alias / g / ".romp-gen"
+                if mf.exists():
+                    self._gen_manifest = mf.read_text().strip()
             return ran.returncode, rows, report
 
     def test_the_report_states_what_the_restart_actually_did(self):
@@ -614,6 +623,22 @@ class RunUpdate(Fresh):
         self.assertIsNone(self._latch, "the heal spent the latch")
         self.assertIn("romp-run-deadbee1", self._gen_dirs,
                       "…and only after building the runtime generation")
+        self.assertEqual(self._gen_manifest, "deadbee1",
+                         "the generation carries its .romp-gen manifest — an existing directory "
+                         "is blessed only against it (the v1.3.20 audit's P2)")
+        self.assertEqual(self._restart_marker, "deadbee1",
+                         "…and the heal armed the update marker before spending the latch: the "
+                         "next spawn requires the verified generation even over a dirty tree "
+                         "(the v1.3.20 audit's P1.2)")
+
+    def test_a_completed_update_arms_the_update_marker(self):
+        # the v1.3.20 audit's P1.2 on the SUCCESS chain: without the marker, one tracked edit
+        # landing between the update and the restart switched the signed release to live bytes
+        rc, rows, report = self._execute_captured_updater(0)
+        self.assertEqual(rc, 0)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(self._restart_marker, "deadbee1",
+                         "arm_marker rode the success chain before the latch was spent")
 
     def test_a_heal_that_cannot_build_the_generation_keeps_the_latch(self):
         # the archive unpacks no executable bin/romp-kernel, so gen_build's content check

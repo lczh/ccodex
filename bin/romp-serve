@@ -49,16 +49,38 @@ esac
 # the case above, so a stale pin with no generation for the current HEAD still exited 1 at the
 # pruned path — the exact crash loop the self-heal exists for)
 KERNEL="${ROMP_KERNEL_BIN:-$ROMP_DIR/bin/romp-kernel}"
+_ROMP_REQ_GEN=""
 if [ -z "${ROMP_KERNEL_BIN:-}" ]; then
     _RGD="$(git -C "$ROMP_DIR" rev-parse --absolute-git-dir 2>/dev/null || true)"
     _RH8="$(git -C "$ROMP_DIR" rev-parse --short=8 HEAD 2>/dev/null || true)"
     _RDIRTY="$(git -C "$ROMP_DIR" status --porcelain 2>/dev/null | head -c 1 || true)"
-    if [ -z "$_RDIRTY" ] && [ -n "$_RGD" ] && [ -n "$_RH8" ] \
-            && [ -x "$_RGD/romp-run-$_RH8/bin/romp-kernel" ]; then
+    # the UPDATE MARKER (the v1.3.20 audit's P1.2): romp-restart-needed is armed by every
+    # update transaction before it spends the install latch and cleared only when a kernel
+    # boots AS its target. While it names HEAD, the boot after an update REQUIRES the verified
+    # generation — one tracked edit landing between the update and this spawn used to switch
+    # the freshly signed release to mutable live bytes (executed: MUTATED_LIVE_BYTES after one
+    # edit). Dirty-live stays the rule for ordinary development launches (no marker).
+    _RMARK=""
+    if [ -n "$_RGD" ] && [ -f "$_RGD/romp-restart-needed" ]; then
+        _RMARK="$(head -1 "$_RGD/romp-restart-needed" 2>/dev/null | tr -cd '0-9a-f' || true)"
+    fi
+    if [ -n "$_RH8" ] && [ -n "$_RMARK" ] && [ "${_RMARK:0:8}" = "$_RH8" ]; then
+        KERNEL="$_RGD/romp-run-$_RH8/bin/romp-kernel"
+        export ROMP_CHECKOUT="$ROMP_DIR"
+        _ROMP_REQ_GEN=1
+        if [ -n "$_RDIRTY" ]; then
+            echo "romp-serve: an update to $_RH8 just landed — launching its VERIFIED build;" >&2
+            echo "  tracked edits in the checkout are ignored for this boot and run normally" >&2
+            echo "  from the next spawn (the marker clears once the updated kernel is up)." >&2
+        fi
+    elif [ -z "$_RDIRTY" ] && [ -n "$_RGD" ] && [ -n "$_RH8" ] \
+            && [ -x "$_RGD/romp-run-$_RH8/bin/romp-kernel" ] \
+            && [ "$(head -c 8 "$_RGD/romp-run-$_RH8/.romp-gen" 2>/dev/null)" = "$_RH8" ]; then
         # a DIRTY checkout always runs live (the r46 re-verify: the generation silently
         # shadowed a developer's uncommitted kernel edits, with no -dirty marker and no drift
         # banner — the generation is the verified COMMIT, and edits mean the commit is not
-        # what the user is running)
+        # what the user is running). The .romp-gen manifest check is the v1.3.20 audit's P2:
+        # an empty or torn generation directory must never be selected over live bytes.
         KERNEL="$_RGD/romp-run-$_RH8/bin/romp-kernel"
         export ROMP_CHECKOUT="$ROMP_DIR"
     else
@@ -109,7 +131,11 @@ fi
 # must never silently rebind the kernel off loopback.
 host="${host:-127.0.0.1}"
 
-[[ -x "$KERNEL" ]] || { echo "romp-serve: kernel not found/executable at $KERNEL" >&2; exit 1; }
+# Under an armed update marker the generation may not exist YET — the gate below builds it
+# (or refuses); the recheck before exec covers both paths (the v1.3.20 audit's P1.2).
+if [ -z "$_ROMP_REQ_GEN" ]; then
+    [[ -x "$KERNEL" ]] || { echo "romp-serve: kernel not found/executable at $KERNEL" >&2; exit 1; }
+fi
 
 # The kernel runs on the best python available, not blindly `python3`: the Agent SDK backend is
 # imported INTO the kernel process and needs >= 3.10, while some hosts pin the system python3 older
@@ -207,6 +233,84 @@ while True:
         if time.time() >= deadline:
             sys.exit(70)               # an update/heal is still running: do not start on it
         time.sleep(0.5)
+import shutil as _sh
+def gen_valid(g, full):
+    # VALIDATED bless (the v1.3.20 audit's P2): an existing directory counts only with a
+    # matching .romp-gen manifest and executable kernel + serve — an empty or torn generation
+    # used to be blessed by its bare existence and then exec'd forever
+    try:
+        mf = open(os.path.join(g, ".romp-gen")).read().strip()
+    except OSError:
+        return False
+    return (mf == full and os.access(os.path.join(g, "bin", "romp-kernel"), os.X_OK)
+            and os.access(os.path.join(g, "bin", "romp-serve"), os.X_OK))
+def gen_build(commit):
+    # content-checked; published by os.rename, which FAILS on an existing target so a
+    # concurrent builder's win is validated-blessed instead of `mv` nesting into it (r47)
+    rv = subprocess.run(["git", "-C", root, "rev-parse", commit], capture_output=True, text=True)
+    full = (rv.stdout or "").strip()
+    if rv.returncode or len(full) < 8:
+        return False
+    g = os.path.join(gdir, "romp-run-" + full[:8])
+    if os.path.isdir(g):
+        if gen_valid(g, full):
+            return True
+        _sh.rmtree(g, ignore_errors=True)      # never bless a torn generation — rebuild it
+    gt = g + ".tmp.%d" % os.getpid()
+    _sh.rmtree(gt, ignore_errors=True)
+    _a = subprocess.run(["git", "-C", root, "archive", full], capture_output=True)
+    if _a.returncode or not _a.stdout:
+        return False
+    os.makedirs(gt)
+    _t = subprocess.run(["tar", "-x", "-C", gt], input=_a.stdout)
+    try:
+        with open(os.path.join(gt, ".romp-gen"), "w") as _mh:
+            _mh.write(full + "\n")
+    except OSError:
+        _sh.rmtree(gt, ignore_errors=True)
+        return False
+    if _t.returncode or not os.access(os.path.join(gt, "bin", "romp-kernel"), os.X_OK) \
+            or not os.access(os.path.join(gt, "bin", "romp-serve"), os.X_OK):
+        _sh.rmtree(gt, ignore_errors=True)
+        return False
+    try:
+        os.rename(gt, g)
+    except OSError:
+        _sh.rmtree(gt, ignore_errors=True)
+        return gen_valid(g, full)
+    return True
+# the UPDATE MARKER leg (the v1.3.20 audit's P1.2), under the same lock and BEFORE the
+# latch's no-latch early exit: while romp-restart-needed names HEAD, this boot must run the
+# verified generation — ensure it exists (validated bless or build) or refuse to start.
+# This also backfills the N−1 upgrade path: an old updater that spent the latch without
+# building a generation leaves the marker, and the first spawn builds it here (the same
+# audit's P1.1 belt alongside install.sh's own build).
+mkp = os.path.join(gdir, "romp-restart-needed")
+try:
+    import stat as _stat
+    if not _stat.S_ISREG(os.lstat(mkp).st_mode):
+        sys.stderr.write("romp-serve: romp-restart-needed exists but is not a regular file — "
+                         "foreign state; heal by hand\n")
+        sys.exit(70)
+    mtok = (open(mkp).read().split() or [""])[0]
+except FileNotFoundError:
+    mtok = ""
+except (OSError, ValueError):
+    sys.exit(70)                       # an EXISTING marker we cannot read is unknown, not absent
+if mtok:
+    if not re.fullmatch(r"[0-9a-f]{7,40}", mtok):
+        sys.stderr.write("romp-serve: romp-restart-needed holds %r, which is not a commit — "
+                         "corrupt or foreign state; heal by hand\n" % mtok[:48])
+        sys.exit(70)
+    _hf = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True)
+    _hfull = (_hf.stdout or "").strip()
+    if not _hf.returncode and _hfull and (_hfull.startswith(mtok) or mtok.startswith(_hfull[:8])):
+        if not gen_build(_hfull):
+            sys.stderr.write("romp-serve: an update to %s landed but its verified build cannot "
+                             "be produced — refusing to start live bytes under the update "
+                             "marker (the v1.3.20 audit's P1.2)\n" % _hfull[:8])
+            sys.exit(70)
+    # HEAD elsewhere: the marker stays — the running-kernel drift banner is that surface
 # UNDER the lock: read, moot-check, heal, clear. The latch may carry TWO lines — the intent and
 # the PRIOR record it superseded (a heal that keeps failing no longer blocks updates; the new arm
 # carries the old sha instead — the adversarial review, 2026-08-19): heal whichever line HEAD
@@ -254,7 +358,6 @@ if cur8 not in lines:
         #                                parsed as one line and was moot-removed into serving)
     os.remove(latch)                   # intent-only mismatch: the move never landed — moot,
     sys.exit(0)                        # and the line's channel token dies with it
-import shutil as _sh
 def snap_install(commit):
     # the SNAPSHOT installer (the v1.3.16 audit's P1.1; the r44 verification extended it to
     # every leg): the COMMIT's complete tree executes — never live-tree bytes a racing writer
@@ -274,31 +377,8 @@ def snap_install(commit):
                          pass_fds=(fd,)).returncode
     _sh.rmtree(_snap, ignore_errors=True)
     return _rc == 0
-def gen_build(commit8):
-    # the runtime generation is REQUIRED before this heal spends the latch (the r47
-    # verification: every heal leg spent it on install alone — one failed or interrupted build
-    # permanently downgraded a signed release to live-byte serving, all indicators green).
-    # Content-checked (an empty unpack is a failure); published by os.rename, which FAILS on an
-    # existing target so a concurrent builder's win is blessed instead of `mv` nesting into it.
-    g = os.path.join(gdir, "romp-run-" + commit8[:8])
-    if os.path.isdir(g):
-        return True
-    gt = g + ".tmp.%d" % os.getpid()
-    _sh.rmtree(gt, ignore_errors=True)
-    _a = subprocess.run(["git", "-C", root, "archive", commit8], capture_output=True)
-    if _a.returncode or not _a.stdout:
-        return False
-    os.makedirs(gt)
-    if subprocess.run(["tar", "-x", "-C", gt], input=_a.stdout).returncode \
-            or not os.access(os.path.join(gt, "bin", "romp-kernel"), os.X_OK):
-        _sh.rmtree(gt, ignore_errors=True)
-        return False
-    try:
-        os.rename(gt, g)
-    except OSError:
-        _sh.rmtree(gt, ignore_errors=True)
-        return os.path.isdir(g)
-    return True
+# the heal's generation build is the validated gen_build defined above the marker leg (the
+# runtime generation is REQUIRED before this heal spends the latch — the r47 verification)
 sys.stderr.write("romp-serve: this checkout's last install never finished — running install.sh before the kernel starts\n")
 if not snap_install(cur8):
     sys.exit(70)                       # latch stays armed for the next retry
@@ -341,4 +421,5 @@ if [[ -n "$port" ]]; then
 fi
 export ROMP_SERVE_HOST="$host"
 export ROMP_KERNEL_NO_OPEN=1
+[[ -x "$KERNEL" ]] || { echo "romp-serve: kernel not found/executable at $KERNEL" >&2; exit 70; }
 exec "$PY" "$KERNEL"

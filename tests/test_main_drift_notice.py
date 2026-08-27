@@ -283,6 +283,11 @@ class ConvergeFunctional(unittest.TestCase):
         (km._MAIN_DRIFT[0], km._MAIN_DRIFT[1], km._CONVERGE_STATE[0],
          km._LAST_AUTO_CONVERGE[0]) = self._saved
         km._set_install_failed("")
+        # the converge arms the restart marker (the v1.3.20 audit's P1.2) — into the same real
+        # gitdir the latch fixtures already use; leave neither behind
+        gd = km._update_git_dir()
+        if gd:
+            (gd / "romp-restart-needed").unlink(missing_ok=True)
 
     def _run(self, kind="pull", target=None, fail=(), tip=None, channel=None, restart_fails=False,
              dirty_second_status=False, second_status_rc_fails=False, diverge_second_ancestry=False,
@@ -363,6 +368,23 @@ class ConvergeFunctional(unittest.TestCase):
              mock.patch.object(km.http.client, "HTTPConnection", FakeConn):
             km._run_main_update(kind, target=target)
         return [s for s, _ in calls], calls
+
+    def test_the_converge_arms_the_restart_marker_before_spending_the_latch(self):
+        # the v1.3.20 audit's P1.2: without the marker, one tracked edit landing between the
+        # converge and the restart switched the freshly installed build to mutable live bytes —
+        # the marker makes the next spawn REQUIRE the verified generation
+        steps, _ = self._run(fail=("install",))
+        gd = km._update_git_dir()
+        self.assertIsNotNone(gd)
+        self.assertFalse((gd / "romp-restart-needed").exists(),
+                         "a failed install arms no marker — nothing verified exists to require")
+        km._set_install_failed("")
+        km._CONVERGE_STATE[0] = ""
+        self._run()
+        content = (gd / "romp-restart-needed").read_text().strip()
+        self.assertTrue(content and self.FULL.startswith(content),
+                        "the converge armed the marker naming the landed commit before spending "
+                        "the latch (the v1.3.20 audit's P1.2)")
 
     def test_a_ui_only_pull_installs_but_never_restarts(self):
         # the fork keeps the INSTALL gate ahead of the in-place converge (a vscode-extension dep
@@ -1592,9 +1614,14 @@ class GenBuildLocal(unittest.TestCase):
         (root / "bin").mkdir(parents=True)
         (root / "install.sh").write_text("#!/bin/sh\nexit 0\n")
         (root / "install.sh").chmod(0o755)
+        # the real install.sh's looks-like-a-romp-clone check needs an executable bin/romp
+        (root / "bin" / "romp").write_text("#!/bin/sh\nexit 0\n")
+        (root / "bin" / "romp").chmod(0o755)
         if with_kernel:
             (root / "bin" / "romp-kernel").write_text("#!/bin/sh\nexit 0\n")
             (root / "bin" / "romp-kernel").chmod(0o755)
+            (root / "bin" / "romp-serve").write_text("#!/bin/sh\nexit 0\n")
+            (root / "bin" / "romp-serve").chmod(0o755)
         sp.run(["git", "-C", str(root), "init", "-q", "-b", "main"], check=True)
         sp.run(["git", "-C", str(root), "add", "-A"], check=True)
         sp.run(["git", "-C", str(root), "-c", "user.email=t@t", "-c", "user.name=t",
@@ -1625,16 +1652,86 @@ class GenBuildLocal(unittest.TestCase):
     def test_gen_build_local_blesses_a_concurrent_winner_never_nests(self):
         # the r47 verification's sibling finding: the shell legs' `mv` moved the tmp dir INSIDE
         # a concurrently-published generation; os.rename fails on an existing target instead,
-        # and the loser blesses the winner's bytes untouched
+        # and the loser VALIDATED-blesses the winner's bytes untouched (the winner carries the
+        # manifest and executables the v1.3.20 audit's bless requires)
+        import subprocess as sp
         root, gd, sha8 = self._repo()
+        full = sp.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                      capture_output=True, text=True).stdout.strip()
         gen = gd / ("romp-run-" + sha8)
-        gen.mkdir()
+        (gen / "bin").mkdir(parents=True)
+        (gen / ".romp-gen").write_text(full + "\n")
+        for b in ("romp-kernel", "romp-serve"):
+            (gen / "bin" / b).write_text("#!/bin/sh\nexit 0\n")
+            (gen / "bin" / b).chmod(0o755)
         (gen / "sentinel").write_text("winner")
         with mock.patch.object(km, "ROOT", root):
             ok, why = km._gen_build_local(sha8)
         self.assertTrue(ok, why)
         self.assertEqual((gen / "sentinel").read_text(), "winner",
                          "the winner's generation survives byte-for-byte, nothing nested into it")
+
+    def test_gen_build_local_rebuilds_an_empty_or_torn_existing_directory(self):
+        # the v1.3.20 audit's P2, executed: every builder blessed ANY existing directory — the
+        # full tag-updater transaction reported success and spent the latch on an EMPTY
+        # generation serve could resolve and fail to exec forever
+        import subprocess as sp
+        root, gd, sha8 = self._repo()
+        full = sp.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                      capture_output=True, text=True).stdout.strip()
+        gen = gd / ("romp-run-" + sha8)
+        gen.mkdir()                                   # empty: no manifest, no binaries
+        with mock.patch.object(km, "ROOT", root):
+            ok, why = km._gen_build_local(sha8)
+        self.assertTrue(ok, why)
+        self.assertEqual((gen / ".romp-gen").read_text().strip(), full,
+                         "the empty directory was REBUILT into a manifested generation")
+        self.assertTrue(os.access(str(gen / "bin" / "romp-kernel"), os.X_OK))
+        self.assertTrue(os.access(str(gen / "bin" / "romp-serve"), os.X_OK),
+                        "…with the executable serve the validated bless requires")
+
+    def test_the_target_commits_install_sh_builds_the_generation_itself(self):
+        # the v1.3.20 audit's P1.1, the N−1→N transition EXECUTED: the v1.3.19 updater installs
+        # v1.3.20 with the OLD updater's code — it spends the latch and builds nothing, so the
+        # release launched from mutable live files (latch_exists=False, generation_exists=False,
+        # V1320_LIVE_NO_GENERATION). The fix rides in the TARGET's install.sh, which every
+        # updater (old or new) executes from the immutable snapshot: this test replays exactly
+        # what the old updater does — run the target's install.sh with ROMP_INSTALL_TARGET —
+        # and the generation must exist afterwards, manifested and executable.
+        import subprocess as sp
+        root, gd, sha8 = self._repo()
+        full = sp.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                      capture_output=True, text=True).stdout.strip()
+        # the fixture's committed install.sh is a stub; run the REAL repo's install.sh the way
+        # an N−1 updater runs the target's: from a separate code dir, aimed at the fixture
+        env = dict(os.environ, ROMP_INSTALL_TARGET=str(root), ROMP_SKIP_PREFLIGHT="1",
+                   ROMP_NO_GITHOOK="1", ROMP_NO_SDK="1", ROMP_NO_EXT="1", ROMP_NO_SERVICE="1",
+                   HOME=str(root.parent))
+        real = os.path.join(os.path.dirname(BIN), "install.sh")
+        ran = sp.run(["bash", real], env=env, capture_output=True, text=True, timeout=120,
+                     cwd=str(root))
+        self.assertEqual(ran.returncode, 0, ran.stderr[-800:])
+        gen = gd / ("romp-run-" + sha8)
+        self.assertEqual((gen / ".romp-gen").read_text().strip(), full,
+                         "install.sh built the target's generation — the N−1 updater needs no "
+                         "generation code of its own")
+        self.assertTrue(os.access(str(gen / "bin" / "romp-kernel"), os.X_OK))
+
+    def test_install_sh_fails_loudly_when_the_generation_cannot_build(self):
+        # fail closed: an install that cannot produce the verified build must not complete —
+        # the caller's latch stays armed for the retry (the v1.3.20 audit's P1.1)
+        import subprocess as sp
+        root, gd, sha8 = self._repo(with_kernel=False)
+        env = dict(os.environ, ROMP_INSTALL_TARGET=str(root), ROMP_SKIP_PREFLIGHT="1",
+                   ROMP_NO_GITHOOK="1", ROMP_NO_SDK="1", ROMP_NO_EXT="1", ROMP_NO_SERVICE="1",
+                   HOME=str(root.parent))
+        real = os.path.join(os.path.dirname(BIN), "install.sh")
+        ran = sp.run(["bash", real], env=env, capture_output=True, text=True, timeout=120,
+                     cwd=str(root))
+        self.assertNotEqual(ran.returncode, 0)
+        self.assertIn("runtime generation", ran.stderr + ran.stdout)
+        self.assertEqual([p.name for p in gd.glob("romp-run-*")], [],
+                         "no half generation published by the failed install")
 
     def test_snap_install_local_requires_the_generation(self):
         # THE revert-detector for the r47 finding: a passing install whose generation cannot

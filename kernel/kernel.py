@@ -2937,23 +2937,44 @@ def _run_update(tag):
         # the RUNTIME GENERATION for the verified commit, REQUIRED before the latch is spent
         # (the v1.3.19 audit's P1): serve/manager resolve romp-run-<sha8> per spawn, and the tag
         # updater built none — /restart-all then launched live checkout bytes on the normal
-        # signed-release path. Idempotent per commit; atomically published (tmp + mv).
+        # signed-release path. Idempotent per commit; atomically published (tmp + os.rename).
+        # VALIDATED bless (the v1.3.20 audit's P2): an existing directory counts only with a
+        # matching .romp-gen full-sha manifest and executable kernel + serve — an empty or torn
+        # generation used to be blessed by bare existence and then exec'd forever.
+        + "gen_ok() {\n"
+        + "  [ \"$(cat \"$GBGD/romp-run-$1/.romp-gen\" 2>/dev/null)\" = \"$2\" ] "
+          "&& [ -x \"$GBGD/romp-run-$1/bin/romp-\"kernel ] && [ -x \"$GBGD/romp-run-$1/bin/romp-serve\" ]\n"
+        + "}\n"
         + "gen_build() {\n"
         + "  GBGD=$(git rev-parse --absolute-git-dir 2>/dev/null) || return 1\n"
-        + "  [ -d \"$GBGD/romp-run-$1\" ] && return 0\n"
+        + "  GBFULL=$(git rev-parse \"$1\" 2>/dev/null); [ -n \"$GBFULL\" ] || return 1\n"
+        + "  if [ -d \"$GBGD/romp-run-$1\" ]; then gen_ok \"$1\" \"$GBFULL\" && return 0; rm -rf \"$GBGD/romp-run-$1\"; fi\n"
         + "  rm -rf \"$GBGD/romp-run-$1.tmp.$$\" && mkdir -p \"$GBGD/romp-run-$1.tmp.$$\" || return 1\n"
         + "  git archive \"$1\" | tar -x -C \"$GBGD/romp-run-$1.tmp.$$\" || { rm -rf \"$GBGD/romp-run-$1.tmp.$$\"; return 1; }\n"
+        + "  printf '%s\\n' \"$GBFULL\" > \"$GBGD/romp-run-$1.tmp.$$/.romp-gen\" || { rm -rf \"$GBGD/romp-run-$1.tmp.$$\"; return 1; }\n"
         # the CONTENT CHECK (the r47 verification): an archive that unpacked to nothing still
         # published a directory serve would resolve and fail to exec forever. The kernel path is
         # written non-contiguously — this script rides in a bash -c argv, and a contiguous
         # "bin/romp-kernel" would match the restart pkill's bracket pattern (the 2026-07-22 class).
-        + "  [ -x \"$GBGD/romp-run-$1.tmp.$$/bin/romp-\"kernel ] || { rm -rf \"$GBGD/romp-run-$1.tmp.$$\"; return 1; }\n"
+        + "  { [ -x \"$GBGD/romp-run-$1.tmp.$$/bin/romp-\"kernel ] && [ -x \"$GBGD/romp-run-$1.tmp.$$/bin/romp-serve\" ]; } "
+          "|| { rm -rf \"$GBGD/romp-run-$1.tmp.$$\"; return 1; }\n"
         # PUBLISH via a rename that FAILS on an existing target (the r47 verification: `mv` moves
         # the tmp dir INSIDE a concurrently-published generation — silent nested litter — and the
         # loser's [ -d ] fallback never runs). os.rename raises EEXIST/ENOTEMPTY instead, and the
-        # loser blesses the winner's generation.
+        # loser VALIDATED-blesses the winner's generation.
         + "  python3 -c 'import os,sys; os.rename(sys.argv[1], sys.argv[2])' \"$GBGD/romp-run-$1.tmp.$$\" \"$GBGD/romp-run-$1\" 2>/dev/null "
-          "|| { rm -rf \"$GBGD/romp-run-$1.tmp.$$\"; [ -d \"$GBGD/romp-run-$1\" ]; }\n"
+          "|| { rm -rf \"$GBGD/romp-run-$1.tmp.$$\"; gen_ok \"$1\" \"$GBFULL\"; }\n"
+        + "}\n"
+        # the UPDATE MARKER (the v1.3.20 audit's P1.2), armed BEFORE the latch is spent exactly
+        # like the p2p wrapper's: while it names the landed commit, the next spawn REQUIRES the
+        # verified generation — one tracked edit between this update and the restart used to
+        # switch the freshly signed release to mutable live bytes. Cleared by the kernel that
+        # boots as its target (_clear_restart_marker_if_current).
+        + "arm_marker() {\n"
+        + "  AMGD=$(git rev-parse --absolute-git-dir 2>/dev/null) || return 1\n"
+        + "  AMFULL=$(git rev-parse \"$1\" 2>/dev/null); [ -n \"$AMFULL\" ] || return 1\n"
+        + "  printf '%s\\n' \"$AMFULL\" > \"$AMGD/romp-restart-needed.tmp.$$\" || return 1\n"
+        + "  mv -f \"$AMGD/romp-restart-needed.tmp.$$\" \"$AMGD/romp-restart-needed\"\n"
         + "}\n"
         # a healed or completed move publishes any staged CHANNEL INTENT for its commit before
         # the latch is spent (the v1.3.8 audit: a healer reviving a crashed bootstrap's stable
@@ -3007,8 +3028,9 @@ def _run_update(tag):
         # verification: every heal leg spent the latch on install alone, so one failed gen_build
         # permanently downgraded a signed release to live-byte serving with all indicators green)
         + "    if snap_install \"$CUR\" >> %s 2>&1 && gen_build \"$CUR\" >> %s 2>&1 "
+          "&& arm_marker \"$CUR\" >> %s 2>&1 "
           "&& pub_line \"$(pick_pub \"$CURLINE\" %s)\"; then rm -f %s; "
-          "else\n" % (log, log, latch, latch)
+          "else\n" % (log, log, log, latch, latch)
         + "      CARRY=\"$CURLINE\"\n"
         # a plain surviving line MERGES the other line's pending token — a lossy carry destroyed
         # the pending stable and blinded the pull gate (the adversarial review, 2026-08-21)
@@ -3046,8 +3068,9 @@ def _run_update(tag):
           "&& git merge --ff-only %s >> %s 2>&1 "
           "&& [ \"$(git rev-parse --short=8 HEAD | head -c 8)\" = \"$NEW8\" ] "
           "&& snap_install \"$NEW8\" >> %s 2>&1 "
-          "&& gen_build \"$NEW8\" >> %s 2>&1; then\n"
-          % (latch, tag, log, log, log)
+          "&& gen_build \"$NEW8\" >> %s 2>&1 "
+          "&& arm_marker \"$NEW8\" >> %s 2>&1; then\n"
+          % (latch, tag, log, log, log, log)
         + "      if pub_line \"$(pick_pub \"$(sed -n 1p %s 2>/dev/null)\" %s)\"; then rm -f %s; OK=1; fi\n"
           % (latch, latch, latch)
         + "    fi\n"
@@ -4083,26 +4106,47 @@ def _gen_build_local(commit):
     gd = _update_git_dir()
     if not gd:
         return False, "cannot resolve the git dir for the runtime generation"
-    gen = os.path.join(gd, "romp-run-" + str(commit)[:8])
+    rv = subprocess.run(["git", "-C", str(ROOT), "rev-parse", str(commit)],
+                        capture_output=True, text=True, timeout=30)
+    full = (rv.stdout or "").strip()
+    if rv.returncode or len(full) < 8:
+        return False, "cannot resolve %s for the runtime generation" % str(commit)[:12]
+
+    def _ok(p):
+        # VALIDATED bless (the v1.3.20 audit's P2): a matching .romp-gen full-sha manifest and
+        # executable kernel + serve — bare existence blessed an empty directory forever
+        try:
+            mf = open(os.path.join(p, ".romp-gen")).read().strip()
+        except OSError:
+            return False
+        return (mf == full and os.access(os.path.join(p, "bin", "romp-kernel"), os.X_OK)
+                and os.access(os.path.join(p, "bin", "romp-serve"), os.X_OK))
+
+    gen = os.path.join(gd, "romp-run-" + full[:8])
     if os.path.isdir(gen):
-        return True, ""
+        if _ok(gen):
+            return True, ""
+        _sh.rmtree(gen, ignore_errors=True)      # a torn generation is rebuilt, never blessed
     tmp = gen + ".tmp.%d" % os.getpid()
     try:
         _sh.rmtree(tmp, ignore_errors=True)
-        ar = subprocess.run(["git", "-C", str(ROOT), "archive", str(commit)],
+        ar = subprocess.run(["git", "-C", str(ROOT), "archive", full],
                             capture_output=True, timeout=120)
         if ar.returncode or not ar.stdout:
-            return False, "git archive %s failed for the runtime generation" % str(commit)[:12]
+            return False, "git archive %s failed for the runtime generation" % full[:12]
         os.makedirs(tmp)
         tr = subprocess.run(["tar", "-x", "-C", tmp], input=ar.stdout, timeout=120)
-        if tr.returncode or not os.access(os.path.join(tmp, "bin", "romp-kernel"), os.X_OK):
+        with open(os.path.join(tmp, ".romp-gen"), "w") as mh:
+            mh.write(full + "\n")
+        if tr.returncode or not os.access(os.path.join(tmp, "bin", "romp-kernel"), os.X_OK) \
+                or not os.access(os.path.join(tmp, "bin", "romp-serve"), os.X_OK):
             _sh.rmtree(tmp, ignore_errors=True)
             return False, "unpacking the runtime generation failed"
         try:
             os.rename(tmp, gen)
         except OSError:
             _sh.rmtree(tmp, ignore_errors=True)
-            if not os.path.isdir(gen):
+            if not _ok(gen):
                 return False, "publishing the runtime generation failed"
         return True, ""
     except subprocess.TimeoutExpired:
@@ -4187,6 +4231,15 @@ def _converge_install(sha8, lock_fd=None):
         _converge_note("the checkout advanced to %s but install.sh failed: %s — nothing restarts "
                        "onto it until install passes; fix the cause, then Update again" % (sha8, why))
         return False
+    if not _arm_restart_marker(sha8):
+        # the UPDATE MARKER (the v1.3.20 audit's P1.2), armed BEFORE the latch is spent like
+        # every other update transaction: while it names the landed commit, the next spawn
+        # REQUIRES the verified generation — one tracked edit landing between this converge and
+        # the restart used to switch the freshly installed build to mutable live bytes
+        _converge_note("installed %s, but the restart marker could not be armed — keeping the "
+                       "install latch so the next boot is not an unverified live-byte launch; "
+                       "fix the checkout's git dir and update again" % sha8)
+        return False
     if not _publish_latch_channel(sha8):
         _converge_note("installed %s, but the update channel intended for it could not be "
                        "recorded — keeping the install latch so nothing runs this build under "
@@ -4195,6 +4248,38 @@ def _converge_install(sha8, lock_fd=None):
         return False
     _set_install_failed("")
     return True
+
+
+def _arm_restart_marker(commit):
+    """Write <gitdir>/romp-restart-needed naming `commit`, atomically. Armed by every update
+    transaction before its latch is spent (the v1.3.20 audit's P1.2): while the marker names
+    HEAD, romp-serve requires the verified generation even over a dirty tree, and the kernel
+    that boots as the target clears it (_clear_restart_marker_if_current). A 7-40 hex commit
+    is written AS GIVEN — the marker grammar prefix-matches, and re-resolving through git here
+    would add a subprocess the converge transaction's step-order contract doesn't carry."""
+    gd = _update_git_dir()
+    if not gd:
+        return False
+    full = str(commit or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{7,40}", full):
+        rv = subprocess.run(["git", "-C", str(ROOT), "rev-parse", full or "HEAD"],
+                            capture_output=True, text=True, timeout=30)
+        full = (rv.stdout or "").strip()
+        if rv.returncode or len(full) < 8:
+            return False
+    mk = os.path.join(str(gd), "romp-restart-needed")
+    tmp = mk + ".tmp.%d" % os.getpid()
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(full + "\n")
+        os.replace(tmp, mk)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
 
 
 def _migrate_codex_flags_order():
@@ -12897,24 +12982,32 @@ def _pr_watches_load():
             r["_next"], r["_fails"], r["_busy"] = 0, 0, False
 
 
+def _pr_watches_save_locked():
+    # caller HOLDS _pr_watch_lock — the WRITE sits under the lock (the v1.3.18 audit: two
+    # concurrent saves could land out of order, resurrecting a retired watch or losing a
+    # fresh one — the snapshot alone serialized nothing)
+    rows = [{k: r[k] for k in ("pr", "repo", "sid", "at", "sent") if k in r}
+            for r in _pr_watches]
+    try:
+        _atomic_write(PR_WATCH_FILE, json.dumps(rows))
+    except Exception:
+        sys.stderr.write("pr-watches save: %s\n" % traceback.format_exc())
+        return False
+    return True
+
+
 def _pr_watches_save():
     with _pr_watch_lock:
-        # the WRITE sits under the lock too (the v1.3.18 audit: two concurrent saves could land
-        # out of order, resurrecting a retired watch or losing a fresh one — the snapshot alone
-        # serialized nothing)
-        rows = [{k: r[k] for k in ("pr", "repo", "sid", "at", "sent") if k in r}
-                for r in _pr_watches]
-        try:
-            _atomic_write(PR_WATCH_FILE, json.dumps(rows))
-        except Exception:
-            sys.stderr.write("pr-watches save: %s\n" % traceback.format_exc())
-            return False
-    return True
+        return _pr_watches_save_locked()
 
 
 def add_pr_watch(pr, repo, sid, now=None):
     """Register (idempotently) a landing watch: one mail to `sid` when repo#pr reaches a terminal
-    state. Returns the row."""
+    state. Returns the row. Lookup, append, PERSIST and rollback are ONE locked transaction (the
+    v1.3.20 audit): with the save outside the lock, a concurrent duplicate was acknowledged off
+    a pending row whose save later failed, and an interleaved second registration persisted the
+    refused row to disk — memory and file disagreed, and the refused watch resurrected at the
+    next boot."""
     pr, repo, sid = int(pr), str(repo).strip(), str(sid).strip()
     with _pr_watch_lock:
         for r in _pr_watches:
@@ -12923,13 +13016,13 @@ def add_pr_watch(pr, repo, sid, now=None):
         row = {"pr": pr, "repo": repo, "sid": sid, "at": int(now if now is not None else time.time()),
                "_next": 0, "_fails": 0, "_busy": False}
         _pr_watches.append(row)
-    if not _pr_watches_save():
-        # never acknowledge a registration that would not survive a restart (the v1.3.19 audit)
-        with _pr_watch_lock:
-            if row in _pr_watches:
-                _pr_watches.remove(row)
-        return None
-    return {k: row[k] for k in ("pr", "repo", "sid", "at")}
+        if not _pr_watches_save_locked():
+            # never acknowledge a registration that would not survive a restart (the v1.3.19
+            # audit) — and roll back under the SAME lock, so no other caller ever observes,
+            # acknowledges, or persists the refused row (the v1.3.20 audit)
+            _pr_watches.remove(row)
+            return None
+        return {k: row[k] for k in ("pr", "repo", "sid", "at")}
 
 
 def _pr_watch_verdict(d, required=None):
@@ -13025,15 +13118,31 @@ def _pr_watch_deliver(sid, text):
         return False
 
 
+def _pr_watch_fail_marker(r, verdict):
+    """The durable KNOWN-FAILURE record for one (watch, verdict) delivery (the v1.3.20 audit):
+    when a delivery fails AND clearing the durable `sent` stamp also fails, the stamp alone
+    reads as possible-success after a restart and the notification silently retires. The marker
+    outlives that crash and says 'the stamp is not evidence — retry'."""
+    key = hashlib.sha256(("%s|%s|%s|%s" % (r.get("repo"), r.get("pr"), r.get("sid"),
+                                           verdict)).encode()).hexdigest()[:24]
+    return jd.STATE / "pr-watch-failed" / key
+
+
 def _pr_watch_stamped_deliver(r, verdict, detail):
     """Deliver a watch's terminal mail AT MOST ONCE across crashes (the v1.3.17 audit's P2.10):
     the verdict is stamped into the durable watch file BEFORE the injection, so a crash between
     deliver and retire retires the stamped row on restart instead of mailing a duplicate. A
     delivery that reports failure clears the stamp and retries next pass — the row is only
     retired (True) once an injection was confirmed, or once a stamp says one may already have
-    landed."""
+    landed. A KNOWN failure whose stamp-clear also fails leaves a durable failure marker, so
+    the stale stamp never silently retires the notification after a restart (the v1.3.20
+    audit)."""
+    fk = _pr_watch_fail_marker(r, verdict)
     if r.get("sent") == verdict:
-        return True                                   # stamped: delivered (or crashed mid-window)
+        if fk.exists():
+            r.pop("sent", None)                       # the stamp survived a KNOWN failure — it is
+        else:                                         # not evidence of delivery; retry below
+            return True                               # stamped: delivered (or crashed mid-window)
     r["sent"] = verdict
     if not _pr_watches_save():
         # the stamp is NOT durable — delivering now would re-mail after a crash (the v1.3.18
@@ -13041,9 +13150,20 @@ def _pr_watch_stamped_deliver(r, verdict, detail):
         r.pop("sent", None)
         return False
     if _pr_watch_deliver(r["sid"], _pr_watch_notice(verdict, r["repo"], r["pr"], detail)):
+        try:
+            fk.unlink(missing_ok=True)                # delivery confirmed — the failure is over
+        except OSError:
+            pass
         return True
     r.pop("sent", None)                               # a KNOWN failure — retry next pass
-    _pr_watches_save()
+    if not _pr_watches_save():
+        try:
+            fk.parent.mkdir(parents=True, exist_ok=True)
+            fk.write_text(verdict + "\n")
+        except OSError:
+            sys.stderr.write("pr-watch: delivery for %s#%s failed AND neither the stamp clear "
+                             "nor the failure marker could be persisted — a restart may retire "
+                             "this notification undelivered\n" % (r.get("repo"), r.get("pr")))
     return False
 
 
@@ -13575,10 +13695,22 @@ def _update_remote(host):
         # existing target — the loser of a concurrent build blesses the winner instead of `mv`
         # nesting its tmp dir inside it. The kernel filename stays non-contiguous in this argv
         # (the join) so the restart pkill's bracket pattern can never match this wrapper itself.
+        # VALIDATED bless (the v1.3.20 audit's P2): an existing directory counts only with a
+        # matching .romp-gen full-sha manifest and executable kernel + serve — bare existence
+        # blessed an empty generation and the full transaction reported success on it
+        "def gen_ok(g,full):\n"
+        "    try:\n"
+        '        mf=open(os.path.join(g,".romp-gen")).read().strip()\n'
+        "    except OSError:\n"
+        "        return False\n"
+        '    return (mf==full and os.access(os.path.join(g,"bin","romp-"+"kernel"),os.X_OK)\n'
+        '            and os.access(os.path.join(g,"bin","romp-serve"),os.X_OK))\n'
         "def gen_build(commit):\n"
         '    g=os.path.join(os.path.dirname(lp),"romp-run-"+commit[:8])\n'
         "    if os.path.isdir(g):\n"
-        "        return g\n"
+        "        if gen_ok(g,commit):\n"
+        "            return g\n"
+        "        shutil.rmtree(g,ignore_errors=True)\n"
         '    gt=g+".tmp.%%d"%%os.getpid()\n'
         "    shutil.rmtree(gt,ignore_errors=True)\n"
         '    ar=subprocess.run(["git","-C",r,"archive",commit],capture_output=True)\n'
@@ -13586,14 +13718,20 @@ def _update_remote(host):
         "        return None\n"
         "    os.makedirs(gt)\n"
         '    tr=subprocess.run(["tar","-x","-C",gt],input=ar.stdout)\n'
-        '    if tr.returncode or not os.access(os.path.join(gt,"bin","romp-"+"kernel"),os.X_OK):\n'
+        "    try:\n"
+        '        with open(os.path.join(gt,".romp-gen"),"w") as mh:\n'
+        '            mh.write(commit+"\\n")\n'
+        "    except OSError:\n"
+        "        tr=None\n"
+        '    if (tr is None or tr.returncode or not os.access(os.path.join(gt,"bin","romp-"+"kernel"),os.X_OK)\n'
+        '            or not os.access(os.path.join(gt,"bin","romp-serve"),os.X_OK)):\n'
         "        shutil.rmtree(gt,ignore_errors=True)\n"
         "        return None\n"
         "    try:\n"
         "        os.rename(gt,g)\n"
         "    except OSError:\n"
         "        shutil.rmtree(gt,ignore_errors=True)\n"
-        "        if not os.path.isdir(g):\n"
+        "        if not gen_ok(g,commit):\n"
         "            return None\n"
         "    return g\n"
         "fd=os.open(lock,os.O_RDWR|os.O_CREAT,0o644)\n"
@@ -14634,12 +14772,18 @@ def _restart_remote_kernel(host):
         'pkill -f "bin/romp-kern[e]l" 2>/dev/null; '
         'LGD="$(git -C "$R" rev-parse --absolute-git-dir 2>/dev/null)"; '
         'H8="$(git -C "$R" rev-parse --short=8 HEAD 2>/dev/null)"; '
-        'if [ -n "$LGD" ] && [ -n "$H8" ]; then GEN="$LGD/romp-run-$H8"; '
+        'HF="$(git -C "$R" rev-parse HEAD 2>/dev/null)"; '
+        'if [ -n "$LGD" ] && [ -n "$H8" ] && [ -n "$HF" ]; then GEN="$LGD/romp-run-$H8"; '
+        # a NEW build carries the .romp-gen manifest and the serve executable (the v1.3.20
+        # audit's P2) — but an EXISTING dir, valid or torn, is never removed here: detached
+        # processes may be execing it right now (the r45 rr race), this leg is best-effort by
+        # design, and serve's own spawn validation refuses a torn generation and runs live
+        # until the next LOCKED updater rebuilds it
         'if [ ! -d "$GEN" ]; then rm -rf "$GEN.tmp.$$"; mkdir -p "$GEN.tmp.$$"; '
         # content-checked, published by a rename that FAILS on an existing target (the r47
         # verification: `mv` nested the tmp dir INSIDE a concurrently-published generation); the
         # kernel filename stays non-contiguous per the NOTE above
-        'if git -C "$R" archive HEAD 2>/dev/null | tar -x -C "$GEN.tmp.$$" 2>/dev/null && [ -x "$GEN.tmp.$$/bin/romp-"kernel ]; then '
+        'if git -C "$R" archive HEAD 2>/dev/null | tar -x -C "$GEN.tmp.$$" 2>/dev/null && printf "%%s\\n" "$HF" > "$GEN.tmp.$$/.romp-gen" && [ -x "$GEN.tmp.$$/bin/romp-"kernel ] && [ -x "$GEN.tmp.$$/bin/romp-serve" ]; then '
         'python3 -c "import os,sys; os.rename(sys.argv[1],sys.argv[2])" "$GEN.tmp.$$" "$GEN" 2>/dev/null || rm -rf "$GEN.tmp.$$"; '
         'else rm -rf "$GEN.tmp.$$"; fi; fi; fi; '
         'GN="romp-manage"; GN="${GN}r"; MGR="$R/bin/$GN"; '
@@ -21876,20 +22020,25 @@ def _postal_wait_maps():
                     _seq = int(o.get("seq") or 0)
                 except (TypeError, ValueError):
                     _seq = 0
+                # len(rows) at append time = strict FILE ORDER, the tie-break of last resort:
+                # two legacy rows with equal (t, seq=0) used to fall through to lexicographic
+                # sid comparison, which picked the OLD sid over the rebinding and missed the
+                # reply (the v1.3.20 audit's residual on the v1.3.18 fix)
                 ahist.setdefault(str(o["from_host"]) + ":" + str(o["from"]), []).append(
-                    (int(o.get("t") or 0), _seq, str(o["from_id"])))
+                    (int(o.get("t") or 0), _seq, len(rows), str(o["from_id"])))
         unpub = {str(o["id"]) for o in rows if o.get("ev") == "unpublished" and o.get("id")}
 
         def _alias_at(key, when):
-            # ordered by (t, seq): the bus stamps a strictly-increasing seq per alias row, so
-            # same-second rebindings resolve in JSONL order, never by lexicographic sid (the
-            # v1.3.18 audit)
+            # ordered by (t, seq, file order): the bus stamps a strictly-increasing seq per
+            # alias row, so same-second rebindings resolve in JSONL order — and rows with EQUAL
+            # (t, seq) (legacy, no seq) still resolve by file order, never by lexicographic sid
+            # (the v1.3.18 audit; the v1.3.20 audit's residual)
             hist = ahist.get(key) or []
             before = [e for e in hist if e[0] <= when]
             if before:
-                return max(before)[2]
+                return max(before)[3]
             after = [e for e in hist if e[0] > when]   # the peer first spoke after the ask —
-            return min(after)[2] if after else ""      # the earliest binding is the ask's world
+            return min(after)[3] if after else ""      # the earliest binding is the ask's world
         for o in rows:
             if o.get("ev") == "sent" and str(o.get("id") or "") in unpub:
                 continue                               # the publish FAILED after the row landed —

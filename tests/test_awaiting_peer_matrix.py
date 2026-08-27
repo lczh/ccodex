@@ -549,6 +549,31 @@ class CrossHostDelegation(_Base):
         self.assertEqual(km._peer_answered_at(SID), T0 + 300,
                          "seq 2 is the binding at ask time — JSONL order, not sid order")
 
+    def test_equal_t_and_seq_legacy_rows_still_resolve_in_log_order(self):
+        # the v1.3.20 audit's residual on the v1.3.18 fix: legacy rows carry NO seq (both
+        # default 0) — with (t, seq) fully equal, max() fell through to lexicographic sid and
+        # picked the OLD binding, so the rebound session's reply never matched and the ask wore
+        # Awaiting forever. File order is the tie-break of last resort now.
+        self._fleet_stub()
+        other = "ffffffff-9999-8888-7777-666666666666"   # lexicographically ABOVE self.RSID:
+        #                                                  the sid fallback picks IT
+        rows = [json.dumps({"t": T0 + 5, "ev": "peer-alias", "from_host": self.RHOST,
+                            "from": "w", "from_id": other}),
+                json.dumps({"t": T0 + 5, "ev": "peer-alias", "from_host": self.RHOST,
+                            "from": "w", "from_id": self.RSID}),
+                json.dumps({"id": "px-32.mail.TESTHOST-A", "ev": "sent", "from": "api",
+                            "from_id": SID, "to_id": "peer:%s" % self.RHOST,
+                            "toName": "%s:w" % self.RHOST,
+                            "t": T0 + 10, "kind": "question", "body": "the port?"}),
+                json.dumps({"id": "rx-32.mail.%s" % self.RHOST, "ev": "sent", "from": "w",
+                            "from_id": self.RSID, "from_host": self.RHOST, "to_id": SID,
+                            "t": T0 + 300, "kind": "coordinate", "body": "8080"})]
+        self._log(rows)
+        km._POSTAL_WAIT_CACHE[0] = None
+        self.assertEqual(km._peer_answered_at(SID), T0 + 300,
+                         "the LAST same-second legacy binding is the ask's — file order, never "
+                         "lexicographic sid (the v1.3.20 audit's residual)")
+
     def test_an_unrelated_peers_reply_never_completes(self):
         self._fleet_stub()
         self._log([self._xrow(1, T0 + 10)])

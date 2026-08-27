@@ -234,6 +234,78 @@ if [[ -z "${ROMP_NO_EXT:-}" && -e "$ROMP_CODE/vscode-extension/install.sh" ]]; t
     bash "$ROMP_CODE/vscode-extension/install.sh" || ROMP_EXT_FAILED=1   # snapshot bytes; builds the TARGET tree
 fi
 
+# RUNTIME GENERATION at install time (the v1.3.20 audit's P1.1): the N−1 release's updater
+# installs a NEWER commit with the OLD updater's code — v1.3.19's spent the install latch
+# without building a generation, so v1.3.20 launched from mutable live files with every
+# indicator green (executed: latch_exists=False, generation_exists=False). Updaters execute
+# THIS script from the immutable snapshot of the TARGET commit, so building the generation
+# here covers every past and future updater that runs the target's install.sh — including
+# ones that predate the generation scheme entirely. VALIDATED bless (the same audit's P2):
+# an existing directory counts only with a matching .romp-gen manifest and executable
+# kernel + serve; an empty or torn generation is rebuilt, never blessed. Fails the install
+# (→ the latch stays armed for the retry) rather than completing without a verified build.
+# ROMP_NO_GEN=1 skips (test fixtures that aren't romp trees); a non-git target (tarball
+# install) skips on its own — no git dir means no generations anywhere.
+if [[ -z "${ROMP_NO_GEN:-}" ]]; then
+    if ! python3 - "$ROMP_DIR" <<'GENPY'
+import os, shutil, subprocess, sys
+root = sys.argv[1]
+gd = subprocess.run(["git", "-C", root, "rev-parse", "--absolute-git-dir"],
+                    capture_output=True, text=True)
+gdir = (gd.stdout or "").strip()
+if gd.returncode or not gdir:
+    sys.exit(0)                        # not a git checkout: no generations here, nothing to build
+hh = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True)
+full = (hh.stdout or "").strip()
+if hh.returncode or len(full) < 8:
+    sys.stderr.write("install.sh: cannot resolve HEAD for the runtime generation\n")
+    sys.exit(1)
+gen = os.path.join(gdir, "romp-run-" + full[:8])
+def valid(p):
+    try:
+        mf = open(os.path.join(p, ".romp-gen")).read().strip()
+    except OSError:
+        return False
+    return (mf == full and os.access(os.path.join(p, "bin", "romp-kernel"), os.X_OK)
+            and os.access(os.path.join(p, "bin", "romp-serve"), os.X_OK))
+if os.path.isdir(gen):
+    if valid(gen):
+        sys.exit(0)
+    shutil.rmtree(gen, ignore_errors=True)
+tmp = gen + ".tmp.%d" % os.getpid()
+shutil.rmtree(tmp, ignore_errors=True)
+ar = subprocess.run(["git", "-C", root, "archive", full], capture_output=True)
+if ar.returncode or not ar.stdout:
+    sys.stderr.write("install.sh: git archive failed for the runtime generation\n")
+    sys.exit(1)
+os.makedirs(tmp)
+tr = subprocess.run(["tar", "-x", "-C", tmp], input=ar.stdout)
+try:
+    with open(os.path.join(tmp, ".romp-gen"), "w") as mh:
+        mh.write(full + "\n")
+except OSError:
+    tr = None
+if tr is None or tr.returncode \
+        or not os.access(os.path.join(tmp, "bin", "romp-kernel"), os.X_OK) \
+        or not os.access(os.path.join(tmp, "bin", "romp-serve"), os.X_OK):
+    shutil.rmtree(tmp, ignore_errors=True)
+    sys.stderr.write("install.sh: the runtime generation did not unpack to a usable tree\n")
+    sys.exit(1)
+try:
+    os.rename(tmp, gen)                # fails on an existing target: a concurrent winner is
+except OSError:                        # blessed only if VALID, never nested into (r47/v1.3.20)
+    shutil.rmtree(tmp, ignore_errors=True)
+    if not valid(gen):
+        sys.stderr.write("install.sh: publishing the runtime generation failed\n")
+        sys.exit(1)
+GENPY
+    then
+        echo "install.sh: could not build the verified runtime generation for this commit." >&2
+        echo "  The install is NOT complete — fix the error above and re-run install.sh." >&2
+        exit 1
+    fi
+fi
+
 # Auto-start: install the login service so the kernel supervisor (romp-manager) is
 # always up — you never run `romp up`; open the browser and you can even start
 # sessions FROM it. launchd on macOS, systemd --user on Linux. Opt out with

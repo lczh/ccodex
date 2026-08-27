@@ -6121,6 +6121,11 @@ _MIG_FP_FILES = ("notify-cards.json", "auto-nudge.json", "judge-auth.json", "ses
                  "session-order.json", "retry-suppressed.json", "timeline-views.json",
                  "timeline-dismissed.json")
 _MIG_JOURNALS = ("cleared.jsonl", "nudge-events.jsonl")
+# _mig_shared_fps's never-match fingerprint for a file that EXISTS but cannot be read (or is
+# not a regular file): "unreadable:" + fresh randomness. Never a valid sha256 hex, never None,
+# never equal to another draw — so it voids the settle compare in both directions, and the
+# certificate writer refuses to store it (an unreadable file must not certify).
+_MIG_FP_UNREADABLE = "unreadable:"
 
 
 def _mig_shared_fps():
@@ -6131,13 +6136,24 @@ def _mig_shared_fps():
     boundary — a shared file containing invalid UTF-8 raised UnicodeDecodeError here and took
     the whole process down. Undecodable content still fingerprints (and so still voids the
     settle when it changes); the rewrite pass is where its corruption surfaces, loudly, inside
-    the migration's own boundary."""
+    the migration's own boundary.
+
+    Only FileNotFoundError means ABSENT (-> None, the one state a certificate may match). Any
+    other failure — EACCES/EIO, or a non-regular replacement (_mig_read_bytes stat-guards
+    S_ISREG and raises plain OSError for a FIFO/symlink, without blocking: it opens
+    O_NONBLOCK|O_NOFOLLOW) — fingerprints as a NEVER-MATCH sentinel, fresh randomness per
+    call, so it equals no stored hash, no stored None, and not even a previously stored
+    sentinel: verification fails in both directions and the migration re-runs (the v1.3.20
+    audit's P2: every OSError mapped to None, so a certificate issued while a file was
+    missing silently accepted an unreadable replacement as settled)."""
     fps = {}
     for name in _MIG_FP_FILES:
         try:
             fps[name] = _mig_sha(_mig_read_bytes(STATE / name))
-        except OSError:
+        except FileNotFoundError:
             fps[name] = None
+        except OSError:
+            fps[name] = _MIG_FP_UNREADABLE + os.urandom(8).hex()
     return fps
 
 
