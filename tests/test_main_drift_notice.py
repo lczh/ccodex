@@ -1716,6 +1716,10 @@ class GenBuildLocal(unittest.TestCase):
                          "install.sh built the target's generation — the N−1 updater needs no "
                          "generation code of its own")
         self.assertTrue(os.access(str(gen / "bin" / "romp-kernel"), os.X_OK))
+        self.assertEqual((gd / "romp-restart-needed").read_text().strip(), full,
+                         "…and ARMED the update marker: this ran as an UPDATER install (code "
+                         "dir != target), so the very hop that ships the marker scheme boots "
+                         "verified (the r48 verification)")
 
     def test_install_sh_fails_loudly_when_the_generation_cannot_build(self):
         # fail closed: an install that cannot produce the verified build must not complete —
