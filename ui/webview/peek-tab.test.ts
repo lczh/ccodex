@@ -93,6 +93,7 @@ test("the peek is a PEEK, not a view edit: the client never posts a views change
   const focusBlock = (RENDER.match(/else if \(m\.type === "focus"\) \{[\s\S]*?\n  \}/) || [""])[0];
   assert.ok(focusBlock.length > 100, "found the focus handler");
   assert.doesNotMatch(focusBlock, /postViews|setTimelineViews|revealSession/);
-  assert.match(RENDER, /function revealSession\(id: string\) \{\s*\n\s*const v = revealIn\(effViews\(\), id\);\s*\n\s*postViews\(v, v\.actives \? \[\{ actives: v\.actives \}\] : undefined\);/,
-    "the reveal is a pure lens move — posted as a targeted op (the v1.3.20 audit)");
+  assert.match(RENDER, /function revealSession\(id: string\) \{\s*\n\s*const v = revealIn\(effViews\(\), id\);/,
+    "the reveal derives the lens move then posts ONLY the chat surface as a targeted op "
+    + "(the v1.3.20 audit; per-surface since r48)");
 });

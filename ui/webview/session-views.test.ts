@@ -95,8 +95,9 @@ test("a view-filtered session keeps one visible home: the picker's other-view se
 test("the hide MECHANISM is fully retired (the user 2026-08-24) — reveal survives as the view jump", () => {
   assert.doesNotMatch(RENDER, /Hide from chat & timeline/);
   assert.doesNotMatch(RENDER, /hideIn\(/, "no hide gesture anywhere");
-  assert.match(RENDER, /function revealSession\(id: string\) \{\s*\n\s*const v = revealIn\(effViews\(\), id\);\s*\n\s*postViews\(v, v\.actives \? \[\{ actives: v\.actives \}\] : undefined\);/,
-    "the reveal is a pure lens move — posted as a targeted op (the v1.3.20 audit)");
+  assert.match(RENDER, /function revealSession\(id: string\) \{\s*\n\s*const v = revealIn\(effViews\(\), id\);/,
+    "the reveal derives the lens move then posts ONLY the chat surface as a targeted op "
+    + "(the v1.3.20 audit; per-surface since r48)");
 });
 
 test("federation carries the LOCAL kernel's views blob through merged tabOrder re-emits", () => {

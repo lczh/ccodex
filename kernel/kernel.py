@@ -2076,7 +2076,14 @@ def _apply_views_ops(ops):
                 d["active"] = op["active"]
                 continue
             if isinstance(op.get("actives"), dict):
-                d["actives"] = op["actives"]           # absolute gesture; _norm validates per surface
+                # PER-SURFACE MERGE, never a whole-dict replace (the r48 verification: a client
+                # posting every surface's lens overwrote OTHER panes' concurrent picks with its
+                # own stale copies — the erase the ops exist to end, one level down). Clients
+                # post only the surface their gesture changed; _norm validates each lens.
+                cur_act = d.get("actives") if isinstance(d.get("actives"), dict) else {}
+                cur_act = dict(cur_act)
+                cur_act.update(op["actives"])
+                d["actives"] = cur_act
                 continue
             if isinstance(op.get("tagOrder"), list):
                 names = [str(n) for n in op["tagOrder"] if isinstance(n, str) and n]
@@ -32871,11 +32878,21 @@ class Handler(BaseHTTPRequestHandler):
             # drag are absolute-state gestures — as whole-blob CAS writes they pipelined guessed
             # revisions (a refused W1's sibling W2 could coincide with a foreign commit's rev and
             # erase it); as ops they COMPOSE under the identity lock with no base to guess. The
-            # ack wears the same viewsAck dress so the shared writer's counter re-anchors.
-            _orev = _apply_views_ops(msg["ops"])
+            # ack wears the same viewsAck dress so the shared writer's counter re-anchors — and
+            # it is sent on FAILURE too (the r48 verification: an exception here answered
+            # nothing, and the serialized writer waited on its one outstanding slot forever).
+            try:
+                _orev = _apply_views_ops(msg["ops"])
+                _oans = {"type": "viewsAck", "ok": True, "rev": _orev}
+            except Exception:
+                try:
+                    _oans = {"type": "viewsAck", "ok": False,
+                             "rev": int(_timeline_views().get("rev") or 0)}
+                except Exception:
+                    _oans = {"type": "viewsAck", "ok": False}
             _mark_views_dirty()
             try:
-                client["send"](json.dumps({"type": "viewsAck", "ok": True, "rev": _orev}))
+                client["send"](json.dumps(_oans))
             except Exception:
                 pass
         elif msg and msg.get("type") == "openTagsDialog":

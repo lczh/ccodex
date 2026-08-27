@@ -641,6 +641,19 @@ class PerFileOpSpool(unittest.TestCase):
         self.assertEqual([t["name"] for t in v["tags"]], ["crew", "pool"],
                          "…and the kernel resorted its own tags to match, as the client did")
 
+    def test_an_actives_op_merges_per_surface_never_replaces_the_dict(self):
+        # the r48 verification: the first cut REPLACED the whole actives dict, so a client
+        # posting every surface's lens overwrote OTHER panes' concurrent picks with its own
+        # stale copies — the erase the ops exist to end, one level down. Clients post only
+        # the changed surface now, and the kernel merges.
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "", "members": []}}])
+        km._apply_views_ops([{"actives": {"chat": {"tags": ["pool"]}}}])      # pane A's pick
+        km._apply_views_ops([{"actives": {"outline": {"none": True}}}])       # pane B's pick
+        v = km._timeline_views()
+        self.assertEqual(v["actives"]["chat"], {"tags": ["pool"]},
+                         "pane A's lens SURVIVES pane B's later single-surface op")
+        self.assertEqual(v["actives"]["outline"], {"none": True})
+
     def test_ops_compose_with_a_foreign_edit_instead_of_erasing_it(self):
         # the audited erase shape, executed at the store: a foreign client's tag lands between
         # two of our gestures — the second, a targeted op, composes with it; a stale whole blob

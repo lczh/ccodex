@@ -279,6 +279,27 @@ def gen_build(commit):
         _sh.rmtree(gt, ignore_errors=True)
         return gen_valid(g, full)
     return True
+def arm_marker(commit):
+    # every latch-spending path arms the update marker BEFORE the spend (the r48 verification:
+    # this gate's heal was the one leg that spent without arming — the healed signed release
+    # then exec'd mutated live bytes on a dirty tree, the exact audited P1.2, with all
+    # indicators green)
+    rv = subprocess.run(["git", "-C", root, "rev-parse", commit], capture_output=True, text=True)
+    full = (rv.stdout or "").strip()
+    if rv.returncode or len(full) < 8:
+        return False
+    tmpm = os.path.join(gdir, "romp-restart-needed.tmp.%d" % os.getpid())
+    try:
+        with open(tmpm, "w") as _mf:
+            _mf.write(full + "\n")
+        os.replace(tmpm, os.path.join(gdir, "romp-restart-needed"))
+        return True
+    except OSError:
+        try:
+            os.unlink(tmpm)
+        except OSError:
+            pass
+        return False
 # the UPDATE MARKER leg (the v1.3.20 audit's P1.2), under the same lock and BEFORE the
 # latch's no-latch early exit: while romp-restart-needed names HEAD, this boot must run the
 # verified generation — ensure it exists (validated bless or build) or refuse to start.
@@ -304,7 +325,14 @@ if mtok:
         sys.exit(70)
     _hf = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True)
     _hfull = (_hf.stdout or "").strip()
-    if not _hf.returncode and _hfull and (_hfull.startswith(mtok) or mtok.startswith(_hfull[:8])):
+    if _hf.returncode or not _hfull:
+        # an ARMED marker with an unreadable HEAD is unknown, never moot: proceeding took the
+        # live-byte leg under the very marker that forbids it (the r48 verification — this leg
+        # failed OPEN)
+        sys.stderr.write("romp-serve: romp-restart-needed is armed but HEAD is unreadable — "
+                         "refusing to start on unknown state\n")
+        sys.exit(70)
+    if _hfull.startswith(mtok) or mtok.startswith(_hfull[:8]):
         if not gen_build(_hfull):
             sys.stderr.write("romp-serve: an update to %s landed but its verified build cannot "
                              "be produced — refusing to start live bytes under the update "
@@ -386,6 +414,12 @@ if not gen_build(cur8):
     sys.stderr.write("romp-serve: healed the install but the runtime generation could not be "
                      "built — the latch stays armed for the next retry\n")
     sys.exit(70)
+if not arm_marker(cur8):
+    # arm BEFORE the latch is spent, like every other update transaction (the r48
+    # verification): without the marker this very boot resolved live bytes on a dirty tree
+    sys.stderr.write("romp-serve: healed the install but the update marker could not be armed "
+                     "— the latch stays armed for the next retry\n")
+    sys.exit(70)
 cur_line = next(ln for ln in rawlines if ln.split()[0][:8] == cur8)
 if len(cur_line.split()) < 2 and cur_line == rawlines[0] and len(rawlines) > 1 \
         and len(rawlines[1].split()) > 1:
@@ -421,5 +455,19 @@ if [[ -n "$port" ]]; then
 fi
 export ROMP_SERVE_HOST="$host"
 export ROMP_KERNEL_NO_OPEN=1
+# RE-RESOLVE after the gate (the r48 verification): the gate's heal and marker legs can ARM
+# romp-restart-needed and build the generation AFTER the resolution above already picked live
+# bytes — without this recheck, the boot that completes a healed update exec'd the mutated
+# live kernel it had pre-resolved. The explicit ROMP_KERNEL_BIN seam still wins.
+if [ -z "${ROMP_KERNEL_BIN:-}" ] && [ -z "$_ROMP_REQ_GEN" ] && [ -n "${_RGD:-}" ] \
+        && [ -f "$_RGD/romp-restart-needed" ]; then
+    _RMARK2="$(head -1 "$_RGD/romp-restart-needed" 2>/dev/null | tr -cd '0-9a-f' || true)"
+    _RH8B="$(git -C "$ROMP_DIR" rev-parse --short=8 HEAD 2>/dev/null || true)"
+    if [ -n "$_RH8B" ] && [ "${_RMARK2:0:8}" = "$_RH8B" ] \
+            && [ -x "$_RGD/romp-run-$_RH8B/bin/romp-kernel" ]; then
+        KERNEL="$_RGD/romp-run-$_RH8B/bin/romp-kernel"
+        export ROMP_CHECKOUT="$ROMP_DIR"
+    fi
+fi
 [[ -x "$KERNEL" ]] || { echo "romp-serve: kernel not found/executable at $KERNEL" >&2; exit 70; }
 exec "$PY" "$KERNEL"

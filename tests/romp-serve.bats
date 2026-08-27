@@ -226,6 +226,44 @@ _latch_fixture() {
     [ "$status" -eq 0 ]
     [[ "$output" == *KERNEL_RAN* ]]
     [ ! -e "$GD/romp-install-failed" ]
+    # the heal ARMS the update marker before spending the latch (the r48 verification: this
+    # gate was the one latch-spending leg that didn't — the healed release then exec'd
+    # mutated live bytes on a dirty tree)
+    [ -s "$GD/romp-restart-needed" ]
+    FULL="$(git -C "$FIX" rev-parse HEAD)"
+    [ "$(cat "$GD/romp-restart-needed")" = "$FULL" ]
+}
+
+@test "romp-serve: the boot that HEALS an update runs the VERIFIED generation, not dirty live bytes (r48)" {
+    # the r48 verification's P1, end-to-end: latch armed at HEAD, NO marker (the update died
+    # before arming), a tracked edit in the tree. The gate heals, arms, builds — and the exec
+    # must re-resolve onto the generation instead of the pre-resolved live kernel.
+    _gen_fixture
+    rm -rf "$GENGD/romp-run-"*
+    printf '#!/bin/sh\necho INSTALL_RAN\nexit 0\n' > "$GENFIX/install.sh"
+    git -C "$GENFIX" add install.sh
+    git -C "$GENFIX" -c user.email=t@t -c user.name=t commit -qm heal-me
+    GENH8="$(git -C "$GENFIX" rev-parse --short=8 HEAD)"
+    printf '%s' "$GENH8" > "$GENGD/romp-install-failed"
+    echo change >> "$GENFIX/tracked.txt"               # the dirty tree that used to win
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [ ! -e "$GENGD/romp-install-failed" ]
+    [ -s "$GENGD/romp-restart-needed" ]
+    # the generation launch exports ROMP_CHECKOUT — the tell that verified bytes ran
+    [[ "$output" == *"LIVE_CHECKOUT=$GENFIX"* ]]
+}
+
+@test "romp-serve: an armed marker with an UNREADABLE HEAD refuses to start (fail closed, r48)" {
+    _gen_fixture
+    printf '%s\n' "$GENFULL" > "$GENGD/romp-restart-needed"
+    # a symbolic ref to a branch that does not exist: --absolute-git-dir still resolves (the
+    # gate reaches its marker leg) but rev-parse HEAD fails — the unreadable-HEAD shape
+    printf 'ref: refs/heads/nonexistent\n' > "$GENGD/HEAD"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 70 ]
+    [[ "$output" != *KERNEL_RAN* ]]
+    [[ "$output" == *"HEAD is unreadable"* ]]
 }
 
 @test "romp-serve: the gate heal BUILDS the runtime generation before spending the latch" {

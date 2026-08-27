@@ -28,6 +28,7 @@ type QueuedWrite = { kind: "blob"; views: SessionViews } | { kind: "ops"; ops: R
 
 let confirmedRev = 0;   // the last rev the KERNEL reported (payload push or ack) — never a guess
 let outstanding = 0;    // 0 or 1: the one write whose ack we await
+let outstandingKind: "blob" | "ops" | null = null;   // what kind it was (the r48 release rule)
 let queue: QueuedWrite[] = [];
 let poster: ((m: Record<string, unknown>) => void) | null = null;
 
@@ -36,13 +37,30 @@ let poster: ((m: Record<string, unknown>) => void) | null = null;
  *  never rewinds the base below a write already outstanding (the r47 verification). */
 export function anchorViewsRev(v: SessionViews | { rev?: unknown } | null | undefined): void {
   const rev = v && (v as { rev?: unknown }).rev;
-  if (typeof rev === "number") confirmedRev = Math.max(confirmedRev, rev);
+  if (typeof rev === "number" && rev > confirmedRev) {
+    confirmedRev = rev;
+    if (outstanding > 0 && outstandingKind === "ops" && !queue.some((w) => w.kind === "blob")) {
+      // the kernel demonstrably moved PAST our outstanding write and its ack never arrived (a
+      // dropped frame — the r48 verification: the queue wedged forever on that missing ack).
+      // The RAISED payload releases the slot ONLY when the outstanding write AND everything
+      // queued are targeted ops: releasing around a BLOB anywhere lets a stale-rendered blob
+      // post at the foreign rev, and the CAS would accept the very erase this module exists to
+      // end (the raise cannot distinguish our own lost-ack success from a foreign commit).
+      // Ops compose safely, so the common gestures — the lens picks — never wedge; a blob
+      // waits for its ack (the kernel now acks failures too) or the reconnect reload that
+      // resets this writer.
+      outstanding = 0;
+      outstandingKind = null;
+      pump();
+    }
+  }
 }
 
 function pump(): void {
   if (!poster || outstanding > 0 || !queue.length) return;
   const w = queue.shift()!;
   outstanding = 1;
+  outstandingKind = w.kind;
   if (w.kind === "ops") {
     poster({ type: "setTimelineViewsOps", ops: w.ops });
     return;
@@ -64,6 +82,7 @@ export function consumeViewsAck(m: unknown, onRefused?: () => void): boolean {
   const a = m as { type?: unknown; ok?: unknown; rev?: unknown } | null;
   if (!a || a.type !== "viewsAck") return false;
   outstanding = 0;
+  outstandingKind = null;
   const rev = typeof a.rev === "number" ? a.rev : null;
   if (a.ok === false) {
     if (rev !== null) confirmedRev = rev;   // the served CAS truth — downward is legitimate HERE
@@ -99,5 +118,5 @@ export function postViewsOps(post: (m: Record<string, unknown>) => void,
 
 /** Tests only: each test starts from a fresh writer. */
 export function resetViewsWriterForTest(): void {
-  confirmedRev = 0; outstanding = 0; queue = []; poster = null;
+  confirmedRev = 0; outstanding = 0; outstandingKind = null; queue = []; poster = null;
 }

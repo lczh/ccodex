@@ -385,6 +385,11 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
     try:
         tmp.rename(mb / "new" / name)   # atomic within the same filesystem — the PUBLISH point
     except Exception:
+        try:
+            tmp.unlink()                # a failed publish must not leave a tmp/ file that reads
+        except OSError:                 # as "mail exists" to the boot reconcile (the r48
+            pass                        # verification); best-effort — the reconcile no longer
+        #                                 counts tmp/ either way
         # The sent row above is already durable; left alone it is a permanent phantom —
         # handoff_done_apply would translate it into a receipt for mail that never existed,
         # and the wait-map readers can mint an Awaiting edge from it. _tl_append is
@@ -1758,10 +1763,13 @@ PHANTOM_TAIL_BYTES = 512 * 1024
 _TERMINAL_EVS = ("exec", "unexec", "unpublished", "recall", "bounced")
 
 def _reconcile_phantom_sent(now=None):
-    """Append the missing ev:"unpublished" for each recent LOCAL sent row that has no
-    terminal row and no file in the recipient's maildir (tmp/new/cur). Files nothing for
-    mail that exists: unread and parked mail sit in new/, consumed mail in cur/, a crashed
-    mid-write in tmp/ — none of those are phantoms and none are touched. Peer-relay rows
+    """Append the missing ev:"unpublished" for each recent LOCAL sent row with no terminal
+    row and no PUBLISHED file (new/ or cur/) in the recipient's maildir. tmp/ deliberately
+    does NOT count as existing (the r48 verification): a failed publish leaves its file in
+    tmp/ — the exact case this reconciles — and counting it as mail made every real failed
+    publish permanent. A tmp-only file at BOOT (this runs before the bus serves) is by
+    definition unpublished: either a failed rename or a crash mid-write, phantom either way.
+    Unread and parked mail sit in new/, consumed mail in cur/ — untouched. Peer-relay rows
     (to_id "peer:<host>") are skipped: their mail lives in the outbox, never a local
     maildir. Idempotent (the appended row is itself terminal). Returns the count filed."""
     log = TLDIR / "messages.jsonl"
@@ -1804,8 +1812,8 @@ def _reconcile_phantom_sent(now=None):
             continue                                 # a peer-relay row — no local maildir to check
         mb = MAILROOT / to_id
         try:
-            if any((mb / d / mid).exists() for d in ("tmp", "new", "cur")):
-                continue                             # the mail exists — not a phantom
+            if any((mb / d / mid).exists() for d in ("new", "cur")):
+                continue                             # PUBLISHED mail — not a phantom
         except OSError:
             continue                                 # can't PROVE absence -> leave the row alone
         if _tl_append("messages.jsonl", {"t": now, "ev": "unpublished", "id": mid}):

@@ -505,6 +505,11 @@ function captureViews(v: SessionViews | null) {
 // the raw setTimelineViews post re-echoed the payload's rev, so the second of two quick gestures
 // always declared a stale CAS base and was refused — the writer stamps an advancing baseRev and
 // the viewsAck frame (routed below) re-anchors it.
+// every webview editTag wire carries its OWN opId (the r48 verification: an opId-less
+// refusal lands on the timeline pane and its newest-gid fallback swept whichever TIMELINE
+// gesture was newest — a rollback for an edit this pane sent). A web-minted id matches no
+// timeline gesture, so such a refusal is loud there and rolls back nothing.
+let webEditSeq = 0;
 function postViews(v: SessionViews, ops?: Record<string, unknown>[]) {
   pendingSessionViews = v; pendingViewsAge = 0;
   if (activeId) assertPeekFor(activeId);   // the optimistic edit re-derives the active session's peek too
@@ -542,7 +547,8 @@ function tabInView(id: string): boolean { return id === peekId || chatVisible(id
 function visibleOrder(): string[] { return order.filter(tabInView); }
 function revealSession(id: string) {
   const v = revealIn(effViews(), id);
-  postViews(v, v.actives ? [{ actives: v.actives }] : undefined);   // a pure lens move → ops
+  // only the CHAT surface the reveal moved (r48: never the whole actives dict)
+  postViews(v, v.actives && v.actives["chat"] ? [{ actives: { chat: v.actives["chat"] } }] : undefined);
 }
 
 let paletteColors: string[] = [];
@@ -4535,7 +4541,8 @@ function renderTabs() {
       onApply: (l) => {
         const v = JSON.parse(JSON.stringify(effViews() || { active: "all", tags: [] }));
         v.actives = Object.assign({}, v.actives, { chat: l });
-        postViews(v, [{ actives: v.actives }]);   // a pure lens move → targeted op (v1.3.20)
+        postViews(v, [{ actives: { chat: l } }]);   // ONLY the changed surface (r48: a
+        // whole-dict post overwrote other panes' concurrent picks with stale copies)
       },
       onConfigure: () => { vscodeApi?.postMessage({ type: "openTagsDialog" }); },
     });
@@ -4558,7 +4565,7 @@ function renderTabs() {
     syncTagFilter(tagBtn, tagChipsHost, surfaceLens(v, "chat"), viewTagUnion(v), (l) => {
       const nv = JSON.parse(JSON.stringify(v || { active: "all", tags: [] }));
       nv.actives = Object.assign({}, nv.actives, { chat: l });
-      postViews(nv, [{ actives: nv.actives }]);   // a pure lens move → targeted op (v1.3.20)
+      postViews(nv, [{ actives: { chat: l } }]);   // only the changed surface (r48)
     });
   }
   // Restore tab-mode focus if a tab held it before this rebuild (see the top of renderTabs).
@@ -4845,7 +4852,7 @@ function showTabMenu(e: MouseEvent, id: string) {
             dirty = true;
           }
         } else if (g.remotes.length) {
-          vscodeApi?.postMessage({ type: "editTag", edit: { host: g.remotes[0].host || "", name: g.name, add: edit.add.slice() } });
+          vscodeApi?.postMessage({ type: "editTag", edit: { opId: "web" + (++webEditSeq),  host: g.remotes[0].host || "", name: g.name, add: edit.add.slice() } });
           const mine = nvRemote(g.remotes[0]);
           if (mine) { mine.members = Array.from(new Set((mine.members || []).concat(edit.add))); dirty = true; }
         }
@@ -4861,7 +4868,7 @@ function showTabMenu(e: MouseEvent, id: string) {
         }
         for (const rt of g.remotes) {
           if (!(rt.members || []).some((m) => edit.remove!.includes(m))) continue;
-          vscodeApi?.postMessage({ type: "editTag", edit: { host: rt.host || "", name: g.name, remove: edit.remove!.slice() } });
+          vscodeApi?.postMessage({ type: "editTag", edit: { opId: "web" + (++webEditSeq),  host: rt.host || "", name: g.name, remove: edit.remove!.slice() } });
           const mine = nvRemote(rt);
           if (mine) { mine.members = (mine.members || []).filter((m) => !edit.remove!.includes(m)); dirty = true; }
         }

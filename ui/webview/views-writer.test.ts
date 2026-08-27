@@ -81,6 +81,35 @@ test("executed: targeted ops ride the queue for order but SURVIVE a blob refusal
   assert.equal(posts[2].views.baseRev, 8, "…and re-anchored the counter for the next blob");
 });
 
+test("executed: a RAISED payload anchor releases a wedged OPS queue — but never a queued blob (r48)", () => {
+  // the r48 verification: a dropped ack frame left the one outstanding slot occupied forever —
+  // every later gesture queued behind it and none ever posted. The kernel demonstrably moving
+  // PAST our write (a payload with a HIGHER rev) releases the slot — but ONLY when nothing
+  // queued is a blob: a queued blob was rendered under the optimistic overlay, without the
+  // foreign edit that raised the rev, and releasing it would be the coincide-erase itself.
+  resetViewsWriterForTest();
+  const posts: any[] = [];
+  const post = (m: any) => posts.push(m);
+  anchorViewsRev({ rev: 4 });
+  postViewsOps(post, [{ actives: { outline: { none: true } } }]);     // O1 flies… and its ack is lost
+  postViewsOps(post, [{ actives: { chat: { all: true } } }]);         // a second lens pick queues
+  assert.equal(posts.length, 1);
+  anchorViewsRev({ rev: 4 });                                         // same rev: NOT evidence — still wedged
+  assert.equal(posts.length, 1, "an equal-rev payload releases nothing");
+  anchorViewsRev({ rev: 5 });                                         // the kernel moved past O1
+  assert.equal(posts.length, 2, "the raised payload releases the wedged OPS queue");
+  assert.equal(posts[1].type, "setTimelineViewsOps");
+  assert.deepEqual(posts[1].ops, [{ actives: { chat: { all: true } } }]);
+  // …but a queued BLOB holds the wedge instead of risking the erase
+  resetViewsWriterForTest();
+  const posts2: any[] = [];
+  anchorViewsRev({ rev: 4 });
+  postViewsWrite((m) => posts2.push(m), { active: "all", tags: [], rev: 4 } as any);
+  postViewsWrite((m) => posts2.push(m), { active: "all", tags: [], rev: 4 } as any);
+  anchorViewsRev({ rev: 5 });
+  assert.equal(posts2.length, 1, "a stale-rendered queued blob is never released by the raise");
+});
+
 test("executed: a viewsAck re-anchors the counter — accepted and refused alike; malformed revs change nothing", () => {
   resetViewsWriterForTest();
   const posts: any[] = [];
@@ -135,8 +164,8 @@ test("wiring: the chat routes views writes through the shared writer — ops for
   assert.ok(opsCalls.length >= 3, "the lens/create gestures pass ops: " + opsCalls.length);
   assert.match(RENDER, /postViews\(nv, localOps\.length \? localOps : undefined\);/,
     "the membership editor passes its collected ops");
-  assert.match(RENDER, /postViews\(v, v\.actives \? \[\{ actives: v\.actives \}\] : undefined\);/,
-    "the reveal is a pure lens move — ops");
+  assert.match(RENDER, /postViews\(v, v\.actives && v\.actives\["chat"\] \? \[\{ actives: \{ chat: v\.actives\["chat"\] \} \}\] : undefined\);/,
+    "the reveal posts ONLY the chat surface it moved (r48)");
   // the frame router consumes the ack — a refusal drops the known-refused optimistic overlay now
   assert.match(RENDER, /else if \(m\.type === "viewsAck"\) consumeViewsAck\(m, \(\) => \{\s*\n\s*pendingSessionViews = null; pendingViewsAge = 0;/);
   // …and every tabOrder payload re-anchors (captureViews is the views-arrival path)
@@ -152,8 +181,9 @@ test("wiring: the chat's viewsAck refusal re-derives the ACTIVE session's peek a
 });
 
 test("wiring: the Outline (fleet) posts its lens picks as TARGETED ops and consumes viewsAck", () => {
-  const writes = FLEET.match(/postViewsOps\(\(msg\) => vscodeApi\.postMessage\(msg\), \[\{ actives: v\.actives \}\]\);/g) || [];
-  assert.equal(writes.length, 2, "the tag-menu apply AND the chip-sync unpick both post the actives op");
+  const writes = FLEET.match(/postViewsOps\(\(msg\) => vscodeApi\.postMessage\(msg\), \[\{ actives: \{ outline: l \} \}\]\);/g) || [];
+  assert.equal(writes.length, 2, "the tag-menu apply AND the chip-sync unpick both post ONLY their "
+    + "surface's lens (r48: a whole-dict post overwrote other panes' concurrent picks)");
   assert.doesNotMatch(FLEET, /postMessage\(\{ type: "setTimelineViews"/, "no raw setTimelineViews post in the fleet");
   assert.doesNotMatch(FLEET, /postViewsWrite/, "no whole-blob CAS write remains in the fleet");
   assert.match(FLEET, /if \(consumeViewsAck\(m\)\) return;/, "the feed-only router consumes the ack before its guard");

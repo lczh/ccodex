@@ -50,8 +50,9 @@ test("edits reuse the wire — never a fork: local adds post the whole blob, rem
     "local add edits the optimistic copy (pendingSessionViews echoes instantly)");
   assert.ok(body.includes("localOps.push({ tag: g.localId, add: edit.add.slice() });"),
     "…and records the TARGETED op the kernel composes (the v1.3.20 audit — no whole-blob CAS)");
-  assert.ok(body.includes('vscodeApi?.postMessage({ type: "editTag", edit: { host: g.remotes[0].host || "", name: g.name, add: edit.add.slice() } });'),
-    "an add with no local home routes to the tag's single home over the editTag wire");
+  assert.ok(body.includes('vscodeApi?.postMessage({ type: "editTag", edit: { opId: "web" + (++webEditSeq),  host: g.remotes[0].host || "", name: g.name, add: edit.add.slice() } });'),
+    "an add with no local home routes to the tag's single home over the editTag wire — WITH a "
+    + "web-minted opId (r48: an opId-less refusal swept the timeline's newest gesture)");
   assert.ok(body.includes("for (const rt of g.remotes) {"),
     "a REMOVE walks every remote store holding the pair — remove-everywhere, never half");
   assert.ok(body.includes("if (dirty) postViews(nv, localOps.length ? localOps : undefined);"),

@@ -217,14 +217,15 @@ test("source: union-op entries carry rt + gesture id + pre-edit name/color at no
 
 test("source: tagEditFailed compensates SIBLING hosts — inverse remote edits; delete is loud, never silent", () => {
   const fn = SRC.indexOf("tagEditFailed(m) {");
-  const win = SRC.slice(fn, fn + 5600);   // widened for the v1.3.20 P1.3 comments
+  const win = SRC.slice(fn, fn + 7000);   // widened for the v1.3.20/r48 comments
   assert.ok(win.indexOf("_applyLocalOp(o.inverse)") > 0, "the local rollback survives untouched");
   // a refusal carrying the opId the edit was stamped with compensates EXACTLY that gesture (the
   // 2026-08-26 audit's Finding C — the kernel echoes it); an opId-less frame (an old kernel)
   // falls back to the newest-gid heuristic (the r46 verification: host+name alone also swept
   // OTHER gestures' entries into the rollback)
   assert.match(win, /const newestGid = matched\.reduce\(\(g, o\) => Math\.max\(g, o\.gid \|\| 0\), 0\);/);
-  assert.match(win, /const ops = matched\.filter\(\(o\) => m\.opId \? String\(o\.gid \|\| 0\) === String\(m\.opId\)\s*\n\s*: \(o\.gid \|\| 0\) === newestGid\);/);
+  assert.match(win, /const ops = matched\.filter\(\(o\) => m\.opId \? String\(o\.gid \|\| 0\) === String\(m\.opId\)\s*\n\s*: \(\(o\.gid \|\| 0\) === newestGid && !o\.confirmed\)\);/,
+    "the opId-less fallback never sweeps a poll-CONFIRMED gesture (r48)");
   // gid-matched entries on OTHER hosts — INCLUDING poll-confirmed ones, which the group
   // retention keeps precisely for this (the v1.3.20 audit's P1.3) — get the inverse REMOTE
   // edit and are dropped as compensated
@@ -369,6 +370,31 @@ test("executed: a poll-CONFIRMED sibling is still compensated when the other own
   assert.match(panel._tagEditErr.error, /rolled the applied edit back on TESTHOST-A/,
     "the loud error NAMES the host whose applied edit was rolled back");
   assert.equal(panel._unionOps.length, 0);
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews;
+});
+
+test("executed: an opId-LESS refusal never sweeps a poll-CONFIRMED gesture (r48)", () => {
+  // the r48 verification: with the group retention keeping confirmed entries around (P1.3),
+  // the opId-less newest-gid heuristic could roll back an APPLIED, CONFIRMED gesture on the
+  // strength of a refusal that names nothing — the cross-gesture rollback one level deeper.
+  // A confirmed entry is swept only by an opId MATCH (the kernel named the gesture).
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const polled = JSON.parse(JSON.stringify(VIEWS));
+  polled.remoteTags[0].members = [];            // A applied and a poll CONFIRMED it
+  panel.update({ now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [], views: polled });
+  const inverse: any[] = [];
+  panel._editRemoteTag = (rt: any, edit: any) => { inverse.push({ rt, edit }); return true; };
+  panel.tagEditFailed({ host: "TESTHOST-A", name: "pool", error: "late opId-less refusal" });
+  assert.equal(inverse.length, 0, "no inverse dispatched off a heuristic match to confirmed state");
+  assert.deepEqual(panel._curViews().tags.find((t: any) => t.id === "g1").members, ["s2"],
+    "the local half of the CONFIRMED gesture stays applied — no heuristic rollback");
+  assert.equal(panel._unionOps.length, 2, "the group is retained for its real deciding event");
+  assert.ok(panel._tagEditErr, "…and the refusal is still loud");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews;
 });
 

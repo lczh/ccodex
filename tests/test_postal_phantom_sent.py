@@ -134,12 +134,17 @@ class BootReconciliation(unittest.TestCase):
         self.assertEqual(pm._reconcile_phantom_sent(), 0,
                          "a file in cur/ means the mail existed — not a phantom")
 
-    def test_a_crashed_mid_write_tmp_file_is_not_a_phantom(self):
+    def test_a_crashed_mid_write_tmp_file_IS_a_phantom(self):
+        # REVERSED by the r48 verification: counting tmp/ as "mail exists" made every real
+        # failed publish permanent — the exact case the reconcile exists for leaves its file
+        # in tmp/. This runs at BOOT (no concurrent writer), so tmp-only is unpublished by
+        # definition: a failed rename or a crash mid-write, phantom either way.
         mid = "101.1_22222.TESTHOST"
         mb = pm._mailbox(SID)
         (mb / "tmp" / mid).write_text("From: web\n\nsynthetic half-written mail\n")
         self._sent(mid)
-        self.assertEqual(pm._reconcile_phantom_sent(), 0)
+        self.assertEqual(pm._reconcile_phantom_sent(), 1,
+                         "tmp-only at boot files the phantom — published means new/ or cur/")
 
     def test_terminal_rows_settle_the_id(self):
         for ev in ("exec", "unexec", "unpublished", "recall", "bounced"):
@@ -195,6 +200,49 @@ class SentReceiptsHonorUnpublished(unittest.TestCase):
                                          "id": "106.1_7.TESTHOST"})
         self.assertEqual(pm._sent_receipts("uuid-me"), [],
                          "the mail never existed — nothing to await")
+
+
+
+class TmpOnlyIsUnpublished(unittest.TestCase):
+    """the r48 verification: a FAILED publish leaves its file in tmp/ — and the reconcile
+    counted tmp/ as 'mail exists', so the exact case it exists for never filed. tmp-only at
+    boot is unpublished by definition (failed rename or crash mid-write, phantom either way)."""
+
+    def setUp(self):
+        _reset()
+
+    def test_a_tmp_only_file_still_files_the_phantom(self):
+        mid = "100.1_1.TESTHOST"
+        pm._mailbox(SID)
+        (pm.MAILROOT / SID / "tmp" / mid).write_text("From: x\n\nbody\n")   # the failed publish
+        pm._tl_append("messages.jsonl", {"t": int(time.time()), "ev": "sent", "id": mid,
+                                         "from": "web", "from_id": "f" * 8, "to_id": SID,
+                                         "body": "hello"})
+        n = pm._reconcile_phantom_sent()
+        self.assertEqual(n, 1, "a tmp-only file is UNPUBLISHED — the phantom files")
+        self.assertEqual(_rows()[-1]["ev"], "unpublished")
+        self.assertEqual(_rows()[-1]["id"], mid)
+
+    def test_published_mail_still_never_files(self):
+        mid = "101.1_1.TESTHOST"
+        pm._mailbox(SID)
+        (pm.MAILROOT / SID / "new" / mid).write_text("From: x\n\nbody\n")
+        pm._tl_append("messages.jsonl", {"t": int(time.time()), "ev": "sent", "id": mid,
+                                         "from": "web", "from_id": "f" * 8, "to_id": SID,
+                                         "body": "hello"})
+        self.assertEqual(pm._reconcile_phantom_sent(), 0, "new/ mail is real — no phantom")
+
+    def test_a_failed_publish_leaves_no_tmp_litter(self):
+        # deliver() now unlinks its tmp file when the publish rename fails (r48)
+        if os.geteuid() == 0:
+            self.skipTest("read-only dir does not block rename for root")
+        mb = pm._mailbox(SID)
+        os.chmod(mb / "new", 0o555)
+        self.addCleanup(os.chmod, mb / "new", 0o755)
+        with self.assertRaises(Exception):
+            pm.deliver(SID, "web", "uuid-a", "synthetic body")
+        self.assertEqual(list((mb / "tmp").iterdir()), [],
+                         "the failed publish cleaned its tmp file")
 
 
 if __name__ == "__main__":

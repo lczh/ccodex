@@ -847,7 +847,7 @@ function showHoverCard(row: HTMLElement, sid: string, nid: string): void {
           // the SHARED writer (views-writer.ts): a lens pick is a pure actives move, posted as a
           // TARGETED op (the v1.3.20 audit) — it composes server-side with no CAS base to guess,
           // so a foreign edit can neither refuse it nor be erased by a stale blob
-          if (vscodeApi) postViewsOps((msg) => vscodeApi.postMessage(msg), [{ actives: v.actives }]);
+          if (vscodeApi) postViewsOps((msg) => vscodeApi.postMessage(msg), [{ actives: { outline: l } }]);
           render();
         },
         onConfigure: () => { vscodeApi?.postMessage({ type: "openTagsDialog" }); },
@@ -863,7 +863,7 @@ function showHoverCard(row: HTMLElement, sid: string, nid: string): void {
       const v = JSON.parse(JSON.stringify(fleetViews || { active: "all", tags: [] }));
       v.actives = Object.assign({}, v.actives, { outline: l });
       fleetViews = v;
-      if (vscodeApi) postViewsOps((msg) => vscodeApi.postMessage(msg), [{ actives: v.actives }]);   // as above
+      if (vscodeApi) postViewsOps((msg) => vscodeApi.postMessage(msg), [{ actives: { outline: l } }]);   // as above
       render();
     });
     syncFleetTagBtn();

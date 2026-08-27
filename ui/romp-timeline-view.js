@@ -2689,8 +2689,13 @@ class TimelinePanel {
     // groups keep their entries and settle on their own evidence — the owner's polled confirm
     // (_reconcileUnionOps) or their own refusal.
     const newestGid = matched.reduce((g, o) => Math.max(g, o.gid || 0), 0);
+    // the opId-less FALLBACK (an old kernel's frame) is a heuristic — with the group retention
+    // keeping poll-CONFIRMED entries around (P1.3), the heuristic must never roll those back:
+    // an applied, confirmed gesture swept by a refusal that names nothing is the r48
+    // verification's cross-gesture rollback, one level deeper. An opId MATCH still rolls back
+    // confirmed entries — the kernel named the gesture.
     const ops = matched.filter((o) => m.opId ? String(o.gid || 0) === String(m.opId)
-                                             : (o.gid || 0) === newestGid);
+                                             : ((o.gid || 0) === newestGid && !o.confirmed));
     this._unionOps = (this._unionOps || []).filter((o) => ops.indexOf(o) < 0);
     for (const o of ops) this._applyLocalOp(o.inverse);
     // ...AND the same gesture's SIBLING remote halves (the v1.3.18 audit's P2: partial
@@ -3128,7 +3133,7 @@ class TimelinePanel {
         nv.actives = Object.assign({}, nv.actives, { timeline: lensToggle(lens, c.pick) });
         // a pure lens move rides the TARGETED op (the v1.3.20 audit): it composes server-side
         // with no CAS base to guess, and the kernel-down spool replays the exact gesture
-        this._setViews(nv, [{ actives: nv.actives }]);
+        this._setViews(nv, [{ actives: { timeline: nv.actives.timeline } }]);
       });
       x.addEventListener('click', (e) => e.stopPropagation());
       chip.appendChild(x);
@@ -3205,7 +3210,7 @@ class TimelinePanel {
       const apply = (nl, close) => {
         const nv = JSON.parse(JSON.stringify(v));
         nv.actives = Object.assign({}, nv.actives, { timeline: nl });
-        this._setViews(nv, [{ actives: nv.actives }]);   // a pure lens move → targeted op (v1.3.20)
+        this._setViews(nv, [{ actives: { timeline: nl } }]);   // only the changed surface (r48)
         if (close) this._closeViewsMenu(); else build();
       };
       item('All', { current: lensAll(lens) }).addEventListener('click', () => apply({ all: true }, true));
@@ -3520,7 +3525,10 @@ class TimelinePanel {
             const upd = key === '*' ? { chat: lens, timeline: lens, outline: lens } : {};
             if (key !== '*') upd[key] = lens;
             nv.actives = Object.assign({}, nv.actives, upd);
-            this._setViews(nv);
+            // the changed surfaces ride the TARGETED op (the r48 verification: this dialog was
+            // the one lens writer left on the whole-blob leg — the audited coincide-erase and
+            // the offline {active} reduction both survived here); the kernel merges per surface
+            this._setViews(nv, [{ actives: upd }]);
           }
           if (key === '*' || key === 'feed') {
             try { localStorage.setItem('romp:feedTags-set', JSON.stringify({ lens, t: Date.now() })); } catch (e) {}

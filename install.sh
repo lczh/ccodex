@@ -247,9 +247,9 @@ fi
 # ROMP_NO_GEN=1 skips (test fixtures that aren't romp trees); a non-git target (tarball
 # install) skips on its own — no git dir means no generations anywhere.
 if [[ -z "${ROMP_NO_GEN:-}" ]]; then
-    if ! python3 - "$ROMP_DIR" <<'GENPY'
+    if ! python3 - "$ROMP_DIR" "$ROMP_CODE" <<'GENPY'
 import os, shutil, subprocess, sys
-root = sys.argv[1]
+root, code = sys.argv[1], sys.argv[2]
 gd = subprocess.run(["git", "-C", root, "rev-parse", "--absolute-git-dir"],
                     capture_output=True, text=True)
 gdir = (gd.stdout or "").strip()
@@ -297,6 +297,24 @@ except OSError:                        # blessed only if VALID, never nested int
     shutil.rmtree(tmp, ignore_errors=True)
     if not valid(gen):
         sys.stderr.write("install.sh: publishing the runtime generation failed\n")
+        sys.exit(1)
+# an UPDATER-driven install (snapshot code dir != target — every updater sets this split, a
+# hand-run install never does) also ARMS the update marker: the N−1 updater that ships this
+# fix predates the marker scheme entirely, so without this the very hop that delivers the
+# protection reruns the audited dirty-live launch (the r48 verification). The kernel that
+# boots as this commit clears it.
+if os.path.realpath(code) != os.path.realpath(root):
+    tmpm = os.path.join(gdir, "romp-restart-needed.tmp.%d" % os.getpid())
+    try:
+        with open(tmpm, "w") as mh:
+            mh.write(full + "\n")
+        os.replace(tmpm, os.path.join(gdir, "romp-restart-needed"))
+    except OSError:
+        try:
+            os.unlink(tmpm)
+        except OSError:
+            pass
+        sys.stderr.write("install.sh: could not arm the update marker for the verified boot\n")
         sys.exit(1)
 GENPY
     then
