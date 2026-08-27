@@ -16,6 +16,10 @@ setup() {
     mkdir -p "$HOME" "$STUB"
     export CALL_LOG="$TEST_DIR/calls.log"
     export ROMP_NO_SERVICE=1 ROMP_NO_SDK=1 ROMP_NO_EXT=1
+    # no runtime-generation build here (the v1.3.20 audit's install-time GENPY): these tests
+    # exercise the optional-deps MESSAGING against the real repo, and the barebin allowlist
+    # carries no tar — the generation build has its own executed suite (test_main_drift_notice)
+    export ROMP_NO_GEN=1
     export ROMP_INSTALL_TOKEN_TRIES=1
     export ROMP_GITHOOK_DIR="$TEST_DIR/githooks"
     # Keep vscode-extension/install.sh's app-bundle probe inside the sandbox: on a
