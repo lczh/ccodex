@@ -2650,7 +2650,8 @@ class TimelinePanel {
       for (const x of (edit.add || [])) if (next.members.indexOf(x) < 0) next.members.push(x);
       if (edit.remove) next.members = next.members.filter((x) => edit.remove.indexOf(x) < 0);
     }
-    this._pendingTagEdits[rt.id] = { tag: next, age: 0 };
+    this._pendingTagEdits[rt.id] = { tag: next, age: 0, gid: gid || 0 };   // gid scopes the
+    //                                 refusal's overlay drop (the v1.3.20 audit's residual)
     const wire = { host: rt.host, name: rt.name, rename: edit.rename,
                    color: edit.color, add: edit.add, remove: edit.remove,
                    delete: !!edit.delete };
@@ -2663,8 +2664,16 @@ class TimelinePanel {
   // the kernel's LOUD refusal (a down owner, a name collision there): the optimistic copy reverts
   // and the reason shows in the dialog (rebuilt in place if open) until dismissed
   tagEditFailed(m) {
-    for (const id of Object.keys(this._pendingTagEdits || {}))
-      if (id.split(':')[0] === m.host) delete this._pendingTagEdits[id];   // edits are name-addressed per host — revert them all
+    // the optimistic overlay drops SCOPED by the refused gesture's opId when the frame carries
+    // one (the v1.3.20 audit's residual): the host-wide sweep also reverted OTHER in-flight
+    // gestures' overlays on the same host, snapping their edits out of view for nothing. An
+    // opId-less frame (an old kernel) keeps the host-wide fallback.
+    for (const id of Object.keys(this._pendingTagEdits || {})) {
+      if (id.split(':')[0] !== m.host) continue;
+      const pgid = (this._pendingTagEdits[id] || {}).gid || 0;
+      if (m.opId && pgid && String(pgid) !== String(m.opId)) continue;
+      delete this._pendingTagEdits[id];
+    }
     // COMPENSATE the local half (the v1.3.17 audit's P2.11): the union edit committed locally
     // the moment the remote DISPATCH succeeded, but this refusal says the owner never applied
     // it — without the rollback the tag is split (deleted here, alive there). Only entries for
@@ -2687,23 +2696,28 @@ class TimelinePanel {
     // ...AND the same gesture's SIBLING remote halves (the v1.3.18 audit's P2: partial
     // multi-host tag edits still split state — fanned to owners A and B with only B refusing,
     // the local rollback above left A holding the applied edit: A changed, B/local reverted).
-    // Every entry sharing a refused entry's gesture id on ANOTHER host is still unconfirmed
-    // (_reconcileUnionOps already dropped confirmed ones), so it gets the inverse REMOTE edit
-    // and is dropped as compensated.
+    // Every entry sharing a refused entry's gesture id on ANOTHER host gets the inverse REMOTE
+    // edit and is dropped as compensated — INCLUDING entries the polls already CONFIRMED (the
+    // v1.3.20 audit's P1.3: _reconcileUnionOps retains the whole group until every participant
+    // is terminal now, precisely so a confirmed applier is still here to compensate when a
+    // slower sibling refuses).
     const gids = new Set();
     for (const o of ops) if (o.gid) gids.add(o.gid);
     const sibs = (this._unionOps || []).filter((o) => o.gid && gids.has(o.gid)
       && o.host !== (m.host || ''));
     this._unionOps = (this._unionOps || []).filter((o) => sibs.indexOf(o) < 0);
     const undead = [];   // hosts holding an applied DELETE — no remote edit can restore a tag
+    const rolled = [];   // hosts an inverse was dispatched to — the loud error names them
     for (const o of sibs) {
       const e = o.edit || {};
       if (e.delete) { undead.push(o.host || 'unknown'); continue; }
       const inv = {};
+      if (e.add) inv.remove = e.add.slice();
       if (e.remove) inv.add = e.remove.slice();
       if (e.rename) inv.rename = o.oldName;
       if (e.color) inv.color = o.oldColor;
       if (!Object.keys(inv).length) continue;
+      rolled.push(o.host || 'unknown');
       // a rename that landed re-keyed the tag on that host, and edits are name-addressed — the
       // inverse must address the NEW name to rename it back to the recorded old one.
       // The inverse dispatch mints its OWN gesture id (the r47 verification of Finding C): an
@@ -2716,8 +2730,11 @@ class TimelinePanel {
                           ++unionGestureSeq);
     }
     // the un-restorable deletes ride the SAME loud slot as the refusal (honest > silent): the
-    // user must redo those by hand, and a silent skip would hide exactly that
+    // user must redo those by hand, and a silent skip would hide exactly that. Hosts an
+    // inverse WAS dispatched to are named too (the v1.3.20 audit's P1.3: the rollback of an
+    // already-applied edit is exactly the surprise the user needs told about).
     this._tagEditErr = { host: m.host || '', name: m.name || '', error: (m.error || 'refused')
+      + (rolled.length ? ' — rolled the applied edit back on ' + rolled.join(', ') : '')
       + (undead.length ? ' — the delete already sent to ' + undead.join(', ') + ' cannot be'
          + ' undone from here; recreate the tag there by hand (romp tag --host <kernel>)' : '') };
     if (this._viewsDialog && this._viewsDialogBuild) this._viewsDialogBuild();
@@ -2744,7 +2761,20 @@ class TimelinePanel {
     // the RAW polled payload, never _curViews(): the optimistic overlay would echo our own edit
     // straight back and drop the entry before any refusal could arrive
     const rts = (this._views && this._views.remoteTags) || [];
-    this._unionOps = this._unionOps.filter((o) => !this._unionOpApplied(o, rts));
+    // the COMPLETE gesture group is retained until EVERY participant is terminal (the v1.3.20
+    // audit's P1.3): dropping each host's entry at ITS OWN polled confirmation forgot host A
+    // the moment its edit appeared — a later refusal from host B then rolled back local+B
+    // while A silently kept the applied delete/rename/color, with no inverse attempt and no
+    // warning. A confirmed entry is only MARKED here; the group leaves the list all-confirmed
+    // (below) or through its refusal's compensation (tagEditFailed). Entries without a gesture
+    // id (none are minted today) keep the old per-entry drop.
+    for (const o of this._unionOps) if (this._unionOpApplied(o, rts)) o.confirmed = true;
+    const gidDone = new Map();
+    for (const o of this._unionOps) {
+      const g = o.gid || 0;
+      gidDone.set(g, (gidDone.has(g) ? gidDone.get(g) : true) && !!o.confirmed);
+    }
+    this._unionOps = this._unionOps.filter((o) => (o.gid ? !gidDone.get(o.gid) : !o.confirmed));
   }
 
   _unionOpApplied(o, rts) {
@@ -2966,7 +2996,13 @@ class TimelinePanel {
     this._pendingViews = v; this._pendingViewsAge = 0;
     const baseRev = this._nextViewsRev();
     try {
-      if (typeof window !== 'undefined' && typeof window.__rompTimelineSetViews === 'function') {
+      if (typeof window !== 'undefined' && typeof window.__rompTimelineSetViewsOps === 'function'
+          && ops && ops.length) {
+        // TARGETED ops on the web path too (the v1.3.20 audit): they compose server-side under
+        // the kernel's lock — no CAS base to guess, no foreign edit to erase; the viewsAck the
+        // kernel answers re-anchors the counter exactly like the blob path's
+        window.__rompTimelineSetViewsOps(ops);
+      } else if (typeof window !== 'undefined' && typeof window.__rompTimelineSetViews === 'function') {
         if (v && typeof v === 'object') { v.baseRev = baseRev; delete v.rev; }
         window.__rompTimelineSetViews(v);
       } else if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
@@ -3090,7 +3126,9 @@ class TimelinePanel {
         e.preventDefault(); e.stopPropagation();
         const nv = JSON.parse(JSON.stringify(v));
         nv.actives = Object.assign({}, nv.actives, { timeline: lensToggle(lens, c.pick) });
-        this._setViews(nv);
+        // a pure lens move rides the TARGETED op (the v1.3.20 audit): it composes server-side
+        // with no CAS base to guess, and the kernel-down spool replays the exact gesture
+        this._setViews(nv, [{ actives: nv.actives }]);
       });
       x.addEventListener('click', (e) => e.stopPropagation());
       chip.appendChild(x);
@@ -3167,7 +3205,7 @@ class TimelinePanel {
       const apply = (nl, close) => {
         const nv = JSON.parse(JSON.stringify(v));
         nv.actives = Object.assign({}, nv.actives, { timeline: nl });
-        this._setViews(nv);
+        this._setViews(nv, [{ actives: nv.actives }]);   // a pure lens move → targeted op (v1.3.20)
         if (close) this._closeViewsMenu(); else build();
       };
       item('All', { current: lensAll(lens) }).addEventListener('click', () => apply({ all: true }, true));
@@ -3371,7 +3409,9 @@ class TimelinePanel {
                 nv.tags = viewTags(nv).slice().sort((a, b) =>
                   ((a.name in pos) ? pos[a.name] : names.length) - ((b.name in pos) ? pos[b.name] : names.length));
                 delete nv.groups;
-                this._setViews(nv);
+                // the drag is an absolute-order gesture → the targeted op (the v1.3.20 audit);
+                // the kernel resorts its own tags array to match, exactly as this client did
+                this._setViews(nv, [{ tagOrder: names.slice() }]);
                 build();
               };
               pillCell.addEventListener('pointermove', onMove);
@@ -3445,7 +3485,7 @@ class TimelinePanel {
           const tg = { id: 'g' + Date.now().toString(36), name: 'tag ' + (viewTags(nv).length + 1), color, members: [] };
           nv.tags = viewTags(nv).concat([tg]); delete nv.groups;
           this._tagEditorFor = tg.name;   // a new tag opens straight into its rename input
-          this._setViews(nv);
+          this._setViews(nv, [{ create: tg }]);   // the create op composes; no CAS base (v1.3.20)
           build();
         });
       }

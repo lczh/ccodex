@@ -308,6 +308,20 @@ class EditTagOpPins(unittest.TestCase):
         self.assertIn('{"type": "tagEditFailed", "host": host, "name": nm,', src)
         self.assertIn('(client or {}).get("wid") or ""', src, "the refusal goes to the ASKING dashboard")
 
+    def test_a_malformed_delete_rejects_the_whole_edit_never_forwards_a_partial(self):
+        # the v1.3.20 audit's residual on the v1.3.19 fix: `delete: "false"` no longer deleted
+        # (never coerce), but the handler silently DROPPED the field and forwarded the rest of
+        # an edit the client didn't send. A malformed frame is rejected whole, loudly.
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        self.assertIn('if host and nm and "delete" in e and not isinstance(e.get("delete"), bool):',
+                      src)
+        self.assertIn('"error": "malformed edit: delete must be a JSON "', src)
+        i_reject = src.index('if host and nm and "delete" in e and not isinstance(e.get("delete"), bool):')
+        i_forward = src.index('ans, err = _forward_tag_edit(host, body)')
+        self.assertLess(i_reject, i_forward,
+                        "the rejection gate sits BEFORE the forward — a malformed frame never "
+                        "reaches the owner in any interpretation")
+
 
 class ForwardHelper(TagRoute):
     """_forward_tag_edit — the one channel every remote edit rides (romp tag --host, the dialog's

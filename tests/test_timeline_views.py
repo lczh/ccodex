@@ -14,6 +14,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -194,6 +195,37 @@ class TimelineViews(unittest.TestCase):
         (jd.STATE / "timeline-views.json").write_text(json.dumps({"active": "all", "tags": []}))
         km._flags_cache.clear()
         self.assertEqual(km._timeline_views()["tags"], [], "minted only when hidden entries exist")
+
+    def test_a_migration_whose_cas_is_refused_returns_the_authoritative_blob_not_the_speculation(self):
+        # the v1.3.20 audit's residual: a concurrent editor committing between the migration's
+        # read and its CAS write refused the write — and the read then RETURNED AND CACHED the
+        # speculative transformed blob, publishing state the store never held. The refusal now
+        # re-reads the authoritative file; a later read retries the migration.
+        raw = {"active": "all", "hidden": ["s7"], "tags": [], "rev": 3}
+        (jd.STATE / "timeline-views.json").write_text(json.dumps(raw))
+        km._flags_cache.clear()
+        real_set = km._set_timeline_views
+
+        def racing_set(blob, base_rev=None):
+            # a concurrent editor lands between the migration's read and its write: bump the
+            # stored rev so the CAS refuses, exactly the audited interleaving
+            cur = json.loads((jd.STATE / "timeline-views.json").read_text())
+            cur["rev"] = 4
+            cur["tags"] = [{"id": "gF", "name": "foreign", "color": "", "members": []}]
+            (jd.STATE / "timeline-views.json").write_text(json.dumps(cur))
+            return real_set(blob, base_rev=base_rev)
+
+        with mock.patch.object(km, "_set_timeline_views", side_effect=racing_set):
+            v = km._timeline_views()
+        self.assertFalse(any(t["name"] == "archived" for t in v["tags"]),
+                         "the refused migration's transformed blob is NOT returned")
+        self.assertTrue(any(t["name"] == "foreign" for t in v["tags"]),
+                        "…the AUTHORITATIVE re-read is — the foreign editor's commit shows")
+        self.assertEqual(v["rev"], 4, "and the rev is the store's, not the speculation's")
+        km._flags_cache.clear()
+        v2 = km._timeline_views()                     # the migration retries on a later read
+        self.assertTrue(any(t["name"] == "archived" for t in v2["tags"]),
+                        "the migration lands once the store is quiet")
 
     def test_ws_op_persists_via_normalizer(self):
         # the handler body is _set_timeline_views + _mark_views_dirty; pin the setter's normalization

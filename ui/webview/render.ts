@@ -14,7 +14,7 @@ import yaml from "highlight.js/lib/languages/yaml";
 import type { ParsedAsk } from "../ask-types";
 import { TABBAR_H_KEY, TABBAR_H_DEFAULT, clampTabbarH, parseTabbarH } from "./tabbar-resize";
 import { SessionViews, viewVisible, viewsKey, revealIn, viewTagUnion, viewTags, type TagUnion, type SessionTag } from "./session-views";
-import { anchorViewsRev, consumeViewsAck, postViewsWrite } from "./views-writer";
+import { anchorViewsRev, consumeViewsAck, postViewsOps, postViewsWrite } from "./views-writer";
 import { lensVisible, surfaceLens } from "./tag-lens";
 import { openTagMenu, tagMenuButton, syncTagFilter } from "./tag-menu";
 import { syncSessionsFromTabMeta, applyMetaToSession, notePendingMeta, PendingTabMeta } from "./tab-meta";
@@ -505,10 +505,16 @@ function captureViews(v: SessionViews | null) {
 // the raw setTimelineViews post re-echoed the payload's rev, so the second of two quick gestures
 // always declared a stale CAS base and was refused — the writer stamps an advancing baseRev and
 // the viewsAck frame (routed below) re-anchors it.
-function postViews(v: SessionViews) {
+function postViews(v: SessionViews, ops?: Record<string, unknown>[]) {
   pendingSessionViews = v; pendingViewsAge = 0;
   if (activeId) assertPeekFor(activeId);   // the optimistic edit re-derives the active session's peek too
-  if (vscodeApi) postViewsWrite((m) => vscodeApi.postMessage(m), v);
+  // TARGETED ops when the gesture is expressible as them (the v1.3.20 audit): ops compose
+  // server-side with no CAS base to guess — a foreign edit landing mid-gesture can neither
+  // refuse them nor be erased by them. The whole-blob CAS write stays as the fallback belt.
+  if (vscodeApi) {
+    if (ops && ops.length) postViewsOps((m) => vscodeApi.postMessage(m), ops);
+    else postViewsWrite((m) => vscodeApi.postMessage(m), v);
+  }
   renderTabs();
 }
 // ── EPHEMERAL PEEK TAB (the user 2026-08-24, superseding the kernel's reveal-rule view mutation):
@@ -534,7 +540,10 @@ function assertPeekFor(id: string): void {
 }
 function tabInView(id: string): boolean { return id === peekId || chatVisible(id); }
 function visibleOrder(): string[] { return order.filter(tabInView); }
-function revealSession(id: string) { postViews(revealIn(effViews(), id)); }
+function revealSession(id: string) {
+  const v = revealIn(effViews(), id);
+  postViews(v, v.actives ? [{ actives: v.actives }] : undefined);   // a pure lens move → ops
+}
 
 let paletteColors: string[] = [];
 fetch(kernelUrl("/palette"), { cache: "no-store" }).then((r) => r.json())
@@ -4526,7 +4535,7 @@ function renderTabs() {
       onApply: (l) => {
         const v = JSON.parse(JSON.stringify(effViews() || { active: "all", tags: [] }));
         v.actives = Object.assign({}, v.actives, { chat: l });
-        postViews(v);
+        postViews(v, [{ actives: v.actives }]);   // a pure lens move → targeted op (v1.3.20)
       },
       onConfigure: () => { vscodeApi?.postMessage({ type: "openTagsDialog" }); },
     });
@@ -4549,7 +4558,7 @@ function renderTabs() {
     syncTagFilter(tagBtn, tagChipsHost, surfaceLens(v, "chat"), viewTagUnion(v), (l) => {
       const nv = JSON.parse(JSON.stringify(v || { active: "all", tags: [] }));
       nv.actives = Object.assign({}, nv.actives, { chat: l });
-      postViews(nv);
+      postViews(nv, [{ actives: nv.actives }]);   // a pure lens move → targeted op (v1.3.20)
     });
   }
   // Restore tab-mode focus if a tab held it before this rebuild (see the top of renderTabs).
@@ -4822,11 +4831,19 @@ function showTabMenu(e: MouseEvent, id: string) {
       // the remote's own next push is the durable truth (a refused edit re-appears there).
       const nv = JSON.parse(JSON.stringify(effViews() || {})) as SessionViews;
       let dirty = false;
+      // the LOCAL half's edits collected as TARGETED ops (the v1.3.20 audit): membership edits
+      // compose server-side under the kernel's lock, so a foreign edit landing mid-gesture is
+      // never CAS-refused against and never erased by a stale blob
+      const localOps: Record<string, unknown>[] = [];
       const nvRemote = (rt: SessionTag) => (nv.remoteTags || []).find((x) => x.id === rt.id);
       if (edit.add?.length) {
         if (g.localId) {
           const t = viewTags(nv).find((x) => x.id === g.localId);
-          if (t) { t.members = Array.from(new Set((t.members || []).concat(edit.add))); dirty = true; }
+          if (t) {
+            t.members = Array.from(new Set((t.members || []).concat(edit.add)));
+            localOps.push({ tag: g.localId, add: edit.add.slice() });
+            dirty = true;
+          }
         } else if (g.remotes.length) {
           vscodeApi?.postMessage({ type: "editTag", edit: { host: g.remotes[0].host || "", name: g.name, add: edit.add.slice() } });
           const mine = nvRemote(g.remotes[0]);
@@ -4838,6 +4855,7 @@ function showTabMenu(e: MouseEvent, id: string) {
           const t = viewTags(nv).find((x) => x.id === g.localId);
           if (t && (t.members || []).some((m) => edit.remove!.includes(m))) {
             t.members = (t.members || []).filter((m) => !edit.remove!.includes(m));
+            localOps.push({ tag: g.localId, remove: edit.remove!.slice() });
             dirty = true;
           }
         }
@@ -4848,7 +4866,7 @@ function showTabMenu(e: MouseEvent, id: string) {
           if (mine) { mine.members = (mine.members || []).filter((m) => !edit.remove!.includes(m)); dirty = true; }
         }
       }
-      if (dirty) postViews(nv);
+      if (dirty) postViews(nv, localOps.length ? localOps : undefined);
     };
     tagsItem.addEventListener("click", (ev) => {
       ev.stopPropagation();
@@ -4896,9 +4914,10 @@ function showTabMenu(e: MouseEvent, id: string) {
           const nv = JSON.parse(JSON.stringify(effViews() || {})) as SessionViews;
           const used = new Set(viewTags(nv).map((t) => t.color));
           const color = paletteColors.find((c) => !used.has(c)) || paletteColors[0] || "#1EA1EB";
-          nv.tags = viewTags(nv).concat([{ id: "g" + Date.now().toString(36), name, color, members: [id] }]);
+          const tg = { id: "g" + Date.now().toString(36), name, color, members: [id] };
+          nv.tags = viewTags(nv).concat([tg]);
           delete nv.groups;
-          postViews(nv);
+          postViews(nv, [{ create: tg }]);   // the create op composes; no CAS base (v1.3.20)
           build(); sb.textContent = subText();
         });
         nrow.appendChild(inp);

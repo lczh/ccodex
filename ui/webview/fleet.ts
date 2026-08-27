@@ -6,7 +6,7 @@
 // so the colours are IDENTICAL to the ledger box.
 import { delegate } from "./actions";
 import { SessionViews, viewTagUnion } from "./session-views";
-import { anchorViewsRev, consumeViewsAck, postViewsWrite } from "./views-writer";
+import { anchorViewsRev, consumeViewsAck, postViewsOps } from "./views-writer";
 import { lensVisible, surfaceLens } from "./tag-lens";
 import { openTagMenu, tagMenuButton, syncTagFilter } from "./tag-menu";
 import { fleetVisibleRoots } from "./fleet-roots";
@@ -844,9 +844,10 @@ function showHoverCard(row: HTMLElement, sid: string, nid: string): void {
           const v = JSON.parse(JSON.stringify(fleetViews || { active: "all", tags: [] }));
           v.actives = Object.assign({}, v.actives, { outline: l });
           fleetViews = v;                                        // optimistic: the next feed push echoes it
-          // the SHARED writer (views-writer.ts, Finding A): stamps an advancing baseRev so two
-          // quick lens picks don't both declare the same CAS base and lose the second
-          if (vscodeApi) postViewsWrite((msg) => vscodeApi.postMessage(msg), v);
+          // the SHARED writer (views-writer.ts): a lens pick is a pure actives move, posted as a
+          // TARGETED op (the v1.3.20 audit) — it composes server-side with no CAS base to guess,
+          // so a foreign edit can neither refuse it nor be erased by a stale blob
+          if (vscodeApi) postViewsOps((msg) => vscodeApi.postMessage(msg), [{ actives: v.actives }]);
           render();
         },
         onConfigure: () => { vscodeApi?.postMessage({ type: "openTagsDialog" }); },
@@ -862,7 +863,7 @@ function showHoverCard(row: HTMLElement, sid: string, nid: string): void {
       const v = JSON.parse(JSON.stringify(fleetViews || { active: "all", tags: [] }));
       v.actives = Object.assign({}, v.actives, { outline: l });
       fleetViews = v;
-      if (vscodeApi) postViewsWrite((msg) => vscodeApi.postMessage(msg), v);   // the shared writer, as above
+      if (vscodeApi) postViewsOps((msg) => vscodeApi.postMessage(msg), [{ actives: v.actives }]);   // as above
       render();
     });
     syncFleetTagBtn();

@@ -90,6 +90,9 @@ export function bridgeFunctions(post: Post): Record<string, (...a: any[]) => voi
     __rompTimelineSendCommand: (name: string, cmd: string) => post({ type: "sendCommand", name, cmd }),
     __rompTimelineSetFlag: (id: string, flag: string, value: unknown) => post({ type: "setSessionFlag", id, flag, value: !!value }),
     __rompTimelineSetViews: (views: unknown) => post({ type: "setTimelineViews", views }),
+    // TARGETED ops (the v1.3.20 audit): lens picks, the union drag and tag creates compose
+    // server-side instead of riding whole-blob CAS writes
+    __rompTimelineSetViewsOps: (ops: unknown) => post({ type: "setTimelineViewsOps", ops }),
     __rompTimelineEditTag: (edit: unknown) => post({ type: "editTag", edit }),
     __rompTimelineDismiss: (id: string) => post({ type: "dismissLane", id }),
     __rompTimelineHover: (sid?: string, segIds?: unknown[], t0?: number, t1?: number) =>

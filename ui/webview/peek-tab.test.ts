@@ -43,7 +43,7 @@ test("a view change that excludes the ACTIVE session converts it into the peek �
   // both views-arrival paths re-derive the active session's peek: the kernel-pushed blob…
   assert.match(RENDER, /pendingSessionViews = null; pendingViewsAge = 0;\s*\n\s*\}[\s\S]{0,700}?if \(activeId\) assertPeekFor\(activeId\);\s*\n\}/);
   // …and the local optimistic edit, BEFORE its renderTabs so the repaint sees the fresh peek state
-  assert.match(RENDER, /pendingSessionViews = v; pendingViewsAge = 0;\s*\n\s*if \(activeId\) assertPeekFor\(activeId\);[\s\S]{0,200}?renderTabs\(\);/);
+  assert.match(RENDER, /pendingSessionViews = v; pendingViewsAge = 0;\s*\n\s*if \(activeId\) assertPeekFor\(activeId\);[\s\S]{0,700}?renderTabs\(\);/);
   // the derivation is symmetric, so a view that now INCLUDES the active peek sheds the dress — the
   // same next-null branch the auto-close pin above holds; and the fallback's fire-time revalidation
   // (below) re-checks tabInView, so a converted peek can never be bounced by an in-flight timeout
@@ -93,5 +93,6 @@ test("the peek is a PEEK, not a view edit: the client never posts a views change
   const focusBlock = (RENDER.match(/else if \(m\.type === "focus"\) \{[\s\S]*?\n  \}/) || [""])[0];
   assert.ok(focusBlock.length > 100, "found the focus handler");
   assert.doesNotMatch(focusBlock, /postViews|setTimelineViews|revealSession/);
-  assert.match(RENDER, /function revealSession\(id: string\) \{ postViews\(revealIn\(effViews\(\), id\)\); \}/);
+  assert.match(RENDER, /function revealSession\(id: string\) \{\s*\n\s*const v = revealIn\(effViews\(\), id\);\s*\n\s*postViews\(v, v\.actives \? \[\{ actives: v\.actives \}\] : undefined\);/,
+    "the reveal is a pure lens move — posted as a targeted op (the v1.3.20 audit)");
 });

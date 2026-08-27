@@ -113,7 +113,7 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
     // views edits ride the kernel's TARGETED ops and spool the same grammar kernel-down
     const fn = SRC.indexOf("_setViews(v, ops)");
     assert.ok(fn > 0, "_setViews names its ops");
-    const win = SRC.slice(fn, fn + 2400);
+    const win = SRC.slice(fn, fn + 3400);   // widened for the v1.3.20 ops branch
     const kp = win.indexOf("_kernelPost('/views'");
     const sp = win.indexOf("_spoolOp({ op: 'views'");
     assert.ok(kp > 0 && sp > kp, "views: kernel first, spool on network failure only");
@@ -150,7 +150,7 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
   }
   {
     const fn = SRC.indexOf("tagEditFailed(m) {");
-    const win = SRC.slice(fn, fn + 2000);
+    const win = SRC.slice(fn, fn + 3000);   // widened for the v1.3.20 overlay-scoping comments
     assert.ok(win.indexOf("_applyLocalOp(o.inverse)") > 0,
       "the refusing host's entries roll the local half back — the union never stays split");
   }
@@ -161,7 +161,7 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
     const fn = SRC.indexOf("_nextViewsRev() {");
     assert.ok(fn > 0, "the optimistic rev counter exists");
     const sv = SRC.indexOf("_setViews(v, ops) {");
-    const win = SRC.slice(sv, sv + 700);
+    const win = SRC.slice(sv, sv + 1700);   // widened for the v1.3.20 ops branch
     assert.match(win, /const baseRev = this\._nextViewsRev\(\);/);
     assert.match(win, /v\.baseRev = baseRev; delete v\.rev;/,
       "the stale payload rev never rides a write — the counter is the declared base");
@@ -172,7 +172,7 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
     // the r45 verification: compensation entries drop on the DECIDING EVENT (the owner's RAW
     // polled store confirms the edit), never a push counter racing a slow refusal
     const fn = SRC.indexOf("_reconcileUnionOps() {");
-    const win = SRC.slice(fn, fn + 800);
+    const win = SRC.slice(fn, fn + 1800);   // widened for the v1.3.20 P1.3 group retention
     assert.ok(win.indexOf("this._views && this._views.remoteTags") > 0,
       "the RAW payload decides — the optimistic overlay would echo our own edit back");
     assert.ok(win.indexOf("_unionOpApplied") > 0);
@@ -217,7 +217,7 @@ test("source: union-op entries carry rt + gesture id + pre-edit name/color at no
 
 test("source: tagEditFailed compensates SIBLING hosts — inverse remote edits; delete is loud, never silent", () => {
   const fn = SRC.indexOf("tagEditFailed(m) {");
-  const win = SRC.slice(fn, fn + 4700);
+  const win = SRC.slice(fn, fn + 5600);   // widened for the v1.3.20 P1.3 comments
   assert.ok(win.indexOf("_applyLocalOp(o.inverse)") > 0, "the local rollback survives untouched");
   // a refusal carrying the opId the edit was stamped with compensates EXACTLY that gesture (the
   // 2026-08-26 audit's Finding C — the kernel echoes it); an opId-less frame (an old kernel)
@@ -225,8 +225,9 @@ test("source: tagEditFailed compensates SIBLING hosts — inverse remote edits; 
   // OTHER gestures' entries into the rollback)
   assert.match(win, /const newestGid = matched\.reduce\(\(g, o\) => Math\.max\(g, o\.gid \|\| 0\), 0\);/);
   assert.match(win, /const ops = matched\.filter\(\(o\) => m\.opId \? String\(o\.gid \|\| 0\) === String\(m\.opId\)\s*\n\s*: \(o\.gid \|\| 0\) === newestGid\);/);
-  // gid-matched entries on OTHER hosts (still unconfirmed — _reconcileUnionOps already dropped
-  // confirmed ones) get the inverse REMOTE edit and are dropped as compensated
+  // gid-matched entries on OTHER hosts — INCLUDING poll-confirmed ones, which the group
+  // retention keeps precisely for this (the v1.3.20 audit's P1.3) — get the inverse REMOTE
+  // edit and are dropped as compensated
   assert.match(win, /o\.gid && gids\.has\(o\.gid\)/);
   assert.match(win, /o\.host !== \(m\.host \|\| ''\)/);
   assert.match(win, /if \(e\.remove\) inv\.add = e\.remove\.slice\(\);/);
@@ -338,6 +339,53 @@ test("executed: one owner's refusal compensates the OTHER owner and the local ha
   assert.deepEqual(panel._curViews().tags.find((t: any) => t.id === "g1").members.slice().sort(),
     ["s1", "s2"], "the local tag regained the member");
   assert.equal(panel._unionOps.length, 0, "refused + compensated entries are all dropped");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews;
+});
+
+test("executed: a poll-CONFIRMED sibling is still compensated when the other owner refuses (v1.3.20 P1.3)", () => {
+  // the v1.3.20 audit's P1.3, the audited silent split: once HOST-A's edit appeared in
+  // polling, _reconcileUnionOps forgot it — HOST-B's later refusal rolled back local+B while
+  // A kept the applied edit, with no inverse attempt and no warning
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  assert.equal(panel._unionOps.length, 2);
+  const polled = JSON.parse(JSON.stringify(VIEWS));
+  polled.remoteTags[0].members = [];            // A applied the remove; a poll echoes it
+  panel.update({ now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [], views: polled });
+  assert.equal(panel._unionOps.length, 2,
+    "the gesture group is retained until EVERY participant is terminal — A's confirmation alone drops nothing");
+  assert.ok(panel._unionOps.find((o: any) => o.host === "TESTHOST-A").confirmed,
+    "…though A's entry is marked confirmed");
+  const inverse: any[] = [];
+  panel._editRemoteTag = (rt: any, edit: any) => { inverse.push({ rt, edit }); return true; };
+  panel.tagEditFailed({ host: "TESTHOST-B", name: "pool", error: "kernel refused" });
+  assert.equal(inverse.length, 1, "the CONFIRMED applier still gets the inverse");
+  assert.equal(inverse[0].rt.host, "TESTHOST-A");
+  assert.deepEqual(inverse[0].edit, { add: ["s1"] });
+  assert.match(panel._tagEditErr.error, /rolled the applied edit back on TESTHOST-A/,
+    "the loud error NAMES the host whose applied edit was rolled back");
+  assert.equal(panel._unionOps.length, 0);
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews;
+});
+
+test("executed: an all-confirmed gesture group leaves the list — retention has an exit", () => {
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  assert.equal(panel._unionOps.length, 2);
+  const polled = JSON.parse(JSON.stringify(VIEWS));
+  polled.remoteTags[0].members = [];
+  polled.remoteTags[1].members = [];            // BOTH owners applied it
+  panel.update({ now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [], views: polled });
+  assert.equal(panel._unionOps.length, 0,
+    "every participant terminal (all confirmed) — the group retires, nothing is immortal");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews;
 });
 

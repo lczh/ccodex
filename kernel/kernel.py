@@ -1845,6 +1845,19 @@ def _timeline_views():
             _rev = _mrev                             # the read reports the rev it LEAVES behind —
         #                                              a stale one CAS-failed the first client
         #                                              write for nothing (the v1.3.19 audit)
+        else:
+            # the CAS refused: a concurrent editor committed between this read and the write.
+            # The transformed blob is SPECULATIVE — returning and caching it published state the
+            # store never held (the v1.3.20 audit's residual); re-read the authoritative file and
+            # let a later read retry the migration.
+            try:
+                d = json.loads(p.read_text())
+            except Exception:
+                d = {}
+            try:
+                _rev = int(d.get("rev") or 0) if isinstance(d, dict) else 0
+            except (TypeError, ValueError):
+                _rev = 0
     d = _norm_timeline_views(d)
     d["rev"] = _rev        # the write counter rides every read (and every client payload clone),
     #                        so a whole-blob writer naturally declares the base it edited from
@@ -2034,7 +2047,12 @@ def _apply_views_ops(ops):
     identity lock — two concurrent editors COMPOSE instead of last-writer-wins, and a kernel-down
     spool can replay the exact gesture later (the v1.3.17 audit's P2.15/P1.5). Per op:
     {"tag": <name or id>, "add": [sid...], "remove": [sid...], "rename": s, "color": s,
-    "delete": true}, {"create": {"id","name","color","members"}}, or {"active": <view id>}.
+    "delete": true}, {"create": {"id","name","color","members"}}, {"active": <view id>},
+    {"actives": <surface->lens dict>}, or {"tagOrder": [names]} — the last two are the v1.3.20
+    audit's grammar extension: the lens picks and the union drag are ABSOLUTE-state gestures
+    that used to ride whole-blob CAS writes (pipelined guessed revisions could erase a foreign
+    edit) and degrade to a bare {active} in the kernel-down spool (dropping actives/tagOrder/new
+    tags). As targeted ops they compose with foreign tag edits and replay offline losslessly.
     Unknown tags and malformed ops drop quietly: a replayed gesture over a deleted tag has
     nothing left to do. Returns the new rev."""
     with jd._identity_file_lock():
@@ -2056,6 +2074,17 @@ def _apply_views_ops(ops):
                 continue
             if isinstance(op.get("active"), str):
                 d["active"] = op["active"]
+                continue
+            if isinstance(op.get("actives"), dict):
+                d["actives"] = op["actives"]           # absolute gesture; _norm validates per surface
+                continue
+            if isinstance(op.get("tagOrder"), list):
+                names = [str(n) for n in op["tagOrder"] if isinstance(n, str) and n]
+                d["tagOrder"] = names
+                pos = {n: i for i, n in enumerate(names)}
+                # the drag rewrites the local array order too (the twin's convention) — remote
+                # names simply don't match anything here
+                d["tags"] = sorted(d["tags"], key=lambda t: pos.get(t.get("name"), len(names)))
                 continue
             cr = op.get("create")
             if isinstance(cr, dict):
@@ -28105,6 +28134,7 @@ window.__rompTimelineCompact=function(name){post({type:"compact",name:name});};
 window.__rompTimelineSendCommand=function(name,cmd){post({type:"sendCommand",name:name,cmd:cmd});};
 window.__rompTimelineSetFlag=function(id,flag,value){post({type:"setSessionFlag",id:id,flag:flag,value:!!value});};
 window.__rompTimelineSetViews=function(views){post({type:"setTimelineViews",views:views});};
+window.__rompTimelineSetViewsOps=function(ops){post({type:"setTimelineViewsOps",ops:ops});};
 window.__rompTimelineEditTag=function(edit){post({type:"editTag",edit:edit});};
 window.__rompTimelineDismiss=function(id){post({type:"dismissLane",id:id});};
 window.__rompTimelineHover=function(sid,segIds,t0,t1){post(sid?{type:"timelineHover",sid:sid,segIds:segIds||[],t0:t0,t1:t1}:{type:"timelineHover",off:true});};
@@ -32836,6 +32866,18 @@ class Handler(BaseHTTPRequestHandler):
                 client["send"](json.dumps({"type": "viewsAck", "ok": bool(_wok), "rev": _wrev}))
             except Exception:
                 pass
+        elif msg and msg.get("type") == "setTimelineViewsOps" and isinstance(msg.get("ops"), list):
+            # TARGETED ops over the WS channel (the v1.3.20 audit): the lens picks and the union
+            # drag are absolute-state gestures — as whole-blob CAS writes they pipelined guessed
+            # revisions (a refused W1's sibling W2 could coincide with a foreign commit's rev and
+            # erase it); as ops they COMPOSE under the identity lock with no base to guess. The
+            # ack wears the same viewsAck dress so the shared writer's counter re-anchors.
+            _orev = _apply_views_ops(msg["ops"])
+            _mark_views_dirty()
+            try:
+                client["send"](json.dumps({"type": "viewsAck", "ok": True, "rev": _orev}))
+            except Exception:
+                pass
         elif msg and msg.get("type") == "openTagsDialog":
             # any pane's "Configure tags…" opens THE tags dialog — which lives on the timeline pane
             # (one dialog, one implementation; the user 2026-08-25). Routed to the SAME dashboard's
@@ -32854,7 +32896,17 @@ class Handler(BaseHTTPRequestHandler):
             host = str(e.get("host") or "").strip()
             nm = str(e.get("name") or "").strip()
             op_id = str(e.get("opId") or "")
-            if host and nm:
+            if host and nm and "delete" in e and not isinstance(e.get("delete"), bool):
+                # a non-bool delete is a MALFORMED frame: never coerce (a string "false" DELETED
+                # a remote tag — the v1.3.19 audit) and never forward a partial interpretation of
+                # it either (the v1.3.20 audit's residual: the silent drop of the field forwarded
+                # the rest of an edit the client didn't send) — reject the whole edit, loudly
+                _send_to_view("timeline", {"type": "tagEditFailed", "host": host, "name": nm,
+                                           **({"opId": op_id} if op_id else {}),
+                                           "error": "malformed edit: delete must be a JSON "
+                                                    "boolean (true/false)"},
+                              (client or {}).get("wid") or "")
+            elif host and nm:
                 tail = lambda x: x.rsplit(":", 1)[-1]
                 body = {"name": nm}
                 for k in ("add", "remove"):

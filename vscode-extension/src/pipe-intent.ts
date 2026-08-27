@@ -14,7 +14,8 @@ export const INTENT_OPS: ReadonlySet<string> = new Set([
   "renameSession", "endSession", "reviveSession",
   "nodeOverride", "askClear", "undoClear", "cardMove", "cardNotify", "redistill",
   "answerAsk", "submitAsk", "toggleAsk", "navAsk", "cancelAsk",
-  "setSessionFlag", "setSessionColor", "setGlobalRetryPaused", "setTimelineViews", "openTagsDialog",
+  "setSessionFlag", "setSessionColor", "setGlobalRetryPaused", "setTimelineViews",
+  "setTimelineViewsOps", "openTagsDialog",
   "reorderTabs", "closeTab",
 ]);
 

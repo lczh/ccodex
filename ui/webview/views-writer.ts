@@ -2,72 +2,102 @@
 // (render.ts postViews) and the Outline's tag lens (fleet.ts) each cloned the pushed views blob
 // and posted {type:"setTimelineViews"} raw — the clone still carried the payload's rev N, so two
 // quick gestures both declared base N to the kernel's compare-and-set and the SECOND was always
-// refused: a rapid hide-then-reveal (or two lens picks) silently lost the later edit. The timeline
-// panel already solved exactly this with an optimistic counter (_nextViewsRev/viewsAck in
-// ui/romp-timeline-view.js); this module is that discipline as the webview's shared TS twin.
+// refused: a rapid hide-then-reveal (or two lens picks) silently lost the later edit.
 //
-// The counter is TWO numbers, not one (the r47 verification of Finding A): the last rev the
-// kernel actually REPORTED (a pushed payload's views.rev, or a viewsAck's rev), plus how many of
-// our writes are still in flight toward it. A single monotone counter forged past its own refused
-// writes — after a foreign client committed, the forged base could COINCIDE with the kernel's
-// real rev and a stale blob was ACCEPTED, silently erasing the foreign edit — and re-anchoring it
-// to every payload rewound it below writes still in flight, resurrecting the second-gesture 409.
-// So:
-//  - postViewsWrite declares baseRev = confirmed + in-flight — exactly one optimistic slot per
-//    write actually outstanding, never headroom left over from writes the kernel already answered;
-//  - anchorViewsRev raises the confirmed rev to a pushed payload's views.rev and NEVER lowers it
-//    (federation re-emits the cached blob with its old rev on reorder/remote-push events — a stale
-//    payload must not rewind the base under an in-flight write);
-//  - consumeViewsAck retires one in-flight slot per kernel answer. ok:true raises the confirmed
-//    rev (never lowers — an ack can arrive after a newer payload). ok:false re-anchors to the
-//    SERVED rev even downward (the refusal reports the CAS truth), clears the remaining
-//    optimistic headroom — every slot minted after the refused write assumed it would land, and
-//    reusing that guess is how a stale base coincides with a foreign commit — and hands the
-//    refusal to the surface so its known-refused overlay drops now instead of aging out.
+// SERIALIZED since the v1.3.20 audit: the r47 two-number counter (confirmed + in-flight) still
+// PIPELINED whole-blob writes on guessed revisions — with W1 in flight and a foreign client
+// committing, W1 was refused but stale W2's guessed base could COINCIDE with the foreign
+// commit's rev and the kernel accepted a blob that never saw the foreign edit, silently erasing
+// it. No guess survives here:
+//  - at most ONE write is outstanding; later gestures queue;
+//  - a whole-blob write declares baseRev = the last KERNEL-REPORTED rev, exactly — stamped at
+//    POST time (dequeue), never at gesture time, so it is the freshest served truth;
+//  - an ok:false ack drops every QUEUED blob (each was rendered on state the kernel just
+//    refuted — re-posting one is exactly the coincide-erase) and hands the refusal to the
+//    surface, which re-derives from the fresh payload;
+//  - TARGETED ops (postViewsOps — the lens picks and their kin, the same audit's grammar
+//    extension) ride the queue for ordering but carry no base at all: they compose server-side
+//    under the kernel's lock, so they survive a blob refusal instead of being dropped.
+//  - anchorViewsRev stays MONOTONIC (the r47 verification): federation re-emits the cached blob
+//    with its old rev — a stale payload must not rewind the base.
 // Pure and stateful-per-bundle (each pane has its own kernel socket and views stream), split out
 // for tests like session-views.ts.
 import { SessionViews } from "./session-views";
 
+type QueuedWrite = { kind: "blob"; views: SessionViews } | { kind: "ops"; ops: Record<string, unknown>[] };
+
 let confirmedRev = 0;   // the last rev the KERNEL reported (payload push or ack) — never a guess
-let inFlight = 0;       // our writes posted since then and not yet answered by a viewsAck
+let outstanding = 0;    // 0 or 1: the one write whose ack we await
+let queue: QueuedWrite[] = [];
+let poster: ((m: Record<string, unknown>) => void) | null = null;
 
 /** Raise the confirmed rev to a pushed payload's views.rev — called on every views arrival
  *  (tabOrder push in the chat, feed push in the Outline). Monotonic: a re-emitted stale payload
- *  never rewinds the base below a write already in flight (the r47 verification). */
+ *  never rewinds the base below a write already outstanding (the r47 verification). */
 export function anchorViewsRev(v: SessionViews | { rev?: unknown } | null | undefined): void {
   const rev = v && (v as { rev?: unknown }).rev;
   if (typeof rev === "number") confirmedRev = Math.max(confirmedRev, rev);
 }
 
-/** The kernel's per-write acknowledgement for setTimelineViews. Returns whether the frame was
- *  consumed (so routers can skip their other cases). Every ack retires one in-flight slot;
- *  ok:false re-anchors to the served rev, clears the forged headroom, and invokes the surface's
- *  rollback — the write is KNOWN-refused, not merely unconfirmed. A malformed rev leaves the
- *  confirmed rev standing (anchoring it to 0 was itself a rewind). */
+function pump(): void {
+  if (!poster || outstanding > 0 || !queue.length) return;
+  const w = queue.shift()!;
+  outstanding = 1;
+  if (w.kind === "ops") {
+    poster({ type: "setTimelineViewsOps", ops: w.ops });
+    return;
+  }
+  const v: SessionViews & { rev?: number; baseRev?: number } = { ...w.views };
+  v.baseRev = confirmedRev;          // the served truth at POST time — never a gesture-time guess
+  delete v.rev;                      // the stale payload rev never rides — baseRev is the declared base
+  poster({ type: "setTimelineViews", views: v });
+}
+
+/** The kernel's per-write acknowledgement (setTimelineViews CAS and setTimelineViewsOps alike —
+ *  both wear the viewsAck dress). Returns whether the frame was consumed (so routers can skip
+ *  their other cases). ok:false re-anchors to the served rev (the CAS truth, downward included),
+ *  DROPS every queued blob, and invokes the surface's rollback — the write is KNOWN-refused, not
+ *  merely unconfirmed. Queued targeted ops survive: they compose against whatever the store
+ *  holds. A malformed rev leaves the confirmed rev standing (anchoring it to 0 was itself a
+ *  rewind). */
 export function consumeViewsAck(m: unknown, onRefused?: () => void): boolean {
   const a = m as { type?: unknown; ok?: unknown; rev?: unknown } | null;
   if (!a || a.type !== "viewsAck") return false;
-  inFlight = Math.max(0, inFlight - 1);
+  outstanding = 0;
   const rev = typeof a.rev === "number" ? a.rev : null;
   if (a.ok === false) {
     if (rev !== null) confirmedRev = rev;   // the served CAS truth — downward is legitimate HERE
-    inFlight = 0;                           // slots minted after the refused write are forged — never reused
+    queue = queue.filter((w) => w.kind === "ops");   // queued blobs were rendered on refuted state
     if (onRefused) onRefused();
   } else if (rev !== null) confirmedRev = Math.max(confirmedRev, rev);
+  pump();
   return true;
 }
 
-/** Stamp and post one whole-blob write. The blob is a clone of a pushed payload, so it may carry
- *  that payload's rev — server truth too, folded into the confirmed rev; the declared base is
- *  confirmed + writes actually in flight, one optimistic slot per outstanding write and no more. */
+/** Queue one whole-blob write. The blob is a clone of a pushed payload, so it may carry that
+ *  payload's rev — server truth too, folded into the confirmed rev. The CAS base is stamped when
+ *  the write actually POSTS (see pump), so a queued gesture declares the freshest served rev,
+ *  never a guess made while an earlier write was still in flight. */
 export function postViewsWrite(post: (m: Record<string, unknown>) => void, views: SessionViews): void {
-  const v: SessionViews & { rev?: number; baseRev?: number } = { ...views };
+  poster = post;
+  const v: SessionViews & { rev?: number } = { ...views };
   if (typeof v.rev === "number") confirmedRev = Math.max(confirmedRev, v.rev);
-  v.baseRev = confirmedRev + inFlight;
-  inFlight++;
-  delete v.rev;                      // the stale payload rev never rides — baseRev is the declared base
-  post({ type: "setTimelineViews", views: v });
+  queue.push({ kind: "blob", views: v });
+  pump();
 }
 
-/** Tests only: each test starts from a fresh counter. */
-export function resetViewsWriterForTest(): void { confirmedRev = 0; inFlight = 0; }
+/** Queue TARGETED ops (the v1.3.20 audit's grammar extension): the webview's gestures — the lens
+ *  picks and the tag-membership edits — are expressible as ops that compose server-side under
+ *  the kernel's lock, with no base to guess and nothing a foreign edit can be erased by. They
+ *  ride the same one-outstanding queue for ordering. */
+export function postViewsOps(post: (m: Record<string, unknown>) => void,
+                             ops: Record<string, unknown>[]): void {
+  poster = post;
+  queue.push({ kind: "ops", ops });
+  pump();
+}
+
+/** Tests only: each test starts from a fresh writer. */
+export function resetViewsWriterForTest(): void {
+  confirmedRev = 0; outstanding = 0; queue = []; poster = null;
+}

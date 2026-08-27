@@ -45,14 +45,17 @@ test("the Tags row sits with the session controls ABOVE the divider; Browse stay
 
 test("edits reuse the wire — never a fork: local adds post the whole blob, remote edits ride editTag", () => {
   const at = RENDER.indexOf("const editUnion = (g: TagUnion");
-  const body = RENDER.slice(at, at + 2400);
-  assert.ok(body.includes("t.members = Array.from(new Set((t.members || []).concat(edit.add))); dirty = true;"),
-    "local add edits the whole blob (posted once below — pendingSessionViews echoes instantly)");
+  const body = RENDER.slice(at, at + 3400);   // widened for the v1.3.20 ops collection
+  assert.ok(body.includes("t.members = Array.from(new Set((t.members || []).concat(edit.add)));"),
+    "local add edits the optimistic copy (pendingSessionViews echoes instantly)");
+  assert.ok(body.includes("localOps.push({ tag: g.localId, add: edit.add.slice() });"),
+    "…and records the TARGETED op the kernel composes (the v1.3.20 audit — no whole-blob CAS)");
   assert.ok(body.includes('vscodeApi?.postMessage({ type: "editTag", edit: { host: g.remotes[0].host || "", name: g.name, add: edit.add.slice() } });'),
     "an add with no local home routes to the tag's single home over the editTag wire");
   assert.ok(body.includes("for (const rt of g.remotes) {"),
     "a REMOVE walks every remote store holding the pair — remove-everywhere, never half");
-  assert.ok(body.includes("if (dirty) postViews(nv);"), "ONE optimistic blob per gesture — the flyout reads true instantly");
+  assert.ok(body.includes("if (dirty) postViews(nv, localOps.length ? localOps : undefined);"),
+    "ONE optimistic blob per gesture, posted as its collected ops (the v1.3.20 audit)");
   assert.ok(body.includes("const nvRemote = (rt: SessionTag)"),
     "the remote entries mirror optimistically too — echoed remoteTags are derived, kernel-dropped, presentation-only");
   assert.match(RENDER, /x\.title = "remove this tag from the session — everywhere it holds it";/);
@@ -62,7 +65,9 @@ test("New tag… is an inline input (menu vocabulary, no native prompt) that cre
   assert.match(RENDER, /inp\.placeholder = "New tag…"; inp\.maxLength = 40;/);
   assert.doesNotMatch(RENDER.slice(RENDER.indexOf("const editUnion")), /window\.prompt/);
   assert.match(RENDER, /const color = paletteColors\.find\(\(c\) => !used\.has\(c\)\) \|\| paletteColors\[0\] \|\| "#1EA1EB";/);
-  assert.match(RENDER, /nv\.tags = viewTags\(nv\)\.concat\(\[\{ id: "g" \+ Date\.now\(\)\.toString\(36\), name, color, members: \[id\] \}\]\);/);
+  assert.match(RENDER, /const tg = \{ id: "g" \+ Date\.now\(\)\.toString\(36\), name, color, members: \[id\] \};/);
+  assert.match(RENDER, /postViews\(nv, \[\{ create: tg \}\]\);/,
+    "the create rides the targeted op — it composes, no CAS base (the v1.3.20 audit)");
   // an existing name typed into the box ADDS to that union instead of minting a duplicate tag
   assert.match(RENDER, /const existing = unionFor\(\)\.find\(\(g\) => g\.name === name\);/);
 });

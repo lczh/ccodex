@@ -622,6 +622,38 @@ class PerFileOpSpool(unittest.TestCase):
         self.assertEqual(order, list(range(12)),
                          "twelve legacy ops replay in write order, not lexicographic-unpadded")
 
+    def test_actives_and_tag_order_ride_the_targeted_op_grammar(self):
+        # the v1.3.20 audit's grammar extension: the lens picks and the union drag are
+        # absolute-state gestures — as whole-blob CAS writes they pipelined guessed revisions
+        # (a stale sibling could coincide with a foreign commit's rev and erase it) and the
+        # kernel-down spool reduced them to a bare {active}, dropping actives/tagOrder/new tags
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "#DD42FF",
+                                         "members": []}}])
+        rev = km._apply_views_ops([
+            {"actives": {"timeline": {"tags": ["pool"]}, "chat": {"all": True}}},
+            {"create": {"id": "g2", "name": "crew", "color": "#4EC9B0", "members": []}},
+            {"tagOrder": ["crew", "pool"]}])
+        v = km._timeline_views()
+        self.assertEqual(v["rev"], rev)
+        self.assertEqual(v["actives"]["timeline"], {"tags": ["pool"]},
+                         "the lens pick landed exactly — no reduction to a bare active")
+        self.assertEqual(v.get("tagOrder"), ["crew", "pool"], "the drag's order landed")
+        self.assertEqual([t["name"] for t in v["tags"]], ["crew", "pool"],
+                         "…and the kernel resorted its own tags to match, as the client did")
+
+    def test_ops_compose_with_a_foreign_edit_instead_of_erasing_it(self):
+        # the audited erase shape, executed at the store: a foreign client's tag lands between
+        # two of our gestures — the second, a targeted op, composes with it; a stale whole blob
+        # would have erased it
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "", "members": []}}])
+        km._apply_views_ops([{"create": {"id": "gF", "name": "foreign", "color": "",
+                                         "members": []}}])          # the foreign commit
+        km._apply_views_ops([{"actives": {"chat": {"tags": ["pool"]}}}])   # our later gesture
+        v = km._timeline_views()
+        self.assertTrue(any(t["id"] == "gF" for t in v["tags"]),
+                        "the foreign tag SURVIVES our op — nothing whole-blob rode over it")
+        self.assertEqual(v["actives"]["chat"], {"tags": ["pool"]})
+
     def test_the_legacy_append_spool_is_still_consumed_once(self):
         (km.jd.STATE / "pending-ui-ops.jsonl").write_text(json.dumps(
             {"op": "flag", "target": SID, "flag": "hideFromFeed", "value": True}) + "\n")
