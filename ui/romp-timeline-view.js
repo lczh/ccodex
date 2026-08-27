@@ -665,7 +665,9 @@ function mediaUrl(name) {
 // single owner must be able to find the gesture's OTHER halves and compensate them too (the
 // v1.3.18 audit's P2 — partial multi-host tag edits still split state). Starts at 1 so a
 // recorded gid is always truthy; entries noted before this counter existed can never match.
-let unionGestureSeq = 0;
+// seeded with randomness (the r49 verification): two open panels minted colliding gids —
+// the journal keys entries by (gid, host), so a collision cross-linked unrelated gestures
+let unionGestureSeq = Math.floor(Math.random() * 0x40000000);
 
 class TimelinePanel {
   constructor(host) {
@@ -2796,11 +2798,16 @@ class TimelinePanel {
       host: o.host, name: o.name, inverse: o.inverse, edit: o.edit, rt: o.rt, gid: o.gid,
       oldName: o.oldName, oldColor: o.oldColor, post: o.post || {}, confirmed: !!o.confirmed,
     }));
+    // retirement is EXPLICIT (the r49 verification: the kernel merges per gid now, so two
+    // open panels no longer clobber each other's entries — omission is not retirement)
+    const gids = new Set(entries.map((o) => o.gid).filter(Boolean));
+    const retired = (this._syncedGids || []).filter((g) => !gids.has(g));
+    this._syncedGids = Array.from(gids);
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineSetUnionOps === 'function') {
-        window.__rompTimelineSetUnionOps(entries);
+        window.__rompTimelineSetUnionOps(entries, retired);
       } else if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
-        this._kernelPost('/union-ops', { entries: entries }, true).catch(() => {});
+        this._kernelPost('/union-ops', { entries: entries, retired: retired }, true).catch(() => {});
       }
     } catch (e) { /* best-effort: the in-memory journal still runs this panel's lifetime */ }
   }

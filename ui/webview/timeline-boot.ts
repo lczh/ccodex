@@ -94,7 +94,7 @@ export function bridgeFunctions(post: Post): Record<string, (...a: any[]) => voi
     // server-side instead of riding whole-blob CAS writes
     __rompTimelineSetViewsOps: (ops: unknown) => post({ type: "setTimelineViewsOps", ops }),
     // the durable multi-host gesture journal (the v1.3.21 audit's P1.5)
-    __rompTimelineSetUnionOps: (entries: unknown) => post({ type: "setUnionOps", entries }),
+    __rompTimelineSetUnionOps: (entries: unknown, retired?: unknown) => post({ type: "setUnionOps", entries, retired: retired || [] }),
     __rompTimelineEditTag: (edit: unknown) => post({ type: "editTag", edit }),
     __rompTimelineDismiss: (id: string) => post({ type: "dismissLane", id }),
     __rompTimelineHover: (sid?: string, segIds?: unknown[], t0?: number, t1?: number) =>

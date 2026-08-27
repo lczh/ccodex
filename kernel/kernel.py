@@ -2061,8 +2061,23 @@ def _union_ops_load():
     return [r for r in rows if isinstance(r, dict)][:_UNION_OPS_MAX] if isinstance(rows, list) else []
 
 
-def _union_ops_set(entries):
-    rows = [r for r in (entries if isinstance(entries, list) else []) if isinstance(r, dict)]
+def _union_ops_set(entries, retired=None):
+    """Per-gid MERGE, never a whole replace (the r49 verification): each open timeline panel
+    mirrors only ITS OWN in-flight list — a full replace last-writer-wins'd between panels, so
+    any gesture in a second panel erased the first's journal and re-opened the audited reload
+    split. Incoming entries upsert by (gid, host); `retired` names gids whose group resolved."""
+    cur = _union_ops_load()
+    inc = [r for r in (entries if isinstance(entries, list) else []) if isinstance(r, dict)]
+    ret = set()
+    for g in (retired if isinstance(retired, list) else []):
+        try:
+            ret.add(int(g))
+        except (TypeError, ValueError):
+            pass
+    inc_keys = {(r.get("gid"), r.get("host")) for r in inc}
+    rows = [r for r in cur if (r.get("gid"), r.get("host")) not in inc_keys
+            and r.get("gid") not in ret]
+    rows += [r for r in inc if r.get("gid") not in ret]
     rows = rows[:_UNION_OPS_MAX]
     try:
         _atomic_write(_union_ops_path(), json.dumps(rows))
@@ -2396,6 +2411,10 @@ def _edit_tag(name, add=(), remove=(), color=None, delete=False, rename=None):
             if not hits:
                 return None, 'no tag named "%s"' % name
             v["tags"] = [t for t in v["tags"] if t["id"] != hits[0]["id"]]
+            _views_drop_refs(v, hits[0].get("name"))   # lenses + tagOrder follow (the r49
+            #                                            verification: the /tag wire — the CLI
+            #                                            and every federated edit — missed the
+            #                                            v1.3.21 P2 migration and hid every row)
             _set_timeline_views(v)      # an active pointing at it falls back to "all" (the All view) in the normalizer
             return None, None
         if hits:
@@ -2415,7 +2434,11 @@ def _edit_tag(name, add=(), remove=(), color=None, delete=False, rename=None):
                 return None, "the new name is empty"
             if any(t2["name"] == rn and t2["id"] != (hits[0]["id"] if hits else None) for t2 in v["tags"]):
                 return None, 'a tag named "%s" already exists' % rn   # names address edits — no twins
+            _oldn = t.get("name")
             t["name"] = rn
+            _views_rename_refs(v, _oldn, rn)   # lenses + tagOrder follow the rename (the r49
+            #                                    verification: the /tag wire missed the
+            #                                    v1.3.21 P2 migration)
         # add/remove arrive as viewer-relative id strings (the route's contract); the store is
         # canonical pairs — convert on the way in, match removals by pair (federation v0)
         addp = [m for m in (_member_pair(x) for x in add) if m]
@@ -13090,7 +13113,17 @@ def _clear_restart_marker_if_current():
         return
     mk = gd / "romp-restart-needed"
     try:
-        want = mk.read_text().strip().split()[0] if mk.exists() else ""
+        # stat-gated, nonblocking, no-follow (the r49 verification: this was the ONE marker
+        # reader the P1.4 sweep missed — a FIFO here hung the kernel AFTER it bound the port,
+        # a live child the manager never respawns)
+        if not stat.S_ISREG(os.lstat(str(mk)).st_mode):
+            return
+        _mfd = os.open(str(mk), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                       | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            want = (os.read(_mfd, 4096).decode(errors="replace").split() or [""])[0]
+        finally:
+            os.close(_mfd)
     except (OSError, IndexError):
         return
     if not os.environ.get("ROMP_CHECKOUT"):
@@ -13294,12 +13327,6 @@ def _pr_watch_stamped_deliver(r, verdict, detail):
                 pass
             return True
         if fk_state:
-            # a KNOWN failure that never got a retry: mark this attempt durably BEFORE the
-            # injection, so a crash mid-retry reads as ambiguous (above), never as pending
-            try:
-                fk.write_text("attempted\n")
-            except OSError:
-                return True                          # can't bound the retry — retire, at-most-once
             r.pop("sent", None)                      # the stamp survived a KNOWN failure — it is
         else:                                        # not evidence of delivery; retry below
             return True                              # stamped: delivered (or crashed mid-window)
@@ -13309,6 +13336,14 @@ def _pr_watch_stamped_deliver(r, verdict, detail):
         # audit: a swallowed save failure turned the at-most-once stamp into a duplicate)
         r.pop("sent", None)
         return False
+    if fk.exists():
+        # mark the attempt durably AFTER the stamp save landed and IMMEDIATELY before the
+        # injection (the r49 verification: marking before the re-stamp save let a save failure
+        # plus a crash read as 'attempted' with no delivery ever tried — silently retired)
+        try:
+            fk.write_text("attempted\n")
+        except OSError:
+            return True                              # can't bound the retry — retire, at-most-once
     if _pr_watch_deliver(r["sid"], _pr_watch_notice(verdict, r["repo"], r["pr"], detail)):
         try:
             fk.unlink(missing_ok=True)                # delivery confirmed — the failure is over
@@ -28279,7 +28314,7 @@ window.__rompTimelineSendCommand=function(name,cmd){post({type:"sendCommand",nam
 window.__rompTimelineSetFlag=function(id,flag,value){post({type:"setSessionFlag",id:id,flag:flag,value:!!value});};
 window.__rompTimelineSetViews=function(views){post({type:"setTimelineViews",views:views});};
 window.__rompTimelineSetViewsOps=function(ops){post({type:"setTimelineViewsOps",ops:ops});};
-window.__rompTimelineSetUnionOps=function(entries){post({type:"setUnionOps",entries:entries});};
+window.__rompTimelineSetUnionOps=function(entries,retired){post({type:"setUnionOps",entries:entries,retired:retired||[]});};
 window.__rompTimelineEditTag=function(edit){post({type:"editTag",edit:edit});};
 window.__rompTimelineDismiss=function(id){post({type:"dismissLane",id:id});};
 window.__rompTimelineHover=function(sid,segIds,t0,t1){post(sid?{type:"timelineHover",sid:sid,segIds:segIds||[],t0:t0,t1:t1}:{type:"timelineHover",off:true});};
@@ -32388,7 +32423,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(400, json.dumps({"ok": False,
                                                        "error": "entries must be a JSON list"}),
                                       "application/json")
-                ok = _union_ops_set(b["entries"])
+                ok = _union_ops_set(b["entries"], b.get("retired"))
                 return self._send(200 if ok else 500, json.dumps({"ok": ok}), "application/json")
             if u.path == "/views":
                 # The Obsidian timeline's views writer — the WS setTimelineViews op as a POST:
@@ -33021,7 +33056,10 @@ class Handler(BaseHTTPRequestHandler):
                 # re-anchors its optimistic counter to the server's actual rev — accepted or
                 # refused — instead of guessing (a guessed rev later coincided with a foreign
                 # write's and a stale blob was accepted)
-                client["send"](json.dumps({"type": "viewsAck", "ok": bool(_wok), "rev": _wrev}))
+                _bans = {"type": "viewsAck", "ok": bool(_wok), "rev": _wrev}
+                if msg.get("opId"):
+                    _bans["opId"] = str(msg["opId"])   # ack correlation (r49)
+                client["send"](json.dumps(_bans))
             except Exception:
                 pass
         elif msg and msg.get("type") == "setTimelineViewsOps" and isinstance(msg.get("ops"), list):
@@ -33041,6 +33079,10 @@ class Handler(BaseHTTPRequestHandler):
                              "rev": int(_timeline_views().get("rev") or 0)}
                 except Exception:
                     _oans = {"type": "viewsAck", "ok": False}
+            if msg.get("opId"):
+                _oans["opId"] = str(msg["opId"])   # ack correlation (the r49 verification: a
+                #                                    surplus ack — a replayed write's second
+                #                                    answer — retired the WRONG queue head)
             _mark_views_dirty()
             try:
                 client["send"](json.dumps(_oans))
@@ -33051,7 +33093,7 @@ class Handler(BaseHTTPRequestHandler):
             # panel mirrors its whole in-flight compensation list here on every change (small,
             # idempotent — a full replace, no per-op protocol to desync), and re-seeds from the
             # payload echo after a reload
-            _union_ops_set(msg["entries"])
+            _union_ops_set(msg["entries"], msg.get("retired"))
         elif msg and msg.get("type") == "openTagsDialog":
             # any pane's "Configure tags…" opens THE tags dialog — which lives on the timeline pane
             # (one dialog, one implementation; the user 2026-08-25). Routed to the SAME dashboard's

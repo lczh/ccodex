@@ -1577,7 +1577,6 @@ class Handler(BaseHTTPRequestHandler):
                     # serialized NAME goes stale the moment the recipient renames mid-flight —
                     # intake then bounced recipient-unavailable though the session sat live
                     relay_msg["to_id"] = str(hit["id"])
-                outbox_put(phost, relay_msg)
                 sent_row = {"t": int(time.time()), "ev": "sent", "id": mid,
                             "from": frm, "from_id": frm_id,
                             "to_id": "peer:%s" % phost,
@@ -1588,7 +1587,14 @@ class Handler(BaseHTTPRequestHandler):
                     # a name-keyed alias could never connect a first reply sent after the
                     # recipient renamed (the v1.3.16 audit's P1.5)
                     sent_row["to_sid"] = str(hit["id"])
-                _tl_append("messages.jsonl", sent_row)
+                if not _tl_append("messages.jsonl", sent_row):
+                    # the row BEFORE the publish, refusing on failure — the same P2.11 rule
+                    # deliver() wears (the r49 verification: this relay leg still published
+                    # into the outbox with no row, mail no receipt could ever account)
+                    return self._send({"ok": False,
+                                       "error": "the delivery record could not be written — "
+                                                "mail NOT relayed; retry"})
+                outbox_put(phost, relay_msg)
                 if PEERS.get(phost, {}).get("up"):
                     return self._send({"ok": True, "id": mid,
                                        "note": "relaying to '%s' on %s%s" % (hit.get("name") or to, phost, tnote)})

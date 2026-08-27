@@ -150,61 +150,12 @@ root = sys.argv[1]
 # deadlocked the fresh install's dashboard-link poll against our own transaction (the adversarial
 # review, 2026-08-18). The marker names the transaction's pid and counts only while it is alive,
 # so a manager that outlives bootstrap cannot carry the bypass forward.
-txn = os.environ.get("ROMP_INSIDE_UPDATE_TXN", "")
-if txn.isdigit():
-    try:
-        os.kill(int(txn), 0)
-        sys.exit(0)                    # the transaction owns the checkout; its verdict governs
-    except OSError:
-        pass                           # holder is gone: the marker is stale — gate normally
 gd = subprocess.run(["git", "-C", root, "rev-parse", "--absolute-git-dir"],
                     capture_output=True, text=True)
 gdir = (gd.stdout or "").strip()
 if gd.returncode or not gdir:
     sys.exit(0)                        # not a git checkout: no latch can exist to gate on
-# The LOCK comes FIRST, before any latch read: reading first let a kernel start in the window
-# where an updater holds the lock but has not armed the latch yet — mid-update, HEAD about to
-# move under the booting kernel's imports (the user's audit, 2026-08-18, reproduced directly).
-# Bounded wait: a live install can legitimately hold this for a while; sibling kernels booting
-# together contend for microseconds. Timing out still refuses (exit 70), never proceeds blind.
-latch = os.path.join(gdir, "romp-install-failed")
-def publish_line(full):
-    """Publish the channel token riding ON the healed latch line ("sha8 channel") before the
-    latch is spent — a healed build must wear the channel its update intended (the v1.3.8 audit
-    reproduced THIS gate healing a crashed bootstrap's stable target and starting it under the
-    stale dev marker, which then followed unsigned main). The channel lives IN the line: every
-    separate-file design failed twice (orphans published by strangers, carried records dropped —
-    the adversarial reviews, 2026-08-20). True when the line stages no channel."""
-    toks = full.split()
-    if len(toks) < 2 or toks[1] not in ("stable", "dev"):
-        return True
-    mk = os.path.join(gdir, "romp-update-channel")
-    try:
-        try:
-            os.unlink(mk + ".pub")     # a planted FIFO at the FIXED staging name blocked this
-        except FileNotFoundError:      # open() while the gate HELD the update flock (the r32
-            pass                       # verification, executed)
-        with open(mk + ".pub", "w") as pf:
-            pf.write(toks[1] + "\n")
-        os.replace(mk + ".pub", mk)
-        return True
-    except OSError:
-        return False
-try:
-    fd = os.open(os.path.join(gdir, "romp-update.lock"), os.O_RDWR | os.O_CREAT, 0o644)
-except OSError:
-    # can't even open the lock (read-only/unowned git dir): with NO latch there is nothing to
-    # gate — such a checkout can't host updates either; with one, protect it (fail closed)
-    sys.exit(70 if os.path.exists(latch) else 0)
-deadline = time.time() + float(os.environ.get("ROMP_GATE_LOCK_WAIT", "90"))
-while True:
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        break
-    except OSError:
-        if time.time() >= deadline:
-            sys.exit(70)               # an update/heal is still running: do not start on it
-        time.sleep(0.5)
+mkp = os.path.join(gdir, "romp-restart-needed")
 import shutil as _sh
 def gen_valid(g, full):
     # VALIDATED bless (the v1.3.20 audit's P2): an existing directory counts only with a
@@ -324,19 +275,85 @@ def emit_pick():
                              "updated kernel is up)\n" % full[:8])
     elif mtok2:
         sys.exit(70)                   # armed marker + unreadable HEAD: never live (P1.1/P1.2)
+    if choice != "live" and not pf:
+        # FAIL CLOSED (the r49 verification): with no deliverable pick, bash keeps its live
+        # default — a marker-forced generation pick silently becoming a dirty live launch is
+        # the audited P1.2 wearing a success log line. A live choice needs no delivery.
+        sys.stderr.write("romp-serve: the launch pick cannot be delivered (no pick file) — "
+                         "refusing to fall back to live bytes\n")
+        sys.exit(70)
     if pf:
         try:
             with open(pf, "w") as pfh:
                 pfh.write(choice + "\n")
         except OSError:
-            pass                       # bash keeps its live/seam default — never a hang
+            if choice != "live":
+                sys.stderr.write("romp-serve: the launch pick could not be written — refusing "
+                                 "to fall back to live bytes\n")
+                sys.exit(70)
+txn = os.environ.get("ROMP_INSIDE_UPDATE_TXN", "")
+if txn.isdigit():
+    try:
+        os.kill(int(txn), 0)
+        # the transaction owns the checkout; its verdict governs — but the LAUNCH pick still
+        # happens (locklessly: the txn holds the lock, and these are advisory reads), or this
+        # exit regressed marker-honoring spawns to blind live bytes (the r49 verification)
+        emit_pick()
+        sys.exit(0)
+    except OSError:
+        pass                           # holder is gone: the marker is stale — gate normally
+# The LOCK comes FIRST, before any latch read: reading first let a kernel start in the window
+# where an updater holds the lock but has not armed the latch yet — mid-update, HEAD about to
+# move under the booting kernel's imports (the user's audit, 2026-08-18, reproduced directly).
+# Bounded wait: a live install can legitimately hold this for a while; sibling kernels booting
+# together contend for microseconds. Timing out still refuses (exit 70), never proceeds blind.
+latch = os.path.join(gdir, "romp-install-failed")
+def publish_line(full):
+    """Publish the channel token riding ON the healed latch line ("sha8 channel") before the
+    latch is spent — a healed build must wear the channel its update intended (the v1.3.8 audit
+    reproduced THIS gate healing a crashed bootstrap's stable target and starting it under the
+    stale dev marker, which then followed unsigned main). The channel lives IN the line: every
+    separate-file design failed twice (orphans published by strangers, carried records dropped —
+    the adversarial reviews, 2026-08-20). True when the line stages no channel."""
+    toks = full.split()
+    if len(toks) < 2 or toks[1] not in ("stable", "dev"):
+        return True
+    mk = os.path.join(gdir, "romp-update-channel")
+    try:
+        try:
+            os.unlink(mk + ".pub")     # a planted FIFO at the FIXED staging name blocked this
+        except FileNotFoundError:      # open() while the gate HELD the update flock (the r32
+            pass                       # verification, executed)
+        with open(mk + ".pub", "w") as pf:
+            pf.write(toks[1] + "\n")
+        os.replace(mk + ".pub", mk)
+        return True
+    except OSError:
+        return False
+try:
+    fd = os.open(os.path.join(gdir, "romp-update.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+except OSError:
+    # can't even open the lock (read-only/unowned git dir): with NO latch there is nothing to
+    # gate — such a checkout can't host updates either; with one, protect it (fail closed)
+    if os.path.exists(latch):
+        sys.exit(70)
+    emit_pick()                        # lockless: an unowned/read-only git dir hosts no updates,
+    sys.exit(0)                        # so the advisory reads are stable (the r49 verification)
+deadline = time.time() + float(os.environ.get("ROMP_GATE_LOCK_WAIT", "90"))
+while True:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except OSError:
+        if time.time() >= deadline:
+            sys.exit(70)               # an update/heal is still running: do not start on it
+        time.sleep(0.5)
 # the UPDATE MARKER leg (the v1.3.20 audit's P1.2), under the same lock and BEFORE the
 # latch's no-latch early exit: while romp-restart-needed names HEAD, this boot must run the
 # verified generation — ensure it exists (validated bless or build) or refuse to start.
 # This also backfills the N−1 upgrade path: an old updater that spent the latch without
 # building a generation leaves the marker, and the first spawn builds it here (the same
 # audit's P1.1 belt alongside install.sh's own build).
-mkp = os.path.join(gdir, "romp-restart-needed")
 try:
     import stat as _stat
     if not _stat.S_ISREG(os.lstat(mkp).st_mode):

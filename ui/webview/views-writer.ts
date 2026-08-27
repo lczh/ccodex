@@ -24,7 +24,9 @@
 // for tests like session-views.ts.
 import { SessionViews } from "./session-views";
 
-type QueuedWrite = { kind: "blob"; views: SessionViews } | { kind: "ops"; ops: Record<string, unknown>[] };
+type QueuedWrite = { kind: "blob"; views: SessionViews; wireId?: string }
+                 | { kind: "ops"; ops: Record<string, unknown>[]; wireId?: string };
+let wireSeq = 0;   // per-page write ids — the ack correlation (the r49 verification)
 
 let confirmedRev = 0;   // the last rev the KERNEL reported (payload push or ack) — never a guess
 let outstanding = 0;    // 0 or 1: the one write whose ack we await
@@ -61,14 +63,15 @@ function pump(): void {
   const w = queue[0];               // the head STAYS queued until its ack retires it (the
   outstanding = 1;                  // v1.3.21 audit's P2.8: a send lost on an OPEN socket that
   outstandingKind = w.kind;         // then died was gone — nothing could ever replay it)
+  w.wireId = "w" + (++wireSeq);     // fresh per POST: a replay's late twin ack must not match
   if (w.kind === "ops") {
-    poster({ type: "setTimelineViewsOps", ops: w.ops });
+    poster({ type: "setTimelineViewsOps", ops: w.ops, opId: w.wireId });
     return;
   }
   const v: SessionViews & { rev?: number; baseRev?: number } = { ...w.views };
   v.baseRev = confirmedRev;          // the served truth at POST time — never a gesture-time guess
   delete v.rev;                      // the stale payload rev never rides — baseRev is the declared base
-  poster({ type: "setTimelineViews", views: v });
+  poster({ type: "setTimelineViews", views: v, opId: w.wireId });
 }
 
 /** The kernel's per-write acknowledgement (setTimelineViews CAS and setTimelineViewsOps alike —
@@ -79,8 +82,17 @@ function pump(): void {
  *  holds. A malformed rev leaves the confirmed rev standing (anchoring it to 0 was itself a
  *  rewind). */
 export function consumeViewsAck(m: unknown, onRefused?: () => void): boolean {
-  const a = m as { type?: unknown; ok?: unknown; rev?: unknown } | null;
+  const a = m as { type?: unknown; ok?: unknown; rev?: unknown; opId?: unknown } | null;
   if (!a || a.type !== "viewsAck") return false;
+  const rev0 = typeof a.rev === "number" ? a.rev : null;
+  if (typeof a.opId === "string" && (!queue.length || queue[0].wireId !== a.opId)) {
+    // a SURPLUS or foreign-generation ack (the r49 verification: after a raise-release or a
+    // reconnect re-post, the original send's late answer arrived alongside the replay's — and
+    // an unconditional shift retired the WRONG head, cascading one write behind forever).
+    // Its rev is still served truth; nothing else about it is ours to act on.
+    if (rev0 !== null) confirmedRev = Math.max(confirmedRev, rev0);
+    return true;
+  }
   outstanding = 0;
   outstandingKind = null;
   queue.shift();                    // the acked head retires NOW (kept queued for replay until here)

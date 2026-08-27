@@ -691,11 +691,20 @@ class PerFileOpSpool(unittest.TestCase):
                  "oldName": "pool", "oldColor": "", "post": {}, "confirmed": False}]
         self.assertTrue(km._union_ops_set(rows))
         self.assertEqual(km._union_ops_load(), rows)
-        self.assertTrue(km._union_ops_set([]))
-        self.assertEqual(km._union_ops_load(), [], "a full replace — retirement empties it")
-        self.assertTrue(km._union_ops_set(["junk", {"host": "TESTHOST-B"}]))
-        self.assertEqual(km._union_ops_load(), [{"host": "TESTHOST-B"}],
-                         "non-dict junk drops; the store never raises")
+        # per-gid MERGE (the r49 verification): a second panel's sync must not clobber this
+        # entry — omission is not retirement
+        other = [{"host": "TESTHOST-B", "name": "crew", "gid": 9, "edit": {}, "inverse": {},
+                  "rt": {}, "oldName": "crew", "oldColor": "", "post": {}, "confirmed": False}]
+        self.assertTrue(km._union_ops_set(other))
+        got = km._union_ops_load()
+        self.assertEqual(len(got), 2, "both panels' entries coexist — no last-writer-wins")
+        self.assertTrue(km._union_ops_set([], retired=[3]))
+        self.assertEqual([r["gid"] for r in km._union_ops_load()], [9],
+                         "retirement is an EXPLICIT tombstone, and it lands")
+        self.assertTrue(km._union_ops_set(["junk", {"host": "TESTHOST-B", "gid": 9}],
+                                          retired=[9]))
+        self.assertEqual(km._union_ops_load(), [],
+                         "non-dict junk drops, a retired gid wins over its own upsert")
 
     def test_ops_compose_with_a_foreign_edit_instead_of_erasing_it(self):
         # the audited erase shape, executed at the store: a foreign client's tag lands between

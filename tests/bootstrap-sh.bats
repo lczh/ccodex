@@ -10,6 +10,9 @@ REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
 
 setup() {
     TEST_DIR="$(mktemp -d)"
+    # the extracted GATEPY fail-closes a generation pick it cannot DELIVER (the r49
+    # verification) — standalone invocations here must offer the pick channel serve offers
+    export ROMP_GATE_PICK="$TEST_DIR/gatepick"
     export HOME="$TEST_DIR/home"
     mkdir -p "$HOME"
     export SHELL=/bin/zsh

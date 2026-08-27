@@ -273,6 +273,11 @@ def snap_install(commit, extra_env=None):
         _sh.rmtree(_snap, ignore_errors=True)
         return False
     _env = dict(os.environ, ROMP_INSTALL_TARGET=root)
+    _sirv = subprocess.run(["git", "-C", root, "rev-parse", commit], capture_output=True, text=True)
+    if _sirv.returncode == 0 and len((_sirv.stdout or "").strip()) >= 8:
+        # the immutable intended commit (the v1.3.21 audit's P1.2, propagated here by the r49
+        # verification: bootstrap's installs raced live HEAD like everyone else's used to)
+        _env["ROMP_INSTALL_COMMIT"] = (_sirv.stdout or "").strip()
     _env.update(extra_env or {})
     _rc = subprocess.run(["bash", os.path.join(_snap, "install.sh")], cwd=root, env=_env,
                          pass_fds=(fd,)).returncode
