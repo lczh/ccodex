@@ -629,10 +629,11 @@ class PerFileOpSpool(unittest.TestCase):
         # kernel-down spool reduced them to a bare {active}, dropping actives/tagOrder/new tags
         km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "#DD42FF",
                                          "members": []}}])
-        rev = km._apply_views_ops([
+        rev, _confl = km._apply_views_ops([
             {"actives": {"timeline": {"tags": ["pool"]}, "chat": {"all": True}}},
             {"create": {"id": "g2", "name": "crew", "color": "#4EC9B0", "members": []}},
             {"tagOrder": ["crew", "pool"]}])
+        self.assertEqual(_confl, [], "an all-clean ops list names no conflicts (r50)")
         v = km._timeline_views()
         self.assertEqual(v["rev"], rev)
         self.assertEqual(v["actives"]["timeline"], {"tags": ["pool"]},
@@ -726,3 +727,226 @@ class PerFileOpSpool(unittest.TestCase):
         flags = json.loads((km.jd.STATE / "session-flags.json").read_text())
         self.assertTrue(flags[SID]["hideFromFeed"])
         self.assertFalse((km.jd.STATE / "pending-ui-ops.jsonl").exists())
+
+
+class R50UnionJournalLock(unittest.TestCase):
+    """the v1.3.22 audit's P1.3: _union_ops_set performed an UNLOCKED load-merge-write — two
+    concurrent syncs (two panels, or a panel and the WS handler) both read the same base,
+    merged their own entry, and the second atomic write silently erased the first's gesture.
+    The whole transaction rides jd._identity_file_lock now."""
+
+    def setUp(self):
+        _scrub_state()
+        try:
+            km._union_ops_path().unlink()
+        except OSError:
+            pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_concurrent_merges_lose_nothing(self):
+        # the executed race shape: many writers, each upserting a DISTINCT (gid, host) entry.
+        # Unlocked, the load-merge-write interleaves and entries vanish; locked, all land.
+        n, per = 4, 12
+        def worker(w):
+            for i in range(per):
+                gid = w * 1000 + i + 1
+                km._union_ops_set([{"host": "TESTHOST-%d" % w, "name": "t%d" % gid,
+                                    "gid": gid, "edit": {}, "inverse": {}, "rt": {},
+                                    "oldName": "", "oldColor": "", "post": {},
+                                    "confirmed": False}])
+        ts = [threading.Thread(target=worker, args=(w,)) for w in range(n)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        gids = sorted(r["gid"] for r in km._union_ops_load())
+        self.assertEqual(len(gids), n * per,
+                         "every concurrent upsert survives — the merge is one locked "
+                         "transaction, not a read-modify-write race")
+
+    def test_the_transaction_holds_the_identity_lock(self):
+        # the revert detector for the mechanism itself: the merge body must sit under
+        # jd._identity_file_lock (the threaded race above is probabilistic; this is not)
+        import inspect
+        src = inspect.getsource(km._union_ops_set)
+        self.assertIn("with jd._identity_file_lock():", src)
+        self.assertLess(src.index("_identity_file_lock"), src.index("_union_ops_load()"),
+                        "the LOAD happens inside the lock — locking after reading is the bug")
+
+
+class R50UnionOpsAckAndConflicts(unittest.TestCase):
+    """the v1.3.22 audit's P1.3 (correlated union-journal acks) and P2.8 (duplicate-name
+    conflicts were silently acked ok with a bumped rev): against the REAL Handler."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), km.Handler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def setUp(self):
+        self._dirty = km._mark_views_dirty
+        km._mark_views_dirty = lambda: None
+        _scrub_state()
+        try:
+            km._union_ops_path().unlink()
+        except OSError:
+            pass
+
+    def tearDown(self):
+        km._mark_views_dirty = self._dirty
+        _scrub_state()
+        try:
+            km._union_ops_path().unlink()
+        except OSError:
+            pass
+
+    def _post(self, path, body):
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d%s" % (self.port, path), data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json",
+                     "X-Romp-Token": os.environ["ROMP_SERVE_TOKEN"]})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read().decode())
+            except Exception:
+                return e.code, {}
+
+    def test_union_ops_post_echoes_the_opid(self):
+        # the twin advances its synced-gid watermark only on a CORRELATED success (P1.3): an
+        # answer that cannot be matched to its write is an answer the twin must ignore
+        st, ans = self._post("/union-ops", {"entries": [], "retired": [], "opId": "u7"})
+        self.assertEqual(st, 200)
+        self.assertTrue(ans["ok"])
+        self.assertEqual(ans.get("opId"), "u7")
+
+    def test_union_ops_save_failure_answers_ok_false_with_the_opid(self):
+        # the audited hole: the WS handler DISCARDED _union_ops_set's failure — the panel
+        # advanced its watermark on hope and the failed retirement was never re-sent
+        with mock.patch.object(km, "_atomic_write", side_effect=OSError("disk")):
+            st, ans = self._post("/union-ops",
+                                 {"entries": [{"host": "TESTHOST-A", "gid": 5}],
+                                  "retired": [], "opId": "u9"})
+        self.assertEqual(st, 500)
+        self.assertFalse(ans["ok"])
+        self.assertEqual(ans.get("opId"), "u9", "the failure is correlated too")
+
+    def test_duplicate_create_is_a_named_conflict_and_bumps_nothing(self):
+        # P2.8, executed at the store: the SECOND create of the name used to vanish under an
+        # ok ack and a bumped rev — the dialog kept showing a tag the store never held
+        rev0, c0 = km._apply_views_ops([{"create": {"id": "g1", "name": "pool",
+                                                    "color": "", "members": []}}])
+        self.assertEqual(c0, [])
+        rev1, c1 = km._apply_views_ops([{"create": {"id": "g2", "name": "pool",
+                                                    "color": "", "members": []}}])
+        self.assertEqual(rev1, rev0, "nothing applied — the rev must NOT advance")
+        self.assertEqual(len(c1), 1)
+        self.assertIn("pool", c1[0])
+        self.assertIn("already taken", c1[0])
+
+    def test_a_replayed_same_id_create_stays_quiet(self):
+        # the reconnect re-pump legitimately re-sends a landed create: same id, same name —
+        # idempotence, not a conflict (alarming here would flag every recovered gesture)
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "",
+                                         "members": []}}])
+        rev, confl = km._apply_views_ops([{"create": {"id": "g1", "name": "pool",
+                                                      "color": "", "members": []}}])
+        self.assertEqual(confl, [])
+
+    def test_duplicate_rename_is_a_named_conflict(self):
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "", "members": []}},
+                             {"create": {"id": "g2", "name": "crew", "color": "", "members": []}}])
+        rev0 = km._timeline_views()["rev"]
+        rev1, confl = km._apply_views_ops([{"tag": "g2", "rename": "pool"}])
+        self.assertEqual(len(confl), 1)
+        self.assertIn("crew", confl[0])
+        self.assertIn("pool", confl[0])
+
+    def test_unknown_tag_ops_apply_nothing_and_bump_nothing(self):
+        # the deliberate quiet drop (a replayed gesture over a deleted tag) must not
+        # advertise a change: no mutation, no rev bump, no conflict
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "", "members": []}}])
+        rev0 = km._timeline_views()["rev"]
+        rev1, confl = km._apply_views_ops([{"tag": "ghost", "add": ["s1"]}])
+        self.assertEqual(rev1, rev0)
+        self.assertEqual(confl, [])
+        self.assertEqual(km._timeline_views()["rev"], rev0)
+
+    def test_post_views_ops_response_carries_the_conflicts(self):
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "", "members": []}}])
+        st, ans = self._post("/views", {"ops": [{"create": {"id": "g2", "name": "pool",
+                                                            "color": "", "members": []}}]})
+        self.assertEqual(st, 200)
+        self.assertTrue(ans["ok"])
+        self.assertEqual(len(ans.get("conflicts") or []), 1,
+                         "the partial application is NAMED in the response — the twin "
+                         "surfaces it instead of trusting a plain ok")
+
+
+class R50RemoteRefMigration(unittest.TestCase):
+    """the v1.3.22 audit's P2.7: a REMOTE-ONLY rename/delete left this kernel's own lens and
+    tagOrder references on the old name (the twin migrated only tags with a localId) — a
+    selected lens silently showed no rows indefinitely."""
+
+    def setUp(self):
+        _scrub_state()
+
+    def tearDown(self):
+        _scrub_state()
+
+    def _seed_remote_refs(self):
+        # a lens and an order slot referencing a name that exists ONLY on a linked kernel —
+        # _norm_lens keeps unknown names by design (they may match remoteTags at read time)
+        km._apply_views_ops([{"create": {"id": "g1", "name": "local", "color": "", "members": []}},
+                             {"actives": {"chat": {"tags": ["farpool"]}}},
+                             {"tagOrder": ["farpool", "local"]}])
+
+    def test_a_landed_remote_rename_migrates_lens_and_order(self):
+        self._seed_remote_refs()
+        rev0 = km._timeline_views()["rev"]
+        km._migrate_refs_after_remote_edit("farpool", {"rename": "nearpool"})
+        v = km._timeline_views()
+        self.assertEqual(v["actives"]["chat"], {"tags": ["nearpool"]},
+                         "the lens followed the REMOTE rename")
+        self.assertEqual(v["tagOrder"], ["nearpool", "local"])
+        self.assertGreater(v["rev"], rev0)
+
+    def test_a_landed_remote_delete_drops_the_refs(self):
+        self._seed_remote_refs()
+        km._migrate_refs_after_remote_edit("farpool", {"delete": True})
+        v = km._timeline_views()
+        self.assertEqual(v["actives"]["chat"], {"all": True},
+                         "the emptied lens falls to All, never an empty screen")
+        self.assertEqual(v.get("tagOrder"), ["local"])
+
+    def test_no_reference_means_no_rev_bump(self):
+        self._seed_remote_refs()
+        rev0 = km._timeline_views()["rev"]
+        km._migrate_refs_after_remote_edit("elsewhere", {"rename": "elsewhere2"})
+        self.assertEqual(km._timeline_views()["rev"], rev0,
+                         "nothing referenced the name — a bump would claim a change "
+                         "nobody made (the P2.8 rule)")
+
+    def test_an_empty_rename_migrates_nothing(self):
+        # the guard: rename="" must not be read as a delete — the forward's answer said ok
+        # to a no-op, not to dropping the refs
+        self._seed_remote_refs()
+        km._migrate_refs_after_remote_edit("farpool", {"rename": "   "})
+        v = km._timeline_views()
+        self.assertEqual(v["actives"]["chat"], {"tags": ["farpool"]})
+
+    def test_the_ws_and_tag_routes_both_migrate_on_success(self):
+        # the two forward paths (the dialog's WS editTag, the /tag --host route) share the
+        # helper — a success on either migrates this kernel's refs
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        self.assertEqual(src.count("_migrate_refs_after_remote_edit(nm, body)"), 1)
+        self.assertEqual(src.count("_migrate_refs_after_remote_edit(name, b)"), 1)

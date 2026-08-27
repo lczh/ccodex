@@ -1950,6 +1950,40 @@ class RestartMarkerClear(unittest.TestCase):
             self.assertTrue((gd / "romp-restart-needed").exists(),
                             "the running kernel is not the intended one — the record stands")
 
+    def test_the_clear_yields_to_a_held_update_lock(self):
+        # the v1.3.22 audit's P1.1, executed: the read-compare-unlink ran OUTSIDE the update
+        # lock — an OLD kernel read marker A, a concurrent update replaced it with B in the
+        # window, and the old kernel's unlink deleted B's fresh intent (the freshly-installed
+        # build then never restarted into). Contention now means "an updater is mid-flight:
+        # the marker is theirs" — the clear stands down and the marker survives.
+        import fcntl as _fcntl
+        import pathlib
+        with tempfile.TemporaryDirectory() as td:
+            gd = pathlib.Path(td)
+            (gd / "romp-restart-needed").write_text("a" * 40 + "\n")
+            lk = os.open(str(gd / "romp-update.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+            _fcntl.flock(lk, _fcntl.LOCK_EX)
+            try:
+                with mock.patch.object(km, "_update_git_dir", return_value=gd), \
+                     mock.patch.object(km, "_kernel_sha", return_value="a" * 8), \
+                     mock.patch.dict(km.os.environ, {"ROMP_CHECKOUT": td}):
+                    km._clear_restart_marker_if_current()
+            finally:
+                _fcntl.flock(lk, _fcntl.LOCK_UN)
+                os.close(lk)
+            self.assertTrue((gd / "romp-restart-needed").exists(),
+                            "a held update lock means the marker belongs to the updater — "
+                            "the clear must not race the transaction that owns it")
+
+    def test_the_clear_holds_the_lock_across_read_and_unlink(self):
+        # the revert detector for the mechanism: the flock must be TAKEN before the marker is
+        # read (locking after reading re-opens the audited window)
+        import inspect
+        src = inspect.getsource(km._clear_restart_marker_if_current)
+        self.assertIn("_update_flock_wait", src)
+        self.assertLess(src.index("_update_flock_wait"), src.index("os.lstat"),
+                        "the lock precedes the stat-gated read — one transaction")
+
     def test_the_clear_runs_after_the_bind(self):
         # the v1.3.21 audit's P1.3, second half: clearing before the listener existed erased
         # the retry evidence for a boot that could still fail to bind

@@ -274,6 +274,52 @@ class Tick(unittest.TestCase):
             {"repo": "TESTORG/testrepo", "pr": 23, "sid": SID}, "merged").exists(),
             "the confirmed delivery spends the marker")
 
+    def test_a_failed_attempted_mark_retains_the_watch(self):
+        # the v1.3.22 audit's P2.6, executed: the pending->attempted transition failing used to
+        # return True — the watch RETIRED with zero deliveries ever attempted (the marker write
+        # precedes the injection, so there is no duplicate to fear; retrying the MARK is free)
+        km.add_pr_watch(31, "TESTORG/testrepo", SID, now=0)
+        km._pr_watch_read = lambda pr, repo: ("merged", "")
+        real_fk = km._pr_watch_fail_marker(km._pr_watches[0], "merged")
+        real_fk.parent.mkdir(parents=True, exist_ok=True)
+        real_fk.write_text("pending\n")             # a prior known failure left the marker
+        state = {"fail_writes": True}
+
+        class FK:
+            def exists(self):
+                return real_fk.exists()
+
+            def read_text(self):
+                return real_fk.read_text()
+
+            def write_text(self, s):
+                if state["fail_writes"]:
+                    raise OSError("disk full")
+                return real_fk.write_text(s)
+
+            def unlink(self, missing_ok=False):
+                return real_fk.unlink(missing_ok=missing_ok)
+
+            @property
+            def parent(self):
+                return real_fk.parent
+
+        try:
+            with mock.patch.object(km, "_pr_watch_fail_marker", return_value=FK()):
+                km._pr_watch_tick(100.0)
+                self.assertEqual(self.mail, [], "no injection was attempted")
+                self.assertEqual(len(km._pr_watches), 1,
+                                 "the watch SURVIVES — nothing was delivered, nothing may retire")
+                state["fail_writes"] = False          # the disk heals
+                km._pr_watch_tick(100.0 + km.PR_WATCH_EVERY)
+        finally:
+            try:
+                real_fk.unlink()
+            except OSError:
+                pass
+        self.assertEqual(len(self.mail), 1, "the retry delivers exactly once")
+        self.assertEqual(km._pr_watches, [], "…and the watch retires on the confirmed delivery")
+
     def test_an_unsaved_stamp_never_delivers(self):
         # the v1.3.18 audit: a swallowed save failure left the stamp in memory only — a crash
         # after delivery re-mailed the notice on restart. No durable stamp, no injection.

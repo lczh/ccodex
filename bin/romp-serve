@@ -60,7 +60,12 @@ KERNEL="${ROMP_KERNEL_BIN:-$ROMP_DIR/bin/romp-kernel}"
 # generation name); the gen pick re-exports it below.
 unset ROMP_CHECKOUT
 _ROMP_PICK="$(mktemp "${TMPDIR:-/tmp}/romp-serve-pick.XXXXXX" 2>/dev/null || true)"
-if [ -n "$_ROMP_PICK" ]; then export ROMP_GATE_PICK="$_ROMP_PICK"; fi
+if [ -n "$_ROMP_PICK" ]; then
+    export ROMP_GATE_PICK="$_ROMP_PICK"
+    # every REFUSED boot leaked its pick file (the r50 verification: three refusals, three
+    # files) — the trap covers every exit; the exec path removes it explicitly first
+    trap '[ -n "${_ROMP_PICK:-}" ] && rm -f "$_ROMP_PICK"' EXIT
+fi
 
 # Port: the manager passes --port; fall back to the env, then the kernel default.
 #
@@ -154,6 +159,13 @@ gd = subprocess.run(["git", "-C", root, "rev-parse", "--absolute-git-dir"],
                     capture_output=True, text=True)
 gdir = (gd.stdout or "").strip()
 if gd.returncode or not gdir:
+    _pf0 = os.environ.get("ROMP_GATE_PICK") or ""
+    if _pf0:
+        try:
+            with open(_pf0, "w") as _pfh0:
+                _pfh0.write("live\n")     # every exit-0 delivers a pick (the r50 verification:
+        except OSError:                    # bash hard-requires one now — absence is tampering
+            pass                           # or failure, never a live default)
     sys.exit(0)                        # not a git checkout: no latch can exist to gate on
 mkp = os.path.join(gdir, "romp-restart-needed")
 import shutil as _sh
@@ -519,7 +531,7 @@ export ROMP_KERNEL_NO_OPEN=1
 # update lock — including a generation its own heal or marker leg just built — and wrote it to
 # the pick file. The explicit ROMP_KERNEL_BIN seam still wins; an empty pick (the gate exited
 # before picking: a non-git checkout) keeps the live default.
-if [ -z "${ROMP_KERNEL_BIN:-}" ] && [ -n "${_ROMP_PICK:-}" ] && [ -f "$_ROMP_PICK" ]; then
+if [ -z "${ROMP_KERNEL_BIN:-}" ] && [ -n "${_ROMP_PICK:-}" ]; then
     _PICK="$(head -1 "$_ROMP_PICK" 2>/dev/null || true)"
     case "$_PICK" in
         "gen "*)
@@ -530,7 +542,43 @@ if [ -z "${ROMP_KERNEL_BIN:-}" ] && [ -n "${_ROMP_PICK:-}" ] && [ -f "$_ROMP_PIC
             KERNEL="$ROMP_DIR/bin/romp-kernel"
             unset ROMP_CHECKOUT
             ;;
+        *)
+            # a MISSING or malformed pick after a successful gate is tampering or failure —
+            # never the live default (the r50 verification: retaining the default was the
+            # fail-open the pick machinery exists to end)
+            echo "romp-serve: the gate's launch pick is missing or malformed — refusing" >&2
+            exit 70
+            ;;
     esac
+    # REVALIDATE under a re-taken lock immediately before exec (the r50 verification: the gate
+    # released its lock when Python exited, and an update landing before this exec launched the
+    # OLD pick — an executed A→B schedule booted A while HEAD and the marker named B). The lock
+    # is released before exec (a held flock would ride into the kernel forever); the remaining
+    # window holds no git state reads, and an updater's pkill covers processes it replaces.
+    _RGD2="$(git -C "$ROMP_DIR" rev-parse --absolute-git-dir 2>/dev/null || true)"
+    if [ -n "$_RGD2" ]; then
+        exec 9>>"$_RGD2/romp-update.lock" || { echo "romp-serve: cannot open the update lock" >&2; exit 70; }
+        flock -n 9 || { echo "romp-serve: an update is mid-flight — refusing this stale pick" >&2; exit 70; }
+        _HF2="$(git -C "$ROMP_DIR" rev-parse HEAD 2>/dev/null || true)"
+        _MK2=""
+        [ -f "$_RGD2/romp-restart-needed" ] && _MK2="$(head -1 "$_RGD2/romp-restart-needed" 2>/dev/null | tr -cd '0-9a-f' || true)"
+        case "$_PICK" in
+            "gen "*)
+                case "${_PICK#gen }" in
+                    *"romp-run-${_HF2:0:8}") : ;;
+                    *) echo "romp-serve: HEAD moved past the gate's pick — refusing (respawn re-picks)" >&2; exit 70 ;;
+                esac
+                ;;
+            live)
+                if [ -n "$_MK2" ] && [ -n "$_HF2" ] && [ "${_MK2:0:8}" = "${_HF2:0:8}" ]; then
+                    echo "romp-serve: an update marker armed after the gate's live pick — refusing (respawn re-picks)" >&2
+                    exit 70
+                fi
+                ;;
+        esac
+        flock -u 9
+        exec 9>&-
+    fi
 fi
 [ -n "${_ROMP_PICK:-}" ] && rm -f "$_ROMP_PICK"
 [[ -x "$KERNEL" ]] || { echo "romp-serve: kernel not found/executable at $KERNEL" >&2; exit 70; }

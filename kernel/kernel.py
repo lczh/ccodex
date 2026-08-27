@@ -1911,7 +1911,9 @@ def _apply_one_ui_op(op):
             return True
         return False
     if op.get("op") == "views" and isinstance(op.get("ops"), list):
-        _apply_views_ops(op["ops"])
+        _rv, _confl = _apply_views_ops(op["ops"])
+        for _c in _confl:
+            sys.stderr.write("ui-op spool replay: %s\n" % _c)   # no client to ack — loud here
         return True
     return False
 
@@ -2066,25 +2068,28 @@ def _union_ops_set(entries, retired=None):
     mirrors only ITS OWN in-flight list — a full replace last-writer-wins'd between panels, so
     any gesture in a second panel erased the first's journal and re-opened the audited reload
     split. Incoming entries upsert by (gid, host); `retired` names gids whose group resolved."""
-    cur = _union_ops_load()
-    inc = [r for r in (entries if isinstance(entries, list) else []) if isinstance(r, dict)]
-    ret = set()
-    for g in (retired if isinstance(retired, list) else []):
+    # the WHOLE load-merge-write under the identity lock (the r50 verification: two threads'
+    # unlocked merges both reported success and persisted only one of two distinct gestures)
+    with jd._identity_file_lock():
+        cur = _union_ops_load()
+        inc = [r for r in (entries if isinstance(entries, list) else []) if isinstance(r, dict)]
+        ret = set()
+        for g in (retired if isinstance(retired, list) else []):
+            try:
+                ret.add(int(g))
+            except (TypeError, ValueError):
+                pass
+        inc_keys = {(r.get("gid"), r.get("host")) for r in inc}
+        rows = [r for r in cur if (r.get("gid"), r.get("host")) not in inc_keys
+                and r.get("gid") not in ret]
+        rows += [r for r in inc if r.get("gid") not in ret]
+        rows = rows[:_UNION_OPS_MAX]
         try:
-            ret.add(int(g))
-        except (TypeError, ValueError):
-            pass
-    inc_keys = {(r.get("gid"), r.get("host")) for r in inc}
-    rows = [r for r in cur if (r.get("gid"), r.get("host")) not in inc_keys
-            and r.get("gid") not in ret]
-    rows += [r for r in inc if r.get("gid") not in ret]
-    rows = rows[:_UNION_OPS_MAX]
-    try:
-        _atomic_write(_union_ops_path(), json.dumps(rows))
-        return True
-    except Exception:
-        sys.stderr.write("union-gestures save: %s\n" % traceback.format_exc())
-        return False
+            _atomic_write(_union_ops_path(), json.dumps(rows))
+            return True
+        except Exception:
+            sys.stderr.write("union-gestures save: %s\n" % traceback.format_exc())
+            return False
 
 
 def _views_rename_refs(d, old, new):
@@ -2124,6 +2129,38 @@ def _views_drop_refs(d, name):
                 #                            an empty screen
 
 
+def _migrate_refs_after_remote_edit(name, body):
+    """After a remote-only rename/delete LANDS on its owner, migrate THIS kernel's own lens and
+    tagOrder references to the tag's name (the r50 verification: the migration ran only for
+    local tags — a remote rename stranded actives.*.tags and tagOrder on the old name, and a
+    selected lens silently showed no rows). Locked read-modify-write, the same discipline as
+    _apply_views_ops; rev bumps only when a reference actually moved."""
+    _new = body.get("rename") if isinstance(body.get("rename"), str) else ""
+    _new = _new.strip()
+    if not _new and body.get("delete") is not True:
+        return
+    with jd._identity_file_lock():
+        try:
+            raw = json.loads(_views_path().read_text())
+        except Exception:
+            raw = {}
+        try:
+            currev = int(raw.get("rev") or 0) if isinstance(raw, dict) else 0
+        except (TypeError, ValueError):
+            currev = 0
+        d = _norm_timeline_views(raw)
+        before = json.dumps(d, sort_keys=True)
+        if _new:
+            _views_rename_refs(d, name, _new)
+        else:
+            _views_drop_refs(d, name)
+        if json.dumps(d, sort_keys=True) == before:
+            return                       # no local reference held the name — nothing to claim
+        d = _norm_timeline_views(jd.canonicalize_timeline_views(d))
+        d["rev"] = currev + 1
+        _atomic_write(_views_path(), json.dumps(d, sort_keys=True))
+
+
 def _apply_views_ops(ops):
     """Targeted, name-or-id-keyed view-tag operations applied against the CURRENT blob under the
     identity lock — two concurrent editors COMPOSE instead of last-writer-wins, and a kernel-down
@@ -2136,7 +2173,13 @@ def _apply_views_ops(ops):
     edit) and degrade to a bare {active} in the kernel-down spool (dropping actives/tagOrder/new
     tags). As targeted ops they compose with foreign tag edits and replay offline losslessly.
     Unknown tags and malformed ops drop quietly: a replayed gesture over a deleted tag has
-    nothing left to do. Returns the new rev."""
+    nothing left to do — but a DUPLICATE-NAME refusal is a CONFLICT, named in the return (the
+    r50 verification: a refused create/rename was acked ok with a bumped rev, and the dialog
+    showed a tag the store never held). Returns (rev, conflicts): rev bumps ONLY when
+    something actually applied — an all-refused ops list leaves the store byte-identical, and
+    advertising a new rev for it claims a change nobody made."""
+    applied = False
+    conflicts = []
     with jd._identity_file_lock():
         try:
             raw = json.loads(_views_path().read_text())
@@ -2156,6 +2199,7 @@ def _apply_views_ops(ops):
                 continue
             if isinstance(op.get("active"), str):
                 d["active"] = op["active"]
+                applied = True
                 continue
             if isinstance(op.get("actives"), dict):
                 # PER-SURFACE MERGE, never a whole-dict replace (the r48 verification: a client
@@ -2166,6 +2210,7 @@ def _apply_views_ops(ops):
                 cur_act = dict(cur_act)
                 cur_act.update(op["actives"])
                 d["actives"] = cur_act
+                applied = True
                 continue
             if isinstance(op.get("tagOrder"), list):
                 names = [str(n) for n in op["tagOrder"] if isinstance(n, str) and n]
@@ -2174,6 +2219,7 @@ def _apply_views_ops(ops):
                 # the drag rewrites the local array order too (the twin's convention) — remote
                 # names simply don't match anything here
                 d["tags"] = sorted(d["tags"], key=lambda t: pos.get(t.get("name"), len(names)))
+                applied = True
                 continue
             cr = op.get("create")
             if isinstance(cr, dict):
@@ -2187,11 +2233,19 @@ def _apply_views_ops(ops):
                                       "color": str(cr.get("color") or ""),
                                       "members": [m for m in (pair(s) for s in (cr.get("members") or []))
                                                   if m]})
+                    applied = True
+                elif cid and not any(t["id"] == cid for t in d["tags"]):
+                    # a NAME collision under a FRESH id — refused and named (r50). A same-id
+                    # re-create is a replay's idempotence (the spool, the reconnect re-pump
+                    # re-sending a landed create) and stays quiet: alarming on it would flag
+                    # every recovered gesture as a failure.
+                    conflicts.append("create '%s': the name is already taken" % crname)
                 continue
             key = str(op.get("tag") or "")
             t = next((x for x in d["tags"] if x.get("name") == key or x.get("id") == key), None)
             if t is None:
                 continue
+            applied = True
             if isinstance(op.get("add"), list):
                 have = {(m["host"], m["sid"]) for m in t["members"]}
                 adds = [m for m in (pair(s) for s in op["add"]) if m]
@@ -2207,8 +2261,12 @@ def _apply_views_ops(ops):
                     _oldname = t.get("name")
                     t["name"] = _newname
                     _views_rename_refs(d, _oldname, _newname)   # lenses + tagOrder follow (P2)
-                # a duplicate target name drops quietly, grammar-style: name-keyed addressing
-                # would break for BOTH tags (the v1.3.21 audit's P2)
+                else:
+                    # name-keyed addressing would break for BOTH tags (the v1.3.21 audit's P2)
+                    # — refused, and NAMED in the ack (r50): silence here left the dialog
+                    # showing a rename the store refused
+                    conflicts.append("rename '%s' \u2192 '%s': the name is already taken"
+                                     % (t.get("name"), _newname))
             if isinstance(op.get("color"), str):
                 t["color"] = op["color"]
             if op.get("delete") is True:
@@ -2216,10 +2274,12 @@ def _apply_views_ops(ops):
                 _views_drop_refs(d, t.get("name"))              # lenses + tagOrder follow (P2)
                 if d.get("active") == t.get("id"):
                     d["active"] = "all"
+        if not applied:
+            return currev, conflicts
         d = _norm_timeline_views(jd.canonicalize_timeline_views(d))
         d["rev"] = currev + 1
         _atomic_write(_views_path(), json.dumps(d, sort_keys=True))
-        return currev + 1
+        return currev + 1, conflicts
 
 
 def _remote_tag_member_str(owner_host, m):
@@ -13112,31 +13172,43 @@ def _clear_restart_marker_if_current():
     if not gd:
         return
     mk = gd / "romp-restart-needed"
-    try:
-        # stat-gated, nonblocking, no-follow (the r49 verification: this was the ONE marker
-        # reader the P1.4 sweep missed — a FIFO here hung the kernel AFTER it bound the port,
-        # a live child the manager never respawns)
-        if not stat.S_ISREG(os.lstat(str(mk)).st_mode):
-            return
-        _mfd = os.open(str(mk), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
-                       | getattr(os, "O_NOFOLLOW", 0))
-        try:
-            want = (os.read(_mfd, 4096).decode(errors="replace").split() or [""])[0]
-        finally:
-            os.close(_mfd)
-    except (OSError, IndexError):
-        return
     if not os.environ.get("ROMP_CHECKOUT"):
         return                          # live bytes (a dev run, a direct bin/romp-kernel): the
     #                                     marker's intent — the VERIFIED build boots — is not
     #                                     fulfilled, however well the shas happen to match
-    ks = _kernel_sha()
-    if ks.endswith("-dirty"):
-        ks = ks[:-len("-dirty")]        # the suffix defeats both prefix checks, and dirty-vs-clean
-    #                                     is the tree's state, not the running commit's identity
-    if want and ks and (want.startswith(ks) or ks.startswith(want)):
+    # UNDER the update lock, read-compare-unlink as ONE transaction (the r50 verification: an
+    # OLD kernel read marker A, update B replaced it in the window, and A's unlink deleted B's
+    # fresh intent). Contention means an updater is mid-flight: the marker is theirs — leave it.
+    lk = _update_flock_wait(2)
+    if lk is None:
+        return
+    try:
         try:
-            os.remove(mk)
+            # stat-gated, nonblocking, no-follow (the r49 verification: this was the ONE marker
+            # reader the P1.4 sweep missed — a FIFO here hung the kernel AFTER it bound the
+            # port, a live child the manager never respawns)
+            if not stat.S_ISREG(os.lstat(str(mk)).st_mode):
+                return
+            _mfd = os.open(str(mk), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                           | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                want = (os.read(_mfd, 4096).decode(errors="replace").split() or [""])[0]
+            finally:
+                os.close(_mfd)
+        except (OSError, IndexError):
+            return
+        ks = _kernel_sha()
+        if ks.endswith("-dirty"):
+            ks = ks[:-len("-dirty")]    # the suffix defeats both prefix checks, and dirty-vs-
+        #                                 clean is the tree's state, not the commit's identity
+        if want and ks and (want.startswith(ks) or ks.startswith(want)):
+            try:
+                os.remove(mk)
+            except OSError:
+                pass
+    finally:
+        try:
+            os.close(lk)
         except OSError:
             pass
 
@@ -13343,7 +13415,10 @@ def _pr_watch_stamped_deliver(r, verdict, detail):
         try:
             fk.write_text("attempted\n")
         except OSError:
-            return True                              # can't bound the retry — retire, at-most-once
+            return False                             # NO delivery was attempted yet — retiring
+        #                                              here dropped the notice with zero sends
+        #                                              (the r50 verification); retrying the MARK
+        #                                              is safe, the injection hasn't happened
     if _pr_watch_deliver(r["sid"], _pr_watch_notice(verdict, r["repo"], r["pr"], detail)):
         try:
             fk.unlink(missing_ok=True)                # delivery confirmed — the failure is over
@@ -28304,6 +28379,7 @@ else if(m.type==="hover"&&panel.setHover)panel.setHover(m);
 else if(m.type==="revealEvent"&&panel.revealEvent)panel.revealEvent(m.sid,m.t,m.id);
 else if(m.type==="tagEditFailed"&&panel.tagEditFailed)panel.tagEditFailed(m);
 else if(m.type==="viewsAck"&&panel.viewsAck)panel.viewsAck(m);
+else if(m.type==="unionOpsAck"&&panel.unionOpsAck)panel.unionOpsAck(m);
 else if(m.type==="openViewsDialog"&&panel._openViewsDialog)panel._openViewsDialog(null);});
 window.__rompTimelineOpenExternal=function(url){try{var u=new URL(url);if(u.protocol==="vscode:"){var q=u.searchParams;
 post({type:"deepLink",session:q.get("session"),anchor:q.get("anchor")||undefined,anchorT:Number(q.get("anchorT"))||undefined,anchorKind:q.get("anchorKind")||undefined,compose:q.get("compose")==="1"});
@@ -28314,7 +28390,7 @@ window.__rompTimelineSendCommand=function(name,cmd){post({type:"sendCommand",nam
 window.__rompTimelineSetFlag=function(id,flag,value){post({type:"setSessionFlag",id:id,flag:flag,value:!!value});};
 window.__rompTimelineSetViews=function(views){post({type:"setTimelineViews",views:views});};
 window.__rompTimelineSetViewsOps=function(ops){post({type:"setTimelineViewsOps",ops:ops});};
-window.__rompTimelineSetUnionOps=function(entries,retired){post({type:"setUnionOps",entries:entries,retired:retired||[]});};
+window.__rompTimelineSetUnionOps=function(entries,retired,opId){var f={type:"setUnionOps",entries:entries,retired:retired||[]};if(opId)f.opId=String(opId);post(f);};
 window.__rompTimelineEditTag=function(edit){post({type:"editTag",edit:edit});};
 window.__rompTimelineDismiss=function(id){post({type:"dismissLane",id:id});};
 window.__rompTimelineHover=function(sid,segIds,t0,t1){post(sid?{type:"timelineHover",sid:sid,segIds:segIds||[],t0:t0,t1:t1}:{type:"timelineHover",off:true});};
@@ -32424,7 +32500,10 @@ class Handler(BaseHTTPRequestHandler):
                                                        "error": "entries must be a JSON list"}),
                                       "application/json")
                 ok = _union_ops_set(b["entries"], b.get("retired"))
-                return self._send(200 if ok else 500, json.dumps({"ok": ok}), "application/json")
+                _uans = {"ok": ok}
+                if b.get("opId"):
+                    _uans["opId"] = str(b["opId"])   # the twin advances _syncedGids on this (r50)
+                return self._send(200 if ok else 500, json.dumps(_uans), "application/json")
             if u.path == "/views":
                 # The Obsidian timeline's views writer — the WS setTimelineViews op as a POST:
                 # the SAME whole-blob last-write-wins semantics every dashboard has, but through
@@ -32443,9 +32522,12 @@ class Handler(BaseHTTPRequestHandler):
                     # targeted operations (the v1.3.17 audit's P1.5/P2.15): applied server-side
                     # against the CURRENT blob, so concurrent editors compose — and the exact
                     # grammar the kernel-down spool replays
-                    rev = _apply_views_ops(b["ops"])
+                    rev, confl = _apply_views_ops(b["ops"])
                     _mark_views_dirty()
-                    return self._send(200, json.dumps({"ok": True, "rev": rev}), "application/json")
+                    _ans = {"ok": True, "rev": rev}
+                    if confl:
+                        _ans["conflicts"] = confl   # partial application, named (r50)
+                    return self._send(200, json.dumps(_ans), "application/json")
                 if not isinstance(b.get("views"), dict):
                     return self._send(400, json.dumps({"ok": False, "error":
                         "views (object) required — or ops (list) for targeted edits"}),
@@ -32522,6 +32604,9 @@ class Handler(BaseHTTPRequestHandler):
                     if err:
                         return self._send(200, json.dumps({"ok": False, "error": err}),
                                           "application/json")
+                    if isinstance(ans, dict) and ans.get("ok", False):
+                        # this kernel's own lens/order refs follow the landed remote edit (r50)
+                        _migrate_refs_after_remote_edit(name, b)
                     _mark_views_dirty()
                     return self._send(200, json.dumps(ans), "application/json")
                 live = _live_names(_tmux_sessions())
@@ -33071,8 +33156,10 @@ class Handler(BaseHTTPRequestHandler):
             # it is sent on FAILURE too (the r48 verification: an exception here answered
             # nothing, and the serialized writer waited on its one outstanding slot forever).
             try:
-                _orev = _apply_views_ops(msg["ops"])
+                _orev, _oconfl = _apply_views_ops(msg["ops"])
                 _oans = {"type": "viewsAck", "ok": True, "rev": _orev}
+                if _oconfl:
+                    _oans["conflicts"] = _oconfl   # partial application, named (r50)
             except Exception:
                 try:
                     _oans = {"type": "viewsAck", "ok": False,
@@ -33093,7 +33180,16 @@ class Handler(BaseHTTPRequestHandler):
             # panel mirrors its whole in-flight compensation list here on every change (small,
             # idempotent — a full replace, no per-op protocol to desync), and re-seeds from the
             # payload echo after a reload
-            _union_ops_set(msg["entries"], msg.get("retired"))
+            _uok = _union_ops_set(msg["entries"], msg.get("retired"))
+            try:
+                # the correlated ack (the r50 verification: the save's failure was discarded and
+                # the panel advanced its synced-gid watermark on hope)
+                _uans = {"type": "unionOpsAck", "ok": bool(_uok)}
+                if msg.get("opId"):
+                    _uans["opId"] = str(msg["opId"])
+                client["send"](json.dumps(_uans))
+            except Exception:
+                pass
         elif msg and msg.get("type") == "openTagsDialog":
             # any pane's "Configure tags…" opens THE tags dialog — which lives on the timeline pane
             # (one dialog, one implementation; the user 2026-08-25). Routed to the SAME dashboard's
@@ -33137,10 +33233,22 @@ class Handler(BaseHTTPRequestHandler):
                     body["delete"] = True
                 ans, err = _forward_tag_edit(host, body)
                 if err or not (ans or {}).get("ok", False):
+                    _rmsg = err or (ans or {}).get("error") or "refused"
                     _send_to_view("timeline", {"type": "tagEditFailed", "host": host, "name": nm,
                                                **({"opId": op_id} if op_id else {}),
-                                               "error": err or (ans or {}).get("error") or "refused"},
+                                               "error": _rmsg},
                                   (client or {}).get("wid") or "")
+                    # the refusal is journaled beside the gestures (the r50 verification: the
+                    # frame is transient — a panel reloading in the send window lost the ONE
+                    # event its re-seeded journal was waiting for, and the split went silent)
+                    try:
+                        _union_ops_set([{"refusal": True, "host": host, "name": nm,
+                                         "opId": op_id, "error": _rmsg,
+                                         "gid": -(int(time.time() * 1000) % 0x40000000)}])
+                    except Exception:
+                        pass
+                else:
+                    _migrate_refs_after_remote_edit(nm, body)
                 _mark_views_dirty()
         elif msg and msg.get("type") == "cardNotify" and msg.get("itemId"):
             # feed card right-click → per-card bell (OS notification when THIS card blocks on you /

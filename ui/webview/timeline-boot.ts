@@ -49,6 +49,9 @@ export function dispatchFrame(panel: any, m: any): boolean {
   // the frame itself (the browser boot is the kernel's inline script); viewsAck is idempotent, so
   // the double delivery here is harmless.
   if (m.type === "viewsAck" && panel.viewsAck) { panel.viewsAck(m); return true; }
+  // the union-journal write's correlated ack (r50) — the panel advances its synced-gid
+  // watermark only when this arrives with ok:true
+  if (m.type === "unionOpsAck" && panel.unionOpsAck) { panel.unionOpsAck(m); return true; }
   return false;
 }
 
@@ -93,8 +96,10 @@ export function bridgeFunctions(post: Post): Record<string, (...a: any[]) => voi
     // TARGETED ops (the v1.3.20 audit): lens picks, the union drag and tag creates compose
     // server-side instead of riding whole-blob CAS writes
     __rompTimelineSetViewsOps: (ops: unknown) => post({ type: "setTimelineViewsOps", ops }),
-    // the durable multi-host gesture journal (the v1.3.21 audit's P1.5)
-    __rompTimelineSetUnionOps: (entries: unknown, retired?: unknown) => post({ type: "setUnionOps", entries, retired: retired || [] }),
+    // the durable multi-host gesture journal (the v1.3.21 audit's P1.5); the opId correlates
+    // the kernel's unionOpsAck so the panel advances its watermark only on success (r50)
+    __rompTimelineSetUnionOps: (entries: unknown, retired?: unknown, opId?: unknown) =>
+      post({ type: "setUnionOps", entries, retired: retired || [], ...(opId ? { opId: String(opId) } : {}) }),
     __rompTimelineEditTag: (edit: unknown) => post({ type: "editTag", edit }),
     __rompTimelineDismiss: (id: string) => post({ type: "dismissLane", id }),
     __rompTimelineHover: (sid?: string, segIds?: unknown[], t0?: number, t1?: number) =>

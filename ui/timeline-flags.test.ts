@@ -774,3 +774,142 @@ test("executed: the compensation's INVERSE dispatch carries its OWN opId — its
   assert.match(panel._tagEditErr.error, /owner down/);   // the failed rollback is LOUD, not silent
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews;
 });
+
+test("executed: the synced-gid watermark advances only on the kernel's ack (r50)", () => {
+  // the v1.3.22 audit's P1.3: _syncUnionOps advanced _syncedGids at SEND time — a failed save
+  // was never retried (the next sync diffed against the advanced watermark, computed
+  // retired=[] and the kernel journal kept the stale group forever)
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const gid = panel._unionOps[0].gid;
+  const last = wire[wire.length - 1];
+  assert.ok(last.opId, "every sync is correlated");
+  assert.equal((panel._syncedGids || []).length, 0, "no ack yet — the watermark HOLDS");
+  panel.unionOpsAck({ ok: true, opId: last.opId });
+  assert.deepEqual(panel._syncedGids, [gid], "the ack advances it");
+  // the group retires (both owners confirm) → the sync carries the retirement…
+  const polled = JSON.parse(JSON.stringify(VIEWS));
+  polled.remoteTags[0].members = [];
+  polled.remoteTags[1].members = [];
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  panel.update(Object.assign({}, base, { views: polled }));
+  const retirePost = wire[wire.length - 1];
+  assert.deepEqual(retirePost.retired, [gid]);
+  // …but the SAVE FAILS: the watermark stands, and the next payload re-sends the retirement
+  panel.unionOpsAck({ ok: false, opId: retirePost.opId });
+  assert.deepEqual(panel._syncedGids, [gid], "a refused write advances nothing");
+  panel.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(polled)) }));
+  const retry = wire[wire.length - 1];
+  assert.notEqual(retry.opId, retirePost.opId, "a fresh correlated post");
+  assert.deepEqual(retry.retired, [gid], "the SAME retirement re-sends — nothing assumed landed");
+  panel.unionOpsAck({ ok: true, opId: retry.opId });
+  assert.deepEqual(panel._syncedGids, [], "the confirmed retirement finally advances it");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: a reload seeds the watermark WITH the entries — retirement still reaches the kernel (r50)", () => {
+  // the v1.3.22 audit's P2.4 (first half): the re-seed restored _unionOps but not _syncedGids,
+  // so a seeded group's later retirement diffed against nothing — entries:[] retired:[] — and
+  // the kernel journal held the stale group forever
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
+  const gid = journal[0].gid;
+  // THE RELOAD, then both owners confirm — the retirement must carry the seeded gid
+  const panel2 = drawnPanel();
+  const polled = JSON.parse(JSON.stringify(VIEWS));
+  polled.remoteTags[0].members = [];
+  polled.remoteTags[1].members = [];
+  panel2.update({ now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                  turns: {}, messages: [], judging: [], views: polled, unionOps: journal });
+  assert.deepEqual(panel2._syncedGids, [gid], "the watermark seeded WITH the entries");
+  const retirePost = wire[wire.length - 1];
+  assert.equal(retirePost.entries.length, 0);
+  assert.deepEqual(retirePost.retired, [gid],
+    "the seeded group's retirement reaches the kernel — the journal is not immortal");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: a journaled refusal is consumed after a reload and tombstoned exactly once (r50)", () => {
+  // the v1.3.22 audit's P2.4 (second half): the tagEditFailed frame is transient — a panel
+  // reloading in the send window lost the one event its re-seeded journal was waiting for.
+  // The kernel persists the refusal beside the gestures now; the owning panel consumes it,
+  // fires the same compensation the lost frame carried, and retires it with a tombstone.
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
+  const gid = journal[0].gid;
+  const refusal = { refusal: true, gid: -777, opId: String(gid), host: "TESTHOST-B",
+                    name: "pool", error: "refused while the panel was away" };
+  // THE RELOAD: the payload echo carries the journal AND the refusal row
+  const panel2 = drawnPanel();
+  const inverse: any[] = [];
+  panel2._editRemoteTag = (rt: any, edit: any) => { inverse.push({ rt, edit }); return true; };
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: journal.concat([refusal]) }));
+  assert.equal(inverse.length, 1, "the lost frame's compensation fires from the journal");
+  assert.equal(inverse[0].rt.host, "TESTHOST-A", "…on the still-applied sibling");
+  assert.match(panel2._tagEditErr.error, /refused while the panel was away/);
+  const post = wire[wire.length - 1];
+  assert.ok(post.retired.indexOf(-777) >= 0, "the consumed refusal row is tombstoned");
+  assert.ok(post.retired.indexOf(gid) >= 0, "…alongside the compensated group");
+  // the row rides the NEXT payload too (the tombstone hasn't landed yet) — no second rollback
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: [refusal] }));
+  assert.equal(inverse.length, 1, "consumed once, never re-fired");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: another panel's journaled refusal is NOT ours to consume (r50)", () => {
+  // ownership: only the panel that minted (or adopted) the gesture may fire its compensation
+  // and retire the row — a bystander panel consuming it would strip the owner of the one
+  // event it reloads to find
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  const inverse: any[] = [];
+  panel._editRemoteTag = (rt: any, edit: any) => { inverse.push({ rt, edit }); return true; };
+  panel.update({ now, sessions: [sess("s1", "web", "#f7768e")], turns: {}, messages: [],
+                 judging: [], views: JSON.parse(JSON.stringify(VIEWS)),
+                 unionOps: [{ refusal: true, gid: -888, opId: "424242", host: "TESTHOST-B",
+                              name: "pool", error: "someone else's gesture" }] });
+  assert.equal(inverse.length, 0, "no compensation for a gesture this panel never made");
+  const tomb = wire.filter((w) => (w.retired || []).indexOf(-888) >= 0);
+  assert.equal(tomb.length, 0, "…and no tombstone — the row waits for its owner");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: a viewsAck carrying conflicts surfaces them loudly and drops the overlay (r50)", () => {
+  // the v1.3.22 audit's P2.8: a duplicate-name create/rename was acked plain-ok — the dialog
+  // kept showing a tag the store never held
+  const panel = drawnPanel();
+  panel._pendingViews = { active: "all", tags: [] };
+  panel.viewsAck({ ok: true, rev: 9, conflicts: ["create 'pool': the name is already taken"] });
+  assert.match(panel._tagEditErr.error, /already taken/);
+  assert.equal(panel._pendingViews, null, "the optimistic overlay drops — the store's truth shows");
+  assert.equal(panel._optViewsRev, 9, "the rev still re-anchors");
+});

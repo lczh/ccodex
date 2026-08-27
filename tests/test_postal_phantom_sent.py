@@ -247,3 +247,80 @@ class TmpOnlyIsUnpublished(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class R50RelayStages(unittest.TestCase):
+    """the v1.3.22 audit's P2.5: the peer-relay leg wrote its sent row and then outbox_put —
+    a crash (or a raise) in the window left a durable sent row for mail that never reached the
+    outbox, and boot reconciliation SKIPS peer rows by design (consumed outbox mail leaves no
+    file, so absence proves nothing there). The stage file is the arbiter now: staged before
+    the publish, resolved after it; an orphaned stage at boot files the unpublished row."""
+
+    def setUp(self):
+        _reset()
+        shutil.rmtree(pm.OUTBOX, ignore_errors=True)   # OUTBOX lives under STATE, outside
+        #                                                MAILROOT — _reset() never touches it
+        self.now = int(time.time())
+        self.hd = pm.OUTBOX / "TESTHOST2"
+        self.hd.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        _reset()
+        shutil.rmtree(pm.OUTBOX, ignore_errors=True)
+
+    def test_an_orphaned_stage_files_the_unpublished_row(self):
+        (self.hd / ".stage-px-201.1_777.TESTHOST").write_text("1")
+        with contextlib.redirect_stderr(io.StringIO()):
+            fixed = pm._reconcile_relay_stages()
+        self.assertEqual(fixed, 1)
+        rows = [r for r in _rows() if r.get("ev") == "unpublished"]
+        self.assertEqual([r["id"] for r in rows], ["px-201.1_777.TESTHOST"],
+                         "the never-published relay is terminal now — receipts and the "
+                         "wait map stop accounting a phantom")
+        self.assertFalse((self.hd / ".stage-px-201.1_777.TESTHOST").exists(),
+                         "the resolved stage is spent")
+
+    def test_a_stage_beside_its_outbox_file_just_drops(self):
+        # a crash AFTER the publish, before the stage unlink: the mail is real — no row
+        (self.hd / ".stage-px-202.1_888.TESTHOST").write_text("1")
+        (self.hd / "px-202.1_888.TESTHOST.json").write_text(json.dumps({"mid": "x"}))
+        self.assertEqual(pm._reconcile_relay_stages(), 0)
+        self.assertEqual([r for r in _rows() if r.get("ev") == "unpublished"], [])
+        self.assertFalse((self.hd / ".stage-px-202.1_888.TESTHOST").exists())
+
+    def test_a_failed_terminal_append_retains_the_stage(self):
+        # the row could not land -> the stage must survive to the NEXT bus start; consuming it
+        # anyway would erase the only evidence the publish never happened
+        (self.hd / ".stage-px-203.1_999.TESTHOST").write_text("1")
+        real = pm._tl_append
+        pm._tl_append = lambda name, row: False
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                fixed = pm._reconcile_relay_stages()
+        finally:
+            pm._tl_append = real
+        self.assertEqual(fixed, 0)
+        self.assertTrue((self.hd / ".stage-px-203.1_999.TESTHOST").exists(),
+                        "no terminal row, no consumption — retried at the next start")
+
+    def test_the_relay_leg_stages_before_publishing_and_boot_resolves(self):
+        # the transaction's ordering, pinned at the source: sent row -> stage -> outbox_put ->
+        # stage unlink; and serve() runs the stage reconciliation at boot
+        src = open(os.path.join(BIN, "romp-postal-service"), encoding="utf-8").read()
+        i_row = src.index('mail NOT relayed; retry')            # the row-first refusal (r49)
+        i_stage = src.index('".stage-" + mid')
+        i_put = src.index("outbox_put(phost, relay_msg)")
+        self.assertLess(i_row, i_stage, "the sent row lands first (receipts never lost)")
+        self.assertLess(i_stage, i_put, "the stage is armed BEFORE the publish — a crash "
+                                        "in the window leaves the arbiter behind")
+        body = src.split("def serve():", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("_reconcile_relay_stages()", body)
+
+    def test_a_publish_raise_gets_a_compensating_row(self):
+        # the executed in-process shape: outbox_put raises (not a crash) — the leg files the
+        # compensating unpublished row itself and spends the stage
+        src = open(os.path.join(BIN, "romp-postal-service"), encoding="utf-8").read()
+        leg = src[src.index('".stage-" + mid'):src.index('".stage-" + mid') + 2500]
+        self.assertIn('"ev": "unpublished"', leg,
+                      "the raise path files the terminal row inline")
+        self.assertIn("relay publication failed", leg, "…and answers the sender loudly")

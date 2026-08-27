@@ -308,6 +308,29 @@ class EditTagOpPins(unittest.TestCase):
         self.assertIn('{"type": "tagEditFailed", "host": host, "name": nm,', src)
         self.assertIn('(client or {}).get("wid") or ""', src, "the refusal goes to the ASKING dashboard")
 
+    def test_a_refusal_is_journaled_beside_the_gestures(self):
+        # the v1.3.22 audit's P2.4: the tagEditFailed frame is TRANSIENT — a panel reloading in
+        # the send window lost the one event its re-seeded journal was waiting for, and the
+        # multi-host split went silent forever. The refusal is a durable row in the union
+        # journal now; the payload echo carries it to whichever panel owns the gesture.
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        i_send = src.index('{"type": "tagEditFailed", "host": host, "name": nm,')
+        i_journal = src.index('_union_ops_set([{"refusal": True, "host": host, "name": nm,')
+        self.assertLess(i_send, i_journal, "the loud frame first, then the durable row")
+        i_branch_end = src.index('elif msg and msg.get("type") == "cardNotify"')
+        self.assertLess(i_journal, i_branch_end, "…both inside the editTag branch")
+
+    def test_a_landed_remote_edit_migrates_this_kernels_refs(self):
+        # the v1.3.22 audit's P2.7 wiring pin (behavior is R50RemoteRefMigration in
+        # test_flag_views_order_routes): the WS branch's SUCCESS arm hands the landed edit to
+        # the shared migration helper
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        i_forward = src.index('ans, err = _forward_tag_edit(host, body)')
+        i_migrate = src.index('_migrate_refs_after_remote_edit(nm, body)')
+        self.assertLess(i_forward, i_migrate)
+        i_branch_end = src.index('elif msg and msg.get("type") == "cardNotify"')
+        self.assertLess(i_migrate, i_branch_end)
+
     def test_a_malformed_delete_rejects_the_whole_edit_never_forwards_a_partial(self):
         # the v1.3.20 audit's residual on the v1.3.19 fix: `delete: "false"` no longer deleted
         # (never coerce), but the handler silently DROPPED the field and forwarded the rest of

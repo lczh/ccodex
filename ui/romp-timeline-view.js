@@ -715,6 +715,10 @@ class TimelinePanel {
     this._views = null;          // the kernel-echoed views blob (data.views); null until the first push
     this._pendingViews = null;   // an optimistic edit held sticky until a push echoes it (see _reconcileViews)
     this._pendingTagEdits = {};  // remote-tag edits held optimistically until the owner's poll echoes (federation v1): id → {tag: shape|null(=deleted), age}
+    this._pendingUnionSyncs = {};   // journal syncs awaiting their kernel ack: opId → {gids, tomb} (r50)
+    this._retireUnionGids = new Set();   // consumed refusal rows awaiting a durable tombstone (r50)
+    this._handledRefusalOps = new Set(); // refusal opIds already fired — the direct frame and the journal row both arrive (r50)
+    this._mintedGids = new Set();        // gesture ids THIS panel dispatched — a journaled refusal is ours to consume only if we own its gesture (r50)
     this._tagEditErr = null;     // the LOUD failure of the last remote-tag edit ({host, name, error}), shown in the dialog until dismissed
     this._pendingViewsAge = 0;   // pushes since the edit — the kernel is authoritative, so a stale pending yields
     this._viewsMenu = null;      // the Show-dropdown element, when open
@@ -1635,14 +1639,43 @@ class TimelinePanel {
       // gesture minted entries; the kernel's copy is the reload survivor, never fresher than
       // this panel's own live list
       this._unionSeeded = true;
-      if (data.unionOps.length && !(this._unionOps || []).length) {
-        this._unionOps = data.unionOps.map((o) => Object.assign({}, o));
+      const seedRows = data.unionOps.filter((o) => o && !o.refusal);   // refusal rows are events, not entries (r50)
+      if (seedRows.length && !(this._unionOps || []).length) {
+        this._unionOps = seedRows.map((o) => Object.assign({}, o));
         // gesture ids must not collide with re-seeded ones: resume the sequence PAST them
         for (const o of this._unionOps)
           if (o.gid && o.gid >= unionGestureSeq) unionGestureSeq = o.gid + 1;
+        // the watermark seeds WITH the entries (the r50 verification: it restarted empty, so
+        // the seeded group's later retirement diffed against nothing and emitted entries:[]
+        // retired:[] — the kernel journal held the stale group forever). Deduped: a gesture's
+        // halves share one gid, and the ack path stores the set.
+        this._syncedGids = Array.from(new Set(this._unionOps.map((o) => o.gid).filter(Boolean)));
+      }
+    }
+    // the journaled refusals (r50): the kernel persists an editTag refusal beside the gestures,
+    // so a panel that reloaded during the send window still learns its gesture was refused —
+    // the direct tagEditFailed frame dies with the old page. Consume ONLY refusals whose
+    // gesture this panel owns (minted here, or adopted by the re-seed above); another panel's
+    // pending gesture is not ours to retire.
+    if (Array.isArray(data.unionOps)) {
+      for (const r of data.unionOps) {
+        if (!r || !r.refusal || !r.gid) continue;
+        if (this._retireUnionGids.has(r.gid)) continue;         // consumed; tombstone in flight
+        const op = String(r.opId || '');
+        if (!op) continue;
+        const ours = this._handledRefusalOps.has(op) || this._mintedGids.has(Number(op))
+          || (this._unionOps || []).some((o) => String(o.gid || 0) === op);
+        if (!ours) continue;
+        this._retireUnionGids.add(r.gid);
+        this._unionSyncDirty = true;
+        if (!this._handledRefusalOps.has(op)) {
+          // the reload path: fire the compensation the lost frame would have carried
+          this.tagEditFailed({ host: r.host, name: r.name, opId: r.opId, error: r.error });
+        }
       }
     }
     this._reconcileUnionOps();       // age out union-edit compensations the owner has since applied
+    if (this._unionSyncDirty) this._syncUnionOps();   // a refused/failed journal write re-sends (r50)
     this._applyLocalOrder();         // Obsidian: the viewer's own arrangement over the seed (P2.16)
     this._reconcileViews();          // ...and an optimistic view edit, until the kernel echoes it
     this._reconcileTagEdits();       // ...and any remote-tag edits, until the owner's poll echoes them
@@ -2664,6 +2697,7 @@ class TimelinePanel {
       for (const x of (edit.add || [])) if (next.members.indexOf(x) < 0) next.members.push(x);
       if (edit.remove) next.members = next.members.filter((x) => edit.remove.indexOf(x) < 0);
     }
+    if (gid) this._mintedGids.add(gid);   // ownership: this panel's refusals are its own to consume (r50)
     this._pendingTagEdits[rt.id] = { tag: next, age: 0, gid: gid || 0 };   // gid scopes the
     //                                 refusal's overlay drop (the v1.3.20 audit's residual)
     const wire = { host: rt.host, name: rt.name, rename: edit.rename,
@@ -2678,6 +2712,9 @@ class TimelinePanel {
   // the kernel's LOUD refusal (a down owner, a name collision there): the optimistic copy reverts
   // and the reason shows in the dialog (rebuilt in place if open) until dismissed
   tagEditFailed(m) {
+    // the journaled twin of this refusal (the kernel persists refusals beside the gestures now,
+    // r50) must not fire the rollback a SECOND time when it rides the next payload
+    if (m && m.opId) this._handledRefusalOps.add(String(m.opId));
     // the optimistic overlay drops SCOPED by the refused gesture's opId when the frame carries
     // one (the v1.3.20 audit's residual): the host-wide sweep also reverted OTHER in-flight
     // gestures' overlays on the same host, snapping their edits out of view for nothing. An
@@ -2801,15 +2838,38 @@ class TimelinePanel {
     // retirement is EXPLICIT (the r49 verification: the kernel merges per gid now, so two
     // open panels no longer clobber each other's entries — omission is not retirement)
     const gids = new Set(entries.map((o) => o.gid).filter(Boolean));
-    const retired = (this._syncedGids || []).filter((g) => !gids.has(g));
-    this._syncedGids = Array.from(gids);
+    const tomb = Array.from(this._retireUnionGids || []);   // consumed refusal rows (r50)
+    const retired = (this._syncedGids || []).filter((g) => !gids.has(g)).concat(tomb);
+    // the watermark advances ONLY on the kernel's ack (the r50 verification: advancing it at
+    // send time meant a failed save was never retried — the next sync computed retired=[] as
+    // if the retirement had landed, and the kernel journal kept the stale group forever)
+    this._unionSyncDirty = false;
+    const opId = 'u' + (++unionGestureSeq);
+    const want = { gids: Array.from(gids), tomb: tomb };
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineSetUnionOps === 'function') {
-        window.__rompTimelineSetUnionOps(entries, retired);
+        this._pendingUnionSyncs[opId] = want;
+        window.__rompTimelineSetUnionOps(entries, retired, opId);
       } else if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
-        this._kernelPost('/union-ops', { entries: entries, retired: retired }, true).catch(() => {});
+        this._pendingUnionSyncs[opId] = want;
+        this._kernelPost('/union-ops', { entries: entries, retired: retired, opId: opId }, true)
+          .then((r) => this.unionOpsAck({ ok: r.ok === true, opId: opId }))
+          .catch(() => this.unionOpsAck({ ok: false, opId: opId }));
       }
     } catch (e) { /* best-effort: the in-memory journal still runs this panel's lifetime */ }
+  }
+
+  // the kernel's answer to one _syncUnionOps post (r50): ok advances the synced-gid watermark
+  // and settles the tombstones that write carried; a failure leaves both standing, so the NEXT
+  // sync — fired on the next payload arrival, an event, not a timer — recomputes and re-sends
+  // the same retirements instead of assuming they landed
+  unionOpsAck(m) {
+    const p = m && m.opId && this._pendingUnionSyncs ? this._pendingUnionSyncs[m.opId] : null;
+    if (!p) return;                                    // a late twin of a superseded sync
+    delete this._pendingUnionSyncs[m.opId];
+    if (m.ok === false) { this._unionSyncDirty = true; return; }
+    this._syncedGids = p.gids;
+    for (const g of (p.tomb || [])) this._retireUnionGids.delete(g);
   }
 
   _noteUnionOp(rt, name, inverse, edit, gid) {
@@ -3063,6 +3123,17 @@ class TimelinePanel {
   // unconfirmed — waiting out _reconcileViews's three pushes would show stale state meanwhile.
   viewsAck(m) {
     this._optViewsRev = (typeof m.rev === 'number') ? m.rev : 0;
+    if (Array.isArray(m.conflicts) && m.conflicts.length) {
+      // the kernel applied the gesture PARTIALLY — a duplicate name refused a create or a
+      // rename (the r50 verification: the ack said plain ok and the dialog kept showing a tag
+      // the store never held). Loud, and the optimistic overlay drops so the store's truth
+      // shows through.
+      this._tagEditErr = { host: '', name: '', error: m.conflicts.join('; ') };
+      this._pendingViews = null; this._pendingViewsAge = 0;
+      if (this._viewsDialog && this._viewsDialogBuild) this._viewsDialogBuild();
+      this.draw();
+      return;
+    }
     if (m.ok === false) {
       this._pendingViews = null; this._pendingViewsAge = 0;
       this.draw();
@@ -3103,7 +3174,7 @@ class TimelinePanel {
             // as when a WS host's ack frame arrives. Kernel unreachable → no rev: the counter
             // holds its optimistic value and the op spools below.
             if (r.ok !== false && r.json && typeof r.json.rev === 'number')
-              this.viewsAck({ ok: r.ok === true, rev: r.json.rev });
+              this.viewsAck({ ok: r.ok === true, rev: r.json.rev, conflicts: r.json.conflicts });
             if (r.ok !== false) return;              // applied, or refused (kernel up)
             // the replay spool speaks only the targeted-op grammar, so a kernel-down blob write
             // degrades to its active pick there (the pre-existing reduction, offline-only now)

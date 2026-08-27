@@ -1594,7 +1594,38 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send({"ok": False,
                                        "error": "the delivery record could not be written — "
                                                 "mail NOT relayed; retry"})
-                outbox_put(phost, relay_msg)
+                # the STAGED relay transaction (the r50 verification): the sent row with no
+                # outbox file was a permanent phantom — boot reconciliation SKIPS peer rows by
+                # design (their mail leaves the outbox when consumed, so absence proves
+                # nothing). The stage file is the arbiter: present + no outbox file = the
+                # publish never happened; _reconcile_relay_stages files the unpublished row.
+                _stagef = OUTBOX / phost / (".stage-" + mid)
+                try:
+                    (OUTBOX / phost).mkdir(parents=True, exist_ok=True)
+                    _stagef.write_text("1")
+                except OSError:
+                    return self._send({"ok": False,
+                                       "error": "the relay stage could not be written — "
+                                                "mail NOT relayed; retry"})
+                try:
+                    outbox_put(phost, relay_msg)
+                except Exception:
+                    comp = {"t": int(time.time()), "ev": "unpublished", "id": mid}
+                    if not _tl_append("messages.jsonl", comp) and not _tl_append("messages.jsonl", comp):
+                        sys.stderr.write("postal: relay publish of %s FAILED and its "
+                                         "compensating row could not be appended — the stage "
+                                         "file heals it at the next bus start\n" % mid)
+                    else:
+                        try:
+                            _stagef.unlink()
+                        except OSError:
+                            pass
+                    return self._send({"ok": False, "error": "relay publication failed — retry"})
+                try:
+                    _stagef.unlink()               # published: the transaction is resolved
+                except OSError:
+                    pass                           # a leftover stage beside a REAL outbox file
+                #                                    is recognized and dropped at boot
                 if PEERS.get(phost, {}).get("up"):
                     return self._send({"ok": True, "id": mid,
                                        "note": "relaying to '%s' on %s%s" % (hit.get("name") or to, phost, tnote)})
@@ -1842,6 +1873,40 @@ def _reconcile_phantom_sent(now=None):
                              "%s — retrying at the next bus start\n" % mid)
     return fixed
 
+def _reconcile_relay_stages():
+    """Resolve relay stage files left by a crash between the sent row and outbox_put (the r50
+    verification): a stage with NO outbox file means the publish never happened — file the
+    unpublished terminal so the wait-map and receipts stop accounting phantom peer mail. A
+    stage BESIDE its outbox file (a crash after publish, before the unlink) just drops."""
+    fixed = 0
+    try:
+        hosts = list(OUTBOX.iterdir()) if OUTBOX.is_dir() else []
+    except OSError:
+        return 0
+    for hd in hosts:
+        try:
+            stages = [f for f in hd.iterdir() if f.name.startswith(".stage-")]
+        except OSError:
+            continue
+        for st in stages:
+            mid = st.name[len(".stage-"):]
+            published = (hd / (mid + ".json")).exists()
+            if not published:
+                if _tl_append("messages.jsonl", {"t": int(time.time()),
+                                                 "ev": "unpublished", "id": mid}):
+                    fixed += 1
+                    _log("boot reconcile: relay stage %s never published — marked unpublished" % mid)
+                else:
+                    sys.stderr.write("postal: could not file the unpublished row for staged "
+                                     "relay %s — retrying at the next bus start\n" % mid)
+                    continue
+            try:
+                st.unlink()
+            except OSError:
+                pass
+    return fixed
+
+
 def _reconcile_markers():
     """One-time sync of every pending-mail marker to the actual new/ boxes — so mail
     that predates the marker feature (or any drift) is corrected on bus startup."""
@@ -1871,6 +1936,7 @@ def serve():
         pass
     try:
         _reconcile_phantom_sent()      # after the bind (only the bus that owns the port), before
+        _reconcile_relay_stages()      # …and the staged relay transactions a crash left open (r50)
     except Exception as e:             # serving: no request sees a phantom this boot can retire
         _log("phantom-sent reconcile failed: %s" % e)
     _log("bus up on %s (pid %d)" % (BASE, os.getpid()))

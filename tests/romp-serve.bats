@@ -607,3 +607,111 @@ HOLDPY
     [[ "$output" == *LIVE_KERNEL_RAN* ]]
     [[ "$output" == *"LIVE_CHECKOUT=<unset>"* ]]
 }
+
+# ── the exec-revalidated launch pick (the v1.3.22 audit's P1.2 + P3.9) ─────────────────────────
+# The gate picks gen-vs-live under the update lock, but bash APPLIES the pick after Python exits
+# — the lock was gone, and an update landing in the window launched the OLD pick (an executed
+# A→B schedule booted A while HEAD and the marker named B). The applier now hard-requires a
+# well-formed pick, re-takes the lock, and revalidates HEAD/marker immediately before exec; the
+# pick tempfile dies with the process on every path (the EXIT trap). These tests INJECT picks by
+# shadowing python3 (the gate's interpreter), so the applier's behavior is what executes.
+
+_pick_shim() {   # $1 = the pick line the fake gate writes ("" = write nothing)
+    mkdir -p "$TEST_DIR/pathbin"
+    if [ -n "$1" ]; then
+        printf '#!/usr/bin/env bash\nprintf "%%s\\n" "%s" > "$ROMP_GATE_PICK"\nexit 0\n' "$1" \
+            > "$TEST_DIR/pathbin/python3"
+    else
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$TEST_DIR/pathbin/python3"
+    fi
+    chmod +x "$TEST_DIR/pathbin/python3"
+    export PATH="$TEST_DIR/pathbin:$PATH"
+}
+
+@test "romp-serve: a MISSING pick after a successful gate refuses — never the live default" {
+    _gen_fixture
+    _pick_shim ""                       # the gate 'succeeded' but persisted no pick
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 70 ]
+    [[ "$output" == *"launch pick is missing or malformed"* ]]
+    [[ "$output" != *KERNEL_RAN* ]]
+}
+
+@test "romp-serve: a MALFORMED pick refuses — tampering or failure, not a fallback" {
+    _gen_fixture
+    _pick_shim "bogus nonsense"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 70 ]
+    [[ "$output" == *"launch pick is missing or malformed"* ]]
+    [[ "$output" != *KERNEL_RAN* ]]
+}
+
+@test "romp-serve: a WELL-FORMED gen pick still applies — the injection seam proves the applier" {
+    _gen_fixture
+    _pick_shim "gen $GENGD/romp-run-$GENH8"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"GEN_KERNEL_RAN"* ]]
+    [[ "$output" == *"GEN_CHECKOUT=$GENFIX"* ]]
+}
+
+@test "romp-serve: HEAD moving past the gate's gen pick refuses at exec time (the A->B schedule)" {
+    # the v1.3.22 audit's P1.2, executed: the pick named generation A; before exec the checkout
+    # moved to B — launching A would boot the superseded build as if it were the update
+    _gen_fixture
+    _pick_shim "gen $GENGD/romp-run-deadbeef"    # a pick for a HEAD this checkout no longer has
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 70 ]
+    [[ "$output" == *"HEAD moved past the gate's pick"* ]]
+    [[ "$output" != *KERNEL_RAN* ]]
+}
+
+@test "romp-serve: a live pick under a NOW-ARMED update marker refuses (respawn re-picks)" {
+    # the marker armed between the gate's pick and the exec: live bytes would boot while the
+    # marker names HEAD — exactly the forced-generation rule the gate enforces, at exec time
+    _gen_fixture
+    _pick_shim "live"
+    printf '%s\n' "$GENFULL" > "$GENGD/romp-restart-needed"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 70 ]
+    [[ "$output" == *"update marker armed after the gate's live pick"* ]]
+    [[ "$output" != *KERNEL_RAN* ]]
+}
+
+@test "romp-serve: a HELD update lock at exec time refuses the stale pick" {
+    _gen_fixture
+    _pick_shim "gen $GENGD/romp-run-$GENH8"
+    exec 8>>"$GENGD/romp-update.lock"
+    flock 8
+    run "$ROMP_SERVE" --port 9999
+    flock -u 8
+    exec 8>&-
+    [ "$status" -eq 70 ]
+    [[ "$output" == *"an update is mid-flight"* ]]
+    [[ "$output" != *KERNEL_RAN* ]]
+}
+
+@test "romp-serve: a refused boot leaves NO pick tempfile behind (the EXIT trap, P3.9)" {
+    _gen_fixture
+    export TMPDIR="$TEST_DIR/picktmp"
+    mkdir -p "$TMPDIR"
+    _pick_shim "bogus"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 70 ]
+    run bash -c "ls \"$TMPDIR\"/romp-serve-pick.* 2>/dev/null | wc -l"
+    [ "$output" -eq 0 ]
+}
+
+@test "romp-serve: a NON-GIT checkout's gate writes an explicit live pick — boot proceeds" {
+    # the r50 close of the pick grammar: the not-a-git exit used to leave the pick EMPTY, which
+    # the hard-required applier would refuse — the explicit 'live' says what the gate decided
+    unset ROMP_KERNEL_BIN ROMP_CHECKOUT
+    NOGIT="$TEST_DIR/nogit"
+    mkdir -p "$NOGIT/bin"
+    printf '#!/usr/bin/env bash\necho "LIVE_KERNEL_RAN"\n' > "$NOGIT/bin/romp-kernel"
+    chmod +x "$NOGIT/bin/romp-kernel"
+    export ROMP_SERVE_ROOT="$NOGIT"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"LIVE_KERNEL_RAN"* ]]
+}
