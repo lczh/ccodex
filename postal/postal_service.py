@@ -381,7 +381,17 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
         ev["relay_via"] = relay_via                  # peer it arrived from — the join the
         #                                              handoff-done receipt translates through
         #                                              (the r44 verification's P1)
-    _tl_append("messages.jsonl", ev)
+    if not _tl_append("messages.jsonl", ev):
+        # the sent row is the mail's ONLY accounting record — receipts, the wait-map's ask and
+        # awaiting edges, the boot reconcile all read it. Publishing without it created real
+        # mail NO reader could ever discover (the v1.3.21 audit's P2: the row's append failure
+        # was ignored and the rename went ahead). Refuse the delivery instead: the tmp file is
+        # withdrawn and the caller surfaces the failure — nothing was published.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise RuntimeError("postal: the delivery record could not be written — mail NOT published")
     try:
         tmp.rename(mb / "new" / name)   # atomic within the same filesystem — the PUBLISH point
     except Exception:
@@ -1819,6 +1829,11 @@ def _reconcile_phantom_sent(now=None):
         if _tl_append("messages.jsonl", {"t": now, "ev": "unpublished", "id": mid}):
             fixed += 1
             _log("boot reconcile: sent row %s has no mail on disk — marked unpublished" % mid)
+        else:
+            # its own corrective append failing SILENTLY was the v1.3.21 audit's coda: say it
+            # out loud; the next boot retries (the phantom row is still in the tail)
+            sys.stderr.write("postal: boot reconcile could NOT append the unpublished row for "
+                             "%s — retrying at the next bus start\n" % mid)
     return fixed
 
 def _reconcile_markers():

@@ -254,6 +254,35 @@ _latch_fixture() {
     [[ "$output" == *"LIVE_CHECKOUT=$GENFIX"* ]]
 }
 
+@test "romp-serve: an EMPTY update marker refuses to start — unknown is never absent (r49)" {
+    # the v1.3.21 audit's P1.1: a torn arm left an empty marker, the gate read it as
+    # no-marker, and the boot took the dirty-live leg under the very intent that forbids it
+    _gen_fixture
+    : > "$GENGD/romp-restart-needed"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 70 ]
+    [[ "$output" != *KERNEL_RAN* ]]
+    [[ "$output" == *"EMPTY"* ]]
+}
+
+@test "romp-serve: the launch pick is made UNDER the gate lock and applied at exec (r49)" {
+    # the v1.3.21 audit's P1.2, executed: bash used to pick a generation BEFORE the gate's
+    # (up to 90s) lock wait — an update landing in that window launched the OLD pick. The
+    # pick now happens inside the gate: a generation built/armed by the gate's own heal is
+    # what boots, which only the under-lock pick can see (the pre-gate resolution never could).
+    _gen_fixture
+    rm -rf "$GENGD/romp-run-"*
+    printf '#!/bin/sh\necho INSTALL_RAN\nexit 0\n' > "$GENFIX/install.sh"
+    git -C "$GENFIX" add install.sh
+    git -C "$GENFIX" -c user.email=t@t -c user.name=t commit -qm heal-pick
+    GENH8="$(git -C "$GENFIX" rev-parse --short=8 HEAD)"
+    printf '%s' "$GENH8" > "$GENGD/romp-install-failed"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"LIVE_CHECKOUT=$GENFIX"* ]]      # the gen the GATE just built is what ran
+    [ ! -e "$GENGD/romp-install-failed" ]
+}
+
 @test "romp-serve: an armed marker with an UNREADABLE HEAD refuses to start (fail closed, r48)" {
     _gen_fixture
     printf '%s\n' "$GENFULL" > "$GENGD/romp-restart-needed"

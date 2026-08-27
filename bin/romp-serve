@@ -49,46 +49,18 @@ esac
 # the case above, so a stale pin with no generation for the current HEAD still exited 1 at the
 # pruned path — the exact crash loop the self-heal exists for)
 KERNEL="${ROMP_KERNEL_BIN:-$ROMP_DIR/bin/romp-kernel}"
-_ROMP_REQ_GEN=""
-if [ -z "${ROMP_KERNEL_BIN:-}" ]; then
-    _RGD="$(git -C "$ROMP_DIR" rev-parse --absolute-git-dir 2>/dev/null || true)"
-    _RH8="$(git -C "$ROMP_DIR" rev-parse --short=8 HEAD 2>/dev/null || true)"
-    _RDIRTY="$(git -C "$ROMP_DIR" status --porcelain 2>/dev/null | head -c 1 || true)"
-    # the UPDATE MARKER (the v1.3.20 audit's P1.2): romp-restart-needed is armed by every
-    # update transaction before it spends the install latch and cleared only when a kernel
-    # boots AS its target. While it names HEAD, the boot after an update REQUIRES the verified
-    # generation — one tracked edit landing between the update and this spawn used to switch
-    # the freshly signed release to mutable live bytes (executed: MUTATED_LIVE_BYTES after one
-    # edit). Dirty-live stays the rule for ordinary development launches (no marker).
-    _RMARK=""
-    if [ -n "$_RGD" ] && [ -f "$_RGD/romp-restart-needed" ]; then
-        _RMARK="$(head -1 "$_RGD/romp-restart-needed" 2>/dev/null | tr -cd '0-9a-f' || true)"
-    fi
-    if [ -n "$_RH8" ] && [ -n "$_RMARK" ] && [ "${_RMARK:0:8}" = "$_RH8" ]; then
-        KERNEL="$_RGD/romp-run-$_RH8/bin/romp-kernel"
-        export ROMP_CHECKOUT="$ROMP_DIR"
-        _ROMP_REQ_GEN=1
-        if [ -n "$_RDIRTY" ]; then
-            echo "romp-serve: an update to $_RH8 just landed — launching its VERIFIED build;" >&2
-            echo "  tracked edits in the checkout are ignored for this boot and run normally" >&2
-            echo "  from the next spawn (the marker clears once the updated kernel is up)." >&2
-        fi
-    elif [ -z "$_RDIRTY" ] && [ -n "$_RGD" ] && [ -n "$_RH8" ] \
-            && [ -x "$_RGD/romp-run-$_RH8/bin/romp-kernel" ] \
-            && [ "$(head -c 8 "$_RGD/romp-run-$_RH8/.romp-gen" 2>/dev/null)" = "$_RH8" ]; then
-        # a DIRTY checkout always runs live (the r46 re-verify: the generation silently
-        # shadowed a developer's uncommitted kernel edits, with no -dirty marker and no drift
-        # banner — the generation is the verified COMMIT, and edits mean the commit is not
-        # what the user is running). The .romp-gen manifest check is the v1.3.20 audit's P2:
-        # an empty or torn generation directory must never be selected over live bytes.
-        KERNEL="$_RGD/romp-run-$_RH8/bin/romp-kernel"
-        export ROMP_CHECKOUT="$ROMP_DIR"
-    else
-        # the LIVE leg never inherits a stale ROMP_CHECKOUT (the r46 re-verify: a leaked value
-        # made _kernel_sha attribute live bytes to a generation name)
-        unset ROMP_CHECKOUT
-    fi
-fi
+# The AUTHORITATIVE launch pick happens INSIDE the gate below, under the checkout's update
+# lock (the v1.3.21 audit's P1.2): resolving a generation HERE raced the gate's own lock wait —
+# an updater landing during those (up to 90) seconds moved HEAD and the marker to B while this
+# shell had already picked A, and the boot launched A as if it were the update. The gate writes
+# its pick ("gen <dir>" | "live") to the ROMP_GATE_PICK file; bash applies it after the gate
+# returns. Only the explicit ROMP_KERNEL_BIN seam (and a non-git checkout, where the gate exits
+# before picking) keeps the default computed here. The live default never inherits a stale
+# ROMP_CHECKOUT (the r46 re-verify: a leaked value made _kernel_sha attribute live bytes to a
+# generation name); the gen pick re-exports it below.
+unset ROMP_CHECKOUT
+_ROMP_PICK="$(mktemp "${TMPDIR:-/tmp}/romp-serve-pick.XXXXXX" 2>/dev/null || true)"
+if [ -n "$_ROMP_PICK" ]; then export ROMP_GATE_PICK="$_ROMP_PICK"; fi
 
 # Port: the manager passes --port; fall back to the env, then the kernel default.
 #
@@ -131,9 +103,9 @@ fi
 # must never silently rebind the kernel off loopback.
 host="${host:-127.0.0.1}"
 
-# Under an armed update marker the generation may not exist YET — the gate below builds it
-# (or refuses); the recheck before exec covers both paths (the v1.3.20 audit's P1.2).
-if [ -z "$_ROMP_REQ_GEN" ]; then
+# The early executability check applies only to the EXPLICIT seam: the authoritative pick
+# (gen or live) is the gate's, made under the lock and applied just before exec below.
+if [ -n "${ROMP_KERNEL_BIN:-}" ]; then
     [[ -x "$KERNEL" ]] || { echo "romp-serve: kernel not found/executable at $KERNEL" >&2; exit 1; }
 fi
 
@@ -237,9 +209,19 @@ import shutil as _sh
 def gen_valid(g, full):
     # VALIDATED bless (the v1.3.20 audit's P2): an existing directory counts only with a
     # matching .romp-gen manifest and executable kernel + serve — an empty or torn generation
-    # used to be blessed by its bare existence and then exec'd forever
+    # used to be blessed by its bare existence and then exec'd forever. Stat-gated,
+    # nonblocking, no-follow (the v1.3.21 audit's P1.4): a FIFO planted at the manifest name
+    # hung the blocking open() forever, UNDER the update lock.
+    mfp = os.path.join(g, ".romp-gen")
     try:
-        mf = open(os.path.join(g, ".romp-gen")).read().strip()
+        if not stat.S_ISREG(os.lstat(mfp).st_mode):
+            return False
+        mfd = os.open(mfp, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                      | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            mf = os.read(mfd, 4096).decode(errors="replace").strip()
+        finally:
+            os.close(mfd)
     except OSError:
         return False
     return (mf == full and os.access(os.path.join(g, "bin", "romp-kernel"), os.X_OK)
@@ -300,6 +282,54 @@ def arm_marker(commit):
         except OSError:
             pass
         return False
+def emit_pick():
+    # the AUTHORITATIVE launch pick, made UNDER the update lock (the v1.3.21 audit's P1.2):
+    # bash used to pick a generation BEFORE the gate even waited for the lock — an updater
+    # landing during that wait moved HEAD and the marker to B while the shell launched A.
+    # Every success exit of this gate passes through here; bash reads the pick file after
+    # the gate returns and launches exactly what was chosen under the lock.
+    pf = os.environ.get("ROMP_GATE_PICK") or ""
+    choice = "live"
+    hf = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True)
+    full = (hf.stdout or "").strip()
+    mtok2 = ""
+    try:
+        if stat.S_ISREG(os.lstat(mkp).st_mode):
+            mfd = os.open(mkp, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                          | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                mtok2 = (os.read(mfd, 4096).decode(errors="replace").split() or [""])[0]
+            finally:
+                os.close(mfd)
+    except FileNotFoundError:
+        mtok2 = ""
+    except OSError:
+        sys.exit(70)
+    if hf.returncode == 0 and len(full) >= 8:
+        g = os.path.join(gdir, "romp-run-" + full[:8])
+        ds = subprocess.run(["git", "-C", root, "status", "--porcelain"],
+                            capture_output=True, text=True)
+        is_dirty = bool(ds.returncode) or bool((ds.stdout or "")[:1])
+        mk_match = bool(mtok2) and (full.startswith(mtok2) or mtok2.startswith(full[:8]))
+        if (mk_match or not is_dirty) and gen_valid(g, full):
+            choice = "gen " + g
+        if mk_match and choice == "live":
+            sys.stderr.write("romp-serve: the update marker names HEAD but no verified "
+                             "generation exists at pick time — refusing live bytes\n")
+            sys.exit(70)
+        if mk_match and is_dirty:
+            sys.stderr.write("romp-serve: an update to %s just landed — launching its VERIFIED "
+                             "build; tracked edits in the checkout are ignored for this boot and "
+                             "run normally from the next spawn (the marker clears once the "
+                             "updated kernel is up)\n" % full[:8])
+    elif mtok2:
+        sys.exit(70)                   # armed marker + unreadable HEAD: never live (P1.1/P1.2)
+    if pf:
+        try:
+            with open(pf, "w") as pfh:
+                pfh.write(choice + "\n")
+        except OSError:
+            pass                       # bash keeps its live/seam default — never a hang
 # the UPDATE MARKER leg (the v1.3.20 audit's P1.2), under the same lock and BEFORE the
 # latch's no-latch early exit: while romp-restart-needed names HEAD, this boot must run the
 # verified generation — ensure it exists (validated bless or build) or refuse to start.
@@ -314,6 +344,13 @@ try:
                          "foreign state; heal by hand\n")
         sys.exit(70)
     mtok = (open(mkp).read().split() or [""])[0]
+    if not mtok:
+        # an EXISTING but EMPTY marker is unknown state, never absence (the v1.3.21 audit's
+        # P1.1: a torn arm read as no-marker and the boot took the dirty-live leg under the
+        # very intent record that forbids it)
+        sys.stderr.write("romp-serve: romp-restart-needed exists but is EMPTY — an unknown "
+                         "record is never absent; heal by hand\n")
+        sys.exit(70)
 except FileNotFoundError:
     mtok = ""
 except (OSError, ValueError):
@@ -349,6 +386,7 @@ try:
         sys.exit(70)                   # a FIFO/device blocks open() forever — unknown, refuse
     rawlines = [ln.strip() for ln in open(latch).read().splitlines() if ln.strip()]
 except FileNotFoundError:
+    emit_pick()
     sys.exit(0)                        # no latch: clear to start
 except (OSError, ValueError):
     sys.exit(70)                       # an EXISTING latch we cannot read — or DECODE: non-UTF-8
@@ -385,6 +423,7 @@ if cur8 not in lines:
         sys.exit(70)                   # fail closed (the v1.3.8 audit: a torn quarantine prefix
         #                                parsed as one line and was moot-removed into serving)
     os.remove(latch)                   # intent-only mismatch: the move never landed — moot,
+    emit_pick()
     sys.exit(0)                        # and the line's channel token dies with it
 def snap_install(commit):
     # the SNAPSHOT installer (the v1.3.16 audit's P1.1; the r44 verification extended it to
@@ -401,6 +440,9 @@ def snap_install(commit):
         _sh.rmtree(_snap, ignore_errors=True)
         return False
     _env = dict(os.environ, ROMP_INSTALL_TARGET=root)
+    _sirv = subprocess.run(["git", "-C", root, "rev-parse", commit], capture_output=True, text=True)
+    if _sirv.returncode == 0 and len((_sirv.stdout or "").strip()) >= 8:
+        _env["ROMP_INSTALL_COMMIT"] = (_sirv.stdout or "").strip()   # the immutable intent (P1.2)
     _rc = subprocess.run(["bash", os.path.join(_snap, "install.sh")], cwd=root, env=_env,
                          pass_fds=(fd,)).returncode
     _sh.rmtree(_snap, ignore_errors=True)
@@ -431,6 +473,7 @@ if not publish_line(cur_line):
                      "recorded — not starting this build under the OLD channel marker\n")
     sys.exit(70)                       # latch stays armed; the next retry publishes
 os.remove(latch)                       # healed — spent under the same lock
+emit_pick()
 sys.exit(0)
 GATEPY
 then
@@ -455,19 +498,23 @@ if [[ -n "$port" ]]; then
 fi
 export ROMP_SERVE_HOST="$host"
 export ROMP_KERNEL_NO_OPEN=1
-# RE-RESOLVE after the gate (the r48 verification): the gate's heal and marker legs can ARM
-# romp-restart-needed and build the generation AFTER the resolution above already picked live
-# bytes — without this recheck, the boot that completes a healed update exec'd the mutated
-# live kernel it had pre-resolved. The explicit ROMP_KERNEL_BIN seam still wins.
-if [ -z "${ROMP_KERNEL_BIN:-}" ] && [ -z "$_ROMP_REQ_GEN" ] && [ -n "${_RGD:-}" ] \
-        && [ -f "$_RGD/romp-restart-needed" ]; then
-    _RMARK2="$(head -1 "$_RGD/romp-restart-needed" 2>/dev/null | tr -cd '0-9a-f' || true)"
-    _RH8B="$(git -C "$ROMP_DIR" rev-parse --short=8 HEAD 2>/dev/null || true)"
-    if [ -n "$_RH8B" ] && [ "${_RMARK2:0:8}" = "$_RH8B" ] \
-            && [ -x "$_RGD/romp-run-$_RH8B/bin/romp-kernel" ]; then
-        KERNEL="$_RGD/romp-run-$_RH8B/bin/romp-kernel"
-        export ROMP_CHECKOUT="$ROMP_DIR"
-    fi
+# APPLY the gate's pick (the v1.3.21 audit's P1.2): the gate resolved gen-vs-live UNDER the
+# update lock — including a generation its own heal or marker leg just built — and wrote it to
+# the pick file. The explicit ROMP_KERNEL_BIN seam still wins; an empty pick (the gate exited
+# before picking: a non-git checkout) keeps the live default.
+if [ -z "${ROMP_KERNEL_BIN:-}" ] && [ -n "${_ROMP_PICK:-}" ] && [ -f "$_ROMP_PICK" ]; then
+    _PICK="$(head -1 "$_ROMP_PICK" 2>/dev/null || true)"
+    case "$_PICK" in
+        "gen "*)
+            KERNEL="${_PICK#gen }/bin/romp-kernel"
+            export ROMP_CHECKOUT="$ROMP_DIR"
+            ;;
+        live)
+            KERNEL="$ROMP_DIR/bin/romp-kernel"
+            unset ROMP_CHECKOUT
+            ;;
+    esac
 fi
+[ -n "${_ROMP_PICK:-}" ] && rm -f "$_ROMP_PICK"
 [[ -x "$KERNEL" ]] || { echo "romp-serve: kernel not found/executable at $KERNEL" >&2; exit 70; }
 exec "$PY" "$KERNEL"

@@ -1721,6 +1721,72 @@ class GenBuildLocal(unittest.TestCase):
                          "dir != target), so the very hop that ships the marker scheme boots "
                          "verified (the r48 verification)")
 
+    def test_a_retried_install_still_arms_the_marker(self):
+        # the v1.3.21 audit's P1.1: the generation helper exited on "already valid" BEFORE the
+        # marker block — a RETRY whose generation survived the prior attempt reported success
+        # with NO restart intent, and the boot took the dirty-live leg
+        import subprocess as sp
+        root, gd, sha8 = self._repo()
+        env = dict(os.environ, ROMP_INSTALL_TARGET=str(root), ROMP_SKIP_PREFLIGHT="1",
+                   ROMP_NO_GITHOOK="1", ROMP_NO_SDK="1", ROMP_NO_EXT="1", ROMP_NO_SERVICE="1",
+                   HOME=str(root.parent))
+        real = os.path.join(os.path.dirname(BIN), "install.sh")
+        ran = sp.run(["bash", real], env=env, capture_output=True, text=True, timeout=120,
+                     cwd=str(root))
+        self.assertEqual(ran.returncode, 0, ran.stderr[-500:])
+        (gd / "romp-restart-needed").unlink()          # the crash between install and restart
+        ran2 = sp.run(["bash", real], env=env, capture_output=True, text=True, timeout=120,
+                      cwd=str(root))                   # the RETRY: generation already valid
+        self.assertEqual(ran2.returncode, 0, ran2.stderr[-500:])
+        self.assertTrue((gd / "romp-restart-needed").exists(),
+                        "the retry re-armed the marker — validation success falls THROUGH to "
+                        "arming, never exits before it (the v1.3.21 audit's P1.1)")
+
+    def test_install_honors_the_immutable_intended_commit(self):
+        # the v1.3.21 audit's P1.2: GENPY derived its target from live HEAD, which a concurrent
+        # mover races — the update built B while reporting A. Updaters pass the verified full
+        # sha in ROMP_INSTALL_COMMIT; it wins over whatever HEAD says at read time.
+        import subprocess as sp
+        root, gd, sha8 = self._repo()
+        first = sp.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                       capture_output=True, text=True).stdout.strip()
+        (root / "later.txt").write_text("x")
+        sp.run(["git", "-C", str(root), "add", "-A"], check=True)
+        sp.run(["git", "-C", str(root), "-c", "user.email=t@t", "-c", "user.name=t",
+                "commit", "-qm", "later"], check=True)          # HEAD moves past the intent
+        env = dict(os.environ, ROMP_INSTALL_TARGET=str(root), ROMP_INSTALL_COMMIT=first,
+                   ROMP_SKIP_PREFLIGHT="1", ROMP_NO_GITHOOK="1", ROMP_NO_SDK="1",
+                   ROMP_NO_EXT="1", ROMP_NO_SERVICE="1", HOME=str(root.parent))
+        real = os.path.join(os.path.dirname(BIN), "install.sh")
+        ran = sp.run(["bash", real], env=env, capture_output=True, text=True, timeout=120,
+                     cwd=str(root))
+        self.assertEqual(ran.returncode, 0, ran.stderr[-500:])
+        gen = gd / ("romp-run-" + first[:8])
+        self.assertEqual((gen / ".romp-gen").read_text().strip(), first,
+                         "the INTENDED commit was built and manifested — not the raced HEAD")
+        self.assertEqual((gd / "romp-restart-needed").read_text().strip(), first,
+                         "…and the marker names the intent too")
+        ran2 = sp.run(["bash", real], env=dict(env, ROMP_INSTALL_COMMIT="not-a-sha"),
+                      capture_output=True, text=True, timeout=120, cwd=str(root))
+        self.assertNotEqual(ran2.returncode, 0, "a malformed intent is refused, never guessed")
+
+    def test_gen_build_local_never_hangs_on_a_fifo_manifest(self):
+        # the v1.3.21 audit's P1.4: the blocking open() on .romp-gen hung forever on a planted
+        # FIFO — under the update lock on several callers. Stat-gated + nonblocking now.
+        root, gd, sha8 = self._repo()
+        with mock.patch.object(km, "ROOT", root):
+            ok, why = km._gen_build_local(sha8)
+            self.assertTrue(ok, why)
+        gen = gd / ("romp-run-" + sha8)
+        (gen / ".romp-gen").unlink()
+        os.mkfifo(str(gen / ".romp-gen"))
+        with mock.patch.object(km, "ROOT", root):
+            ok2, why2 = km._gen_build_local(sha8)      # would HANG before the stat gate
+        # the FIFO invalidates the bless; the rebuild rm -rf's the torn dir and republishes
+        self.assertTrue(ok2, why2)
+        self.assertEqual((gen / ".romp-gen").read_text().strip()[:8], sha8,
+                         "the torn generation was rebuilt with a regular manifest")
+
     def test_install_sh_fails_loudly_when_the_generation_cannot_build(self):
         # fail closed: an install that cannot produce the verified build must not complete —
         # the caller's latch stays armed for the retry (the v1.3.20 audit's P1.1)
@@ -1836,18 +1902,41 @@ class DistGenerationPublish(unittest.TestCase):
 
 
 class RestartMarkerClear(unittest.TestCase):
-    """the r45 verification: _kernel_sha()'s -dirty suffix defeated both prefix checks, so the
-    marker never cleared on a dirty tree and the restart banner nagged forever."""
+    """the r45 verification (the -dirty suffix defeated the prefix checks) + the v1.3.21 audit's
+    P1.3: the marker is consumed ONLY by a kernel running FROM the marker's generation
+    (ROMP_CHECKOUT, serve's gen-leg tell) — a hand-run live kernel used to clear the restart's
+    durable retry evidence while running exactly the bytes the marker exists to replace."""
 
     def test_a_dirty_kernel_sha_still_clears_its_own_marker(self):
+        # the r45 case, now under generation attestation: serve exports ROMP_CHECKOUT on the
+        # gen leg, and dirty-vs-clean stays the tree's state, not the running commit's identity
         import pathlib
         with tempfile.TemporaryDirectory() as td:
             gd = pathlib.Path(td)
             (gd / "romp-restart-needed").write_text("a" * 40 + "\n")
             with mock.patch.object(km, "_update_git_dir", return_value=gd), \
-                 mock.patch.object(km, "_kernel_sha", return_value="a" * 8 + "-dirty"):
+                 mock.patch.object(km, "_kernel_sha", return_value="a" * 8 + "-dirty"), \
+                 mock.patch.dict(km.os.environ, {"ROMP_CHECKOUT": td}):
                 km._clear_restart_marker_if_current()
             self.assertFalse((gd / "romp-restart-needed").exists())
+
+    def test_a_live_bytes_kernel_never_consumes_the_marker(self):
+        # the v1.3.21 audit's P1.3, executed: a direct bin/romp-kernel run (no ROMP_CHECKOUT —
+        # live bytes by definition) matched the sha and cleared the marker, erasing the retry
+        # evidence while the verified generation had never booted
+        import pathlib
+        with tempfile.TemporaryDirectory() as td:
+            gd = pathlib.Path(td)
+            (gd / "romp-restart-needed").write_text("a" * 40 + "\n")
+            env = dict(km.os.environ)
+            env.pop("ROMP_CHECKOUT", None)
+            with mock.patch.object(km, "_update_git_dir", return_value=gd), \
+                 mock.patch.object(km, "_kernel_sha", return_value="a" * 8), \
+                 mock.patch.dict(km.os.environ, env, clear=True):
+                km._clear_restart_marker_if_current()
+            self.assertTrue((gd / "romp-restart-needed").exists(),
+                            "live bytes fulfil nothing — the marker's intent is the VERIFIED "
+                            "build booting, and the record must survive until it does")
 
     def test_a_marker_for_a_different_commit_stays(self):
         import pathlib
@@ -1855,10 +1944,21 @@ class RestartMarkerClear(unittest.TestCase):
             gd = pathlib.Path(td)
             (gd / "romp-restart-needed").write_text("b" * 40 + "\n")
             with mock.patch.object(km, "_update_git_dir", return_value=gd), \
-                 mock.patch.object(km, "_kernel_sha", return_value="a" * 8):
+                 mock.patch.object(km, "_kernel_sha", return_value="a" * 8), \
+                 mock.patch.dict(km.os.environ, {"ROMP_CHECKOUT": td}):
                 km._clear_restart_marker_if_current()
             self.assertTrue((gd / "romp-restart-needed").exists(),
                             "the running kernel is not the intended one — the record stands")
+
+    def test_the_clear_runs_after_the_bind(self):
+        # the v1.3.21 audit's P1.3, second half: clearing before the listener existed erased
+        # the retry evidence for a boot that could still fail to bind
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        i_bind = src.index("srv = ThreadingHTTPServer((BIND, PORT), Handler)")
+        i_clear = src.index("_clear_restart_marker_if_current()                         # this boot IS")
+        self.assertLess(i_bind, i_clear,
+                        "the marker clear sits AFTER the bind — the one externally observable "
+                        "health event this process can offer before serving")
 
 
 class UiOnlyConverge(unittest.TestCase):

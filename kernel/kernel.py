@@ -2042,6 +2042,43 @@ def _replay_ui_op_spool():
         _mark_views_dirty()
 
 
+def _views_rename_refs(d, old, new):
+    """Rename migrates every NAME reference atomically (the v1.3.21 audit's P2): the actives
+    lenses and tagOrder key tags by name — a rename stranded the old name in both, silently
+    emptying the lens that selected it."""
+    if isinstance(d.get("tagOrder"), list):
+        d["tagOrder"] = [new if n == old else n for n in d["tagOrder"]]
+    for lens in (d.get("actives") or {}).values():
+        if isinstance(lens, dict) and isinstance(lens.get("tags"), list):
+            lens["tags"] = [new if n == old else n for n in lens["tags"]]
+
+
+def _views_drop_refs(d, name):
+    """Delete drops the tag's name from tagOrder and every lens (the v1.3.21 audit's P2:
+    deleting a selected tag left the lens referencing nothing and HID every row) — unless the
+    name survives elsewhere in the union: another local tag (pre-uniqueness data) or an
+    attached kernel's remote tag, where the lens deliberately still means something."""
+    if any(t.get("name") == name for t in d.get("tags") or []):
+        return
+    try:
+        for r in _remotes.values():
+            for rt in ((r.get("views") or {}).get("tags") or []):
+                if rt.get("name") == name:
+                    return
+    except Exception:
+        pass
+    if isinstance(d.get("tagOrder"), list):
+        d["tagOrder"] = [n for n in d["tagOrder"] if n != name]
+    acts = d.get("actives") or {}
+    for sf in list(acts):
+        lens = acts[sf]
+        if isinstance(lens, dict) and isinstance(lens.get("tags"), list) and name in lens["tags"]:
+            lens["tags"] = [n for n in lens["tags"] if n != name]
+            if not lens["tags"] and not lens.get("none"):
+                acts[sf] = {"all": True}   # a lens with nothing left shows everything, never
+                #                            an empty screen
+
+
 def _apply_views_ops(ops):
     """Targeted, name-or-id-keyed view-tag operations applied against the CURRENT blob under the
     identity lock — two concurrent editors COMPOSE instead of last-writer-wins, and a kernel-down
@@ -2096,8 +2133,12 @@ def _apply_views_ops(ops):
             cr = op.get("create")
             if isinstance(cr, dict):
                 cid = str(cr.get("id") or "")
-                if cid and not any(t["id"] == cid for t in d["tags"]):
-                    d["tags"].append({"id": cid, "name": str(cr.get("name") or "tag"),
+                crname = str(cr.get("name") or "tag")
+                # unique ids AND unique names (the v1.3.21 audit's P2): tags are name-addressed
+                # across every edit wire, so a duplicate name makes half the grammar ambiguous
+                if cid and not any(t["id"] == cid for t in d["tags"]) \
+                        and not any(t.get("name") == crname for t in d["tags"]):
+                    d["tags"].append({"id": cid, "name": crname,
                                       "color": str(cr.get("color") or ""),
                                       "members": [m for m in (pair(s) for s in (cr.get("members") or []))
                                                   if m]})
@@ -2116,11 +2157,18 @@ def _apply_views_ops(ops):
                 t["members"] = [m for m in t["members"]
                                 if (m.get("host") or "", m.get("sid")) not in gone]
             if isinstance(op.get("rename"), str) and op["rename"].strip():
-                t["name"] = op["rename"].strip()
+                _newname = op["rename"].strip()
+                if not any(x is not t and x.get("name") == _newname for x in d["tags"]):
+                    _oldname = t.get("name")
+                    t["name"] = _newname
+                    _views_rename_refs(d, _oldname, _newname)   # lenses + tagOrder follow (P2)
+                # a duplicate target name drops quietly, grammar-style: name-keyed addressing
+                # would break for BOTH tags (the v1.3.21 audit's P2)
             if isinstance(op.get("color"), str):
                 t["color"] = op["color"]
             if op.get("delete") is True:
                 d["tags"] = [x for x in d["tags"] if x is not t]
+                _views_drop_refs(d, t.get("name"))              # lenses + tagOrder follow (P2)
                 if d.get("active") == t.get("id"):
                     d["active"] = "all"
         d = _norm_timeline_views(jd.canonicalize_timeline_views(d))
@@ -2965,7 +3013,10 @@ def _run_update(tag):
         + "  rm -rf %s && mkdir -p %s || return 1\n" % (snapdir, snapdir)
         + "  git archive \"$1\" | tar -x -C %s || { rm -rf %s; return 1; }\n" % (snapdir, snapdir)
         + "  [ -e %s/install.sh ] || { rm -rf %s; return 1; }\n" % (snapdir, snapdir)
-        + "  ROMP_INSTALL_TARGET=\"$(pwd)\" bash %s/install.sh\n" % snapdir
+        # the IMMUTABLE intended commit rides into install.sh (the v1.3.21 audit's P1.2):
+        # GENPY must never re-derive its target from a HEAD a concurrent mover can race
+        + "  SIFULL=$(git rev-parse \"$1\" 2>/dev/null)\n"
+        + "  ROMP_INSTALL_TARGET=\"$(pwd)\" ROMP_INSTALL_COMMIT=\"$SIFULL\" bash %s/install.sh\n" % snapdir
         + "  SIRC=$?\n"
         + "  rm -rf %s\n" % snapdir
         + "  return $SIRC\n"
@@ -2978,6 +3029,8 @@ def _run_update(tag):
         # matching .romp-gen full-sha manifest and executable kernel + serve — an empty or torn
         # generation used to be blessed by bare existence and then exec'd forever.
         + "gen_ok() {\n"
+        # [ -f ] first (the v1.3.21 audit's P1.4): cat on a planted FIFO hangs this shell forever
+        + "  [ -f \"$GBGD/romp-run-$1/.romp-gen\" ] || return 1\n"
         + "  [ \"$(cat \"$GBGD/romp-run-$1/.romp-gen\" 2>/dev/null)\" = \"$2\" ] "
           "&& [ -x \"$GBGD/romp-run-$1/bin/romp-\"kernel ] && [ -x \"$GBGD/romp-run-$1/bin/romp-serve\" ]\n"
         + "}\n"
@@ -4150,9 +4203,19 @@ def _gen_build_local(commit):
 
     def _ok(p):
         # VALIDATED bless (the v1.3.20 audit's P2): a matching .romp-gen full-sha manifest and
-        # executable kernel + serve — bare existence blessed an empty directory forever
+        # executable kernel + serve — bare existence blessed an empty directory forever.
+        # Stat-gated, nonblocking, no-follow (the v1.3.21 audit's P1.4): a FIFO planted at the
+        # manifest name hung the blocking open() — under the update lock, on several callers.
+        mfp = os.path.join(p, ".romp-gen")
         try:
-            mf = open(os.path.join(p, ".romp-gen")).read().strip()
+            if not stat.S_ISREG(os.lstat(mfp).st_mode):
+                return False
+            mfd = os.open(mfp, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                          | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                mf = os.read(mfd, 4096).decode(errors="replace").strip()
+            finally:
+                os.close(mfd)
         except OSError:
             return False
         return (mf == full and os.access(os.path.join(p, "bin", "romp-kernel"), os.X_OK)
@@ -4216,7 +4279,12 @@ def _snap_install_local(commit, lock_fd=None, timeout=600):
         tr = subprocess.run(["tar", "-x", "-C", snap], input=ar.stdout, timeout=120)
         if tr.returncode or not os.path.exists(os.path.join(snap, "install.sh")):
             return False, "unpacking the install snapshot failed"
+        rv = subprocess.run(["git", "-C", str(ROOT), "rev-parse", str(commit)],
+                            capture_output=True, text=True, timeout=30)
         env = dict(os.environ, ROMP_INSTALL_TARGET=str(ROOT))
+        if rv.returncode == 0 and len((rv.stdout or "").strip()) >= 8:
+            # the immutable intended commit (the v1.3.21 audit's P1.2)
+            env["ROMP_INSTALL_COMMIT"] = (rv.stdout or "").strip()
         inst = subprocess.run(["bash", os.path.join(snap, "install.sh")], cwd=str(ROOT),
                               env=env, capture_output=True, text=True, timeout=timeout,
                               pass_fds=(lock_fd,) if lock_fd is not None else ())
@@ -12977,21 +13045,28 @@ def _prune_stale_generations():
 
 
 def _clear_restart_marker_if_current():
-    """The p2p apply wrapper arms romp-restart-needed BEFORE it spends the install latch and
-    clears it only on a verified healthy launch (the v1.3.17 audit's P1.2: an exec failure
+    """Every update transaction arms romp-restart-needed BEFORE it spends the install latch;
+    it clears only on a verified healthy launch (the v1.3.17 audit's P1.2: an exec failure
     after the latch was spent used to leave NO durable restart evidence — RESETFAIL with
-    latch_exists=False). A kernel that boots AS the marker's target is that intent fulfilled —
-    clear it here so a wrapper that died between probe and cleanup leaves no stale record. A
-    marker naming a DIFFERENT commit stays: the running kernel is not the intended one, and
-    the main-drift restart banner (checkout != kernel) is the surface that says so."""
+    latch_exists=False). The intent is fulfilled ONLY by a kernel that (a) runs FROM the
+    marker's generation — ROMP_CHECKOUT is serve's gen-leg tell, so a hand-run
+    `bin/romp-kernel` on dirty live bytes never consumes the record (the v1.3.21 audit's
+    P1.3) — and (b) has BOUND its listener (the caller runs this after the bind; a boot that
+    dies binding must leave the retry evidence standing). A marker naming a DIFFERENT commit
+    stays: the running kernel is not the intended one, and the main-drift restart banner
+    (checkout != kernel) is the surface that says so."""
     gd = _update_git_dir()
     if not gd:
         return
     mk = gd / "romp-restart-needed"
     try:
-        want = mk.read_text().strip()
-    except OSError:
+        want = mk.read_text().strip().split()[0] if mk.exists() else ""
+    except (OSError, IndexError):
         return
+    if not os.environ.get("ROMP_CHECKOUT"):
+        return                          # live bytes (a dev run, a direct bin/romp-kernel): the
+    #                                     marker's intent — the VERIFIED build boots — is not
+    #                                     fulfilled, however well the shas happen to match
     ks = _kernel_sha()
     if ks.endswith("-dirty"):
         ks = ks[:-len("-dirty")]        # the suffix defeats both prefix checks, and dirty-vs-clean
@@ -13175,10 +13250,29 @@ def _pr_watch_stamped_deliver(r, verdict, detail):
     audit)."""
     fk = _pr_watch_fail_marker(r, verdict)
     if r.get("sent") == verdict:
-        if fk.exists():
-            r.pop("sent", None)                       # the stamp survived a KNOWN failure — it is
-        else:                                         # not evidence of delivery; retry below
-            return True                               # stamped: delivered (or crashed mid-window)
+        try:
+            fk_state = fk.read_text().strip() if fk.exists() else ""
+        except OSError:
+            fk_state = ""
+        if fk_state == "attempted":
+            # the SECOND crash shape (the v1.3.21 audit's P2): a retry already ran and may have
+            # delivered before dying between injection and marker cleanup — retrying again is
+            # the duplicate. At-most-once wins the ambiguity: retire on the stamp.
+            try:
+                fk.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return True
+        if fk_state:
+            # a KNOWN failure that never got a retry: mark this attempt durably BEFORE the
+            # injection, so a crash mid-retry reads as ambiguous (above), never as pending
+            try:
+                fk.write_text("attempted\n")
+            except OSError:
+                return True                          # can't bound the retry — retire, at-most-once
+            r.pop("sent", None)                      # the stamp survived a KNOWN failure — it is
+        else:                                        # not evidence of delivery; retry below
+            return True                              # stamped: delivered (or crashed mid-window)
     r["sent"] = verdict
     if not _pr_watches_save():
         # the stamp is NOT durable — delivering now would re-mail after a crash (the v1.3.18
@@ -13195,7 +13289,9 @@ def _pr_watch_stamped_deliver(r, verdict, detail):
     if not _pr_watches_save():
         try:
             fk.parent.mkdir(parents=True, exist_ok=True)
-            fk.write_text(verdict + "\n")
+            fk.write_text("pending\n")              # one bounded retry (the v1.3.21 audit's P2:
+            #                                          the marker used to allow retry FOREVER,
+            #                                          and a crash mid-retry re-delivered)
         except OSError:
             sys.stderr.write("pr-watch: delivery for %s#%s failed AND neither the stamp clear "
                              "nor the failure marker could be persisted — a restart may retire "
@@ -13721,6 +13817,7 @@ def _update_remote(host):
         "        return False\n"
         "    env=dict(os.environ)\n"
         '    env["ROMP_INSTALL_TARGET"]=r\n'
+        '    env["ROMP_INSTALL_COMMIT"]=commit\n'
         '    rc=subprocess.run(["bash",os.path.join(sd,"install.sh")],cwd=r,env=env,pass_fds=(fd,)).returncode\n'
         "    shutil.rmtree(sd,ignore_errors=True)\n"
         "    return rc==0\n"
@@ -13735,8 +13832,17 @@ def _update_remote(host):
         # matching .romp-gen full-sha manifest and executable kernel + serve — bare existence
         # blessed an empty generation and the full transaction reported success on it
         "def gen_ok(g,full):\n"
+        # stat-gated, nonblocking, no-follow (the v1.3.21 audit's P1.4): a FIFO at the manifest
+        # name hung the blocking open under the update flock
+        '    mfp=os.path.join(g,".romp-gen")\n'
         "    try:\n"
-        '        mf=open(os.path.join(g,".romp-gen")).read().strip()\n'
+        "        if not stat.S_ISREG(os.lstat(mfp).st_mode):\n"
+        "            return False\n"
+        '        mfd=os.open(mfp,os.O_RDONLY|getattr(os,"O_NONBLOCK",0)|getattr(os,"O_NOFOLLOW",0))\n'
+        "        try:\n"
+        '            mf=os.read(mfd,4096).decode(errors="replace").strip()\n'
+        "        finally:\n"
+        "            os.close(mfd)\n"
         "    except OSError:\n"
         "        return False\n"
         '    return (mf==full and os.access(os.path.join(g,"bin","romp-"+"kernel"),os.X_OK)\n'
@@ -33979,7 +34085,6 @@ def main():
     _known_load()                                              # remembered past hosts (popover's re-attach rows)
     _remotes_load()                                            # re-attach remote kernels from a prior run
     _pr_watches_load()                                         # re-arm PR-landing watches (same intent rule)
-    _clear_restart_marker_if_current()                         # this boot IS the restart the marker wanted (P1.2)
     _prune_stale_generations()                                 # rr/pull hosts have no wrapper prune (r46)
     _heal_dist_conversion()                                    # the conversion's hard-death window (r47)
     _replay_ui_op_spool()                                      # gestures queued while no kernel ran — applied
@@ -33989,6 +34094,11 @@ def main():
     threading.Thread(target=_ensure_postal_bus, daemon=True).start()   # a sessionless machine still needs its bus
     threading.Thread(target=_tunnel_supervisor, daemon=True).start()   # keep ssh tunnels alive + poll host↔sid map
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
+    # AFTER the bind (the v1.3.21 audit's P1.3): the marker is the restart's durable retry
+    # evidence, and clearing it before the listener existed erased that evidence for a boot
+    # that could still fail to bind — the very failure the marker must survive. The bind is
+    # the externally observable health event this process can offer before serving.
+    _clear_restart_marker_if_current()                         # this boot IS the restart the marker wanted (P1.2)
     url = "http://127.0.0.1:%d" % PORT
     sys.stderr.write("romp-kernel: serving the ported UI at %s  (Ctrl-C to stop)\n" % url)
     sys.stderr.write("romp-kernel: records under %s ; bundles from %s\n" % (jd.STATE, DIST))

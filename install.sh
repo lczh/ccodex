@@ -248,56 +248,79 @@ fi
 # install) skips on its own — no git dir means no generations anywhere.
 if [[ -z "${ROMP_NO_GEN:-}" ]]; then
     if ! python3 - "$ROMP_DIR" "$ROMP_CODE" <<'GENPY'
-import os, shutil, subprocess, sys
+import os, shutil, stat, subprocess, sys
 root, code = sys.argv[1], sys.argv[2]
 gd = subprocess.run(["git", "-C", root, "rev-parse", "--absolute-git-dir"],
                     capture_output=True, text=True)
 gdir = (gd.stdout or "").strip()
 if gd.returncode or not gdir:
     sys.exit(0)                        # not a git checkout: no generations here, nothing to build
-hh = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True)
-full = (hh.stdout or "").strip()
-if hh.returncode or len(full) < 8:
-    sys.stderr.write("install.sh: cannot resolve HEAD for the runtime generation\n")
+# the IMMUTABLE intended commit (the v1.3.21 audit's P1.2): every updater exports
+# ROMP_INSTALL_COMMIT — the verified target's full sha, fixed BEFORE any of this ran. Deriving
+# it from live HEAD raced a concurrent mover: the executed schedule built B while the update
+# reported A successful. A hand-run install (no env) reads HEAD once and carries that ONE
+# value through build, validation, and the marker.
+full = (os.environ.get("ROMP_INSTALL_COMMIT") or "").strip()
+if full and (len(full) < 8 or any(c not in "0123456789abcdef" for c in full)):
+    sys.stderr.write("install.sh: ROMP_INSTALL_COMMIT %r is not a commit sha\n" % full[:48])
     sys.exit(1)
+if not full:
+    hh = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True)
+    full = (hh.stdout or "").strip()
+    if hh.returncode or len(full) < 8:
+        sys.stderr.write("install.sh: cannot resolve HEAD for the runtime generation\n")
+        sys.exit(1)
 gen = os.path.join(gdir, "romp-run-" + full[:8])
 def valid(p):
+    mf_path = os.path.join(p, ".romp-gen")
     try:
-        mf = open(os.path.join(p, ".romp-gen")).read().strip()
+        # stat-gated, nonblocking, no-follow (the v1.3.21 audit's P1.4): a FIFO planted at the
+        # manifest name hung the blocking open() forever — under the update lock, on some legs
+        if not stat.S_ISREG(os.lstat(mf_path).st_mode):
+            return False
+        fd = os.open(mf_path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            mf = os.read(fd, 4096).decode(errors="replace").strip()
+        finally:
+            os.close(fd)
     except OSError:
         return False
     return (mf == full and os.access(os.path.join(p, "bin", "romp-kernel"), os.X_OK)
             and os.access(os.path.join(p, "bin", "romp-serve"), os.X_OK))
+built = False
 if os.path.isdir(gen):
     if valid(gen):
-        sys.exit(0)
-    shutil.rmtree(gen, ignore_errors=True)
-tmp = gen + ".tmp.%d" % os.getpid()
-shutil.rmtree(tmp, ignore_errors=True)
-ar = subprocess.run(["git", "-C", root, "archive", full], capture_output=True)
-if ar.returncode or not ar.stdout:
-    sys.stderr.write("install.sh: git archive failed for the runtime generation\n")
-    sys.exit(1)
-os.makedirs(tmp)
-tr = subprocess.run(["tar", "-x", "-C", tmp], input=ar.stdout)
-try:
-    with open(os.path.join(tmp, ".romp-gen"), "w") as mh:
-        mh.write(full + "\n")
-except OSError:
-    tr = None
-if tr is None or tr.returncode \
-        or not os.access(os.path.join(tmp, "bin", "romp-kernel"), os.X_OK) \
-        or not os.access(os.path.join(tmp, "bin", "romp-serve"), os.X_OK):
+        built = True                   # NEVER an early exit (the v1.3.21 audit's P1.1): a
+    else:                              # RETRY whose generation survived the prior attempt
+        shutil.rmtree(gen, ignore_errors=True)   # still needs the marker armed below
+if not built:
+    tmp = gen + ".tmp.%d" % os.getpid()
     shutil.rmtree(tmp, ignore_errors=True)
-    sys.stderr.write("install.sh: the runtime generation did not unpack to a usable tree\n")
-    sys.exit(1)
-try:
-    os.rename(tmp, gen)                # fails on an existing target: a concurrent winner is
-except OSError:                        # blessed only if VALID, never nested into (r47/v1.3.20)
-    shutil.rmtree(tmp, ignore_errors=True)
-    if not valid(gen):
-        sys.stderr.write("install.sh: publishing the runtime generation failed\n")
+    ar = subprocess.run(["git", "-C", root, "archive", full], capture_output=True)
+    if ar.returncode or not ar.stdout:
+        sys.stderr.write("install.sh: git archive failed for the runtime generation\n")
         sys.exit(1)
+    os.makedirs(tmp)
+    tr = subprocess.run(["tar", "-x", "-C", tmp], input=ar.stdout)
+    try:
+        with open(os.path.join(tmp, ".romp-gen"), "w") as mh:
+            mh.write(full + "\n")
+    except OSError:
+        tr = None
+    if tr is None or tr.returncode \
+            or not os.access(os.path.join(tmp, "bin", "romp-kernel"), os.X_OK) \
+            or not os.access(os.path.join(tmp, "bin", "romp-serve"), os.X_OK):
+        shutil.rmtree(tmp, ignore_errors=True)
+        sys.stderr.write("install.sh: the runtime generation did not unpack to a usable tree\n")
+        sys.exit(1)
+    try:
+        os.rename(tmp, gen)            # fails on an existing target: a concurrent winner is
+    except OSError:                    # blessed only if VALID, never nested into (r47/v1.3.20)
+        shutil.rmtree(tmp, ignore_errors=True)
+        if not valid(gen):
+            sys.stderr.write("install.sh: publishing the runtime generation failed\n")
+            sys.exit(1)
 # an UPDATER-driven install (snapshot code dir != target — every updater sets this split, a
 # hand-run install never does) also ARMS the update marker: the N−1 updater that ships this
 # fix predates the marker scheme entirely, so without this the very hop that delivers the
