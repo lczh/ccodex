@@ -522,12 +522,26 @@ class Lifecycle(unittest.TestCase):
                 raise RuntimeError("synthetic unavailable client")
             return fake
 
+        # a HUGE backoff floor makes the no-hot-spin phase DETERMINISTIC (the r48 release
+        # gate, twice on the same runner): the real 0.25s floor raced the main thread — a
+        # descheduled runner let the LEGITIMATE 250ms retry fire before the assertion ran,
+        # and the test read its own backoff expiring as a hot spin. With the floor pinned
+        # high, a second attempt inside the observation window can only be a real hot spin;
+        # the recovery phase then releases the backoff EXPLICITLY instead of racing a timer.
+        saved_floor = cb.CLIENT_RETRY_MIN
+        cb.CLIENT_RETRY_MIN = 30.0
+        self.addCleanup(setattr, cb, "CLIENT_RETRY_MIN", saved_floor)
         be, _, _ = build(factory=flaky_factory)
         sid = be.spawn("web", "/TESTDIR")
         self.assertTrue(be.send(sid, "retry me"))
-        time.sleep(0.03)
+        self.assertTrue(until(lambda: len(attempts) == 1), "the first attempt fires")
+        time.sleep(0.05)
         self.assertEqual(len(attempts), 1, "unavailable client must not hot-spin")
-        self.assertTrue(until(lambda: len(attempts) == 2 and not be.busy(sid), timeout=3))
+        with be._client_lock:
+            be._client_retry_at = 0.0                  # the explicit release, not a timer race
+        for _, s in be._session_items():
+            s.kick.set()
+        self.assertTrue(until(lambda: len(attempts) >= 2 and not be.busy(sid), timeout=3))
         self.assertEqual(len(fake.called("thread_start")), 1,
                          "the pending placeholder must become a real Codex thread")
         self.assertFalse(be.pending_queued(sid))
