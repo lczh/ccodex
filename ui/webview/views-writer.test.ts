@@ -15,7 +15,7 @@ import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { anchorViewsRev, consumeViewsAck, postViewsOps, postViewsWrite,
+import { anchorViewsRev, consumeViewsAck, notifyViewsTransportReset, postViewsOps, postViewsWrite,
          resetViewsWriterForTest } from "../../ui/webview/views-writer";
 
 const p = (f: string) => path.resolve(process.cwd(), "..", "ui", "webview", f);
@@ -97,9 +97,11 @@ test("executed: a RAISED payload anchor releases a wedged OPS queue — but neve
   anchorViewsRev({ rev: 4 });                                         // same rev: NOT evidence — still wedged
   assert.equal(posts.length, 1, "an equal-rev payload releases nothing");
   anchorViewsRev({ rev: 5 });                                         // the kernel moved past O1
-  assert.equal(posts.length, 2, "the raised payload releases the wedged OPS queue");
+  assert.equal(posts.length, 2, "the raised payload releases the wedge");
   assert.equal(posts[1].type, "setTimelineViewsOps");
-  assert.deepEqual(posts[1].ops, [{ actives: { chat: { all: true } } }]);
+  assert.deepEqual(posts[1].ops, [{ actives: { outline: { none: true } } }],
+    "the UNACKED head itself re-posts (r49 keep-until-ack: its effect may never have applied; "
+    + "ops are idempotent, so the replay is safe) — the queue drains in order behind it");
   // …but a queued BLOB holds the wedge instead of risking the erase
   resetViewsWriterForTest();
   const posts2: any[] = [];
@@ -108,6 +110,24 @@ test("executed: a RAISED payload anchor releases a wedged OPS queue — but neve
   postViewsWrite((m) => posts2.push(m), { active: "all", tags: [], rev: 4 } as any);
   anchorViewsRev({ rev: 5 });
   assert.equal(posts2.length, 1, "a stale-rendered queued blob is never released by the raise");
+});
+
+test("executed: a transport reconnect REPLAYS the unacked head — a send lost on the dead socket survives (r49)", () => {
+  // the v1.3.21 audit's P2.8: a send accepted by the browser on a socket that then died was
+  // simply gone — the slot waited forever and no reconnect replayed it. The head stays queued
+  // until its ack; the reconnect resets the slot and re-posts it.
+  resetViewsWriterForTest();
+  const posts: any[] = [];
+  const post = (m: any) => posts.push(m);
+  anchorViewsRev({ rev: 4 });
+  postViewsOps(post, [{ actives: { chat: { all: true } } }]);   // sent… and lost with the socket
+  assert.equal(posts.length, 1);
+  notifyViewsTransportReset();                                  // the fresh socket's open event
+  assert.equal(posts.length, 2, "the reconnect re-posts the unacked head");
+  assert.deepEqual(posts[1].ops, posts[0].ops, "…the SAME write (idempotent ops, CAS'd blobs)");
+  assert.equal(consumeViewsAck({ type: "viewsAck", ok: true, rev: 5 }), true);
+  postViewsWrite(post, { active: "all", tags: [] } as any);
+  assert.equal(posts[2].views.baseRev, 5, "the queue drains normally after the replayed ack");
 });
 
 test("executed: a viewsAck re-anchors the counter — accepted and refused alike; malformed revs change nothing", () => {

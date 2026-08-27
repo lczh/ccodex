@@ -58,9 +58,9 @@ export function anchorViewsRev(v: SessionViews | { rev?: unknown } | null | unde
 
 function pump(): void {
   if (!poster || outstanding > 0 || !queue.length) return;
-  const w = queue.shift()!;
-  outstanding = 1;
-  outstandingKind = w.kind;
+  const w = queue[0];               // the head STAYS queued until its ack retires it (the
+  outstanding = 1;                  // v1.3.21 audit's P2.8: a send lost on an OPEN socket that
+  outstandingKind = w.kind;         // then died was gone — nothing could ever replay it)
   if (w.kind === "ops") {
     poster({ type: "setTimelineViewsOps", ops: w.ops });
     return;
@@ -83,6 +83,7 @@ export function consumeViewsAck(m: unknown, onRefused?: () => void): boolean {
   if (!a || a.type !== "viewsAck") return false;
   outstanding = 0;
   outstandingKind = null;
+  queue.shift();                    // the acked head retires NOW (kept queued for replay until here)
   const rev = typeof a.rev === "number" ? a.rev : null;
   if (a.ok === false) {
     if (rev !== null) confirmedRev = rev;   // the served CAS truth — downward is legitimate HERE
@@ -91,6 +92,17 @@ export function consumeViewsAck(m: unknown, onRefused?: () => void): boolean {
   } else if (rev !== null) confirmedRev = Math.max(confirmedRev, rev);
   pump();
   return true;
+}
+
+/** Transport reconnected (the v1.3.21 audit's P2.8): a send lost on the OLD socket — accepted
+ *  by the browser, never delivered — left the one outstanding slot waiting forever, and the
+ *  reconnect neither reloads this page nor replays it. The head is still queued (pump never
+ *  drops it before its ack), and every write is safe to re-send: targeted ops are idempotent
+ *  absolute gestures, and a blob re-post is CAS-protected. Reset the slot and re-post. */
+export function notifyViewsTransportReset(): void {
+  outstanding = 0;
+  outstandingKind = null;
+  pump();
 }
 
 /** Queue one whole-blob write. The blob is a clone of a pushed payload, so it may carry that

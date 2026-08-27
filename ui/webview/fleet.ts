@@ -6,7 +6,8 @@
 // so the colours are IDENTICAL to the ledger box.
 import { delegate } from "./actions";
 import { SessionViews, viewTagUnion } from "./session-views";
-import { anchorViewsRev, consumeViewsAck, postViewsOps } from "./views-writer";
+import { anchorViewsRev, consumeViewsAck, notifyViewsTransportReset, postViewsOps } from "./views-writer";
+window.addEventListener("romp:wsup", () => notifyViewsTransportReset());   // P2.8: replay the lost send
 import { lensVisible, surfaceLens } from "./tag-lens";
 import { openTagMenu, tagMenuButton, syncTagFilter } from "./tag-menu";
 import { fleetVisibleRoots } from "./fleet-roots";

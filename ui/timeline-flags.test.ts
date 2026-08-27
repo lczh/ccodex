@@ -97,7 +97,7 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
   }
   {
     // the spool itself: Electron-gated append to the kernel's replay queue
-    const fn = SRC.indexOf("_spoolOp(op) {");
+    const fn = SRC.indexOf("_spoolOp(op, presetName) {");
     assert.ok(fn > 0, "the spool helper exists");
     const win = SRC.slice(fn, fn + 1600);
     assert.match(win, /!process\.versions \|\| !process\.versions\.electron/,
@@ -150,9 +150,10 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
   }
   {
     const fn = SRC.indexOf("tagEditFailed(m) {");
-    const win = SRC.slice(fn, fn + 3000);   // widened for the v1.3.20 overlay-scoping comments
-    assert.ok(win.indexOf("_applyLocalOp(o.inverse)") > 0,
-      "the refusing host's entries roll the local half back — the union never stays split");
+    const win = SRC.slice(fn, fn + 4600);   // widened for the r49 postimage guards
+    assert.ok(win.indexOf("this._applyLocalOp(o.inverse);") > 0,
+      "the refusing host's entries roll the local half back — the union never stays split "
+      + "(postimage-guarded since r49: a newer local gesture's value stands)");
   }
   {
     // the r45 verification's P1: the CAS refused the rollback itself. Every whole-blob write
@@ -204,10 +205,10 @@ test("every timeline dot's white border is thin (0.75px) — romp + user dots al
 test("source: union-op entries carry rt + gesture id + pre-edit name/color at note time", () => {
   const fn = SRC.indexOf("_noteUnionOp(rt, name, inverse, edit, gid)");
   assert.ok(fn > 0, "the note-op signature threads the gesture id");
-  const win = SRC.slice(fn, fn + 900);
+  const win = SRC.slice(fn, fn + 2600);   // widened for the r49 postimage + durable-sync lines
   // the rt object + gid must ride the entry: a SIBLING host's refusal dispatches the inverse
   // REMOTE edit here, and only note-time state can say what the inverse targets are
-  assert.match(win, /rt: rt, gid: gid \|\| 0,/);
+  assert.match(win, /rt: rt, gid: gid \|\| 0,\s*\n\s*oldName: rt\.name \|\| '', oldColor: rt\.color \|\| '', post: post/);
   assert.match(win, /oldName: rt\.name \|\| '', oldColor: rt\.color \|\| ''/);
   // one id per GESTURE, minted where the fan-out starts, threaded to both note sites
   assert.match(SRC, /const gid = \+\+unionGestureSeq;/);
@@ -217,7 +218,7 @@ test("source: union-op entries carry rt + gesture id + pre-edit name/color at no
 
 test("source: tagEditFailed compensates SIBLING hosts — inverse remote edits; delete is loud, never silent", () => {
   const fn = SRC.indexOf("tagEditFailed(m) {");
-  const win = SRC.slice(fn, fn + 7000);   // widened for the v1.3.20/r48 comments
+  const win = SRC.slice(fn, fn + 8600);   // widened for the r48/r49 guards
   assert.ok(win.indexOf("_applyLocalOp(o.inverse)") > 0, "the local rollback survives untouched");
   // a refusal carrying the opId the edit was stamped with compensates EXACTLY that gesture (the
   // 2026-08-26 audit's Finding C — the kernel echoes it); an opId-less frame (an old kernel)
@@ -396,6 +397,60 @@ test("executed: an opId-LESS refusal never sweeps a poll-CONFIRMED gesture (r48)
   assert.equal(panel._unionOps.length, 2, "the group is retained for its real deciding event");
   assert.ok(panel._tagEditErr, "…and the refusal is still loud");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews;
+});
+
+test("executed: a delayed refusal never rolls back a NEWER edit — the postimage guard (r49)", () => {
+  // the v1.3.21 audit's P1.6, the green→red→blue schedule: red's late refusal used to blindly
+  // invert, painting local and the sibling back to green over blue's newer value
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { color: "#ff0000" });       // red rides out (gesture 1)
+  const gid1 = panel._unionOps[0].gid;
+  panel._editTagUnion(un, { color: "#0000ff" });       // blue supersedes it (gesture 2)
+  const polled = JSON.parse(JSON.stringify(VIEWS));
+  polled.remoteTags[0].color = "#0000ff";              // A already shows BLUE
+  polled.remoteTags[1].color = "#0000ff";
+  panel.update({ now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [], views: polled });
+  const inverse: any[] = [];
+  panel._editRemoteTag = (rt: any, edit: any) => { inverse.push({ rt, edit }); return true; };
+  panel.tagEditFailed({ host: "TESTHOST-B", name: "pool", opId: String(gid1),
+                        error: "red refused, late" });
+  assert.equal(inverse.length, 0, "no inverse rides to a sibling already showing a NEWER value");
+  assert.equal(panel._curViews().tags.find((t: any) => t.id === "g1").color, "#0000ff",
+    "the local blue stands — red's refusal rolls back nothing it no longer owns");
+  assert.match(panel._tagEditErr.error, /NOT rolled back on TESTHOST-A/);
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews;
+});
+
+test("executed: the union journal is durable — mirrored on note, re-seeded after a reload (r49)", () => {
+  // the v1.3.21 audit's P1.5: _unionOps lived only in panel memory — a reload while one host
+  // was pending lost the journal, and its later refusal left applied siblings silently split
+  const synced: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any) => synced.push(entries);
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  assert.ok(synced.length >= 2, "each note mirrors the journal durably");
+  assert.equal(synced[synced.length - 1].length, 2, "…carrying both dispatched halves");
+  const journal = synced[synced.length - 1];
+  // THE RELOAD: a fresh panel seeds from the kernel's payload echo and still compensates
+  const panel2 = drawnPanel();
+  panel2.update({ now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                  turns: {}, messages: [], judging: [], views: JSON.parse(JSON.stringify(VIEWS)),
+                  unionOps: journal });
+  assert.equal(panel2._unionOps.length, 2, "the reload re-seeded the in-flight journal");
+  const inverse: any[] = [];
+  panel2._editRemoteTag = (rt: any, edit: any) => { inverse.push({ rt, edit }); return true; };
+  panel2.tagEditFailed({ host: "TESTHOST-B", name: "pool", opId: String(journal[0].gid),
+                         error: "refused after the reload" });
+  assert.equal(inverse.length, 1, "the refusal STILL compensates the sibling — nothing was lost");
+  assert.equal(inverse[0].rt.host, "TESTHOST-A");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
 });
 
 test("executed: an all-confirmed gesture group leaves the list — retention has an exit", () => {

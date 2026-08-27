@@ -1628,6 +1628,18 @@ class TimelinePanel {
     if (Array.isArray(data.palette) && data.palette.length) this._palette = data.palette;
     this._reconcilePendingFlags();   // hold an optimistic eye-toggle sticky until THIS push (or a later one) confirms it
     this._reconcileDismissed();      // ...and a Cleared dead lane, so a stale/merged push can't pop it back
+    if (!this._unionSeeded && Array.isArray(data.unionOps)) {
+      // re-seed the journal after a reload (the v1.3.21 audit's P1.5) — once, before any local
+      // gesture minted entries; the kernel's copy is the reload survivor, never fresher than
+      // this panel's own live list
+      this._unionSeeded = true;
+      if (data.unionOps.length && !(this._unionOps || []).length) {
+        this._unionOps = data.unionOps.map((o) => Object.assign({}, o));
+        // gesture ids must not collide with re-seeded ones: resume the sequence PAST them
+        for (const o of this._unionOps)
+          if (o.gid && o.gid >= unionGestureSeq) unionGestureSeq = o.gid + 1;
+      }
+    }
     this._reconcileUnionOps();       // age out union-edit compensations the owner has since applied
     this._applyLocalOrder();         // Obsidian: the viewer's own arrangement over the seed (P2.16)
     this._reconcileViews();          // ...and an optimistic view edit, until the kernel echoes it
@@ -2697,7 +2709,17 @@ class TimelinePanel {
     const ops = matched.filter((o) => m.opId ? String(o.gid || 0) === String(m.opId)
                                              : ((o.gid || 0) === newestGid && !o.confirmed));
     this._unionOps = (this._unionOps || []).filter((o) => ops.indexOf(o) < 0);
-    for (const o of ops) this._applyLocalOp(o.inverse);
+    for (const o of ops) {
+      // the same postimage guard for the LOCAL half (P1.6): a third value means a newer
+      // local gesture moved the atom — its result stands, never this inverse
+      const p = o.post || {};
+      if (p.color || p.name) {
+        const lt = viewTags(this._curViews()).find((t) => t.id === (o.inverse && o.inverse.tag));
+        if (lt && p.color && lt.color !== p.color && lt.color !== o.oldColor) continue;
+        if (lt && p.name && lt.name !== p.name && lt.name !== o.oldName) continue;
+      }
+      this._applyLocalOp(o.inverse);
+    }
     // ...AND the same gesture's SIBLING remote halves (the v1.3.18 audit's P2: partial
     // multi-host tag edits still split state — fanned to owners A and B with only B refusing,
     // the local rollback above left A holding the applied edit: A changed, B/local reverted).
@@ -2713,9 +2735,21 @@ class TimelinePanel {
     this._unionOps = (this._unionOps || []).filter((o) => sibs.indexOf(o) < 0);
     const undead = [];   // hosts holding an applied DELETE — no remote edit can restore a tag
     const rolled = [];   // hosts an inverse was dispatched to — the loud error names them
+    const moved = [];   // atoms a NEWER gesture already changed — never rolled back (P1.6)
     for (const o of sibs) {
       const e = o.edit || {};
       if (e.delete) { undead.push(o.host || 'unknown'); continue; }
+      // the postimage guard (the v1.3.21 audit's P1.6): the polled rt must still hold THIS
+      // gesture's result (or its preimage — a not-yet-polled apply, where the inverse is a
+      // harmless no-op) for the inverse to be truthful. A THIRD value means a newer gesture
+      // moved the atom: never roll that back (executed: green→red→blue, red's late refusal).
+      const rtNow = ((this._views && this._views.remoteTags) || []).find((t) =>
+        t.id === (o.rt && o.rt.id));
+      const p = o.post || {};
+      const superseded = !!rtNow && (
+        (p.color && rtNow.color !== p.color && rtNow.color !== o.oldColor) ||
+        (p.name && rtNow.name !== p.name && rtNow.name !== o.oldName));
+      if (superseded) { moved.push(o.host || 'unknown'); continue; }
       const inv = {};
       if (e.add) inv.remove = e.add.slice();
       if (e.remove) inv.add = e.remove.slice();
@@ -2740,8 +2774,11 @@ class TimelinePanel {
     // already-applied edit is exactly the surprise the user needs told about).
     this._tagEditErr = { host: m.host || '', name: m.name || '', error: (m.error || 'refused')
       + (rolled.length ? ' — rolled the applied edit back on ' + rolled.join(', ') : '')
+      + (moved.length ? ' — NOT rolled back on ' + moved.join(', ')
+         + ' (a newer edit already moved it; check by hand)' : '')
       + (undead.length ? ' — the delete already sent to ' + undead.join(', ') + ' cannot be'
          + ' undone from here; recreate the tag there by hand (romp tag --host <kernel>)' : '') };
+    this._syncUnionOps();                              // refusal consumed entries (P1.5)
     if (this._viewsDialog && this._viewsDialogBuild) this._viewsDialogBuild();
     this.draw();
   }
@@ -2750,15 +2787,41 @@ class TimelinePanel {
   // dropped when the owner's store CONFIRMS the edit (never a push counter — a slow refusal can
   // outlive any count of pushes; the r45 verification: the 3-push age-out raced the forward
   // path's 8s timeout and slow refusals got no rollback at all)
+  _syncUnionOps() {
+    // mirror the WHOLE in-flight compensation list durably (the v1.3.21 audit's P1.5): the
+    // journal lived only in this panel's memory — a reload while one host was pending lost it,
+    // and the host's later refusal left already-applied siblings silently split. Full-replace,
+    // idempotent; the kernel echoes it back on the timeline payload for the reload to re-seed.
+    const entries = (this._unionOps || []).map((o) => ({
+      host: o.host, name: o.name, inverse: o.inverse, edit: o.edit, rt: o.rt, gid: o.gid,
+      oldName: o.oldName, oldColor: o.oldColor, post: o.post || {}, confirmed: !!o.confirmed,
+    }));
+    try {
+      if (typeof window !== 'undefined' && typeof window.__rompTimelineSetUnionOps === 'function') {
+        window.__rompTimelineSetUnionOps(entries);
+      } else if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
+        this._kernelPost('/union-ops', { entries: entries }, true).catch(() => {});
+      }
+    } catch (e) { /* best-effort: the in-memory journal still runs this panel's lifetime */ }
+  }
+
   _noteUnionOp(rt, name, inverse, edit, gid) {
     if (!this._unionOps) this._unionOps = [];
     // rt + gid + the PRE-edit name/color ride the entry (the v1.3.18 audit's P2): a SIBLING
     // host's refusal compensates this host by dispatching the inverse REMOTE edit, and by that
     // moment the polled rt may already echo the applied edit — the inverse targets are only
     // knowable at note time
+    // the POSTIMAGE rides the entry (the v1.3.21 audit's P1.6): a compensation may only
+    // fire while the atom still holds THIS gesture's result — a delayed refusal used to
+    // blindly invert whatever was there, rolling a NEWER gesture's value back to this one's
+    // preimage (executed: green→red→blue, and red's late refusal painted green)
+    const post = {};
+    if (edit && edit.rename) post.name = edit.rename;
+    if (edit && edit.color) post.color = edit.color;
     this._unionOps.push({ host: rt.host || '', name: name || '', inverse: inverse,
                           edit: edit || {}, rt: rt, gid: gid || 0,
-                          oldName: rt.name || '', oldColor: rt.color || '' });
+                          oldName: rt.name || '', oldColor: rt.color || '', post: post });
+    this._syncUnionOps();                              // durable the moment it exists (P1.5)
   }
 
   _reconcileUnionOps() {
@@ -2779,7 +2842,9 @@ class TimelinePanel {
       const g = o.gid || 0;
       gidDone.set(g, (gidDone.has(g) ? gidDone.get(g) : true) && !!o.confirmed);
     }
+    const before = this._unionOps.length;
     this._unionOps = this._unionOps.filter((o) => (o.gid ? !gidDone.get(o.gid) : !o.confirmed));
+    if (this._unionOps.length !== before) this._syncUnionOps();   // groups retired (P1.5)
   }
 
   _unionOpApplied(o, rts) {
@@ -3019,18 +3084,26 @@ class TimelinePanel {
         let blob = null;
         if (!ops || !ops.length) { blob = Object.assign({}, v, { baseRev: baseRev }); delete blob.rev; }
         const body = blob ? { views: blob } : { ops: ops };
-        this._kernelPost('/views', body, true).then((r) => {
-          // the POST twin of the WS viewsAck (the r46 verification): the response body carries
-          // the store's actual rev — 200 and 409 alike — so the counter re-anchors here exactly
-          // as when a WS host's ack frame arrives. Kernel unreachable → no rev: the counter
-          // holds its optimistic value and the op spools below.
-          if (r.ok !== false && r.json && typeof r.json.rev === 'number')
-            this.viewsAck({ ok: r.ok === true, rev: r.json.rev });
-          if (r.ok !== false) return;                // applied, or refused (kernel up)
-          // the replay spool speaks only the targeted-op grammar, so a kernel-down blob write
-          // degrades to its active pick there (the pre-existing reduction, offline-only now)
-          this._spoolOp({ op: 'views', ops: body.ops || [{ active: (v && v.active) || 'all' }] });
-        }).catch(() => { /* can't persist */ });
+        // the spool name is allocated at GESTURE time and the POSTs are SERIALIZED (the
+        // v1.3.21 audit's P2.10): independent POSTs used to spool in failure-COMPLETION order —
+        // a rename's failure resolving before its preceding create's replayed rename,create
+        // and the original name survived. One monotonic gesture sequence, one POST at a time.
+        const spoolName = this._allocSpoolName();
+        this._postChain = (this._postChain || Promise.resolve()).then(() =>
+          this._kernelPost('/views', body, true).then((r) => {
+            // the POST twin of the WS viewsAck (the r46 verification): the response body carries
+            // the store's actual rev — 200 and 409 alike — so the counter re-anchors here exactly
+            // as when a WS host's ack frame arrives. Kernel unreachable → no rev: the counter
+            // holds its optimistic value and the op spools below.
+            if (r.ok !== false && r.json && typeof r.json.rev === 'number')
+              this.viewsAck({ ok: r.ok === true, rev: r.json.rev });
+            if (r.ok !== false) return;              // applied, or refused (kernel up)
+            // the replay spool speaks only the targeted-op grammar, so a kernel-down blob write
+            // degrades to its active pick there (the pre-existing reduction, offline-only now)
+            this._spoolOp({ op: 'views', ops: body.ops || [{ active: (v && v.active) || 'all' }] },
+                          spoolName);
+          }).catch(() => { /* can't persist */ })
+        );
       }
     } catch (e) { /* no host hook + no Node → session-local only */ }
     this.draw();
@@ -3487,7 +3560,9 @@ class TimelinePanel {
           const nv = JSON.parse(JSON.stringify(this._curViews()));
           const used = new Set(viewTags(nv).map((t) => t.color));
           const color = (this._palette || []).find((c) => !used.has(c)) || (this._palette || [])[0] || '#1EA1EB';
-          const tg = { id: 'g' + Date.now().toString(36), name: 'tag ' + (viewTags(nv).length + 1), color, members: [] };
+          // ms-only ids silently discarded a simultaneous create (the v1.3.21 audit's P2)
+          const tg = { id: 'g' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
+                       name: 'tag ' + (viewTags(nv).length + 1), color, members: [] };
           nv.tags = viewTags(nv).concat([tg]); delete nv.groups;
           this._tagEditorFor = tg.name;   // a new tag opens straight into its rename input
           this._setViews(nv, [{ create: tg }]);   // the create op composes; no CAS base (v1.3.20)
@@ -3865,7 +3940,15 @@ class TimelinePanel {
   // (hideFromFeed vs postalServiceOff) and able to recreate migrated TID rows after
   // settlement. An append can lose neither: the kernel applies each op against current state
   // at boot and every supervisor pass. Electron-only, like every direct state path here.
-  _spoolOp(op) {
+  _allocSpoolName() {
+    // gesture-time allocation (the v1.3.21 audit's P2.10): the name IS the replay order, so it
+    // must be minted when the user acted, never when the failure happened to resolve
+    this._spoolSeq = (this._spoolSeq || 0) + 1;
+    return Date.now() + '-' + String(this._spoolSeq).padStart(6, '0') + '-'
+      + Math.random().toString(36).slice(2, 8) + '.json';
+  }
+
+  _spoolOp(op, presetName) {
     try {
       if (typeof process === 'undefined' || !process.versions || !process.versions.electron) return;
       const fs = require('fs'), os = require('os'), path = require('path');   // try-scope: see _persistOrder
@@ -3879,7 +3962,7 @@ class TimelinePanel {
       const stage = path.join(root, 'pending-ui-ops.stage');
       fs.mkdirSync(dir, { recursive: true });
       fs.mkdirSync(stage, { recursive: true });
-      const name = Date.now() + '-' + Math.random().toString(36).slice(2, 10) + '.json';
+      const name = presetName || (Date.now() + '-' + Math.random().toString(36).slice(2, 10) + '.json');
       // staged in a SIBLING dir (the r46 re-verify): a tmp inside the spool dir raced the
       // kernel's sweep — the rename hit ENOENT and the gesture was silently lost, exactly at
       // boot when writers are deepest in the kernel-down fallback

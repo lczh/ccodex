@@ -66,7 +66,8 @@ test("New tag… is an inline input (menu vocabulary, no native prompt) that cre
   assert.match(RENDER, /inp\.placeholder = "New tag…"; inp\.maxLength = 40;/);
   assert.doesNotMatch(RENDER.slice(RENDER.indexOf("const editUnion")), /window\.prompt/);
   assert.match(RENDER, /const color = paletteColors\.find\(\(c\) => !used\.has\(c\)\) \|\| paletteColors\[0\] \|\| "#1EA1EB";/);
-  assert.match(RENDER, /const tg = \{ id: "g" \+ Date\.now\(\)\.toString\(36\), name, color, members: \[id\] \};/);
+  assert.match(RENDER, /id: "g" \+ Date\.now\(\)\.toString\(36\) \+ "-" \+ Math\.random\(\)\.toString\(36\)\.slice\(2, 8\)/,
+    "the id carries randomness — ms-only ids silently discarded a simultaneous create (v1.3.21)");
   assert.match(RENDER, /postViews\(nv, \[\{ create: tg \}\]\);/,
     "the create rides the targeted op — it composes, no CAS base (the v1.3.20 audit)");
   // an existing name typed into the box ADDS to that union instead of minting a duplicate tag

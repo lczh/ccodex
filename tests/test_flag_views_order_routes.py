@@ -654,6 +654,49 @@ class PerFileOpSpool(unittest.TestCase):
                          "pane A's lens SURVIVES pane B's later single-surface op")
         self.assertEqual(v["actives"]["outline"], {"none": True})
 
+    def test_rename_and_delete_migrate_lens_and_order_references(self):
+        # the v1.3.21 audit's P2: lenses and tagOrder key tags by NAME — a rename stranded the
+        # old name in both (the lens silently emptied) and deleting a selected tag hid every row
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "", "members": []}},
+                             {"create": {"id": "g2", "name": "crew", "color": "", "members": []}},
+                             {"actives": {"chat": {"tags": ["pool"]}}},
+                             {"tagOrder": ["pool", "crew"]}])
+        km._apply_views_ops([{"tag": "g1", "rename": "squad"}])
+        v = km._timeline_views()
+        self.assertEqual(v["actives"]["chat"], {"tags": ["squad"]}, "the lens followed the rename")
+        self.assertEqual(v["tagOrder"], ["squad", "crew"], "…and the order did too")
+        km._apply_views_ops([{"tag": "g1", "delete": True}])
+        v = km._timeline_views()
+        self.assertEqual(v["actives"]["chat"], {"all": True},
+                         "the emptied lens falls to All — a deleted selection never hides "
+                         "every row (the v1.3.21 audit's P2)")
+        self.assertEqual(v.get("tagOrder"), ["crew"], "the order dropped the dead name")
+
+    def test_duplicate_names_are_refused_on_create_and_rename(self):
+        # tags are name-addressed across every edit wire (the v1.3.21 audit's P2)
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "", "members": []}}])
+        km._apply_views_ops([{"create": {"id": "g9", "name": "pool", "color": "", "members": []}},
+                             {"create": {"id": "g2", "name": "crew", "color": "", "members": []}},
+                             {"tag": "g2", "rename": "pool"}])
+        v = km._timeline_views()
+        self.assertEqual(sorted(t["name"] for t in v["tags"]), ["crew", "pool"],
+                         "the duplicate create dropped and the duplicate rename was a no-op")
+
+    def test_the_union_journal_round_trips_and_replaces_whole(self):
+        # the v1.3.21 audit's P1.5: the multi-host compensation journal is kernel-durable now —
+        # a panel reload re-seeds from this store instead of forgetting in-flight gestures
+        rows = [{"host": "TESTHOST-A", "name": "pool", "gid": 3,
+                 "edit": {"remove": ["s1"]}, "inverse": {"tag": "g1", "add": ["s1"]},
+                 "rt": {"id": "TESTHOST-A:r1", "host": "TESTHOST-A", "name": "pool"},
+                 "oldName": "pool", "oldColor": "", "post": {}, "confirmed": False}]
+        self.assertTrue(km._union_ops_set(rows))
+        self.assertEqual(km._union_ops_load(), rows)
+        self.assertTrue(km._union_ops_set([]))
+        self.assertEqual(km._union_ops_load(), [], "a full replace — retirement empties it")
+        self.assertTrue(km._union_ops_set(["junk", {"host": "TESTHOST-B"}]))
+        self.assertEqual(km._union_ops_load(), [{"host": "TESTHOST-B"}],
+                         "non-dict junk drops; the store never raises")
+
     def test_ops_compose_with_a_foreign_edit_instead_of_erasing_it(self):
         # the audited erase shape, executed at the store: a foreign client's tag lands between
         # two of our gestures — the second, a targeted op, composes with it; a stale whole blob

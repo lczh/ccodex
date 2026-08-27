@@ -14,7 +14,10 @@ import yaml from "highlight.js/lib/languages/yaml";
 import type { ParsedAsk } from "../ask-types";
 import { TABBAR_H_KEY, TABBAR_H_DEFAULT, clampTabbarH, parseTabbarH } from "./tabbar-resize";
 import { SessionViews, viewVisible, viewsKey, revealIn, viewTagUnion, viewTags, type TagUnion, type SessionTag } from "./session-views";
-import { anchorViewsRev, consumeViewsAck, postViewsOps, postViewsWrite } from "./views-writer";
+import { anchorViewsRev, consumeViewsAck, notifyViewsTransportReset, postViewsOps, postViewsWrite } from "./views-writer";
+// the transport reconnected (the v1.3.21 audit's P2.8): a send lost on the dead socket is
+// re-posted — the writer keeps the head queued until its ack, and every write re-sends safely
+window.addEventListener("romp:wsup", () => notifyViewsTransportReset());
 import { lensVisible, surfaceLens } from "./tag-lens";
 import { openTagMenu, tagMenuButton, syncTagFilter } from "./tag-menu";
 import { syncSessionsFromTabMeta, applyMetaToSession, notePendingMeta, PendingTabMeta } from "./tab-meta";
@@ -4921,7 +4924,9 @@ function showTabMenu(e: MouseEvent, id: string) {
           const nv = JSON.parse(JSON.stringify(effViews() || {})) as SessionViews;
           const used = new Set(viewTags(nv).map((t) => t.color));
           const color = paletteColors.find((c) => !used.has(c)) || paletteColors[0] || "#1EA1EB";
-          const tg = { id: "g" + Date.now().toString(36), name, color, members: [id] };
+          // ms-only ids silently discarded a simultaneous create (the v1.3.21 audit's P2)
+          const tg = { id: "g" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),
+                       name, color, members: [id] };
           nv.tags = viewTags(nv).concat([tg]);
           delete nv.groups;
           postViews(nv, [{ create: tg }]);   // the create op composes; no CAS base (v1.3.20)

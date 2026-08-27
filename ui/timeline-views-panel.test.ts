@@ -289,7 +289,11 @@ test("_setViews posts through the host hook; Obsidian rides targeted kernel ops 
   assert.match(SRC, /_kernelPost\('\/views', body, true\)/);
   // kernel-down, the spool still speaks only the targeted-op grammar — a blob write (no ops)
   // degrades to its active pick THERE ONLY (the 2026-08-26 audit's Finding B confined it)
-  assert.match(SRC, /_spoolOp\(\{ op: 'views', ops: body\.ops \|\| \[\{ active: \(v && v\.active\) \|\| 'all' \}\] \}\)/);
+  assert.match(SRC, /_spoolOp\(\{ op: 'views', ops: body\.ops \|\| \[\{ active: \(v && v\.active\) \|\| 'all' \}\] \},\s*\n\s*spoolName\)/,
+    "…with a GESTURE-TIME spool name (the v1.3.21 audit's P2.10: failure-completion order reordered replays)");
+  assert.match(SRC, /const spoolName = this\._allocSpoolName\(\);/);
+  assert.match(SRC, /this\._postChain = \(this\._postChain \|\| Promise\.resolve\(\)\)\.then\(/,
+    "the POSTs are SERIALIZED at gesture initiation (P2.10)");
   // …while a kernel-up no-ops write posts the REV-GATED WHOLE BLOB (actives/tagOrder/tags ride)
   assert.match(SRC, /blob = Object\.assign\(\{\}, v, \{ baseRev: baseRev \}\); delete blob\.rev;/);
   assert.match(SRC, /const body = blob \? \{ views: blob \} : \{ ops: ops \};/);

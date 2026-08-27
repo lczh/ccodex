@@ -2042,6 +2042,36 @@ def _replay_ui_op_spool():
         _mark_views_dirty()
 
 
+_UNION_OPS_MAX = 200
+
+
+def _union_ops_path():
+    return jd.STATE / "union-gestures.json"
+
+
+def _union_ops_load():
+    """The multi-host tag-gesture journal (the v1.3.21 audit's P1.5): the timeline panel's
+    in-flight compensation entries, mirrored here so a panel reload does not lose the
+    transaction — a refusal arriving after the reload used to leave already-applied sibling
+    hosts silently split, with nothing left to compensate them."""
+    try:
+        rows = json.loads(_union_ops_path().read_text())
+    except Exception:
+        return []
+    return [r for r in rows if isinstance(r, dict)][:_UNION_OPS_MAX] if isinstance(rows, list) else []
+
+
+def _union_ops_set(entries):
+    rows = [r for r in (entries if isinstance(entries, list) else []) if isinstance(r, dict)]
+    rows = rows[:_UNION_OPS_MAX]
+    try:
+        _atomic_write(_union_ops_path(), json.dumps(rows))
+        return True
+    except Exception:
+        sys.stderr.write("union-gestures save: %s\n" % traceback.format_exc())
+        return False
+
+
 def _views_rename_refs(d, old, new):
     """Rename migrates every NAME reference atomically (the v1.3.21 audit's P2): the actives
     lenses and tagOrder key tags by name — a rename stranded the old name in both, silently
@@ -25205,6 +25235,7 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
     cmap_grad = [list(cm.ramp(v, ctx_stops)) for v in (0.12, 0.34, 0.56, 0.78, 1.0)]
     return {"type": "timeline", "now": now, "sessions": sessions, "turns": turns,
             "views": _views_client(),
+            "unionOps": _union_ops_load(),   # the durable multi-host gesture journal (P1.5)
             "palette": pal.colors(_palette_name()),   # tag color choices — the same set sessions draw identity colors from
             "messages": messages, "judging": judging,
             "cmapGrad": cmap_grad,
@@ -28248,6 +28279,7 @@ window.__rompTimelineSendCommand=function(name,cmd){post({type:"sendCommand",nam
 window.__rompTimelineSetFlag=function(id,flag,value){post({type:"setSessionFlag",id:id,flag:flag,value:!!value});};
 window.__rompTimelineSetViews=function(views){post({type:"setTimelineViews",views:views});};
 window.__rompTimelineSetViewsOps=function(ops){post({type:"setTimelineViewsOps",ops:ops});};
+window.__rompTimelineSetUnionOps=function(entries){post({type:"setUnionOps",entries:entries});};
 window.__rompTimelineEditTag=function(edit){post({type:"editTag",edit:edit});};
 window.__rompTimelineDismiss=function(id){post({type:"dismissLane",id:id});};
 window.__rompTimelineHover=function(sid,segIds,t0,t1){post(sid?{type:"timelineHover",sid:sid,segIds:segIds||[],t0:t0,t1:t1}:{type:"timelineHover",off:true});};
@@ -32345,6 +32377,19 @@ class Handler(BaseHTTPRequestHandler):
                 _mark_views_dirty()
                 return self._send(200, json.dumps({"ok": True, "id": tsid, "flag": flag,
                                                    "value": b["value"]}), "application/json")
+            if u.path == "/union-ops":
+                # the durable multi-host gesture journal, POST twin of the WS setUnionOps (the
+                # v1.3.21 audit's P1.5) — the Obsidian panel has no WS to the kernel
+                try:
+                    b = json.loads(raw_body or b"{}")
+                except Exception:
+                    b = {}
+                if not isinstance(b, dict) or not isinstance(b.get("entries"), list):
+                    return self._send(400, json.dumps({"ok": False,
+                                                       "error": "entries must be a JSON list"}),
+                                      "application/json")
+                ok = _union_ops_set(b["entries"])
+                return self._send(200 if ok else 500, json.dumps({"ok": ok}), "application/json")
             if u.path == "/views":
                 # The Obsidian timeline's views writer — the WS setTimelineViews op as a POST:
                 # the SAME whole-blob last-write-wins semantics every dashboard has, but through
@@ -33001,6 +33046,12 @@ class Handler(BaseHTTPRequestHandler):
                 client["send"](json.dumps(_oans))
             except Exception:
                 pass
+        elif msg and msg.get("type") == "setUnionOps" and isinstance(msg.get("entries"), list):
+            # the durable multi-host gesture journal (the v1.3.21 audit's P1.5): the timeline
+            # panel mirrors its whole in-flight compensation list here on every change (small,
+            # idempotent — a full replace, no per-op protocol to desync), and re-seeds from the
+            # payload echo after a reload
+            _union_ops_set(msg["entries"])
         elif msg and msg.get("type") == "openTagsDialog":
             # any pane's "Configure tags…" opens THE tags dialog — which lives on the timeline pane
             # (one dialog, one implementation; the user 2026-08-25). Routed to the SAME dashboard's
