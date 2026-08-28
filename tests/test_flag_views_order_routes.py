@@ -1133,18 +1133,23 @@ class V1323NoOpOpsAndMintCollision(unittest.TestCase):
         self.assertEqual((rev2, confl), (rev1, []),
                          "the spool's replayed create stays idempotent and quiet")
 
-    def test_a_same_id_different_name_create_is_a_named_conflict(self):
-        # the v1.3.23 audit's P2.6, executed there: two panels' same-ms Date.now() mints
-        # collided — simultaneous 'alpha'/'beta' creates both reported success and only
-        # 'alpha' existed
+    def test_a_same_id_create_stays_quiet_even_after_a_concurrent_rename(self):
+        # the r51 sibling verification: the collision-conflict branch misfired on the
+        # reconnect re-pump of a LANDED create whose tag another pane had since renamed —
+        # the toast told the user to retry a create that succeeded, and obeying it minted a
+        # duplicate under a fresh id. Same-id is always replay idempotence; the cross-panel
+        # millisecond collision is closed at the MINT (random-suffix ids, pinned by
+        # union-sync-transport.test.ts).
         rev1, _ = km._apply_views_ops([{"create": {"id": "g1", "name": "alpha", "color": "",
                                                    "members": []}}])
-        rev2, confl = km._apply_views_ops([{"create": {"id": "g1", "name": "beta", "color": "",
+        km._apply_views_ops([{"tag": "g1", "rename": "omega"}])   # a concurrent pane's rename
+        rev0 = km._timeline_views()["rev"]
+        rev2, confl = km._apply_views_ops([{"create": {"id": "g1", "name": "alpha", "color": "",
                                                        "members": []}}])
-        self.assertEqual(rev2, rev1, "nothing applied")
-        self.assertEqual(len(confl), 1)
-        self.assertIn("beta", confl[0])
-        self.assertIn("alpha", confl[0], "the collision names BOTH parties")
+        self.assertEqual(confl, [], "the client's own landed gesture is never a loud conflict")
+        self.assertEqual(rev2, rev0, "…and applies nothing")
+        self.assertEqual([t["name"] for t in km._timeline_views()["tags"]], ["omega"],
+                         "the rename stands — the replay resurrects nothing")
 
 
 class V1323RefusalRetryQueue(unittest.TestCase):
@@ -1189,6 +1194,83 @@ class V1323RefusalRetryQueue(unittest.TestCase):
         finally:
             km._union_ops_set = real
         self.assertEqual(len(km._pending_refusal_rows), 1, "held for the next pass")
+
+
+class R51SiblingVerifyMigrations(unittest.TestCase):
+    """the r51 sibling verification round on the migration retry machinery: the queue
+    clobbered a prior boot's durable intents, an unreadable store read as 'moot', and a
+    replayed intent still ignored the edited host's cache long after it had re-polled."""
+
+    def setUp(self):
+        _scrub_state()
+        km._pending_ref_migrations[:] = []
+        try:
+            km._ref_migrations_path().unlink()
+        except OSError:
+            pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_the_queue_adopts_a_prior_boots_durable_intents_before_writing(self):
+        # the executed clobber: intent B persisted, the kernel restarted, and a NEW failure's
+        # queue write overwrote the file with only this boot's rows before the pass-tail
+        # flush ever adopted B — B's remote half had committed, refs stale forever
+        km._ref_migrations_path().write_text(json.dumps(
+            [{"host": "TESTHOST-A", "name": "farpool", "new": "nearpool", "deleted": False}]))
+        km._pending_ref_migrations[:] = []            # the restart
+        km._queue_ref_migration({"host": "TESTHOST-B", "name": "crew", "new": "squad",
+                                 "deleted": False})
+        rows = json.loads(km._ref_migrations_path().read_text())
+        self.assertEqual([(r["host"], r["name"]) for r in rows],
+                         [("TESTHOST-A", "farpool"), ("TESTHOST-B", "crew")],
+                         "the survivor intent is adopted, never clobbered")
+
+    def test_an_unreadable_store_is_retryable_not_moot(self):
+        real = km._views_path
+        class _BadPath:
+            def read_text(self):
+                raise OSError(5, "EIO")
+
+            def stat(self):
+                raise OSError(5, "EIO")   # _timeline_views' cache key probes stat too
+
+            def exists(self):
+                return True
+        try:
+            km._views_path = lambda: _BadPath()
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                ok = km._apply_ref_migration("TESTHOST-A", "farpool", "nearpool", False)
+        finally:
+            km._views_path = real
+        self.assertFalse(ok, "a flaky read must NOT retire the intent as 'no reference held "
+                             "the name' — that was the permanent-stale-refs outcome disguised "
+                             "as success")
+
+    def test_a_replayed_intent_respects_a_reminted_same_name_tag(self):
+        # fresh=False: the edited host's cache exemption is for the one echo window after the
+        # edit — a replayed intent runs after the cache re-polled, and ignoring the host then
+        # renamed away a tag the user had re-minted there since
+        km._apply_views_ops([{"create": {"id": "g1", "name": "local", "color": "", "members": []}},
+                             {"actives": {"chat": {"tags": ["farpool"]}}}])
+        saved = dict(km._remotes)
+        km._remotes.clear()
+        km._remotes["x"] = {"host": "TESTHOST-A", "views":
+                            {"tags": [{"id": "r2", "name": "farpool"}]}}   # the RE-MINTED tag
+        try:
+            self.assertTrue(km._apply_ref_migration("TESTHOST-A", "farpool", "nearpool",
+                                                    False, fresh=False))
+            v = km._timeline_views()
+            self.assertEqual(v["actives"]["chat"], {"tags": ["farpool"]},
+                             "the replayed rename yields to the live re-minted name")
+            self.assertTrue(km._apply_ref_migration("TESTHOST-A", "farpool", "nearpool",
+                                                    False, fresh=True))
+            v = km._timeline_views()
+            self.assertEqual(v["actives"]["chat"], {"tags": ["nearpool"]},
+                             "…while the FRESH call still outranks the one-echo-stale cache")
+        finally:
+            km._remotes.clear()
+            km._remotes.update(saved)
 
 
 class V1323MigrationAuthority(unittest.TestCase):

@@ -632,9 +632,10 @@ function mountControls() {
   foot.append(left, right);
 }
 
-// the chat's warn-toast, mirrored (one treatment, two sheets — the .romp-acted precedent: this
-// page loads feed.css, not styles.css): the Outline's refused tag write used to disappear with
-// nothing saying why (the v1.3.23 audit's P3.9)
+// the chat's warn-toast, mirrored: the Outline's refused tag write used to disappear with
+// nothing saying why (the v1.3.23 audit's P3.9). The styles ride styles.css — BOTH Outline
+// hosts (the kernel's _fleet_page and the extension's buildFleetHtml) link it (the r51
+// sibling verification: a copy in feed.css was dead code encoding the opposite premise).
 function warnToast(msg: string): void {
   let box = document.getElementById("warn-toasts");
   if (!box) {

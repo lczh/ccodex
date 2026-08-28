@@ -2232,20 +2232,32 @@ _pending_ref_migrations = []
 _pending_ref_migrations_lock = threading.Lock()
 
 
-def _apply_ref_migration(host, name, new, deleted):
+def _apply_ref_migration(host, name, new, deleted, fresh=True):
     """The locked read-modify-write half of the reference migration. True = applied or moot;
-    False = ONLY a failed store write (the retryable case). Locked like _apply_views_ops;
-    rev bumps only when a reference actually moved."""
+    False = a failed store WRITE or an unreadable store (the retryable cases). Locked like
+    _apply_views_ops; rev bumps only when a reference actually moved. `fresh` says the edit
+    JUST landed: only then may the survival checks ignore the edited host's cached views
+    (stale for at most one echo window) — a REPLAYED intent runs after the cache re-polled,
+    and ignoring the host then renamed away a same-name tag the user had re-minted there
+    since (the r51 sibling verification)."""
     if not deleted:
         if not new:
             return True
-        if _tag_name_survives_elsewhere(host, name):
+        if _tag_name_survives_elsewhere(host if fresh else None, name):
             return True      # the lens still names something real under the OLD name (r50)
     with jd._identity_file_lock():
         try:
             raw = json.loads(_views_path().read_text())
-        except Exception:
+        except FileNotFoundError:
             raw = {}
+        except OSError:
+            # an UNREADABLE store is the RETRYABLE case, not moot (the r51 sibling
+            # verification: a flaky disk that EIO'd the read made the flush retire the
+            # intent as "no local reference held the name" — the permanent silent-stale-refs
+            # outcome, disguised as success)
+            return False
+        except ValueError:
+            raw = {}                     # corrupt content reads as empty, like every reader
         try:
             currev = int(raw.get("rev") or 0) if isinstance(raw, dict) else 0
         except (TypeError, ValueError):
@@ -2255,7 +2267,7 @@ def _apply_ref_migration(host, name, new, deleted):
         if not deleted:
             _views_rename_refs(d, name, new)
         else:
-            _views_drop_refs(d, name, ignore_host=host)
+            _views_drop_refs(d, name, ignore_host=host if fresh else None)
         if json.dumps(d, sort_keys=True) == before:
             return True                  # no local reference held the name — nothing to claim
         d = _norm_timeline_views(jd.canonicalize_timeline_views(d))
@@ -2268,12 +2280,30 @@ def _apply_ref_migration(host, name, new, deleted):
             return False
 
 
+def _adopt_ref_migrations_locked():
+    """Fold a prior boot's durable intents into the in-memory list (caller holds the lock).
+    BOTH the queue and the flush adopt first (the r51 sibling verification: the queue
+    overwrote the file with only this boot's rows — a crash-survivor intent whose remote
+    half had committed was destroyed before the pass-tail flush ever read it)."""
+    if _pending_ref_migrations:
+        return
+    try:
+        rows = json.loads(_ref_migrations_path().read_text())
+        if isinstance(rows, list):
+            _pending_ref_migrations.extend(r for r in rows if isinstance(r, dict))
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
 def _queue_ref_migration(intent):
     """A migration whose REMOTE half already committed but whose local write failed (the
     v1.3.23 audit's P2.5: an injected write failure after remote success left stale local
     references forever, silently). The intent persists beside the state (best-effort — the
     same disk may refuse it) and the supervisor pass retries until the migration lands."""
     with _pending_ref_migrations_lock:
+        _adopt_ref_migrations_locked()
         _pending_ref_migrations.append(intent)
         try:
             _atomic_write(_ref_migrations_path(), json.dumps(_pending_ref_migrations))
@@ -2287,15 +2317,7 @@ def _flush_pending_ref_migrations():
     kernel's durable intents; re-evaluates each against CURRENT state (the union-survival
     rule runs at apply time, so a name re-minted since simply moots the migration)."""
     with _pending_ref_migrations_lock:
-        if not _pending_ref_migrations:
-            try:
-                rows = json.loads(_ref_migrations_path().read_text())
-                if isinstance(rows, list):
-                    _pending_ref_migrations.extend(r for r in rows if isinstance(r, dict))
-            except FileNotFoundError:
-                pass
-            except Exception:
-                pass
+        _adopt_ref_migrations_locked()
         todo = list(_pending_ref_migrations)
     if not todo:
         return
@@ -2303,7 +2325,8 @@ def _flush_pending_ref_migrations():
     for it in todo:
         try:
             if not _apply_ref_migration(str(it.get("host") or ""), str(it.get("name") or ""),
-                                        str(it.get("new") or ""), it.get("deleted") is True):
+                                        str(it.get("new") or ""), it.get("deleted") is True,
+                                        fresh=False):
                 break                    # still failing — keep order for the next pass
         except Exception:
             break
@@ -2439,12 +2462,11 @@ def _apply_views_ops(ops):
                     # re-sending a landed create) and stays quiet: alarming on it would flag
                     # every recovered gesture as a failure.
                     conflicts.append("create '%s': the name is already taken" % crname)
-                elif cid and _same_id.get("name") != crname:
-                    # the SAME id under a DIFFERENT name is a mint collision, never a replay
-                    # (the v1.3.23 audit's P2.6): two panels' same-ms mints made the second
-                    # create report success while only the first tag existed — name it
-                    conflicts.append("create '%s': its id collided with tag '%s' — retry"
-                                     % (crname, _same_id.get("name")))
+                # the SAME id under a DIFFERENT name stays quiet too (the r51 sibling
+                # verification): the reconnect re-pump legitimately replays a landed create
+                # AFTER a concurrent pane renamed the tag — the collision toast told the user
+                # to retry a create that SUCCEEDED, and obeying it minted a duplicate. The
+                # cross-panel millisecond collision is closed at the MINT (random-suffix ids).
                 continue
             key = str(op.get("tag") or "")
             t = next((x for x in d["tags"] if x.get("name") == key or x.get("id") == key), None)

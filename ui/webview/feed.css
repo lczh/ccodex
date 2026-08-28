@@ -1505,26 +1505,3 @@ body.filebrowse-open { overflow: hidden; }
   font-size: 12px; line-height: 1; cursor: pointer; }
 .fsm-chipx:hover { color: var(--fg); background: rgba(255, 255, 255, 0.10); }
 @media (prefers-reduced-motion: reduce) { #feed-search input { transition: none; } }
-
-/* the chat's warn-toast family, mirrored from styles.css (one treatment, two sheets — the
-   .romp-acted precedent): the Outline surfaces refused tag writes through it now (the
-   v1.3.23 audit's P3.9) */
-#warn-toasts {
-  position: fixed; top: 44px; right: 14px; z-index: 70;
-  display: flex; flex-direction: column; gap: 8px; max-width: 340px;
-}
-.warn-toast {
-  display: flex; align-items: flex-start; gap: 8px;
-  padding: 8px 12px; border-radius: 8px; cursor: pointer;
-  background: rgba(28, 28, 28, 0.96);
-  border: 1px solid var(--vscode-errorForeground, #f48771);
-  color: var(--fg); font-size: 0.85em;
-  transition: opacity 0.7s ease;
-}
-.warn-toast-msg { min-width: 0; }
-.warn-toast-x {
-  flex: 0 0 auto; border: none; background: none; cursor: pointer; color: var(--dim);
-  font-size: 11px; line-height: 1.4; padding: 2px 4px; border-radius: 8px;
-}
-.warn-toast-x:hover { color: var(--fg); background: rgba(255, 255, 255, 0.08); }
-.warn-toast.fade { opacity: 0; }

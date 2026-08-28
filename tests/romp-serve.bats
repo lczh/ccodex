@@ -867,7 +867,29 @@ m = re.search(r"exec python3 -c '(.*?)' \"\$ROMP_DIR\"", src, re.S)
 assert m, "the one-python launcher is gone"
 body = m.group(1)
 assert "fcntl.flock" in body and "os.execv" in body, "lock and exec are not in ONE process"
+# the r51 sibling verification, by mutation: `os.close(fd)` inserted before launch() —
+# reopening the exact audited check->exec gap — left every test green. The lock fd must
+# leave this process ONLY through execve's CLOEXEC: no close, no LOCK_UN, anywhere.
+assert "LOCK_UN" not in body, "the launcher must never unlock before exec"
+assert "os.close(fd)" not in body, "the launcher must never close the lock fd before exec"
+_tail = body[body.rindex("def launch"):]
+assert "os.close" not in _tail.replace("os.close(mfd)", ""), \
+    "nothing between the checks and execve may release the lock"
 CHECK
+}
+
+@test "romp-serve: the ROMP_KERNEL_BIN seam boots even with NO pick channel (nothing reads it)" {
+    # the r51 sibling verification: the no-pick refusal fired before the seam check — a git
+    # checkout with /tmp full exit-70-looped a seam boot over a channel no code path consumes
+    _gen_fixture
+    export ROMP_KERNEL_BIN="$TEST_DIR/seam-kernel"
+    printf '#!/usr/bin/env bash\necho "SEAM_KERNEL_RAN"\n' > "$ROMP_KERNEL_BIN"
+    chmod +x "$ROMP_KERNEL_BIN"
+    export TMPDIR="$TEST_DIR/does-not-exist"
+    run "$ROMP_SERVE" --port 9999
+    unset TMPDIR ROMP_KERNEL_BIN
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SEAM_KERNEL_RAN"* ]]
 }
 
 @test "romp-serve: a bare-name ROMP_PYTHON still boots — the launcher resolves PATH like bash did" {

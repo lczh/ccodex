@@ -65,7 +65,7 @@ if [ -n "$_ROMP_PICK" ]; then
     # every REFUSED boot leaked its pick file (the r50 verification: three refusals, three
     # files) — the trap covers every exit; the exec path removes it explicitly first
     trap '[ -n "${_ROMP_PICK:-}" ] && rm -f "$_ROMP_PICK"' EXIT
-elif git -C "$ROMP_DIR" rev-parse --absolute-git-dir >/dev/null 2>&1; then
+elif [ -z "${ROMP_KERNEL_BIN:-}" ] && git -C "$ROMP_DIR" rev-parse --absolute-git-dir >/dev/null 2>&1; then
     # NO pick channel on a GIT checkout fails CLOSED (the v1.3.23 audit's P1.2): with the pick
     # file unmintable (an invalid TMPDIR), the gate could only refuse non-live picks — a gate
     # that picked "live" exited 0 with nothing to deliver, and bash then skipped the whole
@@ -298,7 +298,10 @@ def emit_pick():
                              "updated kernel is up)\n" % full[:8])
     elif mtok2:
         sys.exit(70)                   # armed marker + unreadable HEAD: never live (P1.1/P1.2)
-    if choice != "live" and not pf:
+    if choice != "live" and not pf and not os.environ.get("ROMP_KERNEL_BIN"):
+        # (the seam exemption, r51 sibling verification: with ROMP_KERNEL_BIN set the pick is
+        # never consumed — bash execs the pinned kernel — so refusing over an undeliverable
+        # pick bricked seam boots on a full /tmp; the latch gating above still ran)
         # FAIL CLOSED (the r49 verification): with no deliverable pick, bash keeps its live
         # default — a marker-forced generation pick silently becoming a dirty live launch is
         # the audited P1.2 wearing a success log line. A live choice needs no delivery.

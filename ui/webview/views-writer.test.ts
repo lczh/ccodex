@@ -211,7 +211,11 @@ test("wiring: the Outline (fleet) posts its lens picks as TARGETED ops and consu
   assert.match(FLEET, /if \(consumeViewsAck\(m, \(conflicts\) => \{ for \(const c of conflicts \|\| \[\]\) warnToast\(c\); \}\)\) return;/,
     "the feed-only router consumes the ack before its guard — and NAMES conflicts (the v1.3.23 audit's P3.9)");
   assert.match(FLEET, /function warnToast\(msg: string\): void \{/,
-    "the Outline mirrors the chat's warn-toast (feed.css carries its styles — the .romp-acted precedent)");
+    "the Outline mirrors the chat's warn-toast (styles.css carries the styles — both Outline "
+    + "hosts link it; the r51 sibling verification killed a dead feed.css copy)");
+  const FEEDCSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.css"), "utf8");
+  assert.doesNotMatch(FEEDCSS, /warn-toast/,
+    "no dead toast styles in feed.css — the Outline never loads that sheet");
   assert.match(FLEET, /fleetViews = m\.views as SessionViews; anchorViewsRev\(fleetViews\);/,
     "every feed payload's views re-anchors");
 });
