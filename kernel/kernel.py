@@ -13593,6 +13593,67 @@ def _pr_watch_fail_marker(r, verdict):
     return jd.STATE / "pr-watch-failed" / key
 
 
+def _pr_watch_marker_put(path, state):
+    """Atomically replace one PR-watch failure marker without touching the old record first.
+
+    These markers distinguish a known failed delivery from a `sent` stamp that may mean the
+    notice landed.  An in-place write can truncate `pending` and then fail; the surviving empty
+    marker makes the next boot trust the stamp and retire an undelivered notice.  Stage the whole
+    state beside the marker, sync the staged bytes, and only then replace.  A failed stage or
+    replace therefore leaves the old evidence byte-for-byte intact.  The directory entry is
+    synced where the filesystem supports it; this does not make the separate watch-file stamp and
+    marker one power-loss transaction.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = (str(state) + "\n").encode("ascii")
+    fd, tmp_name = tempfile.mkstemp(prefix=".%s." % path.name, suffix=".tmp",
+                                    dir=str(path.parent))
+    tmp = Path(tmp_name)
+    published = False
+    try:
+        offset = 0
+        while offset < len(data):
+            wrote = os.write(fd, data[offset:])
+            if wrote <= 0:
+                raise OSError(errno.EIO, "short PR-watch marker write")
+            offset += wrote
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        os.replace(tmp, path)
+        published = True
+        # Directory fsync is unsupported on some platforms.  Unexpected failures are loud, but
+        # MUST NOT make this helper report failure after replace: the live marker already says
+        # `attempted`, and returning before injection would make the next pass retire with no send.
+        dfd = None
+        try:
+            dfd = os.open(str(path.parent), os.O_RDONLY)
+            os.fsync(dfd)
+        except OSError as ex:
+            unsupported = (errno.EINVAL, getattr(errno, "ENOTSUP", -1),
+                           getattr(errno, "EOPNOTSUPP", -1), getattr(errno, "ENOSYS", -1))
+            if ex.errno not in unsupported:
+                sys.stderr.write("pr-watch marker directory sync failed after publish: %s\n" % ex)
+        finally:
+            if dfd is not None:
+                try:
+                    os.close(dfd)
+                except OSError as ex:
+                    sys.stderr.write("pr-watch marker directory close failed after publish: %s\n" % ex)
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if not published:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 def _pr_watch_stamped_deliver(r, verdict, detail):
     """Deliver a watch's terminal mail AT MOST ONCE across crashes (the v1.3.17 audit's P2.10):
     the verdict is stamped into the durable watch file BEFORE the injection, so a crash between
@@ -13640,7 +13701,7 @@ def _pr_watch_stamped_deliver(r, verdict, detail):
         # injection (the r49 verification: marking before the re-stamp save let a save failure
         # plus a crash read as 'attempted' with no delivery ever tried — silently retired)
         try:
-            fk.write_text("attempted\n")
+            _pr_watch_marker_put(fk, "attempted")
         except OSError:
             return False                             # NO delivery was attempted yet — retiring
         #                                              here dropped the notice with zero sends
@@ -13656,8 +13717,7 @@ def _pr_watch_stamped_deliver(r, verdict, detail):
     r.pop("sentDetail", None)
     if not _pr_watches_save():
         try:
-            fk.parent.mkdir(parents=True, exist_ok=True)
-            fk.write_text("pending\n")              # one bounded retry (the v1.3.21 audit's P2:
+            _pr_watch_marker_put(fk, "pending")     # one bounded retry (the v1.3.21 audit's P2:
             #                                          the marker used to allow retry FOREVER,
             #                                          and a crash mid-retry re-delivered)
         except OSError:
