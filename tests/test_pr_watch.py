@@ -277,43 +277,40 @@ class Tick(unittest.TestCase):
             "the confirmed delivery spends the marker")
 
     def test_a_failed_attempted_mark_retains_the_watch(self):
-        # the v1.3.22 audit's P2.6, executed: the pending->attempted transition failing used to
-        # return True — the watch RETIRED with zero deliveries ever attempted (the marker write
-        # precedes the injection, so there is no duplicate to fear; retrying the MARK is free)
+        # The v1.3.22 audit's P2.6 required a failed pending->attempted transition to retain the
+        # watch.  Its first regression raised BEFORE touching the file, missing the real filesystem
+        # schedule: Path.write_text truncates `pending`, then raises.  The empty survivor plus the
+        # durable sent stamp made the next tick retire with zero delivery attempts.  Force both the
+        # old truncating failure and the fixed atomic replace failure; `pending` must survive intact.
         km.add_pr_watch(31, "TESTORG/testrepo", SID, now=0)
         km._pr_watch_read = lambda pr, repo: ("merged", "")
         real_fk = km._pr_watch_fail_marker(km._pr_watches[0], "merged")
         real_fk.parent.mkdir(parents=True, exist_ok=True)
         real_fk.write_text("pending\n")             # a prior known failure left the marker
-        state = {"fail_writes": True}
+        real_write_text = Path.write_text
+        real_replace = os.replace
 
-        class FK:
-            def exists(self):
-                return real_fk.exists()
+        def truncate_then_fail(path, text, *args, **kwargs):
+            if path == real_fk:
+                path.write_bytes(b"")               # the old in-place writer's partial effect
+                raise OSError("synthetic write failure after truncate")
+            return real_write_text(path, text, *args, **kwargs)
 
-            def read_text(self):
-                return real_fk.read_text()
-
-            def write_text(self, s):
-                if state["fail_writes"]:
-                    raise OSError("disk full")
-                return real_fk.write_text(s)
-
-            def unlink(self, missing_ok=False):
-                return real_fk.unlink(missing_ok=missing_ok)
-
-            @property
-            def parent(self):
-                return real_fk.parent
+        def replace_fails_for_marker(src, dst, *args, **kwargs):
+            if Path(dst) == real_fk:
+                raise OSError("synthetic atomic publish failure")
+            return real_replace(src, dst, *args, **kwargs)
 
         try:
-            with mock.patch.object(km, "_pr_watch_fail_marker", return_value=FK()):
+            with mock.patch.object(Path, "write_text", new=truncate_then_fail), \
+                    mock.patch.object(os, "replace", side_effect=replace_fails_for_marker):
                 km._pr_watch_tick(100.0)
-                self.assertEqual(self.mail, [], "no injection was attempted")
-                self.assertEqual(len(km._pr_watches), 1,
-                                 "the watch SURVIVES — nothing was delivered, nothing may retire")
-                state["fail_writes"] = False          # the disk heals
-                km._pr_watch_tick(100.0 + km.PR_WATCH_EVERY)
+            self.assertEqual(self.mail, [], "no injection was attempted")
+            self.assertEqual(real_fk.read_text(), "pending\n",
+                             "failed publication preserves the known-failure evidence exactly")
+            self.assertEqual(len(km._pr_watches), 1,
+                             "the watch SURVIVES — nothing was delivered, nothing may retire")
+            km._pr_watch_tick(100.0 + km.PR_WATCH_EVERY)  # the disk heals
         finally:
             try:
                 real_fk.unlink()
