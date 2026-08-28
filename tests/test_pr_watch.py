@@ -5,6 +5,8 @@ both ends of the standing watcher rule — and delivers ONE [romp] mail, survivi
 restarts that killed every shell loop this replaces. Registrations persist and re-arm on boot (the
 reconnect-intent idiom); a gh failure retires the watch LOUDLY after three consecutive errors.
 Synthetic only — gh fully stubbed."""
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -408,3 +410,85 @@ class Route(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class V1323StampResolutionAndIsolation(unittest.TestCase):
+    """the v1.3.23 audit's P2.8: (a) a crash between delivery and retirement left the stamped
+    row in the durable file, and the next boot's poll could return a CHANGED verdict — the
+    landed "error" notice was followed by a contradictory "merged" one; (b) a non-UTF-8
+    failure marker raised UnicodeDecodeError past the OSError catch and the exception aborted
+    the ENTIRE supervisor pass. Tick's fixture, standalone (inheriting would re-run its tests)."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self._saved = (km.PR_WATCH_FILE, list(km._pr_watches), km._pr_watch_read,
+                       km._pr_watch_deliver)
+        km.PR_WATCH_FILE = Path(self.td.name) / "pr-watches.json"
+        km._pr_watches[:] = []
+        self.mail = []
+        km._pr_watch_deliver = lambda sid, text: self.mail.append((sid, text)) or True
+
+    def tearDown(self):
+        km.PR_WATCH_FILE, km._pr_watches[:], km._pr_watch_read, km._pr_watch_deliver = \
+            self._saved[0], self._saved[1], self._saved[2], self._saved[3]
+        self.td.cleanup()
+
+    def test_a_stamped_row_resolves_before_any_fresh_poll(self):
+        km.add_pr_watch(41, "TESTORG/testrepo", SID, now=0)
+        km._pr_watches[0]["sent"] = "error"               # the restart-loaded stamp:
+        km._pr_watches[0]["sentDetail"] = "auth required"  # delivered, not yet retired
+        polled = []
+        km._pr_watch_read = lambda pr, repo: polled.append(1) or ("merged", "")
+        km._pr_watch_tick(100.0)
+        self.assertEqual(self.mail, [], "the stamp is delivery evidence — nothing re-mails")
+        self.assertEqual(polled, [], "…and the changed verdict is never even polled")
+        self.assertEqual(km._pr_watches, [], "the stamped row retires")
+
+    def test_a_stamped_known_failure_retries_the_stamped_verdict(self):
+        km.add_pr_watch(42, "TESTORG/testrepo", SID, now=0)
+        r = km._pr_watches[0]
+        r["sent"] = "error"
+        r["sentDetail"] = "auth required"
+        fk = km._pr_watch_fail_marker(r, "error")
+        fk.parent.mkdir(parents=True, exist_ok=True)
+        fk.write_text("pending\n")                        # the stamp is NOT delivery evidence
+        self.addCleanup(lambda: fk.unlink(missing_ok=True))
+        km._pr_watch_read = lambda pr, repo: ("merged", "")
+        km._pr_watch_tick(100.0)
+        self.assertEqual(len(self.mail), 1)
+        self.assertIn("could not read", self.mail[0][1],
+                      "the STAMPED error notice retries — never the fresh, contradictory verdict")
+        self.assertIn("auth required", self.mail[0][1], "…with its stamped detail")
+        self.assertEqual(km._pr_watches, [])
+
+    def test_a_non_utf8_marker_never_aborts_the_pass(self):
+        km.add_pr_watch(43, "TESTORG/testrepo", SID, now=0)
+        km.add_pr_watch(44, "TESTORG/testrepo", SID, now=0)
+        r = km._pr_watches[0]
+        r["sent"] = "merged"
+        r["sentDetail"] = ""
+        fk = km._pr_watch_fail_marker(r, "merged")
+        fk.parent.mkdir(parents=True, exist_ok=True)
+        fk.write_bytes(b"\xff\xfe garbage \xff")
+        self.addCleanup(lambda: fk.unlink(missing_ok=True))
+        km._pr_watch_read = lambda pr, repo: ("merged", "")
+        km._pr_watch_tick(100.0)
+        self.assertEqual(km._pr_watches, [], "both watches processed — nothing aborted")
+        self.assertEqual(len(self.mail), 1,
+                         "the corrupt-marked stamp retires at-most-once; the OTHER watch "
+                         "still delivered")
+
+    def test_one_watch_raise_never_aborts_the_others(self):
+        km.add_pr_watch(45, "TESTORG/testrepo", SID, now=0)
+        km.add_pr_watch(46, "TESTORG/testrepo", SID, now=0)
+
+        def read(pr, repo):
+            if pr == 45:
+                raise RuntimeError("synthetic")
+            return ("merged", "")
+
+        km._pr_watch_read = read
+        with contextlib.redirect_stderr(io.StringIO()):
+            km._pr_watch_tick(100.0)
+        self.assertEqual(len(self.mail), 1, "the healthy watch still delivered")
+        self.assertEqual(len(km._pr_watches), 1, "the raising watch survives for retry")

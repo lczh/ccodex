@@ -2055,19 +2055,27 @@ def _union_ops_load():
     """The multi-host tag-gesture journal (the v1.3.21 audit's P1.5): the timeline panel's
     in-flight compensation entries, mirrored here so a panel reload does not lose the
     transaction — a refusal arriving after the reload used to leave already-applied sibling
-    hosts silently split, with nothing left to compensate them."""
+    hosts silently split, with nothing left to compensate them. NO truncation on load (the
+    v1.3.23 audit's P1.3): the load-side cap silently dropped an over-full journal's tail
+    before the merge ever saw it."""
     try:
         rows = json.loads(_union_ops_path().read_text())
     except Exception:
         return []
-    return [r for r in rows if isinstance(r, dict)][:_UNION_OPS_MAX] if isinstance(rows, list) else []
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
 
 
 def _union_ops_set(entries, retired=None):
     """Per-gid MERGE, never a whole replace (the r49 verification): each open timeline panel
     mirrors only ITS OWN in-flight list — a full replace last-writer-wins'd between panels, so
     any gesture in a second panel erased the first's journal and re-opened the audited reload
-    split. Incoming entries upsert by (gid, host); `retired` names gids whose group resolved."""
+    split. Incoming entries upsert by (gid, host); `retired` names gids whose group resolved.
+    NOTHING unresolved is ever evicted (the v1.3.23 audit's P1.3): the old cap dropped the
+    OLDEST rows past _UNION_OPS_MAX and still acked ok:true — the 201st gesture silently
+    un-journaled the oldest ACTIVE one, and a reload had nothing left to compensate. Rows
+    leave through their acked retirement (gesture entries settle on EVIDENCE, never a clock —
+    the design rule the expiry tests pin) or, for refusal rows only, the 7-day staleness
+    backstop; _UNION_OPS_MAX is a loud high-water mark now, not an eviction."""
     # the WHOLE load-merge-write under the identity lock (the r50 verification: two threads'
     # unlocked merges both reported success and persisted only one of two distinct gestures)
     with jd._identity_file_lock():
@@ -2089,15 +2097,69 @@ def _union_ops_set(entries, retired=None):
                          and r["t"] < _cutoff)]
         rows += [r for r in inc if r.get("gid") not in ret]
         if len(rows) > _UNION_OPS_MAX:
-            rows = rows[-_UNION_OPS_MAX:]   # the cap drops the OLDEST — dropping the incoming
-            #                                 gesture while acking ok:true told the panel a
-            #                                 write landed that didn't (the r50 round)
+            sys.stderr.write("union-gestures: %d rows exceed the %d high-water mark — "
+                             "retaining ALL (rows retire on acked evidence or a refusal's "
+                             "7d backstop, never by eviction)\n" % (len(rows), _UNION_OPS_MAX))
         try:
             _atomic_write(_union_ops_path(), json.dumps(rows))
             return True
         except Exception:
             sys.stderr.write("union-gestures save: %s\n" % traceback.format_exc())
             return False
+
+
+_pending_refusal_rows = []
+_pending_refusal_lock = threading.Lock()
+
+
+def _journal_refusal(row):
+    """Persist one editTag refusal beside the gestures, WITH a retry (the v1.3.23 audit's
+    P1.3): the refusal row is the reload-surviving twin of the transient tagEditFailed frame,
+    and a swallowed save failure meant a panel reloading in the send window never learned its
+    gesture was refused — the multi-host split went silent. A failed save queues the row and
+    the supervisor pass retries until it lands (full durability against a kernel death is not
+    to be had while the disk refuses writes — the retry closes the practical window, and the
+    failure is loud)."""
+    ok = False
+    try:
+        ok = _union_ops_set([row])
+    except Exception:
+        sys.stderr.write("refusal journal: %s\n" % traceback.format_exc())
+    if not ok:
+        with _pending_refusal_lock:
+            if len(_pending_refusal_rows) >= _UNION_OPS_MAX:
+                sys.stderr.write("refusal journal: the retry queue is full — dropping the "
+                                 "oldest queued refusal\n")
+                _pending_refusal_rows.pop(0)
+            _pending_refusal_rows.append(row)
+        sys.stderr.write("refusal journal: the save failed — queued for the supervisor "
+                         "pass retry (opId %s)\n" % row.get("opId"))
+
+
+def _flush_pending_refusals():
+    """The supervisor-pass retry of refusal rows whose journal save failed (P1.3). Strict FIFO
+    with head-of-line hold, the ui-op spool's discipline: a still-failing store keeps the
+    order for the next pass."""
+    with _pending_refusal_lock:
+        rows = list(_pending_refusal_rows)
+    if not rows:
+        return
+    landed = []
+    for row in rows:
+        try:
+            if not _union_ops_set([row]):
+                break
+        except Exception:
+            break
+        landed.append(row)
+    if landed:
+        with _pending_refusal_lock:
+            for row in landed:
+                try:
+                    _pending_refusal_rows.remove(row)
+                except ValueError:
+                    pass
+        _mark_views_dirty()          # the journal echo reaches every panel on the next payload
 
 
 def _views_rename_refs(d, old, new):
@@ -2142,37 +2204,43 @@ def _views_drop_refs(d, name, ignore_host=None):
                 #                            an empty screen
 
 
-def _migrate_refs_after_remote_edit(host, name, body):
-    """After a remote-only rename/delete LANDS on its owner (`host`), migrate THIS kernel's own
-    lens and tagOrder references to the tag's name (the r50 verification: the migration ran
-    only for local tags — a remote rename stranded actives.*.tags and tagOrder on the old
-    name, and a selected lens silently showed no rows). Locked read-modify-write, the same
-    discipline as _apply_views_ops; rev bumps only when a reference actually moved. BOTH legs
-    wear the union-survival rule (the r50 round): lens names are name-keyed UNIONS, so when
-    the old name still exists elsewhere — another local tag, another host's remote tag — the
-    refs stay put; only the edited host's own stale cache is disregarded (ignore_host)."""
-    _new = body.get("rename") if isinstance(body.get("rename"), str) else ""
-    _new = _new.strip()
-    if not _new and body.get("delete") is not True:
-        return
-    def _survives_elsewhere():
-        if any(t.get("name") == name for t in _timeline_views().get("tags") or []):
+def _tag_name_survives_elsewhere(host, name):
+    """True when `name` still names a real tag OUTSIDE the edited host: another local tag, or
+    another attached kernel's remote tag. Lens names are name-keyed UNIONS — moving the refs
+    while the old name survives would strip the surviving tag out of every lens (r50)."""
+    if any(t.get("name") == name for t in _timeline_views().get("tags") or []):
+        return True
+    try:
+        with _remotes_lock:
+            rs = list(_remotes.values())
+        for r in rs:
+            if r.get("host") == host:
+                continue
+            for rt in ((r.get("views") or {}).get("tags") or []):
+                if rt.get("name") == name:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _ref_migrations_path():
+    return jd.STATE / "pending-ref-migrations.json"
+
+
+_pending_ref_migrations = []
+_pending_ref_migrations_lock = threading.Lock()
+
+
+def _apply_ref_migration(host, name, new, deleted):
+    """The locked read-modify-write half of the reference migration. True = applied or moot;
+    False = ONLY a failed store write (the retryable case). Locked like _apply_views_ops;
+    rev bumps only when a reference actually moved."""
+    if not deleted:
+        if not new:
             return True
-        try:
-            with _remotes_lock:
-                rs = list(_remotes.values())
-            for r in rs:
-                if r.get("host") == host:
-                    continue
-                for rt in ((r.get("views") or {}).get("tags") or []):
-                    if rt.get("name") == name:
-                        return True
-        except Exception:
-            pass
-        return False
-    if _new and _survives_elsewhere():
-        return          # the lens still names something real under the OLD name — moving the
-    #                     refs would strip the surviving tag out of every lens (the r50 round)
+        if _tag_name_survives_elsewhere(host, name):
+            return True      # the lens still names something real under the OLD name (r50)
     with jd._identity_file_lock():
         try:
             raw = json.loads(_views_path().read_text())
@@ -2184,15 +2252,106 @@ def _migrate_refs_after_remote_edit(host, name, body):
             currev = 0
         d = _norm_timeline_views(raw)
         before = json.dumps(d, sort_keys=True)
-        if _new:
-            _views_rename_refs(d, name, _new)
+        if not deleted:
+            _views_rename_refs(d, name, new)
         else:
             _views_drop_refs(d, name, ignore_host=host)
         if json.dumps(d, sort_keys=True) == before:
-            return                       # no local reference held the name — nothing to claim
+            return True                  # no local reference held the name — nothing to claim
         d = _norm_timeline_views(jd.canonicalize_timeline_views(d))
         d["rev"] = currev + 1
-        _atomic_write(_views_path(), json.dumps(d, sort_keys=True))
+        try:
+            _atomic_write(_views_path(), json.dumps(d, sort_keys=True))
+            return True
+        except Exception:
+            sys.stderr.write("ref migration save: %s\n" % traceback.format_exc())
+            return False
+
+
+def _queue_ref_migration(intent):
+    """A migration whose REMOTE half already committed but whose local write failed (the
+    v1.3.23 audit's P2.5: an injected write failure after remote success left stale local
+    references forever, silently). The intent persists beside the state (best-effort — the
+    same disk may refuse it) and the supervisor pass retries until the migration lands."""
+    with _pending_ref_migrations_lock:
+        _pending_ref_migrations.append(intent)
+        try:
+            _atomic_write(_ref_migrations_path(), json.dumps(_pending_ref_migrations))
+        except Exception:
+            sys.stderr.write("ref migration: the retry intent could not be persisted — "
+                             "retrying in-memory only\n")
+
+
+def _flush_pending_ref_migrations():
+    """The supervisor-pass retry of queued reference migrations (P2.5). Adopts a restarted
+    kernel's durable intents; re-evaluates each against CURRENT state (the union-survival
+    rule runs at apply time, so a name re-minted since simply moots the migration)."""
+    with _pending_ref_migrations_lock:
+        if not _pending_ref_migrations:
+            try:
+                rows = json.loads(_ref_migrations_path().read_text())
+                if isinstance(rows, list):
+                    _pending_ref_migrations.extend(r for r in rows if isinstance(r, dict))
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+        todo = list(_pending_ref_migrations)
+    if not todo:
+        return
+    landed = []
+    for it in todo:
+        try:
+            if not _apply_ref_migration(str(it.get("host") or ""), str(it.get("name") or ""),
+                                        str(it.get("new") or ""), it.get("deleted") is True):
+                break                    # still failing — keep order for the next pass
+        except Exception:
+            break
+        landed.append(it)
+    if landed:
+        with _pending_ref_migrations_lock:
+            for it in landed:
+                try:
+                    _pending_ref_migrations.remove(it)
+                except ValueError:
+                    pass
+            try:
+                if _pending_ref_migrations:
+                    _atomic_write(_ref_migrations_path(), json.dumps(_pending_ref_migrations))
+                else:
+                    _ref_migrations_path().unlink(missing_ok=True)
+            except Exception:
+                pass
+        _mark_views_dirty()
+
+
+def _migrate_refs_after_remote_edit(host, name, body, ans=None):
+    """After a remote-only rename/delete LANDS on its owner (`host`), migrate THIS kernel's own
+    lens and tagOrder references to the tag's name (the r50 verification: the migration ran
+    only for local tags — a remote rename stranded actives.*.tags and tagOrder on the old
+    name, and a selected lens silently showed no rows). BOTH legs wear the union-survival rule
+    (the r50 round): when the old name still exists elsewhere — another local tag, another
+    host's remote tag — the refs stay put; only the edited host's own stale cache is
+    disregarded (ignore_host). The intent is read the way the OWNER reads it (the v1.3.23
+    audit's P2.5): _edit_tag handles delete FIRST and returns — a {delete:true, rename:...}
+    body deletes, and reading rename first renamed this kernel's refs to a name the owner
+    never minted. The rename target prefers the owner's POST-NORMALIZE name off its reply
+    (`ans`, the authoritative result); the fallback applies the owner's own clamp-then-strip —
+    strip-only kept a 40-char viewer reference for a 30-char owner name. A failed local write
+    after the remote committed queues a retryable intent instead of dropping the migration."""
+    deleted = body.get("delete") is True             # the owner's precedence: delete wins
+    new = ""
+    if not deleted:
+        raw = body.get("rename") if isinstance(body.get("rename"), str) else ""
+        new = str(raw)[:_VIEWS_MAX_NAME].strip()     # the owner's normalization (_edit_tag)
+        if new and isinstance(ans, dict) and isinstance(ans.get("tag"), dict) \
+                and isinstance(ans["tag"].get("name"), str) and ans["tag"]["name"]:
+            new = ans["tag"]["name"]                 # the owner's post-normalize name outranks
+            #                                          any local reconstruction of it
+        if not new:
+            return
+    if not _apply_ref_migration(host, name, new, deleted):
+        _queue_ref_migration({"host": host, "name": name, "new": new, "deleted": deleted})
 
 
 def _apply_views_ops(ops):
@@ -2209,9 +2368,11 @@ def _apply_views_ops(ops):
     Unknown tags and malformed ops drop quietly: a replayed gesture over a deleted tag has
     nothing left to do — but a DUPLICATE-NAME refusal is a CONFLICT, named in the return (the
     r50 verification: a refused create/rename was acked ok with a bumped rev, and the dialog
-    showed a tag the store never held). Returns (rev, conflicts): rev bumps ONLY when
-    something actually applied — an all-refused ops list leaves the store byte-identical, and
-    advertising a new rev for it claims a change nobody made."""
+    showed a tag the store never held). Returns (rev, conflicts): rev bumps ONLY when the
+    STORE actually changes — an all-refused ops list leaves it byte-identical, and so does an
+    op restating current values (the v1.3.23 audit's P2.7: repeating the same active/actives/
+    tagOrder advanced rev 1→2→3→4, and the false bumps then 409'd another client's meaningful
+    CAS write). The normalized pre/post comparison below is the one arbiter of "changed"."""
     applied = False
     conflicts = []
     with jd._identity_file_lock():
@@ -2224,6 +2385,9 @@ def _apply_views_ops(ops):
         except (TypeError, ValueError):
             currev = 0
         d = _norm_timeline_views(raw)
+        _pre = json.loads(json.dumps(d))              # the ops mutate d — snapshot first
+        _pre_key = json.dumps(_norm_timeline_views(jd.canonicalize_timeline_views(_pre)),
+                              sort_keys=True)         # canonical basis; _norm carries no rev
         # _member_pair, not a bare-sid wrapper (the r45 verification): clients post the
         # viewer-relative "host:sid" spelling for REMOTE members — wrapping it as a home sid
         # stored a corrupt pair, and remove could never match one
@@ -2259,21 +2423,28 @@ def _apply_views_ops(ops):
             if isinstance(cr, dict):
                 cid = str(cr.get("id") or "")
                 crname = str(cr.get("name") or "tag")
+                _same_id = next((t for t in d["tags"] if t["id"] == cid), None) if cid else None
                 # unique ids AND unique names (the v1.3.21 audit's P2): tags are name-addressed
                 # across every edit wire, so a duplicate name makes half the grammar ambiguous
-                if cid and not any(t["id"] == cid for t in d["tags"]) \
+                if cid and _same_id is None \
                         and not any(t.get("name") == crname for t in d["tags"]):
                     d["tags"].append({"id": cid, "name": crname,
                                       "color": str(cr.get("color") or ""),
                                       "members": [m for m in (pair(s) for s in (cr.get("members") or []))
                                                   if m]})
                     applied = True
-                elif cid and not any(t["id"] == cid for t in d["tags"]):
+                elif cid and _same_id is None:
                     # a NAME collision under a FRESH id — refused and named (r50). A same-id
                     # re-create is a replay's idempotence (the spool, the reconnect re-pump
                     # re-sending a landed create) and stays quiet: alarming on it would flag
                     # every recovered gesture as a failure.
                     conflicts.append("create '%s': the name is already taken" % crname)
+                elif cid and _same_id.get("name") != crname:
+                    # the SAME id under a DIFFERENT name is a mint collision, never a replay
+                    # (the v1.3.23 audit's P2.6): two panels' same-ms mints made the second
+                    # create report success while only the first tag existed — name it
+                    conflicts.append("create '%s': its id collided with tag '%s' — retry"
+                                     % (crname, _same_id.get("name")))
                 continue
             key = str(op.get("tag") or "")
             t = next((x for x in d["tags"] if x.get("name") == key or x.get("id") == key), None)
@@ -2320,6 +2491,11 @@ def _apply_views_ops(ops):
         if not applied:
             return currev, conflicts
         d = _norm_timeline_views(jd.canonicalize_timeline_views(d))
+        if json.dumps(d, sort_keys=True) == _pre_key:
+            # an EXACT no-op (the v1.3.23 audit's P2.7): an op restating current values — the
+            # re-picked lens, the re-posted tagOrder — left the canonical store identical, and
+            # bumping rev for it made every open client's CAS base stale for nothing
+            return currev, conflicts
         d["rev"] = currev + 1
         _atomic_write(_views_path(), json.dumps(d, sort_keys=True))
         return currev + 1, conflicts
@@ -13275,7 +13451,7 @@ def _pr_watches_save_locked():
     # caller HOLDS _pr_watch_lock — the WRITE sits under the lock (the v1.3.18 audit: two
     # concurrent saves could land out of order, resurrecting a retired watch or losing a
     # fresh one — the snapshot alone serialized nothing)
-    rows = [{k: r[k] for k in ("pr", "repo", "sid", "at", "sent") if k in r}
+    rows = [{k: r[k] for k in ("pr", "repo", "sid", "at", "sent", "sentDetail") if k in r}
             for r in _pr_watches]
     try:
         _atomic_write(PR_WATCH_FILE, json.dumps(rows))
@@ -13430,7 +13606,11 @@ def _pr_watch_stamped_deliver(r, verdict, detail):
     if r.get("sent") == verdict:
         try:
             fk_state = fk.read_text().strip() if fk.exists() else ""
-        except OSError:
+        except (OSError, ValueError):
+            # corruption-safe (the v1.3.23 audit's P2.8): a non-UTF-8 marker raised
+            # UnicodeDecodeError (a ValueError) PAST the OSError catch and aborted the whole
+            # supervisor pass. Unreadable is unknown, and at-most-once wins the ambiguity —
+            # the same verdict the OSError leg always gave.
             fk_state = ""
         if fk_state == "attempted":
             # the SECOND crash shape (the v1.3.21 audit's P2): a retry already ran and may have
@@ -13446,10 +13626,14 @@ def _pr_watch_stamped_deliver(r, verdict, detail):
         else:                                        # not evidence of delivery; retry below
             return True                              # stamped: delivered (or crashed mid-window)
     r["sent"] = verdict
+    r["sentDetail"] = detail          # rides the stamp so a stamp RESOLVED after a restart
+    #                                   can retry the same notice verbatim (the v1.3.23
+    #                                   audit's P2.8)
     if not _pr_watches_save():
         # the stamp is NOT durable — delivering now would re-mail after a crash (the v1.3.18
         # audit: a swallowed save failure turned the at-most-once stamp into a duplicate)
         r.pop("sent", None)
+        r.pop("sentDetail", None)
         return False
     if fk.exists():
         # mark the attempt durably AFTER the stamp save landed and IMMEDIATELY before the
@@ -13469,6 +13653,7 @@ def _pr_watch_stamped_deliver(r, verdict, detail):
             pass
         return True
     r.pop("sent", None)                               # a KNOWN failure — retry next pass
+    r.pop("sentDetail", None)
     if not _pr_watches_save():
         try:
             fk.parent.mkdir(parents=True, exist_ok=True)
@@ -13483,31 +13668,50 @@ def _pr_watch_stamped_deliver(r, verdict, detail):
 
 
 def _pr_watch_tick(now):
-    """One supervisor-pass sweep over the registered watches (rate-gated per row)."""
+    """One supervisor-pass sweep over the registered watches (rate-gated per row). Each row is
+    ISOLATED (the v1.3.23 audit's P2.8): one watch's raise used to abort the whole pass —
+    every later watch skipped, plus the supervisor work behind this call."""
     with _pr_watch_lock:
         rows = list(_pr_watches)
     done = []
     for r in rows:
-        if now < r.get("_next", 0):
-            continue
-        verdict, detail = _pr_watch_read(r["pr"], r["repo"])
-        if verdict == "error":
-            r["_fails"] = int(r.get("_fails") or 0) + 1
-            r["_next"] = now + PR_WATCH_EVERY
-            if r["_fails"] >= PR_WATCH_MAX_FAILS:
-                if _pr_watch_stamped_deliver(r, "error", detail):
+        try:
+            if now < r.get("_next", 0):
+                continue
+            if r.get("sent"):
+                # an EXISTING durable stamp is resolved BEFORE any fresh poll (the v1.3.23
+                # audit's P2.8): a crash between delivery and retirement left the stamped row
+                # in the file, and polling again could return a DIFFERENT verdict — the "error"
+                # notice already landed, then a changed "merged" verdict mailed a second,
+                # contradictory one. The stamp's own verdict either retires on the stamp or
+                # retries the SAME notice (its detail rides the stamp).
+                if _pr_watch_stamped_deliver(r, r["sent"], str(r.get("sentDetail") or "")):
                     done.append(r)
                 else:
                     r["_next"] = now + PR_WATCH_EVERY
-            continue
-        r["_fails"] = 0
-        if verdict is None:
-            r["_next"] = now + (PR_WATCH_BUSY_EVERY if detail == "busy" else PR_WATCH_EVERY)
-            continue
-        if _pr_watch_stamped_deliver(r, verdict, detail):
-            done.append(r)
-        else:
+                continue
+            verdict, detail = _pr_watch_read(r["pr"], r["repo"])
+            if verdict == "error":
+                r["_fails"] = int(r.get("_fails") or 0) + 1
+                r["_next"] = now + PR_WATCH_EVERY
+                if r["_fails"] >= PR_WATCH_MAX_FAILS:
+                    if _pr_watch_stamped_deliver(r, "error", detail):
+                        done.append(r)
+                    else:
+                        r["_next"] = now + PR_WATCH_EVERY
+                continue
+            r["_fails"] = 0
+            if verdict is None:
+                r["_next"] = now + (PR_WATCH_BUSY_EVERY if detail == "busy" else PR_WATCH_EVERY)
+                continue
+            if _pr_watch_stamped_deliver(r, verdict, detail):
+                done.append(r)
+            else:
+                r["_next"] = now + PR_WATCH_EVERY
+        except Exception:
             r["_next"] = now + PR_WATCH_EVERY
+            sys.stderr.write("pr-watch: %s#%s tick failed — isolated, retried next pass\n%s"
+                             % (r.get("repo"), r.get("pr"), traceback.format_exc()))
     if done:
         with _pr_watch_lock:
             for r in done:
@@ -15555,6 +15759,8 @@ def _tunnel_supervisor():
                 _push_origin_trust_rows()
             _pr_watch_tick(now)          # PR-landing watches (rate-gated per row; loud on gh failure)
             _replay_ui_op_spool()        # kernel-down Electron gestures queued for locked replay (P1.5)
+            _flush_pending_refusals()    # refusal rows whose journal save failed (the v1.3.23 P1.3)
+            _flush_pending_ref_migrations()   # ref migrations whose local write failed (P2.5)
             # Everything above is the supervisor's own state (status, fails, next_try, kernel_sha, detail).
             # None of it used to reach disk — only the act routes saved — so the file could sit frozen on a
             # failure long after the row recovered. Signature-gated: a steady fleet writes nothing.
@@ -28424,6 +28630,11 @@ else if(m.type==="tagEditFailed"&&panel.tagEditFailed)panel.tagEditFailed(m);
 else if(m.type==="viewsAck"&&panel.viewsAck)panel.viewsAck(m);
 else if(m.type==="unionOpsAck"&&panel.unionOpsAck)panel.unionOpsAck(m);
 else if(m.type==="openViewsDialog"&&panel._openViewsDialog)panel._openViewsDialog(null);});
+// the shim's reconnect: every pending union sync died with the old socket, and nothing else
+// re-marked the journal dirty (the v1.3.23 audit's P1.3) — replay on the fresh one. The VS Code
+// host needs no twin: its extension RELOADS the webview on reconnect, and the reload re-seeds
+// from the kernel's journal echo.
+window.addEventListener("romp:wsup",function(){if(panel&&panel.unionTransportReset)panel.unionTransportReset();});
 window.__rompTimelineOpenExternal=function(url){try{var u=new URL(url);if(u.protocol==="vscode:"){var q=u.searchParams;
 post({type:"deepLink",session:q.get("session"),anchor:q.get("anchor")||undefined,anchorT:Number(q.get("anchorT"))||undefined,anchorKind:q.get("anchorKind")||undefined,compose:q.get("compose")==="1"});
 if(window.parent!==window)window.parent.postMessage({romp:"reveal",pane:"chat"},"*");return;}}catch(e){}window.open(url,"_blank");};
@@ -32649,7 +32860,9 @@ class Handler(BaseHTTPRequestHandler):
                                           "application/json")
                     if isinstance(ans, dict) and ans.get("ok", False):
                         # this kernel's own lens/order refs follow the landed remote edit (r50)
-                        _migrate_refs_after_remote_edit(th, name, b)
+                        # — off the owner's authoritative reply, not a re-read of the raw
+                        # request (the v1.3.23 audit's P2.5)
+                        _migrate_refs_after_remote_edit(th, name, b, ans)
                     _mark_views_dirty()
                     return self._send(200, json.dumps(ans), "application/json")
                 live = _live_names(_tmux_sessions())
@@ -33287,24 +33500,24 @@ class Handler(BaseHTTPRequestHandler):
                                   (client or {}).get("wid") or "")
                     # the refusal is journaled beside the gestures (the r50 verification: the
                     # frame is transient — a panel reloading in the send window lost the ONE
-                    # event its re-seeded journal was waiting for, and the split went silent)
+                    # event its re-seeded journal was waiting for, and the split went silent).
+                    # A FAILED save queues for the supervisor-pass retry instead of being
+                    # swallowed (the v1.3.23 audit's P1.3: the ignored failure re-opened the
+                    # exact reload window the journal exists to close).
+                    # gid = -int(opId): deterministic, so the panel that RECEIVED the
+                    # direct frame can tombstone the journal twin without waiting to see
+                    # it (the r50 round's double-fire/strand windows), and same-ms
+                    # refusals of DIFFERENT gestures never collide. Non-numeric opIds
+                    # (none are minted today) fall back to the clock.
                     try:
-                        # gid = -int(opId): deterministic, so the panel that RECEIVED the
-                        # direct frame can tombstone the journal twin without waiting to see
-                        # it (the r50 round's double-fire/strand windows), and same-ms
-                        # refusals of DIFFERENT gestures never collide. Non-numeric opIds
-                        # (none are minted today) fall back to the clock.
-                        try:
-                            _rgid = -abs(int(op_id))
-                        except (TypeError, ValueError):
-                            _rgid = -(int(time.time() * 1000) % 0x40000000)
-                        _union_ops_set([{"refusal": True, "host": host, "name": nm,
-                                         "opId": op_id, "error": _rmsg,
-                                         "t": int(time.time()), "gid": _rgid}])
-                    except Exception:
-                        pass
+                        _rgid = -abs(int(op_id))
+                    except (TypeError, ValueError):
+                        _rgid = -(int(time.time() * 1000) % 0x40000000)
+                    _journal_refusal({"refusal": True, "host": host, "name": nm,
+                                      "opId": op_id, "error": _rmsg,
+                                      "t": int(time.time()), "gid": _rgid})
                 else:
-                    _migrate_refs_after_remote_edit(host, nm, body)
+                    _migrate_refs_after_remote_edit(host, nm, body, ans)
                 _mark_views_dirty()
         elif msg and msg.get("type") == "cardNotify" and msg.get("itemId"):
             # feed card right-click → per-card bell (OS notification when THIS card blocks on you /

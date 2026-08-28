@@ -797,3 +797,75 @@ HOLDPY
     [ "$status" -eq 0 ]
     [[ "$output" == *"GEN_KERNEL_RAN"* ]]
 }
+
+# ── the v1.3.23 audit: the pick channel fails closed; the lock holds THROUGH exec ──────────────
+
+@test "romp-serve: a GIT checkout that cannot mint the pick channel refuses (exit 70, P1.2)" {
+    # the v1.3.23 audit's P1.2, executed: with TMPDIR unwritable the gate could refuse only
+    # non-live picks — a live verdict exited 0 with nothing to deliver, bash skipped the strict
+    # applier AND the exec revalidation, and an update landing after the gate had armed its
+    # marker still saw unverified mutable live bytes execute
+    _gen_fixture
+    export TMPDIR="$TEST_DIR/no-such-tmp"        # does not exist: mktemp fails
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 70 ]
+    [[ "$output" == *"cannot create the launch-pick channel"* ]]
+    [[ "$output" != *KERNEL_RAN* ]]
+}
+
+@test "romp-serve: a NON-GIT checkout without the pick channel still boots (no updates to race)" {
+    # the P1.2 refusal is scoped to git checkouts: a non-git install hosts no updates, so
+    # there is no pick to protect — a broken TMPDIR must not brick it
+    unset ROMP_KERNEL_BIN ROMP_CHECKOUT
+    NOGIT="$TEST_DIR/nogit-pickless"
+    mkdir -p "$NOGIT/bin"
+    printf '#!/usr/bin/env bash\necho "LIVE_KERNEL_RAN"\n' > "$NOGIT/bin/romp-kernel"
+    chmod +x "$NOGIT/bin/romp-kernel"
+    export ROMP_SERVE_ROOT="$NOGIT"
+    export TMPDIR="$TEST_DIR/no-such-tmp"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"LIVE_KERNEL_RAN"* ]]
+}
+
+@test "romp-serve: the revalidation lock does NOT ride into the kernel (CLOEXEC at exec, P1.1)" {
+    # the v1.3.23 audit's P1.1's counter-worry, pinned: the lock now holds THROUGH os.execv
+    # and must release exactly there — a kernel that inherited a held update lock would block
+    # every later update transaction forever
+    _gen_fixture
+    cat > "$TEST_DIR/lock-probe.py" << 'PROBE'
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    print("LOCK_FREE_IN_KERNEL")
+except OSError:
+    print("LOCK_STILL_HELD")
+PROBE
+    cat > "$GENGD/romp-run-$GENH8/bin/romp-kernel" << STUB
+#!/usr/bin/env bash
+echo "GEN_KERNEL_RAN"
+exec python3 "$TEST_DIR/lock-probe.py" "$GENGD/romp-update.lock"
+STUB
+    chmod +x "$GENGD/romp-run-$GENH8/bin/romp-kernel"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"GEN_KERNEL_RAN"* ]]
+    [[ "$output" == *"LOCK_FREE_IN_KERNEL"* ]]
+}
+
+@test "romp-serve: the revalidation and the exec live in ONE python — no early lock release (P1.1)" {
+    # revert detector (the flock(1) test's pattern): the fd-9 shape closed the lock before
+    # exec, and an update landing in that gap deterministically booted the superseded pick.
+    # The checks and the exec must share one process so the flock is still held at os.execv.
+    run grep -c '9>&-' "$ROMP_SERVE"
+    [ "$output" = "0" ]
+    python3 - "$ROMP_SERVE" << 'CHECK'
+import re, sys
+src = open(sys.argv[1]).read()
+m = re.search(r"exec python3 -c '(.*?)' \"\$ROMP_DIR\"", src, re.S)
+assert m, "the one-python launcher is gone"
+body = m.group(1)
+assert "fcntl.flock" in body and "os.execv" in body, "lock and exec are not in ONE process"
+CHECK
+}

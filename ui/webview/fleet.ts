@@ -632,12 +632,44 @@ function mountControls() {
   foot.append(left, right);
 }
 
+// the chat's warn-toast, mirrored (one treatment, two sheets — the .romp-acted precedent: this
+// page loads feed.css, not styles.css): the Outline's refused tag write used to disappear with
+// nothing saying why (the v1.3.23 audit's P3.9)
+function warnToast(msg: string): void {
+  let box = document.getElementById("warn-toasts");
+  if (!box) {
+    box = el("div", "");
+    box.id = "warn-toasts";
+    document.body.appendChild(box);
+    box.addEventListener("click", (e) => {
+      (e.target as HTMLElement | null)?.closest(".warn-toast")?.remove();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") for (const w of Array.from(box!.children)) w.remove();
+    });
+  }
+  const t = el("div", "warn-toast");
+  const txt = el("span", "warn-toast-msg");
+  txt.textContent = msg;
+  const x = el("button", "warn-toast-x");
+  x.setAttribute("aria-label", "Dismiss");
+  x.title = "dismiss (Esc)";
+  x.textContent = "✕";
+  t.append(txt, x);
+  t.title = "click to dismiss";
+  box.appendChild(t);
+  setTimeout(() => t.classList.add("fade"), 11000);
+  setTimeout(() => t.remove(), 12000);
+}
+
 window.addEventListener("message", (e: MessageEvent) => {
   const m = e.data;
   // the kernel's per-write CAS answer to our setTimelineViews posts (the 2026-08-26 audit's
   // Finding A) → the shared writer re-anchors its optimistic counter; the next feed push repaints
   // the outline with the store's truth either way, so a refusal needs no rollback of its own here
-  if (consumeViewsAck(m)) return;
+  // — but a NAMED conflict must reach the user (the v1.3.23 audit's P3.9): the tag disappears
+  // from the pane, and only these strings say why
+  if (consumeViewsAck(m, (conflicts) => { for (const c of conflicts || []) warnToast(c); })) return;
   if (!m || m.type !== "feed") return;               // Fleet rides the FEED payload (proven channel); reads its `ledgers`
   // "loaded" means the kernel actually BUILT the fleet's ledgers (the key is present, even if []) — NOT merely
   // that some feed message arrived. A feed push can reach us before the (cold) ledger build finishes; treating

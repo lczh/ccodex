@@ -2921,9 +2921,33 @@ class TimelinePanel {
     const p = m && m.opId && this._pendingUnionSyncs ? this._pendingUnionSyncs[m.opId] : null;
     if (!p) return;                                    // a late twin of a superseded sync
     delete this._pendingUnionSyncs[m.opId];
-    if (m.ok === false) { this._unionSyncDirty = true; return; }
+    if (m.ok === false) {
+      this._unionSyncDirty = true;
+      // ONE direct retry per failure streak (the v1.3.23 audit's P1.3): the dirty flag alone
+      // waited for an UNRELATED future payload to re-send — on a quiet kernel the journal sat
+      // behind indefinitely. A second consecutive failure leaves the dirty flag for the
+      // payload-paced re-send, so a persistently failing store is never hammered in a loop.
+      if (!this._unionRetryPending) {
+        this._unionRetryPending = true;
+        this._syncUnionOps();
+      }
+      return;
+    }
+    this._unionRetryPending = false;
     for (const g of (p.retired || [])) { if (this._journaledGids) this._journaledGids.delete(g); }
     for (const g of (p.tomb || [])) { if (this._retireUnionGids) this._retireUnionGids.delete(g); }
+  }
+
+  // Transport reconnected (the v1.3.23 audit's P1.3 — the views writer's P2.8, union twin): a
+  // sync sent on the OLD socket was accepted by the browser and never delivered, its ack is
+  // never coming, and nothing re-marked the journal dirty — the kernel's copy stayed behind
+  // until an unrelated gesture. Every pending sync died with its socket; the full-replace
+  // upsert and the acked-retirement ledger make the replay idempotent on the fresh one.
+  unionTransportReset() {
+    this._pendingUnionSyncs = {};
+    this._unionRetryPending = false;
+    this._unionSyncDirty = true;
+    this._syncUnionOps();
   }
 
   _noteUnionOp(rt, name, inverse, edit, gid) {
@@ -3127,7 +3151,10 @@ class TimelinePanel {
       const nv = JSON.parse(JSON.stringify(this._curViews()));
       const used = new Set(viewTags(nv).map((t) => t.color));
       const color = (this._palette || []).find((c) => !used.has(c)) || (this._palette || [])[0] || '#1EA1EB';
-      const tg = { id: 'g' + Date.now().toString(36),
+      // ms-only ids silently discarded a simultaneous create (the v1.3.21 audit's P2; the
+      // v1.3.23 audit's P2.6 caught THIS last ms-only mint — two panels' same-ms 'alpha'/
+      // 'beta' creates both acked ok while only one tag existed)
+      const tg = { id: 'g' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
         name: ni.value.trim().slice(0, 40), color, members: rowIds.slice() };
       nv.tags = viewTags(nv).concat([tg]);
       delete nv.groups;

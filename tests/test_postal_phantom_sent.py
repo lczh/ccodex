@@ -304,17 +304,17 @@ class R50RelayStages(unittest.TestCase):
                         "no terminal row, no consumption — retried at the next start")
 
     def test_the_relay_leg_stages_first_and_boot_resolves(self):
-        # the transaction's ordering, pinned at the source: STAGE -> sent row -> outbox_put ->
-        # stage unlink (the r50 verification round: staged after the row, a crash — or a plain
-        # OSError on the stage write itself — in the one-line window still minted the permanent
-        # phantom; an orphaned stage with no row is just a harmless terminal for mail nobody
-        # sent); and serve() runs the stage reconciliation at boot
+        # the transaction's ordering, pinned at the source: STAGE -> sent row -> rename-publish
+        # (the r50 verification round: staged after the row, a crash — or a plain OSError on
+        # the stage write itself — in the one-line window still minted the permanent phantom;
+        # the v1.3.23 audit's P2.4 folded the old stage unlink INTO the publish rename); and
+        # serve() runs the stage reconciliation at boot
         src = open(os.path.join(BIN, "romp-postal-service"), encoding="utf-8").read()
         i_stage = src.index('".stage-" + mid')
         # the RELAY leg's copy of the refusal string — deliver()'s local leg wears the same
         # words much earlier in the file, so the search starts at the stage
         i_row = src.index('the delivery record could not be written', i_stage)
-        i_put = src.index("outbox_put(phost, relay_msg)")
+        i_put = src.index("outbox_publish_stage(phost, mid, _stagef)")
         self.assertLess(i_stage, i_row, "the arbiter lands before ANY durable claim")
         self.assertLess(i_row, i_put, "…and the sent row before the publish (receipts never lost)")
         body = src.split("def serve():", 1)[1].split("\ndef ", 1)[0]
@@ -333,6 +333,37 @@ class R50RelayStages(unittest.TestCase):
                          "a relayed row proves the publish — no terminal is filed")
         self.assertFalse((self.hd / ".stage-px-204.1_121.TESTHOST").exists(),
                          "…and the orphan stage is spent")
+
+    def test_the_publish_rename_leaves_no_stage_window(self):
+        # the v1.3.23 audit's P2.4, executed: with put-then-unlink, a fast peer ack could
+        # delete the published file BEFORE the stage unlink ran; a stop before the `relayed`
+        # append then made boot read the orphan stage as never-published and mark DELIVERED
+        # mail unpublished, erasing its receipt. The rename publish retires the stage in the
+        # same atomic step: the delivered schedule leaves NO stage, and boot files nothing.
+        mid = "px-205.1_131.TESTHOST"
+        stage = self.hd / (".stage-" + mid)
+        stage.write_text(json.dumps({"mid": mid, "to": "web", "body": "synthetic"}))
+        pm._tl_append("messages.jsonl", {"t": self.now, "ev": "sent", "id": mid,
+                                         "from": "api", "from_id": "1" * 8,
+                                         "to_id": "peer:TESTHOST2"})
+        pm.outbox_publish_stage("TESTHOST2", mid, stage)
+        self.assertFalse(stage.exists(), "the publish IS the stage's retirement — one atomic step")
+        self.assertEqual(json.loads((self.hd / (mid + ".json")).read_text())["mid"], mid,
+                         "the staged payload is the published record")
+        # the peer consumes and acks; the bus stops before the `relayed` append lands
+        pm.outbox_del("TESTHOST2", mid)
+        self.assertEqual(pm._reconcile_relay_stages(), 0,
+                         "delivered mail is never re-marked unpublished")
+        self.assertEqual([r for r in _rows() if r.get("ev") == "unpublished"], [])
+
+    def test_the_relay_stage_carries_the_full_payload(self):
+        # the rename publish can only be atomic if the stage IS the record — a marker-byte
+        # stage ("1") would publish garbage; pin the leg writing relay_msg into the stage
+        src = open(os.path.join(BIN, "romp-postal-service"), encoding="utf-8").read()
+        i_stage = src.index('".stage-" + mid')
+        leg = src[i_stage:i_stage + 3000]
+        self.assertIn("json.dump(relay_msg, _sf)", leg, "the stage holds the payload")
+        self.assertIn("os.fsync(_sf.fileno())", leg, "…durably, before any durable claim")
 
     def test_a_publish_raise_gets_a_compensating_row(self):
         # the executed in-process shape: outbox_put raises (not a crash) — the leg files the
