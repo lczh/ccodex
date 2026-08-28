@@ -248,8 +248,9 @@ test("executed: the conflict STRINGS reach the refusal callback — ok and refus
   consumeViewsAck({ type: "viewsAck", ok: true, rev: 7, opId: sent[0].opId,
                     conflicts: ["create 'infra': the name is already taken", 7, ""] },
                   (c) => got.push(c));
-  assert.deepEqual(got, [["create 'infra': the name is already taken"]],
+  assert.deepEqual(got[0], ["create 'infra': the name is already taken"],
     "the strings ride through (junk entries filtered)");
+  assert.equal(got.length, 1);
   postViewsOps((m) => sent.push(m), [{ rename: "x" } as any]);
   consumeViewsAck({ type: "viewsAck", ok: false, rev: 3, opId: sent[1].opId,
                     conflicts: ["rename 'a' → 'b': the name is already taken"] },
