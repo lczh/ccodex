@@ -210,3 +210,24 @@ test("wiring: the Outline (fleet) posts its lens picks as TARGETED ops and consu
   assert.match(FLEET, /fleetViews = m\.views as SessionViews; anchorViewsRev\(fleetViews\);/,
     "every feed payload's views re-anchors");
 });
+
+test("a conflicts-bearing ok ack fires the refusal callback but keeps the queue (r50 round)", () => {
+  // the r50 verification round: the timeline twin surfaced duplicate-name conflicts loudly,
+  // but THIS writer's callers (the chat strip's "New tag…", the Outline) read only ok/rev —
+  // the optimistic tag sat over a store that never held it, silently aging out. A conflicts
+  // ack is a PARTIAL application: the surface re-derives (onRefused), and the queue stays —
+  // queued ops compose against served truth, nothing here refutes them.
+  resetViewsWriterForTest();
+  const sent: any[] = [];
+  let refused = 0;
+  postViewsOps((m) => sent.push(m), [{ create: { id: "gX", name: "infra" } }]);
+  postViewsOps((m) => sent.push(m), [{ active: "all" }]);   // a queued follower
+  assert.equal(sent.length, 1, "one outstanding write");
+  consumeViewsAck({ type: "viewsAck", ok: true, rev: 7, opId: sent[0].opId,
+                    conflicts: ["create 'infra': the name is already taken"] },
+                  () => { refused += 1; });
+  assert.equal(refused, 1, "the surface is told to re-derive — never a silent ack");
+  assert.equal(sent.length, 2, "…and the queued op still pumps (nothing was refuted)");
+  consumeViewsAck({ type: "viewsAck", ok: true, rev: 8, opId: sent[1].opId }, () => { refused += 1; });
+  assert.equal(refused, 1, "a clean ok ack fires nothing");
+});

@@ -776,6 +776,53 @@ class R50UnionJournalLock(unittest.TestCase):
                         "the LOAD happens inside the lock — locking after reading is the bug")
 
 
+class R50RefusalExpiryAndCap(unittest.TestCase):
+    """the r50 verification round on the refusal journal: an ownerless refusal row had no
+    retiring event (immortal), and the 200-row cap truncated the NEWEST rows while acking
+    ok:true — the panel was told a write landed that was dropped on the floor."""
+
+    def setUp(self):
+        try:
+            km._union_ops_path().unlink()
+        except OSError:
+            pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_an_aged_refusal_row_expires_and_a_fresh_one_stays(self):
+        now = int(__import__("time").time())
+        km._union_ops_set([
+            {"refusal": True, "host": "TESTHOST-A", "gid": -11, "opId": "11",
+             "t": now - 8 * 86400},
+            {"refusal": True, "host": "TESTHOST-A", "gid": -12, "opId": "12", "t": now}])
+        km._union_ops_set([])            # any later merge sweeps the aged row
+        gids = [r["gid"] for r in km._union_ops_load()]
+        self.assertNotIn(-11, gids, "an 8-day-old ownerless refusal expires (bounded staleness)")
+        self.assertIn(-12, gids, "a fresh refusal stays for its owner to consume")
+
+    def test_gesture_entries_never_expire_by_age(self):
+        now = int(__import__("time").time())
+        km._union_ops_set([{"host": "TESTHOST-A", "gid": 5, "t": now - 30 * 86400,
+                            "edit": {}, "inverse": {}, "rt": {}, "name": "pool"}])
+        km._union_ops_set([])
+        self.assertEqual([r["gid"] for r in km._union_ops_load()], [5],
+                         "in-flight GESTURES settle on evidence, never a clock")
+
+    def test_the_cap_drops_the_oldest_rows_never_the_incoming_write(self):
+        rows = [{"host": "TESTHOST-A", "gid": i, "edit": {}, "inverse": {}, "rt": {},
+                 "name": "t%d" % i} for i in range(1, km._UNION_OPS_MAX + 1)]
+        self.assertTrue(km._union_ops_set(rows))
+        self.assertTrue(km._union_ops_set([{"host": "TESTHOST-B", "gid": 9999, "edit": {},
+                                            "inverse": {}, "rt": {}, "name": "fresh"}]))
+        gids = [r["gid"] for r in km._union_ops_load()]
+        self.assertIn(9999, gids,
+                      "the row the ok:true ack just promised is the LAST one the cap may drop "
+                      "(the r50 round: rows[:MAX] silently dropped the incoming gesture)")
+        self.assertEqual(len(gids), km._UNION_OPS_MAX)
+        self.assertNotIn(1, gids, "the OLDEST row paid for the cap")
+
+
 class R50UnionOpsAckAndConflicts(unittest.TestCase):
     """the v1.3.22 audit's P1.3 (correlated union-journal acks) and P2.8 (duplicate-name
     conflicts were silently acked ok with a bumped rev): against the REAL Handler."""
@@ -829,6 +876,17 @@ class R50UnionOpsAckAndConflicts(unittest.TestCase):
         self.assertTrue(ans["ok"])
         self.assertEqual(ans.get("opId"), "u7")
 
+    def test_the_ws_merge_call_sits_inside_the_ack_try(self):
+        # the r50 verification round: _union_ops_set was called OUTSIDE the try — a raise
+        # (the identity lock propagates loudly by design) was swallowed by the dispatcher and
+        # NO unionOpsAck went out, leaking the panel's pending sync with no retry ever
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        i = src.index('_uok = _union_ops_set(msg["entries"], msg.get("retired"))')
+        window = src[max(0, i - 200):i]
+        self.assertIn("try:", window, "the merge call is guarded")
+        after = src[i:i + 400]
+        self.assertIn("_uok = False", after, "…and a raise answers ok:false, never silence")
+
     def test_union_ops_save_failure_answers_ok_false_with_the_opid(self):
         # the audited hole: the WS handler DISCARDED _union_ops_set's failure — the panel
         # advanced its watermark on hope and the failed retirement was never re-sent
@@ -870,6 +928,27 @@ class R50UnionOpsAckAndConflicts(unittest.TestCase):
         self.assertEqual(len(confl), 1)
         self.assertIn("crew", confl[0])
         self.assertIn("pool", confl[0])
+        self.assertEqual(rev1, rev0,
+                         "a refused rename applied NOTHING — bumping the rev 409'd other "
+                         "panes' CAS writes for a zero-byte change (the r50 round: applied "
+                         "fired at tag LOOKUP, before the refusal)")
+        self.assertEqual(km._timeline_views()["rev"], rev0, "…and the store was not rewritten")
+
+    def test_no_op_field_edits_bump_nothing(self):
+        # the r50 verification round: applied=True at the tag lookup meant a same-value color,
+        # an add of an existing member, or a same-name rename rewrote the store with rev+1
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "#DD42FF",
+                                         "members": ["s1"]}}])
+        rev0 = km._timeline_views()["rev"]
+        for op in ({"tag": "g1", "color": "#DD42FF"},
+                   {"tag": "g1", "add": ["s1"]},
+                   {"tag": "g1", "remove": ["ghost-sid"]},
+                   {"tag": "g1", "rename": "pool"}):
+            rev1, confl = km._apply_views_ops([op])
+            self.assertEqual(rev1, rev0, "no-op %r must not bump" % op)
+            self.assertEqual(confl, [], "…and a no-op is not a conflict either: %r" % op)
+        rev2, _ = km._apply_views_ops([{"tag": "g1", "color": "#4EC9B0"}])
+        self.assertEqual(rev2, rev0 + 1, "a REAL change still bumps")
 
     def test_unknown_tag_ops_apply_nothing_and_bump_nothing(self):
         # the deliberate quiet drop (a replayed gesture over a deleted tag) must not
@@ -913,7 +992,7 @@ class R50RemoteRefMigration(unittest.TestCase):
     def test_a_landed_remote_rename_migrates_lens_and_order(self):
         self._seed_remote_refs()
         rev0 = km._timeline_views()["rev"]
-        km._migrate_refs_after_remote_edit("farpool", {"rename": "nearpool"})
+        km._migrate_refs_after_remote_edit("TESTHOST-A", "farpool", {"rename": "nearpool"})
         v = km._timeline_views()
         self.assertEqual(v["actives"]["chat"], {"tags": ["nearpool"]},
                          "the lens followed the REMOTE rename")
@@ -922,7 +1001,7 @@ class R50RemoteRefMigration(unittest.TestCase):
 
     def test_a_landed_remote_delete_drops_the_refs(self):
         self._seed_remote_refs()
-        km._migrate_refs_after_remote_edit("farpool", {"delete": True})
+        km._migrate_refs_after_remote_edit("TESTHOST-A", "farpool", {"delete": True})
         v = km._timeline_views()
         self.assertEqual(v["actives"]["chat"], {"all": True},
                          "the emptied lens falls to All, never an empty screen")
@@ -931,7 +1010,7 @@ class R50RemoteRefMigration(unittest.TestCase):
     def test_no_reference_means_no_rev_bump(self):
         self._seed_remote_refs()
         rev0 = km._timeline_views()["rev"]
-        km._migrate_refs_after_remote_edit("elsewhere", {"rename": "elsewhere2"})
+        km._migrate_refs_after_remote_edit("TESTHOST-A", "elsewhere", {"rename": "elsewhere2"})
         self.assertEqual(km._timeline_views()["rev"], rev0,
                          "nothing referenced the name — a bump would claim a change "
                          "nobody made (the P2.8 rule)")
@@ -940,13 +1019,60 @@ class R50RemoteRefMigration(unittest.TestCase):
         # the guard: rename="" must not be read as a delete — the forward's answer said ok
         # to a no-op, not to dropping the refs
         self._seed_remote_refs()
-        km._migrate_refs_after_remote_edit("farpool", {"rename": "   "})
+        km._migrate_refs_after_remote_edit("TESTHOST-A", "farpool", {"rename": "   "})
         v = km._timeline_views()
         self.assertEqual(v["actives"]["chat"], {"tags": ["farpool"]})
+
+    def test_a_same_name_local_tag_pins_the_refs_through_a_remote_rename(self):
+        # the r50 verification round: lens names are UNIONS — renaming only the REMOTE 'pool'
+        # moved the refs wholesale and the still-existing LOCAL 'pool' dropped out of every
+        # lens and lost its order slot
+        km._apply_views_ops([{"create": {"id": "gl", "name": "farpool", "color": "",
+                                         "members": []}},
+                             {"actives": {"chat": {"tags": ["farpool"]}}},
+                             {"tagOrder": ["farpool"]}])
+        km._migrate_refs_after_remote_edit("TESTHOST-A", "farpool", {"rename": "nearpool"})
+        v = km._timeline_views()
+        self.assertEqual(v["actives"]["chat"], {"tags": ["farpool"]},
+                         "the local twin still holds the name — the refs stay")
+        self.assertEqual(v["tagOrder"], ["farpool"])
+
+    def test_another_hosts_remote_twin_also_pins_the_refs(self):
+        self._seed_remote_refs()
+        saved = dict(km._remotes)
+        km._remotes.clear()
+        km._remotes["x"] = {"host": "TESTHOST-B", "views":
+                            {"tags": [{"id": "r9", "name": "farpool"}]}}
+        try:
+            km._migrate_refs_after_remote_edit("TESTHOST-A", "farpool", {"rename": "nearpool"})
+            v = km._timeline_views()
+            self.assertEqual(v["actives"]["chat"], {"tags": ["farpool"]},
+                             "TESTHOST-B still owns a 'farpool' — the union survives, refs stay")
+        finally:
+            km._remotes.clear()
+            km._remotes.update(saved)
+
+    def test_the_edited_hosts_stale_cache_cannot_defeat_the_delete_migration(self):
+        # the r50 verification round: _views_drop_refs' survival check read the EDITED host's
+        # cached views — still showing the just-deleted tag when the inline fast-echo refresh
+        # hiccuped — and returned early, with nothing ever re-running the migration
+        self._seed_remote_refs()
+        saved = dict(km._remotes)
+        km._remotes.clear()
+        km._remotes["x"] = {"host": "TESTHOST-A", "views":
+                            {"tags": [{"id": "r1", "name": "farpool"}]}}   # the STALE cache
+        try:
+            km._migrate_refs_after_remote_edit("TESTHOST-A", "farpool", {"delete": True})
+            v = km._timeline_views()
+            self.assertEqual(v["actives"]["chat"], {"all": True},
+                             "the landed delete outranks the edited host's stale cache")
+        finally:
+            km._remotes.clear()
+            km._remotes.update(saved)
 
     def test_the_ws_and_tag_routes_both_migrate_on_success(self):
         # the two forward paths (the dialog's WS editTag, the /tag --host route) share the
         # helper — a success on either migrates this kernel's refs
         src = open(os.path.join(BIN, "romp-kernel")).read()
-        self.assertEqual(src.count("_migrate_refs_after_remote_edit(nm, body)"), 1)
-        self.assertEqual(src.count("_migrate_refs_after_remote_edit(name, b)"), 1)
+        self.assertEqual(src.count("_migrate_refs_after_remote_edit(host, nm, body)"), 1)
+        self.assertEqual(src.count("_migrate_refs_after_remote_edit(th, name, b)"), 1)

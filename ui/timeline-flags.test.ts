@@ -775,10 +775,11 @@ test("executed: the compensation's INVERSE dispatch carries its OWN opId — its
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews;
 });
 
-test("executed: the synced-gid watermark advances only on the kernel's ack (r50)", () => {
-  // the v1.3.22 audit's P1.3: _syncUnionOps advanced _syncedGids at SEND time — a failed save
-  // was never retried (the next sync diffed against the advanced watermark, computed
-  // retired=[] and the kernel journal kept the stale group forever)
+test("executed: a retirement leaves the ledger only on the kernel's ack (r50)", () => {
+  // the v1.3.22 audit's P1.3: the twin assumed its journal writes landed — a failed save was
+  // never retried, and the kernel journal kept the stale group forever. The ledger
+  // (_journaledGids) shrinks ONLY by an acked retirement; a refused write re-sends the same
+  // retirement on the next payload (an event, not a timer).
   const wire: any[] = [];
   g.__rompTimelineEditTag = () => {};
   g.__rompTimelineSetViews = () => {};
@@ -790,9 +791,7 @@ test("executed: the synced-gid watermark advances only on the kernel's ack (r50)
   const gid = panel._unionOps[0].gid;
   const last = wire[wire.length - 1];
   assert.ok(last.opId, "every sync is correlated");
-  assert.equal((panel._syncedGids || []).length, 0, "no ack yet — the watermark HOLDS");
-  panel.unionOpsAck({ ok: true, opId: last.opId });
-  assert.deepEqual(panel._syncedGids, [gid], "the ack advances it");
+  assert.ok(panel._journaledGids.has(gid), "a SENT gesture enters the ledger — the kernel may hold it");
   // the group retires (both owners confirm) → the sync carries the retirement…
   const polled = JSON.parse(JSON.stringify(VIEWS));
   polled.remoteTags[0].members = [];
@@ -802,15 +801,59 @@ test("executed: the synced-gid watermark advances only on the kernel's ack (r50)
   panel.update(Object.assign({}, base, { views: polled }));
   const retirePost = wire[wire.length - 1];
   assert.deepEqual(retirePost.retired, [gid]);
-  // …but the SAVE FAILS: the watermark stands, and the next payload re-sends the retirement
+  // …but the SAVE FAILS: the ledger stands, and the next payload re-sends the retirement
   panel.unionOpsAck({ ok: false, opId: retirePost.opId });
-  assert.deepEqual(panel._syncedGids, [gid], "a refused write advances nothing");
+  assert.ok(panel._journaledGids.has(gid), "a refused write retires nothing");
   panel.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(polled)) }));
   const retry = wire[wire.length - 1];
   assert.notEqual(retry.opId, retirePost.opId, "a fresh correlated post");
   assert.deepEqual(retry.retired, [gid], "the SAME retirement re-sends — nothing assumed landed");
   panel.unionOpsAck({ ok: true, opId: retry.opId });
-  assert.deepEqual(panel._syncedGids, [], "the confirmed retirement finally advances it");
+  assert.ok(!panel._journaledGids.has(gid), "the confirmed retirement finally leaves the ledger");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: a gesture minted and resolved while a sync is UNACKED still gets retired (r50 round)", () => {
+  // the verification round's P2 on my own fix: the acked-snapshot watermark held only what
+  // some ack had confirmed — a gesture whose send was never acked (a busy kernel) but whose
+  // refusal resolved it meanwhile was in NO snapshot, so no sync ever named it retired and
+  // its rows stranded in the kernel journal. The ledger records at SEND time.
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });          // sync sent — ack NEVER arrives
+  const gid = panel._unionOps[0].gid;
+  panel.tagEditFailed({ host: "TESTHOST-B", name: "pool", opId: String(gid),
+                        error: "refused before any ack" });   // resolves the group
+  const post = wire[wire.length - 1];
+  assert.ok(post.retired.indexOf(gid) >= 0,
+    "the resolution names the gid retired even though no ack ever confirmed the send");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: the direct refusal frame tombstones its journal twin immediately (r50 round)", () => {
+  // the verification round: the compensation deletes the very entries the ownership check
+  // needs — a panel that consumed the direct frame and closed before the journal row rode a
+  // payload left the row ownerless forever, and a second panel holding adopted copies could
+  // fire the rollback again. The row's gid is derived from the opId (-|opId|), so the
+  // consuming panel retires it NOW, sight unseen.
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const gid = panel._unionOps[0].gid;
+  panel.tagEditFailed({ host: "TESTHOST-B", name: "pool", opId: String(gid), error: "refused" });
+  const post = wire[wire.length - 1];
+  assert.ok(post.retired.indexOf(-Math.abs(gid)) >= 0,
+    "the journal twin's deterministic gid rides retired without waiting to see the row");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
 });
 
@@ -835,7 +878,7 @@ test("executed: a reload seeds the watermark WITH the entries — retirement sti
   polled.remoteTags[1].members = [];
   panel2.update({ now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
                   turns: {}, messages: [], judging: [], views: polled, unionOps: journal });
-  assert.deepEqual(panel2._syncedGids, [gid], "the watermark seeded WITH the entries");
+  assert.ok(panel2._journaledGids.has(gid), "the ledger seeded WITH the entries");
   const retirePost = wire[wire.length - 1];
   assert.equal(retirePost.entries.length, 0);
   assert.deepEqual(retirePost.retired, [gid],

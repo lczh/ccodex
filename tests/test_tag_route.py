@@ -326,7 +326,7 @@ class EditTagOpPins(unittest.TestCase):
         # the shared migration helper
         src = open(os.path.join(BIN, "romp-kernel")).read()
         i_forward = src.index('ans, err = _forward_tag_edit(host, body)')
-        i_migrate = src.index('_migrate_refs_after_remote_edit(nm, body)')
+        i_migrate = src.index('_migrate_refs_after_remote_edit(host, nm, body)')
         self.assertLess(i_forward, i_migrate)
         i_branch_end = src.index('elif msg and msg.get("type") == "cardNotify"')
         self.assertLess(i_migrate, i_branch_end)

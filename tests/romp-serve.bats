@@ -617,15 +617,24 @@ HOLDPY
 # shadowing python3 (the gate's interpreter), so the applier's behavior is what executes.
 
 _pick_shim() {   # $1 = the pick line the fake gate writes ("" = write nothing)
+    # Shadows the GATE's interpreter only: the exec-time revalidation also runs `python3 -c`
+    # (the fcntl lock on the inherited fd — the r50 verification round replaced the flock(1)
+    # binary, absent on macOS), and THAT invocation must stay real or the held-lock tests
+    # would fake-acquire. -c delegates to the true python3; the bare-stdin gate call fakes.
     mkdir -p "$TEST_DIR/pathbin"
-    if [ -n "$1" ]; then
-        printf '#!/usr/bin/env bash\nprintf "%%s\\n" "%s" > "$ROMP_GATE_PICK"\nexit 0\n' "$1" \
-            > "$TEST_DIR/pathbin/python3"
-    else
-        printf '#!/usr/bin/env bash\nexit 0\n' > "$TEST_DIR/pathbin/python3"
-    fi
+    _REALPY="$(command -v python3)"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'if [ "$1" = "-c" ]; then exec %q "$@"; fi\n' "$_REALPY"
+        if [ -n "$1" ]; then
+            printf 'printf "%%s\\n" %q > "$ROMP_GATE_PICK"\n' "$1"
+        fi
+        printf 'exit 0\n'
+    } > "$TEST_DIR/pathbin/python3"
     chmod +x "$TEST_DIR/pathbin/python3"
     export PATH="$TEST_DIR/pathbin:$PATH"
+    export ROMP_REVAL_LOCK_WAIT=1     # the bounded sibling wait, shrunk so refusal tests
+    #                                   don't idle 15s each
 }
 
 @test "romp-serve: a MISSING pick after a successful gate refuses — never the live default" {
@@ -679,13 +688,21 @@ _pick_shim() {   # $1 = the pick line the fake gate writes ("" = write nothing)
 }
 
 @test "romp-serve: a HELD update lock at exec time refuses the stale pick" {
+    # the lock holder is a background python (fcntl) — the flock(1) BINARY does not exist on
+    # stock macOS, where this suite also runs (the r50 verification round's second P1)
     _gen_fixture
     _pick_shim "gen $GENGD/romp-run-$GENH8"
-    exec 8>>"$GENGD/romp-update.lock"
-    flock 8
+    # the holder runs the REAL interpreter — the shim on PATH would eat this invocation
+    "$_REALPY" - "$GENGD/romp-update.lock" <<'HOLDPY' &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+time.sleep(60)
+HOLDPY
+    HOLDER=$!
+    sleep 1
     run "$ROMP_SERVE" --port 9999
-    flock -u 8
-    exec 8>&-
+    kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null || true
     [ "$status" -eq 70 ]
     [[ "$output" == *"an update is mid-flight"* ]]
     [[ "$output" != *KERNEL_RAN* ]]
@@ -700,6 +717,45 @@ _pick_shim() {   # $1 = the pick line the fake gate writes ("" = write nothing)
     [ "$status" -eq 70 ]
     run bash -c "ls \"$TMPDIR\"/romp-serve-pick.* 2>/dev/null | wc -l"
     [ "$output" -eq 0 ]
+}
+
+@test "romp-serve: INSIDE the transaction the exec revalidation stands down on the PRODUCTION path" {
+    # the r50 verification round's P1, reproduced there: the txn holds the update lock across
+    # install -> manager -> serve; the gate bypasses (pid-alive ROMP_INSIDE_UPDATE_TXN) but the
+    # new revalidation re-took the lock with no bypass and refused every in-transaction boot
+    # (exit 70). This drives the REAL gate (no python shim) with NO ROMP_KERNEL_BIN — the
+    # pinned txn test in the latch section rides the seam, which skips the whole applier.
+    _gen_fixture
+    python3 - "$GENGD/romp-update.lock" <<'HOLDPY' &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+time.sleep(60)
+HOLDPY
+    HOLDER=$!
+    sleep 1
+    ROMP_INSIDE_UPDATE_TXN=$$ run "$ROMP_SERVE" --port 9999
+    kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null || true
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"GEN_KERNEL_RAN"* ]]
+}
+
+@test "romp-serve: a DEAD txn pid gets no bypass — the held lock still refuses at exec time" {
+    _gen_fixture
+    _pick_shim "gen $GENGD/romp-run-$GENH8"
+    # the holder runs the REAL interpreter — the shim on PATH would eat this invocation
+    "$_REALPY" - "$GENGD/romp-update.lock" <<'HOLDPY' &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+time.sleep(60)
+HOLDPY
+    HOLDER=$!
+    sleep 1
+    ROMP_INSIDE_UPDATE_TXN=99999999 run "$ROMP_SERVE" --port 9999
+    kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null || true
+    [ "$status" -eq 70 ]
+    [[ "$output" == *"an update is mid-flight"* ]]
 }
 
 @test "romp-serve: a NON-GIT checkout's gate writes an explicit live pick — boot proceeds" {

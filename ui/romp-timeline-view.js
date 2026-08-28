@@ -715,7 +715,11 @@ class TimelinePanel {
     this._views = null;          // the kernel-echoed views blob (data.views); null until the first push
     this._pendingViews = null;   // an optimistic edit held sticky until a push echoes it (see _reconcileViews)
     this._pendingTagEdits = {};  // remote-tag edits held optimistically until the owner's poll echoes (federation v1): id → {tag: shape|null(=deleted), age}
-    this._pendingUnionSyncs = {};   // journal syncs awaiting their kernel ack: opId → {gids, tomb} (r50)
+    this._pendingUnionSyncs = {};   // journal syncs awaiting their kernel ack: opId → {retired, tomb} (r50)
+    this._journaledGids = new Set();   // every gesture gid a sync ever SENT, minus acked retirements —
+    //                                    what the kernel journal may hold (the r50 verification round:
+    //                                    the acked-snapshot watermark regressed under an in-flight
+    //                                    gesture or an out-of-order ack, stranding resolved groups)
     this._retireUnionGids = new Set();   // consumed refusal rows awaiting a durable tombstone (r50)
     this._handledRefusalOps = new Set(); // refusal opIds already fired — the direct frame and the journal row both arrive (r50)
     this._mintedGids = new Set();        // gesture ids THIS panel dispatched — a journaled refusal is ours to consume only if we own its gesture (r50)
@@ -1645,11 +1649,11 @@ class TimelinePanel {
         // gesture ids must not collide with re-seeded ones: resume the sequence PAST them
         for (const o of this._unionOps)
           if (o.gid && o.gid >= unionGestureSeq) unionGestureSeq = o.gid + 1;
-        // the watermark seeds WITH the entries (the r50 verification: it restarted empty, so
+        // the LEDGER seeds WITH the entries (the r50 verification: it restarted empty, so
         // the seeded group's later retirement diffed against nothing and emitted entries:[]
-        // retired:[] — the kernel journal held the stale group forever). Deduped: a gesture's
-        // halves share one gid, and the ack path stores the set.
-        this._syncedGids = Array.from(new Set(this._unionOps.map((o) => o.gid).filter(Boolean)));
+        // retired:[] — the kernel journal held the stale group forever)
+        if (!this._journaledGids) this._journaledGids = new Set();
+        for (const o of this._unionOps) if (o.gid) this._journaledGids.add(o.gid);
       }
     }
     // the journaled refusals (r50): the kernel persists an editTag refusal beside the gestures,
@@ -1658,6 +1662,9 @@ class TimelinePanel {
     // gesture this panel owns (minted here, or adopted by the re-seed above); another panel's
     // pending gesture is not ours to retire.
     if (Array.isArray(data.unionOps)) {
+      if (!this._retireUnionGids) this._retireUnionGids = new Set();
+      if (!this._handledRefusalOps) this._handledRefusalOps = new Set();
+      if (!this._mintedGids) this._mintedGids = new Set();
       for (const r of data.unionOps) {
         if (!r || !r.refusal || !r.gid) continue;
         if (this._retireUnionGids.has(r.gid)) continue;         // consumed; tombstone in flight
@@ -2697,7 +2704,7 @@ class TimelinePanel {
       for (const x of (edit.add || [])) if (next.members.indexOf(x) < 0) next.members.push(x);
       if (edit.remove) next.members = next.members.filter((x) => edit.remove.indexOf(x) < 0);
     }
-    if (gid) this._mintedGids.add(gid);   // ownership: this panel's refusals are its own to consume (r50)
+    if (gid) (this._mintedGids = this._mintedGids || new Set()).add(gid);   // ownership: this panel's refusals are its own to consume (r50)
     this._pendingTagEdits[rt.id] = { tag: next, age: 0, gid: gid || 0 };   // gid scopes the
     //                                 refusal's overlay drop (the v1.3.20 audit's residual)
     const wire = { host: rt.host, name: rt.name, rename: edit.rename,
@@ -2714,7 +2721,21 @@ class TimelinePanel {
   tagEditFailed(m) {
     // the journaled twin of this refusal (the kernel persists refusals beside the gestures now,
     // r50) must not fire the rollback a SECOND time when it rides the next payload
-    if (m && m.opId) this._handledRefusalOps.add(String(m.opId));
+    if (m && m.opId) {
+      if (!this._handledRefusalOps) this._handledRefusalOps = new Set();
+      if (!this._retireUnionGids) this._retireUnionGids = new Set();
+      this._handledRefusalOps.add(String(m.opId));
+      // the refusal row's gid is DERIVED from the opId (-|opId|, the kernel's mint), so the
+      // panel that consumed the direct frame retires the journal twin NOW instead of waiting
+      // to see it ride a payload — closing the window where the row stranded ownerless (the
+      // compensation removes the very entries the ownership check needs) or a second panel
+      // holding adopted copies fired the rollback again (the r50 verification round)
+      const n = parseInt(String(m.opId), 10);
+      if (!isNaN(n) && n !== 0) {
+        this._retireUnionGids.add(-Math.abs(n));
+        this._unionSyncDirty = true;
+      }
+    }
     // the optimistic overlay drops SCOPED by the refused gesture's opId when the frame carries
     // one (the v1.3.20 audit's residual): the host-wide sweep also reverted OTHER in-flight
     // gestures' overlays on the same host, snapping their edits out of view for nothing. An
@@ -2836,40 +2857,54 @@ class TimelinePanel {
       oldName: o.oldName, oldColor: o.oldColor, post: o.post || {}, confirmed: !!o.confirmed,
     }));
     // retirement is EXPLICIT (the r49 verification: the kernel merges per gid now, so two
-    // open panels no longer clobber each other's entries — omission is not retirement)
+    // open panels no longer clobber each other's entries — omission is not retirement). It
+    // diffs against the CUMULATIVE ledger of everything ever sent, not the last ack's
+    // snapshot (the r50 verification round: a gesture minted and resolved while a sync was
+    // in flight was in no acked snapshot, so its retirement was never named and its rows
+    // stranded in the kernel journal; an out-of-order POST ack likewise regressed the
+    // snapshot). Ledger gids leave only through an ACKED retirement, so a failed write
+    // re-sends the same retirement on the next payload.
     const gids = new Set(entries.map((o) => o.gid).filter(Boolean));
-    const tomb = Array.from(this._retireUnionGids || []);   // consumed refusal rows (r50)
-    const retired = (this._syncedGids || []).filter((g) => !gids.has(g)).concat(tomb);
-    // the watermark advances ONLY on the kernel's ack (the r50 verification: advancing it at
-    // send time meant a failed save was never retried — the next sync computed retired=[] as
-    // if the retirement had landed, and the kernel journal kept the stale group forever)
+    // lazy inits: the house test pattern drives bare-prototype panels (no constructor)
+    if (!this._journaledGids) this._journaledGids = new Set();
+    if (!this._retireUnionGids) this._retireUnionGids = new Set();
+    if (!this._pendingUnionSyncs) this._pendingUnionSyncs = {};
+    for (const g of gids) this._journaledGids.add(g);
+    const tomb = Array.from(this._retireUnionGids);   // consumed refusal rows (r50)
+    const retired = Array.from(this._journaledGids).filter((g) => !gids.has(g)).concat(tomb);
     this._unionSyncDirty = false;
     const opId = 'u' + (++unionGestureSeq);
-    const want = { gids: Array.from(gids), tomb: tomb };
+    const want = { retired: retired.filter((g) => !tomb.includes(g)), tomb: tomb };
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineSetUnionOps === 'function') {
         this._pendingUnionSyncs[opId] = want;
         window.__rompTimelineSetUnionOps(entries, retired, opId);
       } else if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
+        // SERIALIZED like _setViews' spool (the r50 round): bare concurrent fetches let a
+        // later sync's tombstone land BEFORE an earlier sync's upsert, resurrecting the
+        // retired rows — one POST at a time keeps the wire order the WS path gets for free
         this._pendingUnionSyncs[opId] = want;
-        this._kernelPost('/union-ops', { entries: entries, retired: retired, opId: opId }, true)
-          .then((r) => this.unionOpsAck({ ok: r.ok === true, opId: opId }))
-          .catch(() => this.unionOpsAck({ ok: false, opId: opId }));
+        this._postChain = (this._postChain || Promise.resolve()).then(() =>
+          this._kernelPost('/union-ops', { entries: entries, retired: retired, opId: opId }, true)
+            .then((r) => this.unionOpsAck({ ok: r.ok === true, opId: opId }))
+            .catch(() => this.unionOpsAck({ ok: false, opId: opId }))
+        );
       }
     } catch (e) { /* best-effort: the in-memory journal still runs this panel's lifetime */ }
   }
 
-  // the kernel's answer to one _syncUnionOps post (r50): ok advances the synced-gid watermark
-  // and settles the tombstones that write carried; a failure leaves both standing, so the NEXT
-  // sync — fired on the next payload arrival, an event, not a timer — recomputes and re-sends
-  // the same retirements instead of assuming they landed
+  // the kernel's answer to one _syncUnionOps post (r50): ok settles exactly the retirements
+  // THAT write carried — the ledger shrinks by the acked list, never snaps to a snapshot, so
+  // late or reordered acks cannot regress it; a failure leaves everything standing and the
+  // NEXT sync — fired on the next payload arrival, an event, not a timer — re-sends the same
+  // retirements instead of assuming they landed
   unionOpsAck(m) {
     const p = m && m.opId && this._pendingUnionSyncs ? this._pendingUnionSyncs[m.opId] : null;
     if (!p) return;                                    // a late twin of a superseded sync
     delete this._pendingUnionSyncs[m.opId];
     if (m.ok === false) { this._unionSyncDirty = true; return; }
-    this._syncedGids = p.gids;
-    for (const g of (p.tomb || [])) this._retireUnionGids.delete(g);
+    for (const g of (p.retired || [])) { if (this._journaledGids) this._journaledGids.delete(g); }
+    for (const g of (p.tomb || [])) { if (this._retireUnionGids) this._retireUnionGids.delete(g); }
   }
 
   _noteUnionOp(rt, name, inverse, edit, gid) {

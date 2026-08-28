@@ -1587,18 +1587,15 @@ class Handler(BaseHTTPRequestHandler):
                     # a name-keyed alias could never connect a first reply sent after the
                     # recipient renamed (the v1.3.16 audit's P1.5)
                     sent_row["to_sid"] = str(hit["id"])
-                if not _tl_append("messages.jsonl", sent_row):
-                    # the row BEFORE the publish, refusing on failure — the same P2.11 rule
-                    # deliver() wears (the r49 verification: this relay leg still published
-                    # into the outbox with no row, mail no receipt could ever account)
-                    return self._send({"ok": False,
-                                       "error": "the delivery record could not be written — "
-                                                "mail NOT relayed; retry"})
                 # the STAGED relay transaction (the r50 verification): the sent row with no
                 # outbox file was a permanent phantom — boot reconciliation SKIPS peer rows by
                 # design (their mail leaves the outbox when consumed, so absence proves
-                # nothing). The stage file is the arbiter: present + no outbox file = the
-                # publish never happened; _reconcile_relay_stages files the unpublished row.
+                # nothing). The stage file is the arbiter: present + no outbox file + no
+                # terminal row = the publish never happened; _reconcile_relay_stages files the
+                # unpublished row. The stage lands FIRST (the r50 verification round): staged
+                # after the row, a crash — or a plain OSError on this very write — in the
+                # one-line window still minted the permanent phantom; an orphaned stage with
+                # NO row is just a harmless terminal for mail nobody sent.
                 _stagef = OUTBOX / phost / (".stage-" + mid)
                 try:
                     (OUTBOX / phost).mkdir(parents=True, exist_ok=True)
@@ -1606,6 +1603,17 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError:
                     return self._send({"ok": False,
                                        "error": "the relay stage could not be written — "
+                                                "mail NOT relayed; retry"})
+                if not _tl_append("messages.jsonl", sent_row):
+                    # the row BEFORE the publish, refusing on failure — the same P2.11 rule
+                    # deliver() wears (the r49 verification: this relay leg still published
+                    # into the outbox with no row, mail no receipt could ever account)
+                    try:
+                        _stagef.unlink()             # nothing was recorded — retract the stage
+                    except OSError:
+                        pass                         # boot files a rowless terminal: harmless
+                    return self._send({"ok": False,
+                                       "error": "the delivery record could not be written — "
                                                 "mail NOT relayed; retry"})
                 try:
                     outbox_put(phost, relay_msg)
@@ -1883,6 +1891,24 @@ def _reconcile_relay_stages():
         hosts = list(OUTBOX.iterdir()) if OUTBOX.is_dir() else []
     except OSError:
         return 0
+    # the bounded log tail (the phantom reconcile's discipline — never a full-log scan): any
+    # row for the mid BEYOND its sent row proves the publish happened (relayed/recall/bounced
+    # acks ride the log after outbox_del) — an orphaned stage beside such evidence is a
+    # success-path unlink failure, never an unpublished relay
+    settled = set()
+    try:
+        log = TLDIR / "messages.jsonl"
+        with open(log, "rb") as fh:
+            fh.seek(max(0, log.stat().st_size - PHANTOM_TAIL_BYTES))
+            for line in fh.read().decode(errors="replace").splitlines():
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if row.get("ev") in _TERMINAL_EVS or row.get("ev") == "relayed":
+                    settled.add(row.get("id"))
+    except OSError:
+        pass
     for hd in hosts:
         try:
             stages = [f for f in hd.iterdir() if f.name.startswith(".stage-")]
@@ -1890,7 +1916,7 @@ def _reconcile_relay_stages():
             continue
         for st in stages:
             mid = st.name[len(".stage-"):]
-            published = (hd / (mid + ".json")).exists()
+            published = (hd / (mid + ".json")).exists() or mid in settled
             if not published:
                 if _tl_append("messages.jsonl", {"t": int(time.time()),
                                                  "ev": "unpublished", "id": mid}):

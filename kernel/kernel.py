@@ -2080,10 +2080,18 @@ def _union_ops_set(entries, retired=None):
             except (TypeError, ValueError):
                 pass
         inc_keys = {(r.get("gid"), r.get("host")) for r in inc}
+        _cutoff = time.time() - 7 * 86400
         rows = [r for r in cur if (r.get("gid"), r.get("host")) not in inc_keys
-                and r.get("gid") not in ret]
+                and r.get("gid") not in ret
+                # a refusal row whose owner never returns has no retiring event — bounded
+                # staleness (7d) is the backstop, like the phantom reconcile's window (r50)
+                and not (r.get("refusal") and isinstance(r.get("t"), (int, float))
+                         and r["t"] < _cutoff)]
         rows += [r for r in inc if r.get("gid") not in ret]
-        rows = rows[:_UNION_OPS_MAX]
+        if len(rows) > _UNION_OPS_MAX:
+            rows = rows[-_UNION_OPS_MAX:]   # the cap drops the OLDEST — dropping the incoming
+            #                                 gesture while acking ok:true told the panel a
+            #                                 write landed that didn't (the r50 round)
         try:
             _atomic_write(_union_ops_path(), json.dumps(rows))
             return True
@@ -2103,15 +2111,20 @@ def _views_rename_refs(d, old, new):
             lens["tags"] = [new if n == old else n for n in lens["tags"]]
 
 
-def _views_drop_refs(d, name):
+def _views_drop_refs(d, name, ignore_host=None):
     """Delete drops the tag's name from tagOrder and every lens (the v1.3.21 audit's P2:
     deleting a selected tag left the lens referencing nothing and HID every row) — unless the
     name survives elsewhere in the union: another local tag (pre-uniqueness data) or an
-    attached kernel's remote tag, where the lens deliberately still means something."""
+    attached kernel's remote tag, where the lens deliberately still means something.
+    ignore_host: a host whose LANDED delete triggered this drop — its cached views may still
+    show the tag (the inline fast-echo refresh is best-effort), and trusting that stale copy
+    silently defeated the migration with nothing ever re-running it (the r50 round)."""
     if any(t.get("name") == name for t in d.get("tags") or []):
         return
     try:
         for r in _remotes.values():
+            if ignore_host and r.get("host") == ignore_host:
+                continue
             for rt in ((r.get("views") or {}).get("tags") or []):
                 if rt.get("name") == name:
                     return
@@ -2129,16 +2142,37 @@ def _views_drop_refs(d, name):
                 #                            an empty screen
 
 
-def _migrate_refs_after_remote_edit(name, body):
-    """After a remote-only rename/delete LANDS on its owner, migrate THIS kernel's own lens and
-    tagOrder references to the tag's name (the r50 verification: the migration ran only for
-    local tags — a remote rename stranded actives.*.tags and tagOrder on the old name, and a
-    selected lens silently showed no rows). Locked read-modify-write, the same discipline as
-    _apply_views_ops; rev bumps only when a reference actually moved."""
+def _migrate_refs_after_remote_edit(host, name, body):
+    """After a remote-only rename/delete LANDS on its owner (`host`), migrate THIS kernel's own
+    lens and tagOrder references to the tag's name (the r50 verification: the migration ran
+    only for local tags — a remote rename stranded actives.*.tags and tagOrder on the old
+    name, and a selected lens silently showed no rows). Locked read-modify-write, the same
+    discipline as _apply_views_ops; rev bumps only when a reference actually moved. BOTH legs
+    wear the union-survival rule (the r50 round): lens names are name-keyed UNIONS, so when
+    the old name still exists elsewhere — another local tag, another host's remote tag — the
+    refs stay put; only the edited host's own stale cache is disregarded (ignore_host)."""
     _new = body.get("rename") if isinstance(body.get("rename"), str) else ""
     _new = _new.strip()
     if not _new and body.get("delete") is not True:
         return
+    def _survives_elsewhere():
+        if any(t.get("name") == name for t in _timeline_views().get("tags") or []):
+            return True
+        try:
+            with _remotes_lock:
+                rs = list(_remotes.values())
+            for r in rs:
+                if r.get("host") == host:
+                    continue
+                for rt in ((r.get("views") or {}).get("tags") or []):
+                    if rt.get("name") == name:
+                        return True
+        except Exception:
+            pass
+        return False
+    if _new and _survives_elsewhere():
+        return          # the lens still names something real under the OLD name — moving the
+    #                     refs would strip the surviving tag out of every lens (the r50 round)
     with jd._identity_file_lock():
         try:
             raw = json.loads(_views_path().read_text())
@@ -2153,7 +2187,7 @@ def _migrate_refs_after_remote_edit(name, body):
         if _new:
             _views_rename_refs(d, name, _new)
         else:
-            _views_drop_refs(d, name)
+            _views_drop_refs(d, name, ignore_host=host)
         if json.dumps(d, sort_keys=True) == before:
             return                       # no local reference held the name — nothing to claim
         d = _norm_timeline_views(jd.canonicalize_timeline_views(d))
@@ -2245,22 +2279,28 @@ def _apply_views_ops(ops):
             t = next((x for x in d["tags"] if x.get("name") == key or x.get("id") == key), None)
             if t is None:
                 continue
-            applied = True
             if isinstance(op.get("add"), list):
                 have = {(m["host"], m["sid"]) for m in t["members"]}
-                adds = [m for m in (pair(s) for s in op["add"]) if m]
-                t["members"] = t["members"] + [m for m in adds
-                                               if (m["host"], m["sid"]) not in have]
+                adds = [m for m in (pair(s) for s in op["add"]) if m
+                        and (m["host"], m["sid"]) not in have]
+                if adds:
+                    t["members"] = t["members"] + adds
+                    applied = True
             if isinstance(op.get("remove"), list):
                 gone = {(m["host"], m["sid"]) for m in (pair(s) for s in op["remove"]) if m}
-                t["members"] = [m for m in t["members"]
-                                if (m.get("host") or "", m.get("sid")) not in gone]
+                kept = [m for m in t["members"]
+                        if (m.get("host") or "", m.get("sid")) not in gone]
+                if len(kept) != len(t["members"]):
+                    t["members"] = kept
+                    applied = True
             if isinstance(op.get("rename"), str) and op["rename"].strip():
                 _newname = op["rename"].strip()
                 if not any(x is not t and x.get("name") == _newname for x in d["tags"]):
                     _oldname = t.get("name")
-                    t["name"] = _newname
-                    _views_rename_refs(d, _oldname, _newname)   # lenses + tagOrder follow (P2)
+                    if _newname != _oldname:
+                        t["name"] = _newname
+                        _views_rename_refs(d, _oldname, _newname)   # lenses + tagOrder follow
+                        applied = True
                 else:
                     # name-keyed addressing would break for BOTH tags (the v1.3.21 audit's P2)
                     # — refused, and NAMED in the ack (r50): silence here left the dialog
@@ -2268,8 +2308,11 @@ def _apply_views_ops(ops):
                     conflicts.append("rename '%s' \u2192 '%s': the name is already taken"
                                      % (t.get("name"), _newname))
             if isinstance(op.get("color"), str):
-                t["color"] = op["color"]
+                if t["color"] != op["color"]:
+                    t["color"] = op["color"]
+                    applied = True
             if op.get("delete") is True:
+                applied = True
                 d["tags"] = [x for x in d["tags"] if x is not t]
                 _views_drop_refs(d, t.get("name"))              # lenses + tagOrder follow (P2)
                 if d.get("active") == t.get("id"):
@@ -32606,7 +32649,7 @@ class Handler(BaseHTTPRequestHandler):
                                           "application/json")
                     if isinstance(ans, dict) and ans.get("ok", False):
                         # this kernel's own lens/order refs follow the landed remote edit (r50)
-                        _migrate_refs_after_remote_edit(name, b)
+                        _migrate_refs_after_remote_edit(th, name, b)
                     _mark_views_dirty()
                     return self._send(200, json.dumps(ans), "application/json")
                 live = _live_names(_tmux_sessions())
@@ -33180,7 +33223,11 @@ class Handler(BaseHTTPRequestHandler):
             # panel mirrors its whole in-flight compensation list here on every change (small,
             # idempotent — a full replace, no per-op protocol to desync), and re-seeds from the
             # payload echo after a reload
-            _uok = _union_ops_set(msg["entries"], msg.get("retired"))
+            try:
+                _uok = _union_ops_set(msg["entries"], msg.get("retired"))
+            except Exception:
+                _uok = False
+                sys.stderr.write("setUnionOps: %s\n" % traceback.format_exc())
             try:
                 # the correlated ack (the r50 verification: the save's failure was discarded and
                 # the panel advanced its synced-gid watermark on hope)
@@ -33242,13 +33289,22 @@ class Handler(BaseHTTPRequestHandler):
                     # frame is transient — a panel reloading in the send window lost the ONE
                     # event its re-seeded journal was waiting for, and the split went silent)
                     try:
+                        # gid = -int(opId): deterministic, so the panel that RECEIVED the
+                        # direct frame can tombstone the journal twin without waiting to see
+                        # it (the r50 round's double-fire/strand windows), and same-ms
+                        # refusals of DIFFERENT gestures never collide. Non-numeric opIds
+                        # (none are minted today) fall back to the clock.
+                        try:
+                            _rgid = -abs(int(op_id))
+                        except (TypeError, ValueError):
+                            _rgid = -(int(time.time() * 1000) % 0x40000000)
                         _union_ops_set([{"refusal": True, "host": host, "name": nm,
                                          "opId": op_id, "error": _rmsg,
-                                         "gid": -(int(time.time() * 1000) % 0x40000000)}])
+                                         "t": int(time.time()), "gid": _rgid}])
                     except Exception:
                         pass
                 else:
-                    _migrate_refs_after_remote_edit(nm, body)
+                    _migrate_refs_after_remote_edit(host, nm, body)
                 _mark_views_dirty()
         elif msg and msg.get("type") == "cardNotify" and msg.get("itemId"):
             # feed card right-click → per-card bell (OS notification when THIS card blocks on you /

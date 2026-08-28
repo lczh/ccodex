@@ -555,29 +555,62 @@ if [ -z "${ROMP_KERNEL_BIN:-}" ] && [ -n "${_ROMP_PICK:-}" ]; then
     # OLD pick — an executed A→B schedule booted A while HEAD and the marker named B). The lock
     # is released before exec (a held flock would ride into the kernel forever); the remaining
     # window holds no git state reads, and an updater's pkill covers processes it replaces.
-    _RGD2="$(git -C "$ROMP_DIR" rev-parse --absolute-git-dir 2>/dev/null || true)"
-    if [ -n "$_RGD2" ]; then
-        exec 9>>"$_RGD2/romp-update.lock" || { echo "romp-serve: cannot open the update lock" >&2; exit 70; }
-        flock -n 9 || { echo "romp-serve: an update is mid-flight — refusing this stale pick" >&2; exit 70; }
-        _HF2="$(git -C "$ROMP_DIR" rev-parse HEAD 2>/dev/null || true)"
-        _MK2=""
-        [ -f "$_RGD2/romp-restart-needed" ] && _MK2="$(head -1 "$_RGD2/romp-restart-needed" 2>/dev/null | tr -cd '0-9a-f' || true)"
-        case "$_PICK" in
-            "gen "*)
-                case "${_PICK#gen }" in
-                    *"romp-run-${_HF2:0:8}") : ;;
-                    *) echo "romp-serve: HEAD moved past the gate's pick — refusing (respawn re-picks)" >&2; exit 70 ;;
-                esac
-                ;;
-            live)
-                if [ -n "$_MK2" ] && [ -n "$_HF2" ] && [ "${_MK2:0:8}" = "${_HF2:0:8}" ]; then
-                    echo "romp-serve: an update marker armed after the gate's live pick — refusing (respawn re-picks)" >&2
-                    exit 70
-                fi
-                ;;
-        esac
-        flock -u 9
-        exec 9>&-
+    # INSIDE the install transaction the revalidation stands down like the gate does (the r50
+    # verification round: the txn HOLDS this lock across install → manager → serve, so taking
+    # it here refused every fresh bootstrap's in-transaction launch, exit 70, dead-coding the
+    # r49 bypass — reproduced). Same pid-alive check the gate uses.
+    _TXN2="${ROMP_INSIDE_UPDATE_TXN:-}"
+    if [ -n "$_TXN2" ] && [ -z "${_TXN2//[0-9]/}" ] && kill -0 "$_TXN2" 2>/dev/null; then
+        :   # the transaction owns the checkout; its verdict governs the pick it just built
+    else
+        _RGD2="$(git -C "$ROMP_DIR" rev-parse --absolute-git-dir 2>/dev/null || true)"
+        if [ -n "$_RGD2" ]; then
+            exec 9>>"$_RGD2/romp-update.lock" || { echo "romp-serve: cannot open the update lock" >&2; exit 70; }
+            # the lock via python fcntl on the INHERITED fd — flock(2) binds to the open file
+            # description, which bash's fd 9 keeps after the child exits, so the lock HOLDS
+            # across the checks below (the r50 verification round: `flock -n 9` shelled out to
+            # the util-linux flock(1) binary, absent on stock macOS — command-not-found took
+            # the refusal arm and every macOS boot exited 70). Bounded wait, not one-shot:
+            # sibling kernels booting together contend for seconds through a gen_build (the
+            # gate's own rule); an update transaction holds far longer and still refuses.
+            if ! python3 -c '
+import fcntl, os, sys, time
+try:
+    _w = float(os.environ.get("ROMP_REVAL_LOCK_WAIT") or 15.0)
+except ValueError:
+    _w = 15.0
+deadline = time.time() + _w
+while True:
+    try:
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sys.exit(0)
+    except OSError:
+        if time.time() >= deadline:
+            sys.exit(1)
+        time.sleep(0.2)
+'; then
+                echo "romp-serve: an update is mid-flight — refusing this stale pick" >&2
+                exit 70
+            fi
+            _HF2="$(git -C "$ROMP_DIR" rev-parse HEAD 2>/dev/null || true)"
+            _MK2=""
+            [ -f "$_RGD2/romp-restart-needed" ] && _MK2="$(head -1 "$_RGD2/romp-restart-needed" 2>/dev/null | tr -cd '0-9a-f' || true)"
+            case "$_PICK" in
+                "gen "*)
+                    case "${_PICK#gen }" in
+                        *"romp-run-${_HF2:0:8}") : ;;
+                        *) echo "romp-serve: HEAD moved past the gate's pick — refusing (respawn re-picks)" >&2; exit 70 ;;
+                    esac
+                    ;;
+                live)
+                    if [ -n "$_MK2" ] && [ -n "$_HF2" ] && [ "${_MK2:0:8}" = "${_HF2:0:8}" ]; then
+                        echo "romp-serve: an update marker armed after the gate's live pick — refusing (respawn re-picks)" >&2
+                        exit 70
+                    fi
+                    ;;
+            esac
+            exec 9>&-
+        fi
     fi
 fi
 [ -n "${_ROMP_PICK:-}" ] && rm -f "$_ROMP_PICK"

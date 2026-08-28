@@ -82,7 +82,8 @@ function pump(): void {
  *  holds. A malformed rev leaves the confirmed rev standing (anchoring it to 0 was itself a
  *  rewind). */
 export function consumeViewsAck(m: unknown, onRefused?: () => void): boolean {
-  const a = m as { type?: unknown; ok?: unknown; rev?: unknown; opId?: unknown } | null;
+  const a = m as { type?: unknown; ok?: unknown; rev?: unknown; opId?: unknown;
+                   conflicts?: unknown } | null;
   if (!a || a.type !== "viewsAck") return false;
   const rev0 = typeof a.rev === "number" ? a.rev : null;
   if (typeof a.opId === "string" && (!queue.length || queue[0].wireId !== a.opId)) {
@@ -101,7 +102,18 @@ export function consumeViewsAck(m: unknown, onRefused?: () => void): boolean {
     if (rev !== null) confirmedRev = rev;   // the served CAS truth — downward is legitimate HERE
     queue = queue.filter((w) => w.kind === "ops");   // queued blobs were rendered on refuted state
     if (onRefused) onRefused();
-  } else if (rev !== null) confirmedRev = Math.max(confirmedRev, rev);
+  } else {
+    if (rev !== null) confirmedRev = Math.max(confirmedRev, rev);
+    if (Array.isArray(a.conflicts) && a.conflicts.length && onRefused) {
+      // a PARTIAL application (the r50 verification round): the kernel refused a duplicate-name
+      // create/rename inside an otherwise-ok ops write and NAMES it here — the timeline twin
+      // got the loud treatment, but this writer's callers (the chat strip's "New tag…", the
+      // Outline) were still shown their optimistic tag over a store that never held it. The
+      // refusal callback re-derives the surface from served truth; the queue stays — ops
+      // compose against whatever the store holds, and nothing here refutes a queued write.
+      onRefused();
+    }
+  }
   pump();
   return true;
 }

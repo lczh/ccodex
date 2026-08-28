@@ -303,18 +303,36 @@ class R50RelayStages(unittest.TestCase):
         self.assertTrue((self.hd / ".stage-px-203.1_999.TESTHOST").exists(),
                         "no terminal row, no consumption — retried at the next start")
 
-    def test_the_relay_leg_stages_before_publishing_and_boot_resolves(self):
-        # the transaction's ordering, pinned at the source: sent row -> stage -> outbox_put ->
-        # stage unlink; and serve() runs the stage reconciliation at boot
+    def test_the_relay_leg_stages_first_and_boot_resolves(self):
+        # the transaction's ordering, pinned at the source: STAGE -> sent row -> outbox_put ->
+        # stage unlink (the r50 verification round: staged after the row, a crash — or a plain
+        # OSError on the stage write itself — in the one-line window still minted the permanent
+        # phantom; an orphaned stage with no row is just a harmless terminal for mail nobody
+        # sent); and serve() runs the stage reconciliation at boot
         src = open(os.path.join(BIN, "romp-postal-service"), encoding="utf-8").read()
-        i_row = src.index('mail NOT relayed; retry')            # the row-first refusal (r49)
         i_stage = src.index('".stage-" + mid')
+        # the RELAY leg's copy of the refusal string — deliver()'s local leg wears the same
+        # words much earlier in the file, so the search starts at the stage
+        i_row = src.index('the delivery record could not be written', i_stage)
         i_put = src.index("outbox_put(phost, relay_msg)")
-        self.assertLess(i_row, i_stage, "the sent row lands first (receipts never lost)")
-        self.assertLess(i_stage, i_put, "the stage is armed BEFORE the publish — a crash "
-                                        "in the window leaves the arbiter behind")
+        self.assertLess(i_stage, i_row, "the arbiter lands before ANY durable claim")
+        self.assertLess(i_row, i_put, "…and the sent row before the publish (receipts never lost)")
         body = src.split("def serve():", 1)[1].split("\ndef ", 1)[0]
         self.assertIn("_reconcile_relay_stages()", body)
+
+    def test_a_delivered_mails_orphan_stage_files_nothing(self):
+        # the r50 verification round: the success-path stage unlink can fail (OSError) while
+        # the bus keeps serving — the mail ships, the far ack removes the outbox file and logs
+        # ev:"relayed", and the old reconcile then read the orphan stage as never-published,
+        # filing "unpublished" for mail the recipient RECEIVED and erasing its receipt
+        (self.hd / ".stage-px-204.1_121.TESTHOST").write_text("1")
+        pm._tl_append("messages.jsonl", {"t": self.now, "ev": "relayed",
+                                         "id": "px-204.1_121.TESTHOST", "host": "TESTHOST2"})
+        self.assertEqual(pm._reconcile_relay_stages(), 0)
+        self.assertEqual([r for r in _rows() if r.get("ev") == "unpublished"], [],
+                         "a relayed row proves the publish — no terminal is filed")
+        self.assertFalse((self.hd / ".stage-px-204.1_121.TESTHOST").exists(),
+                         "…and the orphan stage is spent")
 
     def test_a_publish_raise_gets_a_compensating_row(self):
         # the executed in-process shape: outbox_put raises (not a crash) — the leg files the
