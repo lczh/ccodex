@@ -588,7 +588,10 @@ def refuse(msg):
 def launch():
     if not os.access(kernel, os.X_OK):
         refuse("kernel not found/executable at %s" % kernel)
-    os.execv(py, [py, kernel])
+    # execvp, not execv (the r51 verification round of the sibling implementation, ported):
+    # the old bash exec PATH-resolved a bare-name ROMP_PYTHON (python3.12); execv did not,
+    # turning that configuration into a permanent exit-70 respawn loop
+    os.execvp(py, [py, kernel])
 
 txn = os.environ.get("ROMP_INSIDE_UPDATE_TXN", "")
 alive = False

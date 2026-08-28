@@ -268,6 +268,17 @@ class R50RelayStages(unittest.TestCase):
         _reset()
         shutil.rmtree(pm.OUTBOX, ignore_errors=True)
 
+    def test_a_stage_is_invisible_to_outbox_consumers_whatever_the_hostname(self):
+        # the r51 verification round (ported): pathlib globs match dotfiles — on a host
+        # literally named "json" the full-payload stage matched *.json and could SHIP as
+        # live mail before its sent row existed
+        (self.hd / ".stage-px-9.1_1.json").write_text(json.dumps({"mid": "px-9.1_1.json",
+                                                                  "body": "not mail yet"}))
+        (self.hd / "px-8.1_0.json.json").write_text(json.dumps({"mid": "px-8.1_0.json"}))
+        rows = pm.outbox_list("TESTHOST2")
+        self.assertEqual([r["mid"] for r in rows], ["px-8.1_0.json"],
+                         "the dot-prefixed stage is never exchanged")
+
     def test_an_orphaned_stage_files_the_unpublished_row(self):
         (self.hd / ".stage-px-201.1_777.TESTHOST").write_text("1")
         with contextlib.redirect_stderr(io.StringIO()):

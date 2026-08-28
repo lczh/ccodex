@@ -869,3 +869,17 @@ body = m.group(1)
 assert "fcntl.flock" in body and "os.execv" in body, "lock and exec are not in ONE process"
 CHECK
 }
+
+@test "romp-serve: a bare-name ROMP_PYTHON still boots — the launcher resolves PATH like bash did" {
+    # the r51 verification round (ported): os.execv did no PATH search, so
+    # ROMP_PYTHON=python3.12 (a bare command name, resolved fine by the old bash exec)
+    # crash-looped exit 70 forever
+    _gen_fixture
+    mkdir -p "$TEST_DIR/pybin"
+    printf '#!/usr/bin/env bash\nexec bash "$@"\n' > "$TEST_DIR/pybin/mypython"
+    chmod +x "$TEST_DIR/pybin/mypython"
+    export PATH="$TEST_DIR/pybin:$PATH" ROMP_PYTHON=mypython
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"GEN_KERNEL_RAN"* ]]
+}

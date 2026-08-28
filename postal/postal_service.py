@@ -1050,6 +1050,8 @@ def _recall(from_id, to, mid):
             if not hostdir.is_dir():
                 continue
             for f in list(hostdir.glob("*.json")):
+                if f.name.startswith("."):
+                    continue   # a relay stage is not recallable mail (r51 port)
                 if mid and f.stem != mid:
                     continue
                 try:
@@ -2723,6 +2725,10 @@ def outbox_list(host, limit=None, byte_limit=None):
         out = []
         used = 0
         for f in sorted((OUTBOX / host).glob("*.json")):
+            if f.name.startswith("."):
+                continue   # a relay STAGE (.stage-<mid>) is not mail (r51 port: pathlib
+                #            globs match dotfiles, and a hostname ending "json" made the
+                #            full-payload stage shippable before its sent row existed)
             if limit is not None and len(out) >= limit:
                 break
             fingerprint = None
