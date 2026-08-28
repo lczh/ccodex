@@ -560,12 +560,25 @@ if [ -z "${ROMP_KERNEL_BIN:-}" ] && [ -n "${_ROMP_PICK:-}" ]; then
     # it here refused every fresh bootstrap's in-transaction launch, exit 70, dead-coding the
     # r49 bypass — reproduced). Same pid-alive check the gate uses.
     _TXN2="${ROMP_INSIDE_UPDATE_TXN:-}"
-    if [ -n "$_TXN2" ] && [ -z "${_TXN2//[0-9]/}" ] && kill -0 "$_TXN2" 2>/dev/null; then
+    if [ -n "$_TXN2" ] && [ -z "${_TXN2//[0-9]/}" ] && [ "$_TXN2" -gt 0 ] 2>/dev/null \
+            && kill -0 "$_TXN2" 2>/dev/null; then
         :   # the transaction owns the checkout; its verdict governs the pick it just built
     else
         _RGD2="$(git -C "$ROMP_DIR" rev-parse --absolute-git-dir 2>/dev/null || true)"
         if [ -n "$_RGD2" ]; then
-            exec 9>>"$_RGD2/romp-update.lock" || { echo "romp-serve: cannot open the update lock" >&2; exit 70; }
+            # an UNOPENABLE lock file mirrors the gate's rule (the r50 verification round,
+            # wave 2: refusing here turned every boot of a read-only/unowned checkout into
+            # exit 70 forever, on a configuration the gate explicitly supports): a checkout
+            # whose git dir cannot host the lock cannot host an update either — the checks
+            # below still run, locklessly, the same advisory reads the gate made
+            _LK2=1
+            # NO stderr suppression on this exec: redirections on a bare `exec` rebind the
+            # SHELL's own fds permanently — 2>/dev/null here silenced every later refusal
+            # message (found the hard way in this very wave). The one-line "Permission
+            # denied" on the read-only path is honest signal.
+            if ! exec 9>>"$_RGD2/romp-update.lock"; then
+                _LK2=""
+            fi
             # the lock via python fcntl on the INHERITED fd — flock(2) binds to the open file
             # description, which bash's fd 9 keeps after the child exits, so the lock HOLDS
             # across the checks below (the r50 verification round: `flock -n 9` shelled out to
@@ -573,7 +586,7 @@ if [ -z "${ROMP_KERNEL_BIN:-}" ] && [ -n "${_ROMP_PICK:-}" ]; then
             # the refusal arm and every macOS boot exited 70). Bounded wait, not one-shot:
             # sibling kernels booting together contend for seconds through a gen_build (the
             # gate's own rule); an update transaction holds far longer and still refuses.
-            if ! python3 -c '
+            if [ -n "$_LK2" ] && ! python3 -c '
 import fcntl, os, sys, time
 try:
     _w = float(os.environ.get("ROMP_REVAL_LOCK_WAIT") or 15.0)
@@ -609,7 +622,7 @@ while True:
                     fi
                     ;;
             esac
-            exec 9>&-
+            [ -n "$_LK2" ] && exec 9>&-
         fi
     fi
 fi

@@ -1646,6 +1646,7 @@ class TimelinePanel {
       const seedRows = data.unionOps.filter((o) => o && !o.refusal);   // refusal rows are events, not entries (r50)
       if (seedRows.length && !(this._unionOps || []).length) {
         this._unionOps = seedRows.map((o) => Object.assign({}, o));
+        this._adoptedGids = new Set(this._unionOps.map((o) => o.gid).filter(Boolean));
         // gesture ids must not collide with re-seeded ones: resume the sequence PAST them
         for (const o of this._unionOps)
           if (o.gid && o.gid >= unionGestureSeq) unionGestureSeq = o.gid + 1;
@@ -1679,6 +1680,28 @@ class TimelinePanel {
           // the reload path: fire the compensation the lost frame would have carried
           this.tagEditFailed({ host: r.host, name: r.name, opId: r.opId, error: r.error });
         }
+      }
+    }
+    // ADOPTED groups follow their owner (the r50 verification round, wave 3): entries this
+    // panel merely re-seeded exist to compensate if the owner DIES — while the owner lives,
+    // its retirement of the group (confirmed by polls, or compensated via its refusal) must
+    // release the bystander's copies too, or a refused gesture's adopted entries never
+    // confirm, are retained forever, and re-upsert the dead group on any later sync. A gid
+    // absent from the payload's journal echo — with no refusal row for it — was retired by
+    // its owner; the copies drop without compensation.
+    if (Array.isArray(data.unionOps) && this._adoptedGids && this._adoptedGids.size) {
+      const present = new Set(data.unionOps.filter((o) => o && !o.refusal && o.gid)
+                                           .map((o) => o.gid));
+      const refusals = new Set(data.unionOps.filter((o) => o && o.refusal && o.opId)
+                                            .map((o) => String(o.opId)));
+      const gone = [];
+      for (const g of this._adoptedGids)
+        if (!present.has(g) && !refusals.has(String(g))) gone.push(g);
+      if (gone.length) {
+        for (const g of gone) this._adoptedGids.delete(g);
+        const before = (this._unionOps || []).length;
+        this._unionOps = (this._unionOps || []).filter((o) => gone.indexOf(o.gid) < 0);
+        if (this._unionOps.length !== before) this._syncUnionOps();
       }
     }
     this._reconcileUnionOps();       // age out union-edit compensations the owner has since applied
@@ -2723,18 +2746,14 @@ class TimelinePanel {
     // r50) must not fire the rollback a SECOND time when it rides the next payload
     if (m && m.opId) {
       if (!this._handledRefusalOps) this._handledRefusalOps = new Set();
-      if (!this._retireUnionGids) this._retireUnionGids = new Set();
       this._handledRefusalOps.add(String(m.opId));
-      // the refusal row's gid is DERIVED from the opId (-|opId|, the kernel's mint), so the
-      // panel that consumed the direct frame retires the journal twin NOW instead of waiting
-      // to see it ride a payload — closing the window where the row stranded ownerless (the
-      // compensation removes the very entries the ownership check needs) or a second panel
-      // holding adopted copies fired the rollback again (the r50 verification round)
-      const n = parseInt(String(m.opId), 10);
-      if (!isNaN(n) && n !== 0) {
-        this._retireUnionGids.add(-Math.abs(n));
-        this._unionSyncDirty = true;
-      }
+      // deliberately NO proactive tombstone of the journal twin here (the r50 verification
+      // round, wave 3): OTHER panels holding adopted copies of this gesture — Obsidian
+      // panels receive no direct frames at all — need the row to fire their own (idempotent,
+      // postimage-guarded) compensation; erasing it within milliseconds stranded their
+      // adopted entries forever. This panel tombstones the row when it rides the next
+      // payload (the scan marks it handled, so nothing re-fires); an ownerless row expires
+      // on the kernel's 7-day backstop.
     }
     // the optimistic overlay drops SCOPED by the refused gesture's opId when the frame carries
     // one (the v1.3.20 audit's residual): the host-wide sweep also reverted OTHER in-flight

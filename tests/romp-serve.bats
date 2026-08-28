@@ -771,3 +771,29 @@ HOLDPY
     [ "$status" -eq 0 ]
     [[ "$output" == *"LIVE_KERNEL_RAN"* ]]
 }
+
+@test "romp-serve: the exec revalidation needs no flock(1) binary (stock macOS)" {
+    # the r50 verification round's second P1 — and its wave-3 revert detector: the Linux CI
+    # runners HAVE flock(1), so a revert to `flock -n 9` stayed green everywhere it runs.
+    # A PATH shim that answers 127 (command not found) makes the reverted code red on Linux.
+    _gen_fixture
+    _pick_shim "gen $GENGD/romp-run-$GENH8"
+    printf '#!/usr/bin/env bash\nexit 127\n' > "$TEST_DIR/pathbin/flock"
+    chmod +x "$TEST_DIR/pathbin/flock"
+    run "$ROMP_SERVE" --port 9999
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"GEN_KERNEL_RAN"* ]]
+}
+
+@test "romp-serve: a READ-ONLY git dir boots locklessly — the gate's rule, at the revalidation too" {
+    # the r50 verification round, wave 3: the gate explicitly supports an unwritable git dir
+    # (no lock openable => no update can be mid-flight) and proceeded locklessly — then the
+    # wave-2 revalidation exit-70'd on the same open, refusing EVERY boot of that checkout
+    _gen_fixture
+    _pick_shim "gen $GENGD/romp-run-$GENH8"
+    chmod 555 "$GENGD"
+    run "$ROMP_SERVE" --port 9999
+    chmod 755 "$GENGD"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"GEN_KERNEL_RAN"* ]]
+}

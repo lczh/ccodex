@@ -835,12 +835,12 @@ test("executed: a gesture minted and resolved while a sync is UNACKED still gets
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
 });
 
-test("executed: the direct refusal frame tombstones its journal twin immediately (r50 round)", () => {
-  // the verification round: the compensation deletes the very entries the ownership check
-  // needs — a panel that consumed the direct frame and closed before the journal row rode a
-  // payload left the row ownerless forever, and a second panel holding adopted copies could
-  // fire the rollback again. The row's gid is derived from the opId (-|opId|), so the
-  // consuming panel retires it NOW, sight unseen.
+test("executed: the direct refusal frame does NOT erase the journal row other panels still need (r50 wave 3)", () => {
+  // the r50 verification round, wave 3: the wave-2 proactive tombstone retired the refusal
+  // row within milliseconds of the direct frame — but Obsidian panels receive no frames and
+  // a reloaded dashboard's adopted copies were waiting for exactly that row; erasing it
+  // stranded their entries forever. The consuming panel now retires the row only when it
+  // rides a payload (the scan marks it handled, so nothing re-fires).
   const wire: any[] = [];
   g.__rompTimelineEditTag = () => {};
   g.__rompTimelineSetViews = () => {};
@@ -852,8 +852,62 @@ test("executed: the direct refusal frame tombstones its journal twin immediately
   const gid = panel._unionOps[0].gid;
   panel.tagEditFailed({ host: "TESTHOST-B", name: "pool", opId: String(gid), error: "refused" });
   const post = wire[wire.length - 1];
-  assert.ok(post.retired.indexOf(-Math.abs(gid)) >= 0,
-    "the journal twin's deterministic gid rides retired without waiting to see the row");
+  assert.ok(post.retired.indexOf(-Math.abs(gid)) < 0,
+    "no sight-unseen tombstone — the row lives for the panels that have only the journal");
+  // …but when the row RIDES a payload, this panel retires it without re-firing
+  const inverse: any[] = [];
+  panel._editRemoteTag = (rt: any, edit: any) => { inverse.push(edit); return true; };
+  panel.update({ now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [], views: JSON.parse(JSON.stringify(VIEWS)),
+                 unionOps: [{ refusal: true, gid: -Math.abs(gid), opId: String(gid),
+                              host: "TESTHOST-B", name: "pool", error: "refused" }] });
+  assert.equal(inverse.length, 0, "handled by the direct frame — the row's arrival re-fires nothing");
+  const tomb = wire[wire.length - 1];
+  assert.ok(tomb.retired.indexOf(-Math.abs(gid)) >= 0, "…and NOW the row is tombstoned");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: an adopted group the OWNER retired releases the bystander's copies (r50 wave 3)", () => {
+  // the r50 verification round, wave 3: a reloaded panel adopted gesture G's rows; the owner
+  // compensated G's refusal and retired the rows — the bystander's copies could never confirm
+  // (the refused edit never applies), were retained forever, and re-upserted the dead group
+  // into the kernel journal on any later sync
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
+  const gid = journal[0].gid;
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  // the bystander adopts…
+  const panel2 = drawnPanel();
+  const inverse: any[] = [];
+  panel2._editRemoteTag = (rt: any, edit: any) => { inverse.push(edit); return true; };
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: journal }));
+  assert.equal(panel2._unionOps.length, 2, "adopted");
+  // …and the owner retires the group: the next journal echo no longer carries it
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: [] }));
+  assert.equal(panel2._unionOps.length, 0,
+    "the owner's retirement releases the copies — no immortal re-upsert loop");
+  assert.equal(inverse.length, 0, "…with no compensation: the owner already settled it");
+  // a payload carrying the REFUSAL row instead is the refusal path's to handle, not a drop
+  const panel3 = drawnPanel();
+  const inv3: any[] = [];
+  panel3._editRemoteTag = (rt: any, edit: any) => { inv3.push(edit); return true; };
+  panel3.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: journal }));
+  panel3.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: [{ refusal: true, gid: -Math.abs(gid),
+                                                       opId: String(gid), host: "TESTHOST-B",
+                                                       name: "pool", error: "late refusal" }] }));
+  assert.equal(inv3.length, 1, "the refusal row still fires the adopted holder's compensation");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
 });
 
