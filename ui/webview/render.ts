@@ -11433,10 +11433,13 @@ window.addEventListener("message", (e: MessageEvent) => {
   // cleared its peek; the refusal restored the hiding blob with peekId still null, and the active
   // tab vanished from the strip until an unrelated push — the refused write changed nothing
   // kernel-side, so no healing tabOrder frame was ever coming).
-  else if (m.type === "viewsAck") consumeViewsAck(m, () => {
+  else if (m.type === "viewsAck") consumeViewsAck(m, (conflicts) => {
     pendingSessionViews = null; pendingViewsAge = 0;
     if (activeId) assertPeekFor(activeId);
     renderTabs();
+    // the refusal is NAMED (the v1.3.23 audit's P3.9): the optimistic tag used to vanish from
+    // the strip with nothing saying why — the kernel's conflict strings ride the ack now
+    for (const c of conflicts || []) warnToast(c);
   });
   else if (m.type === "renamed" && m.id && typeof m.name === "string") {
     notePendingMeta(pendingTabMeta, m.id, { name: m.name });   // kernel truth — hold it against a push built pre-rename

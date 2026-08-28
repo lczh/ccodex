@@ -1595,11 +1595,22 @@ class Handler(BaseHTTPRequestHandler):
                 # unpublished row. The stage lands FIRST (the r50 verification round): staged
                 # after the row, a crash — or a plain OSError on this very write — in the
                 # one-line window still minted the permanent phantom; an orphaned stage with
-                # NO row is just a harmless terminal for mail nobody sent.
+                # NO row is just a harmless terminal for mail nobody sent. The stage carries
+                # the FULL payload and the publish is its atomic RENAME into the outbox name
+                # (the v1.3.23 audit's P2.4): put-then-unlink left the stage and the published
+                # file coexisting — a fast peer ack consumed AND deleted the outbox file
+                # before the stage unlink ran, and a stop before the `relayed` append then
+                # made boot read "stage + no outbox + no terminal row" as never-published,
+                # marking DELIVERED mail unpublished and erasing its receipt. With the rename,
+                # a standing stage means exactly "the publish never happened".
                 _stagef = OUTBOX / phost / (".stage-" + mid)
                 try:
                     (OUTBOX / phost).mkdir(parents=True, exist_ok=True)
-                    _stagef.write_text("1")
+                    with _stagef.open("x") as _sf:
+                        json.dump(relay_msg, _sf)
+                        _sf.flush()
+                        os.fsync(_sf.fileno())
+                    _fsync_dir(OUTBOX / phost)
                 except OSError:
                     return self._send({"ok": False,
                                        "error": "the relay stage could not be written — "
@@ -1616,7 +1627,7 @@ class Handler(BaseHTTPRequestHandler):
                                        "error": "the delivery record could not be written — "
                                                 "mail NOT relayed; retry"})
                 try:
-                    outbox_put(phost, relay_msg)
+                    outbox_publish_stage(phost, mid, _stagef)
                 except Exception:
                     comp = {"t": int(time.time()), "ev": "unpublished", "id": mid}
                     if not _tl_append("messages.jsonl", comp) and not _tl_append("messages.jsonl", comp):
@@ -1629,11 +1640,6 @@ class Handler(BaseHTTPRequestHandler):
                         except OSError:
                             pass
                     return self._send({"ok": False, "error": "relay publication failed — retry"})
-                try:
-                    _stagef.unlink()               # published: the transaction is resolved
-                except OSError:
-                    pass                           # a leftover stage beside a REAL outbox file
-                #                                    is recognized and dropped at boot
                 if PEERS.get(phost, {}).get("up"):
                     return self._send({"ok": True, "id": mid,
                                        "note": "relaying to '%s' on %s%s" % (hit.get("name") or to, phost, tnote)})
@@ -1882,10 +1888,12 @@ def _reconcile_phantom_sent(now=None):
     return fixed
 
 def _reconcile_relay_stages():
-    """Resolve relay stage files left by a crash between the sent row and outbox_put (the r50
+    """Resolve relay stage files left by a crash between the sent row and the publish (the r50
     verification): a stage with NO outbox file means the publish never happened — file the
-    unpublished terminal so the wait-map and receipts stop accounting phantom peer mail. A
-    stage BESIDE its outbox file (a crash after publish, before the unlink) just drops."""
+    unpublished terminal so the wait-map and receipts stop accounting phantom peer mail. The
+    publish RENAMES the stage into the outbox name now (the v1.3.23 audit's P2.4), so a
+    standing stage can only mean an unfinished transaction; a stage BESIDE its outbox file
+    (a pre-rename bus's crash after publish, before its separate unlink) still just drops."""
     fixed = 0
     try:
         hosts = list(OUTBOX.iterdir()) if OUTBOX.is_dir() else []
@@ -2690,6 +2698,22 @@ def outbox_put(host, msg):
     d = OUTBOX / host
     d.mkdir(parents=True, exist_ok=True)
     _atomic_json_put(d / (mid + ".json"), msg)
+    _peer_wake(host).set()
+
+def outbox_publish_stage(host, mid, stagef):
+    """Publish a STAGED full-payload relay by renaming the stage file into its outbox name (the
+    v1.3.23 audit's P2.4). The rename retires the stage in the same atomic step that publishes,
+    so the stage's existence means exactly "the publish never happened" — with a separate
+    unlink, a fast peer ack could consume and delete the published file before the stage was
+    removed, and a stop before the `relayed` append made boot reconciliation mark DELIVERED
+    mail unpublished. The stage was written durably (fsync) by the relay leg; the directory
+    fsync here makes the rename itself durable. Raises on failure — the caller compensates."""
+    if not (_safe_id(host) and _safe_id(mid)):       # path components — block traversal
+        _log("outbox_publish_stage: refusing unsafe host/mid %r/%r" % (host, mid))
+        raise ValueError("unsafe host/mid")
+    d = OUTBOX / host
+    os.rename(stagef, d / (mid + ".json"))
+    _fsync_dir(d)
     _peer_wake(host).set()
 
 def outbox_list(host, limit=None, byte_limit=None):

@@ -65,6 +65,17 @@ if [ -n "$_ROMP_PICK" ]; then
     # every REFUSED boot leaked its pick file (the r50 verification: three refusals, three
     # files) — the trap covers every exit; the exec path removes it explicitly first
     trap '[ -n "${_ROMP_PICK:-}" ] && rm -f "$_ROMP_PICK"' EXIT
+elif git -C "$ROMP_DIR" rev-parse --absolute-git-dir >/dev/null 2>&1; then
+    # NO pick channel on a GIT checkout fails CLOSED (the v1.3.23 audit's P1.2): with the pick
+    # file unmintable (an invalid TMPDIR), the gate could only refuse non-live picks — a gate
+    # that picked "live" exited 0 with nothing to deliver, and bash then skipped the whole
+    # strict applier AND the exec revalidation, so an update landing after the gate armed its
+    # marker still saw unverified mutable live bytes execute. The pick channel is the strict
+    # path's spine; a git checkout that cannot create it does not boot. A non-git checkout
+    # keeps booting: it hosts no updates, so there is no pick to protect.
+    echo "romp-serve: cannot create the launch-pick channel under ${TMPDIR:-/tmp} — refusing" >&2
+    echo "  to boot without the strict launch pick (fix TMPDIR; the manager retries)." >&2
+    exit 70
 fi
 
 # Port: the manager passes --port; fall back to the env, then the kernel default.
@@ -550,81 +561,95 @@ if [ -z "${ROMP_KERNEL_BIN:-}" ] && [ -n "${_ROMP_PICK:-}" ]; then
             exit 70
             ;;
     esac
-    # REVALIDATE under a re-taken lock immediately before exec (the r50 verification: the gate
-    # released its lock when Python exited, and an update landing before this exec launched the
-    # OLD pick — an executed A→B schedule booted A while HEAD and the marker named B). The lock
-    # is released before exec (a held flock would ride into the kernel forever); the remaining
-    # window holds no git state reads, and an updater's pkill covers processes it replaces.
-    # INSIDE the install transaction the revalidation stands down like the gate does (the r50
-    # verification round: the txn HOLDS this lock across install → manager → serve, so taking
-    # it here refused every fresh bootstrap's in-transaction launch, exit 70, dead-coding the
-    # r49 bypass — reproduced). Same pid-alive check the gate uses.
-    _TXN2="${ROMP_INSIDE_UPDATE_TXN:-}"
-    if [ -n "$_TXN2" ] && [ -z "${_TXN2//[0-9]/}" ] && [ "$_TXN2" -gt 0 ] 2>/dev/null \
-            && kill -0 "$_TXN2" 2>/dev/null; then
-        :   # the transaction owns the checkout; its verdict governs the pick it just built
-    else
-        _RGD2="$(git -C "$ROMP_DIR" rev-parse --absolute-git-dir 2>/dev/null || true)"
-        if [ -n "$_RGD2" ]; then
-            # an UNOPENABLE lock file mirrors the gate's rule (the r50 verification round,
-            # wave 2: refusing here turned every boot of a read-only/unowned checkout into
-            # exit 70 forever, on a configuration the gate explicitly supports): a checkout
-            # whose git dir cannot host the lock cannot host an update either — the checks
-            # below still run, locklessly, the same advisory reads the gate made
-            _LK2=1
-            # NO stderr suppression on this exec: redirections on a bare `exec` rebind the
-            # SHELL's own fds permanently — 2>/dev/null here silenced every later refusal
-            # message (found the hard way in this very wave). The one-line "Permission
-            # denied" on the read-only path is honest signal.
-            if ! exec 9>>"$_RGD2/romp-update.lock"; then
-                _LK2=""
-            fi
-            # the lock via python fcntl on the INHERITED fd — flock(2) binds to the open file
-            # description, which bash's fd 9 keeps after the child exits, so the lock HOLDS
-            # across the checks below (the r50 verification round: `flock -n 9` shelled out to
-            # the util-linux flock(1) binary, absent on stock macOS — command-not-found took
-            # the refusal arm and every macOS boot exited 70). Bounded wait, not one-shot:
-            # sibling kernels booting together contend for seconds through a gen_build (the
-            # gate's own rule); an update transaction holds far longer and still refuses.
-            if [ -n "$_LK2" ] && ! python3 -c '
-import fcntl, os, sys, time
-try:
-    _w = float(os.environ.get("ROMP_REVAL_LOCK_WAIT") or 15.0)
-except ValueError:
-    _w = 15.0
-deadline = time.time() + _w
-while True:
+    rm -f "$_ROMP_PICK"
+    # REVALIDATE and EXEC in ONE python, with the update lock HELD THROUGH os.execv (the
+    # v1.3.23 audit's P1.1): the previous shape re-took the lock on bash's fd 9, ran the
+    # checks, then CLOSED the fd before exec — an update landing in that gap deterministically
+    # booted the superseded pick while HEAD and the marker named the new build, and the
+    # updater's pkill never saw it (the process was still this bash, not yet a kernel). The
+    # launcher's lock fd is CLOEXEC (python fds are non-inheritable by default), so the lock
+    # releases exactly as the kernel image replaces the process — never before: an updater can
+    # only take the lock once the picked kernel is RUNNING, where its pkill covers it. The
+    # earlier "a held flock would ride into the kernel forever" worry is answered by CLOEXEC,
+    # not by an early release. The launcher keeps every standing rule: the in-transaction
+    # standdown (pid-alive ROMP_INSIDE_UPDATE_TXN — the txn holds this lock across install →
+    # manager → serve), the lockless advisory reads for an unopenable lock (read-only git
+    # dir), the bounded ROMP_REVAL_LOCK_WAIT sibling wait, and fcntl over any flock(1) binary
+    # (absent on stock macOS).
+    exec python3 -c '
+import fcntl, os, stat, subprocess, sys, time
+
+root, kernel, pick, py = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+def refuse(msg):
+    sys.stderr.write("romp-serve: %s\n" % msg)
+    sys.exit(70)
+
+def launch():
+    if not os.access(kernel, os.X_OK):
+        refuse("kernel not found/executable at %s" % kernel)
+    os.execv(py, [py, kernel])
+
+txn = os.environ.get("ROMP_INSIDE_UPDATE_TXN", "")
+alive = False
+if txn.isdigit() and int(txn) > 0:
     try:
-        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        sys.exit(0)
+        os.kill(int(txn), 0)
+        alive = True
     except OSError:
-        if time.time() >= deadline:
-            sys.exit(1)
-        time.sleep(0.2)
-'; then
-                echo "romp-serve: an update is mid-flight — refusing this stale pick" >&2
-                exit 70
-            fi
-            _HF2="$(git -C "$ROMP_DIR" rev-parse HEAD 2>/dev/null || true)"
-            _MK2=""
-            [ -f "$_RGD2/romp-restart-needed" ] && _MK2="$(head -1 "$_RGD2/romp-restart-needed" 2>/dev/null | tr -cd '0-9a-f' || true)"
-            case "$_PICK" in
-                "gen "*)
-                    case "${_PICK#gen }" in
-                        *"romp-run-${_HF2:0:8}") : ;;
-                        *) echo "romp-serve: HEAD moved past the gate's pick — refusing (respawn re-picks)" >&2; exit 70 ;;
-                    esac
-                    ;;
-                live)
-                    if [ -n "$_MK2" ] && [ -n "$_HF2" ] && [ "${_MK2:0:8}" = "${_HF2:0:8}" ]; then
-                        echo "romp-serve: an update marker armed after the gate's live pick — refusing (respawn re-picks)" >&2
-                        exit 70
-                    fi
-                    ;;
-            esac
-            [ -n "$_LK2" ] && exec 9>&-
-        fi
-    fi
+        pass                        # holder gone: the txn is stale — revalidate normally
+if alive:
+    launch()                        # the transaction owns the checkout; its verdict governs
+gd = subprocess.run(["git", "-C", root, "rev-parse", "--absolute-git-dir"],
+                    capture_output=True, text=True)
+gdir = (gd.stdout or "").strip()
+if gd.returncode or not gdir:
+    launch()                        # not a git checkout: no update can move under this boot
+fd = None
+try:
+    fd = os.open(os.path.join(gdir, "romp-update.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+except OSError:
+    # an UNOPENABLE lock mirrors the gate: a git dir that cannot host the lock cannot host
+    # an update either — the checks below still run, locklessly, the same advisory reads
+    sys.stderr.write("romp-serve: the update lock is unopenable — revalidating locklessly\n")
+if fd is not None:
+    try:
+        wait = float(os.environ.get("ROMP_REVAL_LOCK_WAIT") or 15.0)
+    except ValueError:
+        wait = 15.0
+    deadline = time.time() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.time() >= deadline:
+                refuse("an update is mid-flight — refusing this stale pick")
+            time.sleep(0.2)
+hf = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True)
+head = (hf.stdout or "").strip()
+mkp = os.path.join(gdir, "romp-restart-needed")
+mtok = ""
+try:
+    if stat.S_ISREG(os.lstat(mkp).st_mode):   # a FIFO/device must not hang the open
+        mfd = os.open(mkp, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                      | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            raw = os.read(mfd, 4096).decode(errors="replace").split("\n")[0]
+        finally:
+            os.close(mfd)
+        mtok = "".join(c for c in raw if c in "0123456789abcdef")
+except FileNotFoundError:
+    mtok = ""
+except OSError:
+    refuse("the update marker is unreadable — refusing (respawn re-picks)")
+if pick.startswith("gen "):
+    if not head or not pick[len("gen "):].endswith("romp-run-" + head[:8]):
+        refuse("HEAD moved past the gate'"'"'s pick — refusing (respawn re-picks)")
+elif mtok and head and mtok[:8] == head[:8]:
+    refuse("an update marker armed after the gate'"'"'s live pick — refusing (respawn re-picks)")
+launch()
+' "$ROMP_DIR" "$KERNEL" "$_PICK" "$PY"
 fi
 [ -n "${_ROMP_PICK:-}" ] && rm -f "$_ROMP_PICK"
 [[ -x "$KERNEL" ]] || { echo "romp-serve: kernel not found/executable at $KERNEL" >&2; exit 70; }

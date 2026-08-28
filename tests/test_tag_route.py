@@ -312,21 +312,26 @@ class EditTagOpPins(unittest.TestCase):
         # the v1.3.22 audit's P2.4: the tagEditFailed frame is TRANSIENT — a panel reloading in
         # the send window lost the one event its re-seeded journal was waiting for, and the
         # multi-host split went silent forever. The refusal is a durable row in the union
-        # journal now; the payload echo carries it to whichever panel owns the gesture.
+        # journal now; the payload echo carries it to whichever panel owns the gesture. The
+        # journaling rides _journal_refusal (the v1.3.23 audit's P1.3): a failed save queues
+        # for the supervisor-pass retry instead of being swallowed.
         src = open(os.path.join(BIN, "romp-kernel")).read()
         i_send = src.index('{"type": "tagEditFailed", "host": host, "name": nm,')
-        i_journal = src.index('_union_ops_set([{"refusal": True, "host": host, "name": nm,')
+        i_journal = src.index('_journal_refusal({"refusal": True, "host": host, "name": nm,')
         self.assertLess(i_send, i_journal, "the loud frame first, then the durable row")
         i_branch_end = src.index('elif msg and msg.get("type") == "cardNotify"')
         self.assertLess(i_journal, i_branch_end, "…both inside the editTag branch")
+        self.assertIn("_flush_pending_refusals()", src,
+                      "the failed-save retry runs from the supervisor pass (P1.3)")
 
     def test_a_landed_remote_edit_migrates_this_kernels_refs(self):
         # the v1.3.22 audit's P2.7 wiring pin (behavior is R50RemoteRefMigration in
-        # test_flag_views_order_routes): the WS branch's SUCCESS arm hands the landed edit to
-        # the shared migration helper
+        # test_flag_views_order_routes): the WS branch's SUCCESS arm hands the landed edit —
+        # AND the owner's authoritative reply (the v1.3.23 audit's P2.5) — to the shared
+        # migration helper
         src = open(os.path.join(BIN, "romp-kernel")).read()
         i_forward = src.index('ans, err = _forward_tag_edit(host, body)')
-        i_migrate = src.index('_migrate_refs_after_remote_edit(host, nm, body)')
+        i_migrate = src.index('_migrate_refs_after_remote_edit(host, nm, body, ans)')
         self.assertLess(i_forward, i_migrate)
         i_branch_end = src.index('elif msg and msg.get("type") == "cardNotify"')
         self.assertLess(i_migrate, i_branch_end)

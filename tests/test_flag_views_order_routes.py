@@ -4,6 +4,8 @@ writers, routed through the kernel's LOCKED, canonicalizing setters instead of r
 replaces that lost concurrent fields, deleted sibling rows, and recreated migrated TIDs — muting
 and postal ISOLATION are safety state. Drives the REAL Handler over HTTP (the
 test_rename_route.py pattern). Synthetic only."""
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -809,18 +811,33 @@ class R50RefusalExpiryAndCap(unittest.TestCase):
         self.assertEqual([r["gid"] for r in km._union_ops_load()], [5],
                          "in-flight GESTURES settle on evidence, never a clock")
 
-    def test_the_cap_drops_the_oldest_rows_never_the_incoming_write(self):
+    def test_the_cap_never_evicts_an_unresolved_row(self):
+        # the v1.3.23 audit's P1.3, executed there as a 201-row probe: the r50 cap dropped the
+        # OLDEST rows past _UNION_OPS_MAX and still acked ok:true — the oldest ACTIVE gesture
+        # silently left the journal, and a reload had nothing to compensate. Unretired rows
+        # are the panel's un-acknowledged writes: an ok ack means EVERY one of them persisted;
+        # _UNION_OPS_MAX is a loud high-water mark now, never an eviction.
         rows = [{"host": "TESTHOST-A", "gid": i, "edit": {}, "inverse": {}, "rt": {},
                  "name": "t%d" % i} for i in range(1, km._UNION_OPS_MAX + 1)]
         self.assertTrue(km._union_ops_set(rows))
-        self.assertTrue(km._union_ops_set([{"host": "TESTHOST-B", "gid": 9999, "edit": {},
-                                            "inverse": {}, "rt": {}, "name": "fresh"}]))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertTrue(km._union_ops_set([{"host": "TESTHOST-B", "gid": 9999, "edit": {},
+                                                "inverse": {}, "rt": {}, "name": "fresh"}]))
         gids = [r["gid"] for r in km._union_ops_load()]
-        self.assertIn(9999, gids,
-                      "the row the ok:true ack just promised is the LAST one the cap may drop "
-                      "(the r50 round: rows[:MAX] silently dropped the incoming gesture)")
-        self.assertEqual(len(gids), km._UNION_OPS_MAX)
-        self.assertNotIn(1, gids, "the OLDEST row paid for the cap")
+        self.assertIn(9999, gids, "the row the ok:true ack just promised persisted")
+        self.assertEqual(len(gids), km._UNION_OPS_MAX + 1,
+                         "…and every unresolved row it joined is still there")
+        self.assertIn(1, gids, "the oldest active gesture is NOT the cap's price anymore")
+        self.assertIn("high-water mark", err.getvalue(), "the overflow is loud, not silent")
+
+    def test_the_load_side_never_truncates_an_over_full_journal(self):
+        # the same audit finding's second half: _union_ops_load()[:MAX] silently dropped the
+        # tail of an over-full journal before any merge saw it
+        rows = [{"host": "TESTHOST-A", "gid": i, "edit": {}, "inverse": {}, "rt": {},
+                 "name": "t%d" % i} for i in range(1, km._UNION_OPS_MAX + 2)]
+        km.jd.STATE.mkdir(parents=True, exist_ok=True)
+        km._union_ops_path().write_text(json.dumps(rows))
+        self.assertEqual(len(km._union_ops_load()), km._UNION_OPS_MAX + 1)
 
 
 class R50UnionOpsAckAndConflicts(unittest.TestCase):
@@ -1072,7 +1089,183 @@ class R50RemoteRefMigration(unittest.TestCase):
 
     def test_the_ws_and_tag_routes_both_migrate_on_success(self):
         # the two forward paths (the dialog's WS editTag, the /tag --host route) share the
-        # helper — a success on either migrates this kernel's refs
+        # helper — a success on either migrates this kernel's refs, off the owner's
+        # authoritative reply (the v1.3.23 audit's P2.5), never a re-read of the raw request
         src = open(os.path.join(BIN, "romp-kernel")).read()
-        self.assertEqual(src.count("_migrate_refs_after_remote_edit(host, nm, body)"), 1)
-        self.assertEqual(src.count("_migrate_refs_after_remote_edit(th, name, b)"), 1)
+        self.assertEqual(src.count("_migrate_refs_after_remote_edit(host, nm, body, ans)"), 1)
+        self.assertEqual(src.count("_migrate_refs_after_remote_edit(th, name, b, ans)"), 1)
+
+
+class V1323NoOpOpsAndMintCollision(unittest.TestCase):
+    """the v1.3.23 audit's P2.7 (exact no-op ops bumped the views revision — repeating current
+    values advanced rev 1→2→3→4, and the false bumps then 409'd another client's meaningful
+    CAS write) and P2.6's server half (a same-id, different-name create read as a replay:
+    both panels acked ok while only the first tag existed)."""
+
+    def setUp(self):
+        _scrub_state()
+
+    def tearDown(self):
+        _scrub_state()
+
+    def test_repeating_current_values_never_bumps_rev(self):
+        rev1, _ = km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "",
+                                                   "members": []}},
+                                       {"actives": {"chat": {"tags": ["pool"]}}},
+                                       {"tagOrder": ["pool"]}])
+        for _i in range(3):
+            rev, confl = km._apply_views_ops([{"active": km._timeline_views()["active"]},
+                                              {"actives": {"chat": {"tags": ["pool"]}}},
+                                              {"tagOrder": ["pool"]}])
+            self.assertEqual(rev, rev1, "an exact no-op leaves the revision alone")
+            self.assertEqual(confl, [])
+
+    def test_a_real_change_still_bumps(self):
+        rev1, _ = km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "",
+                                                   "members": []}}])
+        rev2, _ = km._apply_views_ops([{"tag": "pool", "color": "#123456"}])
+        self.assertEqual(rev2, rev1 + 1)
+
+    def test_a_same_id_same_name_create_is_a_quiet_replay(self):
+        cr = {"create": {"id": "g1", "name": "pool", "color": "", "members": []}}
+        rev1, _ = km._apply_views_ops([cr])
+        rev2, confl = km._apply_views_ops([cr])
+        self.assertEqual((rev2, confl), (rev1, []),
+                         "the spool's replayed create stays idempotent and quiet")
+
+    def test_a_same_id_different_name_create_is_a_named_conflict(self):
+        # the v1.3.23 audit's P2.6, executed there: two panels' same-ms Date.now() mints
+        # collided — simultaneous 'alpha'/'beta' creates both reported success and only
+        # 'alpha' existed
+        rev1, _ = km._apply_views_ops([{"create": {"id": "g1", "name": "alpha", "color": "",
+                                                   "members": []}}])
+        rev2, confl = km._apply_views_ops([{"create": {"id": "g1", "name": "beta", "color": "",
+                                                       "members": []}}])
+        self.assertEqual(rev2, rev1, "nothing applied")
+        self.assertEqual(len(confl), 1)
+        self.assertIn("beta", confl[0])
+        self.assertIn("alpha", confl[0], "the collision names BOTH parties")
+
+
+class V1323RefusalRetryQueue(unittest.TestCase):
+    """the v1.3.23 audit's P1.3: a refusal row whose journal save failed was swallowed
+    (`except Exception: pass`) — the reload-surviving twin of the transient tagEditFailed
+    frame never existed, and the multi-host split went silent again."""
+
+    def setUp(self):
+        try:
+            km._union_ops_path().unlink()
+        except OSError:
+            pass
+        km._pending_refusal_rows[:] = []
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_failed_save_queues_and_the_supervisor_retry_lands_it(self):
+        row = {"refusal": True, "host": "TESTHOST-A", "name": "pool", "opId": "77",
+               "error": "synthetic", "t": 1, "gid": -77}
+        real = km._union_ops_set
+        km._union_ops_set = lambda entries, retired=None: False
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                km._journal_refusal(row)
+        finally:
+            km._union_ops_set = real
+        self.assertEqual(km._pending_refusal_rows, [row], "the failed save queues, never drops")
+        self.assertEqual(km._union_ops_load(), [], "nothing landed yet")
+        with mock.patch.object(km, "_mark_views_dirty") as dirty:
+            km._flush_pending_refusals()                      # the disk healed
+            self.assertTrue(dirty.called, "panels learn from the next payload's echo")
+        self.assertEqual([r["gid"] for r in km._union_ops_load()], [-77])
+        self.assertEqual(km._pending_refusal_rows, [], "the queue drains on success")
+
+    def test_a_still_failing_store_keeps_the_queue(self):
+        km._pending_refusal_rows[:] = [{"refusal": True, "gid": -1, "t": 1}]
+        real = km._union_ops_set
+        km._union_ops_set = lambda entries, retired=None: False
+        try:
+            km._flush_pending_refusals()
+        finally:
+            km._union_ops_set = real
+        self.assertEqual(len(km._pending_refusal_rows), 1, "held for the next pass")
+
+
+class V1323MigrationAuthority(unittest.TestCase):
+    """the v1.3.23 audit's P2.5: the migration helper re-read the RAW request instead of the
+    owner's authoritative result — {delete:true, rename:...} renamed the viewer's refs to a
+    name the owner never minted (the owner deletes first and returns), a whitespace-heavy
+    rename kept a 40-char viewer ref for a 30-char owner name (strip-only vs the owner's
+    clamp-then-strip), and a local write failure after the remote committed left stale refs
+    forever, silently."""
+
+    def setUp(self):
+        _scrub_state()
+        km._pending_ref_migrations[:] = []
+        try:
+            km._ref_migrations_path().unlink()
+        except OSError:
+            pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def _seed(self):
+        km._apply_views_ops([{"create": {"id": "g1", "name": "local", "color": "",
+                                         "members": []}},
+                             {"actives": {"chat": {"tags": ["farpool"]}}},
+                             {"tagOrder": ["farpool", "local"]}])
+
+    def test_delete_wins_over_a_riding_rename(self):
+        self._seed()
+        km._migrate_refs_after_remote_edit("TESTHOST-A", "farpool",
+                                           {"delete": True, "rename": "nearpool"})
+        v = km._timeline_views()
+        self.assertEqual(v["actives"]["chat"], {"all": True},
+                         "the owner deleted — the refs drop; renaming them to 'nearpool' "
+                         "pointed every lens at a tag that never existed")
+        self.assertEqual(v.get("tagOrder"), ["local"])
+
+    def test_rename_normalization_matches_the_owner(self):
+        # the owner clamps THEN strips (_edit_tag): 30 y's + 10 spaces + 10 z's clamps to
+        # 40 (the y's and the spaces), strips to the 30 y's — strip-only kept 40 chars
+        self._seed()
+        raw = "y" * 30 + " " * 10 + "z" * 10
+        km._migrate_refs_after_remote_edit("TESTHOST-A", "farpool", {"rename": raw})
+        v = km._timeline_views()
+        self.assertEqual(v["actives"]["chat"], {"tags": ["y" * 30]},
+                         "the viewer ref wears the OWNER's post-normalize name")
+
+    def test_the_owners_reply_name_outranks_the_local_reconstruction(self):
+        self._seed()
+        km._migrate_refs_after_remote_edit("TESTHOST-A", "farpool", {"rename": "nearpool"},
+                                           ans={"ok": True, "tag": {"name": "nearpool-owner"}})
+        v = km._timeline_views()
+        self.assertEqual(v["actives"]["chat"], {"tags": ["nearpool-owner"]})
+
+    def test_a_failed_local_write_queues_a_retryable_intent(self):
+        self._seed()
+        real = km._atomic_write
+
+        def failing(path, data):
+            if str(path).endswith("timeline-views.json"):
+                raise OSError("ENOSPC")
+            return real(path, data)
+
+        km._atomic_write = failing
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                km._migrate_refs_after_remote_edit("TESTHOST-A", "farpool",
+                                                   {"rename": "nearpool"})
+        finally:
+            km._atomic_write = real
+        self.assertEqual(len(km._pending_ref_migrations), 1,
+                         "the committed remote half is never forgotten")
+        v = km._timeline_views()
+        self.assertEqual(v["actives"]["chat"], {"tags": ["farpool"]}, "not yet migrated")
+        with mock.patch.object(km, "_mark_views_dirty"):
+            km._flush_pending_ref_migrations()                # the disk healed
+        v = km._timeline_views()
+        self.assertEqual(v["actives"]["chat"], {"tags": ["nearpool"]},
+                         "the supervisor retry lands the migration")
+        self.assertEqual(km._pending_ref_migrations, [], "…and the intent retires")

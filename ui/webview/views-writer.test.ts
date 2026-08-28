@@ -187,17 +187,19 @@ test("wiring: the chat routes views writes through the shared writer — ops for
   assert.match(RENDER, /postViews\(v, v\.actives && v\.actives\["chat"\] \? \[\{ actives: \{ chat: v\.actives\["chat"\] \} \}\] : undefined\);/,
     "the reveal posts ONLY the chat surface it moved (r48)");
   // the frame router consumes the ack — a refusal drops the known-refused optimistic overlay now
-  assert.match(RENDER, /else if \(m\.type === "viewsAck"\) consumeViewsAck\(m, \(\) => \{\s*\n\s*pendingSessionViews = null; pendingViewsAge = 0;/);
+  assert.match(RENDER, /else if \(m\.type === "viewsAck"\) consumeViewsAck\(m, \(conflicts\) => \{\s*\n\s*pendingSessionViews = null; pendingViewsAge = 0;/);
   // …and every tabOrder payload re-anchors (captureViews is the views-arrival path)
   assert.match(RENDER, /function captureViews\(v: SessionViews \| null\) \{\s*\n\s*if \(v\) sessionViews = v;\s*\n\s*anchorViewsRev\(v\);/);
 });
 
 test("wiring: the chat's viewsAck refusal re-derives the ACTIVE session's peek after dropping the overlay (r47)", () => {
   assert.match(RENDER, new RegExp(
-    'else if \\(m\\.type === "viewsAck"\\) consumeViewsAck\\(m, \\(\\) => \\{\\s*\\n'
+    'else if \\(m\\.type === "viewsAck"\\) consumeViewsAck\\(m, \\(conflicts\\) => \\{\\s*\\n'
     + '\\s*pendingSessionViews = null; pendingViewsAge = 0;\\s*\\n'
     + '\\s*if \\(activeId\\) assertPeekFor\\(activeId\\);\\s*\\n'
-    + '\\s*renderTabs\\(\\);\\s*\\n\\s*\\}\\);'));
+    + '\\s*renderTabs\\(\\);'));
+  // …and the refusal is NAMED (the v1.3.23 audit's P3.9): the conflict strings become toasts
+  assert.match(RENDER, /for \(const c of conflicts \|\| \[\]\) warnToast\(c\);/);
 });
 
 test("wiring: the Outline (fleet) posts its lens picks as TARGETED ops and consumes viewsAck", () => {
@@ -206,7 +208,10 @@ test("wiring: the Outline (fleet) posts its lens picks as TARGETED ops and consu
     + "surface's lens (r48: a whole-dict post overwrote other panes' concurrent picks)");
   assert.doesNotMatch(FLEET, /postMessage\(\{ type: "setTimelineViews"/, "no raw setTimelineViews post in the fleet");
   assert.doesNotMatch(FLEET, /postViewsWrite/, "no whole-blob CAS write remains in the fleet");
-  assert.match(FLEET, /if \(consumeViewsAck\(m\)\) return;/, "the feed-only router consumes the ack before its guard");
+  assert.match(FLEET, /if \(consumeViewsAck\(m, \(conflicts\) => \{ for \(const c of conflicts \|\| \[\]\) warnToast\(c\); \}\)\) return;/,
+    "the feed-only router consumes the ack before its guard — and NAMES conflicts (the v1.3.23 audit's P3.9)");
+  assert.match(FLEET, /function warnToast\(msg: string\): void \{/,
+    "the Outline mirrors the chat's warn-toast (feed.css carries its styles — the .romp-acted precedent)");
   assert.match(FLEET, /fleetViews = m\.views as SessionViews; anchorViewsRev\(fleetViews\);/,
     "every feed payload's views re-anchors");
 });
@@ -230,4 +235,28 @@ test("a conflicts-bearing ok ack fires the refusal callback but keeps the queue 
   assert.equal(sent.length, 2, "…and the queued op still pumps (nothing was refuted)");
   consumeViewsAck({ type: "viewsAck", ok: true, rev: 8, opId: sent[1].opId }, () => { refused += 1; });
   assert.equal(refused, 1, "a clean ok ack fires nothing");
+});
+
+test("executed: the conflict STRINGS reach the refusal callback — ok and refused acks alike (the v1.3.23 audit's P3.9)", () => {
+  // consumeViewsAck used to invoke onRefused() bare: the surface knew to re-derive but had
+  // nothing to tell the user, so the optimistic tag vanished from the chat/Outline with no
+  // explanation while the timeline twin named the duplicate loudly.
+  resetViewsWriterForTest();
+  const sent: any[] = [];
+  const got: (string[] | undefined)[] = [];
+  postViewsOps((m) => sent.push(m), [{ create: { id: "gX", name: "infra" } }]);
+  consumeViewsAck({ type: "viewsAck", ok: true, rev: 7, opId: sent[0].opId,
+                    conflicts: ["create 'infra': the name is already taken", 7, ""] },
+                  (c) => got.push(c));
+  assert.deepEqual(got, [["create 'infra': the name is already taken"]],
+    "the strings ride through (junk entries filtered)");
+  postViewsOps((m) => sent.push(m), [{ rename: "x" } as any]);
+  consumeViewsAck({ type: "viewsAck", ok: false, rev: 3, opId: sent[1].opId,
+                    conflicts: ["rename 'a' → 'b': the name is already taken"] },
+                  (c) => got.push(c));
+  assert.deepEqual(got[1], ["rename 'a' → 'b': the name is already taken"],
+    "a refused ack carries its conflicts too");
+  postViewsOps((m) => sent.push(m), [{ active: "all" }]);
+  consumeViewsAck({ type: "viewsAck", ok: false, rev: 4, opId: sent[2].opId }, (c) => got.push(c));
+  assert.equal(got[2], undefined, "a conflict-less refusal passes nothing — not an empty list");
 });

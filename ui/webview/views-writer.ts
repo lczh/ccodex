@@ -80,8 +80,11 @@ function pump(): void {
  *  DROPS every queued blob, and invokes the surface's rollback — the write is KNOWN-refused, not
  *  merely unconfirmed. Queued targeted ops survive: they compose against whatever the store
  *  holds. A malformed rev leaves the confirmed rev standing (anchoring it to 0 was itself a
- *  rewind). */
-export function consumeViewsAck(m: unknown, onRefused?: () => void): boolean {
+ *  rewind). The kernel's conflict strings ride INTO the callback (the v1.3.23 audit's P3.9):
+ *  discarding them here left the chat/Outline dropping the optimistic tag with nothing saying
+ *  why — the surface decides how to show them; this writer just hands them over. */
+export function consumeViewsAck(m: unknown,
+                                onRefused?: (conflicts?: string[]) => void): boolean {
   const a = m as { type?: unknown; ok?: unknown; rev?: unknown; opId?: unknown;
                    conflicts?: unknown } | null;
   if (!a || a.type !== "viewsAck") return false;
@@ -94,6 +97,8 @@ export function consumeViewsAck(m: unknown, onRefused?: () => void): boolean {
     if (rev0 !== null) confirmedRev = Math.max(confirmedRev, rev0);
     return true;
   }
+  const conflicts = Array.isArray(a.conflicts)
+    ? a.conflicts.filter((c): c is string => typeof c === "string" && !!c) : [];
   outstanding = 0;
   outstandingKind = null;
   queue.shift();                    // the acked head retires NOW (kept queued for replay until here)
@@ -101,17 +106,17 @@ export function consumeViewsAck(m: unknown, onRefused?: () => void): boolean {
   if (a.ok === false) {
     if (rev !== null) confirmedRev = rev;   // the served CAS truth — downward is legitimate HERE
     queue = queue.filter((w) => w.kind === "ops");   // queued blobs were rendered on refuted state
-    if (onRefused) onRefused();
+    if (onRefused) onRefused(conflicts.length ? conflicts : undefined);
   } else {
     if (rev !== null) confirmedRev = Math.max(confirmedRev, rev);
-    if (Array.isArray(a.conflicts) && a.conflicts.length && onRefused) {
+    if (conflicts.length && onRefused) {
       // a PARTIAL application (the r50 verification round): the kernel refused a duplicate-name
       // create/rename inside an otherwise-ok ops write and NAMES it here — the timeline twin
       // got the loud treatment, but this writer's callers (the chat strip's "New tag…", the
       // Outline) were still shown their optimistic tag over a store that never held it. The
       // refusal callback re-derives the surface from served truth; the queue stays — ops
       // compose against whatever the store holds, and nothing here refutes a queued write.
-      onRefused();
+      onRefused(conflicts);
     }
   }
   pump();
