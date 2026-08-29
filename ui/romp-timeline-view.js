@@ -1657,6 +1657,34 @@ class TimelinePanel {
         for (const o of this._unionOps) if (o.gid) this._journaledGids.add(o.gid);
       }
     }
+    // CONTINUOUS adoption (the r52 verification): entries minted by OTHER writers — the chat
+    // tab's remove-everywhere journals through the same wire now — used to be adopted only by
+    // the one-shot seed above, so a panel already open never held them: the compensation the
+    // journal exists for could not fire anywhere, and confirmed gestures had no retirer
+    // (union-gestures.json grew without bound). Any journal row whose gesture this panel
+    // neither minted, holds, nor retired is adopted here, every payload; the normal reconcile
+    // then confirms/retires it and the refusal scan below can compensate it.
+    if (Array.isArray(data.unionOps)) {
+      if (!this._journaledGids) this._journaledGids = new Set();
+      if (!this._retireUnionGids) this._retireUnionGids = new Set();
+      if (!this._mintedGids) this._mintedGids = new Set();
+      if (!this._adoptedGids) this._adoptedGids = new Set();
+      const held = new Set((this._unionOps || []).map((o) => o.gid).filter(Boolean));
+      let took = false;
+      for (const o of data.unionOps) {
+        if (!o || o.refusal || !o.gid) continue;
+        if (held.has(o.gid) || this._journaledGids.has(o.gid)
+            || this._mintedGids.has(o.gid) || this._retireUnionGids.has(o.gid)) continue;
+        if (!this._unionOps) this._unionOps = [];
+        this._unionOps.push(Object.assign({}, o));
+        this._adoptedGids.add(o.gid);
+        this._journaledGids.add(o.gid);   // this panel becomes a retirer: its sync's diff
+        held.add(o.gid);                  // emits the retirement when the group settles
+        if (o.gid >= unionGestureSeq) unionGestureSeq = o.gid + 1;
+        took = true;
+      }
+      if (took) this.draw();
+    }
     // the journaled refusals (r50): the kernel persists an editTag refusal beside the gestures,
     // so a panel that reloaded during the send window still learns its gesture was refused —
     // the direct tagEditFailed frame dies with the old page. Consume ONLY refusals whose
@@ -2743,10 +2771,14 @@ class TimelinePanel {
   // and the reason shows in the dialog (rebuilt in place if open) until dismissed
   tagEditFailed(m) {
     // the journaled twin of this refusal (the kernel persists refusals beside the gestures now,
-    // r50) must not fire the rollback a SECOND time when it rides the next payload
+    // r50) must not fire the rollback a SECOND time when it rides the next payload — but ONLY
+    // a frame that actually COMPENSATED something is "handled" (the r52 verification: a live
+    // panel holding no entries for the chat's gesture marked the opId handled anyway, then
+    // tombstoned the journal refusal row it had compensated nothing for — erasing the one
+    // record the adopting panel needed, and the split went permanent). The matched check runs
+    // below; the handled mark moved after it.
     if (m && m.opId) {
       if (!this._handledRefusalOps) this._handledRefusalOps = new Set();
-      this._handledRefusalOps.add(String(m.opId));
       // deliberately NO proactive tombstone of the journal twin here (the r50 verification
       // round, wave 3): OTHER panels holding adopted copies of this gesture — Obsidian
       // panels receive no direct frames at all — need the row to fire their own (idempotent,
@@ -2787,6 +2819,8 @@ class TimelinePanel {
     // confirmed entries — the kernel named the gesture.
     const ops = matched.filter((o) => m.opId ? String(o.gid || 0) === String(m.opId)
                                              : ((o.gid || 0) === newestGid && !o.confirmed));
+    if (m.opId && ops.length) this._handledRefusalOps.add(String(m.opId));   // compensated
+    //                                                                          — handled (r52)
     this._unionOps = (this._unionOps || []).filter((o) => ops.indexOf(o) < 0);
     for (const o of ops) {
       // the same postimage guard for the LOCAL half (P1.6): a third value means a newer
@@ -3223,7 +3257,9 @@ class TimelinePanel {
   // refusal (ok:false) also drops the overlay, which is now KNOWN-refused rather than merely
   // unconfirmed — waiting out _reconcileViews's three pushes would show stale state meanwhile.
   viewsAck(m) {
-    this._optViewsRev = (typeof m.rev === 'number') ? m.rev : 0;
+    // a rev-less ack leaves the counter STANDING (the r52 verification: the proved-read
+    // refusal acks rev:null, and resetting to 0 rewound the CAS base for nothing)
+    if (typeof m.rev === 'number') this._optViewsRev = m.rev;
     if (Array.isArray(m.conflicts) && m.conflicts.length) {
       // the kernel applied the gesture PARTIALLY — a duplicate name refused a create or a
       // rename (the r50 verification: the ack said plain ok and the dialog kept showing a tag
@@ -3274,9 +3310,21 @@ class TimelinePanel {
             // the store's actual rev — 200 and 409 alike — so the counter re-anchors here exactly
             // as when a WS host's ack frame arrives. Kernel unreachable → no rev: the counter
             // holds its optimistic value and the op spools below.
-            if (r.ok !== false && r.json && typeof r.json.rev === 'number')
+            if (r.ok !== false && r.json)
               this.viewsAck({ ok: r.ok === true, rev: r.json.rev, conflicts: r.json.conflicts });
-            if (r.ok !== false) return;              // applied, or refused (kernel up)
+            //  ^ rev-less refusals still ack (the r52 verification: the 409 carries rev:null
+            //    since the proved-read refusal, and gating on a numeric rev left the
+            //    optimistic overlay pinned until it silently aged out)
+            if (r.ok !== false && !(r.json && r.json.retryable)) return;   // applied, or
+            //                                                                refused for real
+            if (r.json && r.json.retryable) {
+              // the kernel is UP but its store was unreadable (the 503; the r52 verification:
+              // this fell into the kernel-said-no arm and the gesture was silently dropped
+              // with the kernel's own comment promising a spool)
+              this._spoolOp({ op: 'views', ops: body.ops || [{ active: (v && v.active) || 'all' }] },
+                            spoolName);
+              return;
+            }
             // the replay spool speaks only the targeted-op grammar, so a kernel-down blob write
             // degrades to its active pick there (the pre-existing reduction, offline-only now)
             this._spoolOp({ op: 'views', ops: body.ops || [{ active: (v && v.active) || 'all' }] },

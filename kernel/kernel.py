@@ -2028,6 +2028,15 @@ def _replay_ui_op_spool():
             continue
         try:
             ok = _apply_one_ui_op(op)
+        except _StateUnreadable:
+            # the STORE is unreadable (the r52 verification: the proved-read raise landed in
+            # the poison-op counter and quarantined each queued gesture after 5 passes) — not
+            # this op's fault; the queue holds whole and retries next pass, fail counters
+            # untouched. An op whose OWN apply raises a plain OSError still quarantines
+            # below — a poison op must never wedge the queue forever.
+            sys.stderr.write("ui-op spool: the views store is unreadable — holding %s and "
+                             "the queue for the next pass\n" % n)
+            break
         except Exception:
             # RETAINED, and the QUEUE HOLDS (the r46 verification: retrying a failed op after
             # newer gestures applied re-ordered the user's actions — a later un-mute replayed
@@ -2065,6 +2074,12 @@ def _union_ops_path():
     return jd.STATE / "union-gestures.json"
 
 
+class _StateUnreadable(OSError):
+    """A state file that EXISTS but cannot be read (EIO, EACCES) — the retryable store fault,
+    distinguishable from an op's own OSError so the spool can hold the queue for a store
+    fault without un-quarantining genuinely poisonous ops (the r52 verification)."""
+
+
 def _read_state_json(path, what):
     """A PROVED read of a JSON state file (the v1.3.24 audit's P1.1/P1.2): only
     FileNotFoundError means empty (returns None). An UNREADABLE file (EIO, EACCES) RAISES —
@@ -2077,6 +2092,8 @@ def _read_state_json(path, what):
         return json.loads(path.read_text())
     except FileNotFoundError:
         return None
+    except OSError as e:
+        raise _StateUnreadable(*(e.args or ("unreadable",)))
     except ValueError:
         try:
             qp = path.with_name(path.name + ".corrupt-%d" % int(time.time()))
@@ -2275,6 +2292,10 @@ def _ref_migrations_path():
 
 _pending_ref_migrations = []
 _pending_ref_migrations_lock = threading.Lock()
+_ref_migrations_adopted = [False]   # True only after the FILE was successfully read or absent
+#                                     (the r52 verification: the short-circuit read memory-
+#                                     non-empty as adopted, so a refused adopt's next healthy
+#                                     write still clobbered the crash-survivor intents)
 
 
 def _apply_ref_migration(host, name, new, deleted, fresh=True):
@@ -2332,18 +2353,24 @@ def _adopt_ref_migrations_locked():
     BOTH the queue and the flush adopt first (the r51 sibling verification: the queue
     overwrote the file with only this boot's rows — a crash-survivor intent whose remote
     half had committed was destroyed before the pass-tail flush ever read it)."""
-    if _pending_ref_migrations:
+    if _ref_migrations_adopted[0]:
         return True
     try:
         rows = _read_state_json(_ref_migrations_path(), "ref-migrations")
     except OSError:
         # the v1.3.24 audit's P2.6: EIO read as "nothing to adopt", and the next queue write
-        # replaced the file with only the newest intent — destroying an older committed one
+        # replaced the file with only the newest intent — destroying an older committed one.
+        # NOT a latch: every later call re-reads until the file is proven (the r52
+        # verification: short-circuiting on memory-non-empty deferred the clobber by exactly
+        # one healthy write)
         sys.stderr.write("ref-migrations: unreadable — adopting nothing and REFUSING to "
                          "overwrite the file this pass\n")
         return False
+    _seen = {json.dumps(r, sort_keys=True) for r in _pending_ref_migrations}
     if isinstance(rows, list):
-        _pending_ref_migrations.extend(r for r in rows if isinstance(r, dict))
+        _pending_ref_migrations.extend(r for r in rows if isinstance(r, dict)
+                                       and json.dumps(r, sort_keys=True) not in _seen)
+    _ref_migrations_adopted[0] = True
     return True
 
 
@@ -2728,7 +2755,10 @@ def _heal_timeline_views(old_sid, new_sid):
         for t in v["tags"]:
             if _has(t):
                 t["members"] = t["members"] + [{"host": "", "sid": new_sid}]   # normalizer dedups + re-sorts
-        _set_timeline_views(v)
+        _hok, _ = _set_timeline_views(v)
+        if not _hok:
+            sys.stderr.write("views heal for %s -> %s refused (store unreadable) — the next "
+                             "heal pass retries\n" % (old_sid, new_sid))
 
 
 def _b36(n):
@@ -2772,7 +2802,11 @@ def _edit_tag(name, add=(), remove=(), color=None, delete=False, rename=None):
             #                                            verification: the /tag wire — the CLI
             #                                            and every federated edit — missed the
             #                                            v1.3.21 P2 migration and hid every row)
-            _set_timeline_views(v)      # an active pointing at it falls back to "all" (the All view) in the normalizer
+            _dok, _ = _set_timeline_views(v)   # active falls back to "all" in the normalizer
+            if not _dok:
+                # the r52 verification: this ignored refusal acked {ok:true, deleted:true}
+                # over a no-op, and federated callers migrated the VIEWER's refs off it
+                return None, "the views store is unreadable — the delete did not land; retry"
             return None, None
         if hits:
             t = hits[0]
@@ -2805,7 +2839,12 @@ def _edit_tag(name, add=(), remove=(), color=None, delete=False, rename=None):
         if color is not None:
             t["color"] = color
         v = _norm_timeline_views(v)
-        _set_timeline_views(v)
+        _eok, _ = _set_timeline_views(v)
+        if not _eok:
+            # the r52 verification, reproduced there: an injected EIO returned the renamed row
+            # with err=None — POST /tag acked success while the store still held the old name,
+            # and the federated leg rewrote the viewer's lens to a name never persisted
+            return None, "the views store is unreadable — the edit did not land; retry"
         out = json.loads(json.dumps(next(t2 for t2 in v["tags"] if t2["id"] == t["id"])))
         out["members"] = [_member_str(m) for m in out["members"]]   # the route's reply speaks strings
         return out, None
@@ -32919,8 +32958,9 @@ class Handler(BaseHTTPRequestHandler):
                     except OSError:
                         # the proved-read raise (the v1.3.24 audit's P1.2) — the Obsidian
                         # writer treats a refusal as kernel-said-no and spools the op
-                        return self._send(503, json.dumps({"ok": False, "error":
-                            "the views store is unreadable — retry"}), "application/json")
+                        return self._send(503, json.dumps({"ok": False, "retryable": True,
+                            "error": "the views store is unreadable — retry"}),
+                                          "application/json")
                     _mark_views_dirty()
                     _ans = {"ok": True, "rev": rev}
                     if confl:

@@ -113,7 +113,7 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
     // views edits ride the kernel's TARGETED ops and spool the same grammar kernel-down
     const fn = SRC.indexOf("_setViews(v, ops)");
     assert.ok(fn > 0, "_setViews names its ops");
-    const win = SRC.slice(fn, fn + 3400);   // widened for the v1.3.20 ops branch
+    const win = SRC.slice(fn, fn + 4600);   // widened for the r52 retryable-refusal spool
     const kp = win.indexOf("_kernelPost('/views'");
     const sp = win.indexOf("_spoolOp({ op: 'views'");
     assert.ok(kp > 0 && sp > kp, "views: kernel first, spool on network failure only");
@@ -156,7 +156,7 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
   }
   {
     const fn = SRC.indexOf("tagEditFailed(m) {");
-    const win = SRC.slice(fn, fn + 4600);   // widened for the r49 postimage guards
+    const win = SRC.slice(fn, fn + 5600);   // widened for the r52 handled-gate note
     assert.ok(win.indexOf("this._applyLocalOp(o.inverse);") > 0,
       "the refusing host's entries roll the local half back — the union never stays split "
       + "(postimage-guarded since r49: a newer local gesture's value stands)");
@@ -224,7 +224,7 @@ test("source: union-op entries carry rt + gesture id + pre-edit name/color at no
 
 test("source: tagEditFailed compensates SIBLING hosts — inverse remote edits; delete is loud, never silent", () => {
   const fn = SRC.indexOf("tagEditFailed(m) {");
-  const win = SRC.slice(fn, fn + 8600);   // widened for the r48/r49 guards
+  const win = SRC.slice(fn, fn + 9600);   // widened for the r52 handled-gate note
   assert.ok(win.indexOf("_applyLocalOp(o.inverse)") > 0, "the local rollback survives untouched");
   // a refusal carrying the opId the edit was stamped with compensates EXACTLY that gesture (the
   // 2026-08-26 audit's Finding C — the kernel echoes it); an opId-less frame (an old kernel)
@@ -516,7 +516,7 @@ test("executed: an applied delete on a sibling cannot be undone remotely — lou
 test("viewsAck: the kernel's write acknowledgement re-anchors the rev counter; a refusal drops the overlay", () => {
   // the exact client contract for the kernel's {type:'viewsAck', ok, rev} message
   assert.match(SRC, /viewsAck\(m\) \{/);
-  assert.match(SRC, /this\._optViewsRev = \(typeof m\.rev === 'number'\) \? m\.rev : 0;/);
+  assert.match(SRC, /if \(typeof m\.rev === 'number'\) this\._optViewsRev = m\.rev;/);
   const panel = drawnPanel();
   panel._optViewsRev = 99;
   panel._pendingViews = { active: "all", tags: [] };
@@ -528,7 +528,9 @@ test("viewsAck: the kernel's write acknowledgement re-anchors the rev counter; a
   assert.equal(panel._optViewsRev, 7);
   assert.ok(panel._pendingViews, "an accepted write keeps the overlay until the echoing push");
   panel.viewsAck({ ok: true });
-  assert.equal(panel._optViewsRev, 0, "a malformed rev anchors at 0, never NaN");
+  assert.equal(panel._optViewsRev, 7,
+    "a rev-less ack leaves the counter STANDING (the r52 verification: the proved-read "
+    + "refusal acks rev:null, and resetting to 0 rewound the CAS base for nothing)");
 });
 
 test("viewsAck is ROUTED on every WS host (the r46 verification): the boot router case + the panel's own frame listener", () => {
@@ -1036,5 +1038,76 @@ test("executed: the journal is durable before ANY effect dispatches (r52 P1.4)",
   assert.ok(rowsAt.length >= 3, "two remote dispatches and one local commit ran");
   for (const n of rowsAt) assert.equal(n, 2,
     "every effect saw the FULL journal already durable — never rows:0 after a dispatch");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: a LIVE panel adopts a foreign journal row and compensates its refusal (r52 round)", () => {
+  // the r52 verification round on this round's own P2.5: adoption lived only in the one-shot
+  // seed — a panel already open never held the chat's entries, its tagEditFailed matched
+  // nothing yet marked the opId handled, and its next payload TOMBSTONED the refusal row the
+  // adopting panel needed. Continuous adoption + the matched-only handled gate close both.
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();                       // LIVE — seeded on its first payload
+  const inverse: any[] = [];
+  panel._editRemoteTag = (rt: any, edit: any) => { inverse.push(edit); return true; };
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  // the DIRECT refusal frame arrives FIRST (the kernel routes it to this dashboard's
+  // timeline) — the panel holds nothing yet, so it must compensate nothing AND leave the
+  // refusal unconsumed for its adopting self one payload later
+  const chatGid = 777001;
+  panel.tagEditFailed({ host: "TESTHOST-A", name: "pool", opId: String(chatGid),
+                        error: "owner down" });
+  assert.equal(inverse.length, 0, "nothing held, nothing compensated");
+  assert.ok(!panel._handledRefusalOps.has(String(chatGid)),
+    "…and the frame is NOT marked handled — it compensated nothing (the r52 round: the "
+    + "premature mark tombstoned the journal row and made the split permanent)");
+  // the next payload carries the chat-minted entries AND the journaled refusal row
+  const entry = { host: "TESTHOST-A", name: "pool",
+                  inverse: { tag: "g1", add: ["s1"] }, edit: { remove: ["s1"] },
+                  rt: { id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool", color: "#7aa2f7",
+                        members: ["s1"] },
+                  gid: chatGid, oldName: "pool", oldColor: "#7aa2f7", post: {}, confirmed: false };
+  panel.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                         unionOps: [entry,
+                                                    { refusal: true, gid: -chatGid,
+                                                      opId: String(chatGid), host: "TESTHOST-A",
+                                                      name: "pool", error: "owner down" }] }));
+  assert.equal(inverse.length, 0, "one host, no siblings to roll — but the LOCAL half…");
+  assert.ok(wire.length > 0, "…was compensated: the journal synced the retirement");
+  const last = wire[wire.length - 1];
+  assert.ok(last.retired.indexOf(-chatGid) >= 0, "the refusal row is consumed and tombstoned");
+  assert.ok(last.retired.indexOf(chatGid) >= 0, "…with its gesture group");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: a live panel RETIRES a foreign gesture its polls confirm (r52 round)", () => {
+  // the r52 round's unbounded-growth finding: confirmed chat gestures had no retirer — every
+  // open panel ignored foreign gids, and union-gestures.json grew until a panel reloaded
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  const chatGid = 777002;
+  const entry = { host: "TESTHOST-A", name: "pool",
+                  inverse: { tag: "g1", add: ["s1"] }, edit: { remove: ["s1"] },
+                  rt: { id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool", color: "#7aa2f7",
+                        members: ["s1"] },
+                  gid: chatGid, oldName: "pool", oldColor: "#7aa2f7", post: {}, confirmed: false };
+  const polled = JSON.parse(JSON.stringify(VIEWS));
+  polled.remoteTags[0].members = [];                 // the owner APPLIED the remove
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  panel.update(Object.assign({}, base, { views: polled, unionOps: [entry] }));
+  const last = wire[wire.length - 1];
+  assert.ok(last.retired.indexOf(chatGid) >= 0,
+    "adopted, confirmed by the SAME payload's polled views, and retired — the journal is "
+    + "not immortal for foreign writers");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
 });

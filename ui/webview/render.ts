@@ -513,6 +513,8 @@ function captureViews(v: SessionViews | null) {
 // gesture was newest — a rollback for an edit this pane sent). A web-minted id matches no
 // timeline gesture, so such a refusal is loud there and rolls back nothing.
 let webEditSeq = 0;
+// compensable tag gestures held until their journal write is ACKED (r52) — opId -> dispatch
+const pendingUnionGestures = new Map<string, () => void>();
 function postViews(v: SessionViews, ops?: Record<string, unknown>[]) {
   pendingSessionViews = v; pendingViewsAge = 0;
   if (activeId) assertPeekFor(activeId);   // the optimistic edit re-derives the active session's peek too
@@ -4876,6 +4878,7 @@ function showTabMenu(e: MouseEvent, id: string) {
           ? Math.floor(Math.random() * 0x3fffffff) + 1 : 0;
         if (gid) {
           const had = (lt!.members || []).filter((m) => edit.remove!.includes(m));
+          const ackId = "u-chat" + (++webEditSeq);
           vscodeApi?.postMessage({ type: "setUnionOps", entries: candidates.map((rt) => ({
             host: rt.host || "", name: g.name,
             inverse: { tag: g.localId, add: had.slice() },
@@ -4884,7 +4887,24 @@ function showTabMenu(e: MouseEvent, id: string) {
                   members: (rt.members || []).slice() },
             gid, oldName: rt.name || "", oldColor: rt.color || "", post: {},
             confirmed: false,
-          })), retired: [], opId: "u-chat" + (++webEditSeq) });
+          })), retired: [], opId: ackId });
+          // the EFFECTS wait for the journal's ack (the r52 verification: a refused write —
+          // the proved-read EIO path — still let the edits dispatch and the local half commit
+          // with zero durable journal, fail-open on exactly the failure the journal exists
+          // for). ok dispatches below via the ack consumer; ok:false toasts and drops the
+          // gesture whole — nothing began, nothing splits. No ack (a kernel death) dispatches
+          // nothing either: the safe direction; the user retries.
+          pendingUnionGestures.set(ackId, () => {
+            const nv2 = JSON.parse(JSON.stringify(effViews() || {})) as SessionViews;
+            const lt2 = viewTags(nv2).find((x) => x.id === g.localId);
+            if (lt2) lt2.members = (lt2.members || []).filter((m) => !edit.remove!.includes(m));
+            for (const rt of candidates)
+              vscodeApi?.postMessage({ type: "editTag", edit: {
+                opId: String(gid), host: rt.host || "", name: g.name,
+                remove: edit.remove!.slice() } });
+            postViews(nv2, [{ tag: g.localId, remove: edit.remove!.slice() }]);
+          });
+          return;   // the optimistic paint waits with the effects — one ack, one commit
         }
         if (willLocal) {
           lt!.members = (lt!.members || []).filter((m) => !edit.remove!.includes(m));
@@ -4893,7 +4913,7 @@ function showTabMenu(e: MouseEvent, id: string) {
         }
         for (const rt of candidates) {
           vscodeApi?.postMessage({ type: "editTag", edit: {
-            opId: gid ? String(gid) : "web" + (++webEditSeq),
+            opId: "web" + (++webEditSeq),
             host: rt.host || "", name: g.name, remove: edit.remove!.slice() } });
           const mine = nvRemote(rt);
           if (mine) { mine.members = (mine.members || []).filter((m) => !edit.remove!.includes(m)); dirty = true; }
@@ -11467,6 +11487,17 @@ window.addEventListener("message", (e: MessageEvent) => {
   // cleared its peek; the refusal restored the hiding blob with peekId still null, and the active
   // tab vanished from the strip until an unrelated push — the refused write changed nothing
   // kernel-side, so no healing tabOrder frame was ever coming).
+  else if (m.type === "unionOpsAck" && typeof m.opId === "string") {
+    // the chat's journal-write acks (the r52 verification): the compensable gesture's
+    // effects are HELD until the journal is durable — ok releases them; a refusal drops the
+    // whole gesture with the reason shown, and nothing splits
+    const go = pendingUnionGestures.get(m.opId);
+    if (go) {
+      pendingUnionGestures.delete(m.opId);
+      if (m.ok === false) warnToast("The tag edit was not applied — its safety record could not be saved. Retry.");
+      else go();
+    }
+  }
   else if (m.type === "viewsAck") consumeViewsAck(m, (conflicts) => {
     pendingSessionViews = null; pendingViewsAge = 0;
     if (activeId) assertPeekFor(activeId);

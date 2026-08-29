@@ -1476,3 +1476,69 @@ class R52ProvedReads(unittest.TestCase):
         self.assertLess(src.index("jd._identity_file_lock()"),
                         src.index("_tag_name_survives_elsewhere"),
                         "check, mutation and write share ONE identity-lock hold")
+
+
+class R52VerifyRound(unittest.TestCase):
+    """the r52 verification round on this round's own fixes: the ignored whole-blob refusal
+    acked success over a no-op (and federated callers migrated refs off it), and the adopt
+    short-circuit read memory-non-empty as adopted, deferring the clobber by one write."""
+
+    def setUp(self):
+        _scrub_state()
+        km._pending_ref_migrations[:] = []
+        km._ref_migrations_adopted[0] = False
+        try:
+            km._ref_migrations_path().unlink()
+        except OSError:
+            pass
+
+    def tearDown(self):
+        self.setUp()
+
+    class _BadPath:
+        def __init__(self, real):
+            self._real = real
+
+        def read_text(self):
+            raise OSError(5, "EIO")
+
+        def __getattr__(self, k):
+            return getattr(self._real, k)
+
+    def test_edit_tag_honors_the_stores_refusal(self):
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "", "members": []}}])
+        real = km._views_path
+        try:
+            km._views_path = lambda: self._BadPath(real())
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                out, err = km._edit_tag("pool", rename="crew")
+        finally:
+            km._views_path = real
+        self.assertIsNone(out, "no renamed row is returned for a write that never landed")
+        self.assertIn("did not land", err or "",
+                      "the r52 round, reproduced: err=None acked {ok:true, tag:'crew'} while "
+                      "the store held 'pool' — and the federated leg migrated the viewer's "
+                      "refs to a name never persisted")
+        self.assertEqual([t["name"] for t in km._timeline_views()["tags"]], ["pool"])
+
+    def test_the_deferred_clobber_is_closed(self):
+        # the r52 round: refused adopt -> intent held in memory -> the NEXT healthy write
+        # short-circuited on memory-non-empty and clobbered the crash-survivor file anyway
+        km._ref_migrations_path().write_text(json.dumps(
+            [{"host": "TESTHOST-A", "name": "farpool", "new": "nearpool", "deleted": False}]))
+        real = km._ref_migrations_path
+        realp = real()
+        try:
+            km._ref_migrations_path = lambda: self._BadPath(realp)
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                km._queue_ref_migration({"host": "TESTHOST-B", "name": "crew",
+                                         "new": "squad", "deleted": False})   # refused adopt
+        finally:
+            km._ref_migrations_path = real
+        with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+            km._queue_ref_migration({"host": "TESTHOST-C", "name": "gang",
+                                     "new": "band", "deleted": False})        # the disk healed
+        rows = json.loads(km._ref_migrations_path().read_text())
+        self.assertIn("farpool", [r["name"] for r in rows],
+                      "the crash-survivor intent is ADOPTED before any healthy write — the "
+                      "short-circuit on memory-non-empty deferred the clobber, not closed it")

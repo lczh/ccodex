@@ -36,6 +36,7 @@
 # ~/.claude/romp-postal-nopush; disable everything with ~/.claude/romp-postal-off.
 
 import base64
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -1930,6 +1931,8 @@ def _reconcile_relay_stages():
                     if row.get("id") in stage_mids and (
                             row.get("ev") in _TERMINAL_EVS or row.get("ev") == "relayed"):
                         settled.add(row.get("id"))
+                        if len(settled) == len(stage_mids):
+                            break        # every standing stage is proven — stop reading
         except OSError:
             # an UNREADABLE log proves nothing either way: preserve every stage for the next
             # bus start rather than filing terminals over an unproved read (the r52 rule)
@@ -2731,11 +2734,27 @@ def outbox_publish_stage(host, mid, stagef):
     # LINK-then-unlink, not rename (the v1.3.24 audit's P3.10): rename silently REPLACES a
     # same-mid file — a collision overwrote an existing message. link fails EEXIST, so a
     # collision is loud and the standing mail survives; the 128-bit mid makes it unreachable
-    # in practice. The link+unlink pair keeps the stage-means-unpublished invariant: the
-    # published name exists from the link on, so a crash between the two steps reads as
-    # published (the stage drops quietly at boot).
-    os.link(stagef, d / (mid + ".json"))
-    os.unlink(stagef)
+    # in practice. A crash between the two steps reads as published: the boot reconcile drops
+    # a stage whose published file exists, and the ack paths append their terminal row BEFORE
+    # deleting the file (the r52 verification closed that del/append gap).
+    try:
+        os.link(stagef, d / (mid + ".json"))
+    except OSError as e:
+        if e.errno in (errno.EPERM, errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)):
+            # a filesystem without hard links (the r52 verification): rename still publishes
+            # there — its silent-replace window is carried by the 128-bit mid
+            os.rename(stagef, d / (mid + ".json"))
+        else:
+            raise
+    else:
+        try:
+            os.unlink(stagef)
+        except OSError:
+            # the message IS published — raising here filed a false `unpublished` terminal
+            # and the sender's retry double-delivered (the r52 verification). The leftover
+            # stage drops at boot: its published file exists.
+            sys.stderr.write("postal: could not remove the published stage for %s — boot "
+                             "cleans it\n" % mid)
     _fsync_dir(d)
     _peer_wake(host).set()
 
@@ -3125,10 +3144,11 @@ def _bounce_apply(host, b):
         deliver(msg["frm_id"], "romp-postal", "", note, kind="coordinate")
     # The parked source is our retry record.  Retire it only after the return note was successfully
     # written; if delivery raises, the next exchange can retry the bounce instead of losing both.
-    outbox_del(host, mid)
+    # the ROW before the delete (the r52 verification — the same del/append gap as the ack)
     _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "bounced", "id": mid,
                                   "to": msg.get("to") or "?", "host": host,
                                   "code": code, "why": why})
+    outbox_del(host, mid)
 
 def fleet_presence(exclude_host):
     """Presence for an exchange payload: local agents + ONE hop of gossip from our other peers, each
@@ -3428,16 +3448,22 @@ def _ack_arrived(host, mid):
     if not isinstance(mid, str) or not _safe_id(mid):
         return
     msg = outbox_get(host, mid)
-    outbox_del(host, mid)
     if not msg:
+        outbox_del(host, mid)
         return
     if msg.get("origin"):
+        outbox_del(host, mid)
         p = _pending(msg["origin"])
         with _peer_lock:
             p["acks"].append(mid)
         _peer_wake(msg["origin"]).set()
     else:
+        # the ROW before the delete (the r52 verification: a kill between the delete and the
+        # append left "stage + no outbox + no terminal" — boot reconciliation then filed
+        # `unpublished` for DELIVERED mail, erasing its receipt; row-first, a crash leaves the
+        # file standing and the next ack retries idempotently)
         _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "relayed", "id": mid, "host": host})
+        outbox_del(host, mid)
 
 def _bounce_arrived(host, b):
     """A bounce for outbox/<host>/<mid>: relay it backward if we only forwarded the message, else

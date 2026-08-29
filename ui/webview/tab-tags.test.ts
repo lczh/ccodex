@@ -114,10 +114,14 @@ test("the chat's remove-everywhere journals compensation BEFORE any effect (r52 
   const at = RENDER.indexOf("const editUnion = (g: TagUnion");
   const win = RENDER.slice(at, at + 6000);
   const iJournal = win.indexOf('type: "setUnionOps"');
-  const iDispatch = win.indexOf("opId: gid ? String(gid)");
+  const iGate = win.indexOf("pendingUnionGestures.set(ackId");
+  const iDispatch = win.indexOf("opId: String(gid)");
   assert.ok(iJournal > 0, "the compensation journal exists");
-  assert.ok(iDispatch > 0, "the remote dispatch rides the gesture's gid as its opId");
-  assert.ok(iJournal < iDispatch, "…and the journal lands BEFORE the dispatch");
+  assert.ok(iGate > iJournal, "the effects are HELD behind the journal's ack (the r52 "
+    + "verification: a refused write still dispatched, fail-open on exactly the failure "
+    + "the journal exists for)");
+  assert.ok(iDispatch > iGate, "the remote dispatch — riding the gesture's gid as its opId — "
+    + "lives inside the gated commit");
   assert.ok(win.indexOf("inverse: { tag: g.localId, add: had.slice() }") > 0,
     "each entry carries the inverse that restores the LOCAL half");
 });
