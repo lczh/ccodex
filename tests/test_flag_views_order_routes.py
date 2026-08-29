@@ -1668,3 +1668,84 @@ class R53ProvedSnapshots(unittest.TestCase):
         self.assertIn("66666666-7777-8888-9999-aaaaaaaaaaaa", members,
                       "the flush completes the heal once the store recovers")
         self.assertFalse(km._heals_path().exists(), "the landed intent retires")
+
+
+class R53VerifyRound(unittest.TestCase):
+    """the r53 verification round's own findings: the P1.2 fix site was unpinned (a revert
+    to _union_ops_load would pass every test), the heal flush starved this process's own
+    memory intents behind an unreadable intent FILE, and a /clear chained onto a still-queued
+    heal read as moot — the membership never walked the second hop."""
+
+    OLD = "11111111-2222-3333-4444-555555555555"
+    MID = "66666666-7777-8888-9999-aaaaaaaaaaaa"
+    NEW = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    def setUp(self):
+        _scrub_state()
+        km._pending_heals[:] = []
+        km._heals_adopted[0] = False
+        import shutil
+        for pfn in (km._union_ops_path, km._heals_path):
+            p = pfn()
+            shutil.rmtree(p, ignore_errors=True)
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_the_payload_publishes_the_marked_echo(self):
+        # the r53 P1.2 fix routed the timeline payload through _union_ops_echo (None on an
+        # unproved read) — but nothing pinned the SITE: reverting it to _union_ops_load kept
+        # every behavior test green while panels went back to reading EIO as retirement
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        self.assertIn('"unionOps": _union_ops_echo()', src,
+                      "build_timeline must publish the unavailability-marked echo")
+        self.assertNotIn('"unionOps": _union_ops_load()', src,
+                         "the lenient loader must never feed the payload directly")
+
+    def test_memory_intents_flush_even_when_the_intent_file_is_unreadable(self):
+        # the r53 verification round: _flush_pending_heals returned at the failed adoption —
+        # intents queued BY THIS PROCESS never flushed while the file stayed broken, though
+        # the views store they needed was healthy the whole time
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "",
+                                         "members": [self.OLD]}}])
+        km._heals_path().mkdir(parents=True, exist_ok=True)   # a directory: reads raise OSError
+        with contextlib.redirect_stderr(io.StringIO()):
+            km._queue_heal_intent(self.OLD, self.NEW)         # memory-only (adoption fails)
+            km._flush_pending_heals()
+        members = [m["sid"] for t in km._timeline_views()["tags"] for m in t["members"]]
+        self.assertIn(self.NEW, members, "the in-memory intent flushed — the broken intent "
+                      "FILE withholds only the file rewrite, never the heal")
+        self.assertEqual(km._pending_heals, [], "the landed intent left memory")
+        self.assertTrue(km._heals_path().is_dir(), "…and the unreadable file was not touched")
+
+    def test_a_clear_chained_onto_a_queued_heal_is_not_moot(self):
+        # the r53 verification round: OLD->MID queued behind a store fault, then a /clear
+        # mints MID->NEW while MID is not yet in any tag — the moot early-return dropped the
+        # second hop and the live session never regained its tags
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "",
+                                         "members": [self.OLD]}}])
+        with contextlib.redirect_stderr(io.StringIO()):
+            km._queue_heal_intent(self.OLD, self.MID)
+            ok = km._heal_timeline_views(self.MID, self.NEW)
+        self.assertIs(ok, False, "queued behind the pending hop, not moot")
+        self.assertIn({"old": self.MID, "new": self.NEW}, km._pending_heals)
+        km._flush_pending_heals()
+        km._flush_pending_heals()   # hop order in the queue is not guaranteed — one more pass
+        members = [m["sid"] for t in km._timeline_views()["tags"] for m in t["members"]]
+        self.assertIn(self.MID, members, "the first hop landed")
+        self.assertIn(self.NEW, members, "…and the chained hop walked the membership through")
+        self.assertFalse(km._heals_path().exists(), "both intents retired")
+
+    def test_a_truly_unknown_sid_is_still_moot(self):
+        # the chained check must not turn every unknown-sid heal into an immortal intent
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "",
+                                         "members": [self.OLD]}}])
+        ok = km._heal_timeline_views(self.MID, self.NEW)
+        self.assertIsNone(ok, "no tag holds it and no pending intent will add it: moot")
+        self.assertEqual(km._pending_heals, [])
+
+

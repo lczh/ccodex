@@ -45,7 +45,7 @@ test("the Tags row sits with the session controls ABOVE the divider; Browse stay
 
 test("edits reuse the wire — never a fork: local adds post the whole blob, remote edits ride editTag", () => {
   const at = RENDER.indexOf("const editUnion = (g: TagUnion");
-  const body = RENDER.slice(at, at + 6500);   // widened for the r52 journal-first gesture
+  const body = RENDER.slice(at, at + 9800);   // widened for the r52/r53 journal-first gesture
   assert.ok(body.includes("t.members = Array.from(new Set((t.members || []).concat(edit.add)));"),
     "local add edits the optimistic copy (pendingSessionViews echoes instantly)");
   assert.ok(body.includes("localOps.push({ tag: g.localId, add: edit.add.slice() });"),
@@ -130,12 +130,32 @@ test("the chat's remove-everywhere journals compensation BEFORE any effect (r52 
     "every multi-owner gesture journals");
 });
 
+test("the chat's gated gesture carries the r53 settlement fields; paint and flip ride the ack", () => {
+  // the r53 verification round, chat leg: (a) entries journaled without lop/dispatched fell
+  // out of the timeline's local-leg settlement and adoption-completion — a chat webview dying
+  // between the ack and the dispatch stranded a half-run gesture no panel could finish;
+  // (b) the gated remote-only remove painted nothing — the member sat in the flyout until the
+  // owner's next push; (c) rows left saying dispatched:false after the effects DID run invite
+  // the adoption pass to re-run them — a re-remove over a member the user just re-added
+  const at = RENDER.indexOf("const editUnion = (g: TagUnion");
+  const win = RENDER.slice(at, at + 9800);
+  assert.ok(win.indexOf("lop: localOp, dispatched, lapplied: false") > 0,
+    "entries wear the same settlement dress as the timeline twin's mirror");
+  const iGate = win.indexOf("pendingUnionGestures.set(ackId");
+  const iPaint = win.indexOf("const mine = (nv2.remoteTags || []).find((x) => x.id === rt.id);");
+  assert.ok(iPaint > iGate, "the optimistic remote paint rides INSIDE the gated continuation");
+  const iFlip = win.indexOf("mkEntries(true)");
+  assert.ok(win.indexOf("mkEntries(false)") > 0 && iFlip > iGate,
+    "the dispatched:true flip re-posts the rows the moment the effects run — never left "
+    + "for an adopting panel to re-dispatch");
+});
+
 test("remote-only chat tag edits post NO local write (r52 P2.9)", () => {
   // the v1.3.24 audit: the remoteTags mutation is derived presentation the kernel discards —
   // the whole-blob post it used to ride bumped the rev over a byte-identical store and could
   // 409 another client's real CAS write
   const at = RENDER.indexOf("const editUnion = (g: TagUnion");
-  const win = RENDER.slice(at, at + 6500);
+  const win = RENDER.slice(at, at + 9800);   // widened for the r53 gated continuation
   assert.match(win, /if \(localOps\.length\) postViews\(nv, localOps\);/,
     "a LOCAL half still writes through the shared writer");
   assert.match(win, /pendingSessionViews = nv; pendingViewsAge = 0;/,

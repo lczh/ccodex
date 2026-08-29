@@ -517,6 +517,49 @@ class R53ProvedRetirement(unittest.TestCase):
                          "used to unlink the arbiter: sent row, no terminal, no stage, both "
                          "reconcilers skipping peer rows (the r53 audit's P2.12)")
 
+    def test_a_non_dict_row_never_wedges_the_phantom_scanner(self):
+        # the r53 verification round: the stage scanner got the isinstance guard, but the
+        # PHANTOM-SENT tail scanner still called .get on whatever json.loads returned — one
+        # historic [] row raised AttributeError through every boot reconcile forever
+        with open(pm.TLDIR / "messages.jsonl", "a") as fh:
+            fh.write("[]\n")
+            fh.write(json.dumps({"t": self.now, "ev": "sent", "id": "px-404.1_dd.TESTHOST",
+                                 "to_id": "77777777-8888-9999-aaaa-bbbbbbbbbbbb"}) + "\n")
+        fixed = pm._reconcile_phantom_sent(now=self.now)
+        self.assertEqual(fixed, 1, "the phantom past the [] row is still found and filed")
+
+    def test_an_unreadable_record_defers_the_bounce(self):
+        # the r53 verification round (P2.10's siblings): _bounce_arrived and _bounce_apply
+        # called outbox_get bare — one unreadable record raised through the exchange batch,
+        # killing every OTHER host's acks and bounces queued behind it
+        f = self.hd / "px-405.1_ee.TESTHOST.json"
+        f.write_text(json.dumps({"mid": "px-405.1_ee.TESTHOST", "body": "hi",
+                                 "frm_id": "77777777-8888-9999-aaaa-bbbbbbbbbbbb"}))
+        os.chmod(f, 0)
+        try:
+            pm._bounce_arrived("TESTHOST2", {"mid": "px-405.1_ee.TESTHOST",
+                                             "code": "recipient-unavailable"})
+        finally:
+            os.chmod(f, 0o644)
+        self.assertTrue(f.exists(), "deferred whole — the peer re-sends the bounce; the "
+                                    "retry source survives")
+        self.assertEqual([r for r in _rows() if r.get("ev") == "bounced"], [],
+                         "no terminal row over an unproved read")
+
+    def test_an_unreadable_record_still_reads_as_parked(self):
+        # the r53 verification round: check_sent's parked probe raised through the whole
+        # listing on one unreadable outbox record; unreadable is not GONE — the row stays
+        # honestly parked and the listing survives
+        src = open(os.path.join(BIN, "romp-postal-service"), encoding="utf-8").read()
+        i = src.index("def _parked(i, e):")
+        window = src[i:i + 900]
+        self.assertIn("except _OutboxUnreadable:", window)
+        i2 = src.index("a resend while we hold it forwards nothing twice")
+        window2 = src[i2 - 400:i2 + 700]
+        self.assertIn("except _OutboxUnreadable:", window2,
+                      "the forward-dedupe probe treats unreadable as EXISTS — never a "
+                      "double-forward, never a batch-killing raise")
+
     def test_a_non_dict_log_row_never_wedges_the_scanner(self):
         (self.hd / ".stage-px-403.1_cc.TESTHOST").write_text("1")
         with open(pm.TLDIR / "messages.jsonl", "a") as fh:

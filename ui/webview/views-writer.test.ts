@@ -283,3 +283,20 @@ test("a RETRYABLE refusal holds the head and re-pumps on the next payload (r53 P
   consumeViewsAck({ type: "viewsAck", ok: true, rev: 5, opId: sent[1].opId });
   assert.equal(sent.length, 2, "settled");
 });
+
+test("a RETRYABLE refusal of a BLOB head DROPS it — never a re-post at a foreign-raised rev", () => {
+  // the r53 verification round: the held blob's retry stamps baseRev at the LATER pump — the
+  // very rev a foreign commit just raised — so the CAS accepts a blob rendered before that
+  // commit and erases it. Blobs take the refusal exit; the surface re-derives.
+  resetViewsWriterForTest();
+  const sent: any[] = [];
+  const refused: any[] = [];
+  anchorViewsRev({ rev: 7 });
+  postViewsWrite((m) => sent.push(m), { rev: 7, tags: [] } as any);
+  assert.equal(sent.length, 1);
+  consumeViewsAck({ type: "viewsAck", ok: false, retryable: true, opId: sent[0].opId },
+                  (c) => refused.push(c === undefined ? "refused" : c));
+  assert.equal(refused.length, 1, "the surface hears the refusal and re-derives");
+  anchorViewsRev({ rev: 9 });          // a foreign commit raises the rev
+  assert.equal(sent.length, 1, "the stale blob NEVER re-posts at the raised rev");
+});

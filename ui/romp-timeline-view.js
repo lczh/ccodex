@@ -1683,6 +1683,30 @@ class TimelinePanel {
         if (o.gid >= unionGestureSeq) unionGestureSeq = o.gid + 1;
         took = true;
       }
+      // COMPLETE journaled-but-undispatched gestures (the r53 round: a webview reload between
+      // the journal ack and the gated dispatch stranded effect-less immortal rows). One full
+      // echo cycle of patience — the row must show dispatched:false on TWO payload sightings —
+      // so a live writer's own flip (sub-second after its ack) always wins the race; only a
+      // gesture whose writer died gets completed here. Idempotent: remote edits and local ops
+      // are absolute, and the postimage guards protect any compensation.
+      if (!this._undispatchedSeen) this._undispatchedSeen = new Set();
+      const undispatchedNow = new Set();
+      for (const o of data.unionOps) {
+        if (!o || o.refusal || !o.gid || o.dispatched !== false) continue;
+        undispatchedNow.add(o.gid);
+        if (!this._undispatchedSeen.has(o.gid)) continue;
+        const group = (this._unionOps || []).filter((x) => x.gid === o.gid);
+        if (!group.length || group.some((x) => x.dispatched !== false)) continue;
+        for (const x of group) {
+          x.dispatched = true;
+          this._editRemoteTag(x.rt, Object.assign({}, x.edit), x.gid);
+        }
+        const repl = group.find((x) => x.lop);
+        if (repl) this._applyLocalOp(repl.lop);
+        this._unionSyncDirty = true;
+        took = true;
+      }
+      this._undispatchedSeen = undispatchedNow;
       if (took) this.draw();
     }
     // the journaled refusals (r50): the kernel persists an editTag refusal beside the gestures,
@@ -2900,7 +2924,7 @@ class TimelinePanel {
   // dropped when the owner's store CONFIRMS the edit (never a push counter — a slow refusal can
   // outlive any count of pushes; the r45 verification: the 3-push age-out raced the forward
   // path's 8s timeout and slow refusals got no rollback at all)
-  _syncUnionOps() {
+  _syncUnionOps(gate) {
     // mirror the WHOLE in-flight compensation list durably (the v1.3.21 audit's P1.5): the
     // journal lived only in this panel's memory — a reload while one host was pending lost it,
     // and the host's later refusal left already-applied siblings silently split. Full-replace,
@@ -2908,6 +2932,14 @@ class TimelinePanel {
     const entries = (this._unionOps || []).map((o) => ({
       host: o.host, name: o.name, inverse: o.inverse, edit: o.edit, rt: o.rt, gid: o.gid,
       oldName: o.oldName, oldColor: o.oldColor, post: o.post || {}, confirmed: !!o.confirmed,
+      // the r53 verification round: lop (the gesture's LOCAL op) was memory-only — a reload
+      // re-seeded entries without it and the P1.5 settlement fell back to remote-only;
+      // dispatched=false marks a journaled gesture whose effects have NOT run yet (a webview
+      // reload between the journal ack and the dispatch used to strand effect-less immortal
+      // rows — an adopting panel completes them now); lapplied latches the observed local
+      // postimage so a later user re-add reads as supersession, never a re-remove
+      lop: o.lop || null, dispatched: o.dispatched !== false,
+      lapplied: !!o.lapplied,
     }));
     // retirement is EXPLICIT (the r49 verification: the kernel merges per gid now, so two
     // open panels no longer clobber each other's entries — omission is not retirement). It
@@ -2929,6 +2961,12 @@ class TimelinePanel {
     const opId = 'u' + (++unionGestureSeq);
     const want = { retired: retired.filter((g) => !tomb.includes(g)), tomb: tomb };
     let sent = false;
+    // the gate registers BEFORE the send (the r53 verification round's own race: registered
+    // after, a synchronously-delivered ack found no gate and the gesture's effects never ran)
+    if (gate) {
+      this._gatedDispatches = this._gatedDispatches || {};
+      this._gatedDispatches[opId] = gate;
+    }
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineSetUnionOps === 'function') {
         this._pendingUnionSyncs[opId] = want;
@@ -2947,6 +2985,7 @@ class TimelinePanel {
         sent = true;
       }
     } catch (e) { /* best-effort: the in-memory journal still runs this panel's lifetime */ }
+    if (!sent && gate && this._gatedDispatches) delete this._gatedDispatches[opId];
     return sent ? opId : null;   // the r53 ack-gate keys the gesture's dispatch on THIS send
   }
 
@@ -2970,6 +3009,7 @@ class TimelinePanel {
         this._unionOps = (this._unionOps || []).filter((o) => gated.gids.indexOf(o.gid) < 0);
         this._tagEditErr = { host: '', name: gated.name || '',
           error: 'the edit was not applied — its safety record could not be saved; retry' };
+        if (this._viewsDialog && this._viewsDialogBuild) this._viewsDialogBuild();
         this.draw();
       }
       this._unionSyncDirty = true;
@@ -2986,7 +3026,16 @@ class TimelinePanel {
     this._unionRetryPending = false;
     for (const g of (p.retired || [])) { if (this._journaledGids) this._journaledGids.delete(g); }
     for (const g of (p.tomb || [])) { if (this._retireUnionGids) this._retireUnionGids.delete(g); }
-    if (gated) gated.run();   // the journal is DURABLE — the gesture's effects may now run (r53)
+    if (gated) {
+      for (const o of (this._unionOps || []))
+        if (gated.gids.indexOf(o.gid) >= 0) o.dispatched = true;
+      gated.run();              // the journal is DURABLE — the gesture's effects may now run (r53)
+      // persist the dispatched flip NOW, not on the next unrelated sync: a reload in that
+      // window re-seeds dispatched:false rows and the adoption-completion pass would RE-run
+      // an already-executed gesture (a rename's re-dispatch targets the old, now-gone name —
+      // a spurious refusal rolls back a perfectly settled edit)
+      this._syncUnionOps();
+    }
   }
 
   // Transport reconnected (the v1.3.23 audit's P1.3 — the views writer's P2.8, union twin): a
@@ -3000,15 +3049,15 @@ class TimelinePanel {
     this._unionSyncDirty = true;
     const held = this._gatedDispatches ? Object.values(this._gatedDispatches) : [];
     this._gatedDispatches = {};
-    const opId = this._syncUnionOps();
-    if (held.length) {
-      // gestures gated on acks that died with the socket re-gate on the REPLAY's ack (r53):
-      // their entries ride the fresh full-replace sync, so one ok releases them all
-      const run = () => held.forEach((g) => g.run());
-      const gids = held.reduce((a, g) => a.concat(g.gids), []);
-      if (opId) this._gatedDispatches[opId] = { run: run, gids: gids, name: held[0].name };
-      else run();
-    }
+    // gestures gated on acks that died with the socket re-gate on the REPLAY's ack (r53):
+    // their entries ride the fresh full-replace sync, so one ok releases them all
+    const gate = held.length ? {
+      run: () => held.forEach((g) => g.run()),
+      gids: held.reduce((a, g) => a.concat(g.gids), []),
+      name: held[0].name,
+    } : null;
+    const opId = this._syncUnionOps(gate);
+    if (!opId && gate) gate.run();
   }
 
   _noteUnionOp(rt, name, inverse, edit, gid, opts) {
@@ -3027,7 +3076,8 @@ class TimelinePanel {
     this._unionOps.push({ host: rt.host || '', name: name || '', inverse: inverse,
                           edit: edit || {}, rt: rt, gid: gid || 0,
                           oldName: rt.name || '', oldColor: rt.color || '', post: post,
-                          lop: (opts && opts.lop) || null });
+                          lop: (opts && opts.lop) || null,
+                          dispatched: !(opts && opts.defer) });
     // `lop` is the gesture's LOCAL op (the r53 audit's P1.5: settlement judged only remote
     // postimages — a refused local write dropped its overlay, the group retired as done, and
     // the recovery record was gone while local still held the members)
@@ -3059,12 +3109,44 @@ class TimelinePanel {
     // at PREIMAGE re-posts the local op, payload-paced; a THIRD value means a newer gesture
     // owns the atom (the postimage rule) and this leg is settled by supersession.
     const localTags = (this._views && (this._views.tags || this._views.groups)) || [];
+    const gatedGids = new Set();
+    for (const k in (this._gatedDispatches || {}))
+      for (const g2 of this._gatedDispatches[k].gids) gatedGids.add(g2);
     for (const [g, done] of Array.from(gidDone.entries())) {
-      if (!g || !done) continue;
+      if (!g) continue;
+      if (gatedGids.has(g)) {
+        // the gesture's dispatch is still GATED on its journal ack (the r53 round: the
+        // settlement retried the local op and even retired the group before anything had
+        // been allowed to run) — hold it whole, retry nothing
+        gidDone.set(g, false);
+        continue;
+      }
+      if (this._unionOps.some((o) => o.gid === g && o.dispatched === false)) {
+        // journaled-but-undispatched rows belong to the adoption-completion pass (its
+        // two-sighting patience) — settling or retrying their local leg here would run
+        // half the gesture ahead of the machinery that decides whether it runs at all
+        gidDone.set(g, false);
+        continue;
+      }
+      if (!done) continue;
       const rep = this._unionOps.find((o) => o.gid === g && o.lop);
       if (!rep) continue;
+      if (!localTags.length) {
+        // an EMPTY tags list is indistinguishable from a store fault folded to nothing by
+        // the payload's lenient reader (the r53 round: it read as 'superseded' and the group
+        // retired, deleting the recovery record on zero information) — hold, judge nothing
+        gidDone.set(g, false);
+        continue;
+      }
       const st = this._unionLocalState(rep, localTags);
-      if (st === 'applied' || st === 'superseded') continue;
+      if (st === 'applied') {
+        // LATCH the observed postimage (the r53 round: a user re-adding the member during
+        // the confirmation window read as 'pre' forever, and the retry silently re-removed
+        // it payload after payload)
+        for (const o of this._unionOps) if (o.gid === g) o.lapplied = true;
+        continue;
+      }
+      if (st === 'superseded' || rep.lapplied) continue;
       gidDone.set(g, false);                    // not settled: the local leg is outstanding
       this._applyLocalOp(rep.lop);              // the payload-paced retry (an event, no timer)
     }
@@ -3183,11 +3265,8 @@ class TimelinePanel {
                             willLocal ? { tag: g.localId, add: had.slice() } : {},
                             { remove: edit.remove.slice() }, gid,
                             { defer: true, lop: lop });
-        const opId = this._syncUnionOps();
-        if (opId) {
-          this._gatedDispatches = this._gatedDispatches || {};
-          this._gatedDispatches[opId] = { run: dispatch, gids: [gid], name: g.name };
-        } else dispatch();   // no journal transport exists — nothing durable is possible
+        const opId = this._syncUnionOps({ run: dispatch, gids: [gid], name: g.name });
+        if (!opId) dispatch();   // no journal transport exists — nothing durable is possible
       } else dispatch();
     }
     if (edit.rename || edit.color || edit.delete) {
@@ -3235,11 +3314,8 @@ class TimelinePanel {
           this._noteUnionOp(rt, g.name, inverse,
                             { rename: edit.rename, color: edit.color, delete: !!edit.delete },
                             gid, { defer: true, lop: op });
-        const opId = this._syncUnionOps();
-        if (opId) {
-          this._gatedDispatches = this._gatedDispatches || {};
-          this._gatedDispatches[opId] = { run: dispatch, gids: [gid], name: g.name };
-        } else dispatch();
+        const opId = this._syncUnionOps({ run: dispatch, gids: [gid], name: g.name });
+        if (!opId) dispatch();
       } else dispatch();
     }
   }

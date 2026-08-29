@@ -36,7 +36,7 @@ test("peek AUTO-CLOSE: activating any other tab drops it — same derivation, no
   // and the viewsAck refusal rollback (dropping the overlay changes effViews() like any arrival —
   // without it the active session's tab vanished until an unrelated push). Nothing else derives.
   const sites = RENDER.match(/assertPeekFor\(/g) || [];
-  assert.equal(sites.length, 8, "definition + 7 call sites: setActive, focus fast path, captureViews, postViews, the feed click echo (2026-08-24 — the instant ack derives the peek before the kernel frame), the viewsAck refusal rollback (r47), and editUnion's remote-only overlay (r52: it sets pendingSessionViews without postViews, so it re-derives the peek itself)");
+  assert.equal(sites.length, 9, "definition + 8 call sites: setActive, focus fast path, captureViews, postViews, the feed click echo (2026-08-24 — the instant ack derives the peek before the kernel frame), the viewsAck refusal rollback (r47), editUnion's remote-only overlay (r52: it sets pendingSessionViews without postViews, so it re-derives the peek itself), and the gated gesture's ack continuation (r53: the remote-only paint moved inside the journal-ack gate and derives the peek where it paints)");
 });
 
 test("a view change that excludes the ACTIVE session converts it into the peek — never a bounce (the user 2026-08-24)", () => {

@@ -2489,10 +2489,13 @@ def _queue_heal_intent(old_sid, new_sid):
 
 def _flush_pending_heals():
     """The supervisor-pass replay of queued tag-membership heals (r53 P2.7). The heal itself
-    re-queues on failure, so a still-broken store keeps the intent; a landed heal retires."""
+    re-queues on failure, so a still-broken store keeps the intent; a landed heal retires.
+    An unreadable intent FILE withholds only the file rewrite — the intents already in
+    memory still flush (the r53 verification round: the early return starved this process's
+    own queued heals for as long as the file stayed broken, though the views store they
+    needed was healthy the whole time)."""
     with _pending_heals_lock:
-        if not _adopt_heals_locked():
-            return
+        adopted = _adopt_heals_locked()
         todo = list(_pending_heals)
     if not todo:
         return
@@ -2511,6 +2514,13 @@ def _flush_pending_heals():
                     _pending_heals.remove(it)
                 except ValueError:
                     pass
+            if not adopted and not _adopt_heals_locked():
+                # the intent file is still unreadable: its rows were never adopted, so a
+                # rewrite would silently replace them with our partial view — leave it be;
+                # the flushed memory intents are gone from memory either way
+                sys.stderr.write("view-heals: flushed in-memory intents; the intent file is "
+                                 "unreadable and was not rewritten\n")
+                return
             try:
                 if _pending_heals:
                     _atomic_write(_heals_path(), json.dumps(_pending_heals))
@@ -2877,6 +2887,16 @@ def _heal_timeline_views(old_sid, new_sid):
         def _has(t):
             return any(m["host"] == "" and m["sid"] == old_sid for m in t["members"])
         if not any(_has(t) for t in v["tags"]):
+            # CHAINED churn (the r53 verification round): the old sid can itself be the NEW
+            # half of a heal still queued behind a store fault — its membership only appears
+            # once that intent lands, so "not tagged" is not yet moot. Queue this hop behind
+            # it; the flush replays both in order and the membership walks the whole chain.
+            with _pending_heals_lock:
+                _adopt_heals_locked()
+                chained = any(str(r.get("new") or "") == str(old_sid) for r in _pending_heals)
+            if chained:
+                _queue_heal_intent(old_sid, new_sid)
+                return False
             return
         v = json.loads(json.dumps(v))                    # deep copy: never mutate the cached blob
         # COPY, never move: stripping the old sid un-hid its DEAD lane, which lingers on the timeline for

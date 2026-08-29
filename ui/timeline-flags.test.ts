@@ -146,14 +146,22 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
     // (effects used to run before persistence was known — with every ack forced false, both
     // remotes and the local commit had all executed)
     assert.ok(win.indexOf("const dispatch = () => {") > 0
-      && win.indexOf("this._gatedDispatches[opId] = { run: dispatch") > 0,
+      && win.indexOf("this._syncUnionOps({ run: dispatch, gids: [gid], name: g.name })") > 0,
       "remove: the effects are HELD behind the journal's acknowledged write (r53 P1.4)");
     assert.ok(win.indexOf("removeOk = this._editRemoteTag") < win.indexOf("this._applyLocalOp(lop)"),
       "remove: remotes initiate before the local half commits");
-    const fanGate = win.indexOf("this._gatedDispatches[opId] = { run: dispatch",
+    const fanGate = win.indexOf("this._syncUnionOps({ run: dispatch, gids: [gid], name: g.name })",
                                 win.indexOf("if (edit.rename || edit.color || edit.delete)"));
     assert.ok(fanGate > 0,
       "rename/color/delete: the effects are HELD behind the journal's acknowledged write");
+    // the gate registers BEFORE the transport send inside _syncUnionOps itself — registered
+    // after the call returned, a synchronously-delivered ack found no gate and the gesture's
+    // effects never ran (the r53 verification round's own race)
+    const sy = SRC.indexOf("_syncUnionOps(gate) {");
+    const sw = SRC.slice(sy, sy + 5200);
+    assert.ok(sw.indexOf("this._gatedDispatches[opId] = gate") > 0
+      && sw.indexOf("this._gatedDispatches[opId] = gate") < sw.indexOf("__rompTimelineSetUnionOps"),
+      "the ack-gate is registered before the journal send it keys on");
     assert.ok(win.indexOf("fanOk = this._editRemoteTag") < win.indexOf("this._setViews(nv, [op])"),
       "rename/color/delete: remotes initiate before the local half commits");
     assert.ok(win.split("filter((o) => o.gid !== gid)").length === 3,
@@ -328,8 +336,8 @@ const VIEWS = {
 // EFFECTS (not the gating itself) ack each sync synchronously, restoring the old timing
 function autoAckUnion(panel: any): void {
   const real = panel._syncUnionOps.bind(panel);
-  panel._syncUnionOps = () => {
-    const id = real();
+  panel._syncUnionOps = (...a: any[]) => {
+    const id = real(...a);   // forward the gate — dropping it would strand the dispatch
     if (id) panel.unionOpsAck({ ok: true, opId: id });
     return id;
   };
@@ -954,15 +962,18 @@ test("executed: a reload seeds the watermark WITH the entries — retirement sti
   g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
     wire.push({ entries, retired, opId });
   const panel = drawnPanel();
+  autoAckUnion(panel);   // r53: the ack landed pre-reload, so the journal rides dispatched:true
   const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
   panel._editTagUnion(un, { remove: ["s1"] });
   const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
   const gid = journal[0].gid;
-  // THE RELOAD, then both owners confirm — the retirement must carry the seeded gid
+  // THE RELOAD, then EVERY participant confirms — local postimage included (r53 P1.5: a
+  // preimage local store now HOLDS the group and re-posts the local op instead of retiring)
   const panel2 = drawnPanel();
   const polled = JSON.parse(JSON.stringify(VIEWS));
   polled.remoteTags[0].members = [];
   polled.remoteTags[1].members = [];
+  polled.tags[0].members = ["s2"];
   panel2.update({ now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
                   turns: {}, messages: [], judging: [], views: polled, unionOps: journal });
   assert.ok(panel2._journaledGids.has(gid), "the ledger seeded WITH the entries");
@@ -1140,5 +1151,45 @@ test("executed: a live panel RETIRES a foreign gesture its polls confirm (r52 ro
   assert.ok(last.retired.indexOf(chatGid) >= 0,
     "adopted, confirmed by the SAME payload's polled views, and retired — the journal is "
     + "not immortal for foreign writers");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: a dead writer's journaled-but-undispatched gesture is COMPLETED after two sightings (r53)", () => {
+  // the r53 verification round: ack-gating traded the fail-open dispatch for a new stranding —
+  // a webview dying between the journal's ack and the gated dispatch left rows whose effects
+  // never ran anywhere, immortal (nothing confirmed, nothing retired). An adopting panel now
+  // completes them — but only after the row shows dispatched:false on TWO payload sightings,
+  // so a live writer's own sub-second flip always wins the race.
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();                        // the writer: gated, NEVER acked (it "dies")
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
+  assert.ok(journal.length === 2 && journal.every((o: any) => o.dispatched === false),
+    "the stranded shape: journaled rows, effects never ran");
+  assert.ok(journal.some((o: any) => o.lop), "the LOCAL op rides the journal (r53 P1.5)");
+  const panel2 = drawnPanel();                       // the adopter
+  const dispatched: any[] = [];
+  panel2._editRemoteTag = (rt: any, edit: any) => { dispatched.push({ rt, edit }); return true; };
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: journal }));
+  assert.equal(dispatched.length, 0, "FIRST sighting: patience — a live writer may still flip");
+  assert.deepEqual(panel2._curViews().tags[0].members, ["s1", "s2"], "…and no local effect yet");
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: journal }));
+  assert.equal(dispatched.length, 2, "SECOND sighting: both remote halves dispatch");
+  assert.deepEqual(dispatched.map((d) => d.rt.host).sort(), ["TESTHOST-A", "TESTHOST-B"]);
+  assert.deepEqual(dispatched[0].edit, { remove: ["s1"] });
+  assert.deepEqual(panel2._curViews().tags[0].members, ["s2"],
+    "…and the LOCAL leg runs too — the gesture completes whole, never half");
+  assert.ok((panel2._unionOps || []).every((o: any) => o.gid !== journal[0].gid
+      || o.dispatched === true),
+    "the completed rows flip dispatched — never re-run on a third sighting");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
 });

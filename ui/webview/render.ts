@@ -4880,8 +4880,9 @@ function showTabMenu(e: MouseEvent, id: string) {
         //      two-owner removes had zero rows — A applied, B refused, A never rolled back)
         if (gid) {
           const had = willLocal ? (lt!.members || []).filter((m) => edit.remove!.includes(m)) : [];
-          const ackId = "u-chat" + (++webEditSeq);
-          vscodeApi?.postMessage({ type: "setUnionOps", entries: candidates.map((rt) => ({
+          const localOp = willLocal
+            ? { tag: g.localId, remove: edit.remove!.slice() } : null;
+          const mkEntries = (dispatched: boolean) => candidates.map((rt) => ({
             host: rt.host || "", name: g.name,
             inverse: willLocal ? { tag: g.localId, add: had.slice() } : {},
             edit: { remove: edit.remove!.slice() },
@@ -4889,7 +4890,16 @@ function showTabMenu(e: MouseEvent, id: string) {
                   members: (rt.members || []).slice() },
             gid, oldName: rt.name || "", oldColor: rt.color || "", post: {},
             confirmed: false,
-          })), retired: [], opId: ackId });
+            // the r53 local-leg settlement fields, same dress as the timeline twin's mirror:
+            // lop lets an adopting timeline panel settle (or retry) the LOCAL half, and
+            // dispatched:false marks effects that have not run — a chat webview dying between
+            // this journal's ack and the dispatch strands rows a timeline panel COMPLETES
+            // (its two-payload-sighting adoption pass), so the gesture is never half-lost
+            lop: localOp, dispatched, lapplied: false,
+          }));
+          const ackId = "u-chat" + (++webEditSeq);
+          vscodeApi?.postMessage({ type: "setUnionOps", entries: mkEntries(false),
+                                   retired: [], opId: ackId });
           // the EFFECTS wait for the journal's ack (the r52 verification: a refused write —
           // the proved-read EIO path — still let the edits dispatch and the local half commit
           // with zero durable journal, fail-open on exactly the failure the journal exists
@@ -4901,12 +4911,29 @@ function showTabMenu(e: MouseEvent, id: string) {
               vscodeApi?.postMessage({ type: "editTag", edit: {
                 opId: String(gid), host: rt.host || "", name: g.name,
                 remove: edit.remove!.slice() } });
+            // the optimistic paint rides HERE with the effects (the r53 verification round:
+            // the gated remote-only remove painted nothing at all — the member sat in the
+            // flyout until the owner's next push, reading as a dead click)
+            const nv2 = JSON.parse(JSON.stringify(effViews() || {})) as SessionViews;
+            for (const rt of candidates) {
+              const mine = (nv2.remoteTags || []).find((x) => x.id === rt.id);
+              if (mine) mine.members = (mine.members || []).filter((m) => !edit.remove!.includes(m));
+            }
             if (willLocal) {
-              const nv2 = JSON.parse(JSON.stringify(effViews() || {})) as SessionViews;
               const lt2 = viewTags(nv2).find((x) => x.id === g.localId);
               if (lt2) lt2.members = (lt2.members || []).filter((m) => !edit.remove!.includes(m));
               postViews(nv2, [{ tag: g.localId, remove: edit.remove!.slice() }]);
+            } else {
+              // remote-only: overlay only, never a store write (the v1.3.24 audit's P2.9)
+              pendingSessionViews = nv2; pendingViewsAge = 0;
+              if (activeId) assertPeekFor(activeId);
+              renderTabs();
             }
+            // persist the dispatched flip NOW (the twin's rule): rows left saying
+            // dispatched:false invite the adoption pass to RE-run an already-run gesture —
+            // a re-remove over a member the user just re-added
+            vscodeApi?.postMessage({ type: "setUnionOps", entries: mkEntries(true),
+                                     retired: [], opId: "u-chat" + (++webEditSeq) });
           });
           return;   // the optimistic paint waits with the effects — one ack, one commit
         }

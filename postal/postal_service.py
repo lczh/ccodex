@@ -1105,8 +1105,12 @@ def _sent_receipts(mid):
         tid = e.get("to_id", "")
         if tid.startswith("peer:") and not relays.get(i) and not bounced.get(i) and not recalls.get(i):
             h = tid[5:]
-            if outbox_get(h, i):
-                return h
+            try:
+                if outbox_get(h, i):
+                    return h
+            except _OutboxUnreadable:
+                return h                             # the record EXISTS (unreadable is not gone):
+                                                     # still honestly parked; never kill the listing
         return None
 
     def _row(i, e):
@@ -1859,6 +1863,9 @@ def _reconcile_phantom_sent(now=None):
             o = json.loads(ln)
         except Exception:
             continue
+        if not isinstance(o, dict):
+            continue                                 # a well-formed [] row raised on .get and
+                                                     # wedged this reconcile EVERY boot (r53 P3.13)
         mid, ev = o.get("id"), o.get("ev")
         if not isinstance(mid, str):
             continue
@@ -3148,7 +3155,13 @@ def _bounce_apply(host, b):
     if not rows:
         return
     mid = rows[0]["mid"]
-    msg = outbox_get(host, mid)
+    try:
+        msg = outbox_get(host, mid)
+    except _OutboxUnreadable:
+        # the record exists but cannot be read (r53 P2.10's siblings): the return note needs
+        # the message body — defer whole; the peer re-sends the bounce on a later exchange
+        _log("bounce for %s/%s deferred: the outbox record is unreadable" % (host, mid))
+        return
     if not msg:
         return
     code = rows[0]["code"]
@@ -3456,8 +3469,12 @@ def _relay_in(host, m, token_proven=False):
     if not m.get("origin"):                          # one hop MAX: a message that already hopped never re-forwards
         fh, hit = peer_route(to_id or to)            # the stable id outranks the name here too
         if fh and fh != host and not (hit or {}).get("via"):
-            if outbox_get(fh, mid) is None:          # a resend while we hold it forwards nothing twice
-                outbox_put(fh, dict(m, origin=host))
+            try:
+                if outbox_get(fh, mid) is None:      # a resend while we hold it forwards nothing twice
+                    outbox_put(fh, dict(m, origin=host))
+            except _OutboxUnreadable:
+                pass                                 # the record EXISTS (just unreadable) — the
+                                                     # dedupe holds; never re-put, never raise
             return "hold", None
     return "bounce", {"mid": mid, "code": "recipient-unavailable"}
 
@@ -3500,7 +3517,13 @@ def _bounce_arrived(host, b):
         return
     bounce = rows[0]
     mid = bounce["mid"]
-    msg = outbox_get(host, mid)
+    try:
+        msg = outbox_get(host, mid)
+    except _OutboxUnreadable:
+        # forwarded-or-ours is undecidable over an unproved read — defer; the peer re-sends
+        # the bounce on a later exchange (r53 P2.10's siblings)
+        _log("bounce for %s/%s deferred: the outbox record is unreadable" % (host, mid))
+        return
     if msg and msg.get("origin"):
         p = _pending(msg["origin"])
         with _peer_lock:

@@ -105,11 +105,15 @@ export function consumeViewsAck(m: unknown,
   }
   const conflicts = Array.isArray(a.conflicts)
     ? a.conflicts.filter((c): c is string => typeof c === "string" && !!c) : [];
-  if (a.ok === false && a.retryable === true) {
+  if (a.ok === false && a.retryable === true && queue.length && queue[0].kind === "ops") {
     // the kernel is UP but its store was momentarily unreadable/unwritable (the r53 audit's
     // P2.6: the generic refusal dropped the queue head — a plain lens pick or tag edit
     // vanished with no retry and no useful warning). The head STAYS queued; the next payload
-    // arrival (anchorViewsRev) re-pumps it — event-paced, never a timer.
+    // arrival (anchorViewsRev) re-pumps it — event-paced, never a timer. OPS ONLY: a held
+    // BLOB re-posts with baseRev stamped at the LATER pump, i.e. at whatever rev the payload
+    // raised — a foreign commit in the retry window would CAS-accept the stale-rendered blob
+    // and erase itself (the r53 verification round). A retryable-refused blob takes the
+    // normal refusal exit below: dropped, and the surface re-derives from the fresh payload.
     outstanding = 0;
     outstandingKind = null;
     retryOnNextAnchor = true;
