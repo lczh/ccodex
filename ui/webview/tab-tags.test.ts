@@ -45,7 +45,7 @@ test("the Tags row sits with the session controls ABOVE the divider; Browse stay
 
 test("edits reuse the wire — never a fork: local adds post the whole blob, remote edits ride editTag", () => {
   const at = RENDER.indexOf("const editUnion = (g: TagUnion");
-  const body = RENDER.slice(at, at + 3400);   // widened for the v1.3.20 ops collection
+  const body = RENDER.slice(at, at + 6500);   // widened for the r52 journal-first gesture
   assert.ok(body.includes("t.members = Array.from(new Set((t.members || []).concat(edit.add)));"),
     "local add edits the optimistic copy (pendingSessionViews echoes instantly)");
   assert.ok(body.includes("localOps.push({ tag: g.localId, add: edit.add.slice() });"),
@@ -53,10 +53,11 @@ test("edits reuse the wire — never a fork: local adds post the whole blob, rem
   assert.ok(body.includes('vscodeApi?.postMessage({ type: "editTag", edit: { opId: "web" + (++webEditSeq),  host: g.remotes[0].host || "", name: g.name, add: edit.add.slice() } });'),
     "an add with no local home routes to the tag's single home over the editTag wire — WITH a "
     + "web-minted opId (r48: an opId-less refusal swept the timeline's newest gesture)");
-  assert.ok(body.includes("for (const rt of g.remotes) {"),
+  assert.ok(body.includes("const candidates = g.remotes.filter((rt) =>"),
     "a REMOVE walks every remote store holding the pair — remove-everywhere, never half");
-  assert.ok(body.includes("if (dirty) postViews(nv, localOps.length ? localOps : undefined);"),
-    "ONE optimistic blob per gesture, posted as its collected ops (the v1.3.20 audit)");
+  assert.ok(body.includes("if (localOps.length) postViews(nv, localOps);"),
+    "the LOCAL half posts its collected targeted ops (the v1.3.20 audit; blob-less for "
+    + "remote-only gestures since r52)");
   assert.ok(body.includes("const nvRemote = (rt: SessionTag)"),
     "the remote entries mirror optimistically too — echoed remoteTags are derived, kernel-dropped, presentation-only");
   assert.match(RENDER, /x\.title = "remove this tag from the session — everywhere it holds it";/);
@@ -104,4 +105,33 @@ test("the menu groups BY KIND: [Rename+colors] / [toggles+billing+Tags] / [Brows
   assert.ok(!body.slice(firstToggleAt, tagsAt).includes('el("div", "ctx-sep")'),
     "toggles, billing and Tags are ONE behavior section — no inner dividers");
   assert.ok(body.slice(tagsAt, browseAt).includes('menu.appendChild(el("div", "ctx-sep"));'), "a divider splits sections 2/3 — Browse alone at the bottom");
+});
+
+test("the chat's remove-everywhere journals compensation BEFORE any effect (r52 P2.5 + P1.4)", () => {
+  // the v1.3.24 audit: this gesture posted remote edits and committed local ops with no
+  // setUnionOps entries at all — a later remote refusal could neither restore the local half
+  // nor roll back successful siblings; and nothing durable preceded the dispatches
+  const at = RENDER.indexOf("const editUnion = (g: TagUnion");
+  const win = RENDER.slice(at, at + 6000);
+  const iJournal = win.indexOf('type: "setUnionOps"');
+  const iDispatch = win.indexOf("opId: gid ? String(gid)");
+  assert.ok(iJournal > 0, "the compensation journal exists");
+  assert.ok(iDispatch > 0, "the remote dispatch rides the gesture's gid as its opId");
+  assert.ok(iJournal < iDispatch, "…and the journal lands BEFORE the dispatch");
+  assert.ok(win.indexOf("inverse: { tag: g.localId, add: had.slice() }") > 0,
+    "each entry carries the inverse that restores the LOCAL half");
+});
+
+test("remote-only chat tag edits post NO local write (r52 P2.9)", () => {
+  // the v1.3.24 audit: the remoteTags mutation is derived presentation the kernel discards —
+  // the whole-blob post it used to ride bumped the rev over a byte-identical store and could
+  // 409 another client's real CAS write
+  const at = RENDER.indexOf("const editUnion = (g: TagUnion");
+  const win = RENDER.slice(at, at + 6500);
+  assert.match(win, /if \(localOps\.length\) postViews\(nv, localOps\);/,
+    "a LOCAL half still writes through the shared writer");
+  assert.match(win, /pendingSessionViews = nv; pendingViewsAge = 0;/,
+    "…while a remote-only gesture keeps only the optimistic overlay — no wire write");
+  assert.doesNotMatch(win, /postViews\(nv, localOps\.length \? localOps : undefined\)/,
+    "the old unconditional post — blob fallback included — is gone");
 });

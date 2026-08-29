@@ -31,3 +31,12 @@ test("non-strings never classify as intent", () => {
   assert.ok(!intentOp(42));
   assert.ok(!INTENT_OPS.has(""));
 });
+test("the tag-transaction halves are ALL intent — a reconnect must not land one leg (r52)", () => {
+  // the v1.3.24 audit's P1.3, reproduced there: queued [editTag, editTag,
+  // setTimelineViewsOps, setUnionOps] replayed as [setTimelineViewsOps] — the local edit
+  // landed while the remote edits and the compensation journal disappeared
+  for (const op of ["editTag", "setUnionOps", "setTimelineViewsOps"]) {
+    assert.ok(INTENT_OPS.has(op), op + " must survive a reconnect");
+  }
+});
+

@@ -3046,60 +3046,80 @@ class TimelinePanel {
       } else if (g.remotes.length) this._editRemoteTag(g.remotes[0], { add: edit.add.slice() }, gid);
     }
     if (edit.remove && edit.remove.length) {
-      // REMOTE halves first: an initiation that cannot even reach its owner must not leave the
+      // the JOURNAL before any effect (the v1.3.24 audit's P1.4, executed with a synthetic
+      // stop: remote dispatches, then the local op, THEN the note — a renderer death after
+      // the local dispatch left applied changes with zero journal rows and no durable
+      // rollback information). Entries are durable first; a failed INITIATION retracts them
+      // (nothing dispatched — there is nothing to compensate).
+      const candidates = g.remotes.filter((rt) =>
+        (rt.members || []).some((m) => edit.remove.indexOf(m) >= 0));
+      const lt0 = g.localId ? viewTags(this._curViews()).find((x) => x.id === g.localId) : null;
+      const willLocal = !!(lt0 && (lt0.members || []).some((m) => edit.remove.indexOf(m) >= 0));
+      const had = willLocal ? (lt0.members || []).filter((m) => edit.remove.indexOf(m) >= 0) : [];
+      if (willLocal)
+        for (const rt of candidates)
+          this._noteUnionOp(rt, g.name, { tag: g.localId, add: had.slice() },
+                            { remove: edit.remove.slice() }, gid);
+      // REMOTE halves next: an initiation that cannot even reach its owner must not leave the
       // local half committed — "a removal never half-works" (the v1.3.16 audit's P2.16 repro
       // deleted the local copy while the remote edit returned false)
       let removeOk = true;
-      const dispatched = [];
-      for (const rt of g.remotes)
-        if ((rt.members || []).some((m) => edit.remove.indexOf(m) >= 0)) {
-          removeOk = this._editRemoteTag(rt, { remove: edit.remove.slice() }, gid) && removeOk;
-          dispatched.push(rt);
-        }
-      if (removeOk && g.localId) {
+      for (const rt of candidates)
+        removeOk = this._editRemoteTag(rt, { remove: edit.remove.slice() }, gid) && removeOk;
+      if (!removeOk) {
+        // no transport at all (the sync-failure case): nothing left this panel — the
+        // journaled intent describes a gesture that never began, so it retracts
+        this._unionOps = (this._unionOps || []).filter((o) => o.gid !== gid);
+        this._syncUnionOps();
+      } else if (willLocal) {
         const nv = JSON.parse(JSON.stringify(this._curViews()));
         const t = viewTags(nv).find((x) => x.id === g.localId);
-        if (t && (t.members || []).some((m) => edit.remove.indexOf(m) >= 0)) {
-          const had = (t.members || []).filter((m) => edit.remove.indexOf(m) >= 0);
+        if (t) {
           t.members = (t.members || []).filter((m) => edit.remove.indexOf(m) < 0);
           this._setViews(nv, [{ tag: g.localId, remove: edit.remove.slice() }]);
-          // an ASYNC refusal from any dispatched owner must restore this local half — a sync
-          // dispatch success only means the request left (the v1.3.17 audit's P2.11: the local
-          // deletion stayed committed while the remote member survived, splitting the union)
-          for (const rt of dispatched)
-            this._noteUnionOp(rt, g.name, { tag: g.localId, add: had },
-                              { remove: edit.remove.slice() }, gid);
         }
       }
     }
     if (edit.rename || edit.color || edit.delete) {
-      let fanOk = true;                              // remote halves FIRST (P2.16, as above)
-      for (const rt of g.remotes)
-        fanOk = this._editRemoteTag(rt, { rename: edit.rename, color: edit.color,
-                                          delete: !!edit.delete }, gid) && fanOk;
-      if (fanOk && g.localId) {
-        const nv = JSON.parse(JSON.stringify(this._curViews()));
-        const before = viewTags(this._curViews()).find((x) => x.id === g.localId) || {};
-        let op, inverse;
+      // the same journal-before-effects order (the v1.3.24 audit's P1.4): the plan — op,
+      // inverse, postimages — is computed from the PREIMAGE, journaled durably, and only
+      // then does anything dispatch
+      const before = g.localId
+        ? (viewTags(this._curViews()).find((x) => x.id === g.localId) || {}) : {};
+      let op = null, inverse = null;
+      if (g.localId) {
         if (edit.delete) {
-          nv.tags = viewTags(nv).filter((x) => x.id !== g.localId); delete nv.groups;
-          if (nv.active === g.localId) nv.active = 'all';
           op = { tag: g.localId, delete: true };
           inverse = { create: { id: g.localId, name: before.name, color: before.color,
                                 members: (before.members || []).slice() } };
         } else {
-          const t = viewTags(nv).find((x) => x.id === g.localId);
-          if (t) { if (edit.rename) t.name = edit.rename; if (edit.color) t.color = edit.color; }
           op = { tag: g.localId };
           inverse = { tag: g.localId };
           if (edit.rename) { op.rename = edit.rename; inverse.rename = before.name; }
           if (edit.color) { op.color = edit.color; inverse.color = before.color; }
         }
-        this._setViews(nv, [op]);
         for (const rt of g.remotes)
           this._noteUnionOp(rt, g.name, inverse,
                             { rename: edit.rename, color: edit.color, delete: !!edit.delete },
                             gid);
+      }
+      let fanOk = true;                              // remote halves before the local (P2.16)
+      for (const rt of g.remotes)
+        fanOk = this._editRemoteTag(rt, { rename: edit.rename, color: edit.color,
+                                          delete: !!edit.delete }, gid) && fanOk;
+      if (!fanOk) {
+        this._unionOps = (this._unionOps || []).filter((o) => o.gid !== gid);
+        this._syncUnionOps();                        // nothing began — the intent retracts
+      } else if (g.localId) {
+        const nv = JSON.parse(JSON.stringify(this._curViews()));
+        if (edit.delete) {
+          nv.tags = viewTags(nv).filter((x) => x.id !== g.localId); delete nv.groups;
+          if (nv.active === g.localId) nv.active = 'all';
+        } else {
+          const t = viewTags(nv).find((x) => x.id === g.localId);
+          if (t) { if (edit.rename) t.name = edit.rename; if (edit.color) t.color = edit.color; }
+        }
+        this._setViews(nv, [op]);
       }
     }
   }

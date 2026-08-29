@@ -182,8 +182,9 @@ test("wiring: the chat routes views writes through the shared writer — ops for
   // (the v1.3.20 audit) — count the call sites that pass them
   const opsCalls = RENDER.match(/postViews\([^)]*, \[\{ (actives|create): /g) || [];
   assert.ok(opsCalls.length >= 3, "the lens/create gestures pass ops: " + opsCalls.length);
-  assert.match(RENDER, /postViews\(nv, localOps\.length \? localOps : undefined\);/,
-    "the membership editor passes its collected ops");
+  assert.match(RENDER, /if \(localOps\.length\) postViews\(nv, localOps\);/,
+    "the membership editor passes its collected ops — and remote-only gestures post NOTHING "
+    + "(the v1.3.24 audit's P2.9: the blob fallback bumped the rev over a byte-identical store)");
   assert.match(RENDER, /postViews\(v, v\.actives && v\.actives\["chat"\] \? \[\{ actives: \{ chat: v\.actives\["chat"\] \} \}\] : undefined\);/,
     "the reveal posts ONLY the chat surface it moved (r48)");
   // the frame router consumes the ack — a refusal drops the known-refused optimistic overlay now

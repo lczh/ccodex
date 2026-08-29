@@ -136,17 +136,23 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
   // (the v1.3.16 audit's P2.15)
   assert.match(SRC, /const out = \[\], byName = Object\.create\(null\)/);
   {
-    // fan-out tag edits initiate every REMOTE half first; a refused initiation skips the local
-    // commit (P2.16: the repro deleted the local tag while the remote edit returned false)
+    // fan-out tag edits journal FIRST (the v1.3.24 audit's P1.4: a renderer death between
+    // the dispatches and the note left applied changes with zero journal rows), then initiate
+    // every REMOTE half, then commit the local half; a refused initiation retracts the intent
     const fn = SRC.indexOf("_editTagUnion(g, edit)");
-    const win = SRC.slice(fn, fn + 4200);
+    const win = SRC.slice(fn, fn + 6400);
     assert.ok(win.indexOf("removeOk") > 0 && win.indexOf("fanOk") > 0);
-    assert.ok(win.indexOf("removeOk = this._editRemoteTag") < win.indexOf("if (removeOk && g.localId)"),
+    assert.ok(win.indexOf("this._noteUnionOp") < win.indexOf("removeOk = this._editRemoteTag"),
+      "remove: the journal is durable BEFORE any effect dispatches (P1.4)");
+    assert.ok(win.indexOf("removeOk = this._editRemoteTag") < win.indexOf("this._setViews(nv, [{ tag: g.localId, remove:"),
       "remove: remotes initiate before the local half commits");
-    assert.ok(win.indexOf("fanOk = this._editRemoteTag") < win.indexOf("if (fanOk && g.localId)"),
+    const fanNote = win.indexOf("this._noteUnionOp", win.indexOf("if (edit.rename || edit.color || edit.delete)"));
+    assert.ok(fanNote > 0 && fanNote < win.indexOf("fanOk = this._editRemoteTag"),
+      "rename/color/delete: the journal is durable BEFORE any effect dispatches (P1.4)");
+    assert.ok(win.indexOf("fanOk = this._editRemoteTag") < win.indexOf("this._setViews(nv, [op])"),
       "rename/color/delete: remotes initiate before the local half commits");
-    // …and an ASYNC refusal compensates the committed local half (the v1.3.17 audit's P2.11)
-    assert.ok(win.indexOf("_noteUnionOp") > 0, "each dispatched remote half records its inverse");
+    assert.ok(win.split("filter((o) => o.gid !== gid)").length === 3,
+      "a refused initiation RETRACTS both legs' journaled intent — nothing began");
   }
   {
     const fn = SRC.indexOf("tagEditFailed(m) {");
@@ -1009,4 +1015,26 @@ test("executed: a viewsAck carrying conflicts surfaces them loudly and drops the
   assert.match(panel._tagEditErr.error, /already taken/);
   assert.equal(panel._pendingViews, null, "the optimistic overlay drops — the store's truth shows");
   assert.equal(panel._optViewsRev, 9, "the rev still re-anchors");
+});
+
+test("executed: the journal is durable before ANY effect dispatches (r52 P1.4)", () => {
+  // the v1.3.24 audit, reproduced there with a synthetic stop: remote dispatches, then the
+  // local op, THEN the note — {"events":["remote","local"],"journalRows":0} — a renderer
+  // death in that window left applied changes with no durable rollback information
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = () => {};
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  const rowsAt: number[] = [];
+  panel._editRemoteTag = (rt: any, edit: any, gid: any) => {
+    rowsAt.push(panel._unionOps.length); return true;
+  };
+  const realSet = panel._setViews.bind(panel);
+  panel._setViews = (v: any, ops: any) => { rowsAt.push(panel._unionOps.length); realSet(v, ops); };
+  panel._editTagUnion(un, { remove: ["s1"] });
+  assert.ok(rowsAt.length >= 3, "two remote dispatches and one local commit ran");
+  for (const n of rowsAt) assert.equal(n, 2,
+    "every effect saw the FULL journal already durable — never rows:0 after a dispatch");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
 });

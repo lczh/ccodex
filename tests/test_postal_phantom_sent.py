@@ -384,3 +384,71 @@ class R50RelayStages(unittest.TestCase):
         self.assertIn('"ev": "unpublished"', leg,
                       "the raise path files the terminal row inline")
         self.assertIn("relay publication failed", leg, "…and answers the sender loudly")
+
+
+class R52StageReconcileAndIds(unittest.TestCase):
+    """the v1.3.24 audit's P2.8 (a legacy stage whose `relayed` proof scrolled past the 512KiB
+    tail erased a delivered receipt) and P3.10 (100k mids/sec collided, and the colliding
+    publish silently replaced the earlier message)."""
+
+    def setUp(self):
+        _reset()
+        shutil.rmtree(pm.OUTBOX, ignore_errors=True)
+        self.now = int(time.time())
+        self.hd = pm.OUTBOX / "TESTHOST2"
+        self.hd.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        _reset()
+        shutil.rmtree(pm.OUTBOX, ignore_errors=True)
+
+    def test_a_delivered_proof_beyond_the_tail_still_counts(self):
+        # the executed r52 shape: legacy stage + sent + relayed, then >512KiB of traffic —
+        # the tail scan missed the proof and appended `unpublished`, erasing the receipt
+        mid = "px-300.1_aa.TESTHOST"
+        (self.hd / (".stage-" + mid)).write_text("1")           # a legacy pre-rename stage
+        pm._tl_append("messages.jsonl", {"t": self.now, "ev": "relayed", "id": mid,
+                                         "host": "TESTHOST2"})
+        filler = json.dumps({"t": self.now, "ev": "noise", "id": "n", "pad": "z" * 900})
+        with open(pm.TLDIR / "messages.jsonl", "a") as fh:
+            for _ in range(pm.PHANTOM_TAIL_BYTES // len(filler) + 50):
+                fh.write(filler + "\n")
+        self.assertEqual(pm._reconcile_relay_stages(), 0)
+        self.assertEqual([r for r in _rows() if r.get("ev") == "unpublished"], [],
+                         "the scan is keyed to the stage's mid over the WHOLE log — the "
+                         "proof cannot scroll out of sight")
+        self.assertFalse((self.hd / (".stage-" + mid)).exists(), "the settled stage drops")
+
+    def test_an_unreadable_log_preserves_every_stage(self):
+        mid = "px-301.1_bb.TESTHOST"
+        (self.hd / (".stage-" + mid)).write_text("1")
+        log = pm.TLDIR / "messages.jsonl"
+        os.chmod(log, 0)
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                fixed = pm._reconcile_relay_stages()
+        finally:
+            os.chmod(log, 0o644)
+        self.assertEqual(fixed, 0)
+        self.assertTrue((self.hd / (".stage-" + mid)).exists(),
+                        "an unreadable log proves nothing — no terminal is filed over an "
+                        "unproved read, and the stage waits for the next start")
+        self.assertEqual([r for r in _rows() if r.get("ev") == "unpublished"], [])
+
+    def test_mids_carry_128_random_bits(self):
+        mid = pm._unique()
+        rand = mid.split("_", 1)[1].rsplit(".", 1)[0]
+        self.assertEqual(len(rand), 32, "32 hex chars = 128 bits — 100k/sec collided")
+        int(rand, 16)
+
+    def test_publication_never_replaces_standing_mail(self):
+        mid = "px-302.1_cc.TESTHOST"
+        (self.hd / (mid + ".json")).write_text(json.dumps({"mid": mid, "body": "FIRST"}))
+        stage = self.hd / (".stage-" + mid)
+        stage.write_text(json.dumps({"mid": mid, "body": "SECOND"}))
+        with self.assertRaises(OSError):
+            pm.outbox_publish_stage("TESTHOST2", mid, stage)
+        self.assertEqual(json.loads((self.hd / (mid + ".json")).read_text())["body"], "FIRST",
+                         "a colliding publish is LOUD and the standing message survives — "
+                         "rename silently replaced it")
+        self.assertTrue(stage.exists(), "…and the stage is retained for the compensation arm")

@@ -275,7 +275,9 @@ def _unique():
     # self_host(), not raw gethostname: the mid is a path component under mail/ and the peer's
     # outbox (_safe_id-checked at outbox_put), so a stomped hostname baked in here silently killed
     # every OUTBOUND cross-host send too — same 2026-08-11 breakage as self_host's docstring.
-    return f"{int(time.time())}.{os.getpid()}_{random.randint(0, 99999)}.{self_host()}"
+    # 128 RANDOM BITS (the v1.3.24 audit's P3.10): 100,000 choices per second/process/host
+    # collided under load, and the colliding publish silently replaced the earlier message.
+    return f"{int(time.time())}.{os.getpid()}_{os.urandom(16).hex()}.{self_host()}"
 
 def _mark_pending(sid):
     """Reconcile the on-disk pending-mail marker with reality: mail-pending/<sid>
@@ -1901,29 +1903,41 @@ def _reconcile_relay_stages():
         hosts = list(OUTBOX.iterdir()) if OUTBOX.is_dir() else []
     except OSError:
         return 0
-    # the bounded log tail (the phantom reconcile's discipline — never a full-log scan): any
-    # row for the mid BEYOND its sent row proves the publish happened (relayed/recall/bounced
-    # acks ride the log after outbox_del) — an orphaned stage beside such evidence is a
-    # success-path unlink failure, never an unpublished relay
-    settled = set()
-    try:
-        log = TLDIR / "messages.jsonl"
-        with open(log, "rb") as fh:
-            fh.seek(max(0, log.stat().st_size - PHANTOM_TAIL_BYTES))
-            for line in fh.read().decode(errors="replace").splitlines():
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if row.get("ev") in _TERMINAL_EVS or row.get("ev") == "relayed":
-                    settled.add(row.get("id"))
-    except OSError:
-        pass
+    # INVENTORY the standing stages first, then scan the WHOLE log keyed to exactly those
+    # mids (the v1.3.24 audit's P2.8: the 512KiB tail missed a legacy stage's `relayed` proof
+    # once enough traffic followed it, and the reconcile appended `unpublished` for DELIVERED
+    # mail, erasing its receipt). The scan is bounded by the orphan-stage count — near-always
+    # zero — not by log bytes; the r45 full-scan ban is about unconditional scans.
+    stage_mids = set()
+    staged = {}
     for hd in hosts:
         try:
-            stages = [f for f in hd.iterdir() if f.name.startswith(".stage-")]
+            fs2 = [f for f in hd.iterdir() if f.name.startswith(".stage-")]
         except OSError:
             continue
+        staged[hd] = fs2
+        for f in fs2:
+            stage_mids.add(f.name[len(".stage-"):])
+    settled = set()
+    if stage_mids:
+        try:
+            with open(TLDIR / "messages.jsonl", "rb") as fh:
+                for line in fh:
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if row.get("id") in stage_mids and (
+                            row.get("ev") in _TERMINAL_EVS or row.get("ev") == "relayed"):
+                        settled.add(row.get("id"))
+        except OSError:
+            # an UNREADABLE log proves nothing either way: preserve every stage for the next
+            # bus start rather than filing terminals over an unproved read (the r52 rule)
+            sys.stderr.write("postal: the message log is unreadable — leaving %d relay "
+                             "stage(s) for the next start\n" % len(stage_mids))
+            return 0
+    for hd in hosts:
+        stages = staged.get(hd) or []
         for st in stages:
             mid = st.name[len(".stage-"):]
             published = (hd / (mid + ".json")).exists() or mid in settled
@@ -2714,7 +2728,14 @@ def outbox_publish_stage(host, mid, stagef):
         _log("outbox_publish_stage: refusing unsafe host/mid %r/%r" % (host, mid))
         raise ValueError("unsafe host/mid")
     d = OUTBOX / host
-    os.rename(stagef, d / (mid + ".json"))
+    # LINK-then-unlink, not rename (the v1.3.24 audit's P3.10): rename silently REPLACES a
+    # same-mid file — a collision overwrote an existing message. link fails EEXIST, so a
+    # collision is loud and the standing mail survives; the 128-bit mid makes it unreachable
+    # in practice. The link+unlink pair keeps the stage-means-unpublished invariant: the
+    # published name exists from the link on, so a crash between the two steps reads as
+    # published (the stage drops quietly at boot).
+    os.link(stagef, d / (mid + ".json"))
+    os.unlink(stagef)
     _fsync_dir(d)
     _peer_wake(host).set()
 

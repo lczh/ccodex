@@ -1872,9 +1872,13 @@ def _set_timeline_views(blob, base_rev=None):
     is unconditional (the hidden-migration writer, pre-rev clients). Returns (ok, rev)."""
     with jd._identity_file_lock():
         try:
-            cur = json.loads(_views_path().read_text())
-        except Exception:
-            cur = {}
+            cur = _read_state_json(_views_path(), "timeline-views") or {}
+        except OSError:
+            # the proved-read rule (the v1.3.24 audit): a transient EIO must never read as an
+            # empty store — the unconditional write path would then erase every tag. No rev is
+            # KNOWN here, so none is claimed (a None rev leaves clients' counters standing).
+            sys.stderr.write("timeline-views: unreadable — refusing the whole-blob write\n")
+            return False, None
         try:
             currev = int(cur.get("rev") or 0) if isinstance(cur, dict) else 0
         except (TypeError, ValueError):
@@ -1888,6 +1892,16 @@ def _set_timeline_views(blob, base_rev=None):
                 return False, currev
         blob = jd.canonicalize_timeline_views(blob)
         d = _norm_timeline_views(blob)
+        # an IDENTICAL canonical blob bumps nothing (the v1.3.24 audit's P2.9): remote-only
+        # chat edits repost the local blob (their remoteTags mutation is derived state this
+        # kernel discards), and every false bump could 409 another client's real CAS write
+        _curn = _norm_timeline_views(jd.canonicalize_timeline_views(
+            json.loads(json.dumps(cur)))) if isinstance(cur, dict) else {}
+        if isinstance(cur, dict) and cur \
+                and json.dumps(d, sort_keys=True) == json.dumps(_curn, sort_keys=True):
+            return True, currev          # the store already holds this — nothing to claim
+        #                                  (a FRESH store still materializes: its first write
+        #                                   must mint rev 1 for every CAS client to anchor on)
         d["rev"] = currev + 1
         _atomic_write(_views_path(), json.dumps(d, sort_keys=True))
         return True, currev + 1
@@ -2051,6 +2065,28 @@ def _union_ops_path():
     return jd.STATE / "union-gestures.json"
 
 
+def _read_state_json(path, what):
+    """A PROVED read of a JSON state file (the v1.3.24 audit's P1.1/P1.2): only
+    FileNotFoundError means empty (returns None). An UNREADABLE file (EIO, EACCES) RAISES —
+    every writer that folded it to empty then published a merge over the unproved read,
+    overwriting valid state and acking success (executed: a seeded union gesture vanished
+    under one injected EIO; a seeded tag store was erased by the next create). Malformed
+    JSON is QUARANTINED aside (the bytes survive for forensics) and reads as empty — corrupt
+    content can never merge, but it must never be silently overwritten either."""
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except ValueError:
+        try:
+            qp = path.with_name(path.name + ".corrupt-%d" % int(time.time()))
+            path.rename(qp)
+            sys.stderr.write("%s: malformed JSON quarantined as %s\n" % (what, qp.name))
+        except OSError:
+            sys.stderr.write("%s: malformed JSON (quarantine failed — leaving in place)\n" % what)
+        return None
+
+
 def _union_ops_load():
     """The multi-host tag-gesture journal (the v1.3.21 audit's P1.5): the timeline panel's
     in-flight compensation entries, mirrored here so a panel reload does not lose the
@@ -2079,7 +2115,16 @@ def _union_ops_set(entries, retired=None):
     # the WHOLE load-merge-write under the identity lock (the r50 verification: two threads'
     # unlocked merges both reported success and persisted only one of two distinct gestures)
     with jd._identity_file_lock():
-        cur = _union_ops_load()
+        try:
+            _raw = _read_state_json(_union_ops_path(), "union-gestures")
+        except OSError:
+            # the v1.3.24 audit's P1.1: EIO used to read as an EMPTY journal — the merge then
+            # overwrote every valid unresolved gesture and returned success, deleting the
+            # compensation record a multi-host edit needed
+            sys.stderr.write("union-gestures: unreadable — refusing to merge over an "
+                             "unproved read\n")
+            return False
+        cur = [r for r in _raw if isinstance(r, dict)] if isinstance(_raw, list) else []
         inc = [r for r in (entries if isinstance(entries, list) else []) if isinstance(r, dict)]
         ret = set()
         for g in (retired if isinstance(retired, list) else []):
@@ -2240,12 +2285,14 @@ def _apply_ref_migration(host, name, new, deleted, fresh=True):
     (stale for at most one echo window) — a REPLAYED intent runs after the cache re-polled,
     and ignoring the host then renamed away a same-name tag the user had re-minted there
     since (the r51 sibling verification)."""
-    if not deleted:
-        if not new:
-            return True
-        if _tag_name_survives_elsewhere(host if fresh else None, name):
-            return True      # the lens still names something real under the OLD name (r50)
+    if not deleted and not new:
+        return True
     with jd._identity_file_lock():
+        # the survival check lives INSIDE the identity transaction (the v1.3.24 audit's P2.7,
+        # executed with a barrier: a local tag created between the check and the lock kept its
+        # name while the lens and order were rewritten to the new one — hiding the real tag)
+        if not deleted and _tag_name_survives_elsewhere(host if fresh else None, name):
+            return True      # the lens still names something real under the OLD name (r50)
         try:
             raw = json.loads(_views_path().read_text())
         except FileNotFoundError:
@@ -2286,15 +2333,18 @@ def _adopt_ref_migrations_locked():
     overwrote the file with only this boot's rows — a crash-survivor intent whose remote
     half had committed was destroyed before the pass-tail flush ever read it)."""
     if _pending_ref_migrations:
-        return
+        return True
     try:
-        rows = json.loads(_ref_migrations_path().read_text())
-        if isinstance(rows, list):
-            _pending_ref_migrations.extend(r for r in rows if isinstance(r, dict))
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
+        rows = _read_state_json(_ref_migrations_path(), "ref-migrations")
+    except OSError:
+        # the v1.3.24 audit's P2.6: EIO read as "nothing to adopt", and the next queue write
+        # replaced the file with only the newest intent — destroying an older committed one
+        sys.stderr.write("ref-migrations: unreadable — adopting nothing and REFUSING to "
+                         "overwrite the file this pass\n")
+        return False
+    if isinstance(rows, list):
+        _pending_ref_migrations.extend(r for r in rows if isinstance(r, dict))
+    return True
 
 
 def _queue_ref_migration(intent):
@@ -2303,8 +2353,12 @@ def _queue_ref_migration(intent):
     references forever, silently). The intent persists beside the state (best-effort — the
     same disk may refuse it) and the supervisor pass retries until the migration lands."""
     with _pending_ref_migrations_lock:
-        _adopt_ref_migrations_locked()
+        _adopted = _adopt_ref_migrations_locked()
         _pending_ref_migrations.append(intent)
+        if not _adopted:
+            sys.stderr.write("ref migration: holding the intent in memory only — the intent "
+                             "file is unreadable and will not be overwritten\n")
+            return
         try:
             _atomic_write(_ref_migrations_path(), json.dumps(_pending_ref_migrations))
         except Exception:
@@ -2317,7 +2371,8 @@ def _flush_pending_ref_migrations():
     kernel's durable intents; re-evaluates each against CURRENT state (the union-survival
     rule runs at apply time, so a name re-minted since simply moots the migration)."""
     with _pending_ref_migrations_lock:
-        _adopt_ref_migrations_locked()
+        if not _adopt_ref_migrations_locked():
+            return                       # unreadable storage: touch nothing this pass (r52)
         todo = list(_pending_ref_migrations)
     if not todo:
         return
@@ -2399,10 +2454,11 @@ def _apply_views_ops(ops):
     applied = False
     conflicts = []
     with jd._identity_file_lock():
-        try:
-            raw = json.loads(_views_path().read_text())
-        except Exception:
-            raw = {}
+        # a PROVED read (the v1.3.24 audit's P1.2, executed: one injected EIO read as an
+        # empty store, and the next create acked success over a write that erased every
+        # existing tag and lens). The raise is the callers' retained-failure signal: the WS
+        # handler acks ok:false, the POST route answers 500, the spool keeps the op file.
+        raw = _read_state_json(_views_path(), "timeline-views") or {}
         try:
             currev = int(raw.get("rev") or 0) if isinstance(raw, dict) else 0
         except (TypeError, ValueError):
@@ -32858,7 +32914,13 @@ class Handler(BaseHTTPRequestHandler):
                     # targeted operations (the v1.3.17 audit's P1.5/P2.15): applied server-side
                     # against the CURRENT blob, so concurrent editors compose — and the exact
                     # grammar the kernel-down spool replays
-                    rev, confl = _apply_views_ops(b["ops"])
+                    try:
+                        rev, confl = _apply_views_ops(b["ops"])
+                    except OSError:
+                        # the proved-read raise (the v1.3.24 audit's P1.2) — the Obsidian
+                        # writer treats a refusal as kernel-said-no and spools the op
+                        return self._send(503, json.dumps({"ok": False, "error":
+                            "the views store is unreadable — retry"}), "application/json")
                     _mark_views_dirty()
                     _ans = {"ok": True, "rev": rev}
                     if confl:

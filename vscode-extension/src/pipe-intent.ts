@@ -16,6 +16,11 @@ export const INTENT_OPS: ReadonlySet<string> = new Set([
   "answerAsk", "submitAsk", "toggleAsk", "navAsk", "cancelAsk",
   "setSessionFlag", "setSessionColor", "setGlobalRetryPaused", "setTimelineViews",
   "setTimelineViewsOps", "openTagsDialog",
+  // the tag-transaction halves (the v1.3.24 audit's P1.3): a reconnect used to replay the
+  // LOCAL half (setTimelineViewsOps) while dropping the REMOTE edits and the compensation
+  // journal — the multi-host gesture landed one-legged with no rollback record. FIFO order
+  // is the queue's own; classifying all three keeps the transaction whole.
+  "editTag", "setUnionOps",
   "reorderTabs", "closeTab",
 ]);
 

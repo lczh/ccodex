@@ -4861,22 +4861,56 @@ function showTabMenu(e: MouseEvent, id: string) {
         }
       }
       if (edit.remove?.length) {
-        if (g.localId) {
-          const t = viewTags(nv).find((x) => x.id === g.localId);
-          if (t && (t.members || []).some((m) => edit.remove!.includes(m))) {
-            t.members = (t.members || []).filter((m) => !edit.remove!.includes(m));
-            localOps.push({ tag: g.localId, remove: edit.remove!.slice() });
-            dirty = true;
-          }
+        const lt = g.localId ? viewTags(nv).find((x) => x.id === g.localId) : undefined;
+        const willLocal = !!(lt && (lt.members || []).some((m) => edit.remove!.includes(m)));
+        const candidates = g.remotes.filter((rt) =>
+          (rt.members || []).some((m) => edit.remove!.includes(m)));
+        // the COMPENSATION JOURNAL, durable BEFORE any effect (the v1.3.24 audit's P2.5 +
+        // P1.4): this gesture used to dispatch remote edits and commit the local half with no
+        // setUnionOps entries at all — a later remote refusal could neither restore the local
+        // half nor roll back successful siblings. The entries ride the SAME journal the
+        // timeline twin mints; any timeline panel adopts them from the payload echo and runs
+        // the compensation when the kernel's journaled refusal row names this gesture (the
+        // editTag opId is the gid, the correlation the refusal row derives its own id from).
+        const gid = willLocal && candidates.length
+          ? Math.floor(Math.random() * 0x3fffffff) + 1 : 0;
+        if (gid) {
+          const had = (lt!.members || []).filter((m) => edit.remove!.includes(m));
+          vscodeApi?.postMessage({ type: "setUnionOps", entries: candidates.map((rt) => ({
+            host: rt.host || "", name: g.name,
+            inverse: { tag: g.localId, add: had.slice() },
+            edit: { remove: edit.remove!.slice() },
+            rt: { id: rt.id, host: rt.host || "", name: rt.name, color: rt.color,
+                  members: (rt.members || []).slice() },
+            gid, oldName: rt.name || "", oldColor: rt.color || "", post: {},
+            confirmed: false,
+          })), retired: [], opId: "u-chat" + (++webEditSeq) });
         }
-        for (const rt of g.remotes) {
-          if (!(rt.members || []).some((m) => edit.remove!.includes(m))) continue;
-          vscodeApi?.postMessage({ type: "editTag", edit: { opId: "web" + (++webEditSeq),  host: rt.host || "", name: g.name, remove: edit.remove!.slice() } });
+        if (willLocal) {
+          lt!.members = (lt!.members || []).filter((m) => !edit.remove!.includes(m));
+          localOps.push({ tag: g.localId, remove: edit.remove!.slice() });
+          dirty = true;
+        }
+        for (const rt of candidates) {
+          vscodeApi?.postMessage({ type: "editTag", edit: {
+            opId: gid ? String(gid) : "web" + (++webEditSeq),
+            host: rt.host || "", name: g.name, remove: edit.remove!.slice() } });
           const mine = nvRemote(rt);
           if (mine) { mine.members = (mine.members || []).filter((m) => !edit.remove!.includes(m)); dirty = true; }
         }
       }
-      if (dirty) postViews(nv, localOps.length ? localOps : undefined);
+      // REMOTE-ONLY gestures post NO local write (the v1.3.24 audit's P2.9): the remoteTags
+      // mutation is derived presentation the kernel discards — the whole-blob post it used to
+      // ride bumped the rev over a byte-identical store and could 409 a real CAS write. The
+      // optimistic copy still shows instantly; the owner's next push is the durable truth.
+      if (dirty) {
+        if (localOps.length) postViews(nv, localOps);
+        else {
+          pendingSessionViews = nv; pendingViewsAge = 0;
+          if (activeId) assertPeekFor(activeId);
+          renderTabs();
+        }
+      }
     };
     tagsItem.addEventListener("click", (ev) => {
       ev.stopPropagation();

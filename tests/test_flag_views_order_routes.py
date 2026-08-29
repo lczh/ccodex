@@ -774,7 +774,8 @@ class R50UnionJournalLock(unittest.TestCase):
         import inspect
         src = inspect.getsource(km._union_ops_set)
         self.assertIn("with jd._identity_file_lock():", src)
-        self.assertLess(src.index("_identity_file_lock"), src.index("_union_ops_load()"),
+        self.assertLess(src.index("_identity_file_lock"),
+                        src.index('_read_state_json(_union_ops_path()'),
                         "the LOAD happens inside the lock — locking after reading is the bug")
 
 
@@ -1351,3 +1352,127 @@ class V1323MigrationAuthority(unittest.TestCase):
         self.assertEqual(v["actives"]["chat"], {"tags": ["nearpool"]},
                          "the supervisor retry lands the migration")
         self.assertEqual(km._pending_ref_migrations, [], "…and the intent retires")
+
+
+class R52ProvedReads(unittest.TestCase):
+    """the v1.3.24 audit's P1.1/P1.2 (and P2.6's sibling): every state writer folded ANY read
+    failure to empty and then published — one injected EIO deleted a seeded union gesture, and
+    a create acked success over a write that erased every existing tag. Only FileNotFoundError
+    means empty now; unreadable REFUSES; malformed quarantines aside."""
+
+    def setUp(self):
+        _scrub_state()
+        for pfn in (km._union_ops_path, km._ref_migrations_path):
+            try:
+                pfn().unlink()
+            except OSError:
+                pass
+        km._pending_ref_migrations[:] = []
+
+    def tearDown(self):
+        self.setUp()
+
+    class _BadPath:
+        def __init__(self, real):
+            self._real = real
+
+        def read_text(self):
+            raise OSError(5, "EIO")
+
+        def __getattr__(self, k):
+            return getattr(self._real, k)
+
+    def test_the_union_merge_refuses_an_unproved_read(self):
+        self.assertTrue(km._union_ops_set([{"host": "TESTHOST-A", "gid": 1, "edit": {},
+                                            "inverse": {}, "rt": {}, "name": "pool"}]))
+        real = km._union_ops_path
+        try:
+            km._union_ops_path = lambda: self._BadPath(real())
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                ok = km._union_ops_set([{"host": "TESTHOST-B", "gid": 2, "edit": {},
+                                         "inverse": {}, "rt": {}, "name": "crew"}])
+        finally:
+            km._union_ops_path = real
+        self.assertFalse(ok, "EIO used to read as an EMPTY journal — the merge then "
+                             "overwrote every valid gesture and returned success")
+        self.assertEqual([r["gid"] for r in km._union_ops_load()], [1],
+                         "the seeded gesture SURVIVES the refused merge")
+
+    def test_apply_views_ops_refuses_an_unproved_read(self):
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "", "members": []}}])
+        real = km._views_path
+        try:
+            km._views_path = lambda: self._BadPath(real())
+            with self.assertRaises(OSError):
+                km._apply_views_ops([{"create": {"id": "g2", "name": "crew",
+                                                 "color": "", "members": []}}])
+        finally:
+            km._views_path = real
+        self.assertEqual([t["name"] for t in km._timeline_views()["tags"]], ["pool"],
+                         "one transient EIO used to erase every existing tag and lens")
+
+    def test_set_timeline_views_refuses_an_unproved_read(self):
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "", "members": []}}])
+        real = km._views_path
+        try:
+            km._views_path = lambda: self._BadPath(real())
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                ok, rev = km._set_timeline_views({"active": "all", "tags": []})
+        finally:
+            km._views_path = real
+        self.assertFalse(ok)
+        self.assertIsNone(rev, "no rev is KNOWN — none is claimed")
+        self.assertEqual([t["name"] for t in km._timeline_views()["tags"]], ["pool"])
+
+    def test_malformed_views_json_is_quarantined_never_overwritten_silently(self):
+        km.jd.STATE.mkdir(parents=True, exist_ok=True)
+        km._views_path().write_text("{not json")
+        with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+            rev, confl = km._apply_views_ops([{"create": {"id": "g1", "name": "pool",
+                                                          "color": "", "members": []}}])
+        self.assertEqual([t["name"] for t in km._timeline_views()["tags"]], ["pool"],
+                         "a fresh store starts — corrupt content can never merge")
+        quarantined = list(km.jd.STATE.glob("timeline-views.json.corrupt-*"))
+        self.assertEqual(len(quarantined), 1, "…but the bytes survive for forensics")
+        for q in quarantined:
+            q.unlink()
+
+    def test_unreadable_intent_storage_is_never_clobbered(self):
+        km._ref_migrations_path().write_text(json.dumps(
+            [{"host": "TESTHOST-A", "name": "farpool", "new": "nearpool", "deleted": False}]))
+        real = km._ref_migrations_path
+        realp = real()
+        try:
+            km._ref_migrations_path = lambda: self._BadPath(realp)
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                km._queue_ref_migration({"host": "TESTHOST-B", "name": "crew",
+                                         "new": "squad", "deleted": False})
+        finally:
+            km._ref_migrations_path = real
+        rows = json.loads(km._ref_migrations_path().read_text())
+        self.assertEqual([r["name"] for r in rows], ["farpool"],
+                         "the committed intent SURVIVES — EIO used to read as 'nothing to "
+                         "adopt' and the queue replaced the file with only the newest intent")
+
+    def test_identical_whole_blob_writes_bump_nothing(self):
+        # the v1.3.24 audit's P2.9: remote-only chat edits repost the local blob (their
+        # remoteTags mutation is derived state the kernel discards) — rev advanced 1->2 over
+        # a byte-identical store and could 409 another client's real CAS write
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "", "members": []}}])
+        cur = km._timeline_views()
+        rev0 = cur["rev"]
+        blob = {k: json.loads(json.dumps(v)) for k, v in cur.items()
+                if k not in ("rev", "remoteTags")}
+        ok, rev = km._set_timeline_views(blob)
+        self.assertTrue(ok)
+        self.assertEqual(rev, rev0, "the store already holds this — nothing to claim")
+        self.assertEqual(km._timeline_views()["rev"], rev0)
+
+    def test_the_survival_check_rides_the_identity_transaction(self):
+        # the v1.3.24 audit's P2.7 (barrier-reproduced there): a local tag created between
+        # the survival check and the lock kept its name while the lens was rewritten
+        import inspect
+        src = inspect.getsource(km._apply_ref_migration)
+        self.assertLess(src.index("jd._identity_file_lock()"),
+                        src.index("_tag_name_survives_elsewhere"),
+                        "check, mutation and write share ONE identity-lock hold")
