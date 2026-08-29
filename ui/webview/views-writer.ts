@@ -146,11 +146,17 @@ export function consumeViewsAck(m: unknown,
 /** Transport reconnected (the v1.3.21 audit's P2.8): a send lost on the OLD socket — accepted
  *  by the browser, never delivered — left the one outstanding slot waiting forever, and the
  *  reconnect neither reloads this page nor replays it. The head is still queued (pump never
- *  drops it before its ack), and every write is safe to re-send: targeted ops are idempotent
- *  absolute gestures, and a blob re-post is CAS-protected. Reset the slot and re-post. */
+ *  drops it before its ack); targeted ops are idempotent absolute gestures and replay safely.
+ *  BLOBS DO NOT REPLAY (the r53 wave-3 verification, closing the same hole the retryable
+ *  branch closed): the re-post stamps baseRev at pump time — the fresh confirmedRev a foreign
+ *  commit may have raised while this page was dark — and the CAS accepts a blob rendered
+ *  before that commit, erasing it. "A blob re-post is CAS-protected" was exactly backwards:
+ *  the CAS protects the STORE only against bases that stayed put. The reconnect pushes fresh
+ *  payloads that re-derive the surface anyway. */
 export function notifyViewsTransportReset(): void {
   outstanding = 0;
   outstandingKind = null;
+  queue = queue.filter((w) => w.kind === "ops");
   pump();
 }
 

@@ -284,6 +284,23 @@ test("a RETRYABLE refusal holds the head and re-pumps on the next payload (r53 P
   assert.equal(sent.length, 2, "settled");
 });
 
+test("a transport reset REPLAYS ops but DROPS blobs — the reconnect twin of the retryable rule (r53 wave 3)", () => {
+  // the wave-3 verification: notifyViewsTransportReset re-pumped a held BLOB with baseRev
+  // stamped at pump time — the fresh confirmedRev a foreign commit raised while the socket
+  // was dark — and the CAS accepted a blob rendered before that commit, erasing it
+  resetViewsWriterForTest();
+  const sent: any[] = [];
+  anchorViewsRev({ rev: 7 });
+  postViewsWrite((m) => sent.push(m), { rev: 7, tags: [] } as any);
+  postViewsOps((m) => sent.push(m), [{ active: "all" }]);
+  assert.equal(sent.length, 1, "the blob is outstanding; the ops write queues behind it");
+  anchorViewsRev({ rev: 9 });          // a foreign commit lands while the socket is dark
+  notifyViewsTransportReset();
+  assert.equal(sent.length, 2, "exactly one replay");
+  assert.equal(sent[1].type, "setTimelineViewsOps",
+    "the composable ops head replays; the stale blob never re-posts at the raised rev");
+});
+
 test("a RETRYABLE refusal of a BLOB head DROPS it — never a re-post at a foreign-raised rev", () => {
   // the r53 verification round: the held blob's retry stamps baseRev at the LATER pump — the
   // very rev a foreign commit just raised — so the CAS accepts a blob rendered before that

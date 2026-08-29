@@ -1193,3 +1193,152 @@ test("executed: a dead writer's journaled-but-undispatched gesture is COMPLETED 
     "the completed rows flip dispatched — never re-run on a third sighting");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
 });
+
+test("executed: completion NEVER runs this panel's own still-gated gesture (r53 wave 3)", () => {
+  // the wave-3 verification: nothing excluded the panel's own pre-ack rows — two payload
+  // echoes before a slow ack completed the gesture, and the arriving ack's gated.run()
+  // dispatched it a second time
+  const wire: any[] = [];
+  const edits: any[] = [];
+  g.__rompTimelineEditTag = (e: any) => edits.push(e);
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();                        // gated, ack never arrives
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
+  assert.equal(edits.length, 0, "gated: nothing dispatched yet");
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  panel.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                         unionOps: journal }));
+  panel.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                         unionOps: journal }));
+  assert.equal(edits.length, 0, "TWO sightings of our own gated rows complete NOTHING");
+  assert.ok((panel._unionOps || []).every((o: any) => o.dispatched === false),
+    "…and the rows stay undispatched until OUR ack releases the gate");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: completion is postimage-aware and dispatches under a FRESH id (r53 wave 3)", () => {
+  // the wave-3 verification's P1 pair: two bystander panels complete the same dead writer's
+  // gesture near-simultaneously — the duplicate rename targets the old, now-gone name, and
+  // its gid-correlated refusal rolled the SETTLED gesture back on every other host. Applied
+  // halves are marked confirmed (never re-dispatched); what does dispatch wears a fresh id,
+  // so a refused duplicate is loud, never a compensation.
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();                        // the dead writer
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
+  const gid = journal[0].gid;
+  const panel2 = drawnPanel();                       // the adopter
+  const calls: any[] = [];
+  panel2._editRemoteTag = (rt: any, edit: any, g2: any) => { calls.push({ rt, edit, g2 }); return true; };
+  const polled = JSON.parse(JSON.stringify(VIEWS));
+  polled.remoteTags[0].members = [];                 // TESTHOST-A already APPLIED the remove
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(polled)),
+                                          unionOps: journal }));
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(polled)),
+                                          unionOps: journal }));
+  assert.equal(calls.length, 1, "the applied half is CONFIRMED, never re-dispatched");
+  assert.equal(calls[0].rt.host, "TESTHOST-B", "…only the genuinely-missing half dispatches");
+  assert.ok(calls[0].g2 && calls[0].g2 !== gid,
+    "…under a FRESH id (the r47 rule): its refusal is loud, never a rollback of the gesture");
+  const aRow = (panel2._unionOps || []).find((o: any) => o.host === "TESTHOST-A" && o.gid === gid);
+  assert.equal(aRow.confirmed, true, "the applied half carries its confirmation");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: an echo saying dispatched:true refreshes held rows — no completion, no regression (r53 wave 3)", () => {
+  // the wave-3 verification's P1.3: adopters kept dispatched:false copies forever, their
+  // full-replace syncs regressed the journal, and the completion pass re-ran a live writer's
+  // executed gesture
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
+  const panel2 = drawnPanel();
+  const calls: any[] = [];
+  panel2._editRemoteTag = (rt: any, edit: any, g2: any) => { calls.push(g2); return true; };
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: journal }));           // adopts, sighting 1
+  const flipped = journal.map((o: any) => Object.assign({}, o, { dispatched: true }));
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: flipped }));           // the writer's flip
+  assert.equal(calls.length, 0, "a flipped echo means a LIVE writer — nothing completes");
+  assert.ok((panel2._unionOps || []).every((o: any) => o.dispatched === true),
+    "…and the held copies converge to true, so this panel's own sync never regresses the journal");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: the lapplied latch is reachable DURING the confirmation window — a re-add survives (r53 wave 3)", () => {
+  // the wave-3 verification's P2: latching only at done-time was unreachable (the local leg
+  // applies instantly, remotes confirm payloads later) — a user re-adding the member in that
+  // window read as 'pre' at done-time and the retry silently re-removed it
+  const wire: any[] = [];
+  const viewWrites: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = (v: any) => viewWrites.push(v);
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  autoAckUnion(panel);
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });       // local leg applies now
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  const during = JSON.parse(JSON.stringify(VIEWS));
+  during.tags[0].members = ["s2"];                   // local postimage; remotes NOT yet confirmed
+  panel.update(Object.assign({}, base, { views: during }));
+  assert.ok((panel._unionOps || []).some((o: any) => o.lapplied === true),
+    "the latch fires while remotes are still confirming — not only at done-time");
+  const writesBefore = viewWrites.length;
+  const after = JSON.parse(JSON.stringify(VIEWS));
+  after.tags[0].members = ["s1", "s2"];              // the user RE-ADDED s1…
+  after.remoteTags[0].members = [];
+  after.remoteTags[1].members = [];                  // …and the remotes confirm
+  panel.update(Object.assign({}, base, { views: after }));
+  assert.equal(viewWrites.length, writesBefore,
+    "no retry re-removes the re-added member — the latch says this leg already settled");
+  assert.equal((panel._unionOps || []).length, 0, "…and the group retires");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: deleting the panel's LAST local tag still retires — absence is a delete's postimage (r53 wave 3)", () => {
+  // the wave-3 verification's immortal-rows pair: the unconditional empty-tags hold could not
+  // tell a store fault from the one gesture class whose postimage IS the empty list
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  autoAckUnion(panel);
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { delete: true });
+  const gid = (panel._unionOps || [])[0].gid;
+  const polled = JSON.parse(JSON.stringify(VIEWS));
+  polled.tags = [];                                  // the delete's own local postimage
+  polled.remoteTags = [];                            // both owners applied the delete
+  panel.update({ now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [], views: polled });
+  assert.equal((panel._unionOps || []).length, 0, "the all-confirmed delete retires");
+  assert.ok(wire[wire.length - 1].retired.indexOf(gid) >= 0,
+    "…and the retirement reaches the kernel — never an immortal journal group");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});

@@ -2181,6 +2181,17 @@ def _union_ops_set(entries, retired=None):
             return False
         cur = [r for r in _raw if isinstance(r, dict)] if isinstance(_raw, list) else []
         inc = [r for r in (entries if isinstance(entries, list) else []) if isinstance(r, dict)]
+        # the DISPATCH RATCHET (the r53 wave-3 verification): 'the effects ran' is one-way
+        # evidence — an adopter panel's full-replace mirror of rows it seeded BEFORE the
+        # writer's dispatched:true flip regressed the journal to false and re-armed the
+        # completion pass into re-running an executed gesture. A stored true never regresses.
+        _cur_by_key = {(r.get("gid"), r.get("host")): r for r in cur if not r.get("refusal")}
+        inc = [dict(r, dispatched=True)
+               if (not r.get("refusal") and r.get("dispatched") is False
+                   and (_cur_by_key.get((r.get("gid"), r.get("host"))) or
+                        {"dispatched": False}).get("dispatched") is not False)
+               else r
+               for r in inc]
         ret = set()
         for g in (retired if isinstance(retired, list) else []):
             try:
@@ -2205,6 +2216,41 @@ def _union_ops_set(entries, retired=None):
             return True
         except Exception:
             sys.stderr.write("union-gestures save: %s\n" % traceback.format_exc())
+            return False
+
+
+def _union_ops_mark_dispatched(gid):
+    """An arriving editTag whose opId is a journal gesture id IS the dispatch evidence (the
+    r53 wave-3 verification): the writer's own dispatched:true re-post can be lost — a dying
+    webview, a refused flip write — and the stale-false rows re-armed the adoption-completion
+    pass into re-running an executed gesture (a duplicate rename targets the old, now-gone
+    name; its refusal rolled a settled edit back). Event-exact and authoritative: the dispatch
+    itself proves dispatch. Best-effort — a failed flip leaves the client-side flip as the
+    remaining writer, and the completion pass's postimage guards as the backstop."""
+    try:
+        gid = int(gid)
+    except (TypeError, ValueError):
+        return False
+    if gid <= 0:
+        return False
+    with jd._identity_file_lock():
+        try:
+            _raw = _read_state_json(_union_ops_path(), "union-gestures")
+        except OSError:
+            return False
+        rows = [r for r in _raw if isinstance(r, dict)] if isinstance(_raw, list) else []
+        hit = False
+        for r in rows:
+            if not r.get("refusal") and r.get("gid") == gid and r.get("dispatched") is False:
+                r["dispatched"] = True
+                hit = True
+        if not hit:
+            return True
+        try:
+            _atomic_write(_union_ops_path(), json.dumps(rows))
+            return True
+        except Exception:
+            sys.stderr.write("union-gestures dispatch flip: %s\n" % traceback.format_exc())
             return False
 
 
@@ -2892,8 +2938,14 @@ def _heal_timeline_views(old_sid, new_sid):
             # once that intent lands, so "not tagged" is not yet moot. Queue this hop behind
             # it; the flush replays both in order and the membership walks the whole chain.
             with _pending_heals_lock:
-                _adopt_heals_locked()
-                chained = any(str(r.get("new") or "") == str(old_sid) for r in _pending_heals)
+                _adopted_ok = _adopt_heals_locked()
+                # a FAILED adoption is no information (the r53 wave-3 verification: a restart
+                # with the intent file unreadable scanned an empty memory list, read a real
+                # second hop as moot, and dropped it) — queue conservatively; a spurious
+                # intent moots itself at flush once the file is readable again
+                chained = ((not _adopted_ok)
+                           or any(str(r.get("new") or "") == str(old_sid)
+                                  for r in _pending_heals))
             if chained:
                 _queue_heal_intent(old_sid, new_sid)
                 return False
@@ -33849,6 +33901,12 @@ class Handler(BaseHTTPRequestHandler):
                 if e.get("delete") is True:
                     # never coerce: string "false" DELETED a remote tag (the v1.3.19 audit)
                     body["delete"] = True
+                # the journal's dispatched flip rides the dispatch itself (r53 wave 3) —
+                # BEFORE the forward, which can block for seconds on a slow owner
+                try:
+                    _union_ops_mark_dispatched(op_id)
+                except Exception:
+                    sys.stderr.write("editTag dispatch flip: %s\n" % traceback.format_exc())
                 ans, err = _forward_tag_edit(host, body)
                 if err or not (ans or {}).get("ok", False):
                     _rmsg = err or (ans or {}).get("error") or "refused"

@@ -3158,9 +3158,22 @@ def _bounce_apply(host, b):
     try:
         msg = outbox_get(host, mid)
     except _OutboxUnreadable:
-        # the record exists but cannot be read (r53 P2.10's siblings): the return note needs
-        # the message body — defer whole; the peer re-sends the bounce on a later exchange
-        _log("bounce for %s/%s deferred: the outbox record is unreadable" % (host, mid))
+        # the record exists but cannot be read. "Defer" here would be a DROP (the r53 wave-3
+        # verification): the exchange 200s this bounce regardless, so the peer marks it
+        # delivered and never re-sends — and outbox_list quarantines the unreadable record
+        # in the SAME pass, so no later retry can read it either. File the terminal receipt
+        # NOW (the parked accounting must not claim mail the peer refused) and say out loud
+        # that the return note could not be composed — the sender's copy is unreadable.
+        code = rows[0]["code"]
+        if _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "bounced", "id": mid,
+                                         "to": "?", "host": host, "code": code,
+                                         "why": _bounce_reason(code)}):
+            outbox_del(host, mid)
+            _log("bounce for %s/%s: record unreadable — receipt filed; the return note to "
+                 "the sender was lost with it" % (host, mid))
+        else:
+            _log("bounce for %s/%s: record unreadable AND the receipt append failed — "
+                 "kept for the next exchange" % (host, mid))
         return
     if not msg:
         return
@@ -3520,9 +3533,12 @@ def _bounce_arrived(host, b):
     try:
         msg = outbox_get(host, mid)
     except _OutboxUnreadable:
-        # forwarded-or-ours is undecidable over an unproved read — defer; the peer re-sends
-        # the bounce on a later exchange (r53 P2.10's siblings)
-        _log("bounce for %s/%s deferred: the outbox record is unreadable" % (host, mid))
+        # forwarded-or-ours is undecidable over an unproved read, and "defer" is a drop (the
+        # exchange 200s the bounce; the peer never re-sends). Treat it as ours: _bounce_apply's
+        # unreadable arm files the terminal receipt and is loud about the lost return note —
+        # if it WAS a forward, the origin sees its own parked accounting settle on the 7-day
+        # phantom side rather than a silent forever-parked row.
+        _bounce_apply(host, bounce)
         return
     if msg and msg.get("origin"):
         p = _pending(msg["origin"])

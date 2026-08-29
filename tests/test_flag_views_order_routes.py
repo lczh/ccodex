@@ -1740,6 +1740,65 @@ class R53VerifyRound(unittest.TestCase):
         self.assertIn(self.NEW, members, "…and the chained hop walked the membership through")
         self.assertFalse(km._heals_path().exists(), "both intents retired")
 
+    def test_the_merge_ratchets_dispatched_true(self):
+        # the r53 wave-3 verification: an adopter panel's full-replace mirror of rows it
+        # seeded BEFORE the writer's flip regressed the journal to dispatched:false and
+        # re-armed the completion pass into re-running an executed gesture
+        self.assertTrue(km._union_ops_set([{"host": "TESTHOST-A", "gid": 9, "edit": {},
+                                            "inverse": {}, "rt": {}, "name": "pool",
+                                            "dispatched": True}]))
+        self.assertTrue(km._union_ops_set([{"host": "TESTHOST-A", "gid": 9, "edit": {},
+                                            "inverse": {}, "rt": {}, "name": "pool",
+                                            "dispatched": False}]))
+        rows = km._union_ops_load()
+        self.assertEqual([r["dispatched"] for r in rows], [True],
+                         "'the effects ran' is one-way evidence — a merge never regresses it")
+        # …but a FRESH row's false is honest state, not a regression
+        self.assertTrue(km._union_ops_set([{"host": "TESTHOST-B", "gid": 9, "edit": {},
+                                            "inverse": {}, "rt": {}, "name": "pool",
+                                            "dispatched": False}]))
+        rows = {r["host"]: r["dispatched"] for r in km._union_ops_load()}
+        self.assertEqual(rows, {"TESTHOST-A": True, "TESTHOST-B": False})
+
+    def test_an_arriving_dispatch_flips_the_journal(self):
+        # the r53 wave-3 verification: the writer's own dispatched:true re-post can be lost
+        # (a dying webview, a refused flip write) — the arriving editTag carrying the gid as
+        # opId IS the dispatch evidence, flipped kernel-side before the (possibly slow) forward
+        self.assertTrue(km._union_ops_set([
+            {"host": "TESTHOST-A", "gid": 11, "edit": {}, "inverse": {}, "rt": {},
+             "name": "pool", "dispatched": False},
+            {"host": "TESTHOST-B", "gid": 11, "edit": {}, "inverse": {}, "rt": {},
+             "name": "pool", "dispatched": False},
+            {"refusal": True, "gid": -11, "opId": "11", "host": "TESTHOST-A",
+             "name": "pool", "t": int(__import__("time").time())}]))
+        self.assertTrue(km._union_ops_mark_dispatched("11"))
+        rows = km._union_ops_load()
+        self.assertEqual([r.get("dispatched") for r in rows if not r.get("refusal")],
+                         [True, True])
+        self.assertNotIn("dispatched", [k for r in rows if r.get("refusal") for k in
+                                        ("dispatched",) if k in r],
+                         "refusal rows are events, never flipped")
+        self.assertFalse(km._union_ops_mark_dispatched("web7"),
+                         "a web-minted opId names no gesture")
+        self.assertFalse(km._union_ops_mark_dispatched(-11))
+        # …and the editTag handler flips BEFORE the forward, which can block for seconds
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        i_flip = src.index("_union_ops_mark_dispatched(op_id)")
+        i_fwd = src.index("ans, err = _forward_tag_edit(host, body)")
+        self.assertLess(i_flip, i_fwd, "arrival is the event — the flip never waits on the owner")
+
+    def test_a_failed_adoption_queues_the_chained_heal_conservatively(self):
+        # the r53 wave-3 verification: a restart with the intent file unreadable scanned an
+        # EMPTY memory list, read a real second hop as moot, and dropped it forever
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "",
+                                         "members": [self.OLD]}}])
+        km._heals_path().mkdir(parents=True, exist_ok=True)   # unreadable: reads raise OSError
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok = km._heal_timeline_views(self.MID, self.NEW)
+        self.assertIs(ok, False, "no adoption = no information — never moot")
+        self.assertIn({"old": self.MID, "new": self.NEW}, km._pending_heals,
+                      "the hop is queued; a spurious intent moots itself at flush")
+
     def test_a_truly_unknown_sid_is_still_moot(self):
         # the chained check must not turn every unknown-sid heal into an immortal intent
         km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "",

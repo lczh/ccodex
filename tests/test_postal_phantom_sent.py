@@ -528,10 +528,11 @@ class R53ProvedRetirement(unittest.TestCase):
         fixed = pm._reconcile_phantom_sent(now=self.now)
         self.assertEqual(fixed, 1, "the phantom past the [] row is still found and filed")
 
-    def test_an_unreadable_record_defers_the_bounce(self):
-        # the r53 verification round (P2.10's siblings): _bounce_arrived and _bounce_apply
-        # called outbox_get bare — one unreadable record raised through the exchange batch,
-        # killing every OTHER host's acks and bounces queued behind it
+    def test_an_unreadable_record_still_files_the_bounce_receipt(self):
+        # the r53 verification round found the raise (killing the exchange batch); wave 3
+        # found the "defer" that replaced it was a DROP — the exchange 200s the bounce so the
+        # peer never re-sends, and outbox_list quarantines the record in the SAME pass. The
+        # receipt files NOW; only the return note (whose body is unreadable) is lost, loudly.
         f = self.hd / "px-405.1_ee.TESTHOST.json"
         f.write_text(json.dumps({"mid": "px-405.1_ee.TESTHOST", "body": "hi",
                                  "frm_id": "77777777-8888-9999-aaaa-bbbbbbbbbbbb"}))
@@ -540,11 +541,13 @@ class R53ProvedRetirement(unittest.TestCase):
             pm._bounce_arrived("TESTHOST2", {"mid": "px-405.1_ee.TESTHOST",
                                              "code": "recipient-unavailable"})
         finally:
-            os.chmod(f, 0o644)
-        self.assertTrue(f.exists(), "deferred whole — the peer re-sends the bounce; the "
-                                    "retry source survives")
-        self.assertEqual([r for r in _rows() if r.get("ev") == "bounced"], [],
-                         "no terminal row over an unproved read")
+            if f.exists():
+                os.chmod(f, 0o644)
+        bounced = [r for r in _rows() if r.get("ev") == "bounced"]
+        self.assertEqual([r["id"] for r in bounced], ["px-405.1_ee.TESTHOST"],
+                         "the terminal receipt files — parked accounting must not claim "
+                         "mail the peer refused")
+        self.assertFalse(f.exists(), "…and the unreadable record retires with it")
 
     def test_an_unreadable_record_still_reads_as_parked(self):
         # the r53 verification round: check_sent's parked probe raised through the whole

@@ -1686,23 +1686,53 @@ class TimelinePanel {
       // COMPLETE journaled-but-undispatched gestures (the r53 round: a webview reload between
       // the journal ack and the gated dispatch stranded effect-less immortal rows). One full
       // echo cycle of patience — the row must show dispatched:false on TWO payload sightings —
-      // so a live writer's own flip (sub-second after its ack) always wins the race; only a
-      // gesture whose writer died gets completed here. Idempotent: remote edits and local ops
-      // are absolute, and the postimage guards protect any compensation.
+      // and the kernel flips the flag the moment any dispatch ARRIVES (the wire's editTag
+      // carries the gid as opId), so a live writer's gesture reads dispatched:true here long
+      // before two sightings can accrue; only a gesture whose writer died before dispatching
+      // ANYTHING gets completed. Completion is defensive against its residual races (the r53
+      // wave-3 verification: two open bystander panels complete the same dead writer's
+      // gesture near-simultaneously by construction):
+      //  - never our OWN still-gated gesture (the gate's ack owns it),
+      //  - an already-applied half is marked confirmed, never re-dispatched (a duplicate
+      //    rename targets the old, now-gone name — its refusal rolled a SETTLED edit back),
+      //  - the dispatch carries a FRESH id, the compensation dispatch's rule (r47): a
+      //    refused duplicate is loud, never a rollback of the gesture it duplicates,
+      //  - the local leg applies only from its verified preimage.
+      const gatedNow = new Set();
+      for (const k in (this._gatedDispatches || {}))
+        for (const g3 of this._gatedDispatches[k].gids) gatedNow.add(g3);
+      // one-way refresh of HELD rows (the same wave-3 round: adopters kept dispatched:false
+      // copies forever, and their full-replace syncs regressed the journal — the kernel-side
+      // merge ratchet is the durable half; this converges the in-memory mirrors)
+      for (const o of data.unionOps) {
+        if (!o || o.refusal || !o.gid || o.dispatched === false) continue;
+        if (gatedNow.has(o.gid)) continue;     // our own pre-ack state is ours alone
+        for (const x of (this._unionOps || []))
+          if (x.gid === o.gid && x.host === o.host && x.dispatched === false)
+            x.dispatched = true;
+      }
       if (!this._undispatchedSeen) this._undispatchedSeen = new Set();
       const undispatchedNow = new Set();
       for (const o of data.unionOps) {
         if (!o || o.refusal || !o.gid || o.dispatched !== false) continue;
+        if (gatedNow.has(o.gid)) continue;
         undispatchedNow.add(o.gid);
         if (!this._undispatchedSeen.has(o.gid)) continue;
         const group = (this._unionOps || []).filter((x) => x.gid === o.gid);
         if (!group.length || group.some((x) => x.dispatched !== false)) continue;
+        const rts3 = (this._views && this._views.remoteTags) || [];
         for (const x of group) {
           x.dispatched = true;
-          this._editRemoteTag(x.rt, Object.assign({}, x.edit), x.gid);
+          if (this._unionOpApplied(x, rts3)) { x.confirmed = true; continue; }
+          this._editRemoteTag(x.rt, Object.assign({}, x.edit), ++unionGestureSeq);
         }
         const repl = group.find((x) => x.lop);
-        if (repl) this._applyLocalOp(repl.lop);
+        if (repl) {
+          const lt3 = (this._views && (this._views.tags || this._views.groups)) || [];
+          const st3 = this._unionLocalStateGuarded(repl, lt3);
+          if (st3 === 'pre') this._applyLocalOp(repl.lop);
+          else if (st3 === 'applied') for (const x of group) x.lapplied = true;
+        }
         this._unionSyncDirty = true;
         took = true;
       }
@@ -3128,31 +3158,41 @@ class TimelinePanel {
         gidDone.set(g, false);
         continue;
       }
-      if (!done) continue;
       const rep = this._unionOps.find((o) => o.gid === g && o.lop);
-      if (!rep) continue;
-      if (!localTags.length) {
-        // an EMPTY tags list is indistinguishable from a store fault folded to nothing by
-        // the payload's lenient reader (the r53 round: it read as 'superseded' and the group
-        // retired, deleting the recovery record on zero information) — hold, judge nothing
+      if (!rep) { continue; }                   // no local leg — the remote evidence decides
+      const st = this._unionLocalStateGuarded(rep, localTags);
+      if (st === 'applied' && !rep.lapplied) {
+        // LATCH the observed postimage EVERY pass, not only once the remotes confirm (the
+        // r53 wave-3 verification: latching at done-time was unreachable — the local leg
+        // applies instantly, remotes confirm payloads later, and a user re-add in that
+        // window read as 'pre' at done-time; the retry silently re-removed it)
+        for (const o of this._unionOps) if (o.gid === g) o.lapplied = true;
+      }
+      if (!done) continue;
+      if (st === null) {
+        // no local information this payload (the guarded read) — hold, judge nothing
         gidDone.set(g, false);
         continue;
       }
-      const st = this._unionLocalState(rep, localTags);
-      if (st === 'applied') {
-        // LATCH the observed postimage (the r53 round: a user re-adding the member during
-        // the confirmation window read as 'pre' forever, and the retry silently re-removed
-        // it payload after payload)
-        for (const o of this._unionOps) if (o.gid === g) o.lapplied = true;
-        continue;
-      }
-      if (st === 'superseded' || rep.lapplied) continue;
+      if (st === 'applied' || st === 'superseded' || rep.lapplied) continue;
       gidDone.set(g, false);                    // not settled: the local leg is outstanding
       this._applyLocalOp(rep.lop);              // the payload-paced retry (an event, no timer)
     }
     const before = this._unionOps.length;
     this._unionOps = this._unionOps.filter((o) => (o.gid ? !gidDone.get(o.gid) : !o.confirmed));
     if (this._unionOps.length !== before) this._syncUnionOps();   // groups retired (P1.5)
+  }
+
+  // the settlement/completion entry point: an EMPTY tags list is indistinguishable from a
+  // store fault folded to nothing by the payload's lenient reader (the r53 round: it read as
+  // 'superseded' and the group retired, deleting the recovery record on zero information) —
+  // null means "no information, judge nothing". EXCEPT a local DELETE, whose own postimage
+  // is exactly the absence (the r53 wave-3 verification: the unconditional hold made a
+  // delete of the panel's last local tag immortal — its rows re-adopted by every panel
+  // forever, the exact unbounded-journal class the retention rules exist to prevent).
+  _unionLocalStateGuarded(rep, localTags) {
+    if (!localTags.length) return (rep.lop && rep.lop.delete) ? 'applied' : null;
+    return this._unionLocalState(rep, localTags);
   }
 
   // where the RAW local store stands relative to a gesture's local op: 'applied' (postimage),
