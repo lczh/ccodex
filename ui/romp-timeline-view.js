@@ -2928,10 +2928,12 @@ class TimelinePanel {
     this._unionSyncDirty = false;
     const opId = 'u' + (++unionGestureSeq);
     const want = { retired: retired.filter((g) => !tomb.includes(g)), tomb: tomb };
+    let sent = false;
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineSetUnionOps === 'function') {
         this._pendingUnionSyncs[opId] = want;
         window.__rompTimelineSetUnionOps(entries, retired, opId);
+        sent = true;
       } else if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
         // SERIALIZED like _setViews' spool (the r50 round): bare concurrent fetches let a
         // later sync's tombstone land BEFORE an earlier sync's upsert, resurrecting the
@@ -2942,8 +2944,10 @@ class TimelinePanel {
             .then((r) => this.unionOpsAck({ ok: r.ok === true, opId: opId }))
             .catch(() => this.unionOpsAck({ ok: false, opId: opId }))
         );
+        sent = true;
       }
     } catch (e) { /* best-effort: the in-memory journal still runs this panel's lifetime */ }
+    return sent ? opId : null;   // the r53 ack-gate keys the gesture's dispatch on THIS send
   }
 
   // the kernel's answer to one _syncUnionOps post (r50): ok settles exactly the retirements
@@ -2955,7 +2959,19 @@ class TimelinePanel {
     const p = m && m.opId && this._pendingUnionSyncs ? this._pendingUnionSyncs[m.opId] : null;
     if (!p) return;                                    // a late twin of a superseded sync
     delete this._pendingUnionSyncs[m.opId];
+    const gated = this._gatedDispatches ? this._gatedDispatches[m.opId] : null;
+    if (this._gatedDispatches) delete this._gatedDispatches[m.opId];
     if (m.ok === false) {
+      if (gated) {
+        // the r53 audit's P1.4: the gesture's effects were DISPATCHED before the journal's
+        // persistence was known — with the journal refused, remote edits and the local
+        // commit ran with no durable rollback record anywhere. The gesture drops WHOLE:
+        // nothing began, nothing splits; the reason shows.
+        this._unionOps = (this._unionOps || []).filter((o) => gated.gids.indexOf(o.gid) < 0);
+        this._tagEditErr = { host: '', name: gated.name || '',
+          error: 'the edit was not applied — its safety record could not be saved; retry' };
+        this.draw();
+      }
       this._unionSyncDirty = true;
       // ONE direct retry per failure streak (the v1.3.23 audit's P1.3): the dirty flag alone
       // waited for an UNRELATED future payload to re-send — on a quiet kernel the journal sat
@@ -2970,6 +2986,7 @@ class TimelinePanel {
     this._unionRetryPending = false;
     for (const g of (p.retired || [])) { if (this._journaledGids) this._journaledGids.delete(g); }
     for (const g of (p.tomb || [])) { if (this._retireUnionGids) this._retireUnionGids.delete(g); }
+    if (gated) gated.run();   // the journal is DURABLE — the gesture's effects may now run (r53)
   }
 
   // Transport reconnected (the v1.3.23 audit's P1.3 — the views writer's P2.8, union twin): a
@@ -2981,10 +2998,20 @@ class TimelinePanel {
     this._pendingUnionSyncs = {};
     this._unionRetryPending = false;
     this._unionSyncDirty = true;
-    this._syncUnionOps();
+    const held = this._gatedDispatches ? Object.values(this._gatedDispatches) : [];
+    this._gatedDispatches = {};
+    const opId = this._syncUnionOps();
+    if (held.length) {
+      // gestures gated on acks that died with the socket re-gate on the REPLAY's ack (r53):
+      // their entries ride the fresh full-replace sync, so one ok releases them all
+      const run = () => held.forEach((g) => g.run());
+      const gids = held.reduce((a, g) => a.concat(g.gids), []);
+      if (opId) this._gatedDispatches[opId] = { run: run, gids: gids, name: held[0].name };
+      else run();
+    }
   }
 
-  _noteUnionOp(rt, name, inverse, edit, gid) {
+  _noteUnionOp(rt, name, inverse, edit, gid, opts) {
     if (!this._unionOps) this._unionOps = [];
     // rt + gid + the PRE-edit name/color ride the entry (the v1.3.18 audit's P2): a SIBLING
     // host's refusal compensates this host by dispatching the inverse REMOTE edit, and by that
@@ -2999,8 +3026,12 @@ class TimelinePanel {
     if (edit && edit.color) post.color = edit.color;
     this._unionOps.push({ host: rt.host || '', name: name || '', inverse: inverse,
                           edit: edit || {}, rt: rt, gid: gid || 0,
-                          oldName: rt.name || '', oldColor: rt.color || '', post: post });
-    this._syncUnionOps();                              // durable the moment it exists (P1.5)
+                          oldName: rt.name || '', oldColor: rt.color || '', post: post,
+                          lop: (opts && opts.lop) || null });
+    // `lop` is the gesture's LOCAL op (the r53 audit's P1.5: settlement judged only remote
+    // postimages — a refused local write dropped its overlay, the group retired as done, and
+    // the recovery record was gone while local still held the members)
+    if (!(opts && opts.defer)) this._syncUnionOps();   // durable the moment it exists (P1.5)
   }
 
   _reconcileUnionOps() {
@@ -3021,9 +3052,49 @@ class TimelinePanel {
       const g = o.gid || 0;
       gidDone.set(g, (gidDone.has(g) ? gidDone.get(g) : true) && !!o.confirmed);
     }
+    // the LOCAL leg is a participant too (the r53 audit's P1.5, executed: both remotes
+    // applied, the local write was refused, and the group retired — the recovery record
+    // explicitly deleted while local still held the members). A gesture with a local op
+    // settles only when the RAW local store shows its postimage; remotes-done with the local
+    // at PREIMAGE re-posts the local op, payload-paced; a THIRD value means a newer gesture
+    // owns the atom (the postimage rule) and this leg is settled by supersession.
+    const localTags = (this._views && (this._views.tags || this._views.groups)) || [];
+    for (const [g, done] of Array.from(gidDone.entries())) {
+      if (!g || !done) continue;
+      const rep = this._unionOps.find((o) => o.gid === g && o.lop);
+      if (!rep) continue;
+      const st = this._unionLocalState(rep, localTags);
+      if (st === 'applied' || st === 'superseded') continue;
+      gidDone.set(g, false);                    // not settled: the local leg is outstanding
+      this._applyLocalOp(rep.lop);              // the payload-paced retry (an event, no timer)
+    }
     const before = this._unionOps.length;
     this._unionOps = this._unionOps.filter((o) => (o.gid ? !gidDone.get(o.gid) : !o.confirmed));
     if (this._unionOps.length !== before) this._syncUnionOps();   // groups retired (P1.5)
+  }
+
+  // where the RAW local store stands relative to a gesture's local op: 'applied' (postimage),
+  // 'pre' (preimage — retryable), 'superseded' (a THIRD value: a newer gesture owns the atom
+  // — retrying over it is the rollback bug class the postimage rule exists to end). The
+  // entry's inverse carries the local PREIMAGE (rename/color), so the three states separate.
+  _unionLocalState(rep, localTags) {
+    const lop = rep.lop || {};
+    const inv = rep.inverse || {};
+    const t = localTags.find((x) => x.id === lop.tag || x.name === lop.tag);
+    if (lop.delete) return t ? 'pre' : 'applied';
+    if (!t) return 'superseded';                 // the tag itself is gone: nothing to retry
+    if (lop.remove) {
+      return lop.remove.some((m) => (t.members || []).indexOf(m) >= 0) ? 'pre' : 'applied';
+    }
+    if (lop.rename) {
+      if (t.name === lop.rename) return 'applied';
+      return t.name === inv.rename ? 'pre' : 'superseded';
+    }
+    if (lop.color) {
+      if (t.color === lop.color) return 'applied';
+      return t.color === inv.color ? 'pre' : 'superseded';
+    }
+    return 'applied';
   }
 
   _unionOpApplied(o, rts) {
@@ -3080,47 +3151,52 @@ class TimelinePanel {
       } else if (g.remotes.length) this._editRemoteTag(g.remotes[0], { add: edit.add.slice() }, gid);
     }
     if (edit.remove && edit.remove.length) {
-      // the JOURNAL before any effect (the v1.3.24 audit's P1.4, executed with a synthetic
-      // stop: remote dispatches, then the local op, THEN the note — a renderer death after
-      // the local dispatch left applied changes with zero journal rows and no durable
-      // rollback information). Entries are durable first; a failed INITIATION retracts them
-      // (nothing dispatched — there is nothing to compensate).
+      // the JOURNAL before any effect, and the effects behind its ACK (the v1.3.24 audit's
+      // P1.4 + the r53 audit's P1.4: sends were fired and the effects ran before any
+      // persistence was acknowledged — with every ack forced false, remote-A, remote-B and
+      // the local commit had all executed). Entries cover EVERY multi-owner participant (the
+      // r53 audit's P1.3: journaling only behind willLocal left a two-owner remote-only
+      // gesture with zero rows — A applied, B refused, A never rolled back).
       const candidates = g.remotes.filter((rt) =>
         (rt.members || []).some((m) => edit.remove.indexOf(m) >= 0));
       const lt0 = g.localId ? viewTags(this._curViews()).find((x) => x.id === g.localId) : null;
       const willLocal = !!(lt0 && (lt0.members || []).some((m) => edit.remove.indexOf(m) >= 0));
       const had = willLocal ? (lt0.members || []).filter((m) => edit.remove.indexOf(m) >= 0) : [];
-      if (willLocal)
+      const lop = willLocal ? { tag: g.localId, remove: edit.remove.slice() } : null;
+      const journal = candidates.length && (candidates.length + (willLocal ? 1 : 0)) >= 2;
+      const dispatch = () => {
+        let removeOk = true;
         for (const rt of candidates)
-          this._noteUnionOp(rt, g.name, { tag: g.localId, add: had.slice() },
-                            { remove: edit.remove.slice() }, gid);
-      // REMOTE halves next: an initiation that cannot even reach its owner must not leave the
-      // local half committed — "a removal never half-works" (the v1.3.16 audit's P2.16 repro
-      // deleted the local copy while the remote edit returned false)
-      let removeOk = true;
-      for (const rt of candidates)
-        removeOk = this._editRemoteTag(rt, { remove: edit.remove.slice() }, gid) && removeOk;
-      if (!removeOk) {
-        // no transport at all (the sync-failure case): nothing left this panel — the
-        // journaled intent describes a gesture that never began, so it retracts
-        this._unionOps = (this._unionOps || []).filter((o) => o.gid !== gid);
-        this._syncUnionOps();
-      } else if (willLocal) {
-        const nv = JSON.parse(JSON.stringify(this._curViews()));
-        const t = viewTags(nv).find((x) => x.id === g.localId);
-        if (t) {
-          t.members = (t.members || []).filter((m) => edit.remove.indexOf(m) < 0);
-          this._setViews(nv, [{ tag: g.localId, remove: edit.remove.slice() }]);
+          removeOk = this._editRemoteTag(rt, { remove: edit.remove.slice() }, gid) && removeOk;
+        if (!removeOk) {
+          // no transport at all: nothing left this panel — the journaled intent describes a
+          // gesture that never began, so it retracts
+          this._unionOps = (this._unionOps || []).filter((o) => o.gid !== gid);
+          this._syncUnionOps();
+        } else if (willLocal) {
+          this._applyLocalOp(lop);
         }
-      }
+      };
+      if (journal) {
+        for (const rt of candidates)
+          this._noteUnionOp(rt, g.name,
+                            willLocal ? { tag: g.localId, add: had.slice() } : {},
+                            { remove: edit.remove.slice() }, gid,
+                            { defer: true, lop: lop });
+        const opId = this._syncUnionOps();
+        if (opId) {
+          this._gatedDispatches = this._gatedDispatches || {};
+          this._gatedDispatches[opId] = { run: dispatch, gids: [gid], name: g.name };
+        } else dispatch();   // no journal transport exists — nothing durable is possible
+      } else dispatch();
     }
     if (edit.rename || edit.color || edit.delete) {
-      // the same journal-before-effects order (the v1.3.24 audit's P1.4): the plan — op,
-      // inverse, postimages — is computed from the PREIMAGE, journaled durably, and only
-      // then does anything dispatch
+      // the same journal-before-ACKED-effects order (the v1.3.24 P1.4 + r53 P1.3/P1.4): the
+      // plan is computed from the PREIMAGE, journaled for EVERY multi-owner participant
+      // (remote-only two-owner gestures included), and dispatches only on the journal's ack
       const before = g.localId
         ? (viewTags(this._curViews()).find((x) => x.id === g.localId) || {}) : {};
-      let op = null, inverse = null;
+      let op = null, inverse = {};
       if (g.localId) {
         if (edit.delete) {
           op = { tag: g.localId, delete: true };
@@ -3132,29 +3208,39 @@ class TimelinePanel {
           if (edit.rename) { op.rename = edit.rename; inverse.rename = before.name; }
           if (edit.color) { op.color = edit.color; inverse.color = before.color; }
         }
+      }
+      const journal = g.remotes.length && (g.remotes.length + (g.localId ? 1 : 0)) >= 2;
+      const dispatch = () => {
+        let fanOk = true;                            // remote halves before the local (P2.16)
+        for (const rt of g.remotes)
+          fanOk = this._editRemoteTag(rt, { rename: edit.rename, color: edit.color,
+                                            delete: !!edit.delete }, gid) && fanOk;
+        if (!fanOk) {
+          this._unionOps = (this._unionOps || []).filter((o) => o.gid !== gid);
+          this._syncUnionOps();                      // nothing began — the intent retracts
+        } else if (g.localId) {
+          const nv = JSON.parse(JSON.stringify(this._curViews()));
+          if (edit.delete) {
+            nv.tags = viewTags(nv).filter((x) => x.id !== g.localId); delete nv.groups;
+            if (nv.active === g.localId) nv.active = 'all';
+          } else {
+            const t = viewTags(nv).find((x) => x.id === g.localId);
+            if (t) { if (edit.rename) t.name = edit.rename; if (edit.color) t.color = edit.color; }
+          }
+          this._setViews(nv, [op]);
+        }
+      };
+      if (journal) {
         for (const rt of g.remotes)
           this._noteUnionOp(rt, g.name, inverse,
                             { rename: edit.rename, color: edit.color, delete: !!edit.delete },
-                            gid);
-      }
-      let fanOk = true;                              // remote halves before the local (P2.16)
-      for (const rt of g.remotes)
-        fanOk = this._editRemoteTag(rt, { rename: edit.rename, color: edit.color,
-                                          delete: !!edit.delete }, gid) && fanOk;
-      if (!fanOk) {
-        this._unionOps = (this._unionOps || []).filter((o) => o.gid !== gid);
-        this._syncUnionOps();                        // nothing began — the intent retracts
-      } else if (g.localId) {
-        const nv = JSON.parse(JSON.stringify(this._curViews()));
-        if (edit.delete) {
-          nv.tags = viewTags(nv).filter((x) => x.id !== g.localId); delete nv.groups;
-          if (nv.active === g.localId) nv.active = 'all';
-        } else {
-          const t = viewTags(nv).find((x) => x.id === g.localId);
-          if (t) { if (edit.rename) t.name = edit.rename; if (edit.color) t.color = edit.color; }
-        }
-        this._setViews(nv, [op]);
-      }
+                            gid, { defer: true, lop: op });
+        const opId = this._syncUnionOps();
+        if (opId) {
+          this._gatedDispatches = this._gatedDispatches || {};
+          this._gatedDispatches[opId] = { run: dispatch, gids: [gid], name: g.name };
+        } else dispatch();
+      } else dispatch();
     }
   }
 

@@ -1444,6 +1444,13 @@ _atomic_lock = threading.Lock()
 _atomic_seq = [0]
 
 
+class _StateUnreadable(OSError):
+    """A state file that EXISTS but cannot be read or written (EIO, EACCES, ENOSPC) — the
+    retryable store fault, distinguishable from an op's own OSError so the spool can hold the
+    queue for a store fault without un-quarantining genuinely poisonous ops (the r52
+    verification; write-side since the r53 audit's P2.8)."""
+
+
 def _atomic_write(path, text, mode=None):
     """Atomically publish `text` to `path` via a UNIQUELY-named temp + os.replace. The temp name is unique
     per (pid, thread, call): two kernel THREADS writing the SAME state file — the pusher, producer, and WS
@@ -1466,6 +1473,16 @@ def _atomic_write(path, text, mode=None):
         if mode is not None:
             os.chmod(tmp, mode)                          # before the publish — never a world-readable window
         os.replace(tmp, path)                            # atomic publish (overwrites; cross-platform)
+    except OSError as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        # a write-side store fault is as retryable as a read-side one (the r53 audit's P2.8:
+        # an ENOSPC here fell into the spool's poison counter and quarantined valid gestures
+        # into .failed) — _StateUnreadable is the held-queue signal, and it IS-A OSError so
+        # every existing `except OSError` handler still catches it
+        raise _StateUnreadable(*(e.args or ("unwritable",)))
     except Exception:
         try:
             tmp.unlink()
@@ -1803,6 +1820,15 @@ def _norm_timeline_views(d):
     return out
 
 
+def _timeline_views_proved():
+    """The MUTATION snapshot (the r53 audit's P1.1, executed: _timeline_views folded an EIO
+    to an empty view, _edit_tag edited that emptiness, and the later proved re-read published
+    it — both seeded tags deleted under {"acked":true}). Writers snapshot through THIS:
+    unreadable raises _StateUnreadable; only a missing store reads as the default."""
+    raw = _read_state_json(_views_path(), "timeline-views")
+    return _norm_timeline_views(raw if isinstance(raw, dict) else {})
+
+
 def _timeline_views():
     p = _views_path()
     try:
@@ -2074,12 +2100,6 @@ def _union_ops_path():
     return jd.STATE / "union-gestures.json"
 
 
-class _StateUnreadable(OSError):
-    """A state file that EXISTS but cannot be read (EIO, EACCES) — the retryable store fault,
-    distinguishable from an op's own OSError so the spool can hold the queue for a store
-    fault without un-quarantining genuinely poisonous ops (the r52 verification)."""
-
-
 def _read_state_json(path, what):
     """A PROVED read of a JSON state file (the v1.3.24 audit's P1.1/P1.2): only
     FileNotFoundError means empty (returns None). An UNREADABLE file (EIO, EACCES) RAISES —
@@ -2095,12 +2115,18 @@ def _read_state_json(path, what):
     except OSError as e:
         raise _StateUnreadable(*(e.args or ("unreadable",)))
     except ValueError:
+        # UNIQUE destination (the r53 audit's P2.9: one-second names collided, and the second
+        # corruption REPLACED the first's quarantined bytes) — and a failed quarantine RAISES:
+        # returning empty let the caller overwrite the very bytes this promises to preserve
+        qp = path.with_name(path.name + ".corrupt-%d-%d-%s"
+                            % (int(time.time()), os.getpid(), os.urandom(4).hex()))
         try:
-            qp = path.with_name(path.name + ".corrupt-%d" % int(time.time()))
             path.rename(qp)
-            sys.stderr.write("%s: malformed JSON quarantined as %s\n" % (what, qp.name))
-        except OSError:
-            sys.stderr.write("%s: malformed JSON (quarantine failed — leaving in place)\n" % what)
+        except OSError as e:
+            sys.stderr.write("%s: malformed JSON and the quarantine failed — refusing to "
+                             "treat it as empty\n" % what)
+            raise _StateUnreadable(*(e.args or ("quarantine failed",)))
+        sys.stderr.write("%s: malformed JSON quarantined as %s\n" % (what, qp.name))
         return None
 
 
@@ -2115,6 +2141,18 @@ def _union_ops_load():
         rows = json.loads(_union_ops_path().read_text())
     except Exception:
         return []
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def _union_ops_echo():
+    """The journal for the payload echo — or None when the read is UNPROVEN (the r53 audit's
+    P1.2, executed: one EIO read as [], and the panels' adopted-drop machinery took the empty
+    echo as an authoritative owner retirement, deleting durable entries and their ledger
+    records). Every panel gates on Array.isArray, so None means 'no information this push'."""
+    try:
+        rows = _read_state_json(_union_ops_path(), "union-gestures")
+    except OSError:
+        return None
     return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
 
 
@@ -2270,7 +2308,9 @@ def _tag_name_survives_elsewhere(host, name):
     """True when `name` still names a real tag OUTSIDE the edited host: another local tag, or
     another attached kernel's remote tag. Lens names are name-keyed UNIONS — moving the refs
     while the old name survives would strip the surviving tag out of every lens (r50)."""
-    if any(t.get("name") == name for t in _timeline_views().get("tags") or []):
+    # PROVED (the r53 audit's P1.1 sibling): an EIO here read as "no local twin", and the
+    # migration rewrote the lens off a LIVE same-name tag — the raise makes the caller retry
+    if any(t.get("name") == name for t in _timeline_views_proved().get("tags") or []):
         return True
     try:
         with _remotes_lock:
@@ -2311,9 +2351,16 @@ def _apply_ref_migration(host, name, new, deleted, fresh=True):
     with jd._identity_file_lock():
         # the survival check lives INSIDE the identity transaction (the v1.3.24 audit's P2.7,
         # executed with a barrier: a local tag created between the check and the lock kept its
-        # name while the lens and order were rewritten to the new one — hiding the real tag)
-        if not deleted and _tag_name_survives_elsewhere(host if fresh else None, name):
-            return True      # the lens still names something real under the OLD name (r50)
+        # name while the lens and order were rewritten to the new one — hiding the real tag).
+        # Its snapshot is PROVED now (the r53 audit): an EIO read as "no local twin" and the
+        # migration rewrote the lens off a LIVE same-name tag — a store fault is the
+        # retryable False, never a verdict.
+        if not deleted:
+            try:
+                if _tag_name_survives_elsewhere(host if fresh else None, name):
+                    return True   # the lens still names something real under the OLD name
+            except OSError:
+                return False
         try:
             raw = json.loads(_views_path().read_text())
         except FileNotFoundError:
@@ -2391,6 +2438,86 @@ def _queue_ref_migration(intent):
         except Exception:
             sys.stderr.write("ref migration: the retry intent could not be persisted — "
                              "retrying in-memory only\n")
+
+
+_pending_heals = []
+_pending_heals_lock = threading.Lock()
+_heals_adopted = [False]
+
+
+def _heals_path():
+    return jd.STATE / "pending-view-heals.json"
+
+
+def _adopt_heals_locked():
+    if _heals_adopted[0]:
+        return True
+    try:
+        rows = _read_state_json(_heals_path(), "view-heals")
+    except OSError:
+        sys.stderr.write("view-heals: unreadable — adopting nothing and refusing to "
+                         "overwrite this pass\n")
+        return False
+    _seen = {json.dumps(r, sort_keys=True) for r in _pending_heals}
+    if isinstance(rows, list):
+        _pending_heals.extend(r for r in rows if isinstance(r, dict)
+                              and json.dumps(r, sort_keys=True) not in _seen)
+    _heals_adopted[0] = True
+    return True
+
+
+def _queue_heal_intent(old_sid, new_sid):
+    """A failed tag-membership heal is a DURABLE intent (the r53 audit's P2.7): order
+    discovery marks the sid known regardless of the heal's outcome, so nothing else ever
+    retried it — a /clear during one store hiccup silently dropped the session out of its
+    tags forever. The supervisor pass replays until it lands."""
+    with _pending_heals_lock:
+        adopted = _adopt_heals_locked()
+        row = {"old": str(old_sid), "new": str(new_sid)}
+        if row not in _pending_heals:
+            _pending_heals.append(row)
+        if not adopted:
+            sys.stderr.write("view-heals: holding the intent in memory only — the intent "
+                             "file is unreadable and will not be overwritten\n")
+            return
+        try:
+            _atomic_write(_heals_path(), json.dumps(_pending_heals))
+        except Exception:
+            sys.stderr.write("view-heals: the intent could not be persisted — retrying "
+                             "in-memory only\n")
+
+
+def _flush_pending_heals():
+    """The supervisor-pass replay of queued tag-membership heals (r53 P2.7). The heal itself
+    re-queues on failure, so a still-broken store keeps the intent; a landed heal retires."""
+    with _pending_heals_lock:
+        if not _adopt_heals_locked():
+            return
+        todo = list(_pending_heals)
+    if not todo:
+        return
+    landed = []
+    for it in todo:
+        try:
+            ok = _heal_timeline_views(str(it.get("old") or ""), str(it.get("new") or ""))
+        except Exception:
+            continue                     # kept; retried next pass
+        if ok is not False:
+            landed.append(it)            # landed or moot; a False re-queued itself and stays
+    if landed:
+        with _pending_heals_lock:
+            for it in landed:
+                try:
+                    _pending_heals.remove(it)
+                except ValueError:
+                    pass
+            try:
+                if _pending_heals:
+                    _atomic_write(_heals_path(), json.dumps(_pending_heals))
+                else:
+                    _heals_path().unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def _flush_pending_ref_migrations():
@@ -2742,7 +2869,11 @@ def _heal_timeline_views(old_sid, new_sid):
     inheritance that detects the churn. Without this a tagged session would silently fall out of
     its tag on every /clear. (The hidden half retired with the set, 2026-08-24.)"""
     with jd._identity_file_lock():
-        v = _timeline_views()
+        try:
+            v = _timeline_views_proved()   # a mutation snapshot, never the lenient cache (r53)
+        except OSError:
+            _queue_heal_intent(old_sid, new_sid)
+            return False
         def _has(t):
             return any(m["host"] == "" and m["sid"] == old_sid for m in t["members"])
         if not any(_has(t) for t in v["tags"]):
@@ -2757,8 +2888,11 @@ def _heal_timeline_views(old_sid, new_sid):
                 t["members"] = t["members"] + [{"host": "", "sid": new_sid}]   # normalizer dedups + re-sorts
         _hok, _ = _set_timeline_views(v)
         if not _hok:
-            sys.stderr.write("views heal for %s -> %s refused (store unreadable) — the next "
-                             "heal pass retries\n" % (old_sid, new_sid))
+            _queue_heal_intent(old_sid, new_sid)
+            sys.stderr.write("views heal for %s -> %s refused (store unreadable) — queued as "
+                             "a durable intent (r53)\n" % (old_sid, new_sid))
+            return False
+        return True
 
 
 def _b36(n):
@@ -2790,7 +2924,12 @@ def _edit_tag(name, add=(), remove=(), color=None, delete=False, rename=None):
     # _heal_timeline_views and one side's edit was silently lost (the r43 merge integration)
     with jd._identity_file_lock(), \
          _views_lock:   # the server is threaded; two unlocked merges would both copy the same pre-state
-        v = json.loads(json.dumps(_timeline_views()))     # deep copy: never mutate the cached blob
+        try:
+            v = _timeline_views_proved()   # a PROVED mutation snapshot (the r53 audit's
+            #                                P1.1: the lenient cache folded EIO to empty, and
+            #                                the proved WRITE then published the emptiness)
+        except OSError:
+            return None, "the views store is unreadable — the edit did not land; retry"
         hits = [t for t in v["tags"] if t["name"] == name]
         if len(hits) > 1:
             return None, 'two tags are named "%s" — rename one in the dashboard first' % name
@@ -15938,6 +16077,7 @@ def _tunnel_supervisor():
             _replay_ui_op_spool()        # kernel-down Electron gestures queued for locked replay (P1.5)
             _flush_pending_refusals()    # refusal rows whose journal save failed (the v1.3.23 P1.3)
             _flush_pending_ref_migrations()   # ref migrations whose local write failed (P2.5)
+            _flush_pending_heals()       # tag-membership heals a store hiccup refused (r53)
             # Everything above is the supervisor's own state (status, fails, next_try, kernel_sha, detail).
             # None of it used to reach disk — only the act routes saved — so the file could sit frozen on a
             # failure long after the row recovered. Signature-gated: a steady fleet writes nothing.
@@ -25771,7 +25911,7 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
     cmap_grad = [list(cm.ramp(v, ctx_stops)) for v in (0.12, 0.34, 0.56, 0.78, 1.0)]
     return {"type": "timeline", "now": now, "sessions": sessions, "turns": turns,
             "views": _views_client(),
-            "unionOps": _union_ops_load(),   # the durable multi-host gesture journal (P1.5)
+            "unionOps": _union_ops_echo(),   # the journal, or None when UNPROVEN (r53 P1.2)
             "palette": pal.colors(_palette_name()),   # tag color choices — the same set sessions draw identity colors from
             "messages": messages, "judging": judging,
             "cmapGrad": cmap_grad,
@@ -33084,10 +33224,16 @@ class Handler(BaseHTTPRequestHandler):
                         ", ".join('"%s"' % x for x in unknown)}), "application/json")
                 color = b.get("color")
                 rn = b.get("rename")
-                t, err = _edit_tag(name, add=ids["add"], remove=ids["remove"],
-                                   color=(str(color) if isinstance(color, str) else None),
-                                   delete=bool(b.get("delete")),
-                                   rename=(str(rn) if isinstance(rn, str) else None))
+                try:
+                    t, err = _edit_tag(name, add=ids["add"], remove=ids["remove"],
+                                       color=(str(color) if isinstance(color, str) else None),
+                                       delete=bool(b.get("delete")),
+                                       rename=(str(rn) if isinstance(rn, str) else None))
+                except _StateUnreadable:
+                    # the mutation snapshot is PROVED now (the r53 audit's P1.1) — a store
+                    # fault refuses loudly instead of editing an empty view into existence
+                    return self._send(503, json.dumps({"ok": False, "retryable": True,
+                        "error": "the views store is unreadable — retry"}), "application/json")
                 if err:
                     return self._send(200, json.dumps({"ok": False, "error": err}), "application/json")
                 _mark_views_dirty()
@@ -33582,6 +33728,9 @@ class Handler(BaseHTTPRequestHandler):
                 # refused — instead of guessing (a guessed rev later coincided with a foreign
                 # write's and a stale blob was accepted)
                 _bans = {"type": "viewsAck", "ok": bool(_wok), "rev": _wrev}
+                if not _wok and _wrev is None:
+                    _bans["retryable"] = True        # the proved-read refusal (r53 P2.6)
+                    _bans.pop("rev")
                 if msg.get("opId"):
                     _bans["opId"] = str(msg["opId"])   # ack correlation (r49)
                 client["send"](json.dumps(_bans))
@@ -33600,6 +33749,11 @@ class Handler(BaseHTTPRequestHandler):
                 _oans = {"type": "viewsAck", "ok": True, "rev": _orev}
                 if _oconfl:
                     _oans["conflicts"] = _oconfl   # partial application, named (r50)
+            except _StateUnreadable:
+                # RETRYABLE, and NO rev claimed (the r53 audit's P2.6: the generic ok:false
+                # dropped the writer's queue head — a plain lens pick vanished; and the
+                # lenient rev read served 0 on EIO, rewinding the twin's counter)
+                _oans = {"type": "viewsAck", "ok": False, "retryable": True}
             except Exception:
                 try:
                     _oans = {"type": "viewsAck", "ok": False,

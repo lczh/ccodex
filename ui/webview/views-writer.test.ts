@@ -266,3 +266,20 @@ test("executed: the conflict STRINGS reach the refusal callback — ok and refus
   consumeViewsAck({ type: "viewsAck", ok: false, rev: 4, opId: sent[2].opId }, (c) => got.push(c));
   assert.equal(got[2], undefined, "a conflict-less refusal passes nothing — not an empty list");
 });
+
+test("a RETRYABLE refusal holds the head and re-pumps on the next payload (r53 P2.6)", () => {
+  // the v1.3.25 audit: the kernel's store hiccup (EIO) answered a generic ok:false — the
+  // writer dropped the queue head, and a plain lens pick or tag edit vanished with no retry
+  resetViewsWriterForTest();
+  const sent: any[] = [];
+  postViewsOps((m) => sent.push(m), [{ actives: { chat: { all: true } } }]);
+  assert.equal(sent.length, 1);
+  consumeViewsAck({ type: "viewsAck", ok: false, retryable: true, opId: sent[0].opId });
+  assert.equal(sent.length, 1, "nothing re-posts yet — event-paced, never a timer");
+  anchorViewsRev({ rev: 4 });          // the next payload arrives
+  assert.equal(sent.length, 2, "…and the HELD head re-pumps");
+  assert.deepEqual(sent[1].ops, sent[0].ops, "the same gesture, not a drop");
+  assert.notEqual(sent[1].opId, sent[0].opId, "a fresh correlated wire id");
+  consumeViewsAck({ type: "viewsAck", ok: true, rev: 5, opId: sent[1].opId });
+  assert.equal(sent.length, 2, "settled");
+});

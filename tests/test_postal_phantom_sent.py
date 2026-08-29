@@ -452,3 +452,77 @@ class R52StageReconcileAndIds(unittest.TestCase):
                          "a colliding publish is LOUD and the standing message survives — "
                          "rename silently replaced it")
         self.assertTrue(stage.exists(), "…and the stage is retained for the compensation arm")
+
+
+class R53ProvedRetirement(unittest.TestCase):
+    """the v1.3.25 audit's P2.10-P2.12 + P3.13: the ack/bounce paths deleted the retry source
+    over unproved reads and unproved terminal appends; boot reconciliation raced already-
+    seeded dialers; an uncertain sent-append destroyed the relay's arbiter stage; a
+    well-formed [] log row wedged the scanner every boot."""
+
+    def setUp(self):
+        _reset()
+        shutil.rmtree(pm.OUTBOX, ignore_errors=True)
+        self.now = int(time.time())
+        self.hd = pm.OUTBOX / "TESTHOST2"
+        self.hd.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        _reset()
+        shutil.rmtree(pm.OUTBOX, ignore_errors=True)
+
+    def test_an_unreadable_record_defers_the_ack(self):
+        f = self.hd / "px-401.1_aa.TESTHOST.json"
+        f.write_text(json.dumps({"mid": "px-401.1_aa.TESTHOST", "body": "hi"}))
+        os.chmod(f, 0)
+        try:
+            pm._ack_arrived("TESTHOST2", "px-401.1_aa.TESTHOST")
+        finally:
+            os.chmod(f, 0o644)
+        self.assertTrue(f.exists(),
+                        "EIO used to read as 'missing' and the ack DELETED the only retry "
+                        "source with no terminal row (the r53 audit's P2.10)")
+        self.assertEqual([r for r in _rows() if r.get("ev") == "relayed"], [])
+
+    def test_a_failed_relayed_append_keeps_the_file(self):
+        f = self.hd / "px-402.1_bb.TESTHOST.json"
+        f.write_text(json.dumps({"mid": "px-402.1_bb.TESTHOST", "body": "hi"}))
+        real = pm._tl_append
+        pm._tl_append = lambda name, row: False
+        try:
+            pm._ack_arrived("TESTHOST2", "px-402.1_bb.TESTHOST")
+        finally:
+            pm._tl_append = real
+        self.assertTrue(f.exists(), "delete only after the terminal append PROVED — the next "
+                                    "ack retries idempotently")
+
+    def test_reconciliation_runs_before_any_peer_seeding(self):
+        src = open(os.path.join(BIN, "romp-postal-service"), encoding="utf-8").read()
+        body = src.split("def serve():", 1)[1].split("\ndef ", 1)[0]
+        i_rec = body.index("_reconcile_relay_stages()")
+        i_seed = body.index("_seed_peers_from_kernel()")
+        self.assertLess(i_rec, i_seed,
+                        "seeding starts dialer threads (the r53 audit's P2.11, reproduced "
+                        "there: a dialer's ack deleted the outbox file between the "
+                        "reconcile's log snapshot and its stage sweep, and delivered mail "
+                        "was marked unpublished)")
+
+    def test_an_uncertain_sent_append_keeps_the_stage(self):
+        src = open(os.path.join(BIN, "romp-postal-service"), encoding="utf-8").read()
+        i_stage = src.index('".stage-" + mid')
+        i_refuse = src.index("the delivery record could not be written", i_stage)
+        window = src[i_stage:i_refuse]
+        self.assertNotIn("_stagef.unlink()", window,
+                         "a torn append — row durably written, close reporting failure — "
+                         "used to unlink the arbiter: sent row, no terminal, no stage, both "
+                         "reconcilers skipping peer rows (the r53 audit's P2.12)")
+
+    def test_a_non_dict_log_row_never_wedges_the_scanner(self):
+        (self.hd / ".stage-px-403.1_cc.TESTHOST").write_text("1")
+        with open(pm.TLDIR / "messages.jsonl", "a") as fh:
+            fh.write("[]\n")             # well-formed, not an object — raised through boot (P3.13)
+            fh.write(json.dumps({"t": self.now, "ev": "relayed",
+                                 "id": "px-403.1_cc.TESTHOST"}) + "\n")
+        self.assertEqual(pm._reconcile_relay_stages(), 0)
+        self.assertFalse((self.hd / ".stage-px-403.1_cc.TESTHOST").exists(),
+                         "the proof past the [] row still counts — the stage settles")

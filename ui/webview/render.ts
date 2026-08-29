@@ -4874,14 +4874,16 @@ function showTabMenu(e: MouseEvent, id: string) {
         // timeline twin mints; any timeline panel adopts them from the payload echo and runs
         // the compensation when the kernel's journaled refusal row names this gesture (the
         // editTag opId is the gid, the correlation the refusal row derives its own id from).
-        const gid = willLocal && candidates.length
+        const gid = (candidates.length >= 2 || (willLocal && candidates.length))
           ? Math.floor(Math.random() * 0x3fffffff) + 1 : 0;
+        //    ^ EVERY multi-owner gesture journals (the r53 audit's P1.3: remote-only
+        //      two-owner removes had zero rows — A applied, B refused, A never rolled back)
         if (gid) {
-          const had = (lt!.members || []).filter((m) => edit.remove!.includes(m));
+          const had = willLocal ? (lt!.members || []).filter((m) => edit.remove!.includes(m)) : [];
           const ackId = "u-chat" + (++webEditSeq);
           vscodeApi?.postMessage({ type: "setUnionOps", entries: candidates.map((rt) => ({
             host: rt.host || "", name: g.name,
-            inverse: { tag: g.localId, add: had.slice() },
+            inverse: willLocal ? { tag: g.localId, add: had.slice() } : {},
             edit: { remove: edit.remove!.slice() },
             rt: { id: rt.id, host: rt.host || "", name: rt.name, color: rt.color,
                   members: (rt.members || []).slice() },
@@ -4895,14 +4897,16 @@ function showTabMenu(e: MouseEvent, id: string) {
           // gesture whole — nothing began, nothing splits. No ack (a kernel death) dispatches
           // nothing either: the safe direction; the user retries.
           pendingUnionGestures.set(ackId, () => {
-            const nv2 = JSON.parse(JSON.stringify(effViews() || {})) as SessionViews;
-            const lt2 = viewTags(nv2).find((x) => x.id === g.localId);
-            if (lt2) lt2.members = (lt2.members || []).filter((m) => !edit.remove!.includes(m));
             for (const rt of candidates)
               vscodeApi?.postMessage({ type: "editTag", edit: {
                 opId: String(gid), host: rt.host || "", name: g.name,
                 remove: edit.remove!.slice() } });
-            postViews(nv2, [{ tag: g.localId, remove: edit.remove!.slice() }]);
+            if (willLocal) {
+              const nv2 = JSON.parse(JSON.stringify(effViews() || {})) as SessionViews;
+              const lt2 = viewTags(nv2).find((x) => x.id === g.localId);
+              if (lt2) lt2.members = (lt2.members || []).filter((m) => !edit.remove!.includes(m));
+              postViews(nv2, [{ tag: g.localId, remove: edit.remove!.slice() }]);
+            }
           });
           return;   // the optimistic paint waits with the effects — one ack, one commit
         }

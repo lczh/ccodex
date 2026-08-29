@@ -142,17 +142,24 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
     const fn = SRC.indexOf("_editTagUnion(g, edit)");
     const win = SRC.slice(fn, fn + 6400);
     assert.ok(win.indexOf("removeOk") > 0 && win.indexOf("fanOk") > 0);
-    assert.ok(win.indexOf("this._noteUnionOp") < win.indexOf("removeOk = this._editRemoteTag"),
-      "remove: the journal is durable BEFORE any effect dispatches (P1.4)");
-    assert.ok(win.indexOf("removeOk = this._editRemoteTag") < win.indexOf("this._setViews(nv, [{ tag: g.localId, remove:"),
+    // the r53 shape: the dispatches live INSIDE a gated closure keyed on the journal's ACK
+    // (effects used to run before persistence was known — with every ack forced false, both
+    // remotes and the local commit had all executed)
+    assert.ok(win.indexOf("const dispatch = () => {") > 0
+      && win.indexOf("this._gatedDispatches[opId] = { run: dispatch") > 0,
+      "remove: the effects are HELD behind the journal's acknowledged write (r53 P1.4)");
+    assert.ok(win.indexOf("removeOk = this._editRemoteTag") < win.indexOf("this._applyLocalOp(lop)"),
       "remove: remotes initiate before the local half commits");
-    const fanNote = win.indexOf("this._noteUnionOp", win.indexOf("if (edit.rename || edit.color || edit.delete)"));
-    assert.ok(fanNote > 0 && fanNote < win.indexOf("fanOk = this._editRemoteTag"),
-      "rename/color/delete: the journal is durable BEFORE any effect dispatches (P1.4)");
+    const fanGate = win.indexOf("this._gatedDispatches[opId] = { run: dispatch",
+                                win.indexOf("if (edit.rename || edit.color || edit.delete)"));
+    assert.ok(fanGate > 0,
+      "rename/color/delete: the effects are HELD behind the journal's acknowledged write");
     assert.ok(win.indexOf("fanOk = this._editRemoteTag") < win.indexOf("this._setViews(nv, [op])"),
       "rename/color/delete: remotes initiate before the local half commits");
     assert.ok(win.split("filter((o) => o.gid !== gid)").length === 3,
       "a refused initiation RETRACTS both legs' journaled intent — nothing began");
+    assert.ok(win.split(">= 2").length >= 3,
+      "EVERY multi-owner gesture journals — remote-only two-owner included (r53 P1.3)");
   }
   {
     const fn = SRC.indexOf("tagEditFailed(m) {");
@@ -183,7 +190,7 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
     assert.ok(win.indexOf("this._views && this._views.remoteTags") > 0,
       "the RAW payload decides — the optimistic overlay would echo our own edit back");
     assert.ok(win.indexOf("_unionOpApplied") > 0);
-    assert.ok(win.indexOf("age") < 0, "no push-counter age-out survives");
+    assert.ok(!/\bage\b/.test(win), "no push-counter age-out survives");
   }
 });
 
@@ -209,7 +216,7 @@ test("every timeline dot's white border is thin (0.75px) — romp + user dots al
 // over the same house fake-DOM shim timeline-tagorder-drag.test.ts established.
 
 test("source: union-op entries carry rt + gesture id + pre-edit name/color at note time", () => {
-  const fn = SRC.indexOf("_noteUnionOp(rt, name, inverse, edit, gid)");
+  const fn = SRC.indexOf("_noteUnionOp(rt, name, inverse, edit, gid, opts)");
   assert.ok(fn > 0, "the note-op signature threads the gesture id");
   const win = SRC.slice(fn, fn + 2600);   // widened for the r49 postimage + durable-sync lines
   // the rt object + gid must ride the entry: a SIBLING host's refusal dispatches the inverse
@@ -218,8 +225,8 @@ test("source: union-op entries carry rt + gesture id + pre-edit name/color at no
   assert.match(win, /oldName: rt\.name \|\| '', oldColor: rt\.color \|\| ''/);
   // one id per GESTURE, minted where the fan-out starts, threaded to both note sites
   assert.match(SRC, /const gid = \+\+unionGestureSeq;/);
-  assert.match(SRC, /\{ remove: edit\.remove\.slice\(\) \}, gid\);/);
-  assert.match(SRC, /\{ rename: edit\.rename, color: edit\.color, delete: !!edit\.delete \},\s*\n\s*gid\);/);
+  assert.match(SRC, /\{ remove: edit\.remove\.slice\(\) \}, gid,\s*\n\s*\{ defer: true, lop: lop \}\);/);
+  assert.match(SRC, /\{ rename: edit\.rename, color: edit\.color, delete: !!edit\.delete \},\s*\n\s*gid, \{ defer: true, lop: op \}\);/);
 });
 
 test("source: tagEditFailed compensates SIBLING hosts — inverse remote edits; delete is loud, never silent", () => {
@@ -316,6 +323,17 @@ const VIEWS = {
     { id: "TESTHOST-B:r2", host: "TESTHOST-B", name: "pool", color: "#4EC9B0", members: ["s1"] },
   ],
 };
+
+// r53: gestures gate their effects on the journal's unionOpsAck — tests that assert the
+// EFFECTS (not the gating itself) ack each sync synchronously, restoring the old timing
+function autoAckUnion(panel: any): void {
+  const real = panel._syncUnionOps.bind(panel);
+  panel._syncUnionOps = () => {
+    const id = real();
+    if (id) panel.unionOpsAck({ ok: true, opId: id });
+    return id;
+  };
+}
 
 function drawnPanel(): any {
   const panel = new TimelinePanel(makeNode("div"));
@@ -441,7 +459,7 @@ test("executed: the union journal is durable — mirrored on note, re-seeded aft
   const panel = drawnPanel();
   const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
   panel._editTagUnion(un, { remove: ["s1"] });
-  assert.ok(synced.length >= 2, "each note mirrors the journal durably");
+  assert.ok(synced.length >= 1, "the gesture mirrors durably — ONE batched sync (r53)");
   assert.equal(synced[synced.length - 1].length, 2, "…carrying both dispatched halves");
   const journal = synced[synced.length - 1];
   // THE RELOAD: a fresh panel seeds from the kernel's payload echo and still compensates
@@ -462,18 +480,22 @@ test("executed: the union journal is durable — mirrored on note, re-seeded aft
 test("executed: an all-confirmed gesture group leaves the list — retention has an exit", () => {
   g.__rompTimelineEditTag = () => {};
   g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = () => {};
   const panel = drawnPanel();
+  autoAckUnion(panel);                          // effects gate on the journal ack now (r53)
   const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
   panel._editTagUnion(un, { remove: ["s1"] });
   assert.equal(panel._unionOps.length, 2);
   const polled = JSON.parse(JSON.stringify(VIEWS));
   polled.remoteTags[0].members = [];
   polled.remoteTags[1].members = [];            // BOTH owners applied it
+  polled.tags[0].members = ["s2"];              // …and the LOCAL leg's postimage holds (r53
+  //                                               P1.5: settlement judges every participant)
   panel.update({ now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
                  turns: {}, messages: [], judging: [], views: polled });
   assert.equal(panel._unionOps.length, 0,
     "every participant terminal (all confirmed) — the group retires, nothing is immortal");
-  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews;
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
 });
 
 test("executed: a refused rename compensates the sibling ADDRESSED BY THE NEW NAME, back to the old", () => {
@@ -800,10 +822,13 @@ test("executed: a retirement leaves the ledger only on the kernel's ack (r50)", 
   const last = wire[wire.length - 1];
   assert.ok(last.opId, "every sync is correlated");
   assert.ok(panel._journaledGids.has(gid), "a SENT gesture enters the ledger — the kernel may hold it");
-  // the group retires (both owners confirm) → the sync carries the retirement…
+  panel.unionOpsAck({ ok: true, opId: last.opId });   // release the gated dispatch (r53)
+  // the group retires (every participant confirms, LOCAL leg included — r53 P1.5) → the
+  // sync carries the retirement…
   const polled = JSON.parse(JSON.stringify(VIEWS));
   polled.remoteTags[0].members = [];
   polled.remoteTags[1].members = [];
+  polled.tags[0].members = ["s2"];
   const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
                  turns: {}, messages: [], judging: [] };
   panel.update(Object.assign({}, base, { views: polled }));
@@ -1035,7 +1060,13 @@ test("executed: the journal is durable before ANY effect dispatches (r52 P1.4)",
   const realSet = panel._setViews.bind(panel);
   panel._setViews = (v: any, ops: any) => { rowsAt.push(panel._unionOps.length); realSet(v, ops); };
   panel._editTagUnion(un, { remove: ["s1"] });
-  assert.ok(rowsAt.length >= 3, "two remote dispatches and one local commit ran");
+  assert.equal(rowsAt.length, 0,
+    "NOTHING dispatched yet — the effects wait for the journal's ACK (the r53 audit's P1.4: "
+    + "with every ack forced false, both remotes and the local commit had already run)");
+  const gated = Object.keys(panel._gatedDispatches || {});
+  assert.equal(gated.length, 1, "one gated transaction");
+  panel.unionOpsAck({ ok: true, opId: gated[0] });
+  assert.ok(rowsAt.length >= 3, "two remote dispatches and one local commit ran on the ack");
   for (const n of rowsAt) assert.equal(n, 2,
     "every effect saw the FULL journal already durable — never rows:0 after a dispatch");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;

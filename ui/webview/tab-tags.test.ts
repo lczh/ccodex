@@ -122,8 +122,12 @@ test("the chat's remove-everywhere journals compensation BEFORE any effect (r52 
     + "the journal exists for)");
   assert.ok(iDispatch > iGate, "the remote dispatch — riding the gesture's gid as its opId — "
     + "lives inside the gated commit");
-  assert.ok(win.indexOf("inverse: { tag: g.localId, add: had.slice() }") > 0,
-    "each entry carries the inverse that restores the LOCAL half");
+  assert.ok(win.indexOf("inverse: willLocal ? { tag: g.localId, add: had.slice() } : {}") > 0,
+    "each entry carries the LOCAL-half inverse when one exists — and journals EVEN WITHOUT "
+    + "one (the r53 audit's P1.3: remote-only two-owner removes had zero rows, so A applied "
+    + "while B refused and A was never rolled back)");
+  assert.ok(win.indexOf("candidates.length >= 2 || (willLocal && candidates.length)") > 0,
+    "every multi-owner gesture journals");
 });
 
 test("remote-only chat tag edits post NO local write (r52 P2.9)", () => {

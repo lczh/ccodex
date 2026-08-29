@@ -1622,12 +1622,11 @@ class Handler(BaseHTTPRequestHandler):
                                                 "mail NOT relayed; retry"})
                 if not _tl_append("messages.jsonl", sent_row):
                     # the row BEFORE the publish, refusing on failure — the same P2.11 rule
-                    # deliver() wears (the r49 verification: this relay leg still published
-                    # into the outbox with no row, mail no receipt could ever account)
-                    try:
-                        _stagef.unlink()             # nothing was recorded — retract the stage
-                    except OSError:
-                        pass                         # boot files a rowless terminal: harmless
+                    # deliver() wears. The stage is KEPT (the r53 audit's P2.12): a torn
+                    # append — row durably written, close reporting failure — used to unlink
+                    # it, leaving a sent row with no terminal, no file, no stage; both boot
+                    # reconcilers skip peer rows, so the phantom was permanent. The standing
+                    # stage lets boot file the arbitrating terminal either way.
                     return self._send({"ok": False,
                                        "error": "the delivery record could not be written — "
                                                 "mail NOT relayed; retry"})
@@ -1928,6 +1927,8 @@ def _reconcile_relay_stages():
                         row = json.loads(line)
                     except ValueError:
                         continue
+                    if not isinstance(row, dict):
+                        continue         # a well-formed [] row raised through every boot (r53)
                     if row.get("id") in stage_mids and (
                             row.get("ev") in _TERMINAL_EVS or row.get("ev") == "relayed"):
                         settled.add(row.get("id"))
@@ -1976,8 +1977,6 @@ def serve():
     STATE.mkdir(parents=True, exist_ok=True)
     MAILROOT.mkdir(parents=True, exist_ok=True)
     _reconcile_markers()
-    if peers_on():
-        _seed_peers_from_kernel()          # a restarted bus re-learns its peers without waiting for a transition
     try:
         httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     except OSError as e:
@@ -1992,6 +1991,13 @@ def serve():
         _reconcile_relay_stages()      # …and the staged relay transactions a crash left open (r50)
     except Exception as e:             # serving: no request sees a phantom this boot can retire
         _log("phantom-sent reconcile failed: %s" % e)
+    if peers_on():
+        # peers seed AFTER the reconciles (the r53 audit's P2.11, reproduced there: seeding
+        # starts dialer threads, and a dialer's ack landed `relayed` + deleted the outbox file
+        # BETWEEN the reconcile's log snapshot and its stage sweep — the stale snapshot read
+        # the delivered mail as never-published and filed `unpublished` over its receipt)
+        _seed_peers_from_kernel()      # a restarted bus re-learns its peers without waiting
+    #                                    for a transition
     _log("bus up on %s (pid %d)" % (BASE, os.getpid()))
     boot_fp = _source_fingerprint()                              # so the monitor can reload if the code changes under us
     threading.Thread(target=_monitor, args=(httpd, boot_fp), daemon=True).start()
@@ -2790,13 +2796,22 @@ def outbox_list(host, limit=None, byte_limit=None):
     except Exception:
         return []
 
+class _OutboxUnreadable(Exception):
+    """The record EXISTS but cannot be read (EIO) — the r53 audit's P2.10: conflating it with
+    'missing' let the ack path delete the only retry source over an unproved read."""
+
+
 def outbox_get(host, mid):
     if not (_safe_id(host) and _safe_id(mid)):   # host/mid are path components — block traversal
         return None
     try:
         return json.loads((OUTBOX / host / (mid + ".json")).read_text())
-    except Exception:
+    except FileNotFoundError:
         return None
+    except OSError as e:
+        raise _OutboxUnreadable(*(e.args or ("unreadable",)))
+    except ValueError:
+        return None                              # corrupt content: nothing usable to relay
 
 def outbox_del(host, mid):
     if not (_safe_id(host) and _safe_id(mid)):   # host/mid are path components — block traversal
@@ -3144,10 +3159,14 @@ def _bounce_apply(host, b):
         deliver(msg["frm_id"], "romp-postal", "", note, kind="coordinate")
     # The parked source is our retry record.  Retire it only after the return note was successfully
     # written; if delivery raises, the next exchange can retry the bounce instead of losing both.
-    # the ROW before the delete (the r52 verification — the same del/append gap as the ack)
-    _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "bounced", "id": mid,
-                                  "to": msg.get("to") or "?", "host": host,
-                                  "code": code, "why": why})
+    # the ROW before the delete (the r52 verification), and the delete only after the append
+    # PROVED (the r53 audit's P2.10) — a kept file means the bounce may re-deliver its return
+    # note on a later exchange: a duplicate note over a silently lost receipt, every time
+    if not _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "bounced", "id": mid,
+                                         "to": msg.get("to") or "?", "host": host,
+                                         "code": code, "why": why}):
+        _log("bounce for %s/%s deferred: the terminal row could not be appended" % (host, mid))
+        return
     outbox_del(host, mid)
 
 def fleet_presence(exclude_host):
@@ -3447,7 +3466,13 @@ def _ack_arrived(host, mid):
     backward to the origin host; if it was ours, log the delivered receipt."""
     if not isinstance(mid, str) or not _safe_id(mid):
         return
-    msg = outbox_get(host, mid)
+    try:
+        msg = outbox_get(host, mid)
+    except _OutboxUnreadable:
+        # the record exists but cannot be read (the r53 audit's P2.10): deleting it here
+        # removed the only retry source over an unproved read — the next ack retries instead
+        _log("ack for %s/%s deferred: the outbox record is unreadable" % (host, mid))
+        return
     if not msg:
         outbox_del(host, mid)
         return
@@ -3458,11 +3483,13 @@ def _ack_arrived(host, mid):
             p["acks"].append(mid)
         _peer_wake(msg["origin"]).set()
     else:
-        # the ROW before the delete (the r52 verification: a kill between the delete and the
-        # append left "stage + no outbox + no terminal" — boot reconciliation then filed
-        # `unpublished` for DELIVERED mail, erasing its receipt; row-first, a crash leaves the
-        # file standing and the next ack retries idempotently)
-        _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "relayed", "id": mid, "host": host})
+        # the ROW before the delete (the r52 verification), and the delete only after the
+        # append PROVED (the r53 audit's P2.10: a false append result still deleted the file
+        # — no receipt, no retry source; kept, the next ack retries idempotently)
+        if not _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "relayed",
+                                             "id": mid, "host": host}):
+            _log("ack for %s/%s deferred: the relayed row could not be appended" % (host, mid))
+            return
         outbox_del(host, mid)
 
 def _bounce_arrived(host, b):

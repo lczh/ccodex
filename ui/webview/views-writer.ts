@@ -56,6 +56,10 @@ export function anchorViewsRev(v: SessionViews | { rev?: unknown } | null | unde
       pump();
     }
   }
+  if (retryOnNextAnchor && outstanding === 0 && queue.length) {
+    retryOnNextAnchor = false;       // AFTER the raise-release above, so the two arms never
+    pump();                          // double-pump one payload; the retryable-refused head
+  }                                  // re-posts on the next payload (r53 P2.6)
 }
 
 function pump(): void {
@@ -83,10 +87,12 @@ function pump(): void {
  *  rewind). The kernel's conflict strings ride INTO the callback (the v1.3.23 audit's P3.9):
  *  discarding them here left the chat/Outline dropping the optimistic tag with nothing saying
  *  why — the surface decides how to show them; this writer just hands them over. */
+let retryOnNextAnchor = false;   // a RETRYABLE refusal holds the head for the next payload (r53)
+
 export function consumeViewsAck(m: unknown,
                                 onRefused?: (conflicts?: string[]) => void): boolean {
   const a = m as { type?: unknown; ok?: unknown; rev?: unknown; opId?: unknown;
-                   conflicts?: unknown } | null;
+                   conflicts?: unknown; retryable?: unknown } | null;
   if (!a || a.type !== "viewsAck") return false;
   const rev0 = typeof a.rev === "number" ? a.rev : null;
   if (typeof a.opId === "string" && (!queue.length || queue[0].wireId !== a.opId)) {
@@ -99,6 +105,16 @@ export function consumeViewsAck(m: unknown,
   }
   const conflicts = Array.isArray(a.conflicts)
     ? a.conflicts.filter((c): c is string => typeof c === "string" && !!c) : [];
+  if (a.ok === false && a.retryable === true) {
+    // the kernel is UP but its store was momentarily unreadable/unwritable (the r53 audit's
+    // P2.6: the generic refusal dropped the queue head — a plain lens pick or tag edit
+    // vanished with no retry and no useful warning). The head STAYS queued; the next payload
+    // arrival (anchorViewsRev) re-pumps it — event-paced, never a timer.
+    outstanding = 0;
+    outstandingKind = null;
+    retryOnNextAnchor = true;
+    return true;
+  }
   outstanding = 0;
   outstandingKind = null;
   queue.shift();                    // the acked head retires NOW (kept queued for replay until here)
@@ -160,4 +176,5 @@ export function postViewsOps(post: (m: Record<string, unknown>) => void,
 /** Tests only: each test starts from a fresh writer. */
 export function resetViewsWriterForTest(): void {
   confirmedRev = 0; outstanding = 0; outstandingKind = null; queue = []; poster = null;
+  retryOnNextAnchor = false;
 }

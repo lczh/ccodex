@@ -1542,3 +1542,129 @@ class R52VerifyRound(unittest.TestCase):
         self.assertIn("farpool", [r["name"] for r in rows],
                       "the crash-survivor intent is ADOPTED before any healthy write — the "
                       "short-circuit on memory-non-empty deferred the clobber, not closed it")
+
+
+class R53ProvedSnapshots(unittest.TestCase):
+    """the v1.3.25 audit: the LENIENT cache fed mutation snapshots (P1.1 — an EIO'd read
+    became an empty view that the proved write then published, deleting every tag), the
+    journal echo read [] for EIO (P1.2 — panels took it as authoritative retirement), the
+    quarantine could lose its bytes (P2.9), and write faults poisoned the spool (P2.8)."""
+
+    def setUp(self):
+        _scrub_state()
+        km._pending_heals[:] = []
+        km._heals_adopted[0] = False
+        for pfn in (km._union_ops_path, km._heals_path):
+            try:
+                pfn().unlink()
+            except OSError:
+                pass
+
+    def tearDown(self):
+        self.setUp()
+
+    class _BadPath:
+        def __init__(self, real):
+            self._real = real
+
+        def read_text(self):
+            raise OSError(5, "EIO")
+
+        def stat(self):
+            raise OSError(5, "EIO")
+
+        def exists(self):
+            return True
+
+        def __getattr__(self, k):
+            return getattr(self._real, k)
+
+    def test_the_mutation_snapshot_never_edits_an_empty_ghost(self):
+        # the executed r53 P1.1: seed keep-a/keep-b, EIO the read, edit — v1.3.25 acked
+        # {"acked":true,"persisted":["new-tag"]} and BOTH seeded tags were deleted
+        km._apply_views_ops([{"create": {"id": "ga", "name": "keep-a", "color": "", "members": []}},
+                             {"create": {"id": "gb", "name": "keep-b", "color": "", "members": []}}])
+        real = km._views_path
+        try:
+            km._views_path = lambda: self._BadPath(real())
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                out, err = km._edit_tag("new-tag", add=[])
+        finally:
+            km._views_path = real
+        self.assertIsNone(out)
+        self.assertIn("unreadable", err or "")
+        self.assertEqual(sorted(t["name"] for t in km._timeline_views()["tags"]),
+                         ["keep-a", "keep-b"], "nothing was erased under a success ack")
+
+    def test_the_journal_echo_marks_unavailability(self):
+        self.assertTrue(km._union_ops_set([{"host": "TESTHOST-A", "gid": 7, "edit": {},
+                                            "inverse": {}, "rt": {}, "name": "pool"}]))
+        real = km._union_ops_path
+        try:
+            km._union_ops_path = lambda: self._BadPath(real())
+            self.assertIsNone(km._union_ops_echo(),
+                              "an unproved read is NO INFORMATION — [] read as an "
+                              "authoritative owner retirement and panels deleted durable "
+                              "entries (the r53 audit's P1.2)")
+        finally:
+            km._union_ops_path = real
+        self.assertEqual([r["gid"] for r in km._union_ops_echo()], [7])
+
+    def test_a_failed_quarantine_never_reads_as_empty(self):
+        km.jd.STATE.mkdir(parents=True, exist_ok=True)
+        km._views_path().write_text("{corrupt")
+        real_rename = km.Path.rename
+        try:
+            km.Path.rename = lambda self, *a, **kw: (_ for _ in ()).throw(OSError(13, "EACCES"))
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                with self.assertRaises(OSError):
+                    km._read_state_json(km._views_path(), "timeline-views")
+        finally:
+            km.Path.rename = real_rename
+        self.assertEqual(km._views_path().read_text(), "{corrupt",
+                         "the bytes survive — empty-on-failed-quarantine let the caller "
+                         "overwrite them (the r53 audit's P2.9)")
+        with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+            self.assertIsNone(km._read_state_json(km._views_path(), "timeline-views"))
+        q = list(km.jd.STATE.glob("timeline-views.json.corrupt-*"))
+        self.assertEqual(len(q), 1, "…and a WORKING quarantine still moves them aside")
+        self.assertIn("-", q[0].name.rsplit("corrupt-", 1)[1],
+                      "the quarantine name carries pid+random — 1s names collided (P2.9)")
+        q[0].unlink()
+
+    def test_a_write_fault_is_the_held_queue_type(self):
+        # an ENOSPC/EACCES in the atomic publisher used to fall into the spool's poison
+        # counter and .failed valid gestures (the r53 audit's P2.8)
+        rodir = km.jd.STATE / "ro-write-fault"
+        rodir.mkdir(parents=True, exist_ok=True)
+        os.chmod(rodir, 0o500)
+        try:
+            with self.assertRaises(km._StateUnreadable):
+                km._atomic_write(rodir / "f.json", "x")
+        finally:
+            os.chmod(rodir, 0o700)
+            import shutil
+            shutil.rmtree(rodir, ignore_errors=True)
+
+    def test_heal_intents_are_durable_and_flushed(self):
+        # the r53 audit's P2.7: order discovery marks the sid known regardless of the heal's
+        # outcome — nothing else ever retried a failed heal, so a /clear during one store
+        # hiccup dropped the session out of its tags forever
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "",
+                                         "members": ["11111111-2222-3333-4444-555555555555"]}}])
+        real = km._views_path
+        try:
+            km._views_path = lambda: self._BadPath(real())
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                ok = km._heal_timeline_views("11111111-2222-3333-4444-555555555555",
+                                             "66666666-7777-8888-9999-aaaaaaaaaaaa")
+        finally:
+            km._views_path = real
+        self.assertIs(ok, False, "the refused heal reports itself")
+        self.assertTrue(km._heals_path().exists(), "…and persists a durable intent")
+        km._flush_pending_heals()
+        v = km._timeline_views()
+        members = [m["sid"] for t in v["tags"] for m in t["members"]]
+        self.assertIn("66666666-7777-8888-9999-aaaaaaaaaaaa", members,
+                      "the flush completes the heal once the store recovers")
+        self.assertFalse(km._heals_path().exists(), "the landed intent retires")
