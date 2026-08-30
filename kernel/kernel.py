@@ -1592,13 +1592,11 @@ def _merge_session_order(incoming):
     with jd._identity_file_lock():
         incoming = jd.canonicalize_session_identity(
             [x for x in incoming if isinstance(x, str)])
-        _eraw = _read_state_json(jd.STATE / "session-order.json", "session-order")
         # the r56 wave-2 verification (P2.12's DRAG half, confirmed twice): the lenient read
         # folded an EIO to [] and the merge persisted ONLY the dragged sids — every
         # timeline-only lane's slot erased on the path a live user gesture fires. The proved
         # read raises through; the WS handler drops the drag loudly and the user re-drags.
-        existing = jd.canonicalize_session_identity(
-            [x for x in _eraw if isinstance(x, str)] if isinstance(_eraw, list) else [])
+        existing = _session_order_proved()
         inset = set(incoming)
         queue = list(incoming)
         merged = []
@@ -1622,6 +1620,15 @@ def _merge_and_write_session_order(incoming):
         return merged
 
 
+def _session_order_proved():
+    """The order MUTATION paths' read (r56 P2.12): only ENOENT is empty; unreadable raises
+    the held type so no writer can persist a fabricated [] over the user's saved order.
+    A seam by design — the ordering tests inject the persisted order here."""
+    raw = _read_state_json(jd.STATE / "session-order.json", "session-order")
+    return jd.canonicalize_session_identity(
+        [x for x in raw if isinstance(x, str)] if isinstance(raw, list) else [])
+
+
 def _ordered_locked(sessions):
     """Order session dicts STRICTLY by the shared, persisted session order (session-order.json) — and by
     NOTHING else. A session already in the order keeps its saved slot; a session NEW to the order is
@@ -1637,7 +1644,7 @@ def _ordered_locked(sessions):
     sessions carry (default: the sid itself), so session-order.json + the client stay fsid-based — no
     migration (the user 2026-06-24: keep ONE slot across /clear / revive)."""
     try:
-        _oraw = _read_state_json(jd.STATE / "session-order.json", "session-order")
+        order = _session_order_proved()
     except OSError:
         # r56 P2.12: an EIO here used to fold to [] and the heal path then PERSISTED
         # discovery order over the user's saved one — render input-ordered this pass and
@@ -1645,8 +1652,6 @@ def _ordered_locked(sessions):
         sys.stderr.write("session-order: unreadable — rendering unordered this pass, "
                          "persisting nothing\n")
         return list(sessions)
-    order = jd.canonicalize_session_identity(
-        [x for x in _oraw if isinstance(x, str)] if isinstance(_oraw, list) else [])
     known = set(order)
     # Slot inheritance keys on the STABLE session NAME (customTitle), NOT the fsid or discover's anchor: a
     # /clear, relaunch, or revive mints a NEW transcript fsid for the SAME logical session, and it must

@@ -7048,11 +7048,11 @@ class SessionOrderStable(unittest.TestCase):
     pulled into a separate mtime-sorted block, so a session jumped slots the moment it died."""
     def setUp(self):
         self._saved = (km._ordered_alive, km._alive_sessions, km._sessions, km._session_order,
-                       set(km._kept_open))
+                       km._session_order_proved, set(km._kept_open))
 
     def tearDown(self):
         (km._ordered_alive, km._alive_sessions, km._sessions, km._session_order,
-         kept) = self._saved
+         km._session_order_proved, kept) = self._saved
         km._kept_open.clear(); km._kept_open.update(kept)
 
     def _fleet(self):
@@ -7062,6 +7062,7 @@ class SessionOrderStable(unittest.TestCase):
         B = {"sid": "B", "name": "b", "path": "/b", "mtime": NOW - 5}
         C = {"sid": "C", "name": "c", "path": "/c", "mtime": NOW - 400}
         km._session_order = lambda: ["A", "B", "C"]      # the persisted (drag) order
+        km._session_order_proved = lambda: ["A", "B", "C"]   # …and its proved twin (r56 P2.12)
         km._sessions = lambda now: [B, A, C]             # _sessions is mtime-DESC → B first
         # _chat_tab_sessions/_timeline_sessions now read _alive_sessions directly and order via _ordered
         # (the session-order refactor, 15f5037) — stub THAT for the live list; _ordered_alive is no longer
