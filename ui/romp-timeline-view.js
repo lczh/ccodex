@@ -1702,8 +1702,19 @@ class TimelinePanel {
       if (this._yieldedGids && this._yieldedGids.size) {
         const present = new Set(data.unionOps.filter((o) => o && !o.refusal)
           .map((o) => o.gid));
-        for (const g4 of Array.from(this._yieldedGids))
-          if (!present.has(g4)) this._yieldedGids.delete(g4);
+        if (!this._yieldAbsentSeen) this._yieldAbsentSeen = new Set();
+        for (const g4 of Array.from(this._yieldedGids)) {
+          if (present.has(g4)) {
+            this._yieldAbsentSeen.delete(g4);   // still live — the one-off stale re-emit
+            continue;                           // (the r55 wave-2 verification) never counts
+          }
+          if (this._yieldAbsentSeen.has(g4)) {
+            this._yieldedGids.delete(g4);       // TWO consecutive absent echoes: settled
+            this._yieldAbsentSeen.delete(g4);
+          } else {
+            this._yieldAbsentSeen.add(g4);
+          }
+        }
       }
       // COMPLETE journaled-but-undispatched gestures (the r53 round: a webview reload between
       // the journal ack and the gated dispatch stranded effect-less immortal rows). One full
@@ -3152,7 +3163,11 @@ class TimelinePanel {
     } else if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
       this._postChain = (this._postChain || Promise.resolve()).then(() =>
         this._kernelPost('/union-claim', { gid: gid, cid: this._unionCid() }, true)
-          .then((r) => this.unionClaimAck({ gid: gid, ok: !!(r.json && r.json.ok === true) }))
+          .then((r) => this.unionClaimAck({ gid: gid, ok: !!(r.json && r.json.ok === true),
+                                            epoch: r.json && r.json.epoch }))
+          //  ^ the EPOCH rides too (the r55 wave-2 verification, confirmed four ways: the
+          //    dropped epoch made every Obsidian-side completion CAS-refuse forever, and the
+          //    endlessly-refreshed POST claim starved the gesture across every surface)
           .catch(() => { if (this._pendingClaims) delete this._pendingClaims[gid]; }));
     } else {
       // no claim transport → no completion: the safe direction (nothing double-dispatches);

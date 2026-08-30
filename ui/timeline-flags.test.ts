@@ -1715,8 +1715,11 @@ test("executed: a yielded gid is SUPPRESSED until proof — no stale-echo resurr
     + "re-adoption republished rows the completer had retired)");
   panel.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
                                          unionOps: [] }));
+  panel.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                         unionOps: [] }));
   assert.ok(!(panel._yieldedGids && panel._yieldedGids.has(gid)),
-    "…and PROVEN absence ends the suppression — the completer settled it");
+    "…and PROVEN absence (two consecutive echoes — one stale re-emit is a mark, not proof, "
+    + "r55 wave 2) ends the suppression — the completer settled it");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
 });
 
@@ -1751,4 +1754,55 @@ test("executed: a granted claim for a yielded gid recovers the gesture — the c
     "the grant PROVES the completer died — the gesture recovers and completes here");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
   delete g.__rompTimelineClaimUnion;
+});
+
+test("the POST claim ack forwards the kernel's epoch — the CAS token survives the transport (r55 wave 2)", () => {
+  // confirmed four ways: the dropped epoch made every Obsidian-side completion CAS-refuse
+  // forever, and each re-grant refreshed the POST claim's TTL — starving the gesture across
+  // every surface while the panel polled
+  const fn = SRC.indexOf("_requestUnionClaim(gid) {");
+  const win = SRC.slice(fn, fn + 1600);
+  assert.ok(win.indexOf("epoch: r.json && r.json.epoch") > 0,
+    "the /union-claim response's epoch rides into unionClaimAck");
+  const ca = SRC.indexOf("unionClaimAck(m) {");
+  const cw = SRC.slice(ca, ca + 1200);
+  assert.ok(cw.indexOf("this._claimEpochs[m.gid] = m.epoch;") > 0,
+    "…and is stored for the rekey CAS");
+});
+
+test("executed: one absent echo is NOT settlement proof — unsuppress needs two (r55 wave 2)", () => {
+  // the wave-2 verification: a stale federated re-emit whose cached journal predated the
+  // gesture read as 'absent', the suppression lifted, and the next REAL push re-adopted
+  // rows the completer still owned
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  autoAckUnion(panel);
+  panel._yieldUnionGids([515151]);
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  const row = { host: "TESTHOST-A", name: "pool", inverse: {}, edit: { remove: ["s1"] },
+                rt: { id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool",
+                      color: "#7aa2f7", members: ["s1"] },
+                gid: 515151, oldName: "pool", oldColor: "#7aa2f7", post: {},
+                confirmed: false, dispatched: false };
+  panel.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                         unionOps: [] }));          // the STALE re-emit
+  assert.ok(panel._yieldedGids.has(515151),
+    "ONE absent echo is a mark, not proof — the suppression holds");
+  panel.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                         unionOps: [row] }));       // the real push: still live
+  assert.ok(panel._yieldedGids.has(515151), "…a live sighting resets the mark");
+  assert.ok(!(panel._unionOps || []).some((o: any) => o.gid === 515151),
+    "…and the completer's rows are never re-adopted");
+  panel.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                         unionOps: [] }));
+  panel.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                         unionOps: [] }));
+  assert.ok(!panel._yieldedGids.has(515151),
+    "TWO consecutive absent echoes: the completer settled it — suppression ends");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
 });

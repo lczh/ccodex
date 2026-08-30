@@ -1652,7 +1652,14 @@ def _ordered_locked(sessions):
             sib = [i for i, n in enumerate(name_at) if a and n == a]   # same-name entries already placed
             if sib:
                 _hok = _heal_timeline_views(order[sib[-1]], sid)   # the fork inherits hidden/tag state too
-                if _hok is False and not _heal_intent_durable(order[sib[-1]], sid):
+                _name_withheld = any(_nm(_ws) == a for _ws in _withheld)
+                if _name_withheld or (_hok is False
+                                      and not _heal_intent_durable(order[sib[-1]], sid)):
+                    # …and once ANY same-name fork withheld this pass, its later siblings
+                    # withhold too even when their own heal landed (the r55 wave-2
+                    # verification: persisting the later one while the earlier waited put
+                    # them in [P, later] then [P, earlier, later] — the rendered order
+                    # flipped at recovery). The chain keeps them insertion-ordered.
                     # the heal failed AND its retry intent is memory-only (the r54 audit's
                     # P2.8, executed: a crash here left the sid persisted as known while the
                     # intent died with the process — the heal was never retried and the
@@ -1962,6 +1969,9 @@ def _set_timeline_views(blob, base_rev=None):
     with jd._identity_file_lock():
         try:
             cur = _read_state_json(_views_path(), "timeline-views")
+            if cur is not None and cur is not _QUARANTINED and not isinstance(cur, dict):
+                _quarantine_state_bytes(_views_path(), "timeline-views")   # r55 wave 2: the
+                cur = _QUARANTINED       # writer overwrote []-shaped bytes un-quarantined
             cur = cur if isinstance(cur, dict) else {}   # the sentinel is truthy (r55 P2.10)
         except OSError:
             # the proved-read rule (the v1.3.24 audit): a transient EIO must never read as an
@@ -2174,6 +2184,15 @@ _union_claims = {}                     # gid -> {"ckey": str, "t": float, "epoch
 _union_claims_lock = threading.Lock()
 _union_claim_epoch = [0]
 _UNION_CLAIM_TTL = 120.0               # the no-event backstop, POST claimants only
+# retired-gid TOMBSTONES (the r55 wave-2 verification): claims retiring with their rows
+# (P3.19) freed a completed gesture's gid — a dead writer's reconnect replay then re-inserted
+# the retired rows as a PLAIN merge, was granted the freed claim, and its gate ran effects
+# the completer had already run (a re-keyed completion gate replayed the same way, bypassing
+# the CAS through its new gid). Incoming rows whose gid OR ogid is tombstoned are dropped and
+# named back as unclaimed — the writer's gate yields, exactly the r54 shield, kernel-proved.
+# In-memory and bounded like the claims map: the journal rows are the durable truth.
+_union_retired_tombs = {}              # gid -> t, FIFO-capped
+_UNION_TOMBS_MAX = 4096
 
 
 def _union_claim_stamp(gid, ckey):
@@ -2438,6 +2457,16 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                 # staleness (7d) is the backstop, like the phantom reconcile's window (r50)
                 and not (r.get("refusal") and isinstance(r.get("t"), (int, float))
                          and r["t"] < _cutoff)]
+        with _union_claims_lock:
+            _tombed = []
+            for r in inc:
+                if (not r.get("refusal")
+                        and (r.get("gid") in _union_retired_tombs
+                             or (r.get("ogid") or 0) in _union_retired_tombs)):
+                    if r.get("gid") not in _tombed:
+                        _tombed.append(r.get("gid"))
+            if _tombed:
+                inc = [r for r in inc if r.get("gid") not in _tombed]
         rows += [r for r in inc if r.get("gid") not in ret]
         if len(rows) > _UNION_OPS_MAX:
             sys.stderr.write("union-gestures: %d rows exceed the %d high-water mark — "
@@ -2451,9 +2480,15 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
         with _union_claims_lock:
             for g in ret:
                 _union_claims.pop(g, None)       # claims retire WITH their rows (r55 P3.19)
+                _union_retired_tombs[g] = time.time()
+            while len(_union_retired_tombs) > _UNION_TOMBS_MAX:
+                _union_retired_tombs.pop(next(iter(_union_retired_tombs)))
         # the implicit writer claims decide against the rows JUST written, under the same
         # lock pass (r55 P1.4) — never a separate read the world can move between
         unclaimed = _union_claim_entries(inc, ckey, _rows=rows) if ckey else []
+        for g in _tombed:
+            if g not in unclaimed:
+                unclaimed.append(g)              # tombstoned: the replaying gate must yield
         return True, unclaimed, None
 
 
@@ -2659,7 +2694,10 @@ def _apply_ref_migration(host, name, new, deleted, fresh=True):
             # intent as "no local reference held the name" — the permanent silent-stale-refs
             # outcome, disguised as success)
             return False
-        raw = raw if isinstance(raw, dict) else {}   # missing/quarantined/wrong-shape → {}
+        if raw is not None and raw is not _QUARANTINED and not isinstance(raw, dict):
+            _quarantine_state_bytes(_views_path(), "timeline-views")   # r55 wave 2
+            raw = _QUARANTINED
+        raw = raw if isinstance(raw, dict) else {}   # missing/quarantined → {}
         try:
             currev = int(raw.get("rev") or 0)
         except (TypeError, ValueError):
@@ -2934,6 +2972,9 @@ def _apply_views_ops(ops):
         # existing tag and lens). The raise is the callers' retained-failure signal: the WS
         # handler acks ok:false, the POST route answers 500, the spool keeps the op file.
         raw = _read_state_json(_views_path(), "timeline-views")
+        if raw is not None and raw is not _QUARANTINED and not isinstance(raw, dict):
+            _quarantine_state_bytes(_views_path(), "timeline-views")   # r55 wave 2
+            raw = _QUARANTINED
         raw = raw if isinstance(raw, dict) else {}       # the sentinel is truthy (r55 P2.10)
         try:
             currev = int(raw.get("rev") or 0)
@@ -34201,7 +34242,11 @@ class Handler(BaseHTTPRequestHandler):
             # the completion CLAIM (the r54 audit's P1.3): exactly one panel may run a
             # stranded gesture's effects — see _union_claim_grant. The journaling writer
             # already holds its own gesture's claim, so a live writer is never raced.
-            _cep = _union_claim_grant(msg.get("gid"), "ws:%d" % id(client))
+            try:
+                _cep = _union_claim_grant(msg.get("gid"), "ws:%d" % id(client))
+            except OSError:
+                _cep = None              # a lock/store fault refuses the claim — it must
+                #                          never tear the socket down (r55 wave 2)
             try:
                 _cans = {"type": "unionClaimAck", "gid": msg.get("gid"),
                          "ok": _cep is not None}

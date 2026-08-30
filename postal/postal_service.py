@@ -484,9 +484,22 @@ def handoff_done_apply(data):
             or (_rv is not None and not isinstance(_rv, str))):
         # wrong-SHAPED provenance (the r55 audit's P2.16, executed there: a historic row
         # with relay_mid:[] answered {ok,local} — the delivery was marked done with ZERO
-        # completion receipts). "Local" is a VERDICT; corrupt evidence falls to the
-        # retryable arm instead, and a later intact source (the maildir headers) decides.
-        return {"ok": False, "unknown": True, "retry": True}, 404
+        # completion receipts). "Local" is a VERDICT; corrupt evidence consults the SECOND
+        # durable source (the mail's own maildir headers) before any retryable 404 — the
+        # wave-2 verification found the early 404 looping forever past intact headers.
+        row = _receipt_row_from_maildir(mid)
+        if row is None:
+            if len(_HDA_MISS) > 4096:
+                _HDA_MISS.clear()
+            _HDA_MISS[mid] = _logkey
+            return {"ok": False, "unknown": True, "retry": True}, 404
+        _rm, _rv = row.get("relay_mid"), row.get("relay_via")
+        if ((_rm is not None and not isinstance(_rm, str))
+                or (_rv is not None and not isinstance(_rv, str))):
+            if len(_HDA_MISS) > 4096:
+                _HDA_MISS.clear()
+            _HDA_MISS[mid] = _logkey
+            return {"ok": False, "unknown": True, "retry": True}, 404
     relay_mid = str(_rm or "")
     relay_via = str(_rv or "")
     if not (relay_mid and relay_via and _safe_id(relay_mid) and _safe_id(relay_via)):
@@ -579,7 +592,14 @@ def read_box(sid, consume):
     for _f, meta, row in claimed:
         out.append(row)
         _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "exec", "id": row["id"]})
-        _queue_read_receipt(meta, dmid=row["id"])   # cross-host mail: the sender's host learns it was read
+        try:
+            _queue_read_receipt(meta, dmid=row["id"])   # cross-host mail: the sender's host learns it was read
+        except Exception as e:
+            # best-effort relative to DELIVERING the claimed mail (the r55 wave-2
+            # verification: _fsync_dir's honest EIO now propagates through readbox_put, and
+            # raising HERE — after the rename to cur/ — errored the drain while the message
+            # was already consumed: the agent never received mail it could never reclaim)
+            _log("read receipt for %s could not queue (%s) — the delivery proceeds" % (row["id"], e))
         #   dmid = THIS host's delivery mid — the id the recipient's transcript markers carry, so the
         #   sender's timeline can join the connector to the true process turn (the user 2026-08-06)
     if consume:
@@ -3022,11 +3042,13 @@ def _pending_bounce_clear(mid):
 
 
 def _flush_pending_bounces():
-    with _pending_bounces_lock:
-        items = list(_pending_bounces.items())
-    for mid, v in items:
-        if _bounce_apply(str(v.get("host") or ""), {"mid": mid,
-                                                    "code": str(v.get("code") or "")}):
+    for mid, v in list(_pending_bounces.items()):
+        # through _bounce_arrived, never _bounce_apply directly (the r55 wave-2
+        # verification: the direct call skipped the forwarded-vs-ours arbitration and a
+        # HUB's parked bounce delivered its return note to a REMOTE frm_id as local mail
+        # instead of relaying backward to the origin)
+        if _bounce_arrived(str(v.get("host") or ""),
+                           {"mid": mid, "code": str(v.get("code") or "")}):
             _pending_bounce_clear(mid)
 
 
@@ -3448,10 +3470,12 @@ def _bounce_apply(host, b):
             outbox_del(host, mid)
             _log("bounce for %s/%s: record malformed — receipt filed; the return note to "
                  "the sender was lost with it" % (host, mid))
-        else:
-            _queue_terminal_row(_row, "bounce for %s/%s: record malformed AND the receipt "
-                                      "append failed — the row itself is queued" % (host, mid))
-        return True
+            return True
+        _queue_terminal_row(_row, "bounce for %s/%s: record malformed AND the receipt "
+                                  "append failed — the row itself is queued" % (host, mid))
+        return False   # NOT settled (the r55 wave-2 verification: returning True cleared
+        #                the DURABLE park over a memory-only queued row — a process death
+        #                then lost both); the park stays until the terminal actually lands
     if not msg:
         return True
     code = rows[0]["code"]
@@ -3769,17 +3793,28 @@ def _relay_in(host, m, token_proven=False):
             return "hold", None
     return "bounce", {"mid": mid, "code": "recipient-unavailable"}
 
+_drain_lock = threading.Lock()
+
+
 def _drain_postal_retries():
     """The retry pumps (r55 P2.14/P2.15), event-paced: every ack/bounce arrival and every
-    bus start drains queued terminal rows and parked bounces before new work."""
+    bus start drains queued terminal rows and parked bounces before new work. SINGLE-FLIGHT
+    (the r55 wave-2 verification: two exchange threads entered with the same snapshot and
+    the sender got two return notes and two terminal rows) — a concurrent caller skips; the
+    holder is already doing the work."""
+    if not _drain_lock.acquire(blocking=False):
+        return
     try:
-        _flush_terminal_rows()
-    except Exception:
-        pass
-    try:
-        _flush_pending_bounces()
-    except Exception:
-        pass
+        try:
+            _flush_terminal_rows()
+        except Exception:
+            pass
+        try:
+            _flush_pending_bounces()
+        except Exception:
+            pass
+    finally:
+        _drain_lock.release()
 
 
 def _ack_arrived(host, mid):
@@ -3843,16 +3878,15 @@ def _bounce_arrived(host, b):
         # forwarded-or-ours is undecidable here — route through _bounce_apply, whose typed
         # arms decide: a TRANSIENT fault parks the bounce durably and retries (r55 P2.15);
         # parsed garbage files the terminal receipt (queued if the append fails, r55 P2.14)
-        _bounce_apply(host, bounce)
-        return
+        return _bounce_apply(host, bounce)
     if msg and msg.get("origin"):
         p = _pending(msg["origin"])
         with _peer_lock:
             p["bounces"].append(bounce)
         outbox_del(host, mid)                         # enqueue backward first; source remains on failure
         _peer_wake(msg["origin"]).set()
-    else:
-        _bounce_apply(host, bounce)
+        return True
+    return _bounce_apply(host, bounce)
 
 def _pending(host):
     with _peer_lock:

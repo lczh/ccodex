@@ -739,6 +739,7 @@ class R50UnionJournalLock(unittest.TestCase):
 
     def setUp(self):
         _scrub_state()
+        km._union_retired_tombs.clear()   # tests reuse small gids; production mints unique
         try:
             km._union_ops_path().unlink()
         except OSError:
@@ -1847,6 +1848,7 @@ class R54AuditFixes(unittest.TestCase):
         km._pending_heals[:] = []
         km._heals_adopted[0] = False
         km._union_claims.clear()
+        km._union_retired_tombs.clear()
         import shutil
         for pfn in (km._union_ops_path, km._heals_path):
             p = pfn()
@@ -1925,6 +1927,7 @@ class R54AuditFixes(unittest.TestCase):
         self.assertEqual(unclaimed, [], "the writer claims its own gesture at journal time")
         self.assertIsNone(km._union_claim_grant(21, "ws:other"), "the writer holds 21")
         km._union_claims.clear()
+        km._union_retired_tombs.clear()
         self.assertIsNotNone(km._union_claim_grant(21, "ws:completer"))
         ok, unclaimed, _ = km._union_ops_merge(rows21, ckey="ws:9")
         self.assertTrue(ok)
@@ -2178,6 +2181,48 @@ class R54AuditFixes(unittest.TestCase):
         self.assertEqual([s["sid"] for s in out], [self.OLD, self.NEW, NEW2, OTHER],
                          "the fork CHAIN renders oldest-first — the same order the eventual "
                          "persistence will freeze, so recovery moves nothing")
+
+    def test_tombstones_block_replay_resurrection(self):
+        # the r55 wave-2 verification: claims retiring with their rows freed a completed
+        # gesture's gid — a dead writer's reconnect replay re-inserted the retired rows as a
+        # plain merge, was GRANTED the freed claim, and its gate ran the effects a completer
+        # had already run. Retired gids tombstone now; a replay's rows (gid OR ogid) drop
+        # and come back named unclaimed, so the replaying gate yields.
+        self._seed_rows(801)
+        epoch = km._union_claim_grant(801, "ws:completer")
+        ok, _, _ = km._union_ops_merge(
+            [{"host": "TESTHOST-A", "gid": 802, "ogid": 801, "edit": {}, "inverse": {},
+              "rt": {}, "name": "pool", "dispatched": True}],
+            [801], ckey="ws:completer", rekey={"ogid": 801, "gid": 802, "epoch": epoch})
+        self.assertTrue(ok)
+        # the dead writer reconnects and replays its pre-ack rows (plain merge, gid 801)
+        ok, unclaimed, _ = km._union_ops_merge(
+            [{"host": "TESTHOST-A", "gid": 801, "edit": {}, "inverse": {}, "rt": {},
+              "name": "pool", "dispatched": False}], ckey="ws:writer")
+        self.assertTrue(ok)
+        self.assertIn(801, unclaimed, "the tombstone names the gid back — the gate yields")
+        self.assertNotIn(801, [r["gid"] for r in km._union_ops_load()],
+                         "…and the retired rows never re-enter the journal")
+        # a replayed COMPLETION gate (its rows carry the tombstoned ogid) yields too
+        ok, unclaimed, _ = km._union_ops_merge(
+            [{"host": "TESTHOST-A", "gid": 803, "ogid": 801, "edit": {}, "inverse": {},
+              "rt": {}, "name": "pool", "dispatched": False}], ckey="ws:writer")
+        self.assertTrue(ok)
+        self.assertIn(803, unclaimed, "…through ogid as well — no CAS bypass by re-key")
+        self.assertNotIn(803, [r["gid"] for r in km._union_ops_load()])
+
+    def test_rmw_writers_quarantine_wrong_shape_bytes(self):
+        # the r55 wave-2 verification: the readers marked []-shaped stores unproved, but the
+        # WRITERS folded them to {} and overwrote — the garbage bytes were gone forever
+        km.jd.STATE.mkdir(parents=True, exist_ok=True)
+        km._views_path().write_text("[]")
+        km._flags_cache.clear()
+        with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+            km._apply_views_ops([{"active": "all"}])
+        q = list(km.jd.STATE.glob("timeline-views.json.corrupt-*"))
+        self.assertEqual(len(q), 1, "the targeted-ops writer quarantines first")
+        self.assertEqual(q[0].read_text(), "[]", "…bytes preserved")
+        q[0].unlink()
 
     def test_two_quarantines_both_survive(self):
         # r54 P3.13: 32-bit names under a forced clock collided and the replacing rename

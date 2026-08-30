@@ -866,3 +866,97 @@ class R55PublishOutcomesAndSchema(unittest.TestCase):
         df.write_text("{garbage")
         self.assertEqual(pm.readbox_list("TESTHOST2"), [])
         self.assertFalse(df.exists(), "…while proven garbage still quarantines")
+
+class R55Wave2Retries(unittest.TestCase):
+    """the r55 wave-2 verification's postal cluster: the consume drain raised through a
+    failed read receipt AFTER the claim, corrupt handoff provenance 404-looped past intact
+    maildir headers, the parked-bounce flush skipped the forwarded-vs-ours arbitration and
+    cleared durable parks over memory-only queued rows, and two exchange threads
+    double-drained the retry pumps."""
+
+    def setUp(self):
+        _reset()
+        shutil.rmtree(pm.OUTBOX, ignore_errors=True)
+        pm._pending_terminal_rows[:] = []
+        pm._pending_bounces.clear()
+        try:
+            pm._pending_bounces_path().unlink()
+        except OSError:
+            pass
+        self.now = int(time.time())
+        self.hd = pm.OUTBOX / "TESTHOST2"
+        self.hd.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_failed_read_receipt_never_loses_claimed_mail(self):
+        # r55 wave 2: _fsync_dir's honest EIO propagated through readbox_put AFTER the
+        # rename to cur/ — the drain errored with the message already consumed, and the
+        # agent never received mail it could never reclaim
+        sid = "77777777-8888-9999-aaaa-bbbbbbbbbbbb"
+        mid = pm.deliver(sid, "peer", "88888888-9999-aaaa-bbbb-cccccccccccc", "hello there")
+        self.assertTrue(mid)
+        real = pm._queue_read_receipt
+        pm._queue_read_receipt = lambda *a, **kw: (_ for _ in ()).throw(OSError(5, "EIO"))
+        try:
+            out = pm.read_box(sid, consume=True)
+        finally:
+            pm._queue_read_receipt = real
+        self.assertEqual([r["body"] for r in out], ["hello there"],
+                         "the claimed mail DELIVERS — the receipt is best-effort behind it")
+
+    def test_corrupt_provenance_consults_the_maildir_before_any_404(self):
+        # r55 wave 2: the shape-guard 404 looped forever while the delivered mail's own
+        # intact headers sat in the maildir — the promised second source was unreachable
+        sid = "77777777-8888-9999-aaaa-bbbbbbbbbbbb"
+        mid = pm.deliver(sid, "peer", "", "relayed thing",
+                         relay_mid="px-701.1_aa.TESTHOST", relay_via="TESTHOST2")
+        with open(pm.TLDIR / "messages.jsonl", "a") as fh:   # the CORRUPT historic twin
+            fh.write(json.dumps({"t": self.now, "ev": "sent", "id": mid,
+                                 "relay_mid": [], "relay_via": "TESTHOST2"}) + "\n")
+        ans, code = pm.handoff_done_apply({"mid": mid})
+        self.assertEqual(code, 200, "the maildir headers decide — never a loop past them")
+        self.assertEqual(ans.get("queued"), "TESTHOST2",
+                         "…and the completion receipt relays to the via-host")
+
+    def test_the_parked_bounce_flush_is_origin_aware(self):
+        # r55 wave 2: the flush called _bounce_apply directly — a HUB's parked bounce
+        # delivered its return note as LOCAL mail instead of relaying backward
+        mid = "px-702.1_bb.TESTHOST"
+        (self.hd / (mid + ".json")).write_text(json.dumps(
+            {"mid": mid, "body": "hi", "origin": "TESTHOST3"}))
+        pm._pending_bounce_park("TESTHOST2", mid, "recipient-unavailable")
+        pm._flush_pending_bounces()
+        with pm._peer_lock:
+            back = list(pm._peer_pending.get("TESTHOST3", {}).get("bounces") or [])
+        self.assertEqual([b["mid"] for b in back], [mid],
+                         "the bounce relays BACKWARD to the origin — never a local note")
+        self.assertNotIn(mid, pm._pending_bounces, "…and the park clears on settlement")
+
+    def test_a_failed_terminal_append_keeps_the_durable_park(self):
+        # r55 wave 2: the malformed arm returned True after queuing a MEMORY-only row —
+        # the durable park cleared, and a process death lost both
+        mid = "px-703.1_cc.TESTHOST"
+        (self.hd / (mid + ".json")).write_text("{garbage")
+        pm._pending_bounce_park("TESTHOST2", mid, "recipient-unavailable")
+        real = pm._tl_append
+        pm._tl_append = lambda name, row: False
+        try:
+            pm._flush_pending_bounces()
+        finally:
+            pm._tl_append = real
+        self.assertIn(mid, pm._pending_bounces,
+                      "the park SURVIVES a failed terminal append — never cleared over a "
+                      "memory-only queued row")
+        pm._flush_pending_bounces()                  # the store recovers
+        self.assertNotIn(mid, pm._pending_bounces)
+        self.assertIn(mid, [r["id"] for r in _rows() if r.get("ev") == "bounced"])
+
+    def test_the_drain_is_single_flight(self):
+        src = open(os.path.join(BIN, "romp-postal-service"), encoding="utf-8").read()
+        i = src.index("def _drain_postal_retries():")
+        window = src[i:i + 900]
+        self.assertIn("_drain_lock.acquire(blocking=False)", window,
+                      "two exchange threads double-drained: duplicate return notes and "
+                      "terminal rows (r55 wave 2)")
