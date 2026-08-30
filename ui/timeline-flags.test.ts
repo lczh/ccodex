@@ -159,15 +159,26 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
     // effects never ran (the r53 verification round's own race)
     const sy = SRC.indexOf("_syncUnionOps(gate) {");
     const sw = SRC.slice(sy, sy + 5200);
-    assert.ok(sw.indexOf("this._gatedDispatches[opId] = gate") > 0
-      && sw.indexOf("this._gatedDispatches[opId] = gate") < sw.indexOf("__rompTimelineSetUnionOps"),
-      "the ack-gate is registered before the journal send it keys on");
+    const gateReg = "this._gatedDispatches[opId] = { gates: Array.isArray(gate) ? gate : [gate] };";
+    assert.ok(sw.indexOf(gateReg) > 0 && sw.indexOf(gateReg) < sw.indexOf("__rompTimelineSetUnionOps"),
+      "the ack-gate is registered before the journal send it keys on — per-gesture sub-gates "
+      + "(r54 wave 2: the composite's all-or-nothing yield double-dispatched a claimed gesture)");
     assert.ok(win.indexOf("fanOk = this._editRemoteTag") < win.indexOf("this._setViews(nv, [op])"),
       "rename/color/delete: remotes initiate before the local half commits");
     assert.ok(win.split("filter((o) => o.gid !== gid)").length === 3,
       "a refused initiation RETRACTS both legs' journaled intent — nothing began");
     assert.ok(win.split(">= 2").length >= 3,
       "EVERY multi-owner gesture journals — remote-only two-owner included (r53 P1.3)");
+  }
+  {
+    // the claimed completion syncs its RE-KEYED rows before any dispatch (r54 wave 2: the
+    // editTag reached the kernel first, its per-host evidence found only ogid-less old rows,
+    // and a completer dying mid-dispatch left the journal claiming nothing had run)
+    const fn = SRC.indexOf("_completeUnionGesture(gid) {");
+    const win = SRC.slice(fn, fn + 2600);
+    assert.ok(win.indexOf("this._syncUnionOps();") > 0
+      && win.indexOf("this._syncUnionOps();") < win.indexOf("this._editRemoteTag("),
+      "the socket is FIFO — the kernel holds the new rows when the dispatches arrive");
   }
   {
     const fn = SRC.indexOf("tagEditFailed(m) {");
@@ -1510,8 +1521,44 @@ test("executed: the writer's gate YIELDS gestures the ack names unclaimed (r54 P
   const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
   panel._editTagUnion(un, { remove: ["s1"] });
   assert.equal(edits.length, 0, "the gate yielded — the completer's dispatch is the only one");
-  assert.ok((panel._unionOps || []).every((o: any) => o.dispatched === false),
-    "…and the rows stay honest: OUR effects never ran");
+  assert.equal((panel._unionOps || []).length, 0,
+    "…and the yielded rows DROP from this panel's mirror (r54 wave 2: keeping them re-posted "
+    + "stale dispatched:false copies on every later sync, resurrecting rows the completer "
+    + "had retired)");
+  assert.ok(!(panel._journaledGids && panel._journaledGids.size),
+    "…forgotten, never retired — the completer owns the journal rows");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: a MIXED unclaimed answer yields per gesture — the composite replay never double-dispatches (r54 wave 2)", () => {
+  // the wave-2 verification's P1 (confirmed five ways): unionTransportReset merges every held
+  // gate into ONE replay sync; the all-or-nothing yield saw a mixed answer, fell through, and
+  // dispatched the completer-owned gesture too — the duplicate's refusal rolled the settled
+  // edit back on every host
+  const wire: any[] = [];
+  const edits: any[] = [];
+  g.__rompTimelineEditTag = (e: any) => edits.push(e);
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });       // G1: journaled, gated, ack lost
+  const g1 = (panel._unionOps || [])[0].gid;
+  panel._editTagUnion(un, { rename: "crew" });       // G2: journaled (fans to both), gated too
+  const g2 = (panel._unionOps || []).map((o: any) => o.gid).find((x: any) => x !== g1);
+  assert.ok(g2 && g2 !== g1, "two distinct gated gestures");
+  panel.unionTransportReset();                        // the reconnect replay: ONE sync, two gestures
+  const replayOp = wire[wire.length - 1].opId;
+  panel.unionOpsAck({ ok: true, opId: replayOp, unclaimed: [g1] });   // MIXED: a completer owns G1
+  assert.ok(edits.length >= 1 && edits.every((e: any) => String(e.remove || "") !== "s1"),
+    "G1's dispatches never run — the claim holder owns them");
+  assert.ok(edits.some((e: any) => e.rename === "crew"),
+    "…while G2's dispatches DO run — the yield is per gesture, never all-or-nothing");
+  assert.ok((panel._unionOps || []).every((o: any) => o.gid !== g1),
+    "G1's rows dropped (forgotten, not retired)");
+  assert.ok((panel._unionOps || []).filter((o: any) => o.gid === g2)
+    .every((o: any) => o.dispatched === true), "G2's rows flipped");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
 });
 
@@ -1546,5 +1593,8 @@ test("executed: a permanent LOCAL conflict compensates the confirmed remotes (r5
   assert.equal((panel._unionOps || []).length, 0, "the group retires — never immortal");
   assert.match(panel._tagEditErr.error, /refused.*already taken/s,
     "…and the reason is loud");
+  assert.equal(panel._pendingViews, null,
+    "…and the refused optimistic paint drops NOW (r54 wave 2: the pinned overlay kept "
+    + "rendering the refused rename for three pushes under a banner saying it was refused)");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
 });

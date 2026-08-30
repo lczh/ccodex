@@ -1644,6 +1644,7 @@ def _ordered_locked(sessions):
     def _nm(sid):
         return sess_name.get(sid) or _name_of(sid) or ""
     new = [s["sid"] for s in sessions if s["sid"] not in known]
+    _withheld = {}                                   # sid -> the sibling it renders after (r54)
     if new:
         name_at = [_nm(o) for o in order]                # each existing slot's stable name (resolved once)
         for sid in new:
@@ -1655,9 +1656,10 @@ def _ordered_locked(sessions):
                     # the heal failed AND its retry intent is memory-only (the r54 audit's
                     # P2.8, executed: a crash here left the sid persisted as known while the
                     # intent died with the process — the heal was never retried and the
-                    # session stayed out of its tags). Withhold the slot this pass: the sid
-                    # stays "new", re-attempts on the next push (event-paced), and still
-                    # renders meanwhile (unknowns sort after the ordered).
+                    # session stayed out of its tags). Withhold the PERSISTED slot this pass:
+                    # the sid stays "new" and re-attempts on the next push (event-paced),
+                    # while still RENDERING in its inherited slot (see below).
+                    _withheld[sid] = order[sib[-1]]
                     continue
                 order.insert(sib[-1] + 1, sid)           # a fork inherits its session's slot, not the END
                 name_at.insert(sib[-1] + 1, a)           # keep name_at aligned with order as we splice
@@ -1666,7 +1668,20 @@ def _ordered_locked(sessions):
                 name_at.append(a)
         _write_session_order(order)
     idx = {sid: i for i, sid in enumerate(order)}
-    return sorted(sessions, key=lambda s: idx.get(s["sid"], len(idx)))   # stable sort: ties keep input order
+    out = sorted(sessions, key=lambda s: idx.get(s["sid"], len(idx)))   # stable sort: ties keep input order
+    if _withheld:
+        # a sid whose heal intent is not yet durable renders in its INHERITED slot anyway
+        # (the r54 wave-2 verification: sorting it last made the watched lane jump to the
+        # end and snap back when the store recovered — two unprompted reorders); only the
+        # PERSISTED slot waits, so the eventual publication changes nothing on screen
+        by_sid = {s["sid"]: s for s in out}
+        for sid, after in _withheld.items():
+            s = by_sid.get(sid)
+            if s is None or after not in by_sid:
+                continue
+            out.remove(s)
+            out.insert(out.index(by_sid[after]) + 1, s)
+    return out
 
 
 def _ordered(sessions):
@@ -2960,8 +2975,8 @@ def _forward_tag_edit(host, body):
     r.pop("_views_at", None)
     try:
         rv = _poll_remote_views(r)
-        if rv is not None:
-            r["views"] = rv
+        if rv is not None and not (isinstance(rv, dict) and rv.get("unproved")):
+            r["views"] = rv                          # unproved = keep last-good (r54 wave 2)
     except Exception:
         pass
     return ans, None
@@ -2978,21 +2993,28 @@ def _views_client():
     # PROVED or MARKED (the r54 audit's P1.4, executed: an EIO read rendered tags=[], and the
     # timeline panel took the emptiness as a pending local delete's postimage — the journal
     # row retired on zero information and a renderer restart lost the local op for good).
-    # A faulted or malformed store still renders the lenient shape, but the payload SAYS so,
-    # and every settlement judgment holds while the flag is up.
+    # ONE read decides BOTH the shape and the marker (the r54 wave-2 verification: a probe
+    # followed by a second read left a window where the probe proved and the render faulted —
+    # fabricated-empty tags rode out unmarked). A faulted or malformed store still renders
+    # the lenient shape, but the payload SAYS so, and every settlement judgment holds.
+    _pd = None
     _proved = True
     try:
-        _probe = _views_path().read_text()
-        try:
-            json.loads(_probe)
-        except ValueError:
-            _proved = False                          # bytes exist; the lenient {} is a fabrication
+        _pd = json.loads(_views_path().read_text())
     except FileNotFoundError:
-        pass                                         # missing = honestly empty
-    except OSError:
-        _proved = False
-    v = json.loads(json.dumps(_timeline_views()))
-    if not _proved:
+        _pd = {}                                     # missing = honestly empty, proved
+    except Exception:
+        _proved = False                              # EIO or malformed: the shape is a fabrication
+    if _proved:
+        _pd2, _ = _migrate_hidden_blob(_pd if isinstance(_pd, dict) else {})
+        v = _norm_timeline_views(_pd2)
+        try:
+            v["rev"] = int(_pd.get("rev") or 0) if isinstance(_pd, dict) else 0
+        except (TypeError, ValueError):
+            v["rev"] = 0
+        v = json.loads(json.dumps(v))
+    else:
+        v = json.loads(json.dumps(_timeline_views()))
         v["unproved"] = True
     for t in v["tags"]:
         t["members"] = [_member_str(m) for m in t["members"]]
@@ -16252,8 +16274,9 @@ def _tunnel_supervisor():
                             r["usage"] = ruse
                         else:
                             r.pop("usage", None)
-                    if rviews is not None:
-                        r["views"] = rviews
+                    if rviews is not None and not (isinstance(rviews, dict)
+                                                   and rviews.get("unproved")):
+                        r["views"] = rviews          # unproved = keep last-good (r54 wave 2)
                     auto_check = (st == "up")
                     peer_up = (st == "up")
                     peer_port, peer_tok = r.get("bus_port"), r.get("token") or ""
@@ -32401,7 +32424,19 @@ class Handler(BaseHTTPRequestHandler):
                 # tag federation v0. CANONICAL shape (member pairs), remoteTags absent on purpose:
                 # a polling kernel re-spells pairs for ITS viewer, and never re-imports another
                 # viewer's join (no transitive unions in v0). `romp tag` maps either spelling.
-                return self._send(200, json.dumps(_timeline_views()), "application/json", cache="no-cache")
+                _fv = dict(_timeline_views())
+                # PROVED or MARKED for the POLLING kernel too (r54 wave 2, the remote leg of
+                # P1.4): union settlements judge remote halves from this response — a faulted
+                # store's fabricated empty confirmed a pending delete on the poller, which
+                # retired the recovery rows on zero information. Marked, the poller keeps its
+                # last-good copy instead.
+                try:
+                    json.loads(_views_path().read_text())
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    _fv["unproved"] = True
+                return self._send(200, json.dumps(_fv), "application/json", cache="no-cache")
             if p == "/models":                                # the ONE model + effort choice list — chat statusline, timeline lanes, AND judge settings all read it (the user 2026-07-02: no hardcoding in multiple places)
                 # each choice carries its colormap tint (upstream 2026-08-17: the new-comment
                 # dialog's selectors wear the same colors the statusline badges do, for ANY pick).

@@ -1997,6 +1997,46 @@ class R54AuditFixes(unittest.TestCase):
             import shutil
             shutil.rmtree(rodir, ignore_errors=True)
 
+    def test_the_marker_and_the_shape_come_from_one_read(self):
+        # the r54 wave-2 verification: the wave-1 probe was a SECOND read — a fault between
+        # the probe and the render sent fabricated-empty tags out unmarked. One read decides
+        # both now; pin the construction and the remote-leg guards.
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        fn = src.index("def _views_client():")
+        window = src[fn:fn + 3600]
+        self.assertIn("_migrate_hidden_blob(_pd", window,
+                      "the proved arm builds the payload from the PROBE's own parse")
+        self.assertNotIn("v = json.loads(json.dumps(_timeline_views()))\n    if not _proved",
+                         window, "the two-read probe shape is gone")
+        # the remote leg (the same finding's federation half): the served /views carries the
+        # marker, and BOTH poller cache sites keep last-good over an unproved snapshot
+        self.assertIn('_fv["unproved"] = True', src)
+        self.assertIn('if rv is not None and not (isinstance(rv, dict) and rv.get("unproved")):',
+                      src)
+        self.assertIn('if rviews is not None and not (isinstance(rviews, dict)', src)
+
+    def test_a_withheld_sid_still_renders_in_its_inherited_slot(self):
+        # the r54 wave-2 verification: sorting the withheld sid LAST made the watched lane
+        # jump to the end and snap back when the store recovered — two unprompted reorders
+        OTHER = "99999999-8888-7777-6666-555555555555"
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "",
+                                         "members": [self.OLD]}}])
+        km._write_session_order([self.OLD, OTHER])
+        km._heals_path().mkdir(parents=True, exist_ok=True)
+        real = km._views_path
+        sessions = [{"sid": self.OLD, "name": "web"}, {"sid": OTHER, "name": "api"},
+                    {"sid": self.NEW, "name": "web"}]
+        try:
+            km._views_path = lambda: self._BadPath(real())
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                out = km._ordered_locked(list(sessions))
+        finally:
+            km._views_path = real
+        self.assertEqual([s["sid"] for s in out], [self.OLD, self.NEW, OTHER],
+                         "the fork RENDERS right after its sibling even while the persisted "
+                         "slot waits on the durable heal")
+        self.assertNotIn(self.NEW, km._session_order(), "…and the persisted order still waits")
+
     def test_two_quarantines_both_survive(self):
         # r54 P3.13: 32-bit names under a forced clock collided and the replacing rename
         # destroyed the first quarantine's bytes — 128-bit + no-replace now

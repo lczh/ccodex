@@ -1700,7 +1700,8 @@ class TimelinePanel {
       //  - the local leg applies only from its verified preimage.
       const gatedNow = new Set();
       for (const k in (this._gatedDispatches || {}))
-        for (const g3 of this._gatedDispatches[k].gids) gatedNow.add(g3);
+        for (const g1 of (this._gatedDispatches[k].gates || []))
+          for (const g3 of g1.gids) gatedNow.add(g3);
       // one-way refresh of HELD rows (the same wave-3 round: adopters kept dispatched:false
       // copies forever, and their full-replace syncs regressed the journal — the kernel-side
       // merge ratchet is the durable half; this converges the in-memory mirrors)
@@ -2990,7 +2991,10 @@ class TimelinePanel {
     // after, a synchronously-delivered ack found no gate and the gesture's effects never ran)
     if (gate) {
       this._gatedDispatches = this._gatedDispatches || {};
-      this._gatedDispatches[opId] = gate;
+      // normalized to {gates:[...]}: the reconnect replay carries SEVERAL gestures under one
+      // ack, and the r54 wave-2 verification showed the yield must decide PER GESTURE — an
+      // all-or-nothing check on the composite dispatched a gesture a completer already owned
+      this._gatedDispatches[opId] = { gates: Array.isArray(gate) ? gate : [gate] };
     }
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineSetUnionOps === 'function') {
@@ -3005,7 +3009,8 @@ class TimelinePanel {
         this._postChain = (this._postChain || Promise.resolve()).then(() =>
           this._kernelPost('/union-ops', { entries: entries, retired: retired, opId: opId,
                                            cid: this._unionCid() }, true)
-            .then((r) => this.unionOpsAck({ ok: r.ok === true, opId: opId }))
+            .then((r) => this.unionOpsAck({ ok: r.ok === true, opId: opId,
+                                            unclaimed: (r.json && r.json.unclaimed) || [] }))
             .catch(() => this.unionOpsAck({ ok: false, opId: opId }))
         );
         sent = true;
@@ -3026,14 +3031,15 @@ class TimelinePanel {
     delete this._pendingUnionSyncs[m.opId];
     const gated = this._gatedDispatches ? this._gatedDispatches[m.opId] : null;
     if (this._gatedDispatches) delete this._gatedDispatches[m.opId];
+    const _gatedGidsAll = gated ? gated.gates.reduce((a, g1) => a.concat(g1.gids), []) : [];
     if (m.ok === false) {
       if (gated) {
         // the r53 audit's P1.4: the gesture's effects were DISPATCHED before the journal's
         // persistence was known — with the journal refused, remote edits and the local
         // commit ran with no durable rollback record anywhere. The gesture drops WHOLE:
         // nothing began, nothing splits; the reason shows.
-        this._unionOps = (this._unionOps || []).filter((o) => gated.gids.indexOf(o.gid) < 0);
-        this._tagEditErr = { host: '', name: gated.name || '',
+        this._unionOps = (this._unionOps || []).filter((o) => _gatedGidsAll.indexOf(o.gid) < 0);
+        this._tagEditErr = { host: '', name: (gated.gates[0] || {}).name || '',
           error: 'the edit was not applied — its safety record could not be saved; retry' };
         if (this._viewsDialog && this._viewsDialogBuild) this._viewsDialogBuild();
         this.draw();
@@ -3054,21 +3060,31 @@ class TimelinePanel {
     for (const g of (p.tomb || [])) { if (this._retireUnionGids) this._retireUnionGids.delete(g); }
     if (gated) {
       const uncl = new Set(Array.isArray(m.unclaimed) ? m.unclaimed : []);
-      if (gated.gids.length && gated.gids.every((g) => uncl.has(g))) {
-        // a COMPLETER holds these gestures (r54 P1.3): our journal write raced a granted
-        // claim — the effects are the claim holder's to run, and running ours too is the
-        // double dispatch the claim exists to end. Rows stay undispatched here; their flip
-        // arrives on the completer's own sync or the kernel's dispatch evidence.
-        return;
+      let ran = false;
+      for (const g1 of gated.gates) {
+        if (g1.gids.length && g1.gids.every((g) => uncl.has(g))) {
+          // a COMPLETER holds THIS gesture (r54 P1.3): our journal write raced a granted
+          // claim — its effects are the claim holder's to run, and running ours too is the
+          // double dispatch the claim exists to end. Decided PER GESTURE (the r54 wave-2
+          // verification: the reconnect replay's composite gate got a MIXED answer and the
+          // all-or-nothing check dispatched the completer-owned gesture anyway — the
+          // duplicate's refusal rolled the settled edit back). The yielded gesture's rows
+          // DROP from this panel's mirror and ledgers (never retired — the completer owns
+          // the journal rows now): keeping them re-inserted retired rows on every later
+          // full-replace sync, resurrecting the gesture for every open panel.
+          this._yieldUnionGids(g1.gids);
+          continue;
+        }
+        for (const o of (this._unionOps || []))
+          if (g1.gids.indexOf(o.gid) >= 0) o.dispatched = true;
+        g1.run();               // the journal is DURABLE — the gesture's effects may now run (r53)
+        ran = true;
       }
-      for (const o of (this._unionOps || []))
-        if (gated.gids.indexOf(o.gid) >= 0) o.dispatched = true;
-      gated.run();              // the journal is DURABLE — the gesture's effects may now run (r53)
-      // persist the dispatched flip NOW, not on the next unrelated sync: a reload in that
-      // window re-seeds dispatched:false rows and the adoption-completion pass would RE-run
-      // an already-executed gesture (a rename's re-dispatch targets the old, now-gone name —
-      // a spurious refusal rolls back a perfectly settled edit)
-      this._syncUnionOps();
+      // persist the dispatched flips (and any yield-drops) NOW, not on the next unrelated
+      // sync: a reload in that window re-seeds dispatched:false rows and the adoption-
+      // completion pass would RE-run an already-executed gesture (a rename's re-dispatch
+      // targets the old, now-gone name — a spurious refusal rolls back a settled edit)
+      if (ran || gated.gates.length) this._syncUnionOps();
     }
   }
 
@@ -3126,6 +3142,11 @@ class TimelinePanel {
     if (!this._mintedGids) this._mintedGids = new Set();
     this._mintedGids.add(ngid);
     for (const x of group) { x.ogid = x.ogid || x.gid; x.gid = ngid; }
+    // the RE-KEYED rows sync BEFORE any dispatch (the r54 wave-2 verification: the editTag
+    // reached the kernel first, its per-host evidence found only old-gid ogid-less rows,
+    // and a completer dying mid-dispatch left the journal claiming nothing had run) — the
+    // socket is FIFO, so the kernel holds the new rows when the dispatches arrive
+    this._syncUnionOps();
     const rts3 = (this._views && this._views.remoteTags) || [];
     for (const x of pend) {
       x.dispatched = true;
@@ -3143,6 +3164,22 @@ class TimelinePanel {
     this.draw();
   }
 
+  // a gesture yielded to its claim holder leaves this panel's tracking WITHOUT a retirement
+  // (r54 wave 2): the completer owns the journal rows — re-posting our stale dispatched:false
+  // copies resurrected retired rows via the kernel's per-(gid,host) upsert, and emitting a
+  // retirement would erase rows the completer still needs. Forgetting re-arms continuous
+  // adoption: the next proven echo hands us whatever the completer left (the re-keyed rows,
+  // or the originals if it died before completing — claimable again once its socket closes).
+  _yieldUnionGids(gids) {
+    const s = new Set(gids);
+    this._unionOps = (this._unionOps || []).filter((o) => !s.has(o.gid));
+    for (const g of s) {
+      if (this._journaledGids) this._journaledGids.delete(g);
+      if (this._mintedGids) this._mintedGids.delete(g);
+      if (this._adoptedGids) this._adoptedGids.delete(g);
+    }
+  }
+
   // Transport reconnected (the v1.3.23 audit's P1.3 — the views writer's P2.8, union twin): a
   // sync sent on the OLD socket was accepted by the browser and never delivered, its ack is
   // never coming, and nothing re-marked the journal dirty — the kernel's copy stayed behind
@@ -3153,17 +3190,14 @@ class TimelinePanel {
     this._pendingClaims = {};        // claim acks died with the socket; sightings re-ask (r54)
     this._unionRetryPending = false;
     this._unionSyncDirty = true;
-    const held = this._gatedDispatches ? Object.values(this._gatedDispatches) : [];
+    const held = (this._gatedDispatches ? Object.values(this._gatedDispatches) : [])
+      .reduce((a, e) => a.concat(e.gates || []), []);
     this._gatedDispatches = {};
-    // gestures gated on acks that died with the socket re-gate on the REPLAY's ack (r53):
-    // their entries ride the fresh full-replace sync, so one ok releases them all
-    const gate = held.length ? {
-      run: () => held.forEach((g) => g.run()),
-      gids: held.reduce((a, g) => a.concat(g.gids), []),
-      name: held[0].name,
-    } : null;
-    const opId = this._syncUnionOps(gate);
-    if (!opId && gate) gate.run();
+    // gestures gated on acks that died with the socket re-gate on the REPLAY's ack (r53) —
+    // as SEPARATE sub-gates (r54 wave 2): the replay's ack decides each gesture on its own
+    // claim, so a completer-owned one yields while its siblings still run
+    const opId = this._syncUnionOps(held.length ? held : null);
+    if (!opId) held.forEach((g) => g.run());
   }
 
   _noteUnionOp(rt, name, inverse, edit, gid, opts) {
@@ -3222,7 +3256,8 @@ class TimelinePanel {
     const localTags = (this._views && (this._views.tags || this._views.groups)) || [];
     const gatedGids = new Set();
     for (const k in (this._gatedDispatches || {}))
-      for (const g2 of this._gatedDispatches[k].gids) gatedGids.add(g2);
+      for (const g1 of (this._gatedDispatches[k].gates || []))
+        for (const g2 of g1.gids) gatedGids.add(g2);
     for (const [g, done] of Array.from(gidDone.entries())) {
       if (!g) continue;
       if (gatedGids.has(g)) {
@@ -3601,6 +3636,9 @@ class TimelinePanel {
       this._editRemoteTag(e.rename ? Object.assign({}, o.rt, { name: e.rename }) : o.rt, inv,
                           ++unionGestureSeq);
     }
+    this._pendingViews = null; this._pendingViewsAge = 0;   // the refused optimistic paint
+    //   drops NOW (the r54 wave-2 verification: the pinned overlay kept rendering the refused
+    //   rename for three pushes while the banner said it was refused)
     this._tagEditErr = { host: '', name: group[0].name || '',
       error: 'the local half of this edit was refused' + (why ? ' — ' + why : '')
       + (rolled.length ? ' — rolled the applied edit back on ' + rolled.join(', ') : '')

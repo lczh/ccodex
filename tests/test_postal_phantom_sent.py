@@ -637,6 +637,19 @@ class R54PublishAndTypedReader(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertFalse(f.exists(), "…and parsed garbage still quarantines aside")
 
+    def test_a_non_utf8_record_never_wedges_the_listing(self):
+        # the r54 wave-2 verification: read_text's UnicodeDecodeError escaped BOTH arms to
+        # the outer `except Exception: return []` — one torn record silenced the whole
+        # host's relay listing forever, with nothing quarantined and nothing logged
+        good = self.hd / "px-508.1_hh.TESTHOST.json"
+        good.write_text(json.dumps({"mid": "px-508.1_hh.TESTHOST", "body": "hi"}))
+        torn = self.hd / "px-509.1_ii.TESTHOST.json"
+        torn.write_bytes(b"\xff\xfe\x00garbage")
+        rows = pm.outbox_list("TESTHOST2")
+        self.assertEqual([r["mid"] for r in rows], ["px-508.1_hh.TESTHOST"],
+                         "the valid mail still relays")
+        self.assertFalse(torn.exists(), "…and the torn record quarantines as PROVEN garbage")
+
     def test_a_malformed_record_still_files_the_ack_receipt(self):
         # r54 P2.9: malformed read as 'missing' — the ack deleted the record with no
         # terminal row, and the delivered message showed parked-forever after the tail aged

@@ -2824,7 +2824,12 @@ def outbox_list(host, limit=None, byte_limit=None):
             try:
                 st = f.stat()
                 fingerprint = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
-                raw = f.read_text()
+                raw = f.read_bytes().decode("utf-8")   # a decode failure is PROVEN garbage —
+                #   read_text's UnicodeDecodeError escaped BOTH arms to the outer handler and
+                #   one torn record wedged the whole host's relay listing forever (r54 wave 2)
+            except UnicodeDecodeError as e:
+                _quarantine_corrupt_json(f, "outbox", e, fingerprint)
+                continue
             except OSError:
                 # a TRANSIENT read fault is not corruption (the r54 audit's P2.9, executed:
                 # one EIO'd-but-valid record was quarantined out of the outbox by the same
