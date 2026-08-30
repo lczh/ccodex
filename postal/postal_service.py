@@ -1085,6 +1085,9 @@ def _sent_receipts(mid):
     for line in log.read_text(errors="replace").splitlines():
         try: e = json.loads(line)
         except Exception: continue
+        if not isinstance(e, dict) or not isinstance(e.get("id"), str):
+            continue     # a well-formed [] row (or an {"id": []} row) raised through the whole
+            #              listing — /sent answered 500 on one historic line (r54 P2.10)
         ev = e.get("ev")
         if ev == "sent" and e.get("from_id") == mid:
             sent[e["id"]] = e
@@ -1108,9 +1111,10 @@ def _sent_receipts(mid):
             try:
                 if outbox_get(h, i):
                     return h
-            except _OutboxUnreadable:
-                return h                             # the record EXISTS (unreadable is not gone):
-                                                     # still honestly parked; never kill the listing
+            except (_OutboxUnreadable, _OutboxMalformed):
+                return h                             # the record EXISTS (unreadable/garbled is
+                                                     # not gone): still honestly parked; never
+                                                     # kill the listing
         return None
 
     def _row(i, e):
@@ -1936,6 +1940,9 @@ def _reconcile_relay_stages():
                         continue
                     if not isinstance(row, dict):
                         continue         # a well-formed [] row raised through every boot (r53)
+                    if not isinstance(row.get("id"), str):
+                        continue         # an {"id": []} row is unhashable — the set probe raised
+                        #                  and later VALID settlement proof was never read (r54)
                     if row.get("id") in stage_mids and (
                             row.get("ev") in _TERMINAL_EVS or row.get("ev") == "relayed"):
                         settled.add(row.get("id"))
@@ -2752,6 +2759,19 @@ def outbox_publish_stage(host, mid, stagef):
     # deleting the file (the r52 verification closed that del/append gap).
     try:
         os.link(stagef, d / (mid + ".json"))
+    except FileExistsError:
+        # a same-mid file already stands. Its content decides (r54 P1.5 refining the r52
+        # rule): IDENTICAL bytes mean a previous attempt of THIS stage crashed between its
+        # link and unlink — that IS publication, and re-raising filed a false `unpublished`
+        # terminal over live mail (the sender's retry double-delivered). DIFFERENT bytes are
+        # a true collision: loud, and the standing mail survives (r52; 128-bit mids make
+        # this unreachable in practice).
+        try:
+            _same = (d / (mid + ".json")).read_bytes() == Path(stagef).read_bytes()
+        except OSError:
+            _same = False
+        if not _same:
+            raise
     except OSError as e:
         if e.errno in (errno.EPERM, errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)):
             # a filesystem without hard links (the r52 verification): rename still publishes
@@ -2759,16 +2779,32 @@ def outbox_publish_stage(host, mid, stagef):
             os.rename(stagef, d / (mid + ".json"))
         else:
             raise
+    # ── PAST THIS POINT THE MESSAGE IS LIVE (the r54 audit's P1.5, executed: the directory
+    # fsync raised AFTER the link and the stage unlink, the caller compensated `unpublished`,
+    # and the relay still carried the message — the retry double-delivered). Publication is a
+    # one-way door: nothing below may surface as failure. Ordering per the same finding:
+    # make the PUBLICATION durable first, only then retire the stage, then make the
+    # retirement durable — each step best-effort and loud, with boot arbitration (a standing
+    # stage whose published file exists just drops) as the backstop.
+    try:
+        _fsync_dir(d)
+    except Exception:
+        sys.stderr.write("postal: could not fsync the outbox dir for %s — the publication "
+                         "stands; the stage survives for boot arbitration\n" % mid)
+        _peer_wake(host).set()
+        return
+    try:
+        os.unlink(stagef)
+    except FileNotFoundError:
+        pass                                         # the rename arm consumed it
+    except OSError:
+        sys.stderr.write("postal: could not remove the published stage for %s — boot "
+                         "cleans it\n" % mid)
     else:
         try:
-            os.unlink(stagef)
-        except OSError:
-            # the message IS published — raising here filed a false `unpublished` terminal
-            # and the sender's retry double-delivered (the r52 verification). The leftover
-            # stage drops at boot: its published file exists.
-            sys.stderr.write("postal: could not remove the published stage for %s — boot "
-                             "cleans it\n" % mid)
-    _fsync_dir(d)
+            _fsync_dir(d)
+        except Exception:
+            pass
     _peer_wake(host).set()
 
 def outbox_list(host, limit=None, byte_limit=None):
@@ -2788,7 +2824,16 @@ def outbox_list(host, limit=None, byte_limit=None):
             try:
                 st = f.stat()
                 fingerprint = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
-                row = json.loads(f.read_text())
+                raw = f.read_text()
+            except OSError:
+                # a TRANSIENT read fault is not corruption (the r54 audit's P2.9, executed:
+                # one EIO'd-but-valid record was quarantined out of the outbox by the same
+                # exchange whose ack path had correctly deferred it) — keep it this pass
+                _log("outbox: %s unreadable this pass — kept, never quarantined on a "
+                     "transient fault" % f.name)
+                continue
+            try:
+                row = json.loads(raw)
                 size = len(json.dumps(row).encode("utf-8"))
                 if byte_limit is not None and used + size > byte_limit:
                     if not out:
@@ -2798,6 +2843,7 @@ def outbox_list(host, limit=None, byte_limit=None):
                 out.append(row)
                 used += size
             except Exception as e:
+                # PROVEN garbage: the bytes were read whole and do not parse — quarantine
                 _quarantine_corrupt_json(f, "outbox", e, fingerprint)
         return out
     except Exception:
@@ -2808,7 +2854,17 @@ class _OutboxUnreadable(Exception):
     'missing' let the ack path delete the only retry source over an unproved read."""
 
 
+class _OutboxMalformed(Exception):
+    """The record EXISTS but its bytes do not parse (the r54 audit's P2.9): read as 'missing',
+    ack/bounce processing deleted or quarantined it with no terminal record and no return
+    note — the receipt vanished with the garbage. Malformed is definite (the bytes were read
+    whole), so terminal rows may file; unreadable is not, so those paths defer instead."""
+
+
 def outbox_get(host, mid):
+    """None = missing (proved by ENOENT); raises _OutboxUnreadable on a transient read fault
+    and _OutboxMalformed on parsed garbage — four states, never conflated (r53 P2.10 + r54
+    P2.9)."""
     if not (_safe_id(host) and _safe_id(mid)):   # host/mid are path components — block traversal
         return None
     try:
@@ -2818,7 +2874,7 @@ def outbox_get(host, mid):
     except OSError as e:
         raise _OutboxUnreadable(*(e.args or ("unreadable",)))
     except ValueError:
-        return None                              # corrupt content: nothing usable to relay
+        raise _OutboxMalformed("malformed outbox record %s/%s" % (host, mid))
 
 def outbox_del(host, mid):
     if not (_safe_id(host) and _safe_id(mid)):   # host/mid are path components — block traversal
@@ -2929,8 +2985,11 @@ def _handoff_done_ids():
                     r = json.loads(line)
                 except Exception:
                     continue
-                if r.get("ev") == "handoff-done" and r.get("id"):
-                    ids.add(str(r["id"]))
+                if not isinstance(r, dict):
+                    continue             # a [] row raised here and the exchange never answered
+                    #                      — one historic line wedged every handoff (r54 P2.10)
+                if r.get("ev") == "handoff-done" and isinstance(r.get("id"), str):
+                    ids.add(r["id"])
         except OSError:
             return set()
         _HANDOFF_DONE_MEMO["key"], _HANDOFF_DONE_MEMO["ids"] = key, ids
@@ -3157,8 +3216,8 @@ def _bounce_apply(host, b):
     mid = rows[0]["mid"]
     try:
         msg = outbox_get(host, mid)
-    except _OutboxUnreadable:
-        # the record exists but cannot be read. "Defer" here would be a DROP (the r53 wave-3
+    except (_OutboxUnreadable, _OutboxMalformed):
+        # the record exists but cannot be read or parsed. "Defer" here would be a DROP (the r53 wave-3
         # verification): the exchange 200s this bounce regardless, so the peer marks it
         # delivered and never re-sends — and outbox_list quarantines the unreadable record
         # in the SAME pass, so no later retry can read it either. File the terminal receipt
@@ -3485,8 +3544,8 @@ def _relay_in(host, m, token_proven=False):
             try:
                 if outbox_get(fh, mid) is None:      # a resend while we hold it forwards nothing twice
                     outbox_put(fh, dict(m, origin=host))
-            except _OutboxUnreadable:
-                pass                                 # the record EXISTS (just unreadable) — the
+            except (_OutboxUnreadable, _OutboxMalformed):
+                pass                                 # the record EXISTS (unreadable/garbled) — the
                                                      # dedupe holds; never re-put, never raise
             return "hold", None
     return "bounce", {"mid": mid, "code": "recipient-unavailable"}
@@ -3502,6 +3561,17 @@ def _ack_arrived(host, mid):
         # the record exists but cannot be read (the r53 audit's P2.10): deleting it here
         # removed the only retry source over an unproved read — the next ack retries instead
         _log("ack for %s/%s deferred: the outbox record is unreadable" % (host, mid))
+        return
+    except _OutboxMalformed:
+        # PARSED garbage is definite (r54 P2.9): the ack proves delivery, and the old
+        # missing-alike arm deleted the record with no terminal row — the receipt vanished.
+        # File the receipt first; retire the garbage only after it proved.
+        if _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "relayed",
+                                         "id": mid, "host": host}):
+            outbox_del(host, mid)
+            _log("ack for %s/%s: record malformed — receipt filed, record retired" % (host, mid))
+        else:
+            _log("ack for %s/%s: record malformed AND the receipt append failed — kept" % (host, mid))
         return
     if not msg:
         outbox_del(host, mid)
@@ -3532,8 +3602,8 @@ def _bounce_arrived(host, b):
     mid = bounce["mid"]
     try:
         msg = outbox_get(host, mid)
-    except _OutboxUnreadable:
-        # forwarded-or-ours is undecidable over an unproved read, and "defer" is a drop (the
+    except (_OutboxUnreadable, _OutboxMalformed):
+        # forwarded-or-ours is undecidable over an unproved or garbled read, and "defer" is a drop (the
         # exchange 200s the bounce; the peer never re-sends). Treat it as ours: _bounce_apply's
         # unreadable arm files the terminal receipt and is loud about the lost return note —
         # if it WAS a forward, the origin sees its own parked accounting settle on the 7-day

@@ -1614,13 +1614,17 @@ class R53ProvedSnapshots(unittest.TestCase):
         km.jd.STATE.mkdir(parents=True, exist_ok=True)
         km._views_path().write_text("{corrupt")
         real_rename = km.Path.rename
+        real_link = km.os.link
         try:
+            # both quarantine arms fail: the no-replace link (r54 P3.13) and the rename fallback
+            km.os.link = lambda *a, **kw: (_ for _ in ()).throw(OSError(1, "EPERM"))
             km.Path.rename = lambda self, *a, **kw: (_ for _ in ()).throw(OSError(13, "EACCES"))
             with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
                 with self.assertRaises(OSError):
                     km._read_state_json(km._views_path(), "timeline-views")
         finally:
             km.Path.rename = real_rename
+            km.os.link = real_link
         self.assertEqual(km._views_path().read_text(), "{corrupt",
                          "the bytes survive — empty-on-failed-quarantine let the caller "
                          "overwrite them (the r53 audit's P2.9)")
@@ -1628,8 +1632,11 @@ class R53ProvedSnapshots(unittest.TestCase):
             self.assertIsNone(km._read_state_json(km._views_path(), "timeline-views"))
         q = list(km.jd.STATE.glob("timeline-views.json.corrupt-*"))
         self.assertEqual(len(q), 1, "…and a WORKING quarantine still moves them aside")
-        self.assertIn("-", q[0].name.rsplit("corrupt-", 1)[1],
-                      "the quarantine name carries pid+random — 1s names collided (P2.9)")
+        rand = q[0].name.rsplit("-", 1)[1]
+        self.assertEqual(len(rand), 32,
+                         "128 random bits (r54 P3.13: 32-bit names collided under a forced "
+                         "clock, and the replacing rename destroyed the earlier quarantine)")
+        self.assertFalse(km._views_path().exists(), "the source retired with the quarantine")
         q[0].unlink()
 
     def test_a_write_fault_is_the_held_queue_type(self):
@@ -1771,19 +1778,31 @@ class R53VerifyRound(unittest.TestCase):
              "name": "pool", "dispatched": False},
             {"refusal": True, "gid": -11, "opId": "11", "host": "TESTHOST-A",
              "name": "pool", "t": int(__import__("time").time())}]))
-        self.assertTrue(km._union_ops_mark_dispatched("11"))
-        rows = km._union_ops_load()
-        self.assertEqual([r.get("dispatched") for r in rows if not r.get("refusal")],
-                         [True, True])
-        self.assertNotIn("dispatched", [k for r in rows if r.get("refusal") for k in
-                                        ("dispatched",) if k in r],
+        self.assertTrue(km._union_ops_mark_dispatched("11", "TESTHOST-A"))
+        rows = {r["host"]: r.get("dispatched") for r in km._union_ops_load()
+                if not r.get("refusal")}
+        self.assertEqual(rows, {"TESTHOST-A": True, "TESTHOST-B": False},
+                         "the flip is scoped to the ONE host the edit addressed (r54 P1.1: "
+                         "the gid-wide flip marked unsent B dispatched when only A arrived — "
+                         "a renderer dying between sends left B stranded, unadoptable)")
+        self.assertNotIn("dispatched", [k for r in km._union_ops_load() if r.get("refusal")
+                                        for k in ("dispatched",) if k in r],
                          "refusal rows are events, never flipped")
-        self.assertFalse(km._union_ops_mark_dispatched("web7"),
+        # a re-keyed completion row still matches through its carried original id
+        self.assertTrue(km._union_ops_set([{"host": "TESTHOST-B", "gid": 77, "ogid": 11,
+                                            "edit": {}, "inverse": {}, "rt": {},
+                                            "name": "pool", "dispatched": False}], [11]))
+        self.assertTrue(km._union_ops_mark_dispatched("11", "TESTHOST-B"))
+        self.assertEqual([r.get("dispatched") for r in km._union_ops_load()
+                          if r.get("gid") == 77], [True], "ogid carries the correlation")
+        self.assertFalse(km._union_ops_mark_dispatched("web7", "TESTHOST-A"),
                          "a web-minted opId names no gesture")
-        self.assertFalse(km._union_ops_mark_dispatched(-11))
+        self.assertFalse(km._union_ops_mark_dispatched(-11, "TESTHOST-A"))
+        self.assertFalse(km._union_ops_mark_dispatched("11", ""),
+                         "no host, no evidence")
         # …and the editTag handler flips BEFORE the forward, which can block for seconds
         src = open(os.path.join(BIN, "romp-kernel")).read()
-        i_flip = src.index("_union_ops_mark_dispatched(op_id)")
+        i_flip = src.index("_union_ops_mark_dispatched(op_id, host)")
         i_fwd = src.index("ans, err = _forward_tag_edit(host, body)")
         self.assertLess(i_flip, i_fwd, "arrival is the event — the flip never waits on the owner")
 
@@ -1808,3 +1827,186 @@ class R53VerifyRound(unittest.TestCase):
         self.assertEqual(km._pending_heals, [])
 
 
+
+class R54AuditFixes(unittest.TestCase):
+    """the v1.3.26 audit: gid-wide dispatch marking stranded mixed groups (P1.1), completion
+    claims did not exist (P1.3), an EIO payload judged settlements (P1.4), the proved reader
+    skipped the hidden migration (P2.6), order published sids over memory-only heal intents
+    (P2.8), a quarantined journal echoed as authoritative [] (P2.11), parent-dir faults
+    bypassed the retryable type (P2.12), and quarantine names could collide+replace (P3.13)."""
+
+    OLD = "11111111-2222-3333-4444-555555555555"
+    NEW = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    def setUp(self):
+        _scrub_state()
+        km._pending_heals[:] = []
+        km._heals_adopted[0] = False
+        km._union_claims.clear()
+        import shutil
+        for pfn in (km._union_ops_path, km._heals_path):
+            p = pfn()
+            shutil.rmtree(p, ignore_errors=True)
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        try:
+            (km.jd.STATE / "session-order.json").unlink()
+        except OSError:
+            pass
+
+    def tearDown(self):
+        self.setUp()
+
+    class _BadPath:
+        def __init__(self, real):
+            self._real = real
+
+        def read_text(self):
+            raise OSError(5, "EIO")
+
+        def stat(self):
+            raise OSError(5, "EIO")
+
+        def exists(self):
+            return True
+
+        def __getattr__(self, k):
+            return getattr(self._real, k)
+
+    def test_claims_are_exclusive_and_socket_scoped(self):
+        # r54 P1.3: two bystander panels completed the same dead writer's gesture by
+        # construction — the kernel grants exactly one completer now
+        self.assertTrue(km._union_claim_grant(9, "ws:1"))
+        self.assertFalse(km._union_claim_grant(9, "ws:2"), "a live holder refuses")
+        self.assertTrue(km._union_claim_grant(9, "ws:1"), "re-grant refreshes the holder")
+        km._union_claims_release("ws:1")
+        self.assertTrue(km._union_claim_grant(9, "ws:2"),
+                        "the socket-close release frees a dead writer's gestures")
+        # POST claimants have no close event — the TTL backstop yields a stale one
+        self.assertTrue(km._union_claim_grant(10, "cid:a"))
+        self.assertFalse(km._union_claim_grant(10, "cid:b"))
+        km._union_claims[10]["t"] -= km._UNION_CLAIM_TTL + 1
+        self.assertTrue(km._union_claim_grant(10, "cid:b"), "a stale POST claim yields")
+        self.assertFalse(km._union_claim_grant(0, "ws:1"))
+        self.assertFalse(km._union_claim_grant("x", "ws:1"))
+
+    def test_the_journal_write_claims_for_its_writer(self):
+        # the implicit writer claim: a live writer is never raced by a completer, and the
+        # ack NAMES gestures a completer already holds so the gate yields
+        rows = [{"host": "TESTHOST-A", "gid": 21, "dispatched": False},
+                {"host": "TESTHOST-B", "gid": 22, "dispatched": False},
+                {"refusal": True, "gid": -5, "opId": "5"}]
+        self.assertEqual(km._union_claim_entries(rows, "ws:9"), [])
+        self.assertFalse(km._union_claim_grant(21, "ws:other"), "the writer holds 21")
+        km._union_claims.clear()
+        km._union_claim_grant(21, "ws:completer")
+        self.assertEqual(km._union_claim_entries(rows, "ws:9"), [21],
+                         "a completer-held gesture is named back to the writer")
+
+    def test_the_payload_views_carry_the_unproved_marker(self):
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "",
+                                         "members": []}}])
+        self.assertNotIn("unproved", km._views_client(), "a healthy store is proved")
+        real = km._views_path
+        try:
+            km._views_path = lambda: self._BadPath(real())
+            v = km._views_client()
+        finally:
+            km._views_path = real
+        self.assertIs(v.get("unproved"), True,
+                      "an EIO store renders the lenient shape but SAYS so (r54 P1.4: the "
+                      "silent empty read as a pending delete's postimage and the recovery "
+                      "rows retired on zero information)")
+        km.jd.STATE.mkdir(parents=True, exist_ok=True)
+        km._views_path().write_text("{garbage")
+        v2 = km._views_client()
+        self.assertIs(v2.get("unproved"), True, "malformed bytes are a fabrication too")
+        km._views_path().unlink()
+        km._flags_cache.clear()
+        self.assertNotIn("unproved", km._views_client(), "missing = honestly empty, proved")
+
+    def test_the_proved_reader_migrates_hidden_memberships(self):
+        # r54 P2.6, executed there: the same stored blob kept sid-hidden on the lenient
+        # reader and LOST it through the proved mutation snapshot — the first post-upgrade
+        # tag edit erased every hidden membership
+        km.jd.STATE.mkdir(parents=True, exist_ok=True)
+        km._views_path().write_text(json.dumps({"active": "all", "tags": [],
+                                                "hidden": [self.OLD], "rev": 3}))
+        v = km._timeline_views_proved()
+        arch = next((t for t in v["tags"] if t["name"] == "archived"), None)
+        self.assertIsNotNone(arch, "the proved snapshot runs the SAME migration")
+        self.assertIn(self.OLD, [m["sid"] for m in arch["members"]])
+        with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+            out, err = km._edit_tag("new-tag", add=[])
+        self.assertIsNone(err)
+        v2 = km._timeline_views()
+        arch2 = next((t for t in v2["tags"] if t["name"] == "archived"), None)
+        self.assertIsNotNone(arch2, "…so the first post-upgrade edit PRESERVES them")
+        self.assertIn(self.OLD, [m["sid"] for m in arch2["members"]])
+
+    def test_order_withholds_a_sid_whose_heal_intent_is_memory_only(self):
+        # r54 P2.8, executed there: a crash after _write_session_order left the sid known
+        # while the memory-only intent died with the process — the heal never retried
+        km._apply_views_ops([{"create": {"id": "g1", "name": "pool", "color": "",
+                                         "members": [self.OLD]}}])
+        km._write_session_order([self.OLD])
+        km._heals_path().mkdir(parents=True, exist_ok=True)   # intent file unwritable
+        real = km._views_path
+        sessions = [{"sid": self.OLD, "name": "web"}, {"sid": self.NEW, "name": "web"}]
+        try:
+            km._views_path = lambda: self._BadPath(real())    # the heal itself fails too
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                km._ordered_locked(list(sessions))
+        finally:
+            km._views_path = real
+        self.assertNotIn(self.NEW, km._session_order(),
+                         "no durable intent, no published slot — the sid stays new")
+        import shutil
+        shutil.rmtree(km._heals_path(), ignore_errors=True)   # the stores recover
+        with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+            km._ordered_locked(list(sessions))
+        self.assertIn(self.NEW, km._session_order(), "…and the next pass heals AND publishes")
+        members = [m["sid"] for t in km._timeline_views()["tags"] for m in t["members"]]
+        self.assertIn(self.NEW, members)
+
+    def test_a_quarantined_journal_echoes_none_not_empty(self):
+        # r54 P2.11: the quarantine preserved the bytes but the [] echo read as authoritative
+        # owner retirement — panels deleted their usable in-memory recovery copies
+        self.assertEqual(km._union_ops_echo(), [], "missing = honestly empty")
+        km.jd.STATE.mkdir(parents=True, exist_ok=True)
+        km._union_ops_path().write_text("{garbage")
+        with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+            self.assertIsNone(km._union_ops_echo(),
+                              "quarantined garbage is DATA LOSS — no information, never []")
+        for q in km.jd.STATE.glob("union-gestures.json.corrupt-*"):
+            q.unlink()
+
+    def test_a_parent_dir_fault_is_the_held_queue_type(self):
+        # r54 P2.12: the mkdir ran OUTSIDE the _StateUnreadable wrap — a repeated ENOSPC
+        # there fell into the spool's poison counter and .failed a valid gesture
+        rodir = km.jd.STATE / "ro-parent-fault"
+        rodir.mkdir(parents=True, exist_ok=True)
+        os.chmod(rodir, 0o500)
+        try:
+            with self.assertRaises(km._StateUnreadable):
+                km._atomic_write(rodir / "sub" / "f.json", "x")
+        finally:
+            os.chmod(rodir, 0o700)
+            import shutil
+            shutil.rmtree(rodir, ignore_errors=True)
+
+    def test_two_quarantines_both_survive(self):
+        # r54 P3.13: 32-bit names under a forced clock collided and the replacing rename
+        # destroyed the first quarantine's bytes — 128-bit + no-replace now
+        km.jd.STATE.mkdir(parents=True, exist_ok=True)
+        for payload in ("{first", "{second"):
+            km._views_path().write_text(payload)
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                self.assertIsNone(km._read_state_json(km._views_path(), "timeline-views"))
+        q = sorted(km.jd.STATE.glob("timeline-views.json.corrupt-*"))
+        self.assertEqual(len(q), 2, "both corruptions kept their bytes")
+        self.assertEqual(sorted(p.read_text() for p in q), ["{first", "{second"])
+        for p in q:
+            p.unlink()

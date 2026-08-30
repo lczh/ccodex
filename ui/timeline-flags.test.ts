@@ -111,8 +111,8 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
   }
   {
     // views edits ride the kernel's TARGETED ops and spool the same grammar kernel-down
-    const fn = SRC.indexOf("_setViews(v, ops)");
-    assert.ok(fn > 0, "_setViews names its ops");
+    const fn = SRC.indexOf("_setViews(v, ops, corrId)");
+    assert.ok(fn > 0, "_setViews names its ops (corrId = the r54 local-leg correlation)");
     const win = SRC.slice(fn, fn + 4600);   // widened for the r52 retryable-refusal spool
     const kp = win.indexOf("_kernelPost('/views'");
     const sp = win.indexOf("_spoolOp({ op: 'views'");
@@ -182,7 +182,7 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
     // every fresh payload — same-client sequences never self-409.
     const fn = SRC.indexOf("_nextViewsRev() {");
     assert.ok(fn > 0, "the optimistic rev counter exists");
-    const sv = SRC.indexOf("_setViews(v, ops) {");
+    const sv = SRC.indexOf("_setViews(v, ops, corrId) {");
     const win = SRC.slice(sv, sv + 1700);   // widened for the v1.3.20 ops branch
     assert.match(win, /const baseRev = this\._nextViewsRev\(\);/);
     assert.match(win, /v\.baseRev = baseRev; delete v\.rev;/,
@@ -246,8 +246,9 @@ test("source: tagEditFailed compensates SIBLING hosts — inverse remote edits; 
   // falls back to the newest-gid heuristic (the r46 verification: host+name alone also swept
   // OTHER gestures' entries into the rollback)
   assert.match(win, /const newestGid = matched\.reduce\(\(g, o\) => Math\.max\(g, o\.gid \|\| 0\), 0\);/);
-  assert.match(win, /const ops = matched\.filter\(\(o\) => m\.opId \? String\(o\.gid \|\| 0\) === String\(m\.opId\)\s*\n\s*: \(\(o\.gid \|\| 0\) === newestGid && !o\.confirmed\)\);/,
-    "the opId-less fallback never sweeps a poll-CONFIRMED gesture (r48)");
+  assert.match(win, /const ops = matched\.filter\(\(o\) => m\.opId \? \(String\(o\.gid \|\| 0\) === String\(m\.opId\)\s*\n\s*\|\| String\(o\.ogid \|\| 0\) === String\(m\.opId\)\)\s*\n\s*: \(\(o\.gid \|\| 0\) === newestGid && !o\.confirmed\)\);/,
+    "the opId-less fallback never sweeps a poll-CONFIRMED gesture (r48); a straggler refusal "
+    + "of the dead writer's own dispatch finds the re-keyed group through ogid (r54 P1.2)");
   // gid-matched entries on OTHER hosts — INCLUDING poll-confirmed ones, which the group
   // retention keeps precisely for this (the v1.3.20 audit's P1.3) — get the inverse REMOTE
   // edit and are dropped as compensated
@@ -1173,6 +1174,7 @@ test("executed: a dead writer's journaled-but-undispatched gesture is COMPLETED 
     "the stranded shape: journaled rows, effects never ran");
   assert.ok(journal.some((o: any) => o.lop), "the LOCAL op rides the journal (r53 P1.5)");
   const panel2 = drawnPanel();                       // the adopter
+  g.__rompTimelineClaimUnion = (gid2: any) => panel2.unionClaimAck({ gid: gid2, ok: true });
   const dispatched: any[] = [];
   panel2._editRemoteTag = (rt: any, edit: any) => { dispatched.push({ rt, edit }); return true; };
   const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
@@ -1188,10 +1190,14 @@ test("executed: a dead writer's journaled-but-undispatched gesture is COMPLETED 
   assert.deepEqual(dispatched[0].edit, { remove: ["s1"] });
   assert.deepEqual(panel2._curViews().tags[0].members, ["s2"],
     "…and the LOCAL leg runs too — the gesture completes whole, never half");
-  assert.ok((panel2._unionOps || []).every((o: any) => o.gid !== journal[0].gid
-      || o.dispatched === true),
+  assert.ok((panel2._unionOps || []).every((o: any) => o.dispatched === true),
     "the completed rows flip dispatched — never re-run on a third sighting");
+  assert.ok((panel2._unionOps || []).every((o: any) => o.ogid === journal[0].gid
+      && o.gid !== journal[0].gid),
+    "the group RE-KEYED with the original carried as ogid (r54 P1.2): a refusal of the "
+    + "completion correlates to exactly these rows");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+  delete g.__rompTimelineClaimUnion;
 });
 
 test("executed: completion NEVER runs this panel's own still-gated gesture (r53 wave 3)", () => {
@@ -1238,6 +1244,7 @@ test("executed: completion is postimage-aware and dispatches under a FRESH id (r
   const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
   const gid = journal[0].gid;
   const panel2 = drawnPanel();                       // the adopter
+  g.__rompTimelineClaimUnion = (gid2: any) => panel2.unionClaimAck({ gid: gid2, ok: true });
   const calls: any[] = [];
   panel2._editRemoteTag = (rt: any, edit: any, g2: any) => { calls.push({ rt, edit, g2 }); return true; };
   const polled = JSON.parse(JSON.stringify(VIEWS));
@@ -1251,10 +1258,13 @@ test("executed: completion is postimage-aware and dispatches under a FRESH id (r
   assert.equal(calls.length, 1, "the applied half is CONFIRMED, never re-dispatched");
   assert.equal(calls[0].rt.host, "TESTHOST-B", "…only the genuinely-missing half dispatches");
   assert.ok(calls[0].g2 && calls[0].g2 !== gid,
-    "…under a FRESH id (the r47 rule): its refusal is loud, never a rollback of the gesture");
-  const aRow = (panel2._unionOps || []).find((o: any) => o.host === "TESTHOST-A" && o.gid === gid);
+    "…under the group's NEW id — correlated (r54 P1.2), and never the settled original's");
+  const aRow = (panel2._unionOps || []).find((o: any) => o.host === "TESTHOST-A" && o.ogid === gid);
   assert.equal(aRow.confirmed, true, "the applied half carries its confirmation");
+  assert.equal(aRow.gid, calls[0].g2,
+    "ONE new id keys the whole group — its refusal compensates siblings and the local half");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+  delete g.__rompTimelineClaimUnion;
 });
 
 test("executed: an echo saying dispatched:true refreshes held rows — no completion, no regression (r53 wave 3)", () => {
@@ -1340,5 +1350,201 @@ test("executed: deleting the panel's LAST local tag still retires — absence is
   assert.equal((panel._unionOps || []).length, 0, "the all-confirmed delete retires");
   assert.ok(wire[wire.length - 1].retired.indexOf(gid) >= 0,
     "…and the retirement reaches the kernel — never an immortal journal group");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: the claim decides — a refused claimant completes NOTHING (r54 P1.3)", () => {
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();                        // the dead writer
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  const mk = () => {
+    const p = drawnPanel();
+    const calls: any[] = [];
+    p._editRemoteTag = (rt: any, edit: any, g2: any) => { calls.push({ rt, edit, g2 }); return true; };
+    return { p, calls };
+  };
+  const A = mk(), B = mk();
+  let granted = 0;
+  g.__rompTimelineClaimUnion = (gid2: any) => {
+    // the kernel's grant is exclusive: the FIRST claimant wins, every later one is refused
+    const ok = granted === 0; granted += 1;
+    // both panels share the hook — answer whichever panel asked (pendingClaims says who)
+    for (const q of [A.p, B.p]) if (q._pendingClaims && q._pendingClaims[gid2])
+      q.unionClaimAck({ gid: gid2, ok: ok });
+  };
+  for (const round of [1, 2]) {
+    A.p.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                         unionOps: journal }));
+    B.p.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                         unionOps: journal }));
+  }
+  assert.equal(A.calls.length + B.calls.length, 2,
+    "EXACTLY one panel dispatched the two remote halves — never both (the r54 audit's "
+    + "double-completion, executed there as a rolled-back settled rename)");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+  delete g.__rompTimelineClaimUnion;
+});
+
+test("executed: a MIXED group completes only its unsent halves (r54 P1.1)", () => {
+  // the audited stranding: the writer died BETWEEN sequential sends — A's edit arrived
+  // (dispatched:true via the kernel's per-host evidence), B's never did. The all-or-nothing
+  // guard skipped the whole group; B's half was unadoptable forever.
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
+  for (const o of journal) if (o.host === "TESTHOST-A") o.dispatched = true;   // A arrived
+  const panel2 = drawnPanel();
+  g.__rompTimelineClaimUnion = (gid2: any) => panel2.unionClaimAck({ gid: gid2, ok: true });
+  const calls: any[] = [];
+  panel2._editRemoteTag = (rt: any, edit: any, g2: any) => { calls.push({ rt, edit, g2 }); return true; };
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: journal }));
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: journal }));
+  assert.equal(calls.length, 1, "only the UNSENT half dispatches");
+  assert.equal(calls[0].rt.host, "TESTHOST-B");
+  assert.ok((panel2._unionOps || []).every((o: any) => o.dispatched === true),
+    "…and the whole group reads dispatched after completion");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+  delete g.__rompTimelineClaimUnion;
+});
+
+test("executed: a refused COMPLETION compensates the whole re-keyed group (r54 P1.2)", () => {
+  // the audited hole: completion dispatched under per-row fresh ids while the journal kept
+  // the original gid — B's refusal matched no row, so neither A's applied half nor the
+  // local operation was ever compensated
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
+  const panel2 = drawnPanel();
+  g.__rompTimelineClaimUnion = (gid2: any) => panel2.unionClaimAck({ gid: gid2, ok: true });
+  const calls: any[] = [];
+  panel2._editRemoteTag = (rt: any, edit: any, g2: any) => { calls.push({ rt, edit, g2 }); return true; };
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  const polled = JSON.parse(JSON.stringify(VIEWS));
+  polled.remoteTags[0].members = [];                 // A applied (the dead writer got one out)
+  polled.tags[0].members = ["s2"];                   // the local leg landed too
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(polled)),
+                                          unionOps: journal }));
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(polled)),
+                                          unionOps: journal }));
+  assert.equal(calls.length, 1, "B's half dispatches under the re-keyed id");
+  const ngid = calls[0].g2;
+  calls.length = 0;
+  panel2.tagEditFailed({ host: "TESTHOST-B", name: "pool", opId: String(ngid),
+                         error: "kernel refused" });
+  assert.equal(calls.length, 1, "the refusal finds the RE-KEYED group and compensates A");
+  assert.equal(calls[0].rt.host, "TESTHOST-A");
+  assert.deepEqual(calls[0].edit, { add: ["s1"] }, "the inverse restores the removed member");
+  assert.deepEqual(panel2._curViews().tags[0].members.slice().sort(), ["s1", "s2"],
+    "…and the LOCAL half rolls back too — never a split");
+  assert.equal((panel2._unionOps || []).length, 0, "the compensated group retires");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+  delete g.__rompTimelineClaimUnion;
+});
+
+test("executed: an UNPROVED payload judges nothing — the audited delete-retirement repro (r54 P1.4)", () => {
+  // the executed audit finding: an EIO store rendered tags=[] and the pending local
+  // delete's journal row read the emptiness as its postimage — retired on zero information
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  autoAckUnion(panel);
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { delete: true });
+  const gid = (panel._unionOps || [])[0].gid;
+  const faulted = { active: "all", tags: [], remoteTags: [], unproved: true };
+  panel.update({ now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [], views: faulted });
+  assert.ok((panel._unionOps || []).some((o: any) => o.gid === gid),
+    "the marked payload holds ALL judgment — the recovery rows survive the fault");
+  const settled = JSON.parse(JSON.stringify(VIEWS));
+  settled.tags = []; settled.remoteTags = [];        // the PROVED postimage of the delete
+  panel.update({ now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [], views: settled });
+  assert.equal((panel._unionOps || []).length, 0, "…and a PROVED payload still settles it");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: the writer's gate YIELDS gestures the ack names unclaimed (r54 P1.3)", () => {
+  const wire: any[] = [];
+  const edits: any[] = [];
+  g.__rompTimelineEditTag = (e: any) => edits.push(e);
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  const real = panel._syncUnionOps.bind(panel);
+  panel._syncUnionOps = (...a: any[]) => {           // ack ok, but a completer owns the gid
+    const id = real(...a);
+    if (id) panel.unionOpsAck({ ok: true, opId: id,
+      unclaimed: (panel._unionOps || []).map((o: any) => o.gid) });
+    return id;
+  };
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  assert.equal(edits.length, 0, "the gate yielded — the completer's dispatch is the only one");
+  assert.ok((panel._unionOps || []).every((o: any) => o.dispatched === false),
+    "…and the rows stay honest: OUR effects never ran");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: a permanent LOCAL conflict compensates the confirmed remotes (r54 P2.7)", () => {
+  // the audited immortal split: remotes confirmed a rename, the local write hit a
+  // duplicate-name conflict, and the un-correlated ack meant the retry hammered the same
+  // conflict every payload while the journal rows lived forever
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  autoAckUnion(panel);
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { rename: "platform" });
+  const gid = (panel._unionOps || [])[0].gid;
+  const calls: any[] = [];
+  panel._editRemoteTag = (rt: any, edit: any, g2: any) => { calls.push({ rt, edit, g2 }); return true; };
+  // remotes CONFIRM the rename; the local store still shows the preimage (its write conflicted)
+  const polled = JSON.parse(JSON.stringify(VIEWS));
+  polled.remoteTags[0].name = "platform";
+  polled.remoteTags[1].name = "platform";
+  panel.update({ now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [], views: polled });
+  // the payload-paced retry answered with a CONFLICT, correlated to the gesture's local leg
+  panel.viewsAck({ ok: false, opId: "lg" + gid,
+                   conflicts: ["rename 'pool' → 'platform': the name is already taken"] });
+  assert.equal(calls.length, 2, "both confirmed remote halves get the inverse rename");
+  assert.deepEqual(calls.map((c) => c.edit.rename).sort(), ["pool", "pool"],
+    "…back to the recorded old name");
+  assert.equal((panel._unionOps || []).length, 0, "the group retires — never immortal");
+  assert.match(panel._tagEditErr.error, /refused.*already taken/s,
+    "…and the reason is loud");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
 });

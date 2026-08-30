@@ -283,7 +283,7 @@ test("_setViews posts through the host hook; Obsidian rides targeted kernel ops 
   // the direct timeline-views.json write is GONE (the v1.3.17 audit's P1.5): kernel-down
   // gestures queue as targeted ops the kernel replays through its locked setters
   assert.match(SRC, /process\.versions && process\.versions\.electron/);
-  assert.match(SRC, /_setViews\(v, ops\)/);
+  assert.match(SRC, /_setViews\(v, ops, corrId\)/);
   // `true` = wantJson: the POST response's body carries the store's rev — the counter re-anchor
   // (the r46 verification); the bare-verdict form the other callers use is unchanged
   assert.match(SRC, /_kernelPost\('\/views', body, true\)/);

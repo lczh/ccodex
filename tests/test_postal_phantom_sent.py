@@ -556,12 +556,12 @@ class R53ProvedRetirement(unittest.TestCase):
         src = open(os.path.join(BIN, "romp-postal-service"), encoding="utf-8").read()
         i = src.index("def _parked(i, e):")
         window = src[i:i + 900]
-        self.assertIn("except _OutboxUnreadable:", window)
+        self.assertIn("except (_OutboxUnreadable, _OutboxMalformed):", window)
         i2 = src.index("a resend while we hold it forwards nothing twice")
         window2 = src[i2 - 400:i2 + 700]
-        self.assertIn("except _OutboxUnreadable:", window2,
-                      "the forward-dedupe probe treats unreadable as EXISTS — never a "
-                      "double-forward, never a batch-killing raise")
+        self.assertIn("except (_OutboxUnreadable, _OutboxMalformed):", window2,
+                      "the forward-dedupe probe treats unreadable/garbled as EXISTS — never "
+                      "a double-forward, never a batch-killing raise")
 
     def test_a_non_dict_log_row_never_wedges_the_scanner(self):
         (self.hd / ".stage-px-403.1_cc.TESTHOST").write_text("1")
@@ -572,3 +572,110 @@ class R53ProvedRetirement(unittest.TestCase):
         self.assertEqual(pm._reconcile_relay_stages(), 0)
         self.assertFalse((self.hd / ".stage-px-403.1_cc.TESTHOST").exists(),
                          "the proof past the [] row still counts — the stage settles")
+
+class R54PublishAndTypedReader(unittest.TestCase):
+    """the v1.3.26 audit's P1.5 + P2.9 + P2.10: post-link failures compensated live mail as
+    unpublished (double delivery); missing/malformed/transiently-unreadable outbox records
+    were conflated (receipts and return notes vanished, valid files were quarantined); and
+    wrongly-shaped historic log rows wedged /sent, the stage reconcile, and every handoff."""
+
+    def setUp(self):
+        _reset()
+        shutil.rmtree(pm.OUTBOX, ignore_errors=True)
+        self.now = int(time.time())
+        self.hd = pm.OUTBOX / "TESTHOST2"
+        self.hd.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        _reset()
+        shutil.rmtree(pm.OUTBOX, ignore_errors=True)
+
+    def test_publication_is_a_one_way_door(self):
+        # r54 P1.5, executed there: the dir fsync raised after the link and the stage unlink;
+        # the caller filed `unpublished` over LIVE mail and the sender's retry double-delivered
+        mid = "px-501.1_aa.TESTHOST"
+        stage = self.hd / (".stage-" + mid)
+        stage.write_text(json.dumps({"mid": mid, "body": "hi"}))
+        real = pm._fsync_dir
+        pm._fsync_dir = lambda p: (_ for _ in ()).throw(RuntimeError("forced"))
+        try:
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                pm.outbox_publish_stage("TESTHOST2", mid, stage)   # must NOT raise
+        finally:
+            pm._fsync_dir = real
+        self.assertTrue((self.hd / (mid + ".json")).exists(),
+                        "the message is LIVE — no post-link failure reads as unpublished")
+        self.assertTrue(stage.exists(),
+                        "…and the stage survives for boot arbitration (published file wins)")
+
+    def test_a_crashed_retry_of_the_same_stage_is_publication(self):
+        # the EEXIST arm: identical bytes = a link/unlink crash retry — published, silently;
+        # different bytes stay the loud r52 collision (its own test above)
+        mid = "px-502.1_bb.TESTHOST"
+        body = json.dumps({"mid": mid, "body": "hi"})
+        (self.hd / (mid + ".json")).write_text(body)
+        stage = self.hd / (".stage-" + mid)
+        stage.write_text(body)
+        pm.outbox_publish_stage("TESTHOST2", mid, stage)           # no raise
+        self.assertTrue((self.hd / (mid + ".json")).exists())
+        self.assertFalse(stage.exists(), "the stage retires — the publication stands")
+
+    def test_transient_faults_never_quarantine(self):
+        # r54 P2.9, executed there: the exchange's scanner quarantined a VALID record the
+        # same pass its ack path had correctly deferred — retirement of good mail
+        f = self.hd / "px-503.1_cc.TESTHOST.json"
+        f.write_text(json.dumps({"mid": "px-503.1_cc.TESTHOST", "body": "hi"}))
+        os.chmod(f, 0)
+        try:
+            rows = pm.outbox_list("TESTHOST2")
+        finally:
+            os.chmod(f, 0o644)
+        self.assertEqual(rows, [])
+        self.assertTrue(f.exists(), "an EIO'd record is KEPT — only proven garbage moves")
+        f.write_text("{garbage")
+        rows = pm.outbox_list("TESTHOST2")
+        self.assertEqual(rows, [])
+        self.assertFalse(f.exists(), "…and parsed garbage still quarantines aside")
+
+    def test_a_malformed_record_still_files_the_ack_receipt(self):
+        # r54 P2.9: malformed read as 'missing' — the ack deleted the record with no
+        # terminal row, and the delivered message showed parked-forever after the tail aged
+        f = self.hd / "px-504.1_dd.TESTHOST.json"
+        f.write_text("{garbage")
+        pm._ack_arrived("TESTHOST2", "px-504.1_dd.TESTHOST")
+        relayed = [r for r in _rows() if r.get("ev") == "relayed"]
+        self.assertEqual([r["id"] for r in relayed], ["px-504.1_dd.TESTHOST"],
+                         "the ack is definite — the receipt files")
+        self.assertFalse(f.exists(), "…and the garbage retires only after the append proved")
+
+    def test_shaped_rows_never_wedge_sent_or_handoffs(self):
+        # r54 P2.10: one historic [] row (or {"id": []}) raised through /sent's listing,
+        # the handoff parser (the exchange never answered), and the stage reconcile's set probe
+        with open(pm.TLDIR / "messages.jsonl", "a") as fh:
+            fh.write("[]\n")
+            fh.write(json.dumps({"t": self.now, "ev": "sent", "id": [],
+                                 "from_id": "77777777-8888-9999-aaaa-bbbbbbbbbbbb"}) + "\n")
+            fh.write(json.dumps({"t": self.now, "ev": "sent", "id": "px-505.1_ee.TESTHOST",
+                                 "from_id": "77777777-8888-9999-aaaa-bbbbbbbbbbbb",
+                                 "to_id": "88888888-9999-aaaa-bbbb-cccccccccccc"}) + "\n")
+            fh.write(json.dumps({"t": self.now, "ev": "handoff-done", "id": []}) + "\n")
+            fh.write(json.dumps({"t": self.now, "ev": "handoff-done",
+                                 "id": "px-506.1_ff.TESTHOST"}) + "\n")
+        rows = pm._sent_receipts("77777777-8888-9999-aaaa-bbbbbbbbbbbb")
+        self.assertEqual([r["id"] for r in rows], ["px-505.1_ee.TESTHOST"],
+                         "/sent lists the valid row and survives the shaped ones")
+        pm._HANDOFF_DONE_MEMO["key"] = None
+        self.assertEqual(pm._handoff_done_ids(), {"px-506.1_ff.TESTHOST"},
+                         "the handoff parser survives too — the exchange answers")
+
+    def test_an_unhashable_id_never_hides_later_stage_proof(self):
+        # the stage reconcile's set probe raised on {"id": []} BEFORE reading the valid
+        # settlement row behind it — the stage was never retired
+        (self.hd / ".stage-px-507.1_gg.TESTHOST").write_text("1")
+        with open(pm.TLDIR / "messages.jsonl", "a") as fh:
+            fh.write(json.dumps({"t": self.now, "ev": "relayed", "id": []}) + "\n")
+            fh.write(json.dumps({"t": self.now, "ev": "relayed",
+                                 "id": "px-507.1_gg.TESTHOST"}) + "\n")
+        self.assertEqual(pm._reconcile_relay_stages(), 0)
+        self.assertFalse((self.hd / ".stage-px-507.1_gg.TESTHOST").exists(),
+                         "the proof past the shaped row still counts — the stage settles")

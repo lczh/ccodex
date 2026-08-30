@@ -1712,31 +1712,22 @@ class TimelinePanel {
             x.dispatched = true;
       }
       if (!this._undispatchedSeen) this._undispatchedSeen = new Set();
-      const undispatchedNow = new Set();
-      for (const o of data.unionOps) {
-        if (!o || o.refusal || !o.gid || o.dispatched !== false) continue;
-        if (gatedNow.has(o.gid)) continue;
-        undispatchedNow.add(o.gid);
-        if (!this._undispatchedSeen.has(o.gid)) continue;
-        const group = (this._unionOps || []).filter((x) => x.gid === o.gid);
-        if (!group.length || group.some((x) => x.dispatched !== false)) continue;
-        const rts3 = (this._views && this._views.remoteTags) || [];
-        for (const x of group) {
-          x.dispatched = true;
-          if (this._unionOpApplied(x, rts3)) { x.confirmed = true; continue; }
-          this._editRemoteTag(x.rt, Object.assign({}, x.edit), ++unionGestureSeq);
+      // the two-sighting counter and the completion itself are JUDGMENTS — an unproved views
+      // payload (the store faulted; the kernel says so, r54 P1.4) judges nothing this push
+      if (!(data.views && data.views.unproved)) {
+        const undispatchedNow = new Set();
+        for (const o of data.unionOps) {
+          if (!o || o.refusal || !o.gid || o.dispatched !== false) continue;
+          if (gatedNow.has(o.gid)) continue;
+          undispatchedNow.add(o.gid);
+          if (!this._undispatchedSeen.has(o.gid)) continue;
+          if (!(this._unionOps || []).some((x) => x.gid === o.gid && x.dispatched === false))
+            continue;
+          // the kernel grants ONE completer (r54 P1.3) — the completion runs on its ack
+          this._requestUnionClaim(o.gid);
         }
-        const repl = group.find((x) => x.lop);
-        if (repl) {
-          const lt3 = (this._views && (this._views.tags || this._views.groups)) || [];
-          const st3 = this._unionLocalStateGuarded(repl, lt3);
-          if (st3 === 'pre') this._applyLocalOp(repl.lop);
-          else if (st3 === 'applied') for (const x of group) x.lapplied = true;
-        }
-        this._unionSyncDirty = true;
-        took = true;
+        this._undispatchedSeen = undispatchedNow;
       }
-      this._undispatchedSeen = undispatchedNow;
       if (took) this.draw();
     }
     // the journaled refusals (r50): the kernel persists an editTag refusal beside the gestures,
@@ -1754,7 +1745,8 @@ class TimelinePanel {
         const op = String(r.opId || '');
         if (!op) continue;
         const ours = this._handledRefusalOps.has(op) || this._mintedGids.has(Number(op))
-          || (this._unionOps || []).some((o) => String(o.gid || 0) === op);
+          || (this._unionOps || []).some((o) => String(o.gid || 0) === op
+                                                || String(o.ogid || 0) === op);
         if (!ours) continue;
         this._retireUnionGids.add(r.gid);
         this._unionSyncDirty = true;
@@ -2871,7 +2863,8 @@ class TimelinePanel {
     // an applied, confirmed gesture swept by a refusal that names nothing is the r48
     // verification's cross-gesture rollback, one level deeper. An opId MATCH still rolls back
     // confirmed entries — the kernel named the gesture.
-    const ops = matched.filter((o) => m.opId ? String(o.gid || 0) === String(m.opId)
+    const ops = matched.filter((o) => m.opId ? (String(o.gid || 0) === String(m.opId)
+                                                || String(o.ogid || 0) === String(m.opId))
                                              : ((o.gid || 0) === newestGid && !o.confirmed));
     if (m.opId && ops.length) this._handledRefusalOps.add(String(m.opId));   // compensated
     //                                                                          — handled (r52)
@@ -2970,6 +2963,8 @@ class TimelinePanel {
       // postimage so a later user re-add reads as supersession, never a re-remove
       lop: o.lop || null, dispatched: o.dispatched !== false,
       lapplied: !!o.lapplied,
+      ogid: o.ogid || 0,   // a re-keyed completion's original id — straggler refusals and the
+      //                      kernel's per-host dispatch evidence still correlate (r54 P1.1/P1.2)
     }));
     // retirement is EXPLICIT (the r49 verification: the kernel merges per gid now, so two
     // open panels no longer clobber each other's entries — omission is not retirement). It
@@ -3008,7 +3003,8 @@ class TimelinePanel {
         // retired rows — one POST at a time keeps the wire order the WS path gets for free
         this._pendingUnionSyncs[opId] = want;
         this._postChain = (this._postChain || Promise.resolve()).then(() =>
-          this._kernelPost('/union-ops', { entries: entries, retired: retired, opId: opId }, true)
+          this._kernelPost('/union-ops', { entries: entries, retired: retired, opId: opId,
+                                           cid: this._unionCid() }, true)
             .then((r) => this.unionOpsAck({ ok: r.ok === true, opId: opId }))
             .catch(() => this.unionOpsAck({ ok: false, opId: opId }))
         );
@@ -3057,6 +3053,14 @@ class TimelinePanel {
     for (const g of (p.retired || [])) { if (this._journaledGids) this._journaledGids.delete(g); }
     for (const g of (p.tomb || [])) { if (this._retireUnionGids) this._retireUnionGids.delete(g); }
     if (gated) {
+      const uncl = new Set(Array.isArray(m.unclaimed) ? m.unclaimed : []);
+      if (gated.gids.length && gated.gids.every((g) => uncl.has(g))) {
+        // a COMPLETER holds these gestures (r54 P1.3): our journal write raced a granted
+        // claim — the effects are the claim holder's to run, and running ours too is the
+        // double dispatch the claim exists to end. Rows stay undispatched here; their flip
+        // arrives on the completer's own sync or the kernel's dispatch evidence.
+        return;
+      }
       for (const o of (this._unionOps || []))
         if (gated.gids.indexOf(o.gid) >= 0) o.dispatched = true;
       gated.run();              // the journal is DURABLE — the gesture's effects may now run (r53)
@@ -3068,6 +3072,77 @@ class TimelinePanel {
     }
   }
 
+  // ask the kernel for the EXCLUSIVE right to complete a stranded gesture (the r54 audit's
+  // P1.3): two bystander panels used to complete the same dead writer's gesture
+  // near-simultaneously by construction, and the duplicate rename's refusal rolled the
+  // settled edit back everywhere but the refusing host. The kernel grants exactly one claim;
+  // the journaling writer holds its own gesture's claim from journal time (so a live writer
+  // is never raced), and a dead writer's claim frees the moment its socket closes.
+  _requestUnionClaim(gid) {
+    if (!this._pendingClaims) this._pendingClaims = {};
+    if (this._pendingClaims[gid]) return;
+    this._pendingClaims[gid] = true;
+    if (typeof window !== 'undefined' && typeof window.__rompTimelineClaimUnion === 'function') {
+      window.__rompTimelineClaimUnion(gid, 'cl' + gid);
+    } else if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
+      this._postChain = (this._postChain || Promise.resolve()).then(() =>
+        this._kernelPost('/union-claim', { gid: gid, cid: this._unionCid() }, true)
+          .then((r) => this.unionClaimAck({ gid: gid, ok: !!(r.json && r.json.ok === true) }))
+          .catch(() => { if (this._pendingClaims) delete this._pendingClaims[gid]; }));
+    } else {
+      // no claim transport → no completion: the safe direction (nothing double-dispatches);
+      // a surface with a current bridge completes the gesture instead
+      delete this._pendingClaims[gid];
+    }
+  }
+
+  _unionCid() {
+    if (!this._unionCidV)
+      this._unionCidV = 'p' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+    return this._unionCidV;
+  }
+
+  unionClaimAck(m) {
+    if (!m || !this._pendingClaims || !this._pendingClaims[m.gid]) return;
+    delete this._pendingClaims[m.gid];   // refused → a later sighting may re-ask (holders die)
+    if (m.ok !== true) return;           // another panel owns it — its completion flips the rows
+    this._completeUnionGesture(m.gid);
+  }
+
+  // the CLAIMED completion (r54 P1.1/P1.2): only the still-undispatched rows run — a renderer
+  // dying BETWEEN sequential sends leaves a MIXED group, and the all-or-nothing skip stranded
+  // the unsent half forever — and the whole group RE-KEYS to a fresh gesture id first, the
+  // original carried as ogid: the dispatches ride the new id, so a refusal correlates to
+  // exactly these rows and compensates the whole group (the r53 fresh-per-dispatch ids
+  // matched NOTHING — a refused completion left successful siblings and the local half
+  // standing, split), while a straggler refusal of the dead writer's OWN dispatch still
+  // finds the group through ogid.
+  _completeUnionGesture(gid) {
+    if (this._views && this._views.unproved) return;   // no judgment from an unproved payload
+    const group = (this._unionOps || []).filter((x) => x.gid === gid);
+    const pend = group.filter((x) => x.dispatched === false);
+    if (!pend.length) return;
+    const ngid = ++unionGestureSeq;
+    if (!this._mintedGids) this._mintedGids = new Set();
+    this._mintedGids.add(ngid);
+    for (const x of group) { x.ogid = x.ogid || x.gid; x.gid = ngid; }
+    const rts3 = (this._views && this._views.remoteTags) || [];
+    for (const x of pend) {
+      x.dispatched = true;
+      if (this._unionOpApplied(x, rts3)) { x.confirmed = true; continue; }
+      this._editRemoteTag(x.rt, Object.assign({}, x.edit), ngid);
+    }
+    const repl = group.find((x) => x.lop);
+    if (repl) {
+      const lt3 = (this._views && (this._views.tags || this._views.groups)) || [];
+      const st3 = this._unionLocalStateGuarded(repl, lt3);
+      if (st3 === 'pre') this._applyLocalOp(repl.lop, 'lg' + ngid);
+      else if (st3 === 'applied') for (const x of group) x.lapplied = true;
+    }
+    this._syncUnionOps();                // persist the re-key + flips NOW (the wave-3 rule)
+    this.draw();
+  }
+
   // Transport reconnected (the v1.3.23 audit's P1.3 — the views writer's P2.8, union twin): a
   // sync sent on the OLD socket was accepted by the browser and never delivered, its ack is
   // never coming, and nothing re-marked the journal dirty — the kernel's copy stayed behind
@@ -3075,6 +3150,7 @@ class TimelinePanel {
   // upsert and the acked-retirement ledger make the replay idempotent on the fresh one.
   unionTransportReset() {
     this._pendingUnionSyncs = {};
+    this._pendingClaims = {};        // claim acks died with the socket; sightings re-ask (r54)
     this._unionRetryPending = false;
     this._unionSyncDirty = true;
     const held = this._gatedDispatches ? Object.values(this._gatedDispatches) : [];
@@ -3116,6 +3192,11 @@ class TimelinePanel {
 
   _reconcileUnionOps() {
     if (!this._unionOps || !this._unionOps.length) return;
+    if (this._views && this._views.unproved) return;   // a faulted store's payload renders but
+    //                                                    JUDGES nothing (r54 P1.4: an EIO's
+    //                                                    empty tags read as a delete's
+    //                                                    postimage and retired the recovery
+    //                                                    rows on zero information)
     // the RAW polled payload, never _curViews(): the optimistic overlay would echo our own edit
     // straight back and drop the entry before any refusal could arrive
     const rts = (this._views && this._views.remoteTags) || [];
@@ -3176,7 +3257,8 @@ class TimelinePanel {
       }
       if (st === 'applied' || st === 'superseded' || rep.lapplied) continue;
       gidDone.set(g, false);                    // not settled: the local leg is outstanding
-      this._applyLocalOp(rep.lop);              // the payload-paced retry (an event, no timer)
+      this._applyLocalOp(rep.lop, 'lg' + g);    // the payload-paced retry (an event, no timer);
+      //                                           the corrId lets a permanent refusal compensate
     }
     const before = this._unionOps.length;
     this._unionOps = this._unionOps.filter((o) => (o.gid ? !gidDone.get(o.gid) : !o.confirmed));
@@ -3233,7 +3315,7 @@ class TimelinePanel {
 
   // apply one targeted op to the LOCAL store: the optimistic clone mutates and the same op
   // persists through _setViews — the rollback path reuses the exact grammar the edits use
-  _applyLocalOp(op) {
+  _applyLocalOp(op, corrId) {
     if (!op) return;
     const nv = JSON.parse(JSON.stringify(this._curViews()));
     if (op.create && op.create.id) {
@@ -3250,7 +3332,7 @@ class TimelinePanel {
       if (op.rename) t.name = op.rename;
       if (op.color) t.color = op.color;
     }
-    this._setViews(nv, [op]);
+    this._setViews(nv, [op], corrId);
   }
 
   // ── the NAME-KEYED tag editor (user ruling 2026-08-24), shared by the dialog and the lane gear ──
@@ -3462,6 +3544,18 @@ class TimelinePanel {
     // a rev-less ack leaves the counter STANDING (the r52 verification: the proved-read
     // refusal acks rev:null, and resetting to 0 rewound the CAS base for nothing)
     if (typeof m.rev === 'number') this._optViewsRev = m.rev;
+    const lg = typeof m.opId === 'string' ? /^lg(\d+)$/.exec(m.opId) : null;
+    if (lg) {
+      // a union gesture's LOCAL leg answered (r54 P2.7). Transient store faults keep the
+      // payload-paced retry; a CONFLICT (duplicate name) or a plain refusal is PERMANENT —
+      // the old forever-retry hammered the same conflict every payload while the confirmed
+      // remote halves stood applied, split from a local store that would never converge.
+      if (m.retryable === true) return;
+      if ((Array.isArray(m.conflicts) && m.conflicts.length) || m.ok === false)
+        this._localLegRefused(Number(lg[1]),
+                              Array.isArray(m.conflicts) ? m.conflicts.join('; ') : '');
+      return;
+    }
     if (Array.isArray(m.conflicts) && m.conflicts.length) {
       // the kernel applied the gesture PARTIALLY — a duplicate name refused a create or a
       // rename (the r50 verification: the ack said plain ok and the dialog kept showing a tag
@@ -3479,7 +3573,47 @@ class TimelinePanel {
     }
   }
 
-  _setViews(v, ops) {
+  // the LOCAL half is permanently refused (r54 P2.7): compensate the gesture's remote halves
+  // — postimage-guarded, exactly tagEditFailed's discipline — retire the group, and say why.
+  _localLegRefused(gid, why) {
+    const group = (this._unionOps || []).filter((o) => o.gid === gid);
+    if (!group.length) return;
+    this._unionOps = (this._unionOps || []).filter((o) => o.gid !== gid);
+    const rolled = [], undead = [], moved = [];
+    for (const o of group) {
+      const e = o.edit || {};
+      if (e.delete) { undead.push(o.host || 'unknown'); continue; }
+      const rtNow = ((this._views && this._views.remoteTags) || []).find((t) =>
+        t.id === (o.rt && o.rt.id));
+      const p = o.post || {};
+      const superseded = !!rtNow && (
+        (p.color && rtNow.color !== p.color && rtNow.color !== o.oldColor) ||
+        (p.name && rtNow.name !== p.name && rtNow.name !== o.oldName));
+      if (superseded) { moved.push(o.host || 'unknown'); continue; }
+      const inv = {};
+      if (e.add) inv.remove = e.add.slice();
+      if (e.remove) inv.add = e.remove.slice();
+      if (e.rename) inv.rename = o.oldName;
+      if (e.color) inv.color = o.oldColor;
+      if (!Object.keys(inv).length) continue;
+      rolled.push(o.host || 'unknown');
+      // the inverse mints its OWN id (the r47 rule): its refusal is loud, never a cascade
+      this._editRemoteTag(e.rename ? Object.assign({}, o.rt, { name: e.rename }) : o.rt, inv,
+                          ++unionGestureSeq);
+    }
+    this._tagEditErr = { host: '', name: group[0].name || '',
+      error: 'the local half of this edit was refused' + (why ? ' — ' + why : '')
+      + (rolled.length ? ' — rolled the applied edit back on ' + rolled.join(', ') : '')
+      + (moved.length ? ' — NOT rolled back on ' + moved.join(', ')
+         + ' (a newer edit already moved it; check by hand)' : '')
+      + (undead.length ? ' — the delete already sent to ' + undead.join(', ') + ' cannot be'
+         + ' undone from here; recreate the tag there by hand' : '') };
+    this._syncUnionOps();
+    if (this._viewsDialog && this._viewsDialogBuild) this._viewsDialogBuild();
+    this.draw();
+  }
+
+  _setViews(v, ops, corrId) {
     this._pendingViews = v; this._pendingViewsAge = 0;
     const baseRev = this._nextViewsRev();
     try {
@@ -3487,8 +3621,10 @@ class TimelinePanel {
           && ops && ops.length) {
         // TARGETED ops on the web path too (the v1.3.20 audit): they compose server-side under
         // the kernel's lock — no CAS base to guess, no foreign edit to erase; the viewsAck the
-        // kernel answers re-anchors the counter exactly like the blob path's
-        window.__rompTimelineSetViewsOps(ops);
+        // kernel answers re-anchors the counter exactly like the blob path's. corrId (r54
+        // P2.7) rides as the ack's opId, so a union gesture's LOCAL leg can learn ITS write
+        // was the one refused — the un-correlated ack could never say whose conflict it was.
+        window.__rompTimelineSetViewsOps(ops, corrId);
       } else if (typeof window !== 'undefined' && typeof window.__rompTimelineSetViews === 'function') {
         if (v && typeof v === 'object') { v.baseRev = baseRev; delete v.rev; }
         window.__rompTimelineSetViews(v);
@@ -3513,7 +3649,10 @@ class TimelinePanel {
             // as when a WS host's ack frame arrives. Kernel unreachable → no rev: the counter
             // holds its optimistic value and the op spools below.
             if (r.ok !== false && r.json)
-              this.viewsAck({ ok: r.ok === true, rev: r.json.rev, conflicts: r.json.conflicts });
+              this.viewsAck(Object.assign({ ok: r.ok === true, rev: r.json.rev,
+                                            conflicts: r.json.conflicts,
+                                            retryable: r.json.retryable },
+                                          corrId ? { opId: corrId } : {}));
             //  ^ rev-less refusals still ack (the r52 verification: the 409 carries rev:null
             //    since the proved-read refusal, and gating on a numeric rev left the
             //    optimistic overlay pinned until it silently aged out)

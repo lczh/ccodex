@@ -52,6 +52,8 @@ export function dispatchFrame(panel: any, m: any): boolean {
   // the union-journal write's correlated ack (r50) — the panel advances its synced-gid
   // watermark only when this arrives with ok:true
   if (m.type === "unionOpsAck" && panel.unionOpsAck) { panel.unionOpsAck(m); return true; }
+  // the completion-claim grant (r54 P1.3) — exactly one panel may complete a stranded gesture
+  if (m.type === "unionClaimAck" && panel.unionClaimAck) { panel.unionClaimAck(m); return true; }
   return false;
 }
 
@@ -95,12 +97,16 @@ export function bridgeFunctions(post: Post): Record<string, (...a: any[]) => voi
     __rompTimelineSetViews: (views: unknown) => post({ type: "setTimelineViews", views }),
     // TARGETED ops (the v1.3.20 audit): lens picks, the union drag and tag creates compose
     // server-side instead of riding whole-blob CAS writes
-    __rompTimelineSetViewsOps: (ops: unknown) => post({ type: "setTimelineViewsOps", ops }),
+    __rompTimelineSetViewsOps: (ops: unknown, opId?: unknown) =>
+      post({ type: "setTimelineViewsOps", ops, ...(opId ? { opId: String(opId) } : {}) }),
     // the durable multi-host gesture journal (the v1.3.21 audit's P1.5); the opId correlates
     // the kernel's unionOpsAck so the panel advances its watermark only on success (r50)
     __rompTimelineSetUnionOps: (entries: unknown, retired?: unknown, opId?: unknown) =>
       post({ type: "setUnionOps", entries, retired: retired || [], ...(opId ? { opId: String(opId) } : {}) }),
     __rompTimelineEditTag: (edit: unknown) => post({ type: "editTag", edit }),
+    // the completion claim (r54 P1.3): the kernel grants exactly one completer per gesture
+    __rompTimelineClaimUnion: (gid: unknown, opId?: unknown) =>
+      post({ type: "claimUnionGesture", gid, ...(opId ? { opId: String(opId) } : {}) }),
     __rompTimelineDismiss: (id: string) => post({ type: "dismissLane", id }),
     __rompTimelineHover: (sid?: string, segIds?: unknown[], t0?: number, t1?: number) =>
       post(sid ? { type: "timelineHover", sid, segIds: segIds || [], t0, t1 } : { type: "timelineHover", off: true }),
