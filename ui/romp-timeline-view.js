@@ -1793,7 +1793,9 @@ class TimelinePanel {
         if (!op) continue;
         const ours = this._handledRefusalOps.has(op) || this._mintedGids.has(Number(op))
           || (this._unionOps || []).some((o) => String(o.gid || 0) === op
-                                                || String(o.ogid || 0) === op);
+                                                || String(o.ogid || 0) === op
+                                                || (Array.isArray(o.olin)
+                                                    && o.olin.some((x) => String(x) === op)));
         if (!ours) continue;
         this._retireUnionGids.add(r.gid);
         this._unionSyncDirty = true;
@@ -2910,8 +2912,10 @@ class TimelinePanel {
     // an applied, confirmed gesture swept by a refusal that names nothing is the r48
     // verification's cross-gesture rollback, one level deeper. An opId MATCH still rolls back
     // confirmed entries — the kernel named the gesture.
-    const ops = matched.filter((o) => m.opId ? (String(o.gid || 0) === String(m.opId)
-                                                || String(o.ogid || 0) === String(m.opId))
+    const _lin = (o, id) => String(o.gid || 0) === String(id)
+      || String(o.ogid || 0) === String(id)
+      || (Array.isArray(o.olin) && o.olin.some((x) => String(x) === String(id)));
+    const ops = matched.filter((o) => m.opId ? _lin(o, m.opId)
                                              : ((o.gid || 0) === newestGid && !o.confirmed));
     if (m.opId && ops.length) this._handledRefusalOps.add(String(m.opId));   // compensated
     //                                                                          — handled (r52)
@@ -3012,6 +3016,8 @@ class TimelinePanel {
       lapplied: !!o.lapplied,
       ogid: o.ogid || 0,   // a re-keyed completion's original id — straggler refusals and the
       //                      kernel's per-host dispatch evidence still correlate (r54 P1.1/P1.2)
+      olin: o.olin || [],  // …and the bounded ancestor lineage (r56 P1.3): a refusal naming
+      //                      ANY predecessor of a repeatedly-completed gesture still matches
     }));
     // retirement is EXPLICIT (the r49 verification: the kernel merges per gid now, so two
     // open panels no longer clobber each other's entries — omission is not retirement). It
@@ -3216,7 +3222,14 @@ class TimelinePanel {
     const ngid = ++unionGestureSeq;
     if (!this._mintedGids) this._mintedGids = new Set();
     this._mintedGids.add(ngid);
-    for (const x of group) { x.ogid = x.ogid || x.gid; x.gid = ngid; }
+    for (const x of group) {
+      // bounded ANCESTOR LINEAGE (the r56 audit's P1.3, executed there: keeping only the
+      // oldest ogid meant a refusal naming the IMMEDIATE predecessor of a twice-completed
+      // gesture matched zero rows and compensated nothing)
+      x.olin = (x.olin || []).concat([x.gid]).slice(-8);
+      x.ogid = x.ogid || x.gid;
+      x.gid = ngid;
+    }
     // the EFFECTS are ACK-GATED on the rekey write (the r55 audit's P1.1, executed there:
     // a failed first ack left three executed effects while durable storage held only the
     // old gid — a later refusal could compensate nothing). The write itself is the r55
@@ -3238,9 +3251,13 @@ class TimelinePanel {
       }
       self2.draw();
     };
+    const rekey = { ogid: gid, gid: ngid, epoch: epoch };
     const opId = this._syncUnionOps(
-      { run: dispatch, gids: [ngid], name: (group[0] || {}).name || '', ogid: gid },
-      { rekey: { ogid: gid, gid: ngid, epoch: epoch } });
+      { run: dispatch, gids: [ngid], name: (group[0] || {}).name || '', ogid: gid,
+        rekey: rekey },   // the gate REMEMBERS its CAS (r56 P1.2): a reconnect replay used
+      //                     to re-send the rekey as a plain merge, bypassing the epoch check
+      //                     and retiring another socket's legitimate claim
+      { rekey: rekey });
     if (!opId) {
       // no transport: undo the in-memory re-key; the journal never changed
       for (const x of group) { x.gid = x.ogid; delete x.ogid; }
@@ -3279,6 +3296,9 @@ class TimelinePanel {
   unionTransportReset() {
     this._pendingUnionSyncs = {};
     this._pendingClaims = {};        // claim acks died with the socket; sightings re-ask (r54)
+    this._claimEpochs = {};          // …and so did the claims the epochs certify (r56 P2.11:
+    //                                  a kept epoch made the next completion attempt a
+    //                                  guaranteed-stale CAS before recovering)
     this._unionRetryPending = false;
     this._unionSyncDirty = true;
     const held = (this._gatedDispatches ? Object.values(this._gatedDispatches) : [])
@@ -3286,9 +3306,17 @@ class TimelinePanel {
     this._gatedDispatches = {};
     // gestures gated on acks that died with the socket re-gate on the REPLAY's ack (r53) —
     // as SEPARATE sub-gates (r54 wave 2): the replay's ack decides each gesture on its own
-    // claim, so a completer-owned one yields while its siblings still run
-    const opId = this._syncUnionOps(held.length ? held : null);
-    if (!opId) held.forEach((g) => g.run());
+    // claim. A COMPLETION gate replays WITH its rekey CAS on its own sync (r56 P1.2: the
+    // composite replay re-sent the rekey as a plain merge — no epoch check, and it retired
+    // another socket's legitimate claim); the kernel refuses a stale epoch and the yield
+    // path recovers through a fresh claim.
+    const plain = held.filter((g) => !g.rekey);
+    for (const g of held.filter((x) => x.rekey)) {
+      const op2 = this._syncUnionOps([g], { rekey: g.rekey });
+      if (!op2) g.run();
+    }
+    const opId = this._syncUnionOps(plain.length ? plain : null);
+    if (!opId) plain.forEach((g) => g.run());
   }
 
   _noteUnionOp(rt, name, inverse, edit, gid, opts) {

@@ -2238,3 +2238,147 @@ class R54AuditFixes(unittest.TestCase):
         self.assertEqual(sorted(p.read_text() for p in q), ["{first", "{second"])
         for p in q:
             p.unlink()
+
+
+class R56AuditFixes(unittest.TestCase):
+    """the v1.3.28 audit: tombstones dropped resident successors (P1.1), quarantine acted on
+    a pathname a concurrent writer had replaced (P1.4), union rows accepted schema poison
+    (P1.5), one flags EIO erased safety state (P1.6), lineage lost the immediate predecessor
+    (P1.3), and an order-file EIO overwrote the saved order (P2.12)."""
+
+    SID = "11111111-2222-3333-4444-555555555555"
+
+    def setUp(self):
+        _scrub_state()
+        km._union_claims.clear()
+        km._union_retired_tombs.clear()
+        for name in ("union-gestures.json", "session-order.json"):
+            try:
+                (km.jd.STATE / name).unlink()
+            except OSError:
+                pass
+
+    def tearDown(self):
+        self.setUp()
+
+    class _BadPath:
+        def __init__(self, real):
+            self._real = real
+
+        def read_text(self):
+            raise OSError(5, "EIO")
+
+        def stat(self):
+            raise OSError(5, "EIO")
+
+        def exists(self):
+            return True
+
+        def __getattr__(self, k):
+            return getattr(self._real, k)
+
+    def _seed(self, *gids):
+        self.assertTrue(km._union_ops_set(
+            [{"host": "TESTHOST-A", "gid": g, "edit": {}, "inverse": {}, "rt": {},
+              "name": "pool", "dispatched": False} for g in gids]))
+
+    def test_a_resident_successor_survives_its_own_flip(self):
+        # r56 P1.1, executed there: the committed successor's dispatched:true re-post
+        # carries the tombstoned ogid — the filter dropped it, DELETED the healthy
+        # completion's compensation journal, and answered unclaimed over it
+        self._seed(801)
+        epoch = km._union_claim_grant(801, "ws:c")
+        ok, _, _ = km._union_ops_merge(
+            [{"host": "TESTHOST-A", "gid": 802, "ogid": 801, "olin": [801], "edit": {},
+              "inverse": {}, "rt": {}, "name": "pool", "dispatched": False}],
+            [801], ckey="ws:c", rekey={"ogid": 801, "gid": 802, "epoch": epoch})
+        self.assertTrue(ok)
+        ok, unclaimed, _ = km._union_ops_merge(
+            [{"host": "TESTHOST-A", "gid": 802, "ogid": 801, "olin": [801], "edit": {},
+              "inverse": {}, "rt": {}, "name": "pool", "dispatched": True}], ckey="ws:c")
+        self.assertTrue(ok)
+        self.assertNotIn(802, unclaimed, "the resident gesture's own update never yields")
+        rows = km._union_ops_load()
+        self.assertEqual([(r["gid"], r["dispatched"]) for r in rows], [(802, True)],
+                         "…and the compensation journal SURVIVES the healthy flip")
+        # a REPLAY of the retired original (not resident) still tombstone-drops
+        ok, unclaimed, _ = km._union_ops_merge(
+            [{"host": "TESTHOST-A", "gid": 801, "edit": {}, "inverse": {}, "rt": {},
+              "name": "pool", "dispatched": False}], ckey="ws:w")
+        self.assertTrue(ok)
+        self.assertIn(801, unclaimed)
+
+    def test_quarantine_never_touches_a_replaced_file(self):
+        # r56 P1.4, executed there: an unlocked observer judged malformed bytes, a concurrent
+        # writer committed a VALID journal, and the pathname-keyed quarantine unlinked it
+        km.jd.STATE.mkdir(parents=True, exist_ok=True)
+        p = km.jd.STATE / "union-gestures.json"
+        p.write_text("{malformed")
+        st = p.stat()
+        stale_fp = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+        km._atomic_write(p, json.dumps([]))          # the concurrent VALID commit
+        with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+            km._quarantine_state_bytes(p, "union-gestures", fingerprint=stale_fp)
+        self.assertTrue(p.exists(), "the valid replacement SURVIVES the stale judgment")
+        self.assertEqual(p.read_text(), "[]")
+        self.assertEqual(list(km.jd.STATE.glob("union-gestures.json.corrupt-*")), [])
+
+    def test_schema_poison_is_rejected_at_the_gate(self):
+        # r56 P1.5, executed there: gid:[] wedged every later merge with a TypeError;
+        # gid:1e309 persisted as Infinity and the browser refused the whole timeline frame
+        ok, _, reason = km._union_ops_merge(
+            [{"host": "TESTHOST-A", "gid": [], "edit": {}, "inverse": {}, "rt": {},
+              "name": "pool", "dispatched": False}])
+        self.assertFalse(ok)
+        self.assertIn("malformed", reason or "")
+        ok, _, _ = km._union_ops_merge(
+            [{"host": "TESTHOST-A", "gid": 1e309, "edit": {}, "inverse": {}, "rt": {},
+              "name": "pool", "dispatched": False}])
+        self.assertFalse(ok, "non-finite ids never persist")
+        self.assertEqual(km._union_ops_load(), [])
+        # legacy poison already ON DISK is filtered from the echo and dropped at merge
+        km.jd.STATE.mkdir(parents=True, exist_ok=True)
+        km._union_ops_path().write_text('[{"host": "TESTHOST-A", "gid": Infinity}]')
+        with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+            echo = km._union_ops_echo()
+        self.assertEqual(echo, [], "Python's lenient parser ACCEPTS Infinity — the schema "
+                                   "filter strips it from the echo so the browser's strict "
+                                   "JSON.parse never refuses the timeline frame")
+
+    def test_mark_dispatched_matches_through_the_lineage(self):
+        # r56 P1.3 (kernel half): dispatch evidence for a twice-completed gesture must match
+        # the middle ancestor, not only the oldest
+        self.assertTrue(km._union_ops_set(
+            [{"host": "TESTHOST-A", "gid": 903, "ogid": 901, "olin": [901, 902],
+              "edit": {}, "inverse": {}, "rt": {}, "name": "pool", "dispatched": False}]))
+        self.assertTrue(km._union_ops_mark_dispatched("902", "TESTHOST-A"))
+        self.assertEqual([r["dispatched"] for r in km._union_ops_load()], [True])
+
+    def test_a_flags_read_fault_never_erases_safety_state(self):
+        # r56 P1.6, executed there: one EIO folded the store to {} and the next toggle
+        # persisted only the toggled session — every isolation and mute row deleted
+        km._set_session_flag(self.SID, "postalServiceOff", True)
+        p = km.jd.STATE / "session-flags.json"
+        self.assertTrue(p.exists())
+        with mock.patch.object(km, "_read_state_json",
+                               side_effect=km._StateUnreadable(5, "EIO")):
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                out = km._set_session_flag("99999999-8888-7777-6666-555555555555",
+                                           "hideFromFeed", True)
+        self.assertIs(out, False, "the toggle refuses over an unproved read")
+        flags = km._session_flags_proved()
+        self.assertIn(self.SID, flags, "…and the standing isolation row SURVIVES")
+
+    def test_an_order_read_fault_never_overwrites_the_saved_order(self):
+        # r56 P2.12, executed there: an EIO folded the order to [] and healing persisted
+        # DISCOVERY order over the user's saved one
+        km._write_session_order([self.SID])
+        sessions = [{"sid": "99999999-8888-7777-6666-555555555555", "name": "api"},
+                    {"sid": self.SID, "name": "web"}]
+        with mock.patch.object(km, "_read_state_json",
+                               side_effect=km._StateUnreadable(5, "EIO")):
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                out = km._ordered_locked(list(sessions))
+        self.assertEqual([s["sid"] for s in out], [s["sid"] for s in sessions],
+                         "input-ordered render this pass")
+        self.assertEqual(km._session_order(), [self.SID], "…and the saved order is UNTOUCHED")

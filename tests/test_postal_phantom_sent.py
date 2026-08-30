@@ -535,6 +535,7 @@ class R53ProvedRetirement(unittest.TestCase):
         # the exchange 200s it, so the peer never re-sends — and retries until the read
         # PROVES; a recovered record then takes the full path, return note included.
         pm._pending_bounces.clear()
+        pm._pending_bounces_loaded[0] = False
         f = self.hd / "px-405.1_ee.TESTHOST.json"
         f.write_text(json.dumps({"mid": "px-405.1_ee.TESTHOST", "body": "hi",
                                  "frm_id": "77777777-8888-9999-aaaa-bbbbbbbbbbbb"}))
@@ -545,8 +546,8 @@ class R53ProvedRetirement(unittest.TestCase):
             self.assertTrue(f.exists(), "the recoverable record SURVIVES the fault")
             self.assertEqual([r for r in _rows() if r.get("ev") == "bounced"], [],
                              "no terminal over an unproved read")
-            self.assertIn("px-405.1_ee.TESTHOST", pm._pending_bounces,
-                          "…the bounce parked durably instead")
+            self.assertIn("TESTHOST2|px-405.1_ee.TESTHOST", pm._pending_bounces,
+                          "…the bounce parked durably instead (host-keyed since r56 P2.19)")
             self.assertTrue(pm._pending_bounces_path().exists())
         finally:
             os.chmod(f, 0o644)
@@ -555,7 +556,8 @@ class R53ProvedRetirement(unittest.TestCase):
         self.assertEqual([r["id"] for r in bounced], ["px-405.1_ee.TESTHOST"],
                          "the recovered record takes the FULL path — receipt and return note")
         self.assertFalse(f.exists(), "…and retires with it")
-        self.assertNotIn("px-405.1_ee.TESTHOST", pm._pending_bounces, "the parked entry clears")
+        self.assertNotIn("TESTHOST2|px-405.1_ee.TESTHOST", pm._pending_bounces,
+                         "the parked entry clears")
         # PARSED garbage is still definite: terminal now, never parked
         g2 = self.hd / "px-406.1_ff.TESTHOST.json"
         g2.write_text("{garbage")
@@ -724,6 +726,7 @@ class R55PublishOutcomesAndSchema(unittest.TestCase):
         shutil.rmtree(pm.READBOX, ignore_errors=True)
         pm._pending_terminal_rows[:] = []
         pm._pending_bounces.clear()
+        pm._pending_bounces_loaded[0] = False
         try:
             pm._pending_bounces_path().unlink()
         except OSError:
@@ -879,6 +882,7 @@ class R55Wave2Retries(unittest.TestCase):
         shutil.rmtree(pm.OUTBOX, ignore_errors=True)
         pm._pending_terminal_rows[:] = []
         pm._pending_bounces.clear()
+        pm._pending_bounces_loaded[0] = False
         try:
             pm._pending_bounces_path().unlink()
         except OSError:
@@ -932,7 +936,8 @@ class R55Wave2Retries(unittest.TestCase):
             back = list(pm._peer_pending.get("TESTHOST3", {}).get("bounces") or [])
         self.assertEqual([b["mid"] for b in back], [mid],
                          "the bounce relays BACKWARD to the origin — never a local note")
-        self.assertNotIn(mid, pm._pending_bounces, "…and the park clears on settlement")
+        self.assertNotIn("TESTHOST2|" + mid, pm._pending_bounces,
+                         "…and the park clears on settlement")
 
     def test_a_failed_terminal_append_keeps_the_durable_park(self):
         # r55 wave 2: the malformed arm returned True after queuing a MEMORY-only row —
@@ -946,11 +951,11 @@ class R55Wave2Retries(unittest.TestCase):
             pm._flush_pending_bounces()
         finally:
             pm._tl_append = real
-        self.assertIn(mid, pm._pending_bounces,
+        self.assertIn("TESTHOST2|" + mid, pm._pending_bounces,
                       "the park SURVIVES a failed terminal append — never cleared over a "
                       "memory-only queued row")
         pm._flush_pending_bounces()                  # the store recovers
-        self.assertNotIn(mid, pm._pending_bounces)
+        self.assertNotIn("TESTHOST2|" + mid, pm._pending_bounces)
         self.assertIn(mid, [r["id"] for r in _rows() if r.get("ev") == "bounced"])
 
     def test_the_drain_is_single_flight(self):
@@ -960,3 +965,202 @@ class R55Wave2Retries(unittest.TestCase):
         self.assertIn("_drain_lock.acquire(blocking=False)", window,
                       "two exchange threads double-drained: duplicate return notes and "
                       "terminal rows (r55 wave 2)")
+
+class R56DurableBeforeAck(unittest.TestCase):
+    """the v1.3.28 audit's postal cluster: publication lacked an honest uncertain state
+    (P1.7), bounce parking acked before durability (P1.8), the dedupe ledger failed open
+    (P1.9), receipts acked over failed appends (P1.10), and the bounded scanners accepted
+    schema poison (P2.14-P2.18)."""
+
+    def setUp(self):
+        _reset()
+        shutil.rmtree(pm.OUTBOX, ignore_errors=True)
+        shutil.rmtree(pm.RECEIPTBOX, ignore_errors=True)
+        shutil.rmtree(pm.READBOX, ignore_errors=True)
+        pm._pending_terminal_rows[:] = []
+        pm._pending_bounces.clear()
+        pm._pending_bounces_loaded[0] = False
+        pm._bounced_done.clear()
+        pm._seen_ids = None
+        pm._seen_pending_durable.clear()
+        for p in (pm._pending_bounces_path(), pm.PEER_SEEN):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        self.now = int(time.time())
+        self.hd = pm.OUTBOX / "TESTHOST2"
+        self.hd.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_link_that_created_then_failed_is_uncertain(self):
+        # r56 P1.7a, executed there: a link() that created the final and then reported EIO
+        # was classified never-started — `unpublished` was filed over LIVE mail
+        mid = "px-801.1_aa.TESTHOST"
+        stage = self.hd / (".stage-" + mid)
+        body = json.dumps({"mid": mid, "body": "hi"})
+        stage.write_text(body)
+        real = os.link
+        def _link_then_fail(src, dst):
+            real(src, dst)
+            raise OSError(5, "EIO")
+        pm.os.link = _link_then_fail
+        try:
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                pm.outbox_publish_stage("TESTHOST2", mid, stage)   # NO raise: uncertain
+        finally:
+            pm.os.link = real
+        self.assertTrue((self.hd / (mid + ".json")).exists(), "the mail is LIVE")
+        self.assertTrue(stage.exists(), "…and the stage stays for boot arbitration")
+
+    def test_boot_arbitration_keeps_a_stage_over_an_unreadable_final(self):
+        # r56 P1.7c, executed there: Path.exists() folded an unreadable final to "absent",
+        # boot filed `unpublished` over relayable mail and deleted its recovery stage
+        mid = "px-802.1_bb.TESTHOST"
+        final = self.hd / (mid + ".json")
+        final.write_text(json.dumps({"mid": mid, "body": "hi"}))
+        stage = self.hd / (".stage-" + mid)
+        stage.write_text("1")
+        os.chmod(final, 0)
+        # os.stat still SUCCEEDS on a chmod-0 file (read fails; stat needs only the dir) —
+        # simulate a stat-level fault instead
+        real = pm.os.stat
+        def _stat(p, *a, **kw):
+            if str(p).endswith(mid + ".json"):
+                raise OSError(5, "EIO")
+            return real(p, *a, **kw)
+        pm.os.stat = _stat
+        try:
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                pm._reconcile_relay_stages()
+        finally:
+            pm.os.stat = real
+            os.chmod(final, 0o644)
+        self.assertTrue(stage.exists(), "the stage SURVIVES an unknowable final")
+        self.assertEqual([r for r in _rows() if r.get("ev") == "unpublished"], [],
+                         "…and no false unpublished row files over relayable mail")
+
+    def test_a_non_durable_park_fails_the_exchange(self):
+        # r56 P1.8, executed there: a failed park write still answered 200 — after a process
+        # death the bounce was gone and the peer never re-sent
+        mid = "px-803.1_cc.TESTHOST"
+        f = self.hd / (mid + ".json")
+        f.write_text(json.dumps({"mid": mid, "body": "hi"}))
+        os.chmod(f, 0)
+        real = pm._atomic_json_put
+        pm._atomic_json_put = lambda *a, **kw: (_ for _ in ()).throw(OSError(28, "ENOSPC"))
+        try:
+            out = pm._bounce_arrived("TESTHOST2", {"mid": mid,
+                                                   "code": "recipient-unavailable"})
+        finally:
+            pm._atomic_json_put = real
+            os.chmod(f, 0o644)
+        self.assertIs(out, False, "not durable → the exchange must FAIL (503) so the peer "
+                                  "re-sends; every arm is idempotent")
+        src = open(os.path.join(BIN, "romp-postal-service"), encoding="utf-8").read()
+        self.assertIn("_ExchangeNotDurable", src)
+        self.assertIn('return self._send({"error": "not durable', src)
+
+    def test_the_dedupe_ledger_fails_closed(self):
+        # r56 P1.9, executed there: an EIO loaded the ledger as EMPTY and the same message
+        # delivered twice with an ack
+        pm.PEER_SEEN.parent.mkdir(parents=True, exist_ok=True)
+        pm.PEER_SEEN.write_text("px-804.1_dd.TESTHOST\n")
+        os.chmod(pm.PEER_SEEN, 0)
+        try:
+            pm._seen_ids = None
+            self.assertIsNone(pm.peer_seen_check("px-804.1_dd.TESTHOST"),
+                              "unreadable = NO VERDICT, never fresh")
+        finally:
+            os.chmod(pm.PEER_SEEN, 0o644)
+        pm._seen_ids = None
+        self.assertTrue(pm.peer_seen_check("px-804.1_dd.TESTHOST"))
+
+    def test_the_ack_waits_for_the_durable_seen_append(self):
+        # r56 P1.9's second leg: the swallowed append failure acked an effect whose dedupe
+        # record died with the process
+        pm._seen_ids = set()
+        pm._seen_order = []
+        real = pm.os.fsync
+        pm.os.fsync = lambda fd: (_ for _ in ()).throw(OSError(5, "EIO"))
+        try:
+            with pm._seen_lock:
+                ok = pm._peer_seen_add_locked("px-805.1_ee.TESTHOST")
+        finally:
+            pm.os.fsync = real
+        self.assertFalse(ok, "no durable record, no ack")
+        self.assertIn("px-805.1_ee.TESTHOST", pm._seen_pending_durable)
+        with pm._seen_lock:
+            self.assertTrue(pm._peer_seen_append_durable("px-805.1_ee.TESTHOST"))
+        self.assertNotIn("px-805.1_ee.TESTHOST", pm._seen_pending_durable)
+
+    def test_receipt_acks_wait_for_durable_application(self):
+        # r56 P1.10, executed there: apply_ok:true with an empty timeline — the remote then
+        # deleted the only durable receipt
+        real = pm._tl_append
+        pm._tl_append = lambda name, row: False
+        try:
+            out = pm._read_arrived("TESTHOST2", {"mid": "px-806.1_ff.TESTHOST"})
+        finally:
+            pm._tl_append = real
+        self.assertIs(out, False, "no durable exec row, no readAck")
+        self.assertIn("px-806.1_ff.TESTHOST",
+                      [r["id"] for r in pm._pending_terminal_rows],
+                      "…and the row itself queues for the retry pumps")
+        pm._drain_postal_retries()
+        self.assertIn("px-806.1_ff.TESTHOST",
+                      [r["id"] for r in _rows() if r.get("ev") == "exec"])
+
+    def test_settled_bounces_never_renote(self):
+        # r56 P2.14, executed there: a failed source deletion re-ran the whole path — two
+        # return notes and two terminal rows while the source kept relaying
+        mid = "px-807.1_gg.TESTHOST"
+        f = self.hd / (mid + ".json")
+        f.write_text(json.dumps({"mid": mid, "body": "hi",
+                                 "frm_id": "77777777-8888-9999-aaaa-bbbbbbbbbbbb"}))
+        real = pm.outbox_del
+        pm.outbox_del = lambda h, m: False           # the deletion fails
+        try:
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                self.assertIs(pm._bounce_apply("TESTHOST2",
+                                               {"mid": mid,
+                                                "code": "recipient-unavailable"}), True)
+        finally:
+            pm.outbox_del = real
+        self.assertTrue(f.exists())
+        with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+            self.assertIs(pm._bounce_apply("TESTHOST2",
+                                           {"mid": mid,
+                                            "code": "recipient-unavailable"}), True)
+        bounced = [r for r in _rows() if r.get("ev") == "bounced"]
+        self.assertEqual(len(bounced), 1, "ONE terminal row — the retry deletes, never re-notes")
+        self.assertFalse(f.exists(), "…and the deletion retried")
+
+    def test_scanners_bind_schema_and_filenames(self):
+        # r56 P2.15/P2.16/P2.17/P2.18
+        rb = pm.RECEIPTBOX / "TESTHOST2"
+        rb.mkdir(parents=True, exist_ok=True)
+        (rb / "px-808.1_hh.TESTHOST.json").write_text(json.dumps({"mid": "px-999.9_zz.OTHER"}))
+        self.assertEqual(pm.receiptbox_list("TESTHOST2"), [],
+                         "a payload naming ANOTHER mid never marks it done (P2.16)")
+        self.assertFalse((rb / "px-808.1_hh.TESTHOST.json").exists(), "…and quarantines")
+        db = pm.READBOX / "TESTHOST2"
+        db.mkdir(parents=True, exist_ok=True)
+        for i in range(3):
+            (db / ("px-809.%d_ii.TESTHOST.json" % i)).write_text("[]")
+        (db / "px-810.1_jj.TESTHOST.json").write_text(
+            json.dumps({"mid": "px-810.1_jj.TESTHOST"}))
+        rows = pm.readbox_list("TESTHOST2", limit=2)
+        self.assertEqual([r["mid"] for r in rows], ["px-810.1_jj.TESTHOST"],
+                         "garbage never consumes the bounded budget (P2.15)")
+        f = self.hd / "px-811.1_kk.TESTHOST.json"
+        f.write_text(json.dumps({"mid": 123, "body": "x"}))
+        with self.assertRaises(pm._OutboxMalformed):
+            pm.outbox_get("TESTHOST2", "px-811.1_kk.TESTHOST")   # numeric mid (P2.17)
+        f.write_text("[]")
+        out = pm._recall("77777777-8888-9999-aaaa-bbbbbbbbbbbb", "", "")
+        self.assertIsInstance(out, list,
+                              "recall survives schema poison — a [] record used to raise "
+                              "AttributeError and abort the WHOLE recall (P2.18)")

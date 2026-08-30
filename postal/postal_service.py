@@ -1089,8 +1089,11 @@ def _recall(from_id, to, mid):
                 if mid and f.stem != mid:
                     continue
                 try:
-                    msg = json.loads(f.read_text())
-                except Exception:
+                    msg = outbox_get(hostdir.name, f.stem)
+                except (_OutboxUnreadable, _OutboxMalformed):
+                    continue           # the typed reader (r56 P2.18: a valid [] record raised
+                    #                    AttributeError below and aborted the WHOLE recall)
+                if not msg:
                     continue
                 if msg.get("frm_id") != from_id or msg.get("origin"):
                     continue
@@ -1547,7 +1550,12 @@ class Handler(BaseHTTPRequestHandler):
             payload, status = peer_update(data)
             return self._send(payload, status)
         if u.path == "/peer-exchange":             # a peer bus dialing us through the kernel's -L forward
-            payload, status = peer_exchange_handle(data)
+            try:
+                payload, status = peer_exchange_handle(data)
+            except _ExchangeNotDurable as e:
+                # r56 P1.8: a non-durable effect must FAIL the exchange so the peer re-sends
+                # (every arm is idempotent) — a 200 here acked a bounce a process death lost
+                return self._send({"error": "not durable: %s — re-send" % e}, 503)
             return self._send(payload, status)
         if u.path == "/handoff-done":
             # The recipient KERNEL reports a cross-host delegation's planted goal COMPLETE —
@@ -2001,7 +2009,18 @@ def _reconcile_relay_stages():
         stages = staged.get(hd) or []
         for st in stages:
             mid = st.name[len(".stage-"):]
-            published = (hd / (mid + ".json")).exists() or mid in settled
+            try:
+                os.stat(hd / (mid + ".json"))
+                published = True
+            except FileNotFoundError:
+                published = mid in settled
+            except OSError:
+                # an UNREADABLE final proves nothing (the r56 audit's P1.7c, executed there:
+                # Path.exists() folded the fault to "absent" and boot filed `unpublished`
+                # over relayable mail, then deleted its recovery stage) — keep the stage
+                sys.stderr.write("postal: the final for staged relay %s is unreadable — "
+                                 "keeping the stage for the next start\n" % mid)
+                continue
             if not published:
                 if _tl_append("messages.jsonl", {"t": int(time.time()),
                                                  "ev": "unpublished", "id": mid}):
@@ -2508,6 +2527,7 @@ PEER_SEEN = STATE / "peer-seen.jsonl"      # append-only receipt log — the ide
 _SEEN_CAP = 4000
 _seen_ids = None                           # lazy in-memory mirror of PEER_SEEN's tail
 _seen_order = None                         # oldest -> newest, unique; eviction order for the bounded window
+_seen_pending_durable = set()              # in-memory-seen mids whose fsync'd append has not landed (r56 P1.9)
 _seen_appends = 0                          # additions since the last atomic compaction
 _SEEN_COMPACT_EVERY = 256                  # disk stays within CAP + this many crash-safe append records
 _seen_lock = threading.Lock()              # check + delivery + receipt publish is one idempotence claim
@@ -2648,6 +2668,13 @@ def _seen_load():
     if _seen_ids is None:
         try:
             rows = PEER_SEEN.read_text().split()
+        except FileNotFoundError:
+            rows = []
+        except OSError as e:
+            # FAIL CLOSED (the r56 audit's P1.9, executed there: an EIO loaded the ledger as
+            # empty and the same message delivered twice with an ack) — an unreadable window
+            # is NO INFORMATION; the relay path answers drop and the peer retries
+            raise _OutboxUnreadable(*(e.args or ("peer-seen unreadable",)))
         except Exception:
             rows = []
         # Keep the newest occurrence of each valid id.  Older versions appended duplicates and never
@@ -2667,12 +2694,35 @@ def _seen_load():
     return _seen_ids
 
 def peer_seen_check(mid):
+    """True / False / None — None means the ledger is unreadable (no information): callers
+    must fail CLOSED (deliver nothing, ack nothing) rather than treat it as fresh (r56 P1.9)."""
     with _seen_lock:
-        return mid in _seen_load()
+        try:
+            return mid in _seen_load()
+        except _OutboxUnreadable:
+            return None
 
 def peer_seen_add(mid):
     with _seen_lock:
         _peer_seen_add_locked(mid)
+
+def _peer_seen_append_durable(mid):
+    """Retry the fsync'd ledger append for a mid the in-memory window already holds (r56
+    P1.9): the effect ran, its ack is withheld until this lands. Caller holds _seen_lock."""
+    global _seen_appends
+    try:
+        PEER_SEEN.parent.mkdir(parents=True, exist_ok=True)
+        with PEER_SEEN.open("a") as f:
+            f.write(mid + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        _seen_appends += 1
+        _seen_pending_durable.discard(mid)
+        return True
+    except Exception as e:
+        _log("peer-seen append retry failed: %s" % e)
+        return False
+
 
 def _peer_seen_add_locked(mid):
     """Publish one receipt while _seen_lock is held; retain one bounded, ordered dedupe window."""
@@ -2693,10 +2743,17 @@ def _peer_seen_add_locked(mid):
             f.flush()
             os.fsync(f.fileno())                    # an ack means the receipt survives a process crash
         _seen_appends += 1
+        _seen_pending_durable.discard(mid)
         if _seen_appends >= _SEEN_COMPACT_EVERY:
             _peer_seen_compact_locked()
+        return True
     except Exception as e:
-        _log("peer-seen append failed: %s" % e)     # dedupe degrades to the in-memory window
+        # the in-memory window still dedupes THIS process; the mid is marked not-yet-durable
+        # so the relay path withholds its ack until a later attempt lands (r56 P1.9: the
+        # swallowed failure acked an effect whose dedupe record died with the process)
+        _seen_pending_durable.add(mid)
+        _log("peer-seen append failed (ack withheld until durable): %s" % e)
+        return False
 
 
 def _fsync_dir(path):
@@ -2840,14 +2897,44 @@ def outbox_publish_stage(host, mid, stagef):
             raise _PublishNeverStarted("a DIFFERENT message already holds mid %s" % mid)
     except OSError as e:
         if e.errno in (errno.EPERM, errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)):
-            # a filesystem without hard links (the r52 verification): rename still publishes
-            # there — its silent-replace window is carried by the 128-bit mid
+            # a filesystem without hard links (the r52 verification). COPY-fsync-replace, not
+            # a bare rename (the r56 audit's P1.7b, executed there: rename consumed the stage
+            # BEFORE directory durability, and a later fsync failure left no recovery copy)
             try:
-                os.rename(stagef, d / (mid + ".json"))
+                _pb = Path(stagef).read_bytes()
+                _tmpf = d / (".pub-%s.%d.tmp" % (mid, os.getpid()))
+                with _tmpf.open("wb") as _fh:
+                    _fh.write(_pb)
+                    _fh.flush()
+                    os.fsync(_fh.fileno())
+                os.replace(_tmpf, d / (mid + ".json"))
             except OSError as e2:
                 raise _PublishNeverStarted(*(e2.args or ("publish failed",)))
         else:
-            raise _PublishNeverStarted(*(e.args or ("publish failed",)))
+            # the link REPORTED failure — but it may have created the final first (the r56
+            # audit's P1.7a, executed there: a link that created and then EIO'd was filed
+            # `unpublished` over LIVE mail). Arbitrate against the final: provably absent →
+            # never started; present or unknowable → UNCERTAIN (keep the stage, no raise).
+            try:
+                os.stat(d / (mid + ".json"))
+                _final_state = "present"
+            except FileNotFoundError:
+                _final_state = "absent"
+            except OSError:
+                _final_state = "unknown"
+            if _final_state == "absent":
+                raise _PublishNeverStarted(*(e.args or ("publish failed",)))
+            try:
+                sys.stderr.write("postal: link for %s failed with the final %s — publication "
+                                 "uncertain; the stage stays for boot arbitration\n"
+                                 % (mid, _final_state))
+            except Exception:
+                pass
+            try:
+                _peer_wake(host).set()
+            except Exception:
+                pass
+            return
     # ── PAST THIS POINT THE MESSAGE IS LIVE (the r54 audit's P1.5, executed: the directory
     # fsync raised AFTER the link and the stage unlink, the caller compensated `unpublished`,
     # and the relay still carried the message — the retry double-delivered). Publication is a
@@ -2945,6 +3032,11 @@ def outbox_list(host, limit=None, byte_limit=None):
     except Exception:
         return []
 
+class _ExchangeNotDurable(Exception):
+    """One exchange row's effect could not be made durable (r56 P1.8): the handler answers
+    an error instead of 200, so the peer re-sends — every arm is idempotent."""
+
+
 class _PublishNeverStarted(OSError):
     """Typed pre-publication failure (the r55 audit's P1.7): ONLY this may reach the
     caller's `unpublished` compensation. Any failure past the point publication may have
@@ -2998,8 +3090,10 @@ def _flush_terminal_rows():
 # terminal handling — the executed repro deleted recoverable mail and lost its return note
 # over one EIO. The bounce EVENT parks durably instead (the exchange 200s it, so the peer
 # never re-sends) and retries against the record until the read proves one way or the other.
-_pending_bounces = {}
+_pending_bounces = {}                  # "host|mid" -> {host, mid, code, t} (r56 P2.19: a
+#                                        mid-only key aliased the same mid from two hosts)
 _pending_bounces_lock = threading.Lock()
+_pending_bounces_loaded = [False]
 
 
 def _pending_bounces_path():
@@ -3007,49 +3101,71 @@ def _pending_bounces_path():
 
 
 def _pending_bounces_load():
+    """Load the durable parks. An UNREADABLE ledger stays unloaded and retries (r56 P1.8:
+    an EIO used to load as empty, and the next park's rewrite erased the standing entries)."""
+    if _pending_bounces_loaded[0]:
+        return True
     try:
         d = json.loads(_pending_bounces_path().read_text())
-    except Exception:
-        return
+    except FileNotFoundError:
+        d = {}
+    except Exception as e:
+        _log("pending-bounces ledger unreadable (%s) — retrying before any rewrite" % e)
+        return False
     if isinstance(d, dict):
-        with _pending_bounces_lock:
-            for k, v in d.items():
-                if _safe_id(str(k)) and isinstance(v, dict):
-                    _pending_bounces[str(k)] = v
+        for k, v in d.items():
+            if isinstance(v, dict):
+                _pending_bounces[str(k)] = v
+    _pending_bounces_loaded[0] = True
+    return True
 
 
 def _pending_bounce_park(host, mid, code):
+    """True only when the park is DURABLE (r56 P1.8, executed there: a failed write still
+    answered 200 and a process death lost the bounce). The write happens UNDER the lock —
+    the snapshot-then-write let a stale {A} overwrite a concurrent {A,B}."""
     with _pending_bounces_lock:
-        _pending_bounces[mid] = {"host": str(host), "code": str(code), "t": int(time.time())}
-        snap = dict(_pending_bounces)
-    try:
-        _atomic_json_put(_pending_bounces_path(), snap)
-    except Exception:
-        _log("pending-bounce for %s could not persist — retrying in-memory" % mid)
+        if not _pending_bounces_load():
+            _pending_bounces["%s|%s" % (host, mid)] = {"host": str(host), "mid": str(mid),
+                                                       "code": str(code),
+                                                       "t": int(time.time())}
+            return False                             # in-memory only: not durable
+        _pending_bounces["%s|%s" % (host, mid)] = {"host": str(host), "mid": str(mid),
+                                                   "code": str(code), "t": int(time.time())}
+        try:
+            _atomic_json_put(_pending_bounces_path(), dict(_pending_bounces))
+            return True
+        except Exception:
+            _log("pending-bounce for %s/%s could not persist — the exchange must fail so "
+                 "the peer re-sends" % (host, mid))
+            return False
 
 
-def _pending_bounce_clear(mid):
+def _pending_bounce_clear(host, mid):
     with _pending_bounces_lock:
-        _pending_bounces.pop(mid, None)
-        snap = dict(_pending_bounces)
-    try:
-        if snap:
-            _atomic_json_put(_pending_bounces_path(), snap)
-        else:
-            _pending_bounces_path().unlink(missing_ok=True)
-    except Exception:
-        pass
+        _pending_bounces.pop("%s|%s" % (host, mid), None)
+        try:
+            if _pending_bounces:
+                _atomic_json_put(_pending_bounces_path(), dict(_pending_bounces))
+            else:
+                _pending_bounces_path().unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _flush_pending_bounces():
-    for mid, v in list(_pending_bounces.items()):
+    with _pending_bounces_lock:
+        _pending_bounces_load()
+        items = list(_pending_bounces.values())
+    for v in items:
         # through _bounce_arrived, never _bounce_apply directly (the r55 wave-2
         # verification: the direct call skipped the forwarded-vs-ours arbitration and a
         # HUB's parked bounce delivered its return note to a REMOTE frm_id as local mail
         # instead of relaying backward to the origin)
         if _bounce_arrived(str(v.get("host") or ""),
-                           {"mid": mid, "code": str(v.get("code") or "")}):
-            _pending_bounce_clear(mid)
+                           {"mid": str(v.get("mid") or ""),
+                            "code": str(v.get("code") or "")}) is True:
+            _pending_bounce_clear(str(v.get("host") or ""), str(v.get("mid") or ""))
 
 
 def _outbox_row_ok(row, mid):
@@ -3059,8 +3175,9 @@ def _outbox_row_ok(row, mid):
     indefinitely, and an ack for one deleted it as if it were delivered mail."""
     if not isinstance(row, dict):
         return False
-    if str(row.get("mid") or "") != mid:
-        return False
+    if not isinstance(row.get("mid"), str) or row["mid"] != mid:
+        return False     # a numeric mid stringified its way past this and the receiver
+        #                  dropped it with no ack and no bounce (r56 P2.17)
     for k in ("to", "to_id", "frm", "frm_id", "body", "origin", "kind"):
         if k in row and row[k] is not None and not isinstance(row[k], str):
             return False
@@ -3154,11 +3271,17 @@ def receiptbox_list(host, limit=None):
                 continue
             try:
                 row = json.loads(raw)
-                if isinstance(row, dict) and _safe_id(row.get("mid") or ""):
+                if (isinstance(row, dict) and _safe_id(str(row.get("mid") or ""))
+                        and str(row.get("mid")) == f.stem):
                     keep = {"mid": row["mid"]}
                     if _safe_id(str(row.get("origin") or "")):
                         keep["origin"] = str(row["origin"])
                     out.append(keep)
+                else:
+                    # filename binding (the r56 audit's P2.16, executed there: A.json holding
+                    # mid:"B" marked B done while A survived and relisted forever)
+                    _quarantine_corrupt_json(f, "receiptbox", ValueError("mid mismatch"),
+                                             fingerprint)
             except Exception as e:
                 _quarantine_corrupt_json(f, "receiptbox", e, fingerprint)
         return out
@@ -3226,17 +3349,24 @@ def _handoff_done_arrived(host, row):
     safe fallback: an alias mismatch on the sender's own bus still lands the join locally."""
     mid = str((row or {}).get("mid") or "")
     if not _safe_id(mid):
-        return
+        return True
     origin = str((row or {}).get("origin") or "")
     if (origin and _safe_id(origin) and origin != host and origin != self_host()
             and (PEERS.get(origin) or {}).get("port")):
-        receiptbox_put(origin, mid, origin=origin)
-        return
+        try:
+            receiptbox_put(origin, mid, origin=origin)
+        except OSError:
+            return False                     # not parked durably — the ack waits (r56 P1.10)
+        return True
     if mid in _handoff_done_ids():
-        return
-    _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "handoff-done", "id": mid,
-                                  "from_host": host})
+        return True
+    _hrow = {"t": int(time.time()), "ev": "handoff-done", "id": mid, "from_host": host}
+    if not _tl_append("messages.jsonl", _hrow):
+        _queue_terminal_row(_hrow, "handoff-done %s: the row could not append — queued; "
+                                   "the ack waits (r56 P1.10)" % mid)
+        return False
     _HANDOFF_DONE_MEMO["key"] = None                 # the log moved under the memo
+    return True
 
 def readbox_put(host, rec):
     """Park one read receipt for `host` (readbox/<host>/<mid>.json) and poke its exchange. Keyed by
@@ -3275,6 +3405,14 @@ def readbox_list(host, limit=None, byte_limit=None):
                 continue
             try:
                 row = json.loads(raw)
+                if not (isinstance(row, dict) and _safe_id(str(row.get("mid") or ""))
+                        and str(row.get("mid") or "") == f.stem):
+                    # schema + filename binding BEFORE the row consumes the bounded budget
+                    # (the r56 audit's P2.15: 512 []-shaped rows starved a valid receipt
+                    # sorted behind them)
+                    _quarantine_corrupt_json(f, "readbox", ValueError("schema-invalid"),
+                                             fingerprint)
+                    continue
                 size = len(json.dumps(row).encode("utf-8"))
                 if byte_limit is not None and used + size > byte_limit:
                     if not out:
@@ -3418,10 +3556,10 @@ def _read_arrived(host, r):
     Origin-stamped (the mail was forwarded through us) → re-queue one hop backward with the stamp
     stripped, so it can never loop — the same one-hop-max rule relays live by."""
     if not isinstance(r, dict):
-        return
+        return True
     mid = r.get("mid") or ""
     if not _safe_id(mid):
-        return
+        return True
     origin = str((r or {}).get("origin") or "")
     if origin and origin != self_host():
         if PEERS.get(origin):                    # only toward a peer the kernel told us about
@@ -3430,14 +3568,24 @@ def _read_arrived(host, r):
                 fwd["dmid"] = r.get("dmid")
             if r.get("unread"):
                 fwd["unread"] = True
-            readbox_put(origin, fwd)
-        return
+            try:
+                readbox_put(origin, fwd)
+            except OSError:
+                return False                     # not parked durably — the ack waits (r56)
+        return True
     ev = "unexec" if r.get("unread") else "exec"
     row = {"t": int(r.get("t") or time.time()), "ev": ev, "id": mid}
     d = str((r or {}).get("dmid") or "")
     if _safe_id(d):
         row["dmid"] = d   # the recipient's own delivery mid → the timeline's exact turn join (2026-08-06)
-    _tl_append("messages.jsonl", row)
+    if not _tl_append("messages.jsonl", row):
+        # the r56 audit's P1.10: the swallowed failure still ACKed the receipt and the remote
+        # deleted its only durable copy — the row itself queues (drained event-paced +
+        # periodic), and the RESPONSE-carried leg withholds its readAck until this lands
+        _queue_terminal_row(row, "read receipt for %s: the exec row could not append — "
+                                 "queued; the readAck waits" % mid)
+        return False
+    return True
 
 def _bounce_apply(host, b):
     """A peer refused one of our parked messages — return it to the SENDER as a bus-authored note,
@@ -3454,10 +3602,10 @@ def _bounce_apply(host, b):
         # return note). The bounce EVENT parks durably instead — the exchange 200s it, so
         # the peer never re-sends — and retries against the record until the read PROVES
         # readable (full path), malformed (terminal below), or missing (moot).
-        _pending_bounce_park(host, mid, rows[0]["code"])
-        _log("bounce for %s/%s parked: the record is unreadable this pass — retrying "
-             "until the read proves" % (host, mid))
-        return False
+        _pdur = _pending_bounce_park(host, mid, rows[0]["code"])
+        _log("bounce for %s/%s parked%s: the record is unreadable this pass — retrying "
+             "until the read proves" % (host, mid, "" if _pdur else " (NOT YET DURABLE)"))
+        return "parked" if _pdur else False   # False → the exchange fails; the peer re-sends
     except _OutboxMalformed:
         # PARSED garbage is definite: file the terminal receipt (the parked accounting must
         # not claim mail the peer refused) and say out loud that the return note could not
@@ -3478,6 +3626,12 @@ def _bounce_apply(host, b):
         #                then lost both); the park stays until the terminal actually lands
     if not msg:
         return True
+    if mid in _bounced_done:
+        # ALREADY settled (the r56 audit's P2.14, executed there: a failed source deletion
+        # re-ran the whole path — two return notes, two terminal rows) — retry the deletion
+        # alone
+        outbox_del(host, mid)
+        return True
     code = rows[0]["code"]
     why = _bounce_reason(code)
     note = ("undeliverable to '%s' on %s: %s\n\n(your message follows)\n%s"
@@ -3494,7 +3648,12 @@ def _bounce_apply(host, b):
                                          "code": code, "why": why}):
         _log("bounce for %s/%s deferred: the terminal row could not be appended" % (host, mid))
         return False
-    outbox_del(host, mid)
+    _bounced_done.add(mid)
+    if len(_bounced_done) > 4096:
+        _bounced_done.clear()
+    if not outbox_del(host, mid):
+        _log("bounce for %s/%s: the source could not be deleted — retrying without a "
+             "second note (r56 P2.14)" % (host, mid))
     return True
 
 def fleet_presence(exclude_host):
@@ -3743,7 +3902,14 @@ def _relay_in(host, m, token_proven=False):
         # Hold the idempotence claim across the effect and receipt publish.  Two exchange threads can
         # carry the same mid concurrently; neither may pass a separate check before either appends.
         with _seen_lock:
-            if mid in _seen_load():
+            try:
+                _already = mid in _seen_load()
+            except _OutboxUnreadable:
+                return "drop", None                  # no information → no effect, no ack (r56 P1.9)
+            if _already:
+                if mid in _seen_pending_durable and not _peer_seen_append_durable(mid):
+                    return "drop", None              # delivered, but the dedupe record is not
+                    #                                  durable yet — the ack waits (r56 P1.9)
                 return "ack", None                   # duplicate → re-ack, deliver nothing
             # Trust key = the true ORIGIN (the forwarding host stamps m["origin"]; else the direct peer).
             # Unknown host (a race before the kernel's notify lands) defaults to directed — never auto-inject.
@@ -3774,9 +3940,15 @@ def _relay_in(host, m, token_proven=False):
             # else isolated → ack and remember, but deliver nothing (no communication).
             # An isolated host normally never peers at all (the kernel forces its notify down), so this is
             # a defensive backstop for the checkin-peer path where the mobile dials our /peer-exchange.
-            _peer_seen_add_locked(mid)
+            if not _peer_seen_add_locked(mid):
+                return "drop", None                  # the effect ran; the ack waits for the
+                #                                      durable dedupe record — the in-memory
+                #                                      window absorbs the retry (r56 P1.9)
         return "ack", None
-    if peer_seen_check(mid):
+    _psc = peer_seen_check(mid)
+    if _psc is None:
+        return "drop", None                          # unreadable ledger: no verdict (r56 P1.9)
+    if _psc:
         return "ack", None                           # a duplicate whose recipient has since vanished
     if (any(str(a["id"]) == to_id for a in local_agents()) if to_id
             else any(a["name"] == to for a in local_agents())):
@@ -3793,6 +3965,7 @@ def _relay_in(host, m, token_proven=False):
             return "hold", None
     return "bounce", {"mid": mid, "code": "recipient-unavailable"}
 
+_bounced_done = set()                  # mids whose terminal row landed this process (r56 P2.14)
 _drain_lock = threading.Lock()
 
 
@@ -3962,7 +4135,11 @@ def peer_exchange_handle(data):
     for mid in _peer_ack_ids(data.get("acks")):      # the dialer confirmed relays landed — end-to-end:
         _ack_arrived(host, mid)                      # a forwarded one relays its ack back to the origin
     for b in _peer_bounce_rows(data.get("bounces")): # ...or refused them → backward, or to our sender
-        _bounce_arrived(host, b)
+        if _bounce_arrived(host, b) is False:
+            # NOT durable (the r56 audit's P1.8, executed there: a failed park still answered
+            # 200 and a process death lost the bounce) — fail the whole exchange; the peer
+            # re-sends and every arm here is idempotent (seen ledger, parks, terminal rows)
+            raise _ExchangeNotDurable("bounce for %s could not park durably" % b.get("mid"))
     for ra in _peer_read_ack_rows(data.get("readAcks")):  # the dialer confirmed response-carried receipts
         readbox_del(host, ra)
     for r in _peer_read_rows(data.get("reads")):     # read receipts flowing back — ours or one hop onward
@@ -4091,11 +4268,13 @@ def peer_exchange_apply(host, req_sent, resp):
     for b in _peer_bounce_rows(resp.get("bounces")):
         _bounce_arrived(host, b)
     for r in _peer_read_rows(resp.get("reads")):     # response-carried receipts: apply, ack on the NEXT dial
-        _read_arrived(host, r)
+        if _read_arrived(host, r) is False:
+            continue   # not durably applied (r56 P1.10): no ack — the remote keeps its copy
         with _peer_lock:
             p["readAcks"].append({"mid": r.get("mid"), "unread": bool(r.get("unread"))})
     for hd in _receipt_rows(resp.get("handoffDone")):   # completion receipts: same apply-then-ack
-        _handoff_done_arrived(host, hd)
+        if _handoff_done_arrived(host, hd) is False:
+            continue   # not durably applied (r56 P1.10): no ack — the remote keeps its copy
         with _peer_lock:
             p["handoffDoneAcks"].append({"mid": hd["mid"]})
     for m in resp.get("relays") or []:
@@ -4238,6 +4417,8 @@ def _peer_loop(host):
             _peer_wake(host).wait(min(30, 2 ** min(fails, 5)))
             continue
         fails = 0
+        _drain_postal_retries()    # the periodic pump (r56 P2.13: a recovered queued row sat
+        #                            stuck until an unrelated ack/bounce happened to arrive)
         try:
             peer_exchange_apply(host, req, resp)
         except Exception as e:

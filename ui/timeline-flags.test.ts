@@ -180,8 +180,12 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
     assert.ok(win.indexOf("const dispatch = () => {") > 0
       && win.indexOf("self2._editRemoteTag(") > win.indexOf("const dispatch = () => {"),
       "every effect lives inside the gated closure — nothing runs before the ack");
-    assert.ok(win.indexOf("{ rekey: { ogid: gid, gid: ngid, epoch: epoch } }") > 0,
+    assert.ok(win.indexOf("const rekey = { ogid: gid, gid: ngid, epoch: epoch };") > 0
+      && win.indexOf("{ rekey: rekey }") > 0,
       "…and the write carries the claim epoch the kernel CAS-validates (r55 P1.4)");
+    assert.ok(win.indexOf("rekey: rekey }") > 0 && win.indexOf("x.olin = (x.olin || []).concat([x.gid]).slice(-8);") > 0,
+      "the gate remembers its CAS for the reconnect replay (r56 P1.2) and the rows carry "
+      + "the bounded ancestor lineage (r56 P1.3)");
     assert.ok(win.indexOf("{ run: dispatch, gids: [ngid], name:") > 0,
       "the gate keys on the NEW gid — the ok flips exactly the re-keyed rows");
   }
@@ -262,9 +266,12 @@ test("source: tagEditFailed compensates SIBLING hosts — inverse remote edits; 
   // falls back to the newest-gid heuristic (the r46 verification: host+name alone also swept
   // OTHER gestures' entries into the rollback)
   assert.match(win, /const newestGid = matched\.reduce\(\(g, o\) => Math\.max\(g, o\.gid \|\| 0\), 0\);/);
-  assert.match(win, /const ops = matched\.filter\(\(o\) => m\.opId \? \(String\(o\.gid \|\| 0\) === String\(m\.opId\)\s*\n\s*\|\| String\(o\.ogid \|\| 0\) === String\(m\.opId\)\)\s*\n\s*: \(\(o\.gid \|\| 0\) === newestGid && !o\.confirmed\)\);/,
-    "the opId-less fallback never sweeps a poll-CONFIRMED gesture (r48); a straggler refusal "
-    + "of the dead writer's own dispatch finds the re-keyed group through ogid (r54 P1.2)");
+  assert.ok(win.indexOf("const ops = matched.filter((o) => m.opId ? _lin(o, m.opId)") > 0
+    && win.indexOf("|| (Array.isArray(o.olin) && o.olin.some((x) => String(x) === String(id)))") > 0
+    && win.indexOf(": ((o.gid || 0) === newestGid && !o.confirmed));") > 0,
+    "the opId-less fallback never sweeps a poll-CONFIRMED gesture (r48); a refusal naming "
+    + "ANY ancestor of a repeatedly re-keyed gesture still matches (r54 P1.2 + r56 P1.3: "
+    + "the single ogid lost the immediate predecessor after a second completion)");
   // gid-matched entries on OTHER hosts — INCLUDING poll-confirmed ones, which the group
   // retention keeps precisely for this (the v1.3.20 audit's P1.3) — get the inverse REMOTE
   // edit and are dropped as compensated
@@ -1805,4 +1812,93 @@ test("executed: one absent echo is NOT settlement proof — unsuppress needs two
   assert.ok(!panel._yieldedGids.has(515151),
     "TWO consecutive absent echoes: the completer settled it — suppression ends");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: the reconnect replay carries the completion's CAS — never a plain-merge bypass (r56 P1.2)", () => {
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any, rekey: any) =>
+    wire.push({ entries, retired, opId, rekey });
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
+  const gid = journal[0].gid;
+  const panel2 = drawnPanel();
+  g.__rompTimelineClaimUnion = (gid2: any) => panel2.unionClaimAck({ gid: gid2, ok: true, epoch: 9 });
+  panel2._editRemoteTag = () => true;
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: journal }));
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: journal }));       // claim → rekey sync (unacked)
+  const sent = wire[wire.length - 1];
+  assert.ok(sent.rekey && sent.rekey.ogid === gid && sent.rekey.epoch === 9,
+    "the rekey write carries the CAS");
+  panel2.unionTransportReset();                       // the socket died pre-ack; the REPLAY
+  const replayed = wire.filter((w: any) => w.rekey && w.rekey.ogid === gid);
+  assert.ok(replayed.length >= 2,
+    "…and the replay re-sends it WITH the CAS (the r56 audit's P1.2, executed there: the "
+    + "metadata-free plain merge retired another socket's legitimate claim)");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+  delete g.__rompTimelineClaimUnion;
+});
+
+test("executed: a refusal naming the MIDDLE ancestor of a twice-completed gesture still compensates (r56 P1.3)", () => {
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });        // g0, dead writer
+  const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
+  const g0 = journal[0].gid;
+  const panel2 = drawnPanel();
+  autoAckUnion(panel2);
+  let grants = 0;
+  g.__rompTimelineClaimUnion = (gid2: any) => { grants += 1; panel2.unionClaimAck({ gid: gid2, ok: true, epoch: grants }); };
+  const calls: any[] = [];
+  panel2._editRemoteTag = (rt: any, edit: any, g2: any) => { calls.push({ rt, edit, g2 }); return true; };
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: journal }));
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: journal }));       // completion 1: g0 → g1
+  const g1 = calls.length ? calls[0].g2 : 0;
+  assert.ok(g1 && g1 !== g0, "first completion re-keyed");
+  // force a SECOND completion of the same group (the first's flip never reached the echo):
+  for (const o of panel2._unionOps) o.dispatched = false;
+  panel2._undispatchedSeen = new Set([g1]);
+  const echo = JSON.parse(JSON.stringify(panel2._unionOps));
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: echo }));          // completion 2: g1 → g2
+  const g2v = calls[calls.length - 1].g2;
+  assert.ok(g2v && g2v !== g1, "second completion re-keyed again");
+  assert.ok((panel2._unionOps || []).every((o: any) =>
+      Array.isArray(o.olin) && o.olin.indexOf(g1) >= 0 && o.olin.indexOf(g0) >= 0),
+    "the rows carry the WHOLE bounded lineage");
+  calls.length = 0;
+  panel2.tagEditFailed({ host: "TESTHOST-B", name: "pool", opId: String(g1),
+                         error: "kernel refused" });
+  assert.ok(calls.length >= 1,
+    "a refusal naming the MIDDLE ancestor matches and compensates (the r56 audit's P1.3, "
+    + "executed there: the single oldest ogid matched zero rows and zero inverses ran)");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+  delete g.__rompTimelineClaimUnion;
+});
+
+test("a transport reset clears the claim epochs — no guaranteed-stale CAS attempt (r56 P2.11)", () => {
+  const panel = drawnPanel();
+  panel._claimEpochs = { 777: 4 };
+  g.__rompTimelineSetUnionOps = () => {};
+  panel.unionTransportReset();
+  assert.deepEqual(panel._claimEpochs, {},
+    "the claims died with the socket; a kept epoch made the next completion attempt refuse "
+    + "before recovering");
+  delete g.__rompTimelineSetUnionOps;
 });

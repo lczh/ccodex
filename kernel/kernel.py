@@ -1630,7 +1630,17 @@ def _ordered_locked(sessions):
     sibling already in the order. A genuinely-new session still appends at the end. Keyed off the anchor the
     sessions carry (default: the sid itself), so session-order.json + the client stay fsid-based — no
     migration (the user 2026-06-24: keep ONE slot across /clear / revive)."""
-    order = _session_order()
+    try:
+        _oraw = _read_state_json(jd.STATE / "session-order.json", "session-order")
+    except OSError:
+        # r56 P2.12: an EIO here used to fold to [] and the heal path then PERSISTED
+        # discovery order over the user's saved one — render input-ordered this pass and
+        # persist nothing; the next pass re-reads
+        sys.stderr.write("session-order: unreadable — rendering unordered this pass, "
+                         "persisting nothing\n")
+        return list(sessions)
+    order = jd.canonicalize_session_identity(
+        [x for x in _oraw if isinstance(x, str)] if isinstance(_oraw, list) else [])
     known = set(order)
     # Slot inheritance keys on the STABLE session NAME (customTitle), NOT the fsid or discover's anchor: a
     # /clear, relaunch, or revive mints a NEW transcript fsid for the SAME logical session, and it must
@@ -2274,11 +2284,24 @@ _QUARANTINED = object()   # _read_state_json's "malformed bytes moved aside" —
 #                           an authoritative [] over exactly the loss it should have marked)
 
 
-def _quarantine_state_bytes(path, what):
+def _quarantine_state_bytes(path, what, fingerprint=None):
     """Move PROVEN-garbage state bytes aside — 128-bit no-replace names (r54 P3.13) — shared
     by the malformed-JSON arm and the wrong-shape arm (r55 P2.9: a stored null/[] used to
     read as proved-empty and the next edit overwrote it). Raises _StateUnreadable when the
-    bytes cannot be made safe."""
+    bytes cannot be made safe. `fingerprint` is the (dev, ino, size, mtime_ns) of the READ
+    that judged the bytes (the r56 audit's P1.4, executed there: an unlocked observer read
+    malformed bytes, a concurrent writer committed a VALID journal, and the pathname-keyed
+    quarantine unlinked the valid replacement) — a mismatch means the judged bytes are gone
+    and there is nothing left to move."""
+    if fingerprint is not None:
+        try:
+            st = path.stat()
+            if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != fingerprint:
+                return                               # a concurrent atomic writer replaced it
+        except FileNotFoundError:
+            return                                   # consumed concurrently — nothing to move
+        except OSError:
+            raise _StateUnreadable("quarantine fingerprint check failed")
     _qerr = None
     for _ in range(3):
         qp = path.with_name(path.name + ".corrupt-%d-%d-%s"
@@ -2318,19 +2341,26 @@ def _read_state_json(path, what):
     _QUARANTINED sentinel (r55 P2.10) — corrupt content can never merge, must never be
     silently overwritten, and must never masquerade as an honestly-empty store."""
     try:
+        _fst = path.stat()
+        _fp = (_fst.st_dev, _fst.st_ino, _fst.st_size, _fst.st_mtime_ns)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise _StateUnreadable(*(e.args or ("unreadable",)))
+    try:
         val = json.loads(path.read_text())
     except FileNotFoundError:
         return None
     except OSError as e:
         raise _StateUnreadable(*(e.args or ("unreadable",)))
     except ValueError:
-        _quarantine_state_bytes(path, what)
+        _quarantine_state_bytes(path, what, fingerprint=_fp)
         return _QUARANTINED
     if val is None:
         # a stored top-level `null` is garbage for EVERY state file this kernel keeps, and
         # Python's None would masquerade as "missing" to every caller (the r55 audit's P2.9:
         # the next edit overwrote it under a success ack) — same treatment as malformed
-        _quarantine_state_bytes(path, what)
+        _quarantine_state_bytes(path, what, fingerprint=_fp)
         return _QUARANTINED
     return val
 
@@ -2373,7 +2403,35 @@ def _union_ops_echo():
         except OSError:
             pass
         return None
-    return [r for r in rows if isinstance(r, dict)]
+    return [r for r in rows if isinstance(r, dict) and _union_row_valid(r)]
+    #        ^ schema-filtered (r56 P1.5): a legacy Infinity gid rode the payload as invalid
+    #          JSON and the browser refused the whole timeline frame
+
+
+def _union_row_valid(r):
+    """SCHEMA for one journal row (the r56 audit's P1.5, executed there: gid:[] wedged every
+    later merge with a TypeError; gid:1e309 persisted as Infinity, then raised OverflowError
+    AND rode the timeline frame as invalid JSON the browser refused whole). Ids are finite
+    positive safe integers; refusal gids are negative ints; every string field is a string."""
+    if not isinstance(r, dict):
+        return False
+    def _safe_int(v, lo, hi):
+        return isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
+    _MAX = 2 ** 53
+    if r.get("refusal"):
+        return _safe_int(r.get("gid"), -_MAX, -1) or _safe_int(r.get("gid"), 1, _MAX)
+    if not _safe_int(r.get("gid"), 1, _MAX):
+        return False
+    if "ogid" in r and r.get("ogid") not in (None, 0) and not _safe_int(r.get("ogid"), 1, _MAX):
+        return False
+    if "olin" in r and r.get("olin"):
+        if not (isinstance(r["olin"], list)
+                and all(_safe_int(x, 1, _MAX) for x in r["olin"])):
+            return False
+    for k in ("host", "name", "oldName", "oldColor"):
+        if k in r and r[k] is not None and not isinstance(r[k], str):
+            return False
+    return True
 
 
 def _union_ops_set(entries, retired=None):
@@ -2416,7 +2474,17 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
         if _raw is not None and _raw is not _QUARANTINED and not isinstance(_raw, list):
             _quarantine_state_bytes(_union_ops_path(), "union-gestures")   # r55 P2.10
         cur = [r for r in _raw if isinstance(r, dict)] if isinstance(_raw, list) else []
+        _cur_bad = [r for r in cur if not _union_row_valid(r)]
+        if _cur_bad:
+            sys.stderr.write("union-gestures: dropping %d stored schema-invalid row(s) — "
+                             "legacy poison (r56 P1.5)\n" % len(_cur_bad))
+            cur = [r for r in cur if _union_row_valid(r)]
         inc = [r for r in (entries if isinstance(entries, list) else []) if isinstance(r, dict)]
+        if any(not _union_row_valid(r) for r in inc):
+            # REJECT the whole write (the r56 audit's P1.5): one gid:[] row wedged every
+            # later merge; one 1e309 rode the wire as Infinity and the browser refused the
+            # whole timeline frame
+            return False, [], "malformed entry (ids must be finite safe integers; "                               "string fields must be strings)"
         if rekey:
             # the completion CAS (r55 P1.4): the claim must still be THIS claimant's epoch,
             # and the original rows must still stand — both checked under the SAME lock the
@@ -2457,12 +2525,19 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                 # staleness (7d) is the backstop, like the phantom reconcile's window (r50)
                 and not (r.get("refusal") and isinstance(r.get("t"), (int, float))
                          and r["t"] < _cutoff)]
+        _resident = {r.get("gid") for r in cur if not r.get("refusal")}
         with _union_claims_lock:
             _tombed = []
             for r in inc:
-                if (not r.get("refusal")
-                        and (r.get("gid") in _union_retired_tombs
-                             or (r.get("ogid") or 0) in _union_retired_tombs)):
+                if r.get("refusal") or r.get("gid") in _resident:
+                    # a RESIDENT gesture's own update is never tombstone-dropped (the r56
+                    # audit's P1.1, executed there: the committed successor's dispatched:true
+                    # flip carries the tombstoned ogid — dropping it deleted the healthy
+                    # completion's own compensation journal and answered unclaimed over it)
+                    continue
+                if (r.get("gid") in _union_retired_tombs
+                        or (r.get("ogid") or 0) in _union_retired_tombs
+                        or any(x in _union_retired_tombs for x in (r.get("olin") or []))):
                     if r.get("gid") not in _tombed:
                         _tombed.append(r.get("gid"))
             if _tombed:
@@ -2473,7 +2548,7 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                              "retaining ALL (rows retire on acked evidence or a refusal's "
                              "7d backstop, never by eviction)\n" % (len(rows), _UNION_OPS_MAX))
         try:
-            _atomic_write(_union_ops_path(), json.dumps(rows))
+            _atomic_write(_union_ops_path(), json.dumps(rows, allow_nan=False))
         except Exception:
             sys.stderr.write("union-gestures save: %s\n" % traceback.format_exc())
             return False, [], "the journal write failed"
@@ -2519,7 +2594,8 @@ def _union_ops_mark_dispatched(gid, host):
         hit = False
         for r in rows:
             if (not r.get("refusal") and r.get("host") == host
-                    and (r.get("gid") == gid or r.get("ogid") == gid)
+                    and (r.get("gid") == gid or r.get("ogid") == gid
+                         or gid in (r.get("olin") or []))
                     and r.get("dispatched") is False):
                 r["dispatched"] = True
                 hit = True
@@ -3445,11 +3521,28 @@ def _session_flag_raw(sid, flag):
     return None if v is None else bool(v)
 
 
+def _session_flags_proved():
+    """The MUTATION snapshot (the r56 audit's P1.6, executed there: one EIO folded the store
+    to {} and the next toggle persisted only the toggled session — every standing isolation
+    and mute row was deleted). Only ENOENT reads as empty; unreadable raises; wrong-shape
+    valid bytes quarantine aside."""
+    p = jd.STATE / "session-flags.json"
+    raw = _read_state_json(p, "session-flags")
+    if raw is not None and raw is not _QUARANTINED and not isinstance(raw, dict):
+        _quarantine_state_bytes(p, "session-flags")
+        raw = _QUARANTINED
+    return jd.canonicalize_session_flags_identity(raw if isinstance(raw, dict) else {})
+
+
 def _set_session_flag(sid, flag, value):
     with jd._identity_file_lock():
         sid = jd.canonicalize_session_identity(sid)
-        cur = jd.canonicalize_session_flags_identity(
-            dict(_session_flags()))                  # commit-time snapshot + identity
+        try:
+            cur = dict(_session_flags_proved())      # commit-time PROVED snapshot (r56 P1.6)
+        except OSError:
+            sys.stderr.write("session-flags: unreadable — refusing the toggle rather than "
+                             "erasing the standing isolation/mute rows\n")
+            return False
         f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
         if value:
             f[flag] = True
@@ -3460,6 +3553,7 @@ def _set_session_flag(sid, flag, value):
         else:
             cur.pop(sid, None)
         _atomic_write(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
+        _flags_cache.clear()             # the proved write invalidates the lenient cache
     if flag == "hideFromFeed" and value:
         # Muting takes the session OUT of task tracking → VIEW-CLEAR its current goals: seal them exactly like
         # crossing each card off the feed (cleared.jsonl + the durable node flag), NOT delete — they stay on
