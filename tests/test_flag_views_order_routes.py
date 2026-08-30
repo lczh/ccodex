@@ -1940,7 +1940,15 @@ class R54AuditFixes(unittest.TestCase):
         self._seed_rows(7001)
         epoch = km._union_claim_grant(7001, "ws:comp")
         self.assertIsNotNone(epoch)
-        # the owner retires the gesture while the claim is held
+        # a LIVE claim now blocks foreign retirement outright (r56 wave 2: a stale panel's
+        # diff-derived retired list erased a gesture mid-completion) …
+        self.assertTrue(km._union_ops_set([], [7001]))
+        self.assertEqual([r["gid"] for r in km._union_ops_load()], [7001],
+                         "…the rows SURVIVE a retirement over another client's claim")
+        # …so the settled-resurrection scenario needs the claimant DEAD first: its socket
+        # closes (claim released), the owner's retirement lands, and only then does the
+        # stale epoch attempt its rekey
+        km._union_claims_release("ws:comp")
         self.assertTrue(km._union_ops_set([], [7001]))
         ok, _, reason = km._union_ops_merge(
             [{"host": "TESTHOST-A", "gid": 7002, "ogid": 7001, "edit": {}, "inverse": {},
@@ -1968,10 +1976,12 @@ class R54AuditFixes(unittest.TestCase):
             [], [7005], ckey="ws:comp", rekey={"ogid": 7005, "gid": 7006, "epoch": 999999})
         self.assertFalse(ok)
         self.assertIn("stale", reason or "")
-        # claims retire WITH their rows (r55 P3.19)
+        # claims retire WITH their rows (r55 P3.19) — retired by the HOLDER itself, the one
+        # writer the r56 claim-guard lets through
         self._seed_rows(7007)
         km._union_claim_grant(7007, "ws:x")
-        self.assertTrue(km._union_ops_set([], [7007]))
+        ok, _, _ = km._union_ops_merge([], [7007], ckey="ws:x")
+        self.assertTrue(ok)
         self.assertNotIn(7007, km._union_claims)
 
     def test_the_payload_views_carry_the_unproved_marker(self):
@@ -2363,9 +2373,11 @@ class R56AuditFixes(unittest.TestCase):
         with mock.patch.object(km, "_read_state_json",
                                side_effect=km._StateUnreadable(5, "EIO")):
             with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
-                out = km._set_session_flag("99999999-8888-7777-6666-555555555555",
-                                           "hideFromFeed", True)
-        self.assertIs(out, False, "the toggle refuses over an unproved read")
+                with self.assertRaises(km._StateUnreadable):
+                    km._set_session_flag("99999999-8888-7777-6666-555555555555",
+                                         "hideFromFeed", True)
+        #  ^ the refusal RAISES the held-queue type (r56 wave 2: a swallowed False made the
+        #    SPOOL count the refused toggle as applied and delete the op)
         flags = km._session_flags_proved()
         self.assertIn(self.SID, flags, "…and the standing isolation row SURVIVES")
 

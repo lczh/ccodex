@@ -298,18 +298,35 @@ class TwoBusExchange(unittest.TestCase):
         self.assertIn("undeliverable to 'ghost'", back[0]["body"])
         self.assertEqual(back[0]["from"], "romp-postal", "bus-authored, clearly not a peer message")
 
-    def test_failed_bounce_write_keeps_the_parked_source_for_retry(self):
+    def test_failed_bounce_append_keeps_the_parked_source_for_retry(self):
+        # RE-ORDERED in r56 wave 2: the terminal row lands FIRST (note-then-append meant a
+        # failed append 503'd AFTER the note was delivered — the peer's re-send noted the
+        # sender twice). The retry-source invariant now keys on the APPEND: a failed append
+        # keeps the record; a failed NOTE after a landed append is bounded loss, loudly
+        # logged, with the receipt standing and the source retired.
+        pm._bounced_done.clear()
         pm.outbox_put("srv", {"mid": "bounce-retry", "to": "ghost", "frm": "alpha",
                                "frm_id": "sid-a", "body": "keep me", "kind": "", "t": 1})
+        saved_append = pm._tl_append
+        pm._tl_append = lambda name, row: False
+        try:
+            self.assertIs(pm._bounce_apply("srv", {"mid": "bounce-retry",
+                                                   "code": pm.PEER_REFUSAL_CODE}), False)
+        finally:
+            pm._tl_append = saved_append
+        self.assertIsNotNone(pm.outbox_get("srv", "bounce-retry"),
+                             "a failed terminal append keeps the retry record")
         saved = pm.deliver
         pm.deliver = lambda *a, **k: (_ for _ in ()).throw(OSError("synthetic maildir failure"))
         try:
-            with self.assertRaises(OSError):
-                pm._bounce_apply("srv", {"mid": "bounce-retry", "code": pm.PEER_REFUSAL_CODE})
+            self.assertIs(pm._bounce_apply("srv", {"mid": "bounce-retry",
+                                                   "code": pm.PEER_REFUSAL_CODE}), True)
         finally:
             pm.deliver = saved
-        self.assertIsNotNone(pm.outbox_get("srv", "bounce-retry"),
-                             "retry record is deleted only after the return note is written")
+        self.assertIsNone(pm.outbox_get("srv", "bounce-retry"),
+                          "…while a failed NOTE after the landed receipt retires the source "
+                          "(bounded loss, logged) — never a second exchange round that "
+                          "would re-note the sender")
 
     def test_return_mail_rides_the_response_and_acks_the_next_request(self):
         pmb.outbox_put("hosta", {"mid": "m4", "to": "alpha", "frm": "beta", "frm_id": "sid-b",

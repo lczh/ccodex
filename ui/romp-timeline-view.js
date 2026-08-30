@@ -3306,14 +3306,19 @@ class TimelinePanel {
     this._gatedDispatches = {};
     // gestures gated on acks that died with the socket re-gate on the REPLAY's ack (r53) —
     // as SEPARATE sub-gates (r54 wave 2): the replay's ack decides each gesture on its own
-    // claim. A COMPLETION gate replays WITH its rekey CAS on its own sync (r56 P1.2: the
-    // composite replay re-sent the rekey as a plain merge — no epoch check, and it retired
-    // another socket's legitimate claim); the kernel refuses a stale epoch and the yield
-    // path recovers through a fresh claim.
+    // claim. A COMPLETION gate UNWINDS instead (the r56 wave-2 verification, confirmed three
+    // ways): its CAS can NEVER pass post-reconnect — the claim died with the socket and the
+    // new socket is a different claimant — and the r56 P1.2 replay-with-CAS attempt was
+    // worse than useless: the refused replay plus the plain sibling sync's un-CAS'd
+    // retirement erased the gesture entirely (and could retire a gid another socket had
+    // legitimately claimed in the window). The unwind yields BOTH keys — rows dropped,
+    // ledgers forgotten (so no retirement is ever emitted), suppression until proof — and
+    // the next proven echo re-adopts whatever the journal actually holds (the original rows
+    // if the rekey never committed, the re-keyed ones if it committed unacked); a fresh
+    // claim then completes it.
     const plain = held.filter((g) => !g.rekey);
     for (const g of held.filter((x) => x.rekey)) {
-      const op2 = this._syncUnionOps([g], { rekey: g.rekey });
-      if (!op2) g.run();
+      this._yieldUnionGids([g.rekey.gid, g.rekey.ogid]);
     }
     const opId = this._syncUnionOps(plain.length ? plain : null);
     if (!opId) plain.forEach((g) => g.run());

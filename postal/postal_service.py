@@ -1678,7 +1678,7 @@ class Handler(BaseHTTPRequestHandler):
                                        "error": "the delivery record could not be written — "
                                                 "mail NOT relayed; retry"})
                 try:
-                    outbox_publish_stage(phost, mid, _stagef)
+                    _pub = outbox_publish_stage(phost, mid, _stagef)
                 except _PublishNeverStarted:
                     # DEFINITELY never published (r55 P1.7): the compensation is truthful
                     comp = {"t": int(time.time()), "ev": "unpublished", "id": mid}
@@ -1703,6 +1703,13 @@ class Handler(BaseHTTPRequestHandler):
                                        "error": "relay publication uncertain — the message "
                                                 "may have been sent; it will settle at the "
                                                 "next bus start (do not re-send)"})
+                if _pub == "uncertain":
+                    # r56 wave 2 (finding 11): the silent-uncertain arm told the sender ok
+                    # over mail that may never have entered the outbox — say so instead
+                    return self._send({"ok": False,
+                                       "error": "relay publication uncertain — it will "
+                                                "settle at the next bus start (do not "
+                                                "re-send; check /sent later)"})
                 if PEERS.get(phost, {}).get("up"):
                     return self._send({"ok": True, "id": mid,
                                        "note": "relaying to '%s' on %s%s" % (hit.get("name") or to, phost, tnote)})
@@ -2735,7 +2742,12 @@ def _peer_seen_add_locked(mid):
     seen.add(mid)
     _seen_order.append(mid)
     while len(_seen_order) > _SEEN_CAP:
-        seen.discard(_seen_order.pop(0))
+        _victim = next((x for x in _seen_order if x not in _seen_pending_durable), None)
+        if _victim is None:
+            break        # every candidate is awaiting its durable append (r56 wave 2:
+        #                  evicting one re-opened the double-delivery its drop-verdict holds)
+        _seen_order.remove(_victim)
+        seen.discard(_victim)
     try:
         PEER_SEEN.parent.mkdir(parents=True, exist_ok=True)
         with PEER_SEEN.open("a") as f:
@@ -2892,7 +2904,7 @@ def outbox_publish_stage(host, mid, stagef):
                 _peer_wake(host).set()
             except Exception:
                 pass
-            return
+            return "uncertain"
         if not _same:
             raise _PublishNeverStarted("a DIFFERENT message already holds mid %s" % mid)
     except OSError as e:
@@ -2900,16 +2912,41 @@ def outbox_publish_stage(host, mid, stagef):
             # a filesystem without hard links (the r52 verification). COPY-fsync-replace, not
             # a bare rename (the r56 audit's P1.7b, executed there: rename consumed the stage
             # BEFORE directory durability, and a later fsync failure left no recovery copy)
+            _tmpf = d / (".pub-%s.%d.tmp" % (mid, os.getpid()))
             try:
                 _pb = Path(stagef).read_bytes()
-                _tmpf = d / (".pub-%s.%d.tmp" % (mid, os.getpid()))
                 with _tmpf.open("wb") as _fh:
                     _fh.write(_pb)
                     _fh.flush()
                     os.fsync(_fh.fileno())
                 os.replace(_tmpf, d / (mid + ".json"))
             except OSError as e2:
-                raise _PublishNeverStarted(*(e2.args or ("publish failed",)))
+                try:
+                    _tmpf.unlink()                   # never leak the payload copy (r56 wave 2)
+                except OSError:
+                    pass
+                # the replace can take effect and STILL report failure — arbitrate against
+                # the final like the link arm (r56 wave 2: an EIO'd-but-effective replace was
+                # compensated `unpublished` over live mail)
+                try:
+                    os.stat(d / (mid + ".json"))
+                    _fstate = "present"
+                except FileNotFoundError:
+                    _fstate = "absent"
+                except OSError:
+                    _fstate = "unknown"
+                if _fstate == "absent":
+                    raise _PublishNeverStarted(*(e2.args or ("publish failed",)))
+                try:
+                    sys.stderr.write("postal: fallback publish for %s ended with the final "
+                                     "%s — uncertain; the stage stays\n" % (mid, _fstate))
+                except Exception:
+                    pass
+                try:
+                    _peer_wake(host).set()
+                except Exception:
+                    pass
+                return "uncertain"
         else:
             # the link REPORTED failure — but it may have created the final first (the r56
             # audit's P1.7a, executed there: a link that created and then EIO'd was filed
@@ -2934,7 +2971,7 @@ def outbox_publish_stage(host, mid, stagef):
                 _peer_wake(host).set()
             except Exception:
                 pass
-            return
+            return "uncertain"
     # ── PAST THIS POINT THE MESSAGE IS LIVE (the r54 audit's P1.5, executed: the directory
     # fsync raised AFTER the link and the stage unlink, the caller compensated `unpublished`,
     # and the relay still carried the message — the retry double-delivered). Publication is a
@@ -2958,7 +2995,7 @@ def outbox_publish_stage(host, mid, stagef):
             _peer_wake(host).set()
         except Exception:
             pass
-        return
+        return "uncertain"
     try:
         os.unlink(stagef)
     except FileNotFoundError:
@@ -2978,6 +3015,7 @@ def outbox_publish_stage(host, mid, stagef):
         _peer_wake(host).set()
     except Exception:
         pass
+    return "committed"
 
 def outbox_list(host, limit=None, byte_limit=None):
     if not _safe_id(host):
@@ -3114,8 +3152,14 @@ def _pending_bounces_load():
         return False
     if isinstance(d, dict):
         for k, v in d.items():
-            if isinstance(v, dict):
-                _pending_bounces[str(k)] = v
+            if not isinstance(v, dict):
+                continue
+            if not v.get("mid"):
+                # a pre-r56 ledger keyed rows by BARE mid with no mid field (the r56 wave-2
+                # verification, confirmed three ways: those parks flushed mid="" forever and
+                # never settled — the exchange had 200'd, so the peer would never re-send)
+                v = dict(v, mid=str(k).split("|")[-1])
+            _pending_bounces["%s|%s" % (v.get("host") or "", v["mid"])] = v
     _pending_bounces_loaded[0] = True
     return True
 
@@ -3636,8 +3680,6 @@ def _bounce_apply(host, b):
     why = _bounce_reason(code)
     note = ("undeliverable to '%s' on %s: %s\n\n(your message follows)\n%s"
             % (msg.get("to") or "?", host, why, msg.get("body") or ""))
-    if msg.get("frm_id"):
-        deliver(msg["frm_id"], "romp-postal", "", note, kind="coordinate")
     # The parked source is our retry record.  Retire it only after the return note was successfully
     # written; if delivery raises, the next exchange can retry the bounce instead of losing both.
     # the ROW before the delete (the r52 verification), and the delete only after the append
@@ -3646,11 +3688,22 @@ def _bounce_apply(host, b):
     if not _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "bounced", "id": mid,
                                          "to": msg.get("to") or "?", "host": host,
                                          "code": code, "why": why}):
+        # the terminal row lands FIRST (the r56 wave-2 verification: note-then-append meant
+        # a failed append 503'd AFTER the note was delivered, and the peer's re-send noted
+        # the sender twice) — nothing user-visible has happened yet, so the re-send is clean
         _log("bounce for %s/%s deferred: the terminal row could not be appended" % (host, mid))
         return False
-    _bounced_done.add(mid)
-    if len(_bounced_done) > 4096:
-        _bounced_done.clear()
+    _bounced_done[mid] = True
+    while len(_bounced_done) > 4096:
+        # evict oldest-first (r56 wave 2: a wholesale clear() re-opened the double-note
+        # window for every in-flight failed deletion at once)
+        _bounced_done.pop(next(iter(_bounced_done)))
+    if msg.get("frm_id"):
+        try:
+            deliver(msg["frm_id"], "romp-postal", "", note, kind="coordinate")
+        except Exception as e:
+            _log("bounce note for %s/%s could not deliver (%s) — the receipt stands" %
+                 (host, mid, e))
     if not outbox_del(host, mid):
         _log("bounce for %s/%s: the source could not be deleted — retrying without a "
              "second note (r56 P2.14)" % (host, mid))
@@ -3965,7 +4018,8 @@ def _relay_in(host, m, token_proven=False):
             return "hold", None
     return "bounce", {"mid": mid, "code": "recipient-unavailable"}
 
-_bounced_done = set()                  # mids whose terminal row landed this process (r56 P2.14)
+_bounced_done = {}                     # ordered mid -> True; terminal landed this process
+#                                        (r56 P2.14; dict = insertion-ordered bounded eviction)
 _drain_lock = threading.Lock()
 
 
@@ -4143,10 +4197,16 @@ def peer_exchange_handle(data):
     for ra in _peer_read_ack_rows(data.get("readAcks")):  # the dialer confirmed response-carried receipts
         readbox_del(host, ra)
     for r in _peer_read_rows(data.get("reads")):     # read receipts flowing back — ours or one hop onward
-        _read_arrived(host, r)
+        if _read_arrived(host, r) is False:
+            # r56 wave 2 (confirmed twice): the request-carried leg acked non-durable
+            # applications through the 200 — the dialer then deleted the only durable copy.
+            # Fail the exchange; the re-sent rows are idempotent (exec rows key by id, the
+            # handoff ledger dedupes, forward-parks overwrite their own file).
+            raise _ExchangeNotDurable("read receipt %s not durably applied" % r.get("mid"))
     for hd in _receipt_rows(data.get("handoffDone")):     # completion receipts: the request-carried
-        _handoff_done_arrived(host, hd)                   # ones need no explicit ack (a response
-    #                                                       means the whole request was processed)
+        if _handoff_done_arrived(host, hd) is False:      # ones ack via the 200 itself, so a
+            raise _ExchangeNotDurable(                    # non-durable apply must FAIL it (r56)
+                "handoff receipt %s not durably applied" % hd.get("mid"))
     for ha in _receipt_rows(data.get("handoffDoneAcks")):  # the dialer confirmed response-carried ones
         receiptbox_del(host, ha["mid"])
     acks, bounces = [], []

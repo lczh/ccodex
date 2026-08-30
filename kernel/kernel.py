@@ -1592,7 +1592,13 @@ def _merge_session_order(incoming):
     with jd._identity_file_lock():
         incoming = jd.canonicalize_session_identity(
             [x for x in incoming if isinstance(x, str)])
-        existing = _session_order()
+        _eraw = _read_state_json(jd.STATE / "session-order.json", "session-order")
+        # the r56 wave-2 verification (P2.12's DRAG half, confirmed twice): the lenient read
+        # folded an EIO to [] and the merge persisted ONLY the dragged sids — every
+        # timeline-only lane's slot erased on the path a live user gesture fires. The proved
+        # read raises through; the WS handler drops the drag loudly and the user re-drags.
+        existing = jd.canonicalize_session_identity(
+            [x for x in _eraw if isinstance(x, str)] if isinstance(_eraw, list) else [])
         inset = set(incoming)
         queue = list(incoming)
         merged = []
@@ -1906,7 +1912,8 @@ def _timeline_views_proved():
     if raw is not None and raw is not _QUARANTINED and not isinstance(raw, dict):
         # VALID bytes, WRONG shape (r55 P2.9: a stored null/[] read as proved-empty and the
         # next edit overwrote it under a success ack) — malformed content, same treatment
-        _quarantine_state_bytes(_views_path(), "timeline-views")
+        _quarantine_wrong_shape(_views_path(), "timeline-views",
+                                lambda v: isinstance(v, dict))       # fp-guarded (r56)
         raw = _QUARANTINED
     d, _ = _migrate_hidden_blob(raw if isinstance(raw, dict) else {})
     v = _norm_timeline_views(d)
@@ -1980,7 +1987,8 @@ def _set_timeline_views(blob, base_rev=None):
         try:
             cur = _read_state_json(_views_path(), "timeline-views")
             if cur is not None and cur is not _QUARANTINED and not isinstance(cur, dict):
-                _quarantine_state_bytes(_views_path(), "timeline-views")   # r55 wave 2: the
+                _quarantine_wrong_shape(_views_path(), "timeline-views",
+                                    lambda v: isinstance(v, dict))   # r55 wave 2 + r56 fp: the
                 cur = _QUARANTINED       # writer overwrote []-shaped bytes un-quarantined
             cur = cur if isinstance(cur, dict) else {}   # the sentinel is truthy (r55 P2.10)
         except OSError:
@@ -2331,6 +2339,27 @@ def _quarantine_state_bytes(path, what, fingerprint=None):
     raise _StateUnreadable(*((_qerr.args if _qerr else ()) or ("quarantine failed",)))
 
 
+def _quarantine_wrong_shape(path, what, is_expected):
+    """Re-judge and quarantine a WRONG-SHAPE store under a fresh fingerprint (the r56 wave-2
+    verification: the shape arms called the quarantine with NO fingerprint, so the P1.4
+    TOCTOU stayed open there — a concurrent locked writer's valid commit could be unlinked
+    by a stale judgment). Re-stat, re-read, re-parse: quarantine only if the CURRENT bytes
+    are still wrong-shaped."""
+    try:
+        st = path.stat()
+        fp = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+        cur = json.loads(path.read_text())
+    except FileNotFoundError:
+        return
+    except OSError:
+        return                                       # no proof — judge nothing this pass
+    except ValueError:
+        cur = None                                   # malformed counts as wrong-shape here
+    if is_expected(cur):
+        return                                       # a concurrent writer fixed it — keep it
+    _quarantine_state_bytes(path, what, fingerprint=fp)
+
+
 def _read_state_json(path, what):
     """A PROVED read of a JSON state file (the v1.3.24 audit's P1.1/P1.2): only
     FileNotFoundError means empty (returns None). An UNREADABLE file (EIO, EACCES) RAISES —
@@ -2397,9 +2426,10 @@ def _union_ops_echo():
         return []                                    # honestly missing (proved by ENOENT)
     if not isinstance(rows, list):
         # VALID bytes, WRONG shape (r55 P2.10): a fabrication, not a retirement — quarantine
-        # and say "no information" until a writer re-mints the store
+        # (fingerprint-guarded, r56 wave 2) and say "no information" until a writer re-mints
         try:
-            _quarantine_state_bytes(_union_ops_path(), "union-gestures")
+            _quarantine_wrong_shape(_union_ops_path(), "union-gestures",
+                                    lambda v: isinstance(v, list))
         except OSError:
             pass
         return None
@@ -2472,7 +2502,8 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                              "unproved read\n")
             return False, [], "the journal is unreadable"
         if _raw is not None and _raw is not _QUARANTINED and not isinstance(_raw, list):
-            _quarantine_state_bytes(_union_ops_path(), "union-gestures")   # r55 P2.10
+            _quarantine_wrong_shape(_union_ops_path(), "union-gestures",
+                                    lambda v: isinstance(v, list))   # r55 P2.10 + r56 fp
         cur = [r for r in _raw if isinstance(r, dict)] if isinstance(_raw, list) else []
         _cur_bad = [r for r in cur if not _union_row_valid(r)]
         if _cur_bad:
@@ -2517,6 +2548,21 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                 ret.add(int(g))
             except (TypeError, ValueError):
                 pass
+        if ret:
+            with _union_claims_lock:
+                _held_elsewhere = {g for g in ret
+                                   if _union_claims.get(g)
+                                   and _union_claims[g].get("ckey") != ckey}
+            if _held_elsewhere:
+                # a retirement over ANOTHER client's live claim is the r56 wave-2 steal: a
+                # stale panel's diff-derived retired list erased a gesture mid-completion,
+                # and the claimant's CAS then failed "settled while the claim was held".
+                # Skip those gids — the claimant's own commit (or its socket close) settles
+                # them; the skipping panel's ledger re-sends the retirement later and it
+                # lands once the claim is gone.
+                sys.stderr.write("union-gestures: skipping retirement of %d gid(s) held by "
+                                 "another client's live claim\n" % len(_held_elsewhere))
+                ret -= _held_elsewhere
         inc_keys = {(r.get("gid"), r.get("host")) for r in inc}
         _cutoff = time.time() - 7 * 86400
         rows = [r for r in cur if (r.get("gid"), r.get("host")) not in inc_keys
@@ -2771,7 +2817,8 @@ def _apply_ref_migration(host, name, new, deleted, fresh=True):
             # outcome, disguised as success)
             return False
         if raw is not None and raw is not _QUARANTINED and not isinstance(raw, dict):
-            _quarantine_state_bytes(_views_path(), "timeline-views")   # r55 wave 2
+            _quarantine_wrong_shape(_views_path(), "timeline-views",
+                                    lambda v: isinstance(v, dict))   # r55 wave 2 + r56 fp
             raw = _QUARANTINED
         raw = raw if isinstance(raw, dict) else {}   # missing/quarantined → {}
         try:
@@ -3049,7 +3096,8 @@ def _apply_views_ops(ops):
         # handler acks ok:false, the POST route answers 500, the spool keeps the op file.
         raw = _read_state_json(_views_path(), "timeline-views")
         if raw is not None and raw is not _QUARANTINED and not isinstance(raw, dict):
-            _quarantine_state_bytes(_views_path(), "timeline-views")   # r55 wave 2
+            _quarantine_wrong_shape(_views_path(), "timeline-views",
+                                    lambda v: isinstance(v, dict))   # r55 wave 2 + r56 fp
             raw = _QUARANTINED
         raw = raw if isinstance(raw, dict) else {}       # the sentinel is truthy (r55 P2.10)
         try:
@@ -3529,7 +3577,7 @@ def _session_flags_proved():
     p = jd.STATE / "session-flags.json"
     raw = _read_state_json(p, "session-flags")
     if raw is not None and raw is not _QUARANTINED and not isinstance(raw, dict):
-        _quarantine_state_bytes(p, "session-flags")
+        _quarantine_wrong_shape(p, "session-flags", lambda v: isinstance(v, dict))
         raw = _QUARANTINED
     return jd.canonicalize_session_flags_identity(raw if isinstance(raw, dict) else {})
 
@@ -3537,12 +3585,11 @@ def _session_flags_proved():
 def _set_session_flag(sid, flag, value):
     with jd._identity_file_lock():
         sid = jd.canonicalize_session_identity(sid)
-        try:
-            cur = dict(_session_flags_proved())      # commit-time PROVED snapshot (r56 P1.6)
-        except OSError:
-            sys.stderr.write("session-flags: unreadable — refusing the toggle rather than "
-                             "erasing the standing isolation/mute rows\n")
-            return False
+        # the proved snapshot RAISES through on a store fault (the r56 wave-2 verification:
+        # the swallowed-to-False arm made the SPOOL count a refused toggle as applied and
+        # delete the op — the user's isolation click vanished); _StateUnreadable is the
+        # spool's held-queue type, and the WS/HTTP handlers answer honestly (r56 P2.8)
+        cur = dict(_session_flags_proved())          # commit-time PROVED snapshot (r56 P1.6)
         f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
         if value:
             f[flag] = True
@@ -3692,7 +3739,9 @@ def _set_notify_session(sid, value):
     the master is on)."""
     with jd._identity_file_lock():
         sid = jd.canonicalize_session_identity(sid)
-        cur = jd.canonicalize_session_flags_identity(dict(_session_flags()))
+        cur = dict(_session_flags_proved())          # PROVED (r56 wave 2: this sibling still
+        #   snapshotted the lenient {} under an EIO, and one bell click erased every
+        #   standing isolation and mute row — P1.6's exact erase through the other door)
         f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
         if bool(value) == _notify_all_on():
             f.pop("notify", None)
@@ -33568,10 +33617,17 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, json.dumps({"ok": False, "error":
                         'no live session named "%s" (a dormant one goes by sid)' % target}),
                                       "application/json")
-                if flag == "notify":
-                    _set_notify_session(tsid, b["value"])    # tri-state override: its own setter
-                else:
-                    _set_session_flag(tsid, flag, b["value"])
+                try:
+                    if flag == "notify":
+                        _set_notify_session(tsid, b["value"])   # tri-state override: its own setter
+                    else:
+                        _set_session_flag(tsid, flag, b["value"])
+                except _StateUnreadable:
+                    # r56 P2.8: this used to ack ok:true after the toggle was refused — the
+                    # panel painted an isolation the store never held
+                    return self._send(503, json.dumps({"ok": False, "retryable": True,
+                        "error": "the flags store is unreadable — nothing changed; retry"}),
+                                      "application/json")
                 _mark_views_dirty()
                 return self._send(200, json.dumps({"ok": True, "id": tsid, "flag": flag,
                                                    "value": b["value"]}), "application/json")
@@ -34246,9 +34302,17 @@ class Handler(BaseHTTPRequestHandler):
                 client["send"](json.dumps({"type": "warn",
                                            "text": "value must be a JSON boolean (true/false)."}))
             elif str(msg["flag"]) == "notify":
-                _set_notify_session(str(msg["id"]), msg["value"])
+                try:
+                    _set_notify_session(str(msg["id"]), msg["value"])
+                except _StateUnreadable:
+                    client["send"](json.dumps({"type": "warn",
+                        "text": "the flags store is unreadable — nothing changed; retry."}))
             else:
-                _set_session_flag(str(msg["id"]), str(msg["flag"]), msg["value"])
+                try:
+                    _set_session_flag(str(msg["id"]), str(msg["flag"]), msg["value"])
+                except _StateUnreadable:
+                    client["send"](json.dumps({"type": "warn",
+                        "text": "the flags store is unreadable — nothing changed; retry."}))
             _mark_views_dirty()
         elif msg and msg.get("type") == "setTimelineViews" and isinstance(msg.get("views"), dict):
             # timeline corner panel → replace the whole views blob. Every client edits a CLONE of

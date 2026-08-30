@@ -1837,11 +1837,17 @@ test("executed: the reconnect replay carries the completion's CAS — never a pl
   const sent = wire[wire.length - 1];
   assert.ok(sent.rekey && sent.rekey.ogid === gid && sent.rekey.epoch === 9,
     "the rekey write carries the CAS");
-  panel2.unionTransportReset();                       // the socket died pre-ack; the REPLAY
-  const replayed = wire.filter((w: any) => w.rekey && w.rekey.ogid === gid);
-  assert.ok(replayed.length >= 2,
-    "…and the replay re-sends it WITH the CAS (the r56 audit's P1.2, executed there: the "
-    + "metadata-free plain merge retired another socket's legitimate claim)");
+  const wireBefore = wire.length;
+  panel2.unionTransportReset();                       // the socket died pre-ack: UNWIND
+  const after = wire.slice(wireBefore);
+  assert.ok(after.every((w: any) => !w.rekey),
+    "a completion gate NEVER replays (r56 wave 2: its CAS cannot pass — the claim died with "
+    + "the socket — and the refused replay plus the plain sync's un-CAS'd retirement erased "
+    + "the gesture entirely)");
+  assert.ok(after.every((w: any) => (w.retired || []).indexOf(gid) < 0),
+    "…and NO retirement of the original ever rides the reset — the journal rows survive");
+  assert.ok(panel2._yieldedGids && panel2._yieldedGids.has(gid),
+    "…the unwind suppresses both keys; re-adoption + a fresh claim recover the gesture");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
   delete g.__rompTimelineClaimUnion;
 });
