@@ -455,6 +455,9 @@ def handoff_done_apply(data):
                 o = json.loads(line)
             except Exception:
                 continue
+            if not isinstance(o, dict):
+                continue                 # a [] row crashed the scanner and the exchange
+                #                          never answered (r55 P2.16)
             if o.get("id") != mid:
                 continue
             if o.get("ev") == "unpublished":
@@ -476,8 +479,16 @@ def handoff_done_apply(data):
         _HDA_MISS[mid] = _logkey
         return {"ok": False, "unknown": True, "retry": True}, 404
     _HDA_MISS.pop(mid, None)
-    relay_mid = str(row.get("relay_mid") or "")
-    relay_via = str(row.get("relay_via") or "")
+    _rm, _rv = row.get("relay_mid"), row.get("relay_via")
+    if ((_rm is not None and not isinstance(_rm, str))
+            or (_rv is not None and not isinstance(_rv, str))):
+        # wrong-SHAPED provenance (the r55 audit's P2.16, executed there: a historic row
+        # with relay_mid:[] answered {ok,local} — the delivery was marked done with ZERO
+        # completion receipts). "Local" is a VERDICT; corrupt evidence falls to the
+        # retryable arm instead, and a later intact source (the maildir headers) decides.
+        return {"ok": False, "unknown": True, "retry": True}, 404
+    relay_mid = str(_rm or "")
+    relay_via = str(_rv or "")
     if not (relay_mid and relay_via and _safe_id(relay_mid) and _safe_id(relay_via)):
         _receipts_done_add(mid)                # a LOCAL delivery: the origin back-link owns
         return {"ok": True, "local": True}, 200   # it — nothing to relay
@@ -1640,7 +1651,8 @@ class Handler(BaseHTTPRequestHandler):
                                                 "mail NOT relayed; retry"})
                 try:
                     outbox_publish_stage(phost, mid, _stagef)
-                except Exception:
+                except _PublishNeverStarted:
+                    # DEFINITELY never published (r55 P1.7): the compensation is truthful
                     comp = {"t": int(time.time()), "ev": "unpublished", "id": mid}
                     if not _tl_append("messages.jsonl", comp) and not _tl_append("messages.jsonl", comp):
                         sys.stderr.write("postal: relay publish of %s FAILED and its "
@@ -1652,6 +1664,17 @@ class Handler(BaseHTTPRequestHandler):
                         except OSError:
                             pass
                     return self._send({"ok": False, "error": "relay publication failed — retry"})
+                except Exception:
+                    # UNCERTAIN (r55 P1.7, executed there: an unguarded post-link raise let
+                    # the caller file `unpublished` over LIVE mail and the prompted retry
+                    # double-delivered). The stage stays; boot arbitration settles it; no
+                    # compensation, and no retry prompt that would mint a second message.
+                    sys.stderr.write("postal: relay publish of %s ended UNCERTAIN — the "
+                                     "stage stays for boot arbitration\n" % mid)
+                    return self._send({"ok": False,
+                                       "error": "relay publication uncertain — the message "
+                                                "may have been sent; it will settle at the "
+                                                "next bus start (do not re-send)"})
                 if PEERS.get(phost, {}).get("up"):
                     return self._send({"ok": True, "id": mid,
                                        "note": "relaying to '%s' on %s%s" % (hit.get("name") or to, phost, tnote)})
@@ -2001,6 +2024,8 @@ def serve():
     except Exception:
         pass
     try:
+        _pending_bounces_load()        # parked bounces survive the restart (r55 P2.15)
+        _drain_postal_retries()
         _reconcile_phantom_sent()      # after the bind (only the bus that owns the port), before
         _reconcile_relay_stages()      # …and the staged relay transactions a crash left open (r50)
     except Exception as e:             # serving: no request sees a phantom this boot can retire
@@ -2655,13 +2680,23 @@ def _peer_seen_add_locked(mid):
 
 
 def _fsync_dir(path):
-    """Best-effort directory sync after replace; unsupported directory fsync must not break portability."""
+    """Directory sync after a rename/link. Only EXPLICITLY-UNSUPPORTED directory fsync is
+    ignored (portability); a REAL failure — EIO — propagates (the r55 audit's P1.8, executed
+    there with a genuine os.fsync injection: two swallowed EIOs let publication report
+    success and delete the recovery stage, so a hard shutdown that dropped the unpersisted
+    directory entry would have left NO copy at all)."""
     fd = None
     try:
         fd = os.open(str(path), os.O_RDONLY)
         os.fsync(fd)
-    except OSError:
-        pass
+    except OSError as e:
+        if getattr(e, "errno", None) in (errno.EINVAL, errno.ENOTSUP,
+                                         getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+                                         errno.ENOSYS):
+            pass                                     # this filesystem cannot sync directories
+        else:
+            _log("directory fsync FAILED for %s: %s" % (path, e))
+            raise
     finally:
         if fd is not None:
             os.close(fd)
@@ -2749,7 +2784,7 @@ def outbox_publish_stage(host, mid, stagef):
     fsync here makes the rename itself durable. Raises on failure — the caller compensates."""
     if not (_safe_id(host) and _safe_id(mid)):       # path components — block traversal
         _log("outbox_publish_stage: refusing unsafe host/mid %r/%r" % (host, mid))
-        raise ValueError("unsafe host/mid")
+        raise _PublishNeverStarted("unsafe host/mid")
     d = OUTBOX / host
     # LINK-then-unlink, not rename (the v1.3.24 audit's P3.10): rename silently REPLACES a
     # same-mid file — a collision overwrote an existing message. link fails EEXIST, so a
@@ -2765,20 +2800,34 @@ def outbox_publish_stage(host, mid, stagef):
         # link and unlink — that IS publication, and re-raising filed a false `unpublished`
         # terminal over live mail (the sender's retry double-delivered). DIFFERENT bytes are
         # a true collision: loud, and the standing mail survives (r52; 128-bit mids make
-        # this unreachable in practice).
+        # this unreachable in practice). An UNREADABLE standing file is UNCERTAIN (the r55
+        # audit's P1.7): mail is live either way — keep the stage for boot arbitration and
+        # never surface a failure the caller would compensate as unpublished.
         try:
             _same = (d / (mid + ".json")).read_bytes() == Path(stagef).read_bytes()
         except OSError:
-            _same = False
+            try:
+                sys.stderr.write("postal: same-mid file for %s is unreadable — publication "
+                                 "uncertain; the stage stays for boot arbitration\n" % mid)
+            except Exception:
+                pass
+            try:
+                _peer_wake(host).set()
+            except Exception:
+                pass
+            return
         if not _same:
-            raise
+            raise _PublishNeverStarted("a DIFFERENT message already holds mid %s" % mid)
     except OSError as e:
         if e.errno in (errno.EPERM, errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)):
             # a filesystem without hard links (the r52 verification): rename still publishes
             # there — its silent-replace window is carried by the 128-bit mid
-            os.rename(stagef, d / (mid + ".json"))
+            try:
+                os.rename(stagef, d / (mid + ".json"))
+            except OSError as e2:
+                raise _PublishNeverStarted(*(e2.args or ("publish failed",)))
         else:
-            raise
+            raise _PublishNeverStarted(*(e.args or ("publish failed",)))
     # ── PAST THIS POINT THE MESSAGE IS LIVE (the r54 audit's P1.5, executed: the directory
     # fsync raised AFTER the link and the stage unlink, the caller compensated `unpublished`,
     # and the relay still carried the message — the retry double-delivered). Publication is a
@@ -2789,23 +2838,39 @@ def outbox_publish_stage(host, mid, stagef):
     try:
         _fsync_dir(d)
     except Exception:
-        sys.stderr.write("postal: could not fsync the outbox dir for %s — the publication "
-                         "stands; the stage survives for boot arbitration\n" % mid)
-        _peer_wake(host).set()
+        # the publication is NOT yet durable: keep the stage (the recovery copy) — with
+        # _fsync_dir propagating real EIO now (r55 P1.8), a hard shutdown that loses the
+        # directory entry still has the staged bytes; boot arbitration settles either way
+        try:
+            sys.stderr.write("postal: could not fsync the outbox dir for %s — the "
+                             "publication stands; the stage survives for boot "
+                             "arbitration\n" % mid)
+        except Exception:
+            pass
+        try:
+            _peer_wake(host).set()
+        except Exception:
+            pass
         return
     try:
         os.unlink(stagef)
     except FileNotFoundError:
         pass                                         # the rename arm consumed it
     except OSError:
-        sys.stderr.write("postal: could not remove the published stage for %s — boot "
-                         "cleans it\n" % mid)
+        try:
+            sys.stderr.write("postal: could not remove the published stage for %s — boot "
+                             "cleans it\n" % mid)
+        except Exception:
+            pass
     else:
         try:
             _fsync_dir(d)
         except Exception:
             pass
-    _peer_wake(host).set()
+    try:
+        _peer_wake(host).set()
+    except Exception:
+        pass
 
 def outbox_list(host, limit=None, byte_limit=None):
     if not _safe_id(host):
@@ -2839,6 +2904,12 @@ def outbox_list(host, limit=None, byte_limit=None):
                 continue
             try:
                 row = json.loads(raw)
+                if not _outbox_row_ok(row, f.stem):
+                    # parsed-valid garbage (r55 P2.13): it can never relay — 32 such rows
+                    # exhausted the byte budget and starved a REAL parked message forever
+                    _quarantine_corrupt_json(f, "outbox", ValueError("schema-invalid"),
+                                             fingerprint)
+                    continue
                 size = len(json.dumps(row).encode("utf-8"))
                 if byte_limit is not None and used + size > byte_limit:
                     if not out:
@@ -2854,6 +2925,13 @@ def outbox_list(host, limit=None, byte_limit=None):
     except Exception:
         return []
 
+class _PublishNeverStarted(OSError):
+    """Typed pre-publication failure (the r55 audit's P1.7): ONLY this may reach the
+    caller's `unpublished` compensation. Any failure past the point publication may have
+    happened means the message can be LIVE — compensating live mail as unpublished had the
+    sender's retry double-delivering. IS-An OSError so legacy handlers still catch it."""
+
+
 class _OutboxUnreadable(Exception):
     """The record EXISTS but cannot be read (EIO) — the r53 audit's P2.10: conflating it with
     'missing' let the ack path delete the only retry source over an unproved read."""
@@ -2866,20 +2944,124 @@ class _OutboxMalformed(Exception):
     whole), so terminal rows may file; unreadable is not, so those paths defer instead."""
 
 
+# ── queued terminal rows (the r55 audit's P2.14): a terminal receipt whose append failed
+# used to rely on "the file is kept" — hollow, because the SAME exchange's outbox scanner
+# quarantined the malformed record before returning 200, so the peer never re-sent and no
+# terminal ever landed. The row itself is the retry intent now, flushed on every ack/bounce
+# arrival; memory-only (bounded, loud) — a process death leaves the bytes in corrupt/.
+_pending_terminal_rows = []
+_pending_terminal_lock = threading.Lock()
+
+
+def _queue_terminal_row(row, why):
+    with _pending_terminal_lock:
+        if len(_pending_terminal_rows) < 4096 and row not in _pending_terminal_rows:
+            _pending_terminal_rows.append(row)
+    _log(why)
+
+
+def _flush_terminal_rows():
+    with _pending_terminal_lock:
+        rows = list(_pending_terminal_rows)
+    for row in rows:
+        if _tl_append("messages.jsonl", row):
+            with _pending_terminal_lock:
+                try:
+                    _pending_terminal_rows.remove(row)
+                except ValueError:
+                    pass
+        else:
+            break                                    # still failing: keep order, retry later
+
+
+# ── parked bounces (the r55 audit's P2.15): a TRANSIENTLY-unreadable record must not enter
+# terminal handling — the executed repro deleted recoverable mail and lost its return note
+# over one EIO. The bounce EVENT parks durably instead (the exchange 200s it, so the peer
+# never re-sends) and retries against the record until the read proves one way or the other.
+_pending_bounces = {}
+_pending_bounces_lock = threading.Lock()
+
+
+def _pending_bounces_path():
+    return TLDIR / "pending-bounces.json"
+
+
+def _pending_bounces_load():
+    try:
+        d = json.loads(_pending_bounces_path().read_text())
+    except Exception:
+        return
+    if isinstance(d, dict):
+        with _pending_bounces_lock:
+            for k, v in d.items():
+                if _safe_id(str(k)) and isinstance(v, dict):
+                    _pending_bounces[str(k)] = v
+
+
+def _pending_bounce_park(host, mid, code):
+    with _pending_bounces_lock:
+        _pending_bounces[mid] = {"host": str(host), "code": str(code), "t": int(time.time())}
+        snap = dict(_pending_bounces)
+    try:
+        _atomic_json_put(_pending_bounces_path(), snap)
+    except Exception:
+        _log("pending-bounce for %s could not persist — retrying in-memory" % mid)
+
+
+def _pending_bounce_clear(mid):
+    with _pending_bounces_lock:
+        _pending_bounces.pop(mid, None)
+        snap = dict(_pending_bounces)
+    try:
+        if snap:
+            _atomic_json_put(_pending_bounces_path(), snap)
+        else:
+            _pending_bounces_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _flush_pending_bounces():
+    with _pending_bounces_lock:
+        items = list(_pending_bounces.items())
+    for mid, v in items:
+        if _bounce_apply(str(v.get("host") or ""), {"mid": mid,
+                                                    "code": str(v.get("code") or "")}):
+            _pending_bounce_clear(mid)
+
+
+def _outbox_row_ok(row, mid):
+    """SCHEMA, not just syntax (the r55 audit's P2.13): a relayable record is a dict whose
+    mid matches its filename and whose routing/body fields are strings when present — 32
+    parsed-valid [] rows exhausted one exchange's relay byte budget and hid a real message
+    indefinitely, and an ack for one deleted it as if it were delivered mail."""
+    if not isinstance(row, dict):
+        return False
+    if str(row.get("mid") or "") != mid:
+        return False
+    for k in ("to", "to_id", "frm", "frm_id", "body", "origin", "kind"):
+        if k in row and row[k] is not None and not isinstance(row[k], str):
+            return False
+    return True
+
+
 def outbox_get(host, mid):
     """None = missing (proved by ENOENT); raises _OutboxUnreadable on a transient read fault
-    and _OutboxMalformed on parsed garbage — four states, never conflated (r53 P2.10 + r54
-    P2.9)."""
+    and _OutboxMalformed on parsed garbage OR a schema-invalid row — four states, never
+    conflated (r53 P2.10 + r54 P2.9 + r55 P2.13)."""
     if not (_safe_id(host) and _safe_id(mid)):   # host/mid are path components — block traversal
         return None
     try:
-        return json.loads((OUTBOX / host / (mid + ".json")).read_text())
+        row = json.loads((OUTBOX / host / (mid + ".json")).read_text())
     except FileNotFoundError:
         return None
     except OSError as e:
         raise _OutboxUnreadable(*(e.args or ("unreadable",)))
     except ValueError:
         raise _OutboxMalformed("malformed outbox record %s/%s" % (host, mid))
+    if not _outbox_row_ok(row, mid):
+        raise _OutboxMalformed("schema-invalid outbox record %s/%s" % (host, mid))
+    return row
 
 def outbox_del(host, mid):
     if not (_safe_id(host) and _safe_id(mid)):   # host/mid are path components — block traversal
@@ -2934,15 +3116,29 @@ def receiptbox_list(host, limit=None):
         for f in sorted((RECEIPTBOX / host).glob("*.json")):
             if limit is not None and len(out) >= limit:
                 break
+            fingerprint = None
             try:
-                row = json.loads(f.read_text())
+                st = f.stat()
+                fingerprint = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+                raw = f.read_bytes().decode("utf-8")
+            except OSError:
+                # a TRANSIENT fault is not corruption (the r55 audit's P2.17, executed:
+                # one injected EIO moved a VALID receipt into corrupt/ and its completion
+                # was lost) — keep it this pass
+                _log("receiptbox: %s unreadable this pass — kept" % f.name)
+                continue
+            except UnicodeDecodeError as e:
+                _quarantine_corrupt_json(f, "receiptbox", e, fingerprint)
+                continue
+            try:
+                row = json.loads(raw)
                 if isinstance(row, dict) and _safe_id(row.get("mid") or ""):
                     keep = {"mid": row["mid"]}
                     if _safe_id(str(row.get("origin") or "")):
                         keep["origin"] = str(row["origin"])
                     out.append(keep)
             except Exception as e:
-                _quarantine_corrupt_json(f, "receiptbox", e, None)
+                _quarantine_corrupt_json(f, "receiptbox", e, fingerprint)
         return out
     except Exception:
         return []
@@ -3047,7 +3243,16 @@ def readbox_list(host, limit=None, byte_limit=None):
             try:
                 st = f.stat()
                 fingerprint = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
-                row = json.loads(f.read_text())
+                raw = f.read_bytes().decode("utf-8")
+            except OSError:
+                _log("readbox: %s unreadable this pass — kept (transient faults never "
+                     "quarantine, r55 P2.17)" % f.name)
+                continue
+            except UnicodeDecodeError as e:
+                _quarantine_corrupt_json(f, "readbox", e, fingerprint)
+                continue
+            try:
+                row = json.loads(raw)
                 size = len(json.dumps(row).encode("utf-8"))
                 if byte_limit is not None and used + size > byte_limit:
                     if not out:
@@ -3221,26 +3426,34 @@ def _bounce_apply(host, b):
     mid = rows[0]["mid"]
     try:
         msg = outbox_get(host, mid)
-    except (_OutboxUnreadable, _OutboxMalformed):
-        # the record exists but cannot be read or parsed. "Defer" here would be a DROP (the r53 wave-3
-        # verification): the exchange 200s this bounce regardless, so the peer marks it
-        # delivered and never re-sends — and outbox_list quarantines the unreadable record
-        # in the SAME pass, so no later retry can read it either. File the terminal receipt
-        # NOW (the parked accounting must not claim mail the peer refused) and say out loud
-        # that the return note could not be composed — the sender's copy is unreadable.
+    except _OutboxUnreadable:
+        # a TRANSIENT read fault (the r55 audit's P2.15, executed there: this arm shared the
+        # destructive malformed handling and one EIO deleted recoverable mail with its
+        # return note). The bounce EVENT parks durably instead — the exchange 200s it, so
+        # the peer never re-sends — and retries against the record until the read PROVES
+        # readable (full path), malformed (terminal below), or missing (moot).
+        _pending_bounce_park(host, mid, rows[0]["code"])
+        _log("bounce for %s/%s parked: the record is unreadable this pass — retrying "
+             "until the read proves" % (host, mid))
+        return False
+    except _OutboxMalformed:
+        # PARSED garbage is definite: file the terminal receipt (the parked accounting must
+        # not claim mail the peer refused) and say out loud that the return note could not
+        # be composed. A FAILED append queues the row itself (r55 P2.14: "the file is kept"
+        # was hollow — the same exchange's scanner quarantined it before returning 200).
         code = rows[0]["code"]
-        if _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "bounced", "id": mid,
-                                         "to": "?", "host": host, "code": code,
-                                         "why": _bounce_reason(code)}):
+        _row = {"t": int(time.time()), "ev": "bounced", "id": mid,
+                "to": "?", "host": host, "code": code, "why": _bounce_reason(code)}
+        if _tl_append("messages.jsonl", _row):
             outbox_del(host, mid)
-            _log("bounce for %s/%s: record unreadable — receipt filed; the return note to "
+            _log("bounce for %s/%s: record malformed — receipt filed; the return note to "
                  "the sender was lost with it" % (host, mid))
         else:
-            _log("bounce for %s/%s: record unreadable AND the receipt append failed — "
-                 "kept for the next exchange" % (host, mid))
-        return
+            _queue_terminal_row(_row, "bounce for %s/%s: record malformed AND the receipt "
+                                      "append failed — the row itself is queued" % (host, mid))
+        return True
     if not msg:
-        return
+        return True
     code = rows[0]["code"]
     why = _bounce_reason(code)
     note = ("undeliverable to '%s' on %s: %s\n\n(your message follows)\n%s"
@@ -3256,8 +3469,9 @@ def _bounce_apply(host, b):
                                          "to": msg.get("to") or "?", "host": host,
                                          "code": code, "why": why}):
         _log("bounce for %s/%s deferred: the terminal row could not be appended" % (host, mid))
-        return
+        return False
     outbox_del(host, mid)
+    return True
 
 def fleet_presence(exclude_host):
     """Presence for an exchange payload: local agents + ONE hop of gossip from our other peers, each
@@ -3555,11 +3769,25 @@ def _relay_in(host, m, token_proven=False):
             return "hold", None
     return "bounce", {"mid": mid, "code": "recipient-unavailable"}
 
+def _drain_postal_retries():
+    """The retry pumps (r55 P2.14/P2.15), event-paced: every ack/bounce arrival and every
+    bus start drains queued terminal rows and parked bounces before new work."""
+    try:
+        _flush_terminal_rows()
+    except Exception:
+        pass
+    try:
+        _flush_pending_bounces()
+    except Exception:
+        pass
+
+
 def _ack_arrived(host, mid):
     """An end-to-end ack for outbox/<host>/<mid>: clear it. If we only FORWARDED it, relay the ack
     backward to the origin host; if it was ours, log the delivered receipt."""
     if not isinstance(mid, str) or not _safe_id(mid):
         return
+    _drain_postal_retries()
     try:
         msg = outbox_get(host, mid)
     except _OutboxUnreadable:
@@ -3570,13 +3798,16 @@ def _ack_arrived(host, mid):
     except _OutboxMalformed:
         # PARSED garbage is definite (r54 P2.9): the ack proves delivery, and the old
         # missing-alike arm deleted the record with no terminal row — the receipt vanished.
-        # File the receipt first; retire the garbage only after it proved.
-        if _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "relayed",
-                                         "id": mid, "host": host}):
+        # File the receipt first; a FAILED append queues the row itself (r55 P2.14: keeping
+        # the file was hollow — the same exchange's scanner quarantined it before the peer
+        # ever re-sent, and no terminal ever landed).
+        _row = {"t": int(time.time()), "ev": "relayed", "id": mid, "host": host}
+        if _tl_append("messages.jsonl", _row):
             outbox_del(host, mid)
             _log("ack for %s/%s: record malformed — receipt filed, record retired" % (host, mid))
         else:
-            _log("ack for %s/%s: record malformed AND the receipt append failed — kept" % (host, mid))
+            _queue_terminal_row(_row, "ack for %s/%s: record malformed AND the receipt "
+                                      "append failed — the row itself is queued" % (host, mid))
         return
     if not msg:
         outbox_del(host, mid)
@@ -3605,14 +3836,13 @@ def _bounce_arrived(host, b):
         return
     bounce = rows[0]
     mid = bounce["mid"]
+    _drain_postal_retries()
     try:
         msg = outbox_get(host, mid)
     except (_OutboxUnreadable, _OutboxMalformed):
-        # forwarded-or-ours is undecidable over an unproved or garbled read, and "defer" is a drop (the
-        # exchange 200s the bounce; the peer never re-sends). Treat it as ours: _bounce_apply's
-        # unreadable arm files the terminal receipt and is loud about the lost return note —
-        # if it WAS a forward, the origin sees its own parked accounting settle on the 7-day
-        # phantom side rather than a silent forever-parked row.
+        # forwarded-or-ours is undecidable here — route through _bounce_apply, whose typed
+        # arms decide: a TRANSIENT fault parks the bounce durably and retries (r55 P2.15);
+        # parsed garbage files the terminal receipt (queued if the append fails, r55 P2.14)
         _bounce_apply(host, bounce)
         return
     if msg and msg.get("origin"):

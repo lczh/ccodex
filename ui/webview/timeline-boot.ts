@@ -101,8 +101,9 @@ export function bridgeFunctions(post: Post): Record<string, (...a: any[]) => voi
       post({ type: "setTimelineViewsOps", ops, ...(opId ? { opId: String(opId) } : {}) }),
     // the durable multi-host gesture journal (the v1.3.21 audit's P1.5); the opId correlates
     // the kernel's unionOpsAck so the panel advances its watermark only on success (r50)
-    __rompTimelineSetUnionOps: (entries: unknown, retired?: unknown, opId?: unknown) =>
-      post({ type: "setUnionOps", entries, retired: retired || [], ...(opId ? { opId: String(opId) } : {}) }),
+    __rompTimelineSetUnionOps: (entries: unknown, retired?: unknown, opId?: unknown, rekey?: unknown) =>
+      post({ type: "setUnionOps", entries, retired: retired || [],
+             ...(opId ? { opId: String(opId) } : {}), ...(rekey ? { rekey } : {}) }),
     __rompTimelineEditTag: (edit: unknown) => post({ type: "editTag", edit }),
     // the completion claim (r54 P1.3): the kernel grants exactly one completer per gesture
     __rompTimelineClaimUnion: (gid: unknown, opId?: unknown) =>

@@ -1643,7 +1643,9 @@ class TimelinePanel {
       // gesture minted entries; the kernel's copy is the reload survivor, never fresher than
       // this panel's own live list
       this._unionSeeded = true;
-      const seedRows = data.unionOps.filter((o) => o && !o.refusal);   // refusal rows are events, not entries (r50)
+      const seedRows = data.unionOps.filter((o) => o && !o.refusal
+        && !(this._yieldedGids && this._yieldedGids.has(o.gid)));   // refusal rows are events,
+      //   not entries (r50); yielded gids stay suppressed even through the one-shot seed (r55)
       if (seedRows.length && !(this._unionOps || []).length) {
         this._unionOps = seedRows.map((o) => Object.assign({}, o));
         this._adoptedGids = new Set(this._unionOps.map((o) => o.gid).filter(Boolean));
@@ -1671,17 +1673,37 @@ class TimelinePanel {
       if (!this._adoptedGids) this._adoptedGids = new Set();
       const held = new Set((this._unionOps || []).map((o) => o.gid).filter(Boolean));
       let took = false;
+      // eligibility decides ONCE PER GID, then EVERY (gid, host) row adopts (the r55
+      // audit's P1.2, executed there: the guards updated after the first row, so host B's
+      // half of a two-host gesture was skipped — completion then retired both old rows
+      // while carrying only A, and B's operation was lost outright)
+      const eligible = new Set();
       for (const o of data.unionOps) {
         if (!o || o.refusal || !o.gid) continue;
         if (held.has(o.gid) || this._journaledGids.has(o.gid)
-            || this._mintedGids.has(o.gid) || this._retireUnionGids.has(o.gid)) continue;
+            || this._mintedGids.has(o.gid) || this._retireUnionGids.has(o.gid)
+            || (this._yieldedGids && this._yieldedGids.has(o.gid))) continue;
+        eligible.add(o.gid);
+      }
+      for (const o of data.unionOps) {
+        if (!o || o.refusal || !o.gid || !eligible.has(o.gid)) continue;
         if (!this._unionOps) this._unionOps = [];
         this._unionOps.push(Object.assign({}, o));
         this._adoptedGids.add(o.gid);
         this._journaledGids.add(o.gid);   // this panel becomes a retirer: its sync's diff
-        held.add(o.gid);                  // emits the retirement when the group settles
+        //                                   emits the retirement when the group settles
         if (o.gid >= unionGestureSeq) unionGestureSeq = o.gid + 1;
         took = true;
+      }
+      // a YIELDED gid unsuppresses only on PROOF (the r55 audit's P1.5: deleting every
+      // guard let a stale echo re-adopt the yielded rows, and the next unrelated sync
+      // republished them after the completer had retired them): absence from this proven
+      // echo = the completer settled it; a granted claim (below) = the completer died
+      if (this._yieldedGids && this._yieldedGids.size) {
+        const present = new Set(data.unionOps.filter((o) => o && !o.refusal)
+          .map((o) => o.gid));
+        for (const g4 of Array.from(this._yieldedGids))
+          if (!present.has(g4)) this._yieldedGids.delete(g4);
       }
       // COMPLETE journaled-but-undispatched gestures (the r53 round: a webview reload between
       // the journal ack and the gated dispatch stranded effect-less immortal rows). One full
@@ -1722,12 +1744,25 @@ class TimelinePanel {
           if (gatedNow.has(o.gid)) continue;
           undispatchedNow.add(o.gid);
           if (!this._undispatchedSeen.has(o.gid)) continue;
-          if (!(this._unionOps || []).some((x) => x.gid === o.gid && x.dispatched === false))
+          const heldPend = (this._unionOps || []).some((x) => x.gid === o.gid
+            && x.dispatched === false);
+          if (!heldPend && !(this._yieldedGids && this._yieldedGids.has(o.gid)))
             continue;
-          // the kernel grants ONE completer (r54 P1.3) — the completion runs on its ack
+          // the kernel grants ONE completer (r54 P1.3; journal-verified with an epoch since
+          // r55 P1.4) — the completion runs on its ack. A YIELDED gid competes too: if the
+          // grant lands, the completer died and this panel may finish the gesture (r55 P1.5)
           this._requestUnionClaim(o.gid);
         }
         this._undispatchedSeen = undispatchedNow;
+        // a claim granted for a gid whose rows arrived only NOW (the yielded-recovery path:
+        // unsuppress happened at grant time, adoption just above) completes immediately —
+        // the claim is already held, no second sighting cycle
+        for (const k of Object.keys(this._claimEpochs || {})) {
+          const g5 = Number(k);
+          if (this._pendingClaims && this._pendingClaims[g5]) continue;
+          if ((this._unionOps || []).some((x) => x.gid === g5 && x.dispatched === false))
+            this._completeUnionGesture(g5);
+        }
       }
       if (took) this.draw();
     }
@@ -2948,7 +2983,7 @@ class TimelinePanel {
   // dropped when the owner's store CONFIRMS the edit (never a push counter — a slow refusal can
   // outlive any count of pushes; the r45 verification: the 3-push age-out raced the forward
   // path's 8s timeout and slow refusals got no rollback at all)
-  _syncUnionOps(gate) {
+  _syncUnionOps(gate, opts) {
     // mirror the WHOLE in-flight compensation list durably (the v1.3.21 audit's P1.5): the
     // journal lived only in this panel's memory — a reload while one host was pending lost it,
     // and the host's later refusal left already-applied siblings silently split. Full-replace,
@@ -2996,10 +3031,11 @@ class TimelinePanel {
       // all-or-nothing check on the composite dispatched a gesture a completer already owned
       this._gatedDispatches[opId] = { gates: Array.isArray(gate) ? gate : [gate] };
     }
+    const rekey = opts && opts.rekey ? opts.rekey : null;
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineSetUnionOps === 'function') {
         this._pendingUnionSyncs[opId] = want;
-        window.__rompTimelineSetUnionOps(entries, retired, opId);
+        window.__rompTimelineSetUnionOps(entries, retired, opId, rekey);
         sent = true;
       } else if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
         // SERIALIZED like _setViews' spool (the r50 round): bare concurrent fetches let a
@@ -3007,8 +3043,9 @@ class TimelinePanel {
         // retired rows — one POST at a time keeps the wire order the WS path gets for free
         this._pendingUnionSyncs[opId] = want;
         this._postChain = (this._postChain || Promise.resolve()).then(() =>
-          this._kernelPost('/union-ops', { entries: entries, retired: retired, opId: opId,
-                                           cid: this._unionCid() }, true)
+          this._kernelPost('/union-ops', Object.assign(
+              { entries: entries, retired: retired, opId: opId, cid: this._unionCid() },
+              rekey ? { rekey: rekey } : {}), true)
             .then((r) => this.unionOpsAck({ ok: r.ok === true, opId: opId,
                                             unclaimed: (r.json && r.json.unclaimed) || [] }))
             .catch(() => this.unionOpsAck({ ok: false, opId: opId }))
@@ -3034,6 +3071,11 @@ class TimelinePanel {
     const _gatedGidsAll = gated ? gated.gates.reduce((a, g1) => a.concat(g1.gids), []) : [];
     if (m.ok === false) {
       if (gated) {
+        for (const g1 of gated.gates) {
+          if (g1.ogid) this._yieldUnionGids([g1.ogid]);   // a refused rekey: the ORIGINAL
+          //   rows still stand in the journal — forget them (never retire); the next echo
+          //   re-adopts and the gesture completes under a fresh claim (r55 P1.1)
+        }
         // the r53 audit's P1.4: the gesture's effects were DISPATCHED before the journal's
         // persistence was known — with the journal refused, remote edits and the local
         // commit ran with no durable rollback record anywhere. The gesture drops WHOLE:
@@ -3077,6 +3119,13 @@ class TimelinePanel {
         }
         for (const o of (this._unionOps || []))
           if (g1.gids.indexOf(o.gid) >= 0) o.dispatched = true;
+        if (g1.ogid) {
+          // the rekey COMMITTED: the original gid is retired in the journal — suppress it
+          // against stale echoes (r55 P1.5's own-completion leg: a raced pusher's payload
+          // still carrying the old rows re-adopted and re-completed them)
+          if (!this._yieldedGids) this._yieldedGids = new Set();
+          this._yieldedGids.add(g1.ogid);
+        }
         g1.run();               // the journal is DURABLE — the gesture's effects may now run (r53)
         ran = true;
       }
@@ -3122,6 +3171,15 @@ class TimelinePanel {
     if (!m || !this._pendingClaims || !this._pendingClaims[m.gid]) return;
     delete this._pendingClaims[m.gid];   // refused → a later sighting may re-ask (holders die)
     if (m.ok !== true) return;           // another panel owns it — its completion flips the rows
+    if (!this._claimEpochs) this._claimEpochs = {};
+    this._claimEpochs[m.gid] = m.epoch;  // the rekey-and-retire CAS token (r55 P1.4)
+    if (this._yieldedGids && this._yieldedGids.has(m.gid)) {
+      // the granted claim PROVES the completer died (its socket would have held it) — the
+      // suppression ends and the next payload's adoption hands this panel the rows; the
+      // post-adoption pass completes with the epoch already in hand (r55 P1.5)
+      this._yieldedGids.delete(m.gid);
+      return;
+    }
     this._completeUnionGesture(m.gid);
   }
 
@@ -3138,29 +3196,41 @@ class TimelinePanel {
     const group = (this._unionOps || []).filter((x) => x.gid === gid);
     const pend = group.filter((x) => x.dispatched === false);
     if (!pend.length) return;
+    const epoch = this._claimEpochs ? this._claimEpochs[gid] : undefined;
+    if (this._claimEpochs) delete this._claimEpochs[gid];   // one-shot: the CAS consumes it
     const ngid = ++unionGestureSeq;
     if (!this._mintedGids) this._mintedGids = new Set();
     this._mintedGids.add(ngid);
     for (const x of group) { x.ogid = x.ogid || x.gid; x.gid = ngid; }
-    // the RE-KEYED rows sync BEFORE any dispatch (the r54 wave-2 verification: the editTag
-    // reached the kernel first, its per-host evidence found only old-gid ogid-less rows,
-    // and a completer dying mid-dispatch left the journal claiming nothing had run) — the
-    // socket is FIFO, so the kernel holds the new rows when the dispatches arrive
-    this._syncUnionOps();
-    const rts3 = (this._views && this._views.remoteTags) || [];
-    for (const x of pend) {
-      x.dispatched = true;
-      if (this._unionOpApplied(x, rts3)) { x.confirmed = true; continue; }
-      this._editRemoteTag(x.rt, Object.assign({}, x.edit), ngid);
+    // the EFFECTS are ACK-GATED on the rekey write (the r55 audit's P1.1, executed there:
+    // a failed first ack left three executed effects while durable storage held only the
+    // old gid — a later refusal could compensate nothing). The write itself is the r55
+    // P1.4 CAS: it commits only while this panel's claim epoch still holds the original
+    // gid AND its rows still stand, so a stale claimant can never resurrect settled work.
+    const self2 = this;
+    const dispatch = () => {
+      const rts3 = (self2._views && self2._views.remoteTags) || [];
+      for (const x of pend) {
+        if (self2._unionOpApplied(x, rts3)) { x.confirmed = true; continue; }
+        self2._editRemoteTag(x.rt, Object.assign({}, x.edit), ngid);
+      }
+      const repl = group.find((x) => x.lop);
+      if (repl) {
+        const lt3 = (self2._views && (self2._views.tags || self2._views.groups)) || [];
+        const st3 = self2._unionLocalStateGuarded(repl, lt3);
+        if (st3 === 'pre') self2._applyLocalOp(repl.lop, 'lg' + ngid);
+        else if (st3 === 'applied') for (const x of group) x.lapplied = true;
+      }
+      self2.draw();
+    };
+    const opId = this._syncUnionOps(
+      { run: dispatch, gids: [ngid], name: (group[0] || {}).name || '', ogid: gid },
+      { rekey: { ogid: gid, gid: ngid, epoch: epoch } });
+    if (!opId) {
+      // no transport: undo the in-memory re-key; the journal never changed
+      for (const x of group) { x.gid = x.ogid; delete x.ogid; }
+      this._mintedGids.delete(ngid);
     }
-    const repl = group.find((x) => x.lop);
-    if (repl) {
-      const lt3 = (this._views && (this._views.tags || this._views.groups)) || [];
-      const st3 = this._unionLocalStateGuarded(repl, lt3);
-      if (st3 === 'pre') this._applyLocalOp(repl.lop, 'lg' + ngid);
-      else if (st3 === 'applied') for (const x of group) x.lapplied = true;
-    }
-    this._syncUnionOps();                // persist the re-key + flips NOW (the wave-3 rule)
     this.draw();
   }
 
@@ -3173,10 +3243,16 @@ class TimelinePanel {
   _yieldUnionGids(gids) {
     const s = new Set(gids);
     this._unionOps = (this._unionOps || []).filter((o) => !s.has(o.gid));
+    if (!this._yieldedGids) this._yieldedGids = new Set();
     for (const g of s) {
       if (this._journaledGids) this._journaledGids.delete(g);
       if (this._mintedGids) this._mintedGids.delete(g);
       if (this._adoptedGids) this._adoptedGids.delete(g);
+      // SUPPRESSED until proof (r55 P1.5): a stale echo used to re-adopt the yielded rows
+      // immediately, and the next unrelated sync republished rows the completer had
+      // retired. Suppression ends on proven absence (the completer settled it) or on a
+      // granted claim (the completer died and its socket freed the gesture).
+      this._yieldedGids.add(g);
     }
   }
 

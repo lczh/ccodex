@@ -514,7 +514,7 @@ function captureViews(v: SessionViews | null) {
 // timeline gesture, so such a refusal is loud there and rolls back nothing.
 let webEditSeq = 0;
 // compensable tag gestures held until their journal write is ACKED (r52) — opId -> dispatch
-const pendingUnionGestures = new Map<string, () => void>();
+const pendingUnionGestures = new Map<string, { gid: number; run: () => void }>();
 function postViews(v: SessionViews, ops?: Record<string, unknown>[]) {
   pendingSessionViews = v; pendingViewsAge = 0;
   if (activeId) assertPeekFor(activeId);   // the optimistic edit re-derives the active session's peek too
@@ -4906,7 +4906,7 @@ function showTabMenu(e: MouseEvent, id: string) {
           // for). ok dispatches below via the ack consumer; ok:false toasts and drops the
           // gesture whole — nothing began, nothing splits. No ack (a kernel death) dispatches
           // nothing either: the safe direction; the user retries.
-          pendingUnionGestures.set(ackId, () => {
+          pendingUnionGestures.set(ackId, { gid, run: () => {
             for (const rt of candidates)
               vscodeApi?.postMessage({ type: "editTag", edit: {
                 opId: String(gid), host: rt.host || "", name: g.name,
@@ -4934,7 +4934,7 @@ function showTabMenu(e: MouseEvent, id: string) {
             // a re-remove over a member the user just re-added
             vscodeApi?.postMessage({ type: "setUnionOps", entries: mkEntries(true),
                                      retired: [], opId: "u-chat" + (++webEditSeq) });
-          });
+          } });
           return;   // the optimistic paint waits with the effects — one ack, one commit
         }
         if (willLocal) {
@@ -11526,7 +11526,13 @@ window.addEventListener("message", (e: MessageEvent) => {
     if (go) {
       pendingUnionGestures.delete(m.opId);
       if (m.ok === false) warnToast("The tag edit was not applied — its safety record could not be saved. Retry.");
-      else go();
+      else if (Array.isArray(m.unclaimed) && m.unclaimed.includes(go.gid)) {
+        // a COMPLETER holds this gesture (the r55 audit's P1.3, executed there: the chat ran
+        // remote A, remote B, and the local removal over an ack that NAMED the gid unclaimed
+        // — the exact double dispatch the claim exists to end). The claim holder's effects
+        // are the only ones; this panel's continuation drops whole.
+      }
+      else go.run();
     }
   }
   else if (m.type === "viewsAck") consumeViewsAck(m, (conflicts) => {

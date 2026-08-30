@@ -528,11 +528,13 @@ class R53ProvedRetirement(unittest.TestCase):
         fixed = pm._reconcile_phantom_sent(now=self.now)
         self.assertEqual(fixed, 1, "the phantom past the [] row is still found and filed")
 
-    def test_an_unreadable_record_still_files_the_bounce_receipt(self):
-        # the r53 verification round found the raise (killing the exchange batch); wave 3
-        # found the "defer" that replaced it was a DROP — the exchange 200s the bounce so the
-        # peer never re-sends, and outbox_list quarantines the record in the SAME pass. The
-        # receipt files NOW; only the return note (whose body is unreadable) is lost, loudly.
+    def test_an_unreadable_bounce_parks_and_settles_on_proof(self):
+        # r53 found the raise (killing the exchange batch); r54's "file the receipt now"
+        # over-corrected (the r55 audit's P2.15, executed there: one TRANSIENT EIO deleted
+        # recoverable mail and lost its return note). The bounce EVENT parks durably now —
+        # the exchange 200s it, so the peer never re-sends — and retries until the read
+        # PROVES; a recovered record then takes the full path, return note included.
+        pm._pending_bounces.clear()
         f = self.hd / "px-405.1_ee.TESTHOST.json"
         f.write_text(json.dumps({"mid": "px-405.1_ee.TESTHOST", "body": "hi",
                                  "frm_id": "77777777-8888-9999-aaaa-bbbbbbbbbbbb"}))
@@ -540,14 +542,28 @@ class R53ProvedRetirement(unittest.TestCase):
         try:
             pm._bounce_arrived("TESTHOST2", {"mid": "px-405.1_ee.TESTHOST",
                                              "code": "recipient-unavailable"})
+            self.assertTrue(f.exists(), "the recoverable record SURVIVES the fault")
+            self.assertEqual([r for r in _rows() if r.get("ev") == "bounced"], [],
+                             "no terminal over an unproved read")
+            self.assertIn("px-405.1_ee.TESTHOST", pm._pending_bounces,
+                          "…the bounce parked durably instead")
+            self.assertTrue(pm._pending_bounces_path().exists())
         finally:
-            if f.exists():
-                os.chmod(f, 0o644)
+            os.chmod(f, 0o644)
+        pm._flush_pending_bounces()                  # the read proves on the next pass
         bounced = [r for r in _rows() if r.get("ev") == "bounced"]
         self.assertEqual([r["id"] for r in bounced], ["px-405.1_ee.TESTHOST"],
-                         "the terminal receipt files — parked accounting must not claim "
-                         "mail the peer refused")
-        self.assertFalse(f.exists(), "…and the unreadable record retires with it")
+                         "the recovered record takes the FULL path — receipt and return note")
+        self.assertFalse(f.exists(), "…and retires with it")
+        self.assertNotIn("px-405.1_ee.TESTHOST", pm._pending_bounces, "the parked entry clears")
+        # PARSED garbage is still definite: terminal now, never parked
+        g2 = self.hd / "px-406.1_ff.TESTHOST.json"
+        g2.write_text("{garbage")
+        pm._bounce_arrived("TESTHOST2", {"mid": "px-406.1_ff.TESTHOST",
+                                         "code": "recipient-unavailable"})
+        self.assertIn("px-406.1_ff.TESTHOST",
+                      [r["id"] for r in _rows() if r.get("ev") == "bounced"])
+        self.assertFalse(g2.exists())
 
     def test_an_unreadable_record_still_reads_as_parked(self):
         # the r53 verification round: check_sent's parked probe raised through the whole
@@ -692,3 +708,161 @@ class R54PublishAndTypedReader(unittest.TestCase):
         self.assertEqual(pm._reconcile_relay_stages(), 0)
         self.assertFalse((self.hd / ".stage-px-507.1_gg.TESTHOST").exists(),
                          "the proof past the shaped row still counts — the stage settles")
+
+class R55PublishOutcomesAndSchema(unittest.TestCase):
+    """the v1.3.27 audit's P1.7/P1.8 + P2.13/P2.14/P2.16/P2.17: publication could still
+    throw after the message was live (double delivery), REAL directory-fsync failures were
+    swallowed (both copies lost on a hard shutdown), the outbox reader validated syntax but
+    not schema, failed terminal appends raced the scanner's quarantine, wrong-shaped
+    handoff provenance was marked complete with zero receipts, and the receipt/read boxes
+    quarantined valid records on transient faults."""
+
+    def setUp(self):
+        _reset()
+        shutil.rmtree(pm.OUTBOX, ignore_errors=True)
+        shutil.rmtree(pm.RECEIPTBOX, ignore_errors=True)
+        shutil.rmtree(pm.READBOX, ignore_errors=True)
+        pm._pending_terminal_rows[:] = []
+        pm._pending_bounces.clear()
+        try:
+            pm._pending_bounces_path().unlink()
+        except OSError:
+            pass
+        self.now = int(time.time())
+        self.hd = pm.OUTBOX / "TESTHOST2"
+        self.hd.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_real_fsync_failure_keeps_the_stage(self):
+        # r55 P1.8, executed with a REAL os.fsync injection (the audit called out that the
+        # old test mocked the wrapper): two swallowed EIOs let publication report success
+        # and delete the recovery stage — a hard shutdown then had NO copy at all
+        mid = "px-601.1_aa.TESTHOST"
+        stage = self.hd / (".stage-" + mid)
+        stage.write_text(json.dumps({"mid": mid, "body": "hi"}))
+        real = os.fsync
+        def _boom(fd):
+            raise OSError(5, "EIO")
+        pm.os.fsync = _boom
+        try:
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                pm.outbox_publish_stage("TESTHOST2", mid, stage)   # never raises post-link
+        finally:
+            pm.os.fsync = real
+        self.assertTrue((self.hd / (mid + ".json")).exists(), "the message is live")
+        self.assertTrue(stage.exists(),
+                        "…and the UNPERSISTED publication keeps its recovery stage")
+        # unsupported directory fsync stays silent — portability intact
+        def _einval(fd):
+            raise OSError(errno.EINVAL, "EINVAL")
+        import errno
+        pm.os.fsync = lambda fd: (_ for _ in ()).throw(OSError(22, "EINVAL"))
+        try:
+            pm._fsync_dir(self.hd)                   # no raise
+        finally:
+            pm.os.fsync = real
+
+    def test_an_unreadable_standing_file_is_uncertain_never_compensated(self):
+        # r55 P1.7's EEXIST arm: an unreadable same-mid file means the mail is live either
+        # way — raising here filed `unpublished` over delivered mail and the retry doubled
+        mid = "px-602.1_bb.TESTHOST"
+        final = self.hd / (mid + ".json")
+        final.write_text(json.dumps({"mid": mid, "body": "hi"}))
+        stage = self.hd / (".stage-" + mid)
+        stage.write_text(json.dumps({"mid": mid, "body": "hi"}))
+        os.chmod(final, 0)
+        try:
+            with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+                pm.outbox_publish_stage("TESTHOST2", mid, stage)   # no raise
+        finally:
+            os.chmod(final, 0o644)
+        self.assertTrue(stage.exists(), "the stage stays for boot arbitration")
+        # …and the pre-publication failures are TYPED so only they reach compensation
+        self.assertTrue(issubclass(pm._PublishNeverStarted, OSError))
+        src = open(os.path.join(BIN, "romp-postal-service"), encoding="utf-8").read()
+        i = src.index("outbox_publish_stage(phost, mid, _stagef)")
+        window = src[i:i + 1800]
+        self.assertIn("except _PublishNeverStarted:", window,
+                      "ONLY definitely-never-started compensates as unpublished")
+        self.assertIn("UNCERTAIN", window, "…anything else keeps the stage, files nothing")
+
+    def test_schema_invalid_records_never_relay_or_ack(self):
+        # r55 P2.13, executed there: 32 parsed-valid [] rows exhausted the relay byte
+        # budget and hid a real message indefinitely; an ack for one deleted it as mail
+        good = self.hd / "px-603.1_cc.TESTHOST.json"
+        good.write_text(json.dumps({"mid": "px-603.1_cc.TESTHOST", "body": "hi"}))
+        for i in range(3):
+            (self.hd / ("px-604.%d_dd.TESTHOST.json" % i)).write_text("[]")
+        rows = pm.outbox_list("TESTHOST2")
+        self.assertEqual([r["mid"] for r in rows], ["px-603.1_cc.TESTHOST"],
+                         "only schema-valid mail relays; the garbage quarantined aside")
+        self.assertFalse(any(self.hd.glob("px-604*")), "…and left the outbox")
+        # a mid-mismatched record is garbage too (never deletable as someone else's mail)
+        bad = self.hd / "px-605.1_ee.TESTHOST.json"
+        bad.write_text(json.dumps({"mid": "px-999.9_zz.OTHER", "body": "hi"}))
+        with self.assertRaises(pm._OutboxMalformed):
+            pm.outbox_get("TESTHOST2", "px-605.1_ee.TESTHOST")
+
+    def test_a_failed_terminal_append_queues_the_row_itself(self):
+        # r55 P2.14, executed there: "the file is kept" was hollow — the same exchange's
+        # scanner quarantined the malformed record before returning 200, the peer never
+        # re-sent, and no terminal ever landed
+        f = self.hd / "px-606.1_ff.TESTHOST.json"
+        f.write_text("{garbage")
+        real = pm._tl_append
+        pm._tl_append = lambda name, row: False
+        try:
+            pm._ack_arrived("TESTHOST2", "px-606.1_ff.TESTHOST")
+        finally:
+            pm._tl_append = real
+        self.assertEqual([r["id"] for r in pm._pending_terminal_rows],
+                         ["px-606.1_ff.TESTHOST"], "the row itself is the retry intent")
+        pm._drain_postal_retries()
+        relayed = [r for r in _rows() if r.get("ev") == "relayed"]
+        self.assertEqual([r["id"] for r in relayed], ["px-606.1_ff.TESTHOST"],
+                         "…and the drain lands it — the receipt survives the race")
+        self.assertEqual(pm._pending_terminal_rows, [])
+
+    def test_wrong_shaped_handoff_provenance_is_retryable_never_done(self):
+        # r55 P2.16, executed there: a historic row with relay_mid:[] answered
+        # {ok, local:true} — the delivery was marked done with ZERO completion receipts
+        with open(pm.TLDIR / "messages.jsonl", "a") as fh:
+            fh.write("[]\n")             # the scanner survives shaped rows too
+            fh.write(json.dumps({"t": self.now, "ev": "sent", "id": "px-607.1_gg.TESTHOST",
+                                 "relay_mid": [], "relay_via": "TESTHOST2"}) + "\n")
+        ans, code = pm.handoff_done_apply({"mid": "px-607.1_gg.TESTHOST"})
+        self.assertEqual(code, 404, "corrupt provenance falls to RETRYABLE recovery")
+        self.assertTrue(ans.get("retry"))
+        self.assertNotIn("px-607.1_gg.TESTHOST", pm._receipts_done(),
+                         "…and is NEVER marked complete over it")
+
+    def test_receipt_and_read_boxes_keep_valid_records_through_transient_faults(self):
+        # r55 P2.17, executed there: one injected EIO moved each valid row into corrupt/
+        # and its active copy was gone
+        rb = pm.RECEIPTBOX / "TESTHOST2"
+        rb.mkdir(parents=True, exist_ok=True)
+        rf = rb / "px-608.1_hh.TESTHOST.json"
+        rf.write_text(json.dumps({"mid": "px-608.1_hh.TESTHOST"}))
+        os.chmod(rf, 0)
+        try:
+            self.assertEqual(pm.receiptbox_list("TESTHOST2"), [])
+        finally:
+            os.chmod(rf, 0o644)
+        self.assertTrue(rf.exists(), "receiptbox: kept through the fault")
+        self.assertEqual([r["mid"] for r in pm.receiptbox_list("TESTHOST2")],
+                         ["px-608.1_hh.TESTHOST"], "…and lists once readable")
+        db = pm.READBOX / "TESTHOST2"
+        db.mkdir(parents=True, exist_ok=True)
+        df = db / "px-609.1_ii.TESTHOST.json"
+        df.write_text(json.dumps({"mid": "px-609.1_ii.TESTHOST"}))
+        os.chmod(df, 0)
+        try:
+            self.assertEqual(pm.readbox_list("TESTHOST2"), [])
+        finally:
+            os.chmod(df, 0o644)
+        self.assertTrue(df.exists(), "readbox: kept through the fault")
+        df.write_text("{garbage")
+        self.assertEqual(pm.readbox_list("TESTHOST2"), [])
+        self.assertFalse(df.exists(), "…while proven garbage still quarantines")

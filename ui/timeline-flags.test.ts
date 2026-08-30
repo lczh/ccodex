@@ -157,7 +157,7 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
     // the gate registers BEFORE the transport send inside _syncUnionOps itself — registered
     // after the call returned, a synchronously-delivered ack found no gate and the gesture's
     // effects never ran (the r53 verification round's own race)
-    const sy = SRC.indexOf("_syncUnionOps(gate) {");
+    const sy = SRC.indexOf("_syncUnionOps(gate, opts) {");
     const sw = SRC.slice(sy, sy + 5200);
     const gateReg = "this._gatedDispatches[opId] = { gates: Array.isArray(gate) ? gate : [gate] };";
     assert.ok(sw.indexOf(gateReg) > 0 && sw.indexOf(gateReg) < sw.indexOf("__rompTimelineSetUnionOps"),
@@ -171,14 +171,19 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
       "EVERY multi-owner gesture journals — remote-only two-owner included (r53 P1.3)");
   }
   {
-    // the claimed completion syncs its RE-KEYED rows before any dispatch (r54 wave 2: the
-    // editTag reached the kernel first, its per-host evidence found only ogid-less old rows,
-    // and a completer dying mid-dispatch left the journal claiming nothing had run)
+    // the claimed completion's effects are ACK-GATED on the rekey write (r55 P1.1,
+    // superseding r54 wave 2's ordering pin: sync-before-dispatch still left the effects
+    // running before the write was DURABLE — a failed ack meant three executed effects
+    // over a journal that only held the old gid), and the write is the r55 P1.4 CAS
     const fn = SRC.indexOf("_completeUnionGesture(gid) {");
-    const win = SRC.slice(fn, fn + 2600);
-    assert.ok(win.indexOf("this._syncUnionOps();") > 0
-      && win.indexOf("this._syncUnionOps();") < win.indexOf("this._editRemoteTag("),
-      "the socket is FIFO — the kernel holds the new rows when the dispatches arrive");
+    const win = SRC.slice(fn, fn + 3400);
+    assert.ok(win.indexOf("const dispatch = () => {") > 0
+      && win.indexOf("self2._editRemoteTag(") > win.indexOf("const dispatch = () => {"),
+      "every effect lives inside the gated closure — nothing runs before the ack");
+    assert.ok(win.indexOf("{ rekey: { ogid: gid, gid: ngid, epoch: epoch } }") > 0,
+      "…and the write carries the claim epoch the kernel CAS-validates (r55 P1.4)");
+    assert.ok(win.indexOf("{ run: dispatch, gids: [ngid], name:") > 0,
+      "the gate keys on the NEW gid — the ok flips exactly the re-keyed rows");
   }
   {
     const fn = SRC.indexOf("tagEditFailed(m) {");
@@ -1185,6 +1190,7 @@ test("executed: a dead writer's journaled-but-undispatched gesture is COMPLETED 
     "the stranded shape: journaled rows, effects never ran");
   assert.ok(journal.some((o: any) => o.lop), "the LOCAL op rides the journal (r53 P1.5)");
   const panel2 = drawnPanel();                       // the adopter
+  autoAckUnion(panel2);                              // its rekey write acks (r55: effects gate on it)
   g.__rompTimelineClaimUnion = (gid2: any) => panel2.unionClaimAck({ gid: gid2, ok: true });
   const dispatched: any[] = [];
   panel2._editRemoteTag = (rt: any, edit: any) => { dispatched.push({ rt, edit }); return true; };
@@ -1255,6 +1261,7 @@ test("executed: completion is postimage-aware and dispatches under a FRESH id (r
   const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
   const gid = journal[0].gid;
   const panel2 = drawnPanel();                       // the adopter
+  autoAckUnion(panel2);                              // its rekey write acks (r55: effects gate on it)
   g.__rompTimelineClaimUnion = (gid2: any) => panel2.unionClaimAck({ gid: gid2, ok: true });
   const calls: any[] = [];
   panel2._editRemoteTag = (rt: any, edit: any, g2: any) => { calls.push({ rt, edit, g2 }); return true; };
@@ -1378,6 +1385,7 @@ test("executed: the claim decides — a refused claimant completes NOTHING (r54 
                  turns: {}, messages: [], judging: [] };
   const mk = () => {
     const p = drawnPanel();
+    autoAckUnion(p);                                 // rekey writes ack (r55: effects gate on it)
     const calls: any[] = [];
     p._editRemoteTag = (rt: any, edit: any, g2: any) => { calls.push({ rt, edit, g2 }); return true; };
     return { p, calls };
@@ -1419,6 +1427,7 @@ test("executed: a MIXED group completes only its unsent halves (r54 P1.1)", () =
   const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
   for (const o of journal) if (o.host === "TESTHOST-A") o.dispatched = true;   // A arrived
   const panel2 = drawnPanel();
+  autoAckUnion(panel2);                              // rekey writes ack (r55: effects gate on it)
   g.__rompTimelineClaimUnion = (gid2: any) => panel2.unionClaimAck({ gid: gid2, ok: true });
   const calls: any[] = [];
   panel2._editRemoteTag = (rt: any, edit: any, g2: any) => { calls.push({ rt, edit, g2 }); return true; };
@@ -1450,6 +1459,7 @@ test("executed: a refused COMPLETION compensates the whole re-keyed group (r54 P
   panel._editTagUnion(un, { remove: ["s1"] });
   const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
   const panel2 = drawnPanel();
+  autoAckUnion(panel2);                              // rekey writes ack (r55: effects gate on it)
   g.__rompTimelineClaimUnion = (gid2: any) => panel2.unionClaimAck({ gid: gid2, ok: true });
   const calls: any[] = [];
   panel2._editRemoteTag = (rt: any, edit: any, g2: any) => { calls.push({ rt, edit, g2 }); return true; };
@@ -1597,4 +1607,148 @@ test("executed: a permanent LOCAL conflict compensates the confirmed remotes (r5
     "…and the refused optimistic paint drops NOW (r54 wave 2: the pinned overlay kept "
     + "rendering the refused rename for three pushes under a banner saying it was refused)");
   delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: a REFUSED rekey write runs ZERO effects — the journal never lied (r55 P1.1)", () => {
+  // the audit's executed repro: a failed first ack still ran both remote effects and the
+  // local removal while durable storage held only the old gid — a later refusal could
+  // compensate nothing. The effects gate on the rekey ack now.
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();                        // the dead writer
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
+  const gid = journal[0].gid;
+  const panel2 = drawnPanel();
+  const real = panel2._syncUnionOps.bind(panel2);
+  panel2._syncUnionOps = (...a: any[]) => {          // the rekey write FAILS
+    const id = real(...a);
+    if (id) panel2.unionOpsAck({ ok: false, opId: id });
+    return id;
+  };
+  g.__rompTimelineClaimUnion = (gid2: any) => panel2.unionClaimAck({ gid: gid2, ok: true, epoch: 7 });
+  const calls: any[] = [];
+  panel2._editRemoteTag = (rt: any, edit: any, g2: any) => { calls.push(g2); return true; };
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: journal }));
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: journal }));
+  assert.equal(calls.length, 0, "NOTHING dispatched over an unacked rekey");
+  assert.deepEqual(panel2._curViews().tags[0].members, ["s1", "s2"],
+    "…and the local leg never ran either");
+  assert.ok((panel2._unionOps || []).every((o: any) => o.gid !== gid && o.ogid !== gid),
+    "the failed transaction's rows left this panel's mirror (forgotten, never retired)");
+  // recovery: the refused transaction suppressed the original, and the very next GRANTED
+  // claim (nobody owns it — the CAS refused ours) legitimately lifts the suppression; once
+  // the store heals, the gesture completes whole under the fresh claim
+  panel2._syncUnionOps = real;
+  autoAckUnion(panel2);
+  panel2.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                          unionOps: journal }));
+  assert.equal(calls.length, 2,
+    "…and the gesture RECOVERS under a fresh claim once the store heals — both halves run");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+  delete g.__rompTimelineClaimUnion;
+});
+
+test("executed: adoption copies EVERY participant of a multi-host gesture (r55 P1.2)", () => {
+  // the audit's executed repro: the gid-wide guards updated after the FIRST row, so host
+  // B's half was skipped — completion then retired both old rows carrying only A, and B's
+  // operation was lost outright
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const journal = JSON.parse(JSON.stringify(wire[wire.length - 1].entries));
+  assert.equal(journal.length, 2, "two hosts, two rows");
+  const panel2 = drawnPanel();
+  panel2.update({ now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                  turns: {}, messages: [], judging: [],
+                  views: JSON.parse(JSON.stringify(VIEWS)), unionOps: journal });
+  assert.deepEqual((panel2._unionOps || []).map((o: any) => o.host).sort(),
+    ["TESTHOST-A", "TESTHOST-B"],
+    "BOTH (gid, host) rows adopted — eligibility decides once per gid, then every row copies");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: a yielded gid is SUPPRESSED until proof — no stale-echo resurrection (r55 P1.5)", () => {
+  const wire: any[] = [];
+  const edits: any[] = [];
+  g.__rompTimelineEditTag = (e: any) => edits.push(e);
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  const real = panel._syncUnionOps.bind(panel);
+  panel._syncUnionOps = (...a: any[]) => {           // every gesture yields to a completer
+    const id = real(...a);
+    if (id) panel.unionOpsAck({ ok: true, opId: id,
+      unclaimed: (panel._unionOps || []).map((o: any) => o.gid) });
+    return id;
+  };
+  const un = viewTagUnion(panel._curViews()).find((u: any) => u.name === "pool");
+  panel._editTagUnion(un, { remove: ["s1"] });
+  const gid = Array.from(panel._yieldedGids || [])[0];
+  assert.ok(gid, "the yielded gid is suppressed");
+  panel._syncUnionOps = real;
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  const staleRow = { host: "TESTHOST-A", name: "pool", inverse: {}, edit: { remove: ["s1"] },
+                     rt: { id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool",
+                           color: "#7aa2f7", members: ["s1"] },
+                     gid: gid, oldName: "pool", oldColor: "#7aa2f7", post: {},
+                     confirmed: false, dispatched: false };
+  panel.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                         unionOps: [staleRow] }));
+  assert.ok(!(panel._unionOps || []).some((o: any) => o.gid === gid),
+    "a STALE echo still carrying the gid is NOT re-adopted (the audit's executed repro: "
+    + "re-adoption republished rows the completer had retired)");
+  panel.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                         unionOps: [] }));
+  assert.ok(!(panel._yieldedGids && panel._yieldedGids.has(gid)),
+    "…and PROVEN absence ends the suppression — the completer settled it");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+});
+
+test("executed: a granted claim for a yielded gid recovers the gesture — the completer died (r55 P1.5)", () => {
+  const wire: any[] = [];
+  g.__rompTimelineEditTag = () => {};
+  g.__rompTimelineSetViews = () => {};
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any) =>
+    wire.push({ entries, retired, opId });
+  const panel = drawnPanel();
+  autoAckUnion(panel);
+  panel._yieldUnionGids([424242]);                   // yielded earlier; the completer then died
+  let asked = 0;
+  g.__rompTimelineClaimUnion = (gid2: any) => { asked += 1; panel.unionClaimAck({ gid: gid2, ok: true, epoch: 3 }); };
+  const calls: any[] = [];
+  panel._editRemoteTag = (rt: any, edit: any, g2: any) => { calls.push(g2); return true; };
+  const row = { host: "TESTHOST-A", name: "pool", inverse: {}, edit: { remove: ["s1"] },
+                rt: { id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool",
+                      color: "#7aa2f7", members: ["s1"] },
+                gid: 424242, oldName: "pool", oldColor: "#7aa2f7", post: {},
+                confirmed: false, dispatched: false };
+  const base = { now, sessions: [sess("s1", "web", "#f7768e"), sess("s2", "api", "#7aa2f7")],
+                 turns: {}, messages: [], judging: [] };
+  panel.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                         unionOps: [row] }));       // sighting 1 (suppressed)
+  panel.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                         unionOps: [row] }));       // sighting 2 → claim asked
+  assert.ok(asked >= 1, "a suppressed gid still competes for the claim");
+  panel.update(Object.assign({}, base, { views: JSON.parse(JSON.stringify(VIEWS)),
+                                         unionOps: [row] }));       // adopt + complete
+  assert.equal(calls.length, 1,
+    "the grant PROVES the completer died — the gesture recovers and completes here");
+  delete g.__rompTimelineEditTag; delete g.__rompTimelineSetViews; delete g.__rompTimelineSetUnionOps;
+  delete g.__rompTimelineClaimUnion;
 });

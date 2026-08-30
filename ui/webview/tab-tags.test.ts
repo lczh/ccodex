@@ -150,6 +150,21 @@ test("the chat's gated gesture carries the r53 settlement fields; paint and flip
     + "for an adopting panel to re-dispatch");
 });
 
+test("the chat's gated gesture honors the kernel's unclaimed verdict (r55 P1.3)", () => {
+  // the audit's executed repro: an ack carrying unclaimed:[gid] still executed remote A,
+  // remote B, and the local removal — the exact double dispatch the claim exists to end
+  const at = RENDER.indexOf("pendingUnionGestures.set(ackId");
+  const win = RENDER.slice(at - 200, at + 400);
+  assert.ok(win.indexOf("pendingUnionGestures.set(ackId, { gid, run: () => {") > 0,
+    "the pending gesture carries its gid — the ack's verdict needs it");
+  const rt = RENDER.indexOf('m.type === "unionOpsAck"');
+  const rw = RENDER.slice(rt, rt + 1200);
+  assert.ok(rw.indexOf("m.unclaimed.includes(go.gid)") > 0,
+    "an unclaimed answer runs NOTHING — the claim holder's effects are the only ones");
+  assert.ok(rw.indexOf("go.run()") > rw.indexOf("m.unclaimed.includes(go.gid)"),
+    "…and the run sits behind that check");
+});
+
 test("remote-only chat tag edits post NO local write (r52 P2.9)", () => {
   // the v1.3.24 audit: the remoteTags mutation is derived presentation the kernel discards —
   // the whole-blob post it used to ride bumped the rev over a byte-identical store and could

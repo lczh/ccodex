@@ -1658,8 +1658,15 @@ def _ordered_locked(sessions):
                     # intent died with the process — the heal was never retried and the
                     # session stayed out of its tags). Withhold the PERSISTED slot this pass:
                     # the sid stays "new" and re-attempts on the next push (event-paced),
-                    # while still RENDERING in its inherited slot (see below).
-                    _withheld[sid] = order[sib[-1]]
+                    # while still RENDERING in its inherited slot (see below). Same-name
+                    # forks CHAIN behind each other (r55 P3.18: anchoring every fork to the
+                    # persisted sibling reversed their order — insert-after put the newest
+                    # first — and the order flipped again when the store recovered).
+                    _anchor = order[sib[-1]]
+                    for _ws in _withheld:
+                        if _nm(_ws) == a:
+                            _anchor = _ws            # the LAST same-name withheld fork
+                    _withheld[sid] = _anchor
                     continue
                 order.insert(sib[-1] + 1, sid)           # a fork inherits its session's slot, not the END
                 name_at.insert(sib[-1] + 1, a)           # keep name_at aligned with order as we splice
@@ -1879,8 +1886,18 @@ def _timeline_views_proved():
     hidden entries migrate here too (r54 P2.6) — the CALLER's own locked write persists the
     migrated shape, so no separate CAS write is needed."""
     raw = _read_state_json(_views_path(), "timeline-views")
+    if raw is not None and raw is not _QUARANTINED and not isinstance(raw, dict):
+        # VALID bytes, WRONG shape (r55 P2.9: a stored null/[] read as proved-empty and the
+        # next edit overwrote it under a success ack) — malformed content, same treatment
+        _quarantine_state_bytes(_views_path(), "timeline-views")
+        raw = _QUARANTINED
     d, _ = _migrate_hidden_blob(raw if isinstance(raw, dict) else {})
-    return _norm_timeline_views(d)
+    v = _norm_timeline_views(d)
+    try:
+        v["rev"] = int(raw.get("rev") or 0) if isinstance(raw, dict) else 0
+    except (TypeError, ValueError):
+        v["rev"] = 0
+    return v
 
 
 def _timeline_views():
@@ -1944,7 +1961,8 @@ def _set_timeline_views(blob, base_rev=None):
     is unconditional (the hidden-migration writer, pre-rev clients). Returns (ok, rev)."""
     with jd._identity_file_lock():
         try:
-            cur = _read_state_json(_views_path(), "timeline-views") or {}
+            cur = _read_state_json(_views_path(), "timeline-views")
+            cur = cur if isinstance(cur, dict) else {}   # the sentinel is truthy (r55 P2.10)
         except OSError:
             # the proved-read rule (the v1.3.24 audit): a transient EIO must never read as an
             # empty store — the unconditional write path would then erase every tag. No rev is
@@ -2141,36 +2159,65 @@ def _replay_ui_op_spool():
 
 _UNION_OPS_MAX = 200
 
-# ── completion claims (the r54 audit's P1.3): EXACTLY ONE client may run a journaled
-# gesture's effects. The journaling writer claims its own gesture the moment the rows land
-# (so a live writer is never raced by an adopter's completion); an adopter must be GRANTED
-# the claim before completing. WS claims are tied to their socket and released on close —
-# the event that "the writer died" actually has; POST claimants (the Obsidian panel) have
-# no close event, so their claims ride a TTL backstop instead. In-memory by design: a
-# kernel restart releases everything, and the journal rows are the durable truth.
-_union_claims = {}                     # gid -> {"ckey": str, "t": float}
+# ── completion claims (the r54 audit's P1.3; TRANSACTIONAL since the r55 audit's P1.4):
+# EXACTLY ONE client may run a journaled gesture's effects. The journaling writer claims its
+# own gesture the moment the rows land; an adopter must be GRANTED the claim before
+# completing. A grant now verifies an EXTANT, UNDISPATCHED journal row under the identity
+# lock — the free-floating grant let a bystander claim a gid the owner had just retired, and
+# the stale claimant re-keyed a settled gesture back to life — and returns an EPOCH the
+# completion's rekey-and-retire write must CAS against (see _union_ops_merge). WS claims are
+# tied to their socket and released on close; POST claimants ride a TTL backstop. Claims
+# retire WITH their journal rows and expired POST claims sweep on every stamp (r55 P3.19:
+# the map grew without bound under a long-lived client). In-memory by design: a kernel
+# restart releases everything, and the journal rows are the durable truth.
+_union_claims = {}                     # gid -> {"ckey": str, "t": float, "epoch": int}
 _union_claims_lock = threading.Lock()
+_union_claim_epoch = [0]
 _UNION_CLAIM_TTL = 120.0               # the no-event backstop, POST claimants only
 
 
-def _union_claim_grant(gid, ckey):
-    """True when `ckey` holds gid's claim after this call. Exclusive: a live different
-    holder refuses; a POST holder past the TTL is stale and yields; re-granting to the
-    same holder refreshes its stamp."""
+def _union_claim_stamp(gid, ckey):
+    """The claims-lock half of a grant: exclusivity + epoch mint. Callers hold (or prove
+    they do not need) the journal-row precondition. Returns the epoch, or None."""
+    now = time.time()
+    with _union_claims_lock:
+        for g in [g for g, c in list(_union_claims.items())
+                  if c["ckey"].startswith("cid:") and now - c["t"] >= _UNION_CLAIM_TTL]:
+            del _union_claims[g]       # the opportunistic expired-POST sweep (r55 P3.19)
+        cur = _union_claims.get(gid)
+        if cur and cur["ckey"] == ckey:
+            cur["t"] = now             # a re-grant REFRESHES — the held epoch stays valid
+            return cur["epoch"]
+        if cur:
+            return None                # a live different holder refuses (expired swept above)
+        _union_claim_epoch[0] += 1
+        _union_claims[gid] = {"ckey": ckey, "t": now, "epoch": _union_claim_epoch[0]}
+        return _union_claim_epoch[0]
+
+
+def _union_claim_grant(gid, ckey, _rows=None):
+    """Epoch when `ckey` holds gid's claim after this call, else None. The journal-row
+    precondition (an extant, undispatched, non-refusal row) is checked under the identity
+    lock unless the caller passes the rows it already read under it (r55 P1.4)."""
     try:
         gid = int(gid)
     except (TypeError, ValueError):
-        return False
+        return None
     if gid <= 0 or not ckey:
-        return False
-    now = time.time()
-    with _union_claims_lock:
-        cur = _union_claims.get(gid)
-        if cur and cur["ckey"] != ckey:
-            if not (cur["ckey"].startswith("cid:") and now - cur["t"] >= _UNION_CLAIM_TTL):
-                return False
-        _union_claims[gid] = {"ckey": ckey, "t": now}
-        return True
+        return None
+    def _pending(rows):
+        return any(isinstance(r, dict) and not r.get("refusal")
+                   and r.get("gid") == gid and r.get("dispatched") is False for r in rows)
+    if _rows is not None:
+        return _union_claim_stamp(gid, ckey) if _pending(_rows) else None
+    with jd._identity_file_lock():
+        try:
+            raw = _read_state_json(_union_ops_path(), "union-gestures")
+        except OSError:
+            return None                # no proof, no claim
+        if not _pending(raw if isinstance(raw, list) else []):
+            return None                # settled/absent: nothing to complete (r55 P1.4)
+        return _union_claim_stamp(gid, ckey)
 
 
 def _union_claims_release(ckey):
@@ -2182,7 +2229,7 @@ def _union_claims_release(ckey):
             del _union_claims[g]
 
 
-def _union_claim_entries(entries, ckey):
+def _union_claim_entries(entries, ckey, _rows=None):
     """The implicit writer claim (P1.3): grant-if-free every undispatched gesture in a
     journal write to its writer, and name the ones ANOTHER client holds — the writer's
     gated dispatch must yield those (a completer owns them now)."""
@@ -2192,7 +2239,8 @@ def _union_claim_entries(entries, ckey):
     for e in (entries if isinstance(entries, list) else []):
         if (isinstance(e, dict) and not e.get("refusal")
                 and e.get("dispatched") is False and e.get("gid")):
-            if not _union_claim_grant(e.get("gid"), ckey) and e.get("gid") not in unclaimed:
+            if (_union_claim_grant(e.get("gid"), ckey, _rows=_rows) is None
+                    and e.get("gid") not in unclaimed):
                 unclaimed.append(e.get("gid"))
     return unclaimed
 
@@ -2201,55 +2249,71 @@ def _union_ops_path():
     return jd.STATE / "union-gestures.json"
 
 
+_QUARANTINED = object()   # _read_state_json's "malformed bytes moved aside" — DISTINCT from
+#                           missing (r55 P2.10: overloading None conflated quarantined data
+#                           loss with an honestly-absent file, and the union echo answered
+#                           an authoritative [] over exactly the loss it should have marked)
+
+
+def _quarantine_state_bytes(path, what):
+    """Move PROVEN-garbage state bytes aside — 128-bit no-replace names (r54 P3.13) — shared
+    by the malformed-JSON arm and the wrong-shape arm (r55 P2.9: a stored null/[] used to
+    read as proved-empty and the next edit overwrote it). Raises _StateUnreadable when the
+    bytes cannot be made safe."""
+    _qerr = None
+    for _ in range(3):
+        qp = path.with_name(path.name + ".corrupt-%d-%d-%s"
+                            % (int(time.time()), os.getpid(), os.urandom(16).hex()))
+        try:
+            os.link(path, qp)                        # EEXIST refuses instead of replacing
+        except FileExistsError:
+            continue                                 # fresh name, try again
+        except OSError as e:
+            try:
+                if qp.exists():
+                    continue
+                path.rename(qp)
+            except OSError as e2:
+                _qerr = e2
+                break
+            sys.stderr.write("%s: malformed content quarantined as %s\n" % (what, qp.name))
+            return
+        try:
+            path.unlink()                            # the copy is safe; retire the source
+        except OSError:
+            pass                                     # a lingering source just re-quarantines
+        sys.stderr.write("%s: malformed content quarantined as %s\n" % (what, qp.name))
+        return
+    sys.stderr.write("%s: malformed content and the quarantine failed — refusing to "
+                     "treat it as empty\n" % what)
+    raise _StateUnreadable(*((_qerr.args if _qerr else ()) or ("quarantine failed",)))
+
+
 def _read_state_json(path, what):
     """A PROVED read of a JSON state file (the v1.3.24 audit's P1.1/P1.2): only
     FileNotFoundError means empty (returns None). An UNREADABLE file (EIO, EACCES) RAISES —
     every writer that folded it to empty then published a merge over the unproved read,
     overwriting valid state and acking success (executed: a seeded union gesture vanished
     under one injected EIO; a seeded tag store was erased by the next create). Malformed
-    JSON is QUARANTINED aside (the bytes survive for forensics) and reads as empty — corrupt
-    content can never merge, but it must never be silently overwritten either."""
+    JSON is QUARANTINED aside (the bytes survive for forensics) and reads as the DISTINCT
+    _QUARANTINED sentinel (r55 P2.10) — corrupt content can never merge, must never be
+    silently overwritten, and must never masquerade as an honestly-empty store."""
     try:
-        return json.loads(path.read_text())
+        val = json.loads(path.read_text())
     except FileNotFoundError:
         return None
     except OSError as e:
         raise _StateUnreadable(*(e.args or ("unreadable",)))
     except ValueError:
-        # UNIQUE destination (the r53 audit's P2.9; entropy widened to 128 bits and the
-        # publication made NO-REPLACE in r54 P3.13 — a forced time+random collision showed
-        # the replacing rename destroying the earlier quarantine's bytes) — and a failed
-        # quarantine RAISES: returning empty let the caller overwrite the very bytes this
-        # promises to preserve
-        _qerr = None
-        for _ in range(3):
-            qp = path.with_name(path.name + ".corrupt-%d-%d-%s"
-                                % (int(time.time()), os.getpid(), os.urandom(16).hex()))
-            try:
-                os.link(path, qp)                    # EEXIST refuses instead of replacing
-            except FileExistsError:
-                continue                             # fresh name, try again
-            except OSError as e:
-                # some filesystems refuse link(2) — fall back to a rename that first PROVES
-                # the fresh 128-bit name is unoccupied (collision is no longer a real risk)
-                try:
-                    if qp.exists():
-                        continue
-                    path.rename(qp)
-                except OSError as e2:
-                    _qerr = e2
-                    break
-                sys.stderr.write("%s: malformed JSON quarantined as %s\n" % (what, qp.name))
-                return None
-            try:
-                path.unlink()                        # the copy is safe; retire the source
-            except OSError:
-                pass                                 # a lingering source just re-quarantines
-            sys.stderr.write("%s: malformed JSON quarantined as %s\n" % (what, qp.name))
-            return None
-        sys.stderr.write("%s: malformed JSON and the quarantine failed — refusing to "
-                         "treat it as empty\n" % what)
-        raise _StateUnreadable(*((_qerr.args if _qerr else ()) or ("quarantine failed",)))
+        _quarantine_state_bytes(path, what)
+        return _QUARANTINED
+    if val is None:
+        # a stored top-level `null` is garbage for EVERY state file this kernel keeps, and
+        # Python's None would masquerade as "missing" to every caller (the r55 audit's P2.9:
+        # the next edit overwrote it under a success ack) — same treatment as malformed
+        _quarantine_state_bytes(path, what)
+        return _QUARANTINED
+    return val
 
 
 def _union_ops_load():
@@ -2274,18 +2338,33 @@ def _union_ops_echo():
     A file that EXISTED and then read as nothing was malformed and quarantined aside (the
     r54 audit's P2.11) — that is data loss, not an empty journal: echoing [] made adopted
     panels delete their usable in-memory recovery copies. None there too."""
-    p = _union_ops_path()
-    _existed = p.exists()
     try:
-        rows = _read_state_json(p, "union-gestures")
+        rows = _read_state_json(_union_ops_path(), "union-gestures")
     except OSError:
         return None
-    if rows is None and _existed:
+    if rows is _QUARANTINED:
+        return None                                  # data loss, not an empty journal
+    if rows is None:
+        return []                                    # honestly missing (proved by ENOENT)
+    if not isinstance(rows, list):
+        # VALID bytes, WRONG shape (r55 P2.10): a fabrication, not a retirement — quarantine
+        # and say "no information" until a writer re-mints the store
+        try:
+            _quarantine_state_bytes(_union_ops_path(), "union-gestures")
+        except OSError:
+            pass
         return None
-    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+    return [r for r in rows if isinstance(r, dict)]
 
 
 def _union_ops_set(entries, retired=None):
+    """The boolean shim over _union_ops_merge — refusal journaling and every caller that
+    needs no claim semantics keep their old contract."""
+    ok, _, _ = _union_ops_merge(entries, retired)
+    return ok
+
+
+def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
     """Per-gid MERGE, never a whole replace (the r49 verification): each open timeline panel
     mirrors only ITS OWN in-flight list — a full replace last-writer-wins'd between panels, so
     any gesture in a second panel erased the first's journal and re-opened the audited reload
@@ -2295,7 +2374,14 @@ def _union_ops_set(entries, retired=None):
     un-journaled the oldest ACTIVE one, and a reload had nothing left to compensate. Rows
     leave through their acked retirement (gesture entries settle on EVIDENCE, never a clock —
     the design rule the expiry tests pin) or, for refusal rows only, the 7-day staleness
-    backstop; _UNION_OPS_MAX is a loud high-water mark now, not an eviction."""
+    backstop; _UNION_OPS_MAX is a loud high-water mark now, not an eviction.
+
+    Returns (ok, unclaimed, reason). `ckey` identifies the writing client for the implicit
+    writer claims; `rekey` = {"ogid", "gid", "epoch"} makes this write a COMPLETION
+    TRANSACTION (the r55 audit's P1.4): it commits only while the claimant's epoch still
+    holds ogid's claim AND ogid's rows still stand — a bystander whose claim outlived the
+    owner's retirement used to re-key the settled gesture back to life. Grant, retirement
+    and rekey decide under ONE identity-lock pass; claims retire with their rows."""
     # the WHOLE load-merge-write under the identity lock (the r50 verification: two threads'
     # unlocked merges both reported success and persisted only one of two distinct gestures)
     with jd._identity_file_lock():
@@ -2307,9 +2393,26 @@ def _union_ops_set(entries, retired=None):
             # compensation record a multi-host edit needed
             sys.stderr.write("union-gestures: unreadable — refusing to merge over an "
                              "unproved read\n")
-            return False
+            return False, [], "the journal is unreadable"
+        if _raw is not None and _raw is not _QUARANTINED and not isinstance(_raw, list):
+            _quarantine_state_bytes(_union_ops_path(), "union-gestures")   # r55 P2.10
         cur = [r for r in _raw if isinstance(r, dict)] if isinstance(_raw, list) else []
         inc = [r for r in (entries if isinstance(entries, list) else []) if isinstance(r, dict)]
+        if rekey:
+            # the completion CAS (r55 P1.4): the claim must still be THIS claimant's epoch,
+            # and the original rows must still stand — both checked under the SAME lock the
+            # merge commits under, so nothing can settle or steal between check and write
+            try:
+                _ogid = int(rekey.get("ogid") or 0)
+                _epoch = int(rekey.get("epoch") or 0)
+            except (TypeError, ValueError):
+                _ogid, _epoch = 0, 0
+            with _union_claims_lock:
+                _ccur = _union_claims.get(_ogid)
+            if not (_ccur and _ccur.get("epoch") == _epoch and _ccur.get("ckey") == ckey):
+                return False, [], "the completion claim is stale — re-claim and retry"
+            if not any(r.get("gid") == _ogid and not r.get("refusal") for r in cur):
+                return False, [], "the gesture settled while the claim was held"
         # the DISPATCH RATCHET (the r53 wave-3 verification): 'the effects ran' is one-way
         # evidence — an adopter panel's full-replace mirror of rows it seeded BEFORE the
         # writer's dispatched:true flip regressed the journal to false and re-armed the
@@ -2342,10 +2445,16 @@ def _union_ops_set(entries, retired=None):
                              "7d backstop, never by eviction)\n" % (len(rows), _UNION_OPS_MAX))
         try:
             _atomic_write(_union_ops_path(), json.dumps(rows))
-            return True
         except Exception:
             sys.stderr.write("union-gestures save: %s\n" % traceback.format_exc())
-            return False
+            return False, [], "the journal write failed"
+        with _union_claims_lock:
+            for g in ret:
+                _union_claims.pop(g, None)       # claims retire WITH their rows (r55 P3.19)
+        # the implicit writer claims decide against the rows JUST written, under the same
+        # lock pass (r55 P1.4) — never a separate read the world can move between
+        unclaimed = _union_claim_entries(inc, ckey, _rows=rows) if ckey else []
+        return True, unclaimed, None
 
 
 def _union_ops_mark_dispatched(gid, host):
@@ -2543,21 +2652,21 @@ def _apply_ref_migration(host, name, new, deleted, fresh=True):
             except OSError:
                 return False
         try:
-            raw = json.loads(_views_path().read_text())
-        except FileNotFoundError:
-            raw = {}
+            raw = _read_state_json(_views_path(), "timeline-views")
         except OSError:
             # an UNREADABLE store is the RETRYABLE case, not moot (the r51 sibling
             # verification: a flaky disk that EIO'd the read made the flush retire the
             # intent as "no local reference held the name" — the permanent silent-stale-refs
             # outcome, disguised as success)
             return False
-        except ValueError:
-            raw = {}                     # corrupt content reads as empty, like every reader
+        raw = raw if isinstance(raw, dict) else {}   # missing/quarantined/wrong-shape → {}
         try:
-            currev = int(raw.get("rev") or 0) if isinstance(raw, dict) else 0
+            currev = int(raw.get("rev") or 0)
         except (TypeError, ValueError):
             currev = 0
+        # the hidden migration runs in EVERY views RMW (r55 P2.11: this writer normalized
+        # hidden away without archiving — one reference migration erased legacy memberships)
+        raw, _ = _migrate_hidden_blob(raw)
         d = _norm_timeline_views(raw)
         before = json.dumps(d, sort_keys=True)
         if not deleted:
@@ -2810,16 +2919,29 @@ def _apply_views_ops(ops):
     CAS write). The normalized pre/post comparison below is the one arbiter of "changed"."""
     applied = False
     conflicts = []
-    with jd._identity_file_lock():
+    try:
+        _lockctx = jd._identity_file_lock()
+        _lockctx.__enter__()
+    except OSError as e:
+        # the LOCK's own acquisition can fault (the r55 audit's P2.12: an EIO opening the
+        # lock file raised a plain OSError, the spool's poison counter counted it against
+        # the op, and a VALID queued gesture was quarantined into .failed on the fifth
+        # pass) — environmental, so it wears the held-queue type like every store fault
+        raise _StateUnreadable(*(e.args or ("lock unavailable",)))
+    try:
         # a PROVED read (the v1.3.24 audit's P1.2, executed: one injected EIO read as an
         # empty store, and the next create acked success over a write that erased every
         # existing tag and lens). The raise is the callers' retained-failure signal: the WS
         # handler acks ok:false, the POST route answers 500, the spool keeps the op file.
-        raw = _read_state_json(_views_path(), "timeline-views") or {}
+        raw = _read_state_json(_views_path(), "timeline-views")
+        raw = raw if isinstance(raw, dict) else {}       # the sentinel is truthy (r55 P2.10)
         try:
-            currev = int(raw.get("rev") or 0) if isinstance(raw, dict) else 0
+            currev = int(raw.get("rev") or 0)
         except (TypeError, ValueError):
             currev = 0
+        # the hidden migration runs in EVERY views RMW (r55 P2.11: the targeted-ops writer
+        # normalized hidden away without archiving — one lens pick erased legacy memberships)
+        raw, _ = _migrate_hidden_blob(raw)
         d = _norm_timeline_views(raw)
         _pre = json.loads(json.dumps(d))              # the ops mutate d — snapshot first
         _pre_key = json.dumps(_norm_timeline_views(jd.canonicalize_timeline_views(_pre)),
@@ -2934,6 +3056,8 @@ def _apply_views_ops(ops):
         d["rev"] = currev + 1
         _atomic_write(_views_path(), json.dumps(d, sort_keys=True))
         return currev + 1, conflicts
+    finally:
+        _lockctx.__exit__(None, None, None)
 
 
 def _remote_tag_member_str(owner_host, m):
@@ -2982,21 +3106,13 @@ def _forward_tag_edit(host, body):
     return ans, None
 
 
-def _views_client():
-    """The views blob every client renders and matches against — the RENDERING of the canonical
-    store (federation v0, the user 2026-08-24): local tags with members as viewer-relative strings
-    (the pre-pairs contract, so no client re-learns anything), plus `remoteTags` — each ATTACHED
-    kernel's own tags, read-only, host-stamped, members respelled for this viewer. Per-host maps
-    joined at the viewer, never merged (the federation counter rule); same-name tags on two kernels
-    stay two entries — the host disambiguates, nothing silently merges. Remote reads ride the
-    supervisor's cached /views poll; a kernel that is down simply contributes nothing this push."""
-    # PROVED or MARKED (the r54 audit's P1.4, executed: an EIO read rendered tags=[], and the
-    # timeline panel took the emptiness as a pending local delete's postimage — the journal
-    # row retired on zero information and a renderer restart lost the local op for good).
-    # ONE read decides BOTH the shape and the marker (the r54 wave-2 verification: a probe
-    # followed by a second read left a window where the probe proved and the render faulted —
-    # fabricated-empty tags rode out unmarked). A faulted or malformed store still renders
-    # the lenient shape, but the payload SAYS so, and every settlement judgment holds.
+def _views_payload_marked():
+    """ONE read decides both the canonical shape and the proved/unproved marker (the r54
+    audit's P1.4; a wave-2 fix made it one read after the probe-then-render pair left a
+    window that served fabricated-empty tags unmarked). SHARED with GET /views since the
+    r55 audit's P1.6 — the route kept its own two-read probe and re-opened the same window
+    for the POLLING kernel, whose settlement judgments read the response. Non-dict valid
+    JSON is a fabrication too (r55 P2.9): null/[] used to read as proved-empty."""
     _pd = None
     _proved = True
     try:
@@ -3005,17 +3121,30 @@ def _views_client():
         _pd = {}                                     # missing = honestly empty, proved
     except Exception:
         _proved = False                              # EIO or malformed: the shape is a fabrication
-    if _proved:
-        _pd2, _ = _migrate_hidden_blob(_pd if isinstance(_pd, dict) else {})
-        v = _norm_timeline_views(_pd2)
-        try:
-            v["rev"] = int(_pd.get("rev") or 0) if isinstance(_pd, dict) else 0
-        except (TypeError, ValueError):
-            v["rev"] = 0
-        v = json.loads(json.dumps(v))
-    else:
+    if _proved and not isinstance(_pd, dict):
+        _proved = False                              # valid bytes, garbage shape (r55 P2.9)
+    if not _proved:
         v = json.loads(json.dumps(_timeline_views()))
         v["unproved"] = True
+        return v
+    _pd2, _ = _migrate_hidden_blob(_pd)
+    v = _norm_timeline_views(_pd2)
+    try:
+        v["rev"] = int(_pd.get("rev") or 0)
+    except (TypeError, ValueError):
+        v["rev"] = 0
+    return json.loads(json.dumps(v))
+
+
+def _views_client():
+    """The views blob every client renders and matches against — the RENDERING of the canonical
+    store (federation v0, the user 2026-08-24): local tags with members as viewer-relative strings
+    (the pre-pairs contract, so no client re-learns anything), plus `remoteTags` — each ATTACHED
+    kernel's own tags, read-only, host-stamped, members respelled for this viewer. Per-host maps
+    joined at the viewer, never merged (the federation counter rule); same-name tags on two kernels
+    stay two entries — the host disambiguates, nothing silently merges. Remote reads ride the
+    supervisor's cached /views poll; a kernel that is down simply contributes nothing this push."""
+    v = _views_payload_marked()
     for t in v["tags"]:
         t["members"] = [_member_str(m) for m in t["members"]]
     remote = []
@@ -29207,7 +29336,7 @@ window.__rompTimelineSendCommand=function(name,cmd){post({type:"sendCommand",nam
 window.__rompTimelineSetFlag=function(id,flag,value){post({type:"setSessionFlag",id:id,flag:flag,value:!!value});};
 window.__rompTimelineSetViews=function(views){post({type:"setTimelineViews",views:views});};
 window.__rompTimelineSetViewsOps=function(ops,opId){var f={type:"setTimelineViewsOps",ops:ops};if(opId)f.opId=String(opId);post(f);};
-window.__rompTimelineSetUnionOps=function(entries,retired,opId){var f={type:"setUnionOps",entries:entries,retired:retired||[]};if(opId)f.opId=String(opId);post(f);};
+window.__rompTimelineSetUnionOps=function(entries,retired,opId,rekey){var f={type:"setUnionOps",entries:entries,retired:retired||[]};if(opId)f.opId=String(opId);if(rekey)f.rekey=rekey;post(f);};
 window.__rompTimelineClaimUnion=function(gid,opId){var f={type:"claimUnionGesture",gid:gid};if(opId)f.opId=String(opId);post(f);};
 window.__rompTimelineEditTag=function(edit){post({type:"editTag",edit:edit});};
 window.__rompTimelineDismiss=function(id){post({type:"dismissLane",id:id});};
@@ -32424,19 +32553,12 @@ class Handler(BaseHTTPRequestHandler):
                 # tag federation v0. CANONICAL shape (member pairs), remoteTags absent on purpose:
                 # a polling kernel re-spells pairs for ITS viewer, and never re-imports another
                 # viewer's join (no transitive unions in v0). `romp tag` maps either spelling.
-                _fv = dict(_timeline_views())
-                # PROVED or MARKED for the POLLING kernel too (r54 wave 2, the remote leg of
-                # P1.4): union settlements judge remote halves from this response — a faulted
-                # store's fabricated empty confirmed a pending delete on the poller, which
-                # retired the recovery rows on zero information. Marked, the poller keeps its
-                # last-good copy instead.
-                try:
-                    json.loads(_views_path().read_text())
-                except FileNotFoundError:
-                    pass
-                except Exception:
-                    _fv["unproved"] = True
-                return self._send(200, json.dumps(_fv), "application/json", cache="no-cache")
+                # PROVED or MARKED for the POLLING kernel too, from the SAME single read
+                # the local payload uses (r55 P1.6: this route kept its own two-read probe —
+                # a first-read EIO with a healthy second read served fabricated-empty tags
+                # unmarked, and the poller's settlement retired recovery rows from them)
+                return self._send(200, json.dumps(_views_payload_marked()),
+                                  "application/json", cache="no-cache")
             if p == "/models":                                # the ONE model + effort choice list — chat statusline, timeline lanes, AND judge settings all read it (the user 2026-07-02: no hardcoding in multiple places)
                 # each choice carries its colormap tint (upstream 2026-08-17: the new-comment
                 # dialog's selectors wear the same colors the statusline badges do, for ANY pick).
@@ -33329,12 +33451,15 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(400, json.dumps({"ok": False,
                                                        "error": "entries must be a JSON list"}),
                                       "application/json")
-                ok = _union_ops_set(b["entries"], b.get("retired"))
+                ok, _ucl, _ureason = _union_ops_merge(
+                    b["entries"], b.get("retired"),
+                    ckey=("cid:" + str(b["cid"])[:64]) if b.get("cid") else None,
+                    rekey=b.get("rekey") if isinstance(b.get("rekey"), dict) else None)
                 _uans = {"ok": ok}
-                if ok and b.get("cid"):
-                    _ucl = _union_claim_entries(b["entries"], "cid:" + str(b["cid"])[:64])
-                    if _ucl:
-                        _uans["unclaimed"] = _ucl     # a completer owns these (r54 P1.3)
+                if _ucl:
+                    _uans["unclaimed"] = _ucl         # a completer owns these (r54 P1.3)
+                if not ok and _ureason:
+                    _uans["error"] = _ureason
                 if b.get("opId"):
                     _uans["opId"] = str(b["opId"])   # the twin advances _syncedGids on this (r50)
                 return self._send(200 if ok else 500, json.dumps(_uans), "application/json")
@@ -33349,8 +33474,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(400, json.dumps({"ok": False,
                                                        "error": "gid and cid are required"}),
                                       "application/json")
-                _cok = _union_claim_grant(b.get("gid"), "cid:" + str(b["cid"])[:64])
-                return self._send(200, json.dumps({"ok": bool(_cok)}), "application/json")
+                _cep = _union_claim_grant(b.get("gid"), "cid:" + str(b["cid"])[:64])
+                return self._send(200, json.dumps(
+                    {"ok": _cep is not None, **({"epoch": _cep} if _cep is not None else {})}),
+                    "application/json")
             if u.path == "/views":
                 # The Obsidian timeline's views writer — the WS setTimelineViews op as a POST:
                 # the SAME whole-blob last-write-wins semantics every dashboard has, but through
@@ -34051,17 +34178,20 @@ class Handler(BaseHTTPRequestHandler):
             # idempotent — a full replace, no per-op protocol to desync), and re-seeds from the
             # payload echo after a reload
             try:
-                _uok = _union_ops_set(msg["entries"], msg.get("retired"))
+                _uok, _unclaimed, _ureason = _union_ops_merge(
+                    msg["entries"], msg.get("retired"), ckey="ws:%d" % id(client),
+                    rekey=msg.get("rekey") if isinstance(msg.get("rekey"), dict) else None)
             except Exception:
-                _uok = False
+                _uok, _unclaimed, _ureason = False, [], "internal error"
                 sys.stderr.write("setUnionOps: %s\n" % traceback.format_exc())
-            _unclaimed = _union_claim_entries(msg["entries"], "ws:%d" % id(client)) if _uok else []
             try:
                 # the correlated ack (the r50 verification: the save's failure was discarded and
                 # the panel advanced its synced-gid watermark on hope)
                 _uans = {"type": "unionOpsAck", "ok": bool(_uok)}
                 if _unclaimed:
                     _uans["unclaimed"] = _unclaimed   # a completer owns these — the gate yields (r54)
+                if not _uok and _ureason:
+                    _uans["error"] = _ureason
                 if msg.get("opId"):
                     _uans["opId"] = str(msg["opId"])
                 client["send"](json.dumps(_uans))
@@ -34071,9 +34201,12 @@ class Handler(BaseHTTPRequestHandler):
             # the completion CLAIM (the r54 audit's P1.3): exactly one panel may run a
             # stranded gesture's effects — see _union_claim_grant. The journaling writer
             # already holds its own gesture's claim, so a live writer is never raced.
-            _cok = _union_claim_grant(msg.get("gid"), "ws:%d" % id(client))
+            _cep = _union_claim_grant(msg.get("gid"), "ws:%d" % id(client))
             try:
-                _cans = {"type": "unionClaimAck", "gid": msg.get("gid"), "ok": bool(_cok)}
+                _cans = {"type": "unionClaimAck", "gid": msg.get("gid"),
+                         "ok": _cep is not None}
+                if _cep is not None:
+                    _cans["epoch"] = _cep   # the rekey-and-retire CAS token (r55 P1.4)
                 if msg.get("opId"):
                     _cans["opId"] = str(msg["opId"])
                 client["send"](json.dumps(_cans))
