@@ -133,6 +133,186 @@ class StateWriteRoutes(unittest.TestCase):
             self.assertEqual(st, 400, "%s: %r" % (path, r))
 
 
+
+
+class R57AuditFixes(unittest.TestCase):
+    """the v1.3.29 audit: the quarantine linked a PATHNAME a locked writer had replaced
+    (P1.2), invalid stored rows silently retired live gestures (P1.3), one flags EIO
+    un-isolated a session and CACHED the fabrication (P1.4), control-ledger RMWs folded
+    faults to defaults — reversing explicit user stops (P1.5) — dispatched:0 passed for a
+    bool and a float-inf rekey raised into a 500 (P2.14), a foreign-claimed retirement was
+    skipped without being NAMED (P2.12), and {}-shaped order bytes read proved-empty and
+    were then overwritten (P2.16)."""
+
+    SID = "12121212-3434-5656-7878-909090909090"
+    ROW = {"host": "TESTHOST-A", "gid": 7, "edit": {}, "inverse": {}, "rt": {},
+           "name": "pool", "dispatched": False}
+
+    def setUp(self):
+        _scrub_state()
+        km._union_claims.clear()
+        km._union_retired_tombs.clear()
+        km._retry_paused_cache[0] = None
+        for name in ("union-gestures.json", "session-order.json", "auto-nudge.json",
+                     "retry-paused.json"):
+            try:
+                (km.jd.STATE / name).unlink()
+            except OSError:
+                pass
+        for f in km.jd.STATE.glob("*.corrupt-*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_quarantine_spares_a_concurrent_valid_replacement(self):
+        # r57 P1.2, executed there: the fingerprint was checked against the PATH, then the
+        # path was linked — a locked writer's valid commit in between was quarantined and
+        # the store lost. The fix links the VERIFIED INODE via its open fd.
+        p = km.jd.STATE / "union-gestures.json"
+        p.write_text("{{{not json")
+        st = p.stat()
+        fp = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+        tmp = km.jd.STATE / "union-gestures.json.new"
+        tmp.write_text("[]")                         # the concurrent writer's valid commit
+        os.replace(tmp, p)                           # …atomically, on a NEW inode
+        with contextlib.redirect_stderr(io.StringIO()):
+            km._quarantine_state_bytes(p, "union-gestures", fingerprint=fp)
+        self.assertEqual(p.read_text(), "[]", "the valid replacement SURVIVES")
+        self.assertEqual(list(km.jd.STATE.glob("union-gestures.json.corrupt-*")), [],
+                         "nothing moved aside — the judged bytes are already gone")
+
+    def test_b_quarantine_moves_exactly_the_judged_inode(self):
+        p = km.jd.STATE / "union-gestures.json"
+        p.write_text("{{{not json")
+        st = p.stat()
+        with contextlib.redirect_stderr(io.StringIO()):
+            km._quarantine_state_bytes(
+                p, "union-gestures",
+                fingerprint=(st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns))
+        qs = list(km.jd.STATE.glob("union-gestures.json.corrupt-*"))
+        self.assertEqual(len(qs), 1)
+        self.assertEqual(qs[0].read_text(), "{{{not json", "the judged bytes are preserved")
+        self.assertFalse(p.exists(), "…and the source is retired")
+
+    def test_c_dispatched_must_be_a_real_bool(self):
+        # r57 P2.14: 0 passed the falsy check, so int poison rode into the dispatch ratchet
+        self.assertTrue(km._union_row_valid(dict(self.ROW)))
+        self.assertFalse(km._union_row_valid(dict(self.ROW, dispatched=0)))
+        self.assertFalse(km._union_row_valid(dict(self.ROW, dispatched=1)))
+
+    def test_d_inf_rekey_refuses_instead_of_500(self):
+        # r57 P2.14: json.loads accepts bare Infinity; int(float('inf')) raised
+        # OverflowError past the (TypeError, ValueError) net and 500'd the POST
+        self.assertTrue(km._union_ops_set([dict(self.ROW)]))
+        ok, _, reason, _u = km._union_ops_merge(
+            [], [], ckey="ws:x", rekey={"ogid": float("inf"), "gid": 8, "epoch": 1})
+        self.assertFalse(ok)
+        self.assertIn("claim", reason, "an unparseable rekey is a stale-claim refusal")
+
+    def test_e_foreign_claimed_retirement_is_skipped_and_named(self):
+        # r57 P2.12: the skip protected the claimant but was SILENT — the bystander panel
+        # dropped its ledger row and the retirement never re-sent after the claim cleared
+        self.assertTrue(km._union_ops_set([dict(self.ROW, gid=901)]))
+        self.assertTrue(km._union_claim_grant(901, "ws:owner"))
+        ok, _, _, unret = km._union_ops_merge([], [901], ckey="ws:bystander")
+        self.assertTrue(ok)
+        self.assertIn(901, unret, "the skipped retirement is NAMED so the panel re-ledgers")
+        self.assertEqual([r["gid"] for r in km._union_ops_load()], [901],
+                         "the claimed gesture survives the bystander's stale diff")
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_f_flags_fault_serves_last_known_good_and_caches_no_fabrication(self):
+        p = km.jd.STATE / "session-flags.json"
+        p.write_text(json.dumps({self.SID: {"postalServiceOff": True}}))
+        self.assertTrue(km._session_flag(self.SID, "postalServiceOff"))   # primes the copy
+        os.utime(p, (1, 1))                          # a new mtime key defeats the cache hit
+        os.chmod(p, 0)
+        try:
+            self.assertTrue(km._session_flag(self.SID, "postalServiceOff"),
+                            "an unreadable window serves the last-known-good copy (r57 "
+                            "P1.4) — one EIO used to deliver into an isolated session")
+        finally:
+            os.chmod(p, 0o644)
+        km._flags_cache.clear()                      # a fresh process with NO good read yet
+        os.utime(p, (2, 2))
+        os.chmod(p, 0)
+        try:
+            self.assertEqual(km._session_flags(), {})
+            self.assertEqual(km._flags_cache, {},
+                             "the fabricated {} must never enter the cache — cached under "
+                             "the real mtime key it kept serving after the fault cleared")
+        finally:
+            os.chmod(p, 0o644)
+        self.assertTrue(km._session_flag(self.SID, "postalServiceOff"),
+                        "…so the cleared fault reads the REAL flags again")
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_g_control_ledger_mutations_read_proved(self):
+        # r57 P1.5, executed there: one EIO folded auto-nudge to its default — flipping an
+        # explicit enabled:false back ON and erasing the standing nudge memos on the write
+        p = km.jd.STATE / "auto-nudge.json"
+        d = km._proved_ledger_read(p, "auto-nudge", {"enabled": True})
+        self.assertEqual(d, {"enabled": True})
+        d["x"] = 1                                   # the return is a COPY of the default
+        self.assertEqual(km._proved_ledger_read(p, "auto-nudge", {"enabled": True}),
+                         {"enabled": True})
+        p.write_text("[1, 2]")                       # valid bytes, wrong shape
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(km._proved_ledger_read(p, "auto-nudge", {"enabled": True}),
+                             {"enabled": True})
+        self.assertEqual(len(list(km.jd.STATE.glob("auto-nudge.json.corrupt-*"))), 1,
+                         "wrong-shaped bytes quarantine aside — never silently replaced")
+        p.write_text(json.dumps({"enabled": False, "nudged": {"g": 1}}))
+        os.chmod(p, 0)
+        try:
+            with self.assertRaises(km._StateUnreadable):
+                km._proved_ledger_read(p, "auto-nudge", {"enabled": True})
+            with self.assertRaises(km._StateUnreadable):
+                km._set_auto_nudge(True)             # the MUTATION refuses — never defaults
+        finally:
+            os.chmod(p, 0o644)
+        self.assertEqual(json.loads(p.read_text()), {"enabled": False, "nudged": {"g": 1}},
+                         "the refused write changed NOTHING")
+        km._set_auto_nudge(True)
+        d2 = json.loads(p.read_text())
+        self.assertIs(d2["enabled"], True)
+        self.assertEqual(d2["nudged"], {"g": 1}, "the honored write keeps sibling keys")
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_h_retry_pause_folds_toward_paused(self):
+        # r57 P1.5: the lenient reader answered False on EIO — un-stopping retries the user
+        # had explicitly paused
+        p = km.jd.STATE / "retry-paused.json"
+        self.assertFalse(km._retry_paused_on(), "provably no file: not paused")
+        p.write_text(json.dumps({"paused": True}))
+        self.assertTrue(km._retry_paused_on())
+        os.chmod(p, 0)
+        try:
+            self.assertTrue(km._retry_paused_on(), "the fault serves last-known-good")
+            km._retry_paused_cache[0] = None         # a fresh process with no history
+            self.assertTrue(km._retry_paused_on(),
+                            "…and with none folds toward PAUSED — the safe direction")
+        finally:
+            os.chmod(p, 0o644)
+        p.write_text(json.dumps({"paused": False}))
+        self.assertFalse(km._retry_paused_on())
+
+    def test_i_wrong_shaped_order_quarantines_not_proved_empty(self):
+        # r57 P2.16: {}-shaped bytes read as [] and the next drag PERSISTED over them —
+        # the user's saved order was unrecoverable
+        p = km.jd.STATE / "session-order.json"
+        p.write_text(json.dumps({"a": 1}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(km._session_order_proved(), [])
+        self.assertFalse(p.exists())
+        self.assertEqual(len(list(km.jd.STATE.glob("session-order.json.corrupt-*"))), 1,
+                         "the bytes move aside — a later writer can't silently erase them")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
@@ -900,11 +1080,11 @@ class R50UnionOpsAckAndConflicts(unittest.TestCase):
         # (the identity lock propagates loudly by design) was swallowed by the dispatcher and
         # NO unionOpsAck went out, leaking the panel's pending sync with no retry ever
         src = open(os.path.join(BIN, "romp-kernel")).read()
-        i = src.index('_uok, _unclaimed, _ureason = _union_ops_merge(')
+        i = src.index('_uok, _unclaimed, _ureason, _unret = _union_ops_merge(')
         window = src[max(0, i - 200):i]
         self.assertIn("try:", window, "the merge call is guarded")
         after = src[i:i + 500]
-        self.assertIn('_uok, _unclaimed, _ureason = False, [], "internal error"', after,
+        self.assertIn('_uok, _unclaimed, _ureason, _unret = False, [], "internal error", []', after,
                       "…and a raise answers ok:false, never silence")
 
     def test_union_ops_save_failure_answers_ok_false_with_the_opid(self):
@@ -1922,14 +2102,14 @@ class R54AuditFixes(unittest.TestCase):
         # ack NAMES gestures a completer already holds so the gate yields
         rows21 = [{"host": "TESTHOST-A", "gid": 21, "edit": {}, "inverse": {}, "rt": {},
                    "name": "pool", "dispatched": False}]
-        ok, unclaimed, _ = km._union_ops_merge(rows21, ckey="ws:9")
+        ok, unclaimed, _, _u4 = km._union_ops_merge(rows21, ckey="ws:9")
         self.assertTrue(ok)
         self.assertEqual(unclaimed, [], "the writer claims its own gesture at journal time")
         self.assertIsNone(km._union_claim_grant(21, "ws:other"), "the writer holds 21")
         km._union_claims.clear()
         km._union_retired_tombs.clear()
         self.assertIsNotNone(km._union_claim_grant(21, "ws:completer"))
-        ok, unclaimed, _ = km._union_ops_merge(rows21, ckey="ws:9")
+        ok, unclaimed, _, _u4 = km._union_ops_merge(rows21, ckey="ws:9")
         self.assertTrue(ok)
         self.assertEqual(unclaimed, [21],
                          "a completer-held gesture is named back to the writer")
@@ -1950,7 +2130,7 @@ class R54AuditFixes(unittest.TestCase):
         # stale epoch attempt its rekey
         km._union_claims_release("ws:comp")
         self.assertTrue(km._union_ops_set([], [7001]))
-        ok, _, reason = km._union_ops_merge(
+        ok, _, reason, _u4 = km._union_ops_merge(
             [{"host": "TESTHOST-A", "gid": 7002, "ogid": 7001, "edit": {}, "inverse": {},
               "rt": {}, "name": "pool", "dispatched": False}],
             [7001], ckey="ws:comp", rekey={"ogid": 7001, "gid": 7002, "epoch": epoch})
@@ -1962,7 +2142,7 @@ class R54AuditFixes(unittest.TestCase):
         # the healthy path: rows standing, epoch valid → the rekey commits atomically
         self._seed_rows(7003)
         epoch = km._union_claim_grant(7003, "ws:comp")
-        ok, _, reason = km._union_ops_merge(
+        ok, _, reason, _u4 = km._union_ops_merge(
             [{"host": "TESTHOST-A", "gid": 7004, "ogid": 7003, "edit": {}, "inverse": {},
               "rt": {}, "name": "pool", "dispatched": False}],
             [7003], ckey="ws:comp", rekey={"ogid": 7003, "gid": 7004, "epoch": epoch})
@@ -1972,7 +2152,7 @@ class R54AuditFixes(unittest.TestCase):
         self.assertTrue(km._union_ops_set([], [7004]))
         self._seed_rows(7005)
         km._union_claim_grant(7005, "ws:comp")
-        ok, _, reason = km._union_ops_merge(
+        ok, _, reason, _u4 = km._union_ops_merge(
             [], [7005], ckey="ws:comp", rekey={"ogid": 7005, "gid": 7006, "epoch": 999999})
         self.assertFalse(ok)
         self.assertIn("stale", reason or "")
@@ -1980,7 +2160,7 @@ class R54AuditFixes(unittest.TestCase):
         # writer the r56 claim-guard lets through
         self._seed_rows(7007)
         km._union_claim_grant(7007, "ws:x")
-        ok, _, _ = km._union_ops_merge([], [7007], ckey="ws:x")
+        ok, _, _, _u4 = km._union_ops_merge([], [7007], ckey="ws:x")
         self.assertTrue(ok)
         self.assertNotIn(7007, km._union_claims)
 
@@ -2200,13 +2380,13 @@ class R54AuditFixes(unittest.TestCase):
         # and come back named unclaimed, so the replaying gate yields.
         self._seed_rows(801)
         epoch = km._union_claim_grant(801, "ws:completer")
-        ok, _, _ = km._union_ops_merge(
+        ok, _, _, _u4 = km._union_ops_merge(
             [{"host": "TESTHOST-A", "gid": 802, "ogid": 801, "edit": {}, "inverse": {},
               "rt": {}, "name": "pool", "dispatched": True}],
             [801], ckey="ws:completer", rekey={"ogid": 801, "gid": 802, "epoch": epoch})
         self.assertTrue(ok)
         # the dead writer reconnects and replays its pre-ack rows (plain merge, gid 801)
-        ok, unclaimed, _ = km._union_ops_merge(
+        ok, unclaimed, _, _u4 = km._union_ops_merge(
             [{"host": "TESTHOST-A", "gid": 801, "edit": {}, "inverse": {}, "rt": {},
               "name": "pool", "dispatched": False}], ckey="ws:writer")
         self.assertTrue(ok)
@@ -2214,7 +2394,7 @@ class R54AuditFixes(unittest.TestCase):
         self.assertNotIn(801, [r["gid"] for r in km._union_ops_load()],
                          "…and the retired rows never re-enter the journal")
         # a replayed COMPLETION gate (its rows carry the tombstoned ogid) yields too
-        ok, unclaimed, _ = km._union_ops_merge(
+        ok, unclaimed, _, _u4 = km._union_ops_merge(
             [{"host": "TESTHOST-A", "gid": 803, "ogid": 801, "edit": {}, "inverse": {},
               "rt": {}, "name": "pool", "dispatched": False}], ckey="ws:writer")
         self.assertTrue(ok)
@@ -2298,12 +2478,12 @@ class R56AuditFixes(unittest.TestCase):
         # completion's compensation journal, and answered unclaimed over it
         self._seed(801)
         epoch = km._union_claim_grant(801, "ws:c")
-        ok, _, _ = km._union_ops_merge(
+        ok, _, _, _u4 = km._union_ops_merge(
             [{"host": "TESTHOST-A", "gid": 802, "ogid": 801, "olin": [801], "edit": {},
               "inverse": {}, "rt": {}, "name": "pool", "dispatched": False}],
             [801], ckey="ws:c", rekey={"ogid": 801, "gid": 802, "epoch": epoch})
         self.assertTrue(ok)
-        ok, unclaimed, _ = km._union_ops_merge(
+        ok, unclaimed, _, _u4 = km._union_ops_merge(
             [{"host": "TESTHOST-A", "gid": 802, "ogid": 801, "olin": [801], "edit": {},
               "inverse": {}, "rt": {}, "name": "pool", "dispatched": True}], ckey="ws:c")
         self.assertTrue(ok)
@@ -2312,7 +2492,7 @@ class R56AuditFixes(unittest.TestCase):
         self.assertEqual([(r["gid"], r["dispatched"]) for r in rows], [(802, True)],
                          "…and the compensation journal SURVIVES the healthy flip")
         # a REPLAY of the retired original (not resident) still tombstone-drops
-        ok, unclaimed, _ = km._union_ops_merge(
+        ok, unclaimed, _, _u4 = km._union_ops_merge(
             [{"host": "TESTHOST-A", "gid": 801, "edit": {}, "inverse": {}, "rt": {},
               "name": "pool", "dispatched": False}], ckey="ws:w")
         self.assertTrue(ok)
@@ -2336,24 +2516,38 @@ class R56AuditFixes(unittest.TestCase):
     def test_schema_poison_is_rejected_at_the_gate(self):
         # r56 P1.5, executed there: gid:[] wedged every later merge with a TypeError;
         # gid:1e309 persisted as Infinity and the browser refused the whole timeline frame
-        ok, _, reason = km._union_ops_merge(
+        ok, _, reason, _u4 = km._union_ops_merge(
             [{"host": "TESTHOST-A", "gid": [], "edit": {}, "inverse": {}, "rt": {},
               "name": "pool", "dispatched": False}])
         self.assertFalse(ok)
         self.assertIn("malformed", reason or "")
-        ok, _, _ = km._union_ops_merge(
+        ok, _, _, _u4 = km._union_ops_merge(
             [{"host": "TESTHOST-A", "gid": 1e309, "edit": {}, "inverse": {}, "rt": {},
               "name": "pool", "dispatched": False}])
         self.assertFalse(ok, "non-finite ids never persist")
         self.assertEqual(km._union_ops_load(), [])
-        # legacy poison already ON DISK is filtered from the echo and dropped at merge
+        # legacy poison already ON DISK makes the WHOLE journal unproved (r57 P1.3,
+        # superseding r56's silent filter: dropping the bad row let an unrelated acked
+        # merge treat the unresolved gesture as retired — no refusal, no quarantine, gone)
         km.jd.STATE.mkdir(parents=True, exist_ok=True)
         km._union_ops_path().write_text('[{"host": "TESTHOST-A", "gid": Infinity}]')
         with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
             echo = km._union_ops_echo()
-        self.assertEqual(echo, [], "Python's lenient parser ACCEPTS Infinity — the schema "
-                                   "filter strips it from the echo so the browser's strict "
-                                   "JSON.parse never refuses the timeline frame")
+        self.assertIsNone(echo, "one invalid stored row = NO INFORMATION, never a partial "
+                                "authoritative view")
+        q = list(km.jd.STATE.glob("union-gestures.json.corrupt-*"))
+        self.assertEqual(len(q), 1, "…and the bytes quarantined aside for forensics")
+        q[0].unlink()
+        # a MERGE over a poisoned journal refuses rather than persisting the drop
+        km._union_ops_path().write_text('[{"host": "TESTHOST-A", "gid": Infinity}]')
+        with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+            ok, _, reason, _u4 = km._union_ops_merge(
+                [{"host": "TESTHOST-B", "gid": 5, "edit": {}, "inverse": {}, "rt": {},
+                  "name": "pool", "dispatched": False}])
+        self.assertFalse(ok)
+        self.assertIn("quarantined", reason or "")
+        for q in km.jd.STATE.glob("union-gestures.json.corrupt-*"):
+            q.unlink()
 
     def test_mark_dispatched_matches_through_the_lineage(self):
         # r56 P1.3 (kernel half): dispatch evidence for a twice-completed gesture must match

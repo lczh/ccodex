@@ -245,6 +245,187 @@ class TmpOnlyIsUnpublished(unittest.TestCase):
                          "the failed publish cleaned its tmp file")
 
 
+
+
+class R57PostalDurability(unittest.TestCase):
+    """the v1.3.29 audit's postal half: _tl_append returned True with zero fsync calls
+    (P1.6), a non-UTF-8 seen ledger loaded as EMPTY and re-delivered recorded mids (P1.8),
+    relay effects preceded the durable dedupe — a crash replay double-delivered (P1.7), boot
+    filed `unpublished` over a half-durable publication and deleted its only payload (P1.9),
+    forwarded acks/bounces lived only in memory (P1.10), bounce settlement was process-local
+    (P1.11), receipts confirmed the RELAY id so /handoff-done requeued forever (P2.17), junk
+    exchange rows consumed the whole read budget (P2.19), isolation failed open (P1.4)."""
+
+    HOST = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+    def setUp(self):
+        _reset()
+        pm._seen_ids = None
+        try:
+            pm.PEER_SEEN.unlink()
+        except OSError:
+            pass
+        pm._bounced_done.clear()
+        pm._bounced_done_loaded[0] = False
+        pm._postal_off_cache[0] = None
+        for p in (pm._bounced_done_path(), pm._backflow_path(), pm.RECEIPTS_DONE,
+                  pm.SESSION_FLAGS):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        with pm._peer_lock:
+            pm._peer_pending.clear()
+        shutil.rmtree(pm.OUTBOX / self.HOST, ignore_errors=True)
+        shutil.rmtree(pm.RECEIPTBOX / self.HOST, ignore_errors=True)
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_terminal_log_append_is_fsynced(self):
+        seen = []
+        real = os.fsync
+
+        def spy(fd):
+            seen.append(os.fstat(fd).st_ino)
+            real(fd)
+
+        pm.os.fsync = spy
+        try:
+            self.assertTrue(pm._tl_append("messages.jsonl", {"t": 1, "ev": "sent", "id": "x"}))
+        finally:
+            pm.os.fsync = real
+        self.assertIn((pm.TLDIR / "messages.jsonl").stat().st_ino, seen,
+                      "True means DURABLE: fsync ran on the log's own fd (r57 P1.6)")
+
+    def test_b_fsync_failure_refuses_append_and_delivery(self):
+        real = os.fsync
+
+        def boom(fd):
+            raise OSError(5, "EIO")
+
+        mb = pm._mailbox(SID)
+        pm.os.fsync = boom
+        try:
+            self.assertFalse(pm._tl_append("messages.jsonl", {"t": 1}),
+                             "an unsynced row must never report durable")
+            with self.assertRaises(RuntimeError):
+                pm.deliver(SID, "peer", SID2, "hello")
+        finally:
+            pm.os.fsync = real
+        self.assertEqual(list((mb / "new").iterdir()), [],
+                         "no mail publishes over a lost accounting record")
+
+    def test_c_non_utf8_seen_ledger_holds_the_verdict(self):
+        pm.PEER_SEEN.parent.mkdir(parents=True, exist_ok=True)
+        pm.PEER_SEEN.write_bytes(b"\xff\xfe not utf8\n")
+        pm._seen_ids = None
+        self.assertIsNone(pm.peer_seen_check("a" * 32),
+                          "corrupt bytes are NO INFORMATION — never a fresh ledger (r57 "
+                          "P1.8); the relay path drops and the peer re-sends")
+        self.assertEqual(pm.PEER_SEEN.read_bytes(), b"\xff\xfe not utf8\n",
+                         "…and the records are preserved for recovery, not clobbered")
+
+    def test_d_relayed_delivery_is_idempotent_by_relay_mid(self):
+        mid = "ab" * 16
+        via = "cd" * 16
+        pm.deliver(SID, "peer", SID2, "hello", relay_mid=mid, relay_via=via)
+        pm.deliver(SID, "peer", SID2, "hello", relay_mid=mid, relay_via=via)  # crash replay
+        files = [f.name for f in (pm._mailbox(SID) / "new").iterdir()]
+        self.assertEqual(files, ["r-" + mid],
+                         "the replay lands on the SAME unread file — one delivery (r57 "
+                         "P1.7), where the random name minted a duplicate")
+
+    def test_e_phase_marker_republishes_the_lost_final(self):
+        # r57 P1.9, executed there: crash after link+failed-fsync lost the final's dir
+        # entry; boot filed `unpublished` and deleted the stage — the ONLY payload copy
+        d = pm.OUTBOX / self.HOST
+        d.mkdir(parents=True, exist_ok=True)
+        mid = "cd" * 16
+        st = d / (".stage-" + mid)
+        st.write_text(json.dumps({"body": "payload"}))
+        (d / (".pubphase-" + mid)).write_text("1")
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm._reconcile_relay_stages()
+        self.assertEqual((d / (mid + ".json")).read_text(), json.dumps({"body": "payload"}),
+                         "a standing phase marker means outcome UNKNOWN — boot RE-PUBLISHES")
+        self.assertFalse(st.exists(), "…retiring the stage in the same step")
+        self.assertFalse((d / (".pubphase-" + mid)).exists(),
+                         "…and the settled marker is cleared")
+
+    def test_f_backflow_survives_the_restart(self):
+        mid, bmid = "11" * 16, "22" * 16
+        with pm._peer_lock:
+            p = pm._peer_pending.setdefault(self.HOST, {"acks": [], "bounces": [],
+                                                        "readAcks": [], "handoffDoneAcks": []})
+            p["acks"].append(mid)
+            p["bounces"].append({"mid": bmid, "reason": "gone"})
+            pm._backflow_save_locked()
+            pm._peer_pending.clear()                 # the process died mid-flight
+        pm._backflow_load()
+        with pm._peer_lock:
+            q = pm._peer_pending.get(self.HOST)
+        self.assertEqual(q["acks"], [mid],
+                         "a forwarded ack survives the dropped response (r57 P1.10)")
+        self.assertEqual(q["bounces"], [{"mid": bmid, "reason": "gone"}])
+
+    def test_g_bounce_settlement_survives_the_restart(self):
+        mid = "33" * 16
+        self.assertTrue(pm._bounced_done_add(self.HOST, mid))
+        pm._bounced_done.clear()
+        pm._bounced_done_loaded[0] = False           # a fresh process
+        self.assertTrue(pm._bounced_done_has(self.HOST, mid),
+                        "settlement is durable — the return note never re-sends (r57 P1.11)")
+        self.assertFalse(pm._bounced_done_has(self.HOST, "44" * 16))
+
+    def test_h_receipt_confirmation_keys_on_the_delivery_id(self):
+        rmid, dmid = "55" * 16, "66" * 16
+        pm.receiptbox_put(self.HOST, rmid, dmid=dmid)
+        row = json.loads((pm.RECEIPTBOX / self.HOST / (rmid + ".json")).read_text())
+        self.assertEqual(row.get("dmid"), dmid, "the park records the DELIVERY id")
+        pm.receiptbox_del(self.HOST, rmid)
+        done = json.loads(pm.RECEIPTS_DONE.read_text())
+        self.assertIn(dmid, done,
+                      "confirmation marks the id /handoff-done re-posts (r57 P2.17: marking "
+                      "the relay id re-parked the receipt forever)")
+        self.assertNotIn(rmid, done)
+
+    def test_i_junk_rows_do_not_consume_the_read_budget(self):
+        cap = pm.PEER_LIST_LIMITS["reads"]
+        rows = [123] * (cap + 50) + [{"mid": "77" * 16, "t": 5}]
+        out = pm._peer_read_rows(rows)
+        self.assertEqual([r["mid"] for r in out], ["77" * 16],
+                         "junk is discarded WITHOUT spending the cap (r57 P2.19: numeric "
+                         "rows hid every valid receipt behind them)")
+
+    def test_j_isolation_fails_closed_with_last_known_good(self):
+        # r57 P1.4, executed there: one EIO read isolation as OFF and a peer message was
+        # delivered and ACKed into a durably-isolated session
+        pm.SESSION_FLAGS.parent.mkdir(parents=True, exist_ok=True)
+        pm.SESSION_FLAGS.write_text(json.dumps({SID: {"postalServiceOff": True}}))
+        self.assertTrue(pm._postal_off(SID))         # a good read primes the copy
+        pm.SESSION_FLAGS.write_text("{not valid json")
+        self.assertTrue(pm._postal_off(SID), "the fault serves the copy — still isolated")
+        pm.SESSION_FLAGS.write_text(json.dumps({SID: {"postalServiceOff": False}}))
+        self.assertFalse(pm._postal_off(SID))
+        pm.SESSION_FLAGS.write_text("{not valid json")
+        self.assertFalse(pm._postal_off(SID), "…and un-isolation holds over a fault too")
+        pm._postal_off_cache[0] = None               # a fresh process with no history
+        self.assertTrue(pm._postal_off(SID),
+                        "no history + unreadable: CLOSED — isolation is safety state")
+        pm.SESSION_FLAGS.unlink()
+        self.assertFalse(pm._postal_off(SID), "provably no flags: not isolated")
+
+    def test_k_the_quiet_bus_drains_the_retry_queues(self):
+        # r57 P2.20: the pumps were event-paced only (ack arrivals, dials) — a recovered
+        # queued row on a QUIET bus starved forever. The maintenance loop drains too.
+        src = open(os.path.join(BIN, "romp-postal-service")).read()
+        fn = src.index("def _monitor(")
+        body = src[fn:fn + 2400]
+        self.assertIn("_drain_postal_retries()", body,
+                      "the periodic monitor pumps queued terminal rows and parked bounces")
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -292,12 +473,22 @@ class R50RelayStages(unittest.TestCase):
                          "the resolved stage is spent")
 
     def test_a_stage_beside_its_outbox_file_just_drops(self):
-        # a crash AFTER the publish, before the stage unlink: the mail is real — no row
-        (self.hd / ".stage-px-202.1_888.TESTHOST").write_text("1")
-        (self.hd / "px-202.1_888.TESTHOST.json").write_text(json.dumps({"mid": "x"}))
+        # a crash AFTER the publish, before the stage unlink: the mail is real — no row.
+        # CONTENT decides since r57 P1.9: identical bytes = this stage's message published
+        body = json.dumps({"mid": "px-202.1_888.TESTHOST"})
+        (self.hd / ".stage-px-202.1_888.TESTHOST").write_text(body)
+        (self.hd / "px-202.1_888.TESTHOST.json").write_text(body)
         self.assertEqual(pm._reconcile_relay_stages(), 0)
         self.assertEqual([r for r in _rows() if r.get("ev") == "unpublished"], [])
         self.assertFalse((self.hd / ".stage-px-202.1_888.TESTHOST").exists())
+        # …while a DIFFERENT same-mid final keeps BOTH copies (the r57 audit's P1.9: boot
+        # used to spend the staged payload's only copy over someone else's final)
+        (self.hd / ".stage-px-203.1_999.TESTHOST").write_text("the staged message")
+        (self.hd / "px-203.1_999.TESTHOST.json").write_text("a different message")
+        with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+            pm._reconcile_relay_stages()
+        self.assertTrue((self.hd / ".stage-px-203.1_999.TESTHOST").exists())
+        self.assertTrue((self.hd / "px-203.1_999.TESTHOST.json").exists())
 
     def test_a_failed_terminal_append_retains_the_stage(self):
         # the row could not land -> the stage must survive to the NEXT bus start; consuming it
@@ -981,6 +1172,11 @@ class R56DurableBeforeAck(unittest.TestCase):
         pm._pending_bounces.clear()
         pm._pending_bounces_loaded[0] = False
         pm._bounced_done.clear()
+        pm._bounced_done_loaded[0] = False
+        try:
+            pm._bounced_done_path().unlink()
+        except OSError:
+            pass
         pm._seen_ids = None
         pm._seen_pending_durable.clear()
         for p in (pm._pending_bounces_path(), pm.PEER_SEEN):

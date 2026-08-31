@@ -32,6 +32,8 @@ class HiddenFromFeed(unittest.TestCase):
         self._saved_state = jd.STATE
         self._td = tempfile.mkdtemp()
         jd._rebind_state(Path(self._td))   # rebind STATE *and* its derived dirs, not just STATE (avoid live-state leak)
+        jd._hidden_lkg[0] = None           # the r57 last-known-good copy is process-global —
+        #                                    a leftover verdict would leak across tests
 
     def tearDown(self):
         jd._rebind_state(self._saved_state)
@@ -47,9 +49,23 @@ class HiddenFromFeed(unittest.TestCase):
         self.assertTrue(jd._hidden_from_feed(MUTED))
         self.assertFalse(jd._hidden_from_feed(VISIBLE), "a different session is unaffected")
 
-    def test_reader_fails_open_on_corruption(self):
+    def test_reader_holds_the_mute_on_corruption(self):
+        # r57 P1.4 REVERSES the old fail-open pin: one unreadable window used to UN-mute a
+        # session into judge planning. With no history the judge holds off (hidden) — a
+        # skipped pass is recoverable; planning a muted session is the harm.
         (jd.STATE / "session-flags.json").write_text("{not valid json")
-        self.assertFalse(jd._hidden_from_feed(MUTED), "a corrupt flags file must NOT wedge the judge")
+        self.assertTrue(jd._hidden_from_feed(MUTED),
+                        "unreadable flags with NO good read yet: hold off, never un-mute")
+
+    def test_reader_serves_last_known_good_over_a_fault(self):
+        self._mute(MUTED)
+        self.assertTrue(jd._hidden_from_feed(MUTED))         # a good read primes the copy
+        (jd.STATE / "session-flags.json").write_text("{not valid json")
+        self.assertTrue(jd._hidden_from_feed(MUTED), "the fault serves the copy — still muted")
+        self.assertFalse(jd._hidden_from_feed(VISIBLE),
+                         "…and the copy answers for UNMUTED sessions too — planning goes on")
+        (jd.STATE / "session-flags.json").unlink()
+        self.assertFalse(jd._hidden_from_feed(MUTED), "provably no flags: not hidden")
 
     def test_postaloff_does_not_stop_tracking(self):
         self._mute(MUTED, flag="postalServiceOff")

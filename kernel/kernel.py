@@ -1625,6 +1625,10 @@ def _session_order_proved():
     the held type so no writer can persist a fabricated [] over the user's saved order.
     A seam by design — the ordering tests inject the persisted order here."""
     raw = _read_state_json(jd.STATE / "session-order.json", "session-order")
+    if raw is not None and raw is not _QUARANTINED and not isinstance(raw, list):
+        _quarantine_wrong_shape(jd.STATE / "session-order.json", "session-order",
+                                lambda v: isinstance(v, list))   # r57: {}-shaped bytes were
+        raw = _QUARANTINED                                       # proved-empty and OVERWRITTEN
     return jd.canonicalize_session_identity(
         [x for x in raw if isinstance(x, str)] if isinstance(raw, list) else [])
 
@@ -2306,39 +2310,55 @@ def _quarantine_state_bytes(path, what, fingerprint=None):
     malformed bytes, a concurrent writer committed a VALID journal, and the pathname-keyed
     quarantine unlinked the valid replacement) — a mismatch means the judged bytes are gone
     and there is nothing left to move."""
-    if fingerprint is not None:
-        try:
-            st = path.stat()
-            if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != fingerprint:
-                return                               # a concurrent atomic writer replaced it
-        except FileNotFoundError:
-            return                                   # consumed concurrently — nothing to move
-        except OSError:
-            raise _StateUnreadable("quarantine fingerprint check failed")
-    _qerr = None
-    for _ in range(3):
-        qp = path.with_name(path.name + ".corrupt-%d-%d-%s"
-                            % (int(time.time()), os.getpid(), os.urandom(16).hex()))
-        try:
-            os.link(path, qp)                        # EEXIST refuses instead of replacing
-        except FileExistsError:
-            continue                                 # fresh name, try again
-        except OSError as e:
+    try:
+        _qfd = os.open(str(path), os.O_RDONLY)
+    except FileNotFoundError:
+        return                                       # consumed concurrently — nothing to move
+    except OSError:
+        raise _StateUnreadable("quarantine open failed")
+    try:
+        _qst = os.fstat(_qfd)
+        if fingerprint is not None and ((_qst.st_dev, _qst.st_ino, _qst.st_size,
+                                         _qst.st_mtime_ns) != fingerprint):
+            return                                   # a concurrent atomic writer replaced it
+        _qerr = None
+        for _ in range(3):
+            qp = path.with_name(path.name + ".corrupt-%d-%d-%s"
+                                % (int(time.time()), os.getpid(), os.urandom(16).hex()))
             try:
-                if qp.exists():
-                    continue
-                path.rename(qp)
-            except OSError as e2:
-                _qerr = e2
-                break
+                # link the VERIFIED INODE, not the pathname (the r57 audit's P1.2, executed
+                # there: a concurrent locked writer replaced the path between the fingerprint
+                # check and a pathname link, and the writer's VALID commit was quarantined)
+                os.link("/proc/self/fd/%d" % _qfd, str(qp), follow_symlinks=True)
+            except FileExistsError:
+                continue                             # fresh name, try again
+            except OSError:
+                # no /proc (or no links): fall back to the fingerprint-checked rename —
+                # narrower guarantee, kept for portability
+                try:
+                    _st2 = path.stat()
+                    if fingerprint is not None and ((_st2.st_dev, _st2.st_ino, _st2.st_size,
+                                                     _st2.st_mtime_ns) != fingerprint):
+                        return
+                    if qp.exists():
+                        continue
+                    path.rename(qp)
+                except OSError as e2:
+                    _qerr = e2
+                    break
+                sys.stderr.write("%s: malformed content quarantined as %s\n" % (what, qp.name))
+                return
+            try:
+                # retire the source ONLY while the path still bears the judged inode
+                _st3 = os.stat(str(path))
+                if (_st3.st_dev, _st3.st_ino) == (_qst.st_dev, _qst.st_ino):
+                    os.unlink(str(path))
+            except OSError:
+                pass                                 # a lingering source just re-quarantines
             sys.stderr.write("%s: malformed content quarantined as %s\n" % (what, qp.name))
             return
-        try:
-            path.unlink()                            # the copy is safe; retire the source
-        except OSError:
-            pass                                     # a lingering source just re-quarantines
-        sys.stderr.write("%s: malformed content quarantined as %s\n" % (what, qp.name))
-        return
+    finally:
+        os.close(_qfd)
     sys.stderr.write("%s: malformed content and the quarantine failed — refusing to "
                      "treat it as empty\n" % what)
     raise _StateUnreadable(*((_qerr.args if _qerr else ()) or ("quarantine failed",)))
@@ -2438,9 +2458,20 @@ def _union_ops_echo():
         except OSError:
             pass
         return None
-    return [r for r in rows if isinstance(r, dict) and _union_row_valid(r)]
-    #        ^ schema-filtered (r56 P1.5): a legacy Infinity gid rode the payload as invalid
-    #          JSON and the browser refused the whole timeline frame
+    if any(not (isinstance(r, dict) and _union_row_valid(r)) for r in rows):
+        # ONE invalid stored row makes the WHOLE journal unproved (the r57 audit's P1.3,
+        # executed there: silently filtering the bad row let an unrelated acked merge treat
+        # the unresolved gesture as retired — no refusal, no quarantine, gone). Quarantine
+        # the file (bytes preserved) and answer "no information".
+        try:
+            _quarantine_wrong_shape(_union_ops_path(), "union-gestures",
+                                    lambda v: isinstance(v, list)
+                                    and all(isinstance(r, dict) and _union_row_valid(r)
+                                            for r in v))
+        except OSError:
+            pass
+        return None
+    return [r for r in rows]
 
 
 def _union_row_valid(r):
@@ -2463,6 +2494,8 @@ def _union_row_valid(r):
         if not (isinstance(r["olin"], list)
                 and all(_safe_int(x, 1, _MAX) for x in r["olin"])):
             return False
+    if "dispatched" in r and not isinstance(r.get("dispatched"), bool):
+        return False     # r57: dispatched:0 slid through the is-False checks as truthy-ish
     for k in ("host", "name", "oldName", "oldColor"):
         if k in r and r[k] is not None and not isinstance(r[k], str):
             return False
@@ -2472,7 +2505,7 @@ def _union_row_valid(r):
 def _union_ops_set(entries, retired=None):
     """The boolean shim over _union_ops_merge — refusal journaling and every caller that
     needs no claim semantics keep their old contract."""
-    ok, _, _ = _union_ops_merge(entries, retired)
+    ok, _, _, _ = _union_ops_merge(entries, retired)
     return ok
 
 
@@ -2505,22 +2538,30 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             # compensation record a multi-host edit needed
             sys.stderr.write("union-gestures: unreadable — refusing to merge over an "
                              "unproved read\n")
-            return False, [], "the journal is unreadable"
+            return False, [], "the journal is unreadable", []
         if _raw is not None and _raw is not _QUARANTINED and not isinstance(_raw, list):
             _quarantine_wrong_shape(_union_ops_path(), "union-gestures",
                                     lambda v: isinstance(v, list))   # r55 P2.10 + r56 fp
         cur = [r for r in _raw if isinstance(r, dict)] if isinstance(_raw, list) else []
-        _cur_bad = [r for r in cur if not _union_row_valid(r)]
-        if _cur_bad:
-            sys.stderr.write("union-gestures: dropping %d stored schema-invalid row(s) — "
-                             "legacy poison (r56 P1.5)\n" % len(_cur_bad))
-            cur = [r for r in cur if _union_row_valid(r)]
+        if any(not _union_row_valid(r) for r in cur):
+            # ONE invalid stored row poisons the whole journal (r57 P1.3: the r56 drop-and-log
+            # silently RETIRED the unresolved gesture through an unrelated acked merge) —
+            # quarantine the file whole and refuse this write; panels hold their mirrors
+            # (the echo answers None) and re-mint the store on their next sync
+            try:
+                _quarantine_wrong_shape(_union_ops_path(), "union-gestures",
+                                        lambda v: isinstance(v, list)
+                                        and all(isinstance(r, dict) and _union_row_valid(r)
+                                                for r in v))
+            except OSError:
+                pass
+            return False, [], "the journal held invalid rows and was quarantined — retry", []
         inc = [r for r in (entries if isinstance(entries, list) else []) if isinstance(r, dict)]
         if any(not _union_row_valid(r) for r in inc):
             # REJECT the whole write (the r56 audit's P1.5): one gid:[] row wedged every
             # later merge; one 1e309 rode the wire as Infinity and the browser refused the
             # whole timeline frame
-            return False, [], "malformed entry (ids must be finite safe integers; "                               "string fields must be strings)"
+            return False, [], "malformed entry (ids must be finite safe integers; "                               "string fields must be strings)", []
         if rekey:
             # the completion CAS (r55 P1.4): the claim must still be THIS claimant's epoch,
             # and the original rows must still stand — both checked under the SAME lock the
@@ -2528,14 +2569,14 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             try:
                 _ogid = int(rekey.get("ogid") or 0)
                 _epoch = int(rekey.get("epoch") or 0)
-            except (TypeError, ValueError):
-                _ogid, _epoch = 0, 0
+            except (TypeError, ValueError, OverflowError):
+                _ogid, _epoch = 0, 0     # r57: float('inf') raised OverflowError into a 500
             with _union_claims_lock:
                 _ccur = _union_claims.get(_ogid)
             if not (_ccur and _ccur.get("epoch") == _epoch and _ccur.get("ckey") == ckey):
-                return False, [], "the completion claim is stale — re-claim and retry"
+                return False, [], "the completion claim is stale — re-claim and retry", []
             if not any(r.get("gid") == _ogid and not r.get("refusal") for r in cur):
-                return False, [], "the gesture settled while the claim was held"
+                return False, [], "the gesture settled while the claim was held", []
         # the DISPATCH RATCHET (the r53 wave-3 verification): 'the effects ran' is one-way
         # evidence — an adopter panel's full-replace mirror of rows it seeded BEFORE the
         # writer's dispatched:true flip regressed the journal to false and re-armed the
@@ -2553,6 +2594,7 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                 ret.add(int(g))
             except (TypeError, ValueError):
                 pass
+        _unretired = []
         if ret:
             with _union_claims_lock:
                 _held_elsewhere = {g for g in ret
@@ -2568,6 +2610,7 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                 sys.stderr.write("union-gestures: skipping retirement of %d gid(s) held by "
                                  "another client's live claim\n" % len(_held_elsewhere))
                 ret -= _held_elsewhere
+                _unretired = sorted(_held_elsewhere)
         inc_keys = {(r.get("gid"), r.get("host")) for r in inc}
         _cutoff = time.time() - 7 * 86400
         rows = [r for r in cur if (r.get("gid"), r.get("host")) not in inc_keys
@@ -2602,7 +2645,7 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             _atomic_write(_union_ops_path(), json.dumps(rows, allow_nan=False))
         except Exception:
             sys.stderr.write("union-gestures save: %s\n" % traceback.format_exc())
-            return False, [], "the journal write failed"
+            return False, [], "the journal write failed", []
         with _union_claims_lock:
             for g in ret:
                 _union_claims.pop(g, None)       # claims retire WITH their rows (r55 P3.19)
@@ -2615,7 +2658,7 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
         for g in _tombed:
             if g not in unclaimed:
                 unclaimed.append(g)              # tombstoned: the replaying gate must yield
-        return True, unclaimed, None
+        return True, unclaimed, None, _unretired
 
 
 def _union_ops_mark_dispatched(gid, host):
@@ -3545,8 +3588,14 @@ def _session_flags():
     p = jd.STATE / "session-flags.json"
     try:
         st = p.stat(); key = (st.st_mtime_ns, st.st_size)   # ns + size → no stale hit on rapid toggles
-    except OSError:
+    except FileNotFoundError:
         return {}
+    except OSError:
+        # r57 P1.4: isolation and mute are SAFETY state — an unreadable window serves the
+        # last-known-good copy, never a fabricated {} (which delivered into an isolated
+        # session and, cached, kept doing so after the fault cleared)
+        hit = _flags_cache.get(str(p))
+        return hit[1] if hit is not None else {}
     hit = _flags_cache.get(str(p))
     if hit is not None and hit[0] == key:
         return hit[1]
@@ -3554,8 +3603,14 @@ def _session_flags():
         d = jd.canonicalize_session_flags_identity(json.loads(p.read_text()))
         if not isinstance(d, dict):
             d = {}
-    except Exception:
+    except FileNotFoundError:
         d = {}
+    except Exception:
+        # a READ/PARSE fault serves the last-known-good copy and CACHES NOTHING (the r57
+        # audit's P1.4: the fabricated {} was cached under the real mtime key and kept
+        # serving un-isolation after the fault cleared)
+        hit = _flags_cache.get(str(p))
+        return hit[1] if hit is not None else {}
     _flags_cache[str(p)] = (key, d)
     return d
 
@@ -3726,7 +3781,8 @@ def _set_notify_card(item_id, value, sid=""):
         item_id = jd.canonicalize_goal_identity(item_id)
         sid = jd.canonicalize_session_identity(sid)
         cur = jd.canonicalize_goal_keyed_map(
-            dict(_notify_cards()))                   # commit-time snapshot + identity
+            _proved_ledger_read(jd.STATE / "notify-cards.json", "notify-cards", {}))
+        #     ^ PROVED RMW (r57 P1.5: an EIO snapshot erased every standing bell override)
         default = _session_flag_raw(sid, "notify")
         if default is None:
             default = bool(cur.get(NOTIFY_ALL_KEY))
@@ -3877,8 +3933,22 @@ def _write_auto_nudge(d):
         _atomic_write(jd.STATE / "auto-nudge.json", json.dumps(d))
 
 
+def _proved_ledger_read(path, what, default):
+    """A control-ledger MUTATION snapshot (the r57 audit's P1.5, executed there: one EIO
+    folded auto-nudge to its default — flipping an explicit enabled:false back ON — erased
+    standing retry suppressions on the next write, and dropped every notify override and
+    push subscription). Only ENOENT is the default; unreadable RAISES the held type;
+    wrong-shape valid bytes quarantine aside."""
+    raw = _read_state_json(path, what)
+    if raw is not None and raw is not _QUARANTINED and not isinstance(raw, dict):
+        _quarantine_wrong_shape(path, what, lambda v: isinstance(v, dict))
+        raw = _QUARANTINED
+    return dict(raw) if isinstance(raw, dict) else dict(default)
+
+
 def _set_auto_nudge(enabled):
-    d = dict(_auto_nudge_data())
+    d = _proved_ledger_read(jd.STATE / "auto-nudge.json", "auto-nudge",
+                            {"enabled": True, "nudged": {}})   # PROVED RMW (r57 P1.5)
     d["enabled"] = bool(enabled)
     _write_auto_nudge(d)
 
@@ -5768,13 +5838,23 @@ def _set_auto_update_remotes(enabled):
     _atomic_write(jd.STATE / "auto-update-remotes.json", json.dumps({"enabled": bool(enabled)}))
 
 
+_retry_paused_cache = [None]           # last-known-good verdict (r57 P1.5)
+
+
 def _retry_paused_on():
     p = jd.STATE / "retry-paused.json"
     try:
         d = json.loads(p.read_text())
-        return bool(d.get("paused"))
-    except Exception:
+        v = bool(d.get("paused")) if isinstance(d, dict) else False
+        _retry_paused_cache[0] = v
+        return v
+    except FileNotFoundError:
+        _retry_paused_cache[0] = False
         return False
+    except Exception:
+        # an unreadable window must not REVERSE the user's explicit Stop (r57 P1.5) —
+        # last-known-good, else PAUSED (the safe direction for a stop flag)
+        return _retry_paused_cache[0] if _retry_paused_cache[0] is not None else True
 
 
 def _set_retry_paused(paused, reason=""):
@@ -28573,13 +28653,16 @@ def _save_push_subs(subs):
 
 
 def _set_push_sub(sub):
-    cur = dict(_push_subs())
+    cur = _proved_ledger_read(jd.STATE / "push-subscriptions.json",
+                              "push-subscriptions", {})   # PROVED RMW (r57 P1.5: one EIO
+    #                                                        erased every other device's sub)
     cur[sub["endpoint"]] = sub
     _save_push_subs(cur)
 
 
 def _del_push_sub(endpoint):
-    cur = dict(_push_subs())
+    cur = _proved_ledger_read(jd.STATE / "push-subscriptions.json",
+                              "push-subscriptions", {})
     if cur.pop(endpoint, None) is not None:
         _save_push_subs(cur)
 
@@ -28693,7 +28776,11 @@ def _push_notify(title, body, sid="", badge=None):
             except Exception:
                 pass                               # one bad subscription must not block the rest
         for ep in dead:
-            _del_push_sub(ep)
+            try:
+                _del_push_sub(ep)
+            except _StateUnreadable:
+                print("[romp] push prune skipped: subscription store unreadable", file=sys.stderr)
+                break                        # the same fault answers every sibling — stop here
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -33175,15 +33262,21 @@ class Handler(BaseHTTPRequestHandler):
                     _vapid_keys()                 # fail HERE, loudly, if the crypto dep is missing —
                 except RuntimeError as e:         # never store a subscription we can't deliver to
                     return self._send(500, str(e), "text/plain")
-                _set_push_sub({"endpoint": ep, "keys": {"p256dh": str(keys["p256dh"]),
-                                                        "auth": str(keys["auth"])}})
+                try:
+                    _set_push_sub({"endpoint": ep, "keys": {"p256dh": str(keys["p256dh"]),
+                                                            "auth": str(keys["auth"])}})
+                except _StateUnreadable:
+                    return self._send(503, "subscription store unreadable — retry", "text/plain")
                 return self._send(200, json.dumps({"ok": True}), "application/json")
             if u.path == "/push/unsubscribe":
                 try:
                     ep = str(json.loads(raw_body or b"{}").get("endpoint") or "")
                 except (ValueError, AttributeError):
                     return self._send(400, "bad json", "text/plain")
-                _del_push_sub(ep)
+                try:
+                    _del_push_sub(ep)
+                except _StateUnreadable:
+                    return self._send(503, "subscription store unreadable — retry", "text/plain")
                 return self._send(200, json.dumps({"ok": True}), "application/json")
             if u.path == "/push/relay":
                 # A federated peer mirroring its bell events into THIS kernel's subscriptions
@@ -33647,13 +33740,15 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(400, json.dumps({"ok": False,
                                                        "error": "entries must be a JSON list"}),
                                       "application/json")
-                ok, _ucl, _ureason = _union_ops_merge(
+                ok, _ucl, _ureason, _unret = _union_ops_merge(
                     b["entries"], b.get("retired"),
                     ckey=("cid:" + str(b["cid"])[:64]) if b.get("cid") else None,
                     rekey=b.get("rekey") if isinstance(b.get("rekey"), dict) else None)
                 _uans = {"ok": ok}
                 if _ucl:
                     _uans["unclaimed"] = _ucl         # a completer owns these (r54 P1.3)
+                if _unret:
+                    _uans["unretired"] = _unret       # skipped over a live claim (r57)
                 if not ok and _ureason:
                     _uans["error"] = _ureason
                 if b.get("opId"):
@@ -34382,11 +34477,11 @@ class Handler(BaseHTTPRequestHandler):
             # idempotent — a full replace, no per-op protocol to desync), and re-seeds from the
             # payload echo after a reload
             try:
-                _uok, _unclaimed, _ureason = _union_ops_merge(
+                _uok, _unclaimed, _ureason, _unret = _union_ops_merge(
                     msg["entries"], msg.get("retired"), ckey="ws:%d" % id(client),
                     rekey=msg.get("rekey") if isinstance(msg.get("rekey"), dict) else None)
             except Exception:
-                _uok, _unclaimed, _ureason = False, [], "internal error"
+                _uok, _unclaimed, _ureason, _unret = False, [], "internal error", []
                 sys.stderr.write("setUnionOps: %s\n" % traceback.format_exc())
             try:
                 # the correlated ack (the r50 verification: the save's failure was discarded and
@@ -34394,6 +34489,10 @@ class Handler(BaseHTTPRequestHandler):
                 _uans = {"type": "unionOpsAck", "ok": bool(_uok)}
                 if _unclaimed:
                     _uans["unclaimed"] = _unclaimed   # a completer owns these — the gate yields (r54)
+                if _unret:
+                    _uans["unretired"] = _unret   # skipped over a live claim (r57 P2: the
+                    #                               silent skip let the panel drop its ledger
+                    #                               entry, and the retirement never re-sent)
                 if not _uok and _ureason:
                     _uans["error"] = _ureason
                 if msg.get("opId"):
@@ -34504,7 +34603,11 @@ class Handler(BaseHTTPRequestHandler):
                 client["send"](json.dumps({"type": "warn",
                                            "text": "value must be a JSON boolean (true/false)."}))
                 return
-            _set_notify_card(str(msg["itemId"]), msg["value"], str(msg.get("sid") or ""))
+            try:
+                _set_notify_card(str(msg["itemId"]), msg["value"], str(msg.get("sid") or ""))
+            except _StateUnreadable:
+                client["send"](json.dumps({"type": "warn",
+                    "text": "the notify store is unreadable — nothing changed; retry."}))
             _mark_views_dirty()
         elif msg and msg.get("type") == "setSessionColor" and msg.get("id") and msg.get("bg"):
             # tab right-click color picker → override the session's identity color (persisted to the names
@@ -34516,7 +34619,12 @@ class Handler(BaseHTTPRequestHandler):
                 client["send"](json.dumps({"type": "warn",
                                            "text": "enabled must be a JSON boolean (true/false)."}))
                 return
-            _set_auto_nudge(msg["enabled"])         # feed gear → server-side Auto Nudge on/off
+            try:
+                _set_auto_nudge(msg["enabled"])     # feed gear → server-side Auto Nudge on/off
+            except _StateUnreadable:
+                client["send"](json.dumps({"type": "warn",
+                    "text": "the nudge store is unreadable — nothing changed; retry."}))
+                return
             # act immediately on turn-on (don't wait 4s) — but skip the dead-wait sweep: the
             # death transition has ONE observer (the pusher's tick; see _auto_nudge_tick), and
             # this WS thread racing its prev-swap could spend a transition uncorroborated

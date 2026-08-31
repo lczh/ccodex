@@ -8401,6 +8401,9 @@ def _plan_session(fsid, path, now):
     rollup_status(store, _session_settled(fsid, path, session, store))
     save_goals(fsid, store)
     return placed
+_hidden_lkg = [None]                     # last-known-good session-flags (r57 P1.4)
+
+
 def _hidden_from_feed(fsid):
     """True if the session is muted from the feed (session-flags.json, set from the timeline checkbox). The
     judge honours it by NOT tracking the session's goals — the planner + closer skip it — so muting takes a
@@ -8408,10 +8411,21 @@ def _hidden_from_feed(fsid):
     (run_index) is deliberately NOT gated: a muted session stays captioned/archived for the dashboard.
     Best-effort; any read error → not hidden (fail open)."""
     try:
-        f = json.loads((STATE / "session-flags.json").read_text()).get(fsid)
+        d = json.loads((STATE / "session-flags.json").read_text())
+        if isinstance(d, dict):
+            _hidden_lkg[0] = d                       # last-known-good (r57 P1.4)
+        f = d.get(fsid) if isinstance(d, dict) else None
         return bool(isinstance(f, dict) and f.get("hideFromFeed"))
-    except Exception:
+    except FileNotFoundError:
+        _hidden_lkg[0] = {}
         return False
+    except Exception:
+        # an unreadable window must not UN-mute a session (the r57 audit's P1.4: a muted
+        # session re-entered judge planning through one EIO) — last-known-good, else hidden
+        if isinstance(_hidden_lkg[0], dict):
+            f = _hidden_lkg[0].get(fsid)
+            return bool(isinstance(f, dict) and f.get("hideFromFeed"))
+        return True
 def run_plan(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
     """One TRIAGE-TIER planner pass: advance each session's goal tree. Per-session sequential
     (the tree accretes); sessions concurrent. Returns total placements made. (Global cross-session

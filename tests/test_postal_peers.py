@@ -305,6 +305,11 @@ class TwoBusExchange(unittest.TestCase):
         # keeps the record; a failed NOTE after a landed append is bounded loss, loudly
         # logged, with the receipt standing and the source retired.
         pm._bounced_done.clear()
+        pm._bounced_done_loaded[0] = False
+        try:
+            pm._bounced_done_path().unlink()
+        except OSError:
+            pass
         pm.outbox_put("srv", {"mid": "bounce-retry", "to": "ghost", "frm": "alpha",
                                "frm_id": "sid-a", "body": "keep me", "kind": "", "t": 1})
         saved_append = pm._tl_append

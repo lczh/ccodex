@@ -176,16 +176,17 @@ test("setSessionFlag posts via the web host hook; kernel-down gestures SPOOL for
     // running before the write was DURABLE — a failed ack meant three executed effects
     // over a journal that only held the old gid), and the write is the r55 P1.4 CAS
     const fn = SRC.indexOf("_completeUnionGesture(gid) {");
-    const win = SRC.slice(fn, fn + 3400);
+    const win = SRC.slice(fn, fn + 3800);   // widened for the r57 whole-identity undo capture
     assert.ok(win.indexOf("const dispatch = () => {") > 0
       && win.indexOf("self2._editRemoteTag(") > win.indexOf("const dispatch = () => {"),
       "every effect lives inside the gated closure — nothing runs before the ack");
     assert.ok(win.indexOf("const rekey = { ogid: gid, gid: ngid, epoch: epoch };") > 0
       && win.indexOf("{ rekey: rekey }") > 0,
       "…and the write carries the claim epoch the kernel CAS-validates (r55 P1.4)");
-    assert.ok(win.indexOf("rekey: rekey }") > 0 && win.indexOf("x.olin = (x.olin || []).concat([x.gid]).slice(-8);") > 0,
+    assert.ok(win.indexOf("rekey: rekey }") > 0 && win.indexOf("x.olin = (x.olin || []).concat([x.gid]).slice(-32);") > 0,
       "the gate remembers its CAS for the reconnect replay (r56 P1.2) and the rows carry "
-      + "the bounded ancestor lineage (r56 P1.3)");
+      + "the bounded ancestor lineage (r56 P1.3; bound 32 since r57 — eleven takeovers "
+      + "outran 8)");
     assert.ok(win.indexOf("{ run: dispatch, gids: [ngid], name:") > 0,
       "the gate keys on the NEW gid — the ok flips exactly the re-keyed rows");
   }
@@ -1907,4 +1908,46 @@ test("a transport reset clears the claim epochs — no guaranteed-stale CAS atte
     "the claims died with the socket; a kept epoch made the next completion attempt refuse "
     + "before recovering");
   delete g.__rompTimelineSetUnionOps;
+});
+
+test("r57: an indeterminate journal ack UNWINDS, skipped retirements re-ledger, the undo restores the whole identity", () => {
+  {
+    // P1.1: a dead response is not a refusal — the kernel may have COMMITTED. The old
+    // definitive ok:false retired the possibly-committed successor and the durable journal
+    // ended empty.
+    assert.ok(SRC.indexOf("indeterminate: r.ok !== true && !r.json") > 0,
+      "a json-less POST outcome is marked indeterminate, never a definitive refusal");
+    assert.ok(SRC.indexOf(
+      ".catch(() => this.unionOpsAck({ ok: false, opId: opId, indeterminate: true }))") > 0,
+      "a network-level death synthesizes the indeterminate ack");
+  }
+  {
+    const fn = SRC.indexOf("unionOpsAck(m) {");
+    const win = SRC.slice(fn, fn + 8000);
+    const ind = win.indexOf("if (m.ok === false && m.indeterminate) {");
+    const def1 = win.indexOf("if (m.ok === false) {");
+    assert.ok(ind > 0 && def1 > ind,
+      "the ok:false path splits on indeterminate BEFORE the definitive-refusal arm");
+    const arm = win.slice(ind, def1);
+    assert.ok(arm.indexOf(
+      "this._yieldUnionGids(g1.rekey ? [g1.rekey.gid, g1.rekey.ogid] : g1.gids);") > 0,
+      "…and UNWINDS both identities of every gated gesture — retire NOTHING, refuse NOTHING");
+    assert.ok(arm.indexOf("_unionSyncDirty = true") > 0 && arm.indexOf("_syncUnionOps(") < 0,
+      "no immediate retry rides the unknown outcome — the paced re-send's ledger diff decides");
+    assert.ok(win.indexOf(
+      "const _unret = new Set(Array.isArray(m.unretired) ? m.unretired : []);") > 0
+      && win.indexOf("if (_unret.has(g)) continue;") > 0,
+      "a retirement the kernel SKIPPED over a live claim stays in the ledger so it re-sends "
+      + "(r57 P2.12: the silent skip dropped the panel's retry evidence)");
+  }
+  {
+    // P2: the no-transport undo restored gid alone — a second-generation row kept ogid/olin
+    // claiming a rekey that never happened, and the refusal-compensation matcher misfired
+    const fn = SRC.indexOf("_completeUnionGesture(gid) {");
+    const win = SRC.slice(fn, fn + 3800);
+    assert.ok(win.indexOf("const prior = group.map((x) => ({ x: x, gid: x.gid, ogid: x.ogid,") > 0,
+      "the whole prior identity is captured before the re-key");
+    assert.ok(win.indexOf("pr.x.gid = pr.gid; pr.x.ogid = pr.ogid; pr.x.olin = pr.olin;") > 0,
+      "…and the undo restores gid AND ogid AND olin");
+  }
 });

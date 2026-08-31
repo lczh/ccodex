@@ -3064,7 +3064,13 @@ class TimelinePanel {
               { entries: entries, retired: retired, opId: opId, cid: this._unionCid() },
               rekey ? { rekey: rekey } : {}), true)
             .then((r) => this.unionOpsAck({ ok: r.ok === true, opId: opId,
-                                            unclaimed: (r.json && r.json.unclaimed) || [] }))
+                                            unclaimed: (r.json && r.json.unclaimed) || [],
+                                            unretired: (r.json && r.json.unretired) || [],
+                                            // NO parsed body = the kernel may have COMMITTED
+                                            // and the response died (r57 P1.1): indeterminate,
+                                            // never a definitive refusal
+                                            indeterminate: r.ok !== true && !r.json }))
+            .catch(() => this.unionOpsAck({ ok: false, opId: opId, indeterminate: true }))
             .catch(() => this.unionOpsAck({ ok: false, opId: opId }))
         );
         sent = true;
@@ -3086,6 +3092,26 @@ class TimelinePanel {
     const gated = this._gatedDispatches ? this._gatedDispatches[m.opId] : null;
     if (this._gatedDispatches) delete this._gatedDispatches[m.opId];
     const _gatedGidsAll = gated ? gated.gates.reduce((a, g1) => a.concat(g1.gids), []) : [];
+    if (m.ok === false && m.indeterminate) {
+      // the RESPONSE died — the kernel may have COMMITTED (the r57 audit's P1.1, executed
+      // there: treating this as a refusal retired the possibly-committed successor and the
+      // durable journal ended empty). Retire NOTHING, refuse NOTHING: unwind every gated
+      // gesture (rows dropped, ledgers forgotten so no retirement can ride a later sync,
+      // both keys suppressed) — the next proven echo re-adopts whatever the journal actually
+      // holds and a fresh claim completes it.
+      if (gated) {
+        for (const g1 of gated.gates) {
+          this._yieldUnionGids(g1.rekey ? [g1.rekey.gid, g1.rekey.ogid] : g1.gids);
+        }
+        this._tagEditErr = { host: '', name: (gated.gates[0] || {}).name || '',
+          error: 'the connection dropped mid-save — the edit recovers by itself; retry '
+                 + 'only if it does not appear' };
+        if (this._viewsDialog && this._viewsDialogBuild) this._viewsDialogBuild();
+        this.draw();
+      }
+      this._unionSyncDirty = true;   // the payload-paced re-send; never the immediate retry
+      return;                        // (its ledger diff is what retired the committed rows)
+    }
     if (m.ok === false) {
       if (gated) {
         for (const g1 of gated.gates) {
@@ -3115,7 +3141,11 @@ class TimelinePanel {
       return;
     }
     this._unionRetryPending = false;
-    for (const g of (p.retired || [])) { if (this._journaledGids) this._journaledGids.delete(g); }
+    const _unret = new Set(Array.isArray(m.unretired) ? m.unretired : []);
+    for (const g of (p.retired || [])) {
+      if (_unret.has(g)) continue;   // skipped over a live claim (r57): the ledger KEEPS it
+      if (this._journaledGids) this._journaledGids.delete(g);
+    }
     for (const g of (p.tomb || [])) { if (this._retireUnionGids) this._retireUnionGids.delete(g); }
     if (gated) {
       const uncl = new Set(Array.isArray(m.unclaimed) ? m.unclaimed : []);
@@ -3222,11 +3252,12 @@ class TimelinePanel {
     const ngid = ++unionGestureSeq;
     if (!this._mintedGids) this._mintedGids = new Set();
     this._mintedGids.add(ngid);
+    const prior = group.map((x) => ({ x: x, gid: x.gid, ogid: x.ogid,
+                                      olin: (x.olin || []).slice() }));
     for (const x of group) {
-      // bounded ANCESTOR LINEAGE (the r56 audit's P1.3, executed there: keeping only the
-      // oldest ogid meant a refusal naming the IMMEDIATE predecessor of a twice-completed
-      // gesture matched zero rows and compensated nothing)
-      x.olin = (x.olin || []).concat([x.gid]).slice(-8);
+      // bounded ANCESTOR LINEAGE (the r56 audit's P1.3; bound 32 since r57 — eleven
+      // takeovers outran 8 and a refusal naming generation two matched nothing)
+      x.olin = (x.olin || []).concat([x.gid]).slice(-32);
       x.ogid = x.ogid || x.gid;
       x.gid = ngid;
     }
@@ -3259,8 +3290,9 @@ class TimelinePanel {
       //                     and retiring another socket's legitimate claim
       { rekey: rekey });
     if (!opId) {
-      // no transport: undo the in-memory re-key; the journal never changed
-      for (const x of group) { x.gid = x.ogid; delete x.ogid; }
+      // no transport: undo the WHOLE in-memory identity (the r57 audit: restoring gid alone
+      // corrupted a second-generation row — its ogid/olin claimed a rekey that never was)
+      for (const pr of prior) { pr.x.gid = pr.gid; pr.x.ogid = pr.ogid; pr.x.olin = pr.olin; }
       this._mintedGids.delete(ngid);
     }
     this.draw();
