@@ -10,6 +10,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 import urllib.error
@@ -657,6 +658,102 @@ class R58AuditFixes(unittest.TestCase):
         d2 = json.loads(p.read_text())
         self.assertEqual(d2["intrBlocked"], {"s1": "g1", "s2": "g9"})
         self.assertIs(d2["enabled"], False, "…and the explicit stop survives")
+
+    def test_h_claim_grant_reads_four_state(self):
+        # r58 wave 2, reproduced: this branch read through _read_state_json, whose
+        # malformed arm quarantined WITH UNLINK and armed no marker — one client claim
+        # against a corrupt store minted the authoritative-empty the round closed
+        km.jd.STATE.mkdir(parents=True, exist_ok=True)
+        km._union_ops_path().write_text("{{{garbage")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(km._union_claim_grant(7, "cid:x"), "no proof, no claim")
+        self.assertEqual(km._union_ops_path().read_text(), "{{{garbage",
+                         "the judged bytes STAND at the path")
+        self.assertTrue(km._union_unproved_marker().exists(), "…under the durable marker")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(km._union_ops_echo(), "the next read still holds")
+
+    def test_i_reconstruction_needs_surviving_evidence(self):
+        # r58 wave 2, reproduced twice: a lone refusal row and a tombstoned-only replay
+        # each cleared the marker and minted a (near-)empty store from nothing; and the
+        # live SUCCESSOR of a tombstoned gesture was dropped because cur=[] blinded the
+        # resident exemption
+        self.assertTrue(km._union_ops_set([dict(self.ROW, gid=911)]))
+        ok, _, _, _u = km._union_ops_merge([], [911], ckey="ws:x")   # durable tombstone
+        self.assertTrue(ok)
+        km._union_ops_path().write_text("{{{garbage")
+        with contextlib.redirect_stderr(io.StringIO()):
+            km._union_ops_echo()                     # judge: marker armed
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok, _, reason, _u = km._union_ops_merge(
+                [{"host": "TESTHOST-A", "gid": -5, "refusal": True, "t": 1, "name": "x"}])
+        self.assertFalse(ok, "a refusal row reconstructs NOTHING")
+        self.assertIn("reconstruction", reason)
+        self.assertTrue(km._union_unproved_marker().exists(), "the hold stands")
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok, _, reason, _u = km._union_ops_merge(
+                [dict(self.ROW, gid=911)], [], ckey="ws:y")
+        self.assertFalse(ok, "a tombstoned-only replay reconstructs NOTHING")
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok, unclaimed, _, _u = km._union_ops_merge(
+                [dict(self.ROW, gid=912, ogid=911, olin=[911])], [], ckey="ws:z")
+        self.assertTrue(ok, "the SUCCESSOR of a tombstoned gesture is live evidence")
+        self.assertNotIn(912, unclaimed, "…and is never tombstone-dropped mid-rebuild")
+        self.assertFalse(km._union_unproved_marker().exists())
+        self.assertEqual([r["gid"] for r in km._union_ops_load()], [912])
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_j_tombs_never_truncate_through_a_load_fault(self):
+        # r58 wave 2, reproduced: one transient load fault + any retire overwrote the
+        # durable ledger with only the in-memory map
+        (km.jd.STATE / "union-tombs.json").write_text(
+            json.dumps({"777": time.time()}))
+        km._union_tombs_loaded[0] = False
+        os.chmod(km.jd.STATE / "union-tombs.json", 0)
+        try:
+            self.assertTrue(km._union_ops_set([dict(self.ROW, gid=920)]))
+            with contextlib.redirect_stderr(io.StringIO()):
+                ok, _, _, _u = km._union_ops_merge([], [920], ckey="ws:x")
+            self.assertTrue(ok)
+        finally:
+            os.chmod(km.jd.STATE / "union-tombs.json", 0o644)
+        self.assertIn("777", json.loads((km.jd.STATE / "union-tombs.json").read_text()),
+                      "the unfolded ledger was never overwritten")
+        km._union_retired_tombs.clear()
+        km._union_tombs_loaded[0] = False
+        self.assertTrue(km._union_ops_set([dict(self.ROW, gid=921)]))
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok, _, _, _u = km._union_ops_merge([], [921], ckey="ws:x")
+        self.assertTrue(ok)
+        d = json.loads((km.jd.STATE / "union-tombs.json").read_text())
+        self.assertIn("777", d, "the healed load folds the old entries in…")
+        self.assertIn("921", d, "…and the save keeps both")
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_k_nudge_fire_pauses_on_unproved(self):
+        # r58 wave 2, reproduced: the write refusal met an unguarded FIRE side — the
+        # dedupe record never persisted, so the same goal nudged EVERY tick, and the
+        # fabricated enabled:True overrode an explicit OFF
+        p = km.jd.STATE / "auto-nudge.json"
+        p.write_text(json.dumps({"enabled": True, "nudged": {}}))
+        self.assertTrue(km._auto_nudge_on())
+        p.write_text("{not valid json")              # a NEW, unreadable generation
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(km._auto_nudge_on(),
+                             "never ON by fabrication — nudging pauses while unproved")
+            km._auto_nudge_tick(int(time.time()), {})   # returns without firing or raising
+
+    def test_l_tombstones_expire_on_the_7d_backstop(self):
+        # r58 wave 2: gids mint from a random 30-bit per-load seed — an everlasting shield
+        # eventually swallows a legitimately-reused id
+        (km.jd.STATE / "union-tombs.json").write_text(json.dumps(
+            {"801": time.time() - 8 * 86400, "802": time.time()}))
+        km._union_retired_tombs.clear()
+        km._union_tombs_loaded[0] = False
+        with km.jd._identity_file_lock():
+            km._union_tombs_load_locked()
+        self.assertNotIn(801, km._union_retired_tombs, "the stale shield expired")
+        self.assertIn(802, km._union_retired_tombs, "the fresh one stands")
 
 
 if __name__ == "__main__":

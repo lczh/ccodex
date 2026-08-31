@@ -2061,3 +2061,18 @@ test("r58: queued sends of a moved world are void, rid correlation is stable, un
       "the held mirror is the reconstruction evidence — the paced re-send fired");
   }
 });
+
+test("r58 wave 2: a voided queued send treats its gates like the transport reset", () => {
+  // reproduced upstream: the silent gate delete let a voided COMPLETION's re-keyed rows
+  // ride a later plain mirror sync as an un-CAS'd merge (the r56 P1.2 regression), and a
+  // voided PLAIN gate's effects simply never ran — no unwind, no error
+  const sy = SRC.indexOf("if (_sendEpoch !== (this._unionEpoch || 0)) {");
+  assert.ok(sy > 0);
+  const win = SRC.slice(sy, sy + 1600);
+  assert.ok(win.indexOf("for (const g1 of _gates.filter((x) => x.rekey)) {") > 0
+    && win.indexOf("this._yieldUnionGids([g1.rekey.gid, g1.rekey.ogid]);") > 0,
+    "a voided completion gate UNWINDS both identities (the r56 rule)");
+  assert.ok(win.indexOf("const _plain = _gates.filter((x) => !x.rekey);") > 0
+    && win.indexOf("this._syncUnionOps(_plain);") > 0,
+    "…and voided plain gates re-gate on a CURRENT-world send");
+});

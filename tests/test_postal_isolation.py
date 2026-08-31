@@ -39,7 +39,6 @@ class PostalOff(unittest.TestCase):
         # (the r57 wave-2 verification caught the OLD fail-open pin below passing exactly
         # that way — green in a full run, red standalone)
         pm._postal_off_cache[0] = None
-        pm._postal_off_key[0] = None
 
     def tearDown(self):
         try:
@@ -97,7 +96,6 @@ class PostalOff(unittest.TestCase):
                             "%s must answer isolated (a fault/closed verdict), never "
                             "un-isolate through the success path" % junk)
         pm._postal_off_cache[0] = None
-        pm._postal_off_key[0] = None               # a fresh process with no history
         pm.SESSION_FLAGS.write_text("[]")
         self.assertTrue(pm._postal_off(SID), "wrong shape with no history: closed")
 

@@ -268,7 +268,6 @@ class R57PostalDurability(unittest.TestCase):
         pm._bounced_done.clear()
         pm._bounced_done_loaded[0] = False
         pm._postal_off_cache[0] = None
-        pm._postal_off_key[0] = None
         for p in (pm._bounced_done_path(), pm._backflow_path(), pm.RECEIPTS_DONE,
                   pm.SESSION_FLAGS):
             try:
@@ -417,7 +416,6 @@ class R57PostalDurability(unittest.TestCase):
                         "r58 P1.4: the corrupt overwrite is a NEW generation — the stale "
                         "permissive copy is never proof across it; fail closed")
         pm._postal_off_cache[0] = None
-        pm._postal_off_key[0] = None               # a fresh process with no history
         self.assertTrue(pm._postal_off(SID),
                         "no history + unreadable: CLOSED — isolation is safety state")
         pm.SESSION_FLAGS.unlink()
@@ -451,7 +449,6 @@ class R57Wave2Postal(unittest.TestCase):
     def setUp(self):
         _reset()
         pm._postal_off_cache[0] = None
-        pm._postal_off_key[0] = None
         pm._postal_off_warned[0] = False
         pm._bounced_done.clear()
         pm._bounced_done_loaded[0] = False
@@ -650,7 +647,6 @@ class R57Wave2Postal(unittest.TestCase):
         pm.SESSION_FLAGS.parent.mkdir(parents=True, exist_ok=True)
         pm.SESSION_FLAGS.write_text("{not valid json")
         pm._postal_off_cache[0] = None
-        pm._postal_off_key[0] = None               # cold cache: no history
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 verdict, bounce = pm._relay_in(
@@ -684,7 +680,6 @@ class R58PostalAudit(unittest.TestCase):
     def setUp(self):
         _reset()
         pm._postal_off_cache[0] = None
-        pm._postal_off_key[0] = None
         pm._bounced_done.clear()
         pm._bounced_done_loaded[0] = False
         pm._seen_ids = None
@@ -837,9 +832,9 @@ class R58PostalAudit(unittest.TestCase):
         self.assertTrue((d / (mid + ".json")).exists(),
                         "the downstream source SURVIVES the failed save")
         with pm._peer_lock:
-            self.assertNotIn(mid, pm._pending(self.HOST2)["acks"] if False else
-                             (pm._peer_pending.get(self.HOST2) or {}).get("acks") or [],
-                             "…and the memory-only half was withdrawn too")
+            self.assertIn(mid, (pm._peer_pending.get(self.HOST2) or {}).get("acks") or [],
+                          "the memory entry stays UNSAVED (wave 2: withdrawing it raced a "
+                          "concurrent duplicate that had skipped its own append)")
         self.assertTrue(pm._ack_arrived(self.HOST, mid), "the healed save applies")
         self.assertFalse((d / (mid + ".json")).exists())
 
@@ -917,6 +912,34 @@ class R58PostalAudit(unittest.TestCase):
             out = pm.outbox_list(self.HOST)
         self.assertEqual(out, [], "never listed")
         self.assertFalse((d / "bad id.json").exists(), "…and moved aside, not stranded")
+
+    def test_m_receipt_parks_scope_by_origin(self):
+        # r58 wave 2, reproduced: two origins' same-mid mail through one hub parked on one
+        # bare-mid file — the second receipt replaced the first and one sender never
+        # learned its mail landed
+        mid, dA, dB = "a3" * 16, "a4" * 16, "a5" * 16
+        pm.receiptbox_put(self.HOST, mid, origin=self.HOST2, dmid=dA)
+        pm.receiptbox_put(self.HOST, mid, origin="cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+                          dmid=dB)
+        rows = pm.receiptbox_list(self.HOST)
+        self.assertEqual(len(rows), 2, "both origins' receipts park independently")
+        pm.receiptbox_del(self.HOST, mid, origin=self.HOST2)
+        self.assertIn(dA, pm._receipts_done(), "A's delivery id settled")
+        self.assertNotIn(dB, pm._receipts_done(), "…without touching B's")
+        self.assertEqual(len(pm.receiptbox_list(self.HOST)), 1, "B's park stands")
+
+    def test_n_legacy_named_deliveries_stay_idempotent(self):
+        # r58 wave 2: pre-r58 files wear r-<mid> — invisible to the digest skip, a crash
+        # replay re-delivered them, read mail included
+        mid = "a6" * 16
+        mb = pm._mailbox(SID)
+        (mb / "cur").mkdir(parents=True, exist_ok=True)
+        (mb / "cur" / ("r-" + mid)).write_text(
+            "From: peer\nFrom-Id: x\nDate: now\n\nold\n")   # an already-READ v1.3.30 file
+        pm.deliver(SID, "peer", "77" * 16, "old", from_host=self.HOST,
+                   relay_mid=mid, relay_via=self.HOST)          # the crash replay
+        self.assertEqual(list((mb / "new").iterdir()), [],
+                         "the legacy spelling satisfies the skip — nothing re-delivers")
 
 
 if __name__ == "__main__":

@@ -3086,8 +3086,23 @@ class TimelinePanel {
         const _sendEpoch = this._unionEpoch;
         this._postChain = (this._postChain || Promise.resolve()).then(() => {
           if (_sendEpoch !== (this._unionEpoch || 0)) {
+            // the world moved past this queued send. Its GATES get the transport-reset
+            // treatment, not a silent delete (r58 wave 2, both reproduced: a voided
+            // completion gate's re-keyed rows later rode a plain mirror sync as an
+            // un-CAS'd merge — the r56 P1.2 regression — and a voided plain gate's
+            // effects simply never ran, with no unwind and no error).
             if (this._pendingUnionSyncs) delete this._pendingUnionSyncs[opId];
+            const _held = (this._gatedDispatches && this._gatedDispatches[opId]) || null;
             if (this._gatedDispatches) delete this._gatedDispatches[opId];
+            const _gates = _held ? (_held.gates || []) : [];
+            for (const g1 of _gates.filter((x) => x.rekey)) {
+              this._yieldUnionGids([g1.rekey.gid, g1.rekey.ogid]);   // unwind (r56 rule)
+            }
+            const _plain = _gates.filter((x) => !x.rekey);
+            if (_plain.length) {
+              this._syncUnionOps(_plain);          // re-gate on a CURRENT-world send
+              return;
+            }
             this._unionSyncDirty = true;
             return;
           }

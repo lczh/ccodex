@@ -374,8 +374,13 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
     #        length — no random fallback to lose crash idempotency — and two peers reusing
     #        one mid deliver as two files instead of the second aliasing the first
     if name.startswith("r-"):
+        _legacy = ("r-" + relay_mid) if (relay_mid and _safe_id("r-" + relay_mid)) else ""
+        #  ^ the v1.3.30 spelling (r58 wave 2: pre-upgrade unread/read files wore r-<mid>;
+        #    invisible to the digest skip, a crash replay re-delivered them — read included)
         try:
-            if (mb / "new" / name).exists() or (mb / "cur" / name).exists():
+            if ((mb / "new" / name).exists() or (mb / "cur" / name).exists()
+                    or (_legacy and ((mb / "new" / _legacy).exists()
+                                     or (mb / "cur" / _legacy).exists()))):
                 # the SAME relayed delivery already stands — unread or already READ (the
                 # r57 wave-2 verification, reproduced: a replay after the recipient read the
                 # mail minted a fresh unread copy and the agent got it twice; and the blind
@@ -992,9 +997,10 @@ _postal_off_cache = [None]                 # last-known-good session-flags dict 
 
 
 _postal_off_warned = [False]
-_postal_off_key = [None]                 # the stat generation the cached copy was read from
-#                                          (r58 P1.4: a stale PERMISSIVE copy must never
-#                                          overrule a newer inode it cannot read)
+#   the LKG rides ONE cell as an atomically-swapped (key, dict) tuple (r58 wave 2: two
+#   cells let a fault-arm reader pair the OLD dict with the NEW key and serve a stale
+#   permissive verdict as proved); _postal_off_cache[0] is that tuple, or a bare dict from
+#   the pre-r58 shape, or None
 
 
 def _postal_off_verdict(sid):
@@ -1011,8 +1017,7 @@ def _postal_off_verdict(sid):
         st = SESSION_FLAGS.stat()
         key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
     except FileNotFoundError:
-        _postal_off_cache[0] = {}
-        _postal_off_key[0] = None
+        _postal_off_cache[0] = (None, {})
         return False, True                           # provably no flags: not isolated
     except OSError:
         key = None                                   # can't even correlate the generation
@@ -1023,13 +1028,11 @@ def _postal_off_verdict(sid):
             # past a primed last-known-good (the r57 wave-2 verification, reproduced with
             # []-shaped bytes) — a fault, same arms as an unreadable file
             raise ValueError("session-flags is not a dict")
-        _postal_off_cache[0] = d                     # last-known-good (r57 P1.4)
-        _postal_off_key[0] = key
+        _postal_off_cache[0] = (key, d)              # ONE atomic swap (r58 wave 2)
         f = d.get(sid)
         return bool(isinstance(f, dict) and (f.get("postalServiceOff") or f.get("postalOff"))), True
     except FileNotFoundError:
-        _postal_off_cache[0] = {}
-        _postal_off_key[0] = None
+        _postal_off_cache[0] = (None, {})
         return False, True                           # provably no flags: not isolated
     except Exception:
         # UNREADABLE is not "not isolated" (the r57 audit's P1.4, executed there: one EIO
@@ -1038,11 +1041,13 @@ def _postal_off_verdict(sid):
         # (r58 P1.4); otherwise its verdict still answers — restrictive answers hold mail
         # harmlessly — but marked unproved so no terminal effect rides it. With no copy at
         # all, fail CLOSED and say so OUT LOUD (r57 wave 2).
-        if isinstance(_postal_off_cache[0], dict):
-            f = _postal_off_cache[0].get(sid)
+        _hit = _postal_off_cache[0]
+        if isinstance(_hit, tuple):
+            _hkey, _hd = _hit
+            f = _hd.get(sid)
             _off = bool(isinstance(f, dict)
                         and (f.get("postalServiceOff") or f.get("postalOff")))
-            if key is not None and key == _postal_off_key[0]:
+            if key is not None and key == _hkey:
                 return _off, True                    # same generation: the copy IS current
             return True, False                       # the world moved past the copy: closed
         if not _postal_off_warned[0]:
@@ -3082,6 +3087,10 @@ def outbox_put(host, msg):
     _atomic_json_put(d / (mid + ".json"), msg)
     _peer_wake(host).set()
 
+_outbox_pub_lock = threading.Lock()    # serializes THIS process's linkless publishes
+#                                        (r58 wave 2) — the bus is the outbox's only writer
+
+
 def outbox_publish_stage(host, mid, stagef):
     """Publish a STAGED full-payload relay by renaming the stage file into its outbox name (the
     v1.3.23 audit's P2.4). The rename retires the stage in the same atomic step that publishes,
@@ -3151,30 +3160,35 @@ def outbox_publish_stage(host, mid, stagef):
             raise _PublishNeverStarted("a DIFFERENT message already holds mid %s" % mid)
     except OSError as e:
         if e.errno in (errno.EPERM, errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)):
-            # a filesystem without hard links (the r52 verification). EXCLUSIVE creation
-            # of the final itself (r58 P2.15, reproduced: the absence-check-then-replace
-            # dance overwrote a competing final that landed in the window) — O_EXCL either
-            # wins the name outright or loses loudly into content arbitration.
+            # a filesystem without hard links (the r52 verification). A dot-named random
+            # temp (readers skip dotfiles — r58 wave 2, reproduced: writing the FINAL name
+            # O_EXCL exposed partial bytes a concurrent outbox_list quarantined mid-write,
+            # and the publish still reported success over the vanished mail) + the
+            # process-wide publish lock (every OUTBOX writer and reader lives in this bus
+            # process) closes the overwrite race the r58 O_EXCL rewrite traded it for.
             try:
                 _pb = Path(stagef).read_bytes()
-                try:
-                    _ffd = os.open(str(d / (mid + ".json")),
-                                   os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                   0o600)
-                    with os.fdopen(_ffd, "wb") as _fh:
-                        _fh.write(_pb)
-                        _fh.flush()
-                        os.fsync(_fh.fileno())
-                except FileExistsError:
-                    _fb = (d / (mid + ".json")).read_bytes()
-                    if _fb != _pb:
-                        try:
-                            _phasef.unlink()
-                        except OSError:
-                            pass
-                        raise _PublishNeverStarted(
-                            "a DIFFERENT message already holds mid %s" % mid)
-                    # identical bytes: already published — fall through to the durable tail
+                _tmpf = d / (".pub-%s.%s.tmp" % (mid, os.urandom(8).hex()))
+                _tfd = os.open(str(_tmpf),
+                               os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(_tfd, "wb") as _fh:
+                    _fh.write(_pb)
+                    _fh.flush()
+                    os.fsync(_fh.fileno())
+                with _outbox_pub_lock:
+                    try:
+                        _fb = (d / (mid + ".json")).read_bytes()
+                        _tmpf.unlink()
+                        if _fb != _pb:
+                            try:
+                                _phasef.unlink()
+                            except OSError:
+                                pass
+                            raise _PublishNeverStarted(
+                                "a DIFFERENT message already holds mid %s" % mid)
+                        # identical bytes: already published — fall to the durable tail
+                    except FileNotFoundError:
+                        os.rename(str(_tmpf), str(d / (mid + ".json")))
             except _PublishNeverStarted:
                 raise                                # the different-content verdict is final —
                 #                                      never re-arbitrated into "uncertain"
@@ -3555,6 +3569,14 @@ def _receipts_done_add(mid):
             d.pop(k, None)
     _atomic_json_put(RECEIPTS_DONE, d)
 
+def _receipt_park_name(mid, origin=""):
+    """The park FILENAME, origin-scoped when the receipt names one (r58 wave 2: two
+    origins' same-mid mail through one hub parked on one bare-mid file — the second
+    receipt silently replaced the first and one sender never learned its mail landed)."""
+    return (mid + ("." + hashlib.sha256(origin.encode()).hexdigest()[:8] if origin else "")
+            + ".json")
+
+
 def receiptbox_put(host, mid, origin="", dmid=""):
     """Park one handoff-done receipt for `host` (receiptbox/<host>/<mid>.json). Same
     at-least-once + idempotent-apply contract as the readbox: it survives a bus restart and
@@ -3575,7 +3597,8 @@ def receiptbox_put(host, mid, origin="", dmid=""):
         #                      /handoff-done forever and the receipt re-parked every pass)
     if origin:
         row["origin"] = origin
-    _atomic_json_put(d / (mid + ".json"), row)
+    _fname = _receipt_park_name(mid, origin)
+    _atomic_json_put(d / _fname, row)
     _peer_wake(host).set()
 
 def receiptbox_list(host, limit=None):
@@ -3602,11 +3625,19 @@ def receiptbox_list(host, limit=None):
                 continue
             try:
                 row = json.loads(raw)
-                if (isinstance(row, dict) and _safe_id(str(row.get("mid") or ""))
-                        and str(row.get("mid")) == f.stem):
-                    keep = {"mid": row["mid"]}
-                    if _safe_id(str(row.get("origin") or "")):
-                        keep["origin"] = str(row["origin"])
+                _rmid = str(row.get("mid") or "") if isinstance(row, dict) else ""
+                _rorig = str(row.get("origin") or "") if isinstance(row, dict) else ""
+                _bound = (isinstance(row, dict) and _safe_id(_rmid)
+                          and (not _rorig or _safe_id(_rorig))
+                          # filename binding accepts the row's OWN two spellings (r58
+                          # wave 2: parks are origin-scoped now; legacy bare-mid files
+                          # keep their old binding)
+                          and f.name in (_rmid + ".json",
+                                         _receipt_park_name(_rmid, _rorig)))
+                if _bound:
+                    keep = {"mid": _rmid}
+                    if _rorig:
+                        keep["origin"] = _rorig
                     out.append(keep)
                 else:
                     # filename binding (the r56 audit's P2.16, executed there: A.json holding
@@ -3619,12 +3650,16 @@ def receiptbox_list(host, limit=None):
     except Exception:
         return []
 
-def receiptbox_del(host, mid):
-    if not (_safe_id(host) and _safe_id(mid)):
+def receiptbox_del(host, mid, origin=""):
+    if not (_safe_id(host) and _safe_id(mid)) or (origin and not _safe_id(origin)):
         return
+    # the origin-scoped spelling first (r58 wave 2), the bare pre-r58 spelling second
+    _f = RECEIPTBOX / host / _receipt_park_name(mid, origin)
+    if origin and not _f.exists():
+        _f = RECEIPTBOX / host / (mid + ".json")
     _dmid = ""
     try:
-        _row = json.loads((RECEIPTBOX / host / (mid + ".json")).read_text())
+        _row = json.loads(_f.read_text())
         if isinstance(_row, dict) and _safe_id(str(_row.get("dmid") or "")):
             _dmid = str(_row["dmid"])
     except FileNotFoundError:
@@ -3638,7 +3673,7 @@ def receiptbox_del(host, mid):
     except ValueError:
         pass                                         # parsed garbage: the mid fallback stands
     try:
-        (RECEIPTBOX / host / (mid + ".json")).unlink()
+        _f.unlink()
     except Exception:
         pass
     _receipts_done_add(_dmid or mid)   # the DELIVERY id when the receipt carries it (r57):
@@ -4398,6 +4433,12 @@ def _bounced_done_add(host, mid):
     _bounced_done["%s|%s" % (host, mid)] = int(time.time())
     while len(_bounced_done) > 4096:
         _bounced_done.pop(next(iter(_bounced_done)))
+    if not _bounced_done_loaded[0]:
+        # the durable copy is UNFOLDED (a load fault): persisting now would truncate the
+        # whole ledger to this one entry (r58 wave 2) — settlement stays process-local
+        # until the ledger reads again
+        _log("bounced-done ledger unfolded — settlement is process-local until it reads")
+        return False
     try:
         _atomic_json_put(_bounced_done_path(), dict(_bounced_done))
         return True
@@ -4474,11 +4515,10 @@ def _ack_arrived(host, mid):
                 p["acks"].append(mid)
             _saved = _backflow_save_locked()
         if not _saved:
-            with _peer_lock:
-                try:
-                    p["acks"].remove(mid)            # withdraw the memory-only half too —
-                except ValueError:                   # the retry re-runs the whole arm
-                    pass
+            # the entry STAYS in memory unsaved (r58 wave 2: withdrawing it raced a
+            # concurrent duplicate that had seen it present, skipped its own append, saved
+            # successfully, and spent its source — the removal then erased the ack both
+            # relied on). A later save persists it; the kept source re-runs this arm.
             return False
         outbox_del(host, mid)
         _peer_wake(msg["origin"]).set()
@@ -4516,12 +4556,9 @@ def _bounce_arrived(host, b):
                 p["bounces"].append(bounce)
             _saved = _backflow_save_locked()   # durable BEFORE the downstream source dies (r57)
         if not _saved:
-            with _peer_lock:
-                try:
-                    p["bounces"].remove(bounce)      # r58 P1.10: a failed save spends nothing
-                except ValueError:
-                    pass
-            return False                     # the exchange 503s; the peer re-sends
+            return False                     # the exchange 503s; the peer re-sends — the
+            #                                  entry stays in memory unsaved (r58 wave 2:
+            #                                  withdrawing raced a concurrent duplicate)
         outbox_del(host, mid)
         _peer_wake(msg["origin"]).set()
         return True
@@ -4695,7 +4732,7 @@ def peer_exchange_handle(data):
             raise _ExchangeNotDurable(                    # non-durable apply must FAIL it (r56)
                 "handoff receipt %s not durably applied" % hd.get("mid"))
     for ha in _receipt_rows(data.get("handoffDoneAcks")):  # the dialer confirmed response-carried ones
-        receiptbox_del(host, ha["mid"])
+        receiptbox_del(host, ha["mid"], origin=ha.get("origin") or "")
     acks, bounces = [], []
     for m in data.get("relays") or []:
         if not isinstance(m, dict):
@@ -4810,7 +4847,8 @@ def peer_exchange_apply(host, req_sent, resp):
         readbox_del(host, r)
     if isinstance(resp.get("handoffDone"), list):    # a lane-aware peer ALWAYS includes the key;
         for hd in _receipt_rows(req_sent.get("handoffDone")):   # a v1.3.16 response ignored the
-            receiptbox_del(host, hd["mid"])          # field entirely, and confirming on its 200
+            receiptbox_del(host, hd["mid"],          # field entirely, and confirming on its 200
+                           origin=hd.get("origin") or "")
     #                                                  destroyed every parked receipt (the r44
     #                                                  verification) — unconfirmed rows stay
     #                                                  parked and retry against the upgraded peer
@@ -4854,7 +4892,9 @@ def peer_exchange_apply(host, req_sent, resp):
         if _handoff_done_arrived(host, hd) is False:
             continue   # not durably applied (r56 P1.10): no ack — the remote keeps its copy
         with _peer_lock:
-            p["handoffDoneAcks"].append({"mid": hd["mid"]})
+            p["handoffDoneAcks"].append(dict({"mid": hd["mid"]},
+                                             **({"origin": hd["origin"]}
+                                                if hd.get("origin") else {})))
     for m in resp.get("relays") or []:
         if not isinstance(m, dict):
             continue

@@ -235,7 +235,7 @@ def _last_machine_cut(sid):
     uncached scan would add megabytes of reading per push cycle to a loop that is already CPU-bound."""
     p = jd.STATE / "states" / ("%s.jsonl" % sid)
     try:
-        st = p.stat(); key = (st.st_mtime_ns, st.st_size)
+        st = p.stat(); key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
     except OSError:
         return 0.0, ""
     hit = _machine_cut_cache.get(str(p))
@@ -1942,7 +1942,7 @@ def _timeline_views_proved():
 def _timeline_views():
     p = _views_path()
     try:
-        st = p.stat(); key = (st.st_mtime_ns, st.st_size)
+        st = p.stat(); key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
     except OSError:
         return _norm_timeline_views({})
     hit = _flags_cache.get(str(p))
@@ -2246,9 +2246,14 @@ def _union_tombs_load_locked():
     try:
         d = json.loads(_union_tombs_path().read_text())
         if isinstance(d, dict):
+            _floor = time.time() - 7 * 86400   # the refusal rows' staleness precedent
+            #  (r58 wave 2: gids mint from a random 30-bit per-load seed, so an
+            #  everlasting shield eventually swallows a legitimately-reused id; every
+            #  replay the shield exists for happens within a session's working life)
             for k, v in d.items():
                 try:
-                    _union_retired_tombs.setdefault(int(k), float(v))
+                    if float(v) >= _floor:
+                        _union_retired_tombs.setdefault(int(k), float(v))
                 except (TypeError, ValueError, OverflowError):
                     continue
     except FileNotFoundError:
@@ -2260,7 +2265,13 @@ def _union_tombs_load_locked():
 
 def _union_tombs_save_locked():
     """Persist the tombstone map — caller holds the identity lock (and usually the claims
-    lock; both writes are cheap). Best-effort with a loud log."""
+    lock; both writes are cheap). Best-effort with a loud log. NEVER writes while the
+    durable copy is unfolded (r58 wave 2: one transient load fault followed by any retire
+    truncated the whole ledger to the in-memory map)."""
+    if not _union_tombs_loaded[0]:
+        sys.stderr.write("union-tombs: durable copy not yet folded in — holding the save "
+                         "so a load fault can never truncate the ledger\n")
+        return
     try:
         _atomic_write(_union_tombs_path(),
                       json.dumps({str(k): v for k, v in _union_retired_tombs.items()}))
@@ -2304,11 +2315,14 @@ def _union_claim_grant(gid, ckey, _rows=None):
     if _rows is not None:
         return _union_claim_stamp(gid, ckey) if _pending(_rows) else None
     with jd._identity_file_lock():
-        try:
-            raw = _read_state_json(_union_ops_path(), "union-gestures")
-        except OSError:
-            return None                # no proof, no claim
-        if not _pending(raw if isinstance(raw, list) else []):
+        rows, _rstate = _union_store_read_locked()
+        # the FOUR-STATE reader (r58 wave 2, reproduced: this branch still read through
+        # _read_state_json, whose malformed arm quarantined WITH UNLINK and armed no
+        # marker — one client claim against a corrupt store left ENOENT that the next
+        # read answered as proved-empty, the exact P1.1 fail-open the round closed)
+        if rows is None:
+            return None                # unproved/unreadable: no proof, no claim
+        if not _pending(rows):
             return None                # settled/absent: nothing to complete (r55 P1.4)
         return _union_claim_stamp(gid, ckey)
 
@@ -2740,6 +2754,11 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                 _ccur = _union_claims.get(_ogid)
             if not (_ccur and _ccur.get("epoch") == _epoch and _ccur.get("ckey") == ckey):
                 return False, [], "the completion claim is stale — re-claim and retry", []
+            if _reconstructing:
+                # the store is UNPROVED: "settled" cannot be fabricated from the empty
+                # reconstruction base (r58 wave 2 — the definitive verdict made the twin
+                # retire a live gesture); hold the completion until the store is rebuilt
+                return False, [], "the journal is held for reconstruction — retry", []
             if not any(r.get("gid") == _ogid and not r.get("refusal") for r in cur):
                 return False, [], "the gesture settled while the claim was held", []
         # the DISPATCH RATCHET (the r53 wave-3 verification): 'the effects ran' is one-way
@@ -2794,6 +2813,11 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                     # flip carries the tombstoned ogid — dropping it deleted the healthy
                     # completion's own compensation journal and answered unclaimed over it)
                     continue
+                if _reconstructing and r.get("gid") not in _union_retired_tombs:
+                    # cur=[] blinds the resident-successor exemption during reconstruction
+                    # (r58 wave 2): a live SUCCESSOR row hits only through its ogid/olin —
+                    # dropping it killed the healthy completion, now restart-durably
+                    continue
                 if (r.get("gid") in _union_retired_tombs
                         or (r.get("ogid") or 0) in _union_retired_tombs
                         or any(x in _union_retired_tombs for x in (r.get("olin") or []))):
@@ -2802,6 +2826,12 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             if _tombed:
                 inc = [r for r in inc if r.get("gid") not in _tombed]
         rows += [r for r in inc if r.get("gid") not in ret]
+        if _reconstructing and not any(not r.get("refusal") for r in rows):
+            # NOTHING survived the filters (r58 wave 2, reproduced twice: a stale replay
+            # carrying only tombstoned gids, and a lone refusal row journaled during the
+            # hold, each cleared the marker and minted a (near-)empty store from evidence
+            # that reconstructs nothing). The hold stands; the write is refused retryable.
+            return False, [], "the journal is held for reconstruction — retry", []
         if len(rows) > _UNION_OPS_MAX:
             sys.stderr.write("union-gestures: %d rows exceed the %d high-water mark — "
                              "retaining ALL (rows retire on acked evidence or a refusal's "
@@ -3768,7 +3798,7 @@ def _flags_cache_seed(d):
     p = jd.STATE / "session-flags.json"
     try:
         st = p.stat()
-        _flags_cache[str(p)] = ((st.st_mtime_ns, st.st_size), d)
+        _flags_cache[str(p)] = ((st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size), d)
     except OSError:
         pass
 
@@ -3781,7 +3811,7 @@ def _session_flags_read():
     through the fabricated {} — the one door the bus-side fail-closed did not cover)."""
     p = jd.STATE / "session-flags.json"
     try:
-        st = p.stat(); key = (st.st_mtime_ns, st.st_size)   # ns + size → no stale hit on rapid toggles
+        st = p.stat(); key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)   # ns + size → no stale hit on rapid toggles
     except FileNotFoundError:
         return {}, True                              # provably no flags
     except OSError:
@@ -3934,7 +3964,7 @@ def _write_notify_cards(cur):
 def _notify_cards():
     p = jd.STATE / "notify-cards.json"
     try:
-        st = p.stat(); key = (st.st_mtime_ns, st.st_size)
+        st = p.stat(); key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
     except FileNotFoundError:
         return {}
     except OSError:
@@ -4134,7 +4164,7 @@ def _auto_nudge_data():
     launder itself into durable state through any of the seventeen RMW sites."""
     p = jd.STATE / "auto-nudge.json"
     try:
-        st = p.stat(); key = (st.st_mtime_ns, st.st_size)
+        st = p.stat(); key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
     except FileNotFoundError:
         return {"enabled": True, "nudged": {}}       # provably absent: the real default
     except OSError:
@@ -4144,7 +4174,9 @@ def _auto_nudge_data():
         return d
     hit = _autonudge_cache.get(str(p))
     if hit is not None and hit[0] == key:
-        return hit[1]
+        return dict(hit[1])              # a COPY (r58 wave 2: sites mutated the cached
+        #                                  object in place, and a write that then raised
+        #                                  left the poisoned cache serving for the boot)
     try:
         d = json.loads(p.read_text())
         if not isinstance(d, dict):
@@ -4166,11 +4198,12 @@ def _auto_nudge_data():
     d.pop("done", None)                # drop the vestigial one-shot list (old code wrote it; nothing reads it now) →
     #                                    cleaned from the file on the next write (the user via business 2026-06-22)
     _autonudge_cache[str(p)] = (key, d)
-    return d
+    return dict(d)                       # same copy rule as the cache-hit arm (r58 wave 2)
 
 
 def _auto_nudge_on():
-    return bool(_auto_nudge_data().get("enabled"))
+    d = _auto_nudge_data()
+    return bool(d.get("enabled")) and not d.get("_unproved")   # never ON by fabrication
 
 
 _auto_nudge_skip_warned = [False]
@@ -4206,10 +4239,12 @@ def _proved_ledger_read(path, what, default):
 
 
 def _set_auto_nudge(enabled):
-    d = _proved_ledger_read(jd.STATE / "auto-nudge.json", "auto-nudge",
-                            {"enabled": True, "nudged": {}})   # PROVED RMW (r57 P1.5)
-    d["enabled"] = bool(enabled)
-    _write_auto_nudge(d)
+    with _NUDGE_LOCK:                    # end-to-end RMW (r58 wave 2: a concurrent locked
+        #                                  span re-persisted enabled:True over the OFF)
+        d = _proved_ledger_read(jd.STATE / "auto-nudge.json", "auto-nudge",
+                                {"enabled": True, "nudged": {}})   # PROVED RMW (r57 P1.5)
+        d["enabled"] = bool(enabled)
+        _write_auto_nudge(d)
 
 
 def _file_editing_on():
@@ -7039,9 +7074,19 @@ def _auto_nudge_tick(now, tmux, run_dead_wait=True):
     once a NEW GENUINE (work/user, not the agent's own nudge-response) ended turn leaves it still working, with
     a count that climbs each fire (surfaced on the timeline; no cap — the warning is the alert). A no-op unless
     the user turned it on."""
-    if not _auto_nudge_on():
+    _and = _auto_nudge_data()
+    if _and.get("_unproved"):
+        # r58 wave 2, reproduced: with the store unreadable the write refusal (correct) met
+        # an unguarded FIRE side — the dedupe record never persisted and the same goal was
+        # nudged every tick, while the fabricated enabled:True overrode an explicit OFF
+        if not _auto_nudge_skip_warned[0]:
+            _auto_nudge_skip_warned[0] = True
+            sys.stderr.write("auto-nudge: store unreadable — nudging is PAUSED (not "
+                             "defaulted on) until it reads again\n")
         return
-    nudged = dict(_auto_nudge_data().get("nudged", {}))   # {gid: {count, lastTurnId}}
+    if not _and.get("enabled"):
+        return
+    nudged = dict(_and.get("nudged", {}))                 # {gid: {count, lastTurnId}}
     alive = list(_alive_sessions(now, tmux))
     alive_ids = {s["sid"] for s in alive}
     waitfor = _wait_for_graph(now, alive_ids)             # {sid:{peerSid,name,inCycle}} — the peer-wait gate
@@ -23990,7 +24035,7 @@ def _judge_error_rows(now, horizon=3 * 86400, tail_bytes=262144):
     inside `horizon`, newest last. mtime-cached: one stat per push while the file is quiet."""
     p = jd.ERRORS
     try:
-        st = p.stat(); key = (st.st_mtime_ns, st.st_size)
+        st = p.stat(); key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
     except OSError:
         return []
     hit = _jerr_cache.get(str(p))
@@ -26560,7 +26605,7 @@ def _nudge_times():
     and when, must be one click away). mtime-cached like _auto_nudge_data; best-effort {}."""
     p = jd.STATE / "nudge-events.jsonl"
     try:
-        st = p.stat(); key = (st.st_mtime_ns, st.st_size)
+        st = p.stat(); key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
     except OSError:
         return {}
     hit = _nudge_times_cache.get(str(p))
