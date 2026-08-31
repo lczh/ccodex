@@ -61,10 +61,12 @@ class OtherStagingWriters(unittest.TestCase):
         # bus thread (the r34 verification)
         src = open(os.path.join(ROOT, "bin", "romp-postal-service")).read()
         i = src.index('tmp = QUARANTINE / (mid + ".tmp")')
-        window = src[i:i + 300]
+        window = src[i:i + 600]   # widened for the r58 fsync'd fd write (durable effect
+        #                           before the ack correlates — the O_NOFOLLOW open is the
+        #                           symlink half; the unlink-first stays the FIFO half)
         self.assertIn("tmp.unlink(missing_ok=True)", window)
         self.assertLess(window.index("tmp.unlink(missing_ok=True)"),
-                        window.index("tmp.write_text"))
+                        window.index("os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW"))
 
     def test_the_node_copy_stagers_remove_the_plant_first(self):
         # BOTH node copiers: the login-time one (node-launch) and the install-time twin in

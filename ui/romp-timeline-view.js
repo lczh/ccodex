@@ -1666,6 +1666,14 @@ class TimelinePanel {
     // (union-gestures.json grew without bound). Any journal row whose gesture this panel
     // neither minted, holds, nor retired is adopted here, every payload; the normal reconcile
     // then confirms/retires it and the refusal scan below can compensate it.
+    if (data && data.unionOps === null && (this._unionOps || []).length
+        && this._journaledGids && this._journaledGids.size && !this._unionSyncDirty) {
+      // the journal is UNPROVED (corruption stands judged kernel-side; r58 P1.1) — this
+      // panel's mirror is the reconstruction evidence: the paced re-send's merge rebuilds
+      // the store and clears the kernel's unproved marker. Idempotent upsert, so arming on
+      // a merely-transient null is harmless.
+      this._unionSyncDirty = true;
+    }
     if (Array.isArray(data.unionOps)) {
       if (!this._journaledGids) this._journaledGids = new Set();
       if (!this._retireUnionGids) this._retireUnionGids = new Set();
@@ -2914,6 +2922,8 @@ class TimelinePanel {
     // confirmed entries — the kernel named the gesture.
     const _lin = (o, id) => String(o.gid || 0) === String(id)
       || String(o.ogid || 0) === String(id)
+      || String(o.rid || 0) === String(id)   // the STABLE root id (r58 P2.19): survives
+      //                                        past the bounded lineage's 32-entry cap
       || (Array.isArray(o.olin) && o.olin.some((x) => String(x) === String(id)));
     const ops = matched.filter((o) => m.opId ? _lin(o, m.opId)
                                              : ((o.gid || 0) === newestGid && !o.confirmed));
@@ -2998,11 +3008,14 @@ class TimelinePanel {
   // dropped when the owner's store CONFIRMS the edit (never a push counter — a slow refusal can
   // outlive any count of pushes; the r45 verification: the 3-push age-out raced the forward
   // path's 8s timeout and slow refusals got no rollback at all)
-  _syncUnionOps(gate, opts) {
+  _unionSyncBody() {
     // mirror the WHOLE in-flight compensation list durably (the v1.3.21 audit's P1.5): the
     // journal lived only in this panel's memory — a reload while one host was pending lost it,
     // and the host's later refusal left already-applied siblings silently split. Full-replace,
     // idempotent; the kernel echoes it back on the timeline payload for the reload to re-seed.
+    // Built AT THE SEND HEAD (r58 P1.3, reproduced: a snapshot captured at queue time
+    // survived the reconnect unwind and flushed after the reset — the kernel accepted it
+    // and forked one gesture into two separately claimable identities).
     const entries = (this._unionOps || []).map((o) => ({
       host: o.host, name: o.name, inverse: o.inverse, edit: o.edit, rt: o.rt, gid: o.gid,
       oldName: o.oldName, oldColor: o.oldColor, post: o.post || {}, confirmed: !!o.confirmed,
@@ -3018,6 +3031,9 @@ class TimelinePanel {
       //                      kernel's per-host dispatch evidence still correlate (r54 P1.1/P1.2)
       olin: o.olin || [],  // …and the bounded ancestor lineage (r56 P1.3): a refusal naming
       //                      ANY predecessor of a repeatedly-completed gesture still matches
+      // the STABLE root id (r58 P2.19): minted once from the earliest known ancestor and
+      // never re-keyed, so refusal correlation survives past the lineage cap
+      rid: o.rid || (o.rid = ((o.olin && o.olin[0]) || o.ogid || o.gid)),
     }));
     // retirement is EXPLICIT (the r49 verification: the kernel merges per gid now, so two
     // open panels no longer clobber each other's entries — omission is not retirement). It
@@ -3031,13 +3047,16 @@ class TimelinePanel {
     // lazy inits: the house test pattern drives bare-prototype panels (no constructor)
     if (!this._journaledGids) this._journaledGids = new Set();
     if (!this._retireUnionGids) this._retireUnionGids = new Set();
-    if (!this._pendingUnionSyncs) this._pendingUnionSyncs = {};
     for (const g of gids) this._journaledGids.add(g);
     const tomb = Array.from(this._retireUnionGids);   // consumed refusal rows (r50)
     const retired = Array.from(this._journaledGids).filter((g) => !gids.has(g)).concat(tomb);
+    return { entries: entries, retired: retired, tomb: tomb };
+  }
+
+  _syncUnionOps(gate, opts) {
+    if (!this._pendingUnionSyncs) this._pendingUnionSyncs = {};
     this._unionSyncDirty = false;
     const opId = 'u' + (++unionGestureSeq);
-    const want = { retired: retired.filter((g) => !tomb.includes(g)), tomb: tomb };
     let sent = false;
     // the gate registers BEFORE the send (the r53 verification round's own race: registered
     // after, a synchronously-delivered ack found no gate and the gesture's effects never ran)
@@ -3051,17 +3070,32 @@ class TimelinePanel {
     const rekey = opts && opts.rekey ? opts.rekey : null;
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineSetUnionOps === 'function') {
-        this._pendingUnionSyncs[opId] = want;
-        window.__rompTimelineSetUnionOps(entries, retired, opId, rekey);
+        const body = this._unionSyncBody();          // synchronous send: this IS the head
+        this._pendingUnionSyncs[opId] = { retired: body.retired.filter((g) => !body.tomb.includes(g)),
+                                          tomb: body.tomb };
+        window.__rompTimelineSetUnionOps(body.entries, body.retired, opId, rekey);
         sent = true;
       } else if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
         // SERIALIZED like _setViews' spool (the r50 round): bare concurrent fetches let a
         // later sync's tombstone land BEFORE an earlier sync's upsert, resurrecting the
-        // retired rows — one POST at a time keeps the wire order the WS path gets for free
-        this._pendingUnionSyncs[opId] = want;
-        this._postChain = (this._postChain || Promise.resolve()).then(() =>
-          this._kernelPost('/union-ops', Object.assign(
-              { entries: entries, retired: retired, opId: opId, cid: this._unionCid() },
+        // retired rows — one POST at a time keeps the wire order the WS path gets for free.
+        // The body builds INSIDE the chain, at the send head, under a world-epoch guard
+        // (r58 P1.3): a queued closure whose world reset/unwound sends NOTHING — the dirty
+        // bit re-sends current state instead of a stale snapshot that forks identities.
+        this._unionEpoch = this._unionEpoch || 0;
+        const _sendEpoch = this._unionEpoch;
+        this._postChain = (this._postChain || Promise.resolve()).then(() => {
+          if (_sendEpoch !== (this._unionEpoch || 0)) {
+            if (this._pendingUnionSyncs) delete this._pendingUnionSyncs[opId];
+            if (this._gatedDispatches) delete this._gatedDispatches[opId];
+            this._unionSyncDirty = true;
+            return;
+          }
+          const body = this._unionSyncBody();
+          this._pendingUnionSyncs[opId] = { retired: body.retired.filter((g) => !body.tomb.includes(g)),
+                                            tomb: body.tomb };
+          return this._kernelPost('/union-ops', Object.assign(
+              { entries: body.entries, retired: body.retired, opId: opId, cid: this._unionCid() },
               rekey ? { rekey: rekey } : {}), true)
             .then((r) => this.unionOpsAck({ ok: r.ok === true, opId: opId,
                                             unclaimed: (r.json && r.json.unclaimed) || [],
@@ -3077,8 +3111,8 @@ class TimelinePanel {
                                             // edit the definitive arm would have surfaced)
                                             indeterminate: r.ok !== true && !r.json
                                               && !(r.status >= 400 && r.status < 500) }))
-            .catch(() => this.unionOpsAck({ ok: false, opId: opId, indeterminate: true }))
-        );
+            .catch(() => this.unionOpsAck({ ok: false, opId: opId, indeterminate: true }));
+        });
         sent = true;
       }
     } catch (e) { /* best-effort: the in-memory journal still runs this panel's lifetime */ }
@@ -3105,6 +3139,9 @@ class TimelinePanel {
       // gesture (rows dropped, ledgers forgotten so no retirement can ride a later sync,
       // both keys suppressed) — the next proven echo re-adopts whatever the journal actually
       // holds and a fresh claim completes it.
+      this._unionEpoch = (this._unionEpoch || 0) + 1;   // the unwind moves the world too
+      //                                                   (r58 P1.3): queued snapshots of
+      //                                                   the pre-unwind rows are void
       if (gated) {
         for (const g1 of gated.gates) {
           this._yieldUnionGids(g1.rekey ? [g1.rekey.gid, g1.rekey.ogid] : g1.gids);
@@ -3339,6 +3376,8 @@ class TimelinePanel {
   // until an unrelated gesture. Every pending sync died with its socket; the full-replace
   // upsert and the acked-retirement ledger make the replay idempotent on the fresh one.
   unionTransportReset() {
+    this._unionEpoch = (this._unionEpoch || 0) + 1;   // queued sends of the OLD world are
+    //                                                   void (r58 P1.3)
     this._pendingUnionSyncs = {};
     this._pendingClaims = {};        // claim acks died with the socket; sightings re-ask (r54)
     this._claimEpochs = {};          // …and so did the claims the epochs certify (r56 P2.11:

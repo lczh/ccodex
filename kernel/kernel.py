@@ -1227,18 +1227,22 @@ def _fire_debt_reminder(sid, now, alive_ids):
     asks = _debt_asks(sid, alive_ids)
     if not asks:
         return False
-    d = _auto_nudge_data()
-    dn = dict(d.get("debtNudged") or {})
-    due = [(asker, name, ts, kind, head) for asker, name, ts, kind, head in asks
-           if ("%s>%s:%d" % (asker, sid, ts)) not in dn]
-    if not due:
-        return False
-    Sessions.backend_for(sid).send(sid, _debt_reminder_body([(n, t, k, h) for _a, n, t, k, h in due]))
-    for asker, _n, ts, _k, _h in due:
-        dn["%s>%s:%d" % (asker, sid, ts)] = int(now)
-    d["debtNudged"] = dn
-    _write_auto_nudge(d)
-    return True
+    with _NUDGE_LOCK:                    # end-to-end RMW (r58 P2.12)
+        d = _auto_nudge_data()
+        if d.get("_unproved"):
+            return False                 # r58 P1.5: the record write would be refused, and
+            #                              an unrecorded reminder re-fires every tick
+        dn = dict(d.get("debtNudged") or {})
+        due = [(asker, name, ts, kind, head) for asker, name, ts, kind, head in asks
+               if ("%s>%s:%d" % (asker, sid, ts)) not in dn]
+        if not due:
+            return False
+        Sessions.backend_for(sid).send(sid, _debt_reminder_body([(n, t, k, h) for _a, n, t, k, h in due]))
+        for asker, _n, ts, _k, _h in due:
+            dn["%s>%s:%d" % (asker, sid, ts)] = int(now)
+        d["debtNudged"] = dn
+        _write_auto_nudge(d)
+        return True
 
 
 def _debt_key_parse(key):
@@ -1289,27 +1293,28 @@ def _debt_reminder_outcomes(sid, lt, now):
     its chance and moved on without replying (the reminder's own response turn included: both honest
     exits it offered were postal replies, so a reply-less end IS the failure). A debtor that never turns
     again is the backstop's case (_debt_backstop_tick)."""
-    d = _auto_nudge_data()
-    dn = dict(d.get("debtNudged") or {})
-    if not dn:
-        return
-    last_any, _ask, _aw = _postal_wait_maps()
-    lt_end = (lt.get("end", lt.get("t", 0)) or 0) if lt else 0
-    changed = False
-    for key, fire_t in list(dn.items()):
-        parsed = _debt_key_parse(key)
-        if not parsed or parsed[1] != sid:
-            continue
-        asker, _debtor, ts = parsed
-        if last_any.get((sid, asker), 0) >= ts:        # answered → the reminder worked
-            dn.pop(key); changed = True
-            continue
-        if isinstance(fire_t, (int, float)) and lt_end > fire_t:
-            _debt_escalate(asker, sid, ts, now)        # moved on without replying → the user's turn
-            dn.pop(key); changed = True
-    if changed:
-        d["debtNudged"] = dn
-        _write_auto_nudge(d)
+    with _NUDGE_LOCK:                    # end-to-end RMW (r58 P2.12)
+        d = _auto_nudge_data()
+        dn = dict(d.get("debtNudged") or {})
+        if not dn:
+            return
+        last_any, _ask, _aw = _postal_wait_maps()
+        lt_end = (lt.get("end", lt.get("t", 0)) or 0) if lt else 0
+        changed = False
+        for key, fire_t in list(dn.items()):
+            parsed = _debt_key_parse(key)
+            if not parsed or parsed[1] != sid:
+                continue
+            asker, _debtor, ts = parsed
+            if last_any.get((sid, asker), 0) >= ts:        # answered → the reminder worked
+                dn.pop(key); changed = True
+                continue
+            if isinstance(fire_t, (int, float)) and lt_end > fire_t:
+                _debt_escalate(asker, sid, ts, now)        # moved on without replying → the user's turn
+                dn.pop(key); changed = True
+        if changed:
+            d["debtNudged"] = dn
+            _write_auto_nudge(d)
 
 
 def _debt_backstop_tick(now):
@@ -1317,27 +1322,28 @@ def _debt_backstop_tick(now):
     idling forever on its reminder: past the same backstop the awaiting/deferral machinery uses, an
     unanswered reminder escalates (or, if answered meanwhile, retires) regardless. Mirrors
     AWAITING_DEADMAN_SECS' rationale: a missing event, surfaced rather than waited on forever."""
-    d = _auto_nudge_data()
-    dn = dict(d.get("debtNudged") or {})
-    if not dn:
-        return
-    last_any, _ask, _aw = _postal_wait_maps()
-    changed = False
-    for key, fire_t in list(dn.items()):
-        parsed = _debt_key_parse(key)
-        if not parsed:
-            dn.pop(key); changed = True                # malformed → drop rather than loop on it forever
-            continue
-        asker, debtor, ts = parsed
-        if last_any.get((debtor, asker), 0) >= ts:
-            dn.pop(key); changed = True
-            continue
-        if isinstance(fire_t, (int, float)) and now - fire_t > NUDGE_DEFER_BACKSTOP_SECS:
-            _debt_escalate(asker, debtor, ts, now)
-            dn.pop(key); changed = True
-    if changed:
-        d["debtNudged"] = dn
-        _write_auto_nudge(d)
+    with _NUDGE_LOCK:                    # end-to-end RMW (r58 P2.12)
+        d = _auto_nudge_data()
+        dn = dict(d.get("debtNudged") or {})
+        if not dn:
+            return
+        last_any, _ask, _aw = _postal_wait_maps()
+        changed = False
+        for key, fire_t in list(dn.items()):
+            parsed = _debt_key_parse(key)
+            if not parsed:
+                dn.pop(key); changed = True                # malformed → drop rather than loop on it forever
+                continue
+            asker, debtor, ts = parsed
+            if last_any.get((debtor, asker), 0) >= ts:
+                dn.pop(key); changed = True
+                continue
+            if isinstance(fire_t, (int, float)) and now - fire_t > NUDGE_DEFER_BACKSTOP_SECS:
+                _debt_escalate(asker, debtor, ts, now)
+                dn.pop(key); changed = True
+        if changed:
+            d["debtNudged"] = dn
+            _write_auto_nudge(d)
 
 
 def _rgb(color):
@@ -2218,8 +2224,49 @@ _UNION_CLAIM_TTL = 120.0               # the no-event backstop, POST claimants o
 # the CAS through its new gid). Incoming rows whose gid OR ogid is tombstoned are dropped and
 # named back as unclaimed — the writer's gate yields, exactly the r54 shield, kernel-proved.
 # In-memory and bounded like the claims map: the journal rows are the durable truth.
-_union_retired_tombs = {}              # gid -> t, FIFO-capped
+_union_retired_tombs = {}              # gid -> t, FIFO-capped; MIRRORED to
+#                                        union-tombs.json since r58 P2.14 (process-local
+#                                        tombstones let a stale panel's replay resurrect a
+#                                        RETIRED gesture after a kernel restart — both its
+#                                        completion CAS operations then succeeded)
 _UNION_TOMBS_MAX = 4096
+_union_tombs_loaded = [False]
+
+
+def _union_tombs_path():
+    return jd.STATE / "union-tombs.json"
+
+
+def _union_tombs_load_locked():
+    """Fold the durable tombstones in, once per process — caller holds the identity lock.
+    Best-effort: an unreadable ledger degrades to the process-local map (the journal rows
+    stay the durable truth; tombstones only shield replays)."""
+    if _union_tombs_loaded[0]:
+        return
+    try:
+        d = json.loads(_union_tombs_path().read_text())
+        if isinstance(d, dict):
+            for k, v in d.items():
+                try:
+                    _union_retired_tombs.setdefault(int(k), float(v))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+    except FileNotFoundError:
+        pass
+    except Exception:
+        return                           # unreadable: retry on the next locked pass
+    _union_tombs_loaded[0] = True
+
+
+def _union_tombs_save_locked():
+    """Persist the tombstone map — caller holds the identity lock (and usually the claims
+    lock; both writes are cheap). Best-effort with a loud log."""
+    try:
+        _atomic_write(_union_tombs_path(),
+                      json.dumps({str(k): v for k, v in _union_retired_tombs.items()}))
+    except Exception:
+        sys.stderr.write("union-tombs: could not persist — retired-gesture shields are "
+                         "process-local until the next successful save\n")
 
 
 def _union_claim_stamp(gid, ckey):
@@ -2249,8 +2296,8 @@ def _union_claim_grant(gid, ckey, _rows=None):
         gid = int(gid)
     except (TypeError, ValueError, OverflowError):
         return None                                  # inf rode json.loads (r57 wave 2)
-    if gid <= 0 or not ckey:
-        return None
+    if gid <= 0 or gid > 2 ** 53 - 1 or not ckey:
+        return None                                  # r58 P2.19: 2**53 itself was let in
     def _pending(rows):
         return any(isinstance(r, dict) and not r.get("refusal")
                    and r.get("gid") == gid and r.get("dispatched") is False for r in rows)
@@ -2301,7 +2348,7 @@ _QUARANTINED = object()   # _read_state_json's "malformed bytes moved aside" —
 #                           an authoritative [] over exactly the loss it should have marked)
 
 
-def _quarantine_state_bytes(path, what, fingerprint=None):
+def _quarantine_state_bytes(path, what, fingerprint=None, keep_source=False):
     """Move PROVEN-garbage state bytes aside — 128-bit no-replace names (r54 P3.13) — shared
     by the malformed-JSON arm and the wrong-shape arm (r55 P2.9: a stored null/[] used to
     read as proved-empty and the next edit overwrote it). Raises _StateUnreadable when the
@@ -2333,6 +2380,29 @@ def _quarantine_state_bytes(path, what, fingerprint=None):
             except FileExistsError:
                 continue                             # fresh name, try again
             except OSError:
+                if keep_source:
+                    # COPY-first judgment (r58 P1.2): read the verified fd's bytes and
+                    # publish them exclusively — the source never moves
+                    try:
+                        os.lseek(_qfd, 0, os.SEEK_SET)
+                        _qb, _chunk = b"", os.read(_qfd, 1 << 20)
+                        while _chunk:
+                            _qb += _chunk
+                            _chunk = os.read(_qfd, 1 << 20)
+                        _cfd = os.open(str(qp), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                       | os.O_NOFOLLOW, 0o600)
+                        with os.fdopen(_cfd, "wb") as _cfh:
+                            _cfh.write(_qb)
+                            _cfh.flush()
+                            os.fsync(_cfh.fileno())
+                    except FileExistsError:
+                        continue
+                    except OSError as e2:
+                        _qerr = e2
+                        break
+                    sys.stderr.write("%s: malformed content quarantined as %s\n"
+                                     % (what, qp.name))
+                    return
                 # no /proc (or no links): fall back to the fingerprint-checked rename —
                 # narrower guarantee, kept for portability
                 try:
@@ -2343,9 +2413,22 @@ def _quarantine_state_bytes(path, what, fingerprint=None):
                     if qp.exists():
                         continue
                     path.rename(qp)
+                    # VERIFY the moved inode is the judged one (r58 P2.13: a concurrent
+                    # writer's replacement landing between the check and the rename was
+                    # renamed instead) — an innocent grab goes straight back
+                    _st4 = os.stat(str(qp))
+                    if (_st4.st_dev, _st4.st_ino) != (_qst.st_dev, _qst.st_ino):
+                        os.replace(str(qp), str(path))
+                        return
                 except OSError as e2:
                     _qerr = e2
                     break
+                sys.stderr.write("%s: malformed content quarantined as %s\n" % (what, qp.name))
+                return
+            if keep_source:
+                # the fd-linked copy stands beside the UNMOVED source (r58 P1.2: retiring
+                # the only live inode before the salvage published left ENOENT — read as
+                # authoritative absence)
                 sys.stderr.write("%s: malformed content quarantined as %s\n" % (what, qp.name))
                 return
             try:
@@ -2433,6 +2516,96 @@ def _union_ops_load():
     return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
 
 
+def _union_unproved_marker():
+    return _union_ops_path().with_name(_union_ops_path().name + ".unproved")
+
+
+def _union_store_read_locked(what="union-gestures"):
+    """FOUR-STATE read of the union journal — the caller holds the identity lock. Returns
+    (rows, state): "proved" (rows authoritative, possibly []), "salvaged" (the provably-
+    valid subset, re-minted onto the store), "unproved" (rows None — corruption stands
+    JUDGED: the bytes and a durable .unproved marker hold the verdict until a panel's
+    mirror sync reconstructs the store through the merge), "unreadable" (rows None — a
+    transient fault; no judgment). The r58 audit's P1.1 (executed): the r57 re-mint-[]
+    made corruption read as an AUTHORITATIVE empty one push later and panels retired
+    their recovery copies; and P1.2: the salvage moved the only live inode aside before
+    publishing, so one injected write fault left ENOENT — the same authoritative absence.
+    Now every judgment is copy-first: the judged bytes stay standing at the path until
+    the atomic write that replaces them, so no failure leaves an absence that reads as
+    proof of anything."""
+    p = _union_ops_path()
+    marker = _union_unproved_marker()
+    try:
+        raw = p.read_text()              # read_text: the _BadPath test seam stubs it, and
+        #                                  UnicodeDecodeError surfaces here as a judgment
+    except FileNotFoundError:
+        if marker.exists():
+            return None, "unproved"      # a crash mid-reconstruction: absence is NOT proof
+        return [], "proved"              # honestly missing (proved by ENOENT, unjudged)
+    except UnicodeDecodeError:
+        raw = None                       # bytes that are not text are judged corruption
+    except OSError:
+        return None, "unreadable"        # a transient window: no information (r53 P1.2)
+    try:
+        if raw is None:
+            raise ValueError("union journal is not utf-8 text")
+        rows = json.loads(raw)
+        if not isinstance(rows, list):
+            raise ValueError("union journal is not a list")
+    except (ValueError, UnicodeDecodeError):
+        # malformed / wrong shape: copy the judged bytes aside (SOURCE KEPT — failure-
+        # atomic, r58 P1.2), arm the durable marker, hold. The bytes stand at the path,
+        # so a failed marker write just re-judges next pass — never an ENOENT window.
+        if not marker.exists():
+            try:
+                st = p.stat()
+                _quarantine_state_bytes(p, what,
+                                        fingerprint=(st.st_dev, st.st_ino, st.st_size,
+                                                     st.st_mtime_ns), keep_source=True)
+            except OSError:
+                pass
+            try:
+                _atomic_write(marker, "1")
+            except OSError:
+                pass
+        return None, "unproved"
+    bad = any(not _union_row_valid(r) for r in rows)   # NON-DICTS judged too (r58 P1.6:
+    #                                the isinstance pre-filter acked a mixed journal
+    #                                while silently dropping its invalid rows)
+    if bad:
+        # row-poison: SALVAGE (r57 wave 2), copy-first (r58 P1.2) — the poisoned file
+        # stands until the very rename that publishes the valid rows
+        _valid = [r for r in rows if _union_row_valid(r)]
+        try:
+            st = p.stat()
+            _quarantine_state_bytes(p, what,
+                                    fingerprint=(st.st_dev, st.st_ino, st.st_size,
+                                                 st.st_mtime_ns), keep_source=True)
+        except OSError:
+            pass
+        try:
+            _atomic_write(p, json.dumps(_valid, allow_nan=False))
+        except (OSError, ValueError):
+            try:
+                _atomic_write(marker, "1")
+            except OSError:
+                pass
+            return None, "unproved"
+        sys.stderr.write("union-gestures: invalid stored row(s) quarantined aside; "
+                         "%d valid row(s) salvaged\n" % len(_valid))
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+        return _valid, "salvaged"
+    if marker.exists():
+        try:
+            marker.unlink()              # a proven read retires a stale marker
+        except OSError:
+            pass
+    return rows, "proved"
+
+
 def _union_ops_echo():
     """The journal for the payload echo — or None when the read is UNPROVEN (the r53 audit's
     P1.2, executed: one EIO read as [], and the panels' adopted-drop machinery took the empty
@@ -2445,55 +2618,8 @@ def _union_ops_echo():
     # quarantine raced a locked merge's rename between its stat and its unlink — the writer's
     # fresh VALID commit was deleted and the next echo answered authoritative-empty)
     with jd._identity_file_lock():
-        try:
-            rows = _read_state_json(_union_ops_path(), "union-gestures")
-        except OSError:
-            return None
-        if rows is _QUARANTINED:
-            # malformed bytes moved aside inside the read. Re-mint the store EMPTY in the
-            # SAME locked pass (the r57 wave-2 verification: leaving ENOENT read as
-            # "honestly missing" one push later, and the adopted-drop machinery retired
-            # every panel's recovery copy of gestures that were merely unreadable) — the
-            # next push reads a deliberate [], owners re-seed their mirrors on their sync.
-            try:
-                _atomic_write(_union_ops_path(), "[]")
-            except OSError:
-                pass
-            return None                              # THIS push carries no information
-        if rows is None:
-            return []                                # honestly missing (proved by ENOENT)
-        if not isinstance(rows, list):
-            # VALID bytes, WRONG shape (r55 P2.10): quarantine (fingerprint-guarded) and
-            # re-mint empty in the same pass — never leave the ENOENT ambiguity behind
-            try:
-                _quarantine_wrong_shape(_union_ops_path(), "union-gestures",
-                                        lambda v: isinstance(v, list))
-                _atomic_write(_union_ops_path(), "[]")
-            except OSError:
-                pass
-            return None
-        if any(not (isinstance(r, dict) and _union_row_valid(r)) for r in rows):
-            # ONE invalid stored row unproves the journal (r57 P1.3) — but the wave-1
-            # quarantine-the-whole answer left the store ENOENT, which the NEXT push read
-            # as authoritative-empty and panels retired every valid recovery copy (the
-            # wave-2 verification, reproduced). SALVAGE instead: the original bytes move
-            # aside whole (forensics), the provably-valid rows re-mint the store in the
-            # same locked pass, loudly — a deliberate judged salvage, not the r56 silent
-            # filter (which left poison on disk and let an acked merge persist the
-            # filtered view). The poisoned row's owner re-seeds via its mirror sync.
-            _valid = [r for r in rows if isinstance(r, dict) and _union_row_valid(r)]
-            try:
-                _quarantine_wrong_shape(_union_ops_path(), "union-gestures",
-                                        lambda v: isinstance(v, list)
-                                        and all(isinstance(r, dict) and _union_row_valid(r)
-                                                for r in v))
-                _atomic_write(_union_ops_path(), json.dumps(_valid, allow_nan=False))
-            except OSError:
-                return None
-            sys.stderr.write("union-gestures: invalid stored row(s) quarantined aside; "
-                             "%d valid row(s) salvaged\n" % len(_valid))
-            return _valid
-        return [r for r in rows]
+        rows, _state = _union_store_read_locked()
+        return list(rows) if rows is not None else None
 
 
 def _union_row_valid(r):
@@ -2505,7 +2631,29 @@ def _union_row_valid(r):
         return False
     def _safe_int(v, lo, hi):
         return isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
-    _MAX = 2 ** 53
+    _MAX = 2 ** 53 - 1                   # JS MAX_SAFE_INTEGER (r58 P2.19: 2**53 was let in)
+    def _finite(v, depth=0):
+        # RECURSIVE (r58 P1.6: a nested Infinity in edit/inverse/rt passed the top-level
+        # checks, then either raised at the strict dump or rode the wire as JSON the
+        # browser refused whole)
+        if depth > 8:
+            return False
+        if isinstance(v, bool) or v is None or isinstance(v, str):
+            return True
+        if isinstance(v, int):
+            return -_MAX <= v <= _MAX
+        if isinstance(v, float):
+            return float("-inf") < v < float("inf")   # NaN fails both comparisons
+        if isinstance(v, dict):
+            return all(isinstance(k, str) and _finite(x, depth + 1) for k, x in v.items())
+        if isinstance(v, list):
+            return all(_finite(x, depth + 1) for x in v)
+        return False
+    for k in ("edit", "inverse", "rt"):
+        if k in r and r[k] is not None and not _finite(r[k]):
+            return False
+    if "rid" in r and r.get("rid") not in (None, 0) and not _safe_int(r.get("rid"), 1, _MAX):
+        return False
     if r.get("refusal"):
         return _safe_int(r.get("gid"), -_MAX, -1) or _safe_int(r.get("gid"), 1, _MAX)
     if not _safe_int(r.get("gid"), 1, _MAX):
@@ -2552,38 +2700,27 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
     # the WHOLE load-merge-write under the identity lock (the r50 verification: two threads'
     # unlocked merges both reported success and persisted only one of two distinct gestures)
     with jd._identity_file_lock():
-        try:
-            _raw = _read_state_json(_union_ops_path(), "union-gestures")
-        except OSError:
-            # the v1.3.24 audit's P1.1: EIO used to read as an EMPTY journal — the merge then
-            # overwrote every valid unresolved gesture and returned success, deleting the
-            # compensation record a multi-host edit needed
-            sys.stderr.write("union-gestures: unreadable — refusing to merge over an "
-                             "unproved read\n")
-            return False, [], "the journal is unreadable", []
-        if _raw is not None and _raw is not _QUARANTINED and not isinstance(_raw, list):
-            _quarantine_wrong_shape(_union_ops_path(), "union-gestures",
-                                    lambda v: isinstance(v, list))   # r55 P2.10 + r56 fp
-        cur = [r for r in _raw if isinstance(r, dict)] if isinstance(_raw, list) else []
-        if any(not _union_row_valid(r) for r in cur):
-            # ONE invalid stored row unproves the journal (r57 P1.3) — SALVAGE, don't just
-            # refuse (the wave-2 verification: refuse+quarantine left the store ENOENT and
-            # the next echo answered authoritative-empty, retiring every valid recovery
-            # copy). Original bytes move aside whole; the valid rows re-mint the store and
-            # this merge proceeds over them, loudly.
-            _valid = [r for r in cur if _union_row_valid(r)]
-            try:
-                _quarantine_wrong_shape(_union_ops_path(), "union-gestures",
-                                        lambda v: isinstance(v, list)
-                                        and all(isinstance(r, dict) and _union_row_valid(r)
-                                                for r in v))
-                _atomic_write(_union_ops_path(), json.dumps(_valid, allow_nan=False))
-            except OSError:
-                return False, [], "the journal held invalid rows and could not be " \
-                                  "salvaged — retry", []
-            sys.stderr.write("union-gestures: invalid stored row(s) quarantined aside; "
-                             "%d valid row(s) salvaged\n" % len(_valid))
-            cur = _valid
+        _union_tombs_load_locked()
+        cur, _rstate = _union_store_read_locked()
+        _reconstructing = False
+        if cur is None:
+            if _rstate == "unreadable":
+                # the v1.3.24 audit's P1.1: EIO used to read as an EMPTY journal — the
+                # merge then overwrote every valid unresolved gesture and returned success
+                sys.stderr.write("union-gestures: unreadable — refusing to merge over an "
+                                 "unproved read\n")
+                return False, [], "the journal is unreadable", []
+            # JUDGED corruption (r58 P1.1): the bytes are preserved aside and the marker
+            # holds the verdict. A panel carrying its mirror ROWS is the reconstruction
+            # evidence — this merge rebuilds the store from them and clears the marker in
+            # the same locked commit. A row-less sync (a bare retirement) proves nothing
+            # to rebuild from and refuses retryable instead: minting [] from it would be
+            # the authoritative-empty this whole chain exists to prevent.
+            if not (isinstance(entries, list)
+                    and any(isinstance(r, dict) for r in entries)):
+                return False, [], "the journal is held for reconstruction — retry", []
+            cur = []
+            _reconstructing = True
         inc = [r for r in (entries if isinstance(entries, list) else []) if isinstance(r, dict)]
         if any(not _union_row_valid(r) for r in inc):
             # REJECT the whole write (the r56 audit's P1.5): one gid:[] row wedged every
@@ -2674,12 +2811,24 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
         except Exception:
             sys.stderr.write("union-gestures save: %s\n" % traceback.format_exc())
             return False, [], "the journal write failed", []
+        if _reconstructing:
+            # the panel's mirror REBUILT the judged store — the commit above replaced the
+            # preserved corrupt bytes atomically; the marker retires with them (r58 P1.1)
+            try:
+                _union_unproved_marker().unlink()
+            except OSError:
+                pass
+            sys.stderr.write("union-gestures: reconstructed from a panel mirror "
+                             "(%d row(s)) — the unproved hold is over\n" % len(rows))
         with _union_claims_lock:
             for g in ret:
                 _union_claims.pop(g, None)       # claims retire WITH their rows (r55 P3.19)
                 _union_retired_tombs[g] = time.time()
             while len(_union_retired_tombs) > _UNION_TOMBS_MAX:
                 _union_retired_tombs.pop(next(iter(_union_retired_tombs)))
+            _union_tombs_save_locked()   # DURABLE (r58 P2.14: process-local tombstones let
+            #                              retired gestures resurrect through a stale
+            #                              panel's replay after a kernel restart)
         # the implicit writer claims decide against the rows JUST written, under the same
         # lock pass (r55 P1.4) — never a separate read the world can move between
         unclaimed = _union_claim_entries(inc, ckey, _rows=rows) if ckey else []
@@ -2707,28 +2856,13 @@ def _union_ops_mark_dispatched(gid, host):
         return False
     if gid <= 0 or not host:
         return False
+    if gid > 2 ** 53 - 1:
+        return False                     # past the JS safe-integer domain (r58 P2.19)
     with jd._identity_file_lock():
-        try:
-            _raw = _read_state_json(_union_ops_path(), "union-gestures")
-        except OSError:
-            return False
-        rows = [r for r in _raw if isinstance(r, dict)] if isinstance(_raw, list) else []
-        if any(not _union_row_valid(r) for r in rows):
-            # the flip must not re-persist stored poison under a True ack (the r57 wave-2
-            # verification: this path bypassed the whole-journal rule and its unguarded
-            # json.dumps re-serialized a legacy Infinity gid) — same salvage as the merge
-            _valid = [r for r in rows if _union_row_valid(r)]
-            try:
-                _quarantine_wrong_shape(_union_ops_path(), "union-gestures",
-                                        lambda v: isinstance(v, list)
-                                        and all(isinstance(r, dict) and _union_row_valid(r)
-                                                for r in v))
-                _atomic_write(_union_ops_path(), json.dumps(_valid, allow_nan=False))
-            except OSError:
-                return False
-            sys.stderr.write("union-gestures: invalid stored row(s) quarantined aside; "
-                             "%d valid row(s) salvaged\n" % len(_valid))
-            rows = _valid
+        rows, _rstate = _union_store_read_locked()
+        if rows is None:
+            return False                 # unreadable or held-for-reconstruction: no flip —
+            #                              the client-side flip remains the writer
         hit = False
         for r in rows:
             if (not r.get("refusal") and r.get("host") == host
@@ -3651,11 +3785,11 @@ def _session_flags_read():
     except FileNotFoundError:
         return {}, True                              # provably no flags
     except OSError:
-        # r57 P1.4: isolation and mute are SAFETY state — an unreadable window serves the
-        # last-known-good copy, never a fabricated {} (which delivered into an isolated
-        # session and, cached, kept doing so after the fault cleared)
+        # the stat itself faulted: we cannot even correlate the cache with the file's
+        # generation — the copy is displayed but NEVER proof (r58 P1.4: a stale permissive
+        # copy crossed a NEWER isolation the fault was hiding)
         hit = _flags_cache.get(str(p))
-        return (hit[1], True) if hit is not None else ({}, False)
+        return (hit[1], False) if hit is not None else ({}, False)
     hit = _flags_cache.get(str(p))
     if hit is not None and hit[0] == key:
         return hit[1], True
@@ -3666,15 +3800,19 @@ def _session_flags_read():
             # verification: []-shaped bytes took the SUCCESS path and un-isolated every
             # session past a primed last-known-good) — same arm as a read fault
             hit = _flags_cache.get(str(p))
-            return (hit[1], True) if hit is not None else ({}, False)
+            return (hit[1], False) if hit is not None else ({}, False)
     except FileNotFoundError:
         d = {}
     except Exception:
-        # a READ/PARSE fault serves the last-known-good copy and CACHES NOTHING (the r57
-        # audit's P1.4: the fabricated {} was cached under the real mtime key and kept
-        # serving un-isolation after the fault cleared)
+        # a READ/PARSE fault: the copy answers ONLY while the stat key still matches the
+        # generation it was read from (r58 P1.4, reproduced: an EIO on a NEWER inode let
+        # the stale permissive copy overrule a durable postalServiceOff:true — a changed
+        # key means the world moved and the copy is display-only, never proof). Nothing
+        # is cached either way (r57 P1.4).
         hit = _flags_cache.get(str(p))
-        return (hit[1], True) if hit is not None else ({}, False)
+        if hit is not None and hit[0] == key:
+            return hit[1], True
+        return (hit[1], False) if hit is not None else ({}, False)
     _flags_cache[str(p)] = (key, d)
     return d, True
 
@@ -3987,20 +4125,42 @@ _NUDGE_LOCK = threading.RLock()
 
 
 def _auto_nudge_data():
+    """FOUR-STATE snapshot of auto-nudge.json (r58 P1.5, executed there: a fault fabricated
+    the default snapshot, and the next writer PERSISTED it — flipping an explicit
+    enabled:false back on and erasing standing suppression/nudge/debt entries). A fault
+    serves the last-known-good copy only for the SAME stat generation; otherwise the
+    fabricated fallback is TAGGED "_unproved" — readers still get their best-effort view,
+    and _write_auto_nudge refuses to persist any snapshot wearing the tag, so no fault can
+    launder itself into durable state through any of the seventeen RMW sites."""
     p = jd.STATE / "auto-nudge.json"
     try:
         st = p.stat(); key = (st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
+        return {"enabled": True, "nudged": {}}       # provably absent: the real default
     except OSError:
-        return {"enabled": True, "nudged": {}}
+        hit = _autonudge_cache.get(str(p))
+        d = dict(hit[1]) if hit is not None else {"enabled": True, "nudged": {}}
+        d["_unproved"] = True                        # can't correlate the generation
+        return d
     hit = _autonudge_cache.get(str(p))
     if hit is not None and hit[0] == key:
         return hit[1]
     try:
         d = json.loads(p.read_text())
         if not isinstance(d, dict):
-            d = {}
+            raise ValueError("auto-nudge is not a dict")   # wrong shape = fault (r57 P1.5)
+    except FileNotFoundError:
+        return {"enabled": True, "nudged": {}}
     except Exception:
-        d = {}
+        # a read/parse fault: the copy is PROOF only for the same generation; a moved
+        # world (or no copy) yields a TAGGED fallback that no writer may persist. Nothing
+        # is cached (the r57 P1.4 fabrication-caching lesson).
+        hit = _autonudge_cache.get(str(p))
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        d = dict(hit[1]) if hit is not None else {"enabled": True, "nudged": {}}
+        d["_unproved"] = True
+        return d
     d.setdefault("enabled", True)
     d.setdefault("nudged", {})         # {gid: {count, lastTurnId}} — re-arm per stall episode (replaces the one-shot "done" list)
     d.pop("done", None)                # drop the vestigial one-shot list (old code wrote it; nothing reads it now) →
@@ -4013,10 +4173,23 @@ def _auto_nudge_on():
     return bool(_auto_nudge_data().get("enabled"))
 
 
+_auto_nudge_skip_warned = [False]
+
+
 def _write_auto_nudge(d):
     with jd._identity_file_lock():
+        if isinstance(d, dict) and d.pop("_unproved", False):
+            # the snapshot was FABRICATED under a fault (r58 P1.5) — persisting it is the
+            # erase-everything bug, every time. Skip; the tick that wanted this write
+            # retries against a readable store.
+            if not _auto_nudge_skip_warned[0]:
+                _auto_nudge_skip_warned[0] = True
+                sys.stderr.write("auto-nudge: a write built from an UNPROVED snapshot was "
+                                 "skipped — mutations resume when the store reads again\n")
+            return False
         d = jd.canonicalize_auto_nudge_identity(d)
         _atomic_write(jd.STATE / "auto-nudge.json", json.dumps(d))
+        return True
 
 
 def _proved_ledger_read(path, what, default):
@@ -6561,14 +6734,16 @@ def _intr_blocked(sid=None):
 
 
 def _set_intr_blocked(sid, gid):
-    d = dict(_auto_nudge_data())
-    m = dict(d.get("intrBlocked") or {})
-    if gid:
-        m[str(sid)] = gid
-    else:
-        m.pop(str(sid), None)
-    d["intrBlocked"] = m
-    _write_auto_nudge(d)
+    with _NUDGE_LOCK:                    # end-to-end RMW (r58 P2.12: two concurrent
+        #                                  writers lost whichever snapshot landed first)
+        d = dict(_auto_nudge_data())
+        m = dict(d.get("intrBlocked") or {})
+        if gid:
+            m[str(sid)] = gid
+        else:
+            m.pop(str(sid), None)
+        d["intrBlocked"] = m
+        _write_auto_nudge(d)
 
 
 def _intr_block_stands(sid, gid):
@@ -7996,27 +8171,28 @@ def _nudge_deferred_ok(gid, reason, now, sid=None, ev_t=None):
     a seen counter or a screen (both retired; a frozen record can no longer hide a stale claim,
     because nothing freezes). `ev_t` rides WHY_TURN_IN_FLIGHT records: the newest diary evidence the
     hold is waiting to see END, which is exactly the event the sweep retires it on."""
-    d = _auto_nudge_data()
-    dd = dict(d.get("deferred") or {})
-    if not reason:
-        if gid in dd:                                    # the reviver ran → forget the deferral
-            dd.pop(gid, None)
+    with _NUDGE_LOCK:                    # end-to-end RMW (r58 P2.12)
+        d = _auto_nudge_data()
+        dd = dict(d.get("deferred") or {})
+        if not reason:
+            if gid in dd:                                # the reviver ran → forget the deferral
+                dd.pop(gid, None)
+                d["deferred"] = dd
+                _write_auto_nudge(d)
+            return True
+        rec = dd.get(gid)
+        first = _deferral_at(rec)
+        if first is None:
+            dd[gid] = {"at": int(now), "why": reason, "sid": sid,
+                       **({"evT": int(ev_t)} if ev_t else {})}
             d["deferred"] = dd
             _write_auto_nudge(d)
-        return True
-    rec = dd.get(gid)
-    first = _deferral_at(rec)
-    if first is None:
-        dd[gid] = {"at": int(now), "why": reason, "sid": sid,
-                   **({"evT": int(ev_t)} if ev_t else {})}
-        d["deferred"] = dd
-        _write_auto_nudge(d)
-        return False
-    if _deferral_why(rec) != reason:                     # the wait moved to a DIFFERENT reviver: keep the clock
-        dd[gid] = {"at": first, "why": reason, "sid": sid,
-                   **({"evT": int(ev_t)} if ev_t else {})}
-        d["deferred"] = dd
-        _write_auto_nudge(d)
+            return False
+        if _deferral_why(rec) != reason:                 # the wait moved to a DIFFERENT reviver: keep the clock
+            dd[gid] = {"at": first, "why": reason, "sid": sid,
+                       **({"evT": int(ev_t)} if ev_t else {})}
+            d["deferred"] = dd
+            _write_auto_nudge(d)
     # WEDGED-REVIVER BOUND ON THE PASS EVENT, not a clock (W2c, the user 2026-08-24): the named
     # reviver is wedged exactly when its OWNING TIER has completed a per-session pass over this fsid
     # SINCE the deferral was minted and the reason still stands — the pass ran and did not retire it.
@@ -28774,18 +28950,21 @@ def _save_push_subs(subs):
 
 
 def _set_push_sub(sub):
-    cur = _proved_ledger_read(jd.STATE / "push-subscriptions.json",
-                              "push-subscriptions", {})   # PROVED RMW (r57 P1.5: one EIO
-    #                                                        erased every other device's sub)
-    cur[sub["endpoint"]] = sub
-    _save_push_subs(cur)
+    with jd._identity_file_lock():       # end-to-end RMW lock (r58 P2.12: two concurrent
+        #                                  subscribers lost one acknowledged registration)
+        cur = _proved_ledger_read(jd.STATE / "push-subscriptions.json",
+                                  "push-subscriptions", {})   # PROVED RMW (r57 P1.5: one EIO
+        #                                                        erased every other device's sub)
+        cur[sub["endpoint"]] = sub
+        _save_push_subs(cur)
 
 
 def _del_push_sub(endpoint):
-    cur = _proved_ledger_read(jd.STATE / "push-subscriptions.json",
-                              "push-subscriptions", {})
-    if cur.pop(endpoint, None) is not None:
-        _save_push_subs(cur)
+    with jd._identity_file_lock():
+        cur = _proved_ledger_read(jd.STATE / "push-subscriptions.json",
+                                  "push-subscriptions", {})
+        if cur.pop(endpoint, None) is not None:
+            _save_push_subs(cur)
 
 
 def _vapid_keys():
@@ -29170,7 +29349,9 @@ def _pusher_cycle_jobs(now, tmux, any_client):
     except Exception:
         sys.stderr.write("end-on-idle: %s\n" % traceback.format_exc())
     try:                                  # deferral records retire on their reasons' own events — BEFORE
-        _deferral_sweep_tick(now)         # the walk, independent of the nudge toggle (the stall/swirl
+        with _NUDGE_LOCK:                 # end-to-end RMW (r58 P2.12: the sweep's snapshot
+            #                               raced a WS writer's and dropped its update)
+            _deferral_sweep_tick(now)     # the walk, independent of the nudge toggle (the stall/swirl
     except Exception:                     # surfaces read these records regardless)
         sys.stderr.write("deferral-sweep: %s\n" % traceback.format_exc())
     try:                                  # Auto Nudge runs server-side even with no browser open (cheap when

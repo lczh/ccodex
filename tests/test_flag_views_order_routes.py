@@ -153,7 +153,9 @@ class R57AuditFixes(unittest.TestCase):
         km._union_claims.clear()
         km._union_retired_tombs.clear()
         km._retry_paused_cache[0] = None
-        for name in ("union-gestures.json", "session-order.json", "auto-nudge.json",
+        km._union_tombs_loaded[0] = False
+        for name in ("union-gestures.json", "union-gestures.json.unproved",
+                     "union-tombs.json", "session-order.json", "auto-nudge.json",
                      "retry-paused.json"):
             try:
                 (km.jd.STATE / name).unlink()
@@ -334,8 +336,11 @@ class R57Wave2(unittest.TestCase):
         km._retry_pause_lkg["reason"] = ""
         km._retry_pause_lkg["ts"] = 0.0
         km._notify_cards_cache.clear()
+        km._autonudge_cache.clear()
+        km._union_tombs_loaded[0] = False
         km._postal_isolated_warned[0] = False
-        for name in ("union-gestures.json", "session-order.json", "auto-nudge.json",
+        for name in ("union-gestures.json", "union-gestures.json.unproved",
+                     "union-tombs.json", "session-order.json", "auto-nudge.json",
                      "retry-paused.json", "notify-cards.json"):
             try:
                 (km.jd.STATE / name).unlink()
@@ -438,16 +443,41 @@ class R57Wave2(unittest.TestCase):
                           "POST /union-claim, and the WS arm dropped the ack — the panel's "
                           "_pendingClaims latched forever")
 
-    def test_g_malformed_journal_reminted_never_reads_empty_later(self):
+    def test_g_malformed_journal_holds_unproved_until_reconstructed(self):
+        # r58 P1.1, executed there: the r57 re-mint-[] answer made corruption read as an
+        # AUTHORITATIVE empty one push later — None once, then [], and panels retired
+        # their recovery copies. Corruption now stands JUDGED (bytes at the path + a
+        # durable marker) and every read answers "no information" until a panel's mirror
+        # sync RECONSTRUCTS the store through the merge.
         km.jd.STATE.mkdir(parents=True, exist_ok=True)
         km._union_ops_path().write_text("{{{garbage")
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertIsNone(km._union_ops_echo(), "the judged push has no information")
-        self.assertEqual(km._union_ops_path().read_text(), "[]",
-                         "the store re-mints in the SAME locked pass — the wave-1 ENOENT "
-                         "read as authoritative-empty and panels retired recovery copies")
-        self.assertEqual(len(list(km.jd.STATE.glob("union-gestures.json.corrupt-*"))), 1)
-        self.assertEqual(km._union_ops_echo(), [], "the next push reads a deliberate []")
+            self.assertIsNone(km._union_ops_echo(),
+                              "…and the NEXT push too — never an authoritative []")
+        self.assertEqual(km._union_ops_path().read_text(), "{{{garbage",
+                         "the judged bytes STAND at the path (failure-atomic, r58 P1.2)")
+        self.assertTrue(km._union_unproved_marker().exists(), "…under a durable marker")
+        self.assertEqual(len(list(km.jd.STATE.glob("union-gestures.json.corrupt-*"))), 1,
+                         "one forensic copy — later reads never re-quarantine")
+        # a bare retirement proves nothing to rebuild from: refused, retryable
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok, _, reason, _u = km._union_ops_merge([], [7], ckey="ws:x")
+        self.assertFalse(ok)
+        self.assertIn("reconstruction", reason)
+        # a panel's mirror rows ARE the reconstruction evidence
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok, _, _, _u = km._union_ops_merge(
+                [{"host": "TESTHOST-A", "gid": 9, "edit": {}, "inverse": {}, "rt": {},
+                  "name": "pool", "dispatched": False}], [], ckey="ws:x")
+        self.assertTrue(ok)
+        self.assertFalse(km._union_unproved_marker().exists(),
+                         "the commit clears the marker in the same locked pass")
+        self.assertEqual([r["gid"] for r in km._union_ops_echo()], [9],
+                         "…and the store is proven again")
+        km._union_unproved_marker().unlink(missing_ok=True)
+        for q in km.jd.STATE.glob("union-gestures.json.corrupt-*"):
+            q.unlink()
 
     def test_h_echo_quarantine_runs_under_the_identity_lock(self):
         # the wave-2 verification reproduced the stat→unlink TOCTOU by scheduling a locked
@@ -459,6 +489,174 @@ class R57Wave2(unittest.TestCase):
         fn = src.index("def _union_ops_echo():")
         body = src[fn:src.index("def ", fn + 10)]
         self.assertIn("with jd._identity_file_lock():", body)
+
+
+
+
+class R58AuditFixes(unittest.TestCase):
+    """the v1.3.30 audit, kernel half (11 P1 / 9 P2 against 4aeec698): corrupt union state
+    became authoritative absence one push later (P1.1), the salvage moved the only live
+    inode aside before publishing (P1.2), a stale permissive flags copy crossed a newer
+    isolation (P1.4), auto-nudge RMWs fabricated-and-overwrote (P1.5), non-dicts were
+    filtered before validation and nested Infinity rode the wire (P1.6), tombstones were
+    process-local (P2.14), and 2**53 passed the safe-integer gate (P2.19)."""
+
+    SID = "15151515-6262-7373-8484-616161616161"
+    ROW = {"host": "TESTHOST-A", "gid": 7, "edit": {}, "inverse": {}, "rt": {},
+           "name": "pool", "dispatched": False}
+
+    def setUp(self):
+        _scrub_state()
+        km._union_claims.clear()
+        km._union_retired_tombs.clear()
+        km._union_tombs_loaded[0] = False
+        km._retry_paused_cache[0] = None
+        km._autonudge_cache.clear()
+        km._auto_nudge_skip_warned[0] = False
+        km._postal_isolated_warned[0] = False
+        for name in ("union-gestures.json", "union-gestures.json.unproved",
+                     "union-tombs.json", "session-order.json", "auto-nudge.json",
+                     "retry-paused.json", "notify-cards.json"):
+            try:
+                (km.jd.STATE / name).unlink()
+            except OSError:
+                pass
+        for f in km.jd.STATE.glob("*.corrupt-*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_salvage_is_failure_atomic(self):
+        # r58 P1.2, reproduced there: the quarantine moved the only live inode aside BEFORE
+        # the salvage published — one injected write fault left ENOENT, and the next read
+        # answered authoritative-[]. Copy-first: the poisoned file stands until the very
+        # rename that publishes the valid rows.
+        km.jd.STATE.mkdir(parents=True, exist_ok=True)
+        _good = ('{"host": "TESTHOST-B", "gid": 7, "edit": {}, "inverse": {}, "rt": {}, '
+                 '"name": "pool", "dispatched": false}')
+        poisoned = '[%s, {"host": "TESTHOST-A", "gid": 0.5}]' % _good
+        km._union_ops_path().write_text(poisoned)
+        real = km._atomic_write
+
+        def boom(path, data):
+            if str(path) == str(km._union_ops_path()):
+                raise OSError(5, "EIO")
+            return real(path, data)
+
+        km._atomic_write = boom
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertIsNone(km._union_ops_echo(), "the failed salvage holds")
+        finally:
+            km._atomic_write = real
+        self.assertEqual(km._union_ops_path().read_text(), poisoned,
+                         "the judged bytes STAND at the path — never an ENOENT window")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual([r["gid"] for r in km._union_ops_echo()], [7],
+                             "…and the healed write completes the salvage")
+
+    def test_b_non_dict_rows_are_judged_not_silently_dropped(self):
+        # r58 P1.6: the isinstance pre-filter acked a mixed journal while silently dropping
+        # its invalid rows — the drop IS the silent retirement the whole chain forbids
+        km.jd.STATE.mkdir(parents=True, exist_ok=True)
+        _good = ('{"host": "TESTHOST-B", "gid": 7, "edit": {}, "inverse": {}, "rt": {}, '
+                 '"name": "pool", "dispatched": false}')
+        km._union_ops_path().write_text('[123, %s]' % _good)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual([r["gid"] for r in km._union_ops_echo()], [7])
+        self.assertEqual(len(list(km.jd.STATE.glob("union-gestures.json.corrupt-*"))), 1,
+                         "the mixed journal was JUDGED (bytes aside), not silently filtered")
+
+    def test_c_nested_infinity_is_rejected_at_the_gate(self):
+        # r58 P1.6: a nested non-finite passed the top-level checks and either raised at
+        # the strict dump or rode the wire as JSON the browser refused whole
+        self.assertFalse(km._union_row_valid(dict(self.ROW, edit={"x": float("inf")})))
+        self.assertFalse(km._union_row_valid(dict(self.ROW, rt={"a": [{"b": float("nan")}]})))
+        self.assertTrue(km._union_row_valid(dict(self.ROW, edit={"x": [1, "y", None, 2.5]})))
+        ok, _, reason, _u = km._union_ops_merge(
+            [dict(self.ROW, inverse={"deep": {"deeper": float("inf")}})])
+        self.assertFalse(ok)
+        self.assertIn("malformed", reason or "")
+
+    def test_d_safe_integer_bound_is_exclusive_of_2_53(self):
+        # r58 P2.19: the server accepted 2**53 — outside JavaScript's exact domain
+        self.assertFalse(km._union_row_valid(dict(self.ROW, gid=2 ** 53)))
+        self.assertTrue(km._union_row_valid(dict(self.ROW, gid=2 ** 53 - 1)))
+        self.assertIsNone(km._union_claim_grant(2 ** 53, "cid:x"))
+        self.assertFalse(km._union_row_valid(dict(self.ROW, rid=2 ** 53)))
+        self.assertTrue(km._union_row_valid(dict(self.ROW, rid=5)),
+                        "the stable root id rides the schema (r58 P2.19)")
+
+    def test_e_tombstones_survive_a_kernel_restart(self):
+        # r58 P2.14, reproduced there: claims and tombstones were process-local — a stale
+        # panel's replay after a restart resurrected a RETIRED gesture and both completion
+        # CAS operations succeeded
+        self.assertTrue(km._union_ops_set([dict(self.ROW, gid=911)]))
+        ok, _, _, _u = km._union_ops_merge([], [911], ckey="ws:x")
+        self.assertTrue(ok)
+        self.assertTrue((km.jd.STATE / "union-tombs.json").exists(), "minted durable")
+        km._union_retired_tombs.clear()              # the process died
+        km._union_tombs_loaded[0] = False
+        ok, unclaimed, _, _u = km._union_ops_merge(
+            [dict(self.ROW, gid=911)], [], ckey="ws:y")   # the stale replay
+        self.assertTrue(ok)
+        self.assertIn(911, unclaimed,
+                      "the reloaded tombstone names the replay back — the gate yields")
+        self.assertEqual(km._union_ops_load(), [], "the retired gesture stays retired")
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_f_stale_permissive_flags_never_cross_a_newer_generation(self):
+        # r58 P1.4, reproduced there: an EIO on a NEWER inode let the stale not-isolated
+        # copy deliver into a durably-isolated session
+        km._set_session_flag(self.SID, "postalServiceOff", False)
+        self.assertFalse(km._postal_isolated(self.SID))   # primes a PERMISSIVE copy
+        p = km.jd.STATE / "session-flags.json"
+        p.write_text("{not valid json")              # a NEWER generation, unreadable
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(km._postal_isolated(self.SID),
+                            "the stale permissive copy is never proof across it — closed")
+        d, proved = km._session_flags_read()
+        self.assertFalse(proved)
+        p.unlink()
+        km._set_session_flag(self.SID, "hideFromFeed", True)
+        os.chmod(p, 0)                               # SAME generation, unreadable window
+        try:
+            self.assertTrue(km._session_flag(self.SID, "hideFromFeed"),
+                            "…while a same-generation fault still serves the proven copy")
+            _, proved = km._session_flags_read()
+            self.assertTrue(proved)
+        finally:
+            os.chmod(p, 0o644)
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_g_unproved_nudge_snapshots_never_persist(self):
+        # r58 P1.5, reproduced there: a fault fabricated the default snapshot and the next
+        # writer PERSISTED it — enabled:false flipped back on, suppressions/debt erased
+        p = km.jd.STATE / "auto-nudge.json"
+        p.write_text(json.dumps({"enabled": False, "nudged": {"g1": {"count": 2}},
+                                 "intrBlocked": {"s1": "g1"}}))
+        os.utime(p, (1, 1))                          # a generation the cache has not seen
+        os.chmod(p, 0)
+        try:
+            d = km._auto_nudge_data()
+            self.assertTrue(d.get("_unproved"), "the fabricated snapshot wears its tag")
+            with contextlib.redirect_stderr(io.StringIO()):
+                km._set_intr_blocked("s2", "g9")     # one of the seventeen RMW sites
+        finally:
+            os.chmod(p, 0o644)
+        self.assertEqual(json.loads(p.read_text()),
+                         {"enabled": False, "nudged": {"g1": {"count": 2}},
+                          "intrBlocked": {"s1": "g1"}},
+                         "the refused write changed NOTHING — no fault launders itself "
+                         "into durable state through any RMW site")
+        km._set_intr_blocked("s2", "g9")             # the healed store accepts the mutation
+        d2 = json.loads(p.read_text())
+        self.assertEqual(d2["intrBlocked"], {"s1": "g1", "s2": "g9"})
+        self.assertIs(d2["enabled"], False, "…and the explicit stop survives")
 
 
 if __name__ == "__main__":
@@ -1104,7 +1302,7 @@ class R50UnionJournalLock(unittest.TestCase):
         src = inspect.getsource(km._union_ops_merge)   # _union_ops_set is its shim since r55
         self.assertIn("with jd._identity_file_lock():", src)
         self.assertLess(src.index("_identity_file_lock"),
-                        src.index('_read_state_json(_union_ops_path()'),
+                        src.index("_union_store_read_locked("),
                         "the LOAD happens inside the lock — locking after reading is the bug")
 
 
@@ -2590,7 +2788,9 @@ class R56AuditFixes(unittest.TestCase):
         _scrub_state()
         km._union_claims.clear()
         km._union_retired_tombs.clear()
-        for name in ("union-gestures.json", "session-order.json"):
+        km._union_tombs_loaded[0] = False
+        for name in ("union-gestures.json", "union-gestures.json.unproved",
+                     "union-tombs.json", "session-order.json"):
             try:
                 (km.jd.STATE / name).unlink()
             except OSError:

@@ -2004,3 +2004,60 @@ test("r57 wave 2: a received 4xx is DEFINITIVE, and the indeterminate/unretired 
     assert.equal(panel._unionSyncDirty, true, "…and ARMS the paced re-send");
   }
 });
+
+test("r58: queued sends of a moved world are void, rid correlation is stable, unproved echoes arm reconstruction", async () => {
+  {
+    // P1.3 EXECUTED (reproduced upstream: a snapshot captured at queue time survived the
+    // reconnect unwind, flushed after the reset, and the kernel forked one gesture into
+    // two separately claimable identities). The body now builds at the send head under a
+    // world-epoch guard.
+    const panel = drawnPanel();
+    const posts: any[] = [];
+    (panel as any)._kernelPost = (route: string, body: any) => {
+      posts.push(body);
+      return Promise.resolve({ ok: true, json: { ok: true }, status: 200 });
+    };
+    const realProcess = (globalThis as any).process;
+    (globalThis as any).process = { versions: { electron: "1" } };
+    try {
+      panel._unionOps = [{ gid: 61, host: "TESTHOST-A", edit: {}, inverse: {}, rt: {},
+                           name: "pool", dispatched: false }];
+      const opId = panel._syncUnionOps();
+      assert.ok(opId, "the Electron arm queued a send");
+      panel._unionOps = [];                        // the gesture UNWINDS…
+      panel.unionTransportReset();                 // …and the world resets BEFORE the flush
+      await panel._postChain;
+      assert.ok(posts.every((b) => !b || !(b.entries || []).some((o: any) => o.gid === 61)),
+        "no queued closure sent the pre-unwind rows — the body builds at the send head "
+        + "under the epoch guard (old code captured them at queue time and the flushed "
+        + "snapshot forked the gesture into two claimable identities)");
+    } finally {
+      (globalThis as any).process = realProcess;
+    }
+  }
+  {
+    // P2.19: the STABLE root id is minted once and survives re-keying — refusal
+    // correlation no longer dies past the lineage cap
+    assert.ok(SRC.indexOf("rid: o.rid || (o.rid = ((o.olin && o.olin[0]) || o.ogid || o.gid)),") > 0,
+      "every journaled row carries rid, minted from the earliest known ancestor");
+    assert.ok(SRC.indexOf("|| String(o.rid || 0) === String(id)") > 0,
+      "…and the refusal matcher correlates by it");
+  }
+  {
+    // P1.1 twin half: a null echo while this panel HOLDS journaled rows arms the mirror
+    // re-sync — the kernel's merge reconstructs the judged store and clears its marker
+    const panel = drawnPanel();
+    panel._unionOps = [{ gid: 71, host: "TESTHOST-A", edit: {}, inverse: {}, rt: {},
+                         name: "pool", dispatched: false }];
+    if (!panel._journaledGids) panel._journaledGids = new Set();
+    panel._journaledGids.add(71);
+    panel._unionSyncDirty = false;
+    let syncs = 0;
+    panel._syncUnionOps = () => { syncs += 1; return null; };   // the pump in the SAME
+    //  update() consumes the dirty bit — the spy proves the re-send actually fired
+    panel.update({ now, sessions: [sess("s1", "web", "#f7768e")], turns: {}, messages: [],
+                   judging: [], views: JSON.parse(JSON.stringify(VIEWS)), unionOps: null });
+    assert.ok(syncs >= 1,
+      "the held mirror is the reconstruction evidence — the paced re-send fired");
+  }
+});

@@ -39,6 +39,7 @@ class PostalOff(unittest.TestCase):
         # (the r57 wave-2 verification caught the OLD fail-open pin below passing exactly
         # that way — green in a full run, red standalone)
         pm._postal_off_cache[0] = None
+        pm._postal_off_key[0] = None
 
     def tearDown(self):
         try:
@@ -63,8 +64,9 @@ class PostalOff(unittest.TestCase):
 
     def test_malformed_flags_file_fails_closed_then_serves_history(self):
         # r57 P1.4 REVERSED the old fail-open pin here: one unreadable window used to
-        # deliver into a durably-isolated session. With no good read yet, isolation is the
-        # safe answer; with history, the last-known-good copy answers.
+        # deliver into a durably-isolated session. With no good read yet, isolation is
+        # the safe answer; with history, the copy answers ONLY for the same stat
+        # generation (r58 P1.4: a stale permissive copy crossed a NEWER isolation).
         pm.SESSION_FLAGS.parent.mkdir(parents=True, exist_ok=True)
         pm.SESSION_FLAGS.write_text("{not valid json")
         self.assertTrue(pm._postal_off(SID),
@@ -72,9 +74,17 @@ class PostalOff(unittest.TestCase):
         pm.SESSION_FLAGS.unlink()                    # the helper reads the file it writes
         _set_flag(SID, False)
         self.assertFalse(pm._postal_off(SID))        # a good read primes the copy
+        if os.geteuid() != 0:
+            os.chmod(pm.SESSION_FLAGS, 0)            # SAME generation, unreadable window
+            try:
+                self.assertFalse(pm._postal_off(SID),
+                                 "…and a same-generation fault serves the copy")
+            finally:
+                os.chmod(pm.SESSION_FLAGS, 0o644)
         pm.SESSION_FLAGS.write_text("{not valid json")
-        self.assertFalse(pm._postal_off(SID),
-                         "…and the fault serves the last-known-good verdict")
+        self.assertTrue(pm._postal_off(SID),
+                        "r58 P1.4: a NEW generation the reader cannot read is never "
+                        "answered by the stale permissive copy — fail closed")
 
     def test_wrong_shape_flags_are_a_fault_not_an_empty_store(self):
         # the r57 wave-2 verification, reproduced: []-shaped VALID bytes took the success
@@ -84,8 +94,10 @@ class PostalOff(unittest.TestCase):
         for junk in ('[]', 'null', '0', '"oops"'):
             pm.SESSION_FLAGS.write_text(junk)
             self.assertTrue(pm._postal_off(SID),
-                            "%s must serve the last-known-good isolation, not un-isolate" % junk)
-        pm._postal_off_cache[0] = None               # a fresh process with no history
+                            "%s must answer isolated (a fault/closed verdict), never "
+                            "un-isolate through the success path" % junk)
+        pm._postal_off_cache[0] = None
+        pm._postal_off_key[0] = None               # a fresh process with no history
         pm.SESSION_FLAGS.write_text("[]")
         self.assertTrue(pm._postal_off(SID), "wrong shape with no history: closed")
 

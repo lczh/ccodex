@@ -303,6 +303,23 @@ def _mark_pending(sid):
     except Exception:
         pass
 
+def _seen_key(origin, mid):
+    """The seen-ledger key for one relayed message: ORIGIN-scoped (r58 P2.16, reproduced:
+    two peers reusing one mid both got ACKs while only the first body delivered — identity
+    was the bare mid). '|' is outside _safe_id's alphabet, so scoped keys can never collide
+    with legacy bare-mid entries, which stay honored on lookup."""
+    return "%s|%s" % (origin or "", mid)
+
+
+def _relay_name(origin, mid):
+    """Deterministic, origin-scoped, BOUNDED delivery id for relayed mail (r58 P1.8 +
+    P2.16, both reproduced: "r-"+mid outgrew the 128-char id cap for 127-byte mids — the
+    random fallback lost crash idempotency and a replay double-delivered; and a bare-mid
+    name aliased two peers' same-mid messages). The digest keeps the id deterministic per
+    (origin, mid), short, and path-safe, so a crash replay overwrites the same file."""
+    return "r-" + hashlib.sha256(("%s|%s" % (origin or "", mid)).encode()).hexdigest()[:32]
+
+
 def _tl_append(fname, obj):
     """Append one JSON line to a timeline log (best-effort; never raises).
     Returns True ONLY when the row is DURABLE (the r57 audit's P1.6, executed there: the
@@ -323,8 +340,11 @@ def _tl_append(fname, obj):
             try:
                 _fsync_dir(TLDIR)
             except Exception:
-                pass                                 # the row itself is durable; the dir
-                #                                      entry follows on the next sync
+                # the row's DIRECTORY ENTRY is not durable: a crash can lose the whole new
+                # log while callers have already deleted/ACKed their only retry source on
+                # this True (r58 P1.11) — report the truth; the caller retries (a possible
+                # duplicate row over a lost record, the standing r53 trade)
+                return False
         return True
     except Exception:
         return False
@@ -348,11 +368,11 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
     # relayed mail is keyed by its RELAY mid (the r57 audit's P1.7, executed there: a crash
     # between the delivery and the durable seen-append re-delivered on replay — with the
     # deterministic name the replay overwrites the same unread file instead of duplicating)
-    name = ("r-" + relay_mid) if (relay_mid and _safe_id("r-" + relay_mid)) else _unique()
-    #      ^ the PREFIXED name must stay a safe id too (r57 wave 2: a 127-char peer mid made
-    #        a 129-char delivery id that failed every /handoff-done validation — the receipt
-    #        could never file and the kernel re-posted forever); an over-long mid falls back
-    #        to the local unique name, trading idempotency for a working receipt loop
+    name = _relay_name(from_host, relay_mid) if (relay_mid and _safe_id(relay_mid)) \
+        else _unique()
+    #      ^ origin-scoped digest (r58 P1.8 + P2.16): deterministic for ANY valid mid
+    #        length — no random fallback to lose crash idempotency — and two peers reusing
+    #        one mid deliver as two files instead of the second aliasing the first
     if name.startswith("r-"):
         try:
             if (mb / "new" / name).exists() or (mb / "cur" / name).exists():
@@ -389,7 +409,21 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
         hdr += "X-From-Host: %s\n" % h["from_host"]
     if h["relay_mid"] and h["relay_via"]:
         hdr += "X-Peer-Mid: %s\nX-Peer-Via: %s\n" % (h["relay_mid"], h["relay_via"])
-    tmp.write_text(hdr + "\n" + body + "\n")
+    try:
+        _dfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(_dfd, "w") as _dfh:
+            _dfh.write(hdr + "\n" + body + "\n")
+            _dfh.flush()
+            os.fsync(_dfh.fileno())      # the EFFECT outlives the crash the durable seen-
+            #                              append survives (r58 P1.7, reproduced: the effect
+            #                              vanished, `seen` stood, and the replay ACKed
+            #                              without restoring the mail)
+    except OSError:
+        try:
+            tmp.unlink()                 # withdraw the un-durable half; the caller drops
+        except OSError:                  # and the peer re-sends
+            pass
+        raise
     # Timeline log: a message was SENT (the matching exec event is logged when
     # the recipient consumes it in read_box). id = maildir filename joins the two.
     # Logged BEFORE the rename publishes the mail (the v1.3.17 audit's P1.3): this row is the
@@ -427,6 +461,14 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
         raise RuntimeError("postal: the delivery record could not be written — mail NOT published")
     try:
         tmp.rename(mb / "new" / name)   # atomic within the same filesystem — the PUBLISH point
+        try:
+            _fsync_dir(mb / "new")       # the ENTRY outlives the crash too (r58 P1.7)
+        except OSError:
+            try:
+                (mb / "new" / name).unlink()   # withdraw: never let an un-durable publish
+            except OSError:                    # correlate with a durable seen-append
+                pass
+            raise
     except Exception:
         try:
             tmp.unlink()                # a failed publish must not leave a tmp/ file that reads
@@ -950,15 +992,30 @@ _postal_off_cache = [None]                 # last-known-good session-flags dict 
 
 
 _postal_off_warned = [False]
+_postal_off_key = [None]                 # the stat generation the cached copy was read from
+#                                          (r58 P1.4: a stale PERMISSIVE copy must never
+#                                          overrule a newer inode it cannot read)
 
 
 def _postal_off_verdict(sid):
-    """(isolated, proved). proved=False means the flags store was UNREADABLE with no
-    last-known-good copy — the True beside it is fail-closed POLICY, not evidence: relay
-    intake maps it to a retryable drop (never a terminal bounce), and the send gate answers
-    a retryable 503 instead of blaming a mailbox nobody toggled (r57 wave 2)."""
+    """(isolated, proved). proved=False means the verdict is fail-closed POLICY, not
+    evidence — the store is unreadable and the cached copy (if any) cannot be proven
+    current: relay intake maps unproved to a retryable drop (never a terminal bounce), and
+    the send gate answers a retryable 503 instead of blaming a mailbox nobody toggled (r57
+    wave 2). The copy counts as PROOF only while the file's stat generation still matches
+    the read it came from (r58 P1.4, reproduced: an EIO on a NEWER inode let a stale
+    not-isolated copy deliver into a durably-isolated session)."""
     if not sid:
         return False, True
+    try:
+        st = SESSION_FLAGS.stat()
+        key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
+        _postal_off_cache[0] = {}
+        _postal_off_key[0] = None
+        return False, True                           # provably no flags: not isolated
+    except OSError:
+        key = None                                   # can't even correlate the generation
     try:
         d = json.loads(SESSION_FLAGS.read_text())
         if not isinstance(d, dict):
@@ -967,20 +1024,27 @@ def _postal_off_verdict(sid):
             # []-shaped bytes) — a fault, same arms as an unreadable file
             raise ValueError("session-flags is not a dict")
         _postal_off_cache[0] = d                     # last-known-good (r57 P1.4)
+        _postal_off_key[0] = key
         f = d.get(sid)
         return bool(isinstance(f, dict) and (f.get("postalServiceOff") or f.get("postalOff"))), True
     except FileNotFoundError:
         _postal_off_cache[0] = {}
+        _postal_off_key[0] = None
         return False, True                           # provably no flags: not isolated
     except Exception:
         # UNREADABLE is not "not isolated" (the r57 audit's P1.4, executed there: one EIO
-        # delivered and ACKed a peer message into a durably-isolated session). Judge from the
-        # last-known-good copy; with none, fail CLOSED — and say so OUT LOUD (r57 wave 2:
-        # the silent verdict was an undiagnosable stall wearing user-isolation's clothes).
+        # delivered and ACKed a peer message into a durably-isolated session). The cached
+        # copy is PROOF only if the stat generation still matches the read it came from
+        # (r58 P1.4); otherwise its verdict still answers — restrictive answers hold mail
+        # harmlessly — but marked unproved so no terminal effect rides it. With no copy at
+        # all, fail CLOSED and say so OUT LOUD (r57 wave 2).
         if isinstance(_postal_off_cache[0], dict):
             f = _postal_off_cache[0].get(sid)
-            return bool(isinstance(f, dict)
-                        and (f.get("postalServiceOff") or f.get("postalOff"))), True
+            _off = bool(isinstance(f, dict)
+                        and (f.get("postalServiceOff") or f.get("postalOff")))
+            if key is not None and key == _postal_off_key[0]:
+                return _off, True                    # same generation: the copy IS current
+            return True, False                       # the world moved past the copy: closed
         if not _postal_off_warned[0]:
             _postal_off_warned[0] = True
             _log("session-flags is unreadable with NO good read yet — treating every "
@@ -2833,7 +2897,7 @@ def _seen_load():
         # compacted; loading them must neither weaken the window nor retain attacker-shaped lines.
         keep, have = [], set()
         for mid in reversed(rows):
-            if _safe_id(mid) and mid not in have:
+            if _seen_token_ok(mid) and mid not in have:
                 keep.append(mid)
                 have.add(mid)
                 if len(keep) >= _SEEN_CAP:
@@ -2876,10 +2940,20 @@ def _peer_seen_append_durable(mid):
         return False
 
 
+def _seen_token_ok(tok):
+    """A ledger token: a legacy bare mid, or an origin-scoped pair (r58 P2.16)."""
+    if _safe_id(tok):
+        return True
+    if isinstance(tok, str) and tok.count("|") == 1:
+        a, b = tok.split("|", 1)
+        return _safe_id(a) and _safe_id(b)
+    return False
+
+
 def _peer_seen_add_locked(mid):
     """Publish one receipt while _seen_lock is held; retain one bounded, ordered dedupe window."""
     global _seen_appends
-    if not _safe_id(mid):
+    if not _seen_token_ok(mid):
         return
     seen = _seen_load()
     if mid in seen:
@@ -3026,9 +3100,19 @@ def outbox_publish_stage(host, mid, stagef):
     # attempted, outcome unknown": boot RE-PUBLISHES from the stage instead of spending it.
     _phasef = d / (".pubphase-" + mid)
     try:
-        _phasef.write_text("1")
-    except OSError:
-        pass                                         # best-effort: boot then follows the old rules
+        _pfd = os.open(str(_phasef), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        #      ^ no-follow (r58 P2.20: the predictable path followed a planted symlink and
+        #        overwrote its target)
+        with os.fdopen(_pfd, "w") as _pfh:
+            _pfh.write("1")
+            _pfh.flush()
+            os.fsync(_pfh.fileno())
+        _fsync_dir(d)                                # the marker must SURVIVE the crash it
+        #                                              exists to arbitrate (r58 P1.9)
+    except OSError as e:
+        # nothing has happened yet — refusing here is the honest verdict: the stage stands,
+        # the caller compensates/retries, and no crash window opens without its record
+        raise _PublishNeverStarted("the publication-phase record could not be written: %s" % e)
     # LINK-then-unlink, not rename (the v1.3.24 audit's P3.10): rename silently REPLACES a
     # same-mid file — a collision overwrote an existing message. link fails EEXIST, so a
     # collision is loud and the standing mail survives; the 128-bit mid makes it unreachable
@@ -3067,24 +3151,22 @@ def outbox_publish_stage(host, mid, stagef):
             raise _PublishNeverStarted("a DIFFERENT message already holds mid %s" % mid)
     except OSError as e:
         if e.errno in (errno.EPERM, errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)):
-            # a filesystem without hard links (the r52 verification). COPY-fsync-replace, not
-            # a bare rename (the r56 audit's P1.7b, executed there: rename consumed the stage
-            # BEFORE directory durability, and a later fsync failure left no recovery copy)
-            _tmpf = d / (".pub-%s.%s.tmp" % (mid, os.urandom(8).hex()))
+            # a filesystem without hard links (the r52 verification). EXCLUSIVE creation
+            # of the final itself (r58 P2.15, reproduced: the absence-check-then-replace
+            # dance overwrote a competing final that landed in the window) — O_EXCL either
+            # wins the name outright or loses loudly into content arbitration.
             try:
                 _pb = Path(stagef).read_bytes()
-                _tfd = os.open(str(_tmpf),
-                               os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-                #  ^ exclusive + no-follow + random (the r57 audit: the predictable,
-                #    follow-happy temp could be planted as a symlink and replaced a
-                #    DIFFERENT same-mid final unconditionally)
-                with os.fdopen(_tfd, "wb") as _fh:
-                    _fh.write(_pb)
-                    _fh.flush()
-                    os.fsync(_fh.fileno())
                 try:
+                    _ffd = os.open(str(d / (mid + ".json")),
+                                   os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                   0o600)
+                    with os.fdopen(_ffd, "wb") as _fh:
+                        _fh.write(_pb)
+                        _fh.flush()
+                        os.fsync(_fh.fileno())
+                except FileExistsError:
                     _fb = (d / (mid + ".json")).read_bytes()
-                    _tmpf.unlink()
                     if _fb != _pb:
                         try:
                             _phasef.unlink()
@@ -3093,19 +3175,14 @@ def outbox_publish_stage(host, mid, stagef):
                         raise _PublishNeverStarted(
                             "a DIFFERENT message already holds mid %s" % mid)
                     # identical bytes: already published — fall through to the durable tail
-                except FileNotFoundError:
-                    os.replace(_tmpf, d / (mid + ".json"))
             except _PublishNeverStarted:
                 raise                                # the different-content verdict is final —
                 #                                      never re-arbitrated into "uncertain"
             except OSError as e2:
-                try:
-                    _tmpf.unlink()                   # never leak the payload copy (r56 wave 2)
-                except OSError:
-                    pass
-                # the replace can take effect and STILL report failure — arbitrate against
-                # the final like the link arm (r56 wave 2: an EIO'd-but-effective replace was
-                # compensated `unpublished` over live mail)
+                # the exclusive write can take effect and STILL report failure — arbitrate
+                # against the final like the link arm (r56 wave 2: an EIO'd-but-effective
+                # publish was compensated `unpublished` over live mail). No temp exists to
+                # clean since r58 P2.15: the final itself is created O_EXCL.
                 try:
                     os.stat(d / (mid + ".json"))
                     _fstate = "present"
@@ -3218,6 +3295,11 @@ def outbox_list(host, limit=None, byte_limit=None):
                 continue   # a relay STAGE (.stage-<mid>) is not mail (r51 port: pathlib
                 #            globs match dotfiles, and a hostname ending "json" made the
                 #            full-payload stage shippable before its sent row existed)
+            if not _safe_id(f.stem):
+                # an id the ACK path must refuse can never settle — listed forever, acked
+                # never (r58 P2.18) — judge it aside instead
+                _quarantine_corrupt_json(f, "outbox", ValueError("unsafe outbox id"), None)
+                continue
             if limit is not None and len(out) >= limit:
                 break
             fingerprint = None
@@ -3339,6 +3421,17 @@ def _pending_bounces_load():
         d = {}
     except Exception as e:
         _log("pending-bounces ledger unreadable (%s) — retrying before any rewrite" % e)
+        return False
+    if not isinstance(d, dict):
+        # VALID bytes, WRONG shape (r58 P2.18): loading it as empty made the standing
+        # parks rewriteable-away — move the bytes aside and hold this pass
+        try:
+            _pending_bounces_path().rename(_pending_bounces_path().with_name(
+                _pending_bounces_path().name + ".corrupt-%d-%s"
+                % (os.getpid(), os.urandom(8).hex())))
+            _log("pending-bounces ledger was wrong-shaped — moved aside for inspection")
+        except OSError:
+            pass
         return False
     if isinstance(d, dict):
         for k, v in d.items():
@@ -3534,8 +3627,16 @@ def receiptbox_del(host, mid):
         _row = json.loads((RECEIPTBOX / host / (mid + ".json")).read_text())
         if isinstance(_row, dict) and _safe_id(str(_row.get("dmid") or "")):
             _dmid = str(_row["dmid"])
-    except Exception:
-        pass
+    except FileNotFoundError:
+        pass                                         # already consumed: mid-keyed fallback
+    except OSError:
+        # a read FAULT is not absence (r58 P2.17: settling under the RELAY id here lost the
+        # delivery id and the kernel re-posted /handoff-done forever) — leave the park for
+        # the retry; nothing is confirmed this pass
+        _log("receiptbox_del %s/%s: park unreadable — kept for retry" % (host, mid))
+        return
+    except ValueError:
+        pass                                         # parsed garbage: the mid fallback stands
     try:
         (RECEIPTBOX / host / (mid + ".json")).unlink()
     except Exception:
@@ -3548,7 +3649,9 @@ def _receipt_rows(value):
     if not isinstance(value, list):
         return []
     out = []
-    for row in value[:PEER_LIST_LIMITS["handoffDone"]]:
+    for row in value:                    # validate WHILE collecting (r58 P2.18)
+        if len(out) >= PEER_LIST_LIMITS["handoffDone"]:
+            break
         if isinstance(row, dict) and _safe_id(str(row.get("mid") or "")):
             keep = {"mid": str(row["mid"])}
             if _safe_id(str(row.get("origin") or "")):
@@ -3690,11 +3793,18 @@ def readbox_del(host, rec):
         pass
 
 def _peer_ack_ids(value):
-    """Accept only bounded path-safe ack ids from an exchange list."""
+    """Accept only bounded path-safe ack ids from an exchange list. Validation happens
+    WHILE collecting to the cap (r58 P2.18: slice-first let junk rows consume the whole
+    budget and hide every valid entry sorted behind them)."""
     if not isinstance(value, list):
         return []
-    return [mid for mid in value[:PEER_LIST_LIMITS["acks"]]
-            if isinstance(mid, str) and _safe_id(mid)]
+    out = []
+    for mid in value:
+        if len(out) >= PEER_LIST_LIMITS["acks"]:
+            break
+        if isinstance(mid, str) and _safe_id(mid):
+            out.append(mid)
+    return out
 
 
 _LEGACY_BOUNCE_CODES = {reason: code for code, reason in PEER_BOUNCE_REASONS.items()}
@@ -3742,7 +3852,9 @@ def _peer_bounce_rows(value):
     if not isinstance(value, list):
         return []
     out = []
-    for row in value[:PEER_LIST_LIMITS["bounces"]]:
+    for row in value:                    # validate WHILE collecting (r58 P2.18)
+        if len(out) >= PEER_LIST_LIMITS["bounces"]:
+            break
         if not isinstance(row, dict):
             continue
         mid = row.get("mid")
@@ -3791,7 +3903,9 @@ def _peer_read_ack_rows(value):
     if not isinstance(value, list):
         return []
     out = []
-    for row in value[:PEER_LIST_LIMITS["readAcks"]]:
+    for row in value:                    # validate WHILE collecting (r58 P2.18)
+        if len(out) >= PEER_LIST_LIMITS["readAcks"]:
+            break
         if not isinstance(row, dict):
             continue
         mid = row.get("mid")
@@ -3959,8 +4073,13 @@ def _quarantine_put(origin, m, to_id, via=""):
         tmp = QUARANTINE / (mid + ".tmp")
         tmp.unlink(missing_ok=True)   # the staging name derives from the SENDER's mid — a
         #                               planted FIFO hung the bus thread (the r34 verification)
-        tmp.write_text(json.dumps(rec))
+        _qfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(_qfd, "w") as _qfh:
+            _qfh.write(json.dumps(rec))
+            _qfh.flush()
+            os.fsync(_qfh.fileno())      # durable BEFORE the ack correlates (r58 P1.7)
         tmp.rename(QUARANTINE / (mid + ".json"))      # atomic publish (the kernel may be reading the dir)
+        _fsync_dir(QUARANTINE)
         _log("quarantine: held %s from %s -> %s (directed)" % (mid, origin, rec["to"]))
         return True
     except OSError:
@@ -4170,22 +4289,29 @@ def _relay_in(host, m, token_proven=False):
         # deleted its source and told the sender the recipient chose isolation, all from one
         # transient read error). No information → no verdict: the peer re-sends.
         return "drop", None
+    _origin0 = m.get("origin") or host               # identity scope (r58 P2.16)
+    _skey = _seen_key(_origin0, mid)
     if match:
         # Hold the idempotence claim across the effect and receipt publish.  Two exchange threads can
         # carry the same mid concurrently; neither may pass a separate check before either appends.
         with _seen_lock:
             try:
-                _already = mid in _seen_load()
+                _seen = _seen_load()
             except _OutboxUnreadable:
                 return "drop", None                  # no information → no effect, no ack (r56 P1.9)
+            _already = _skey in _seen or mid in _seen   # scoped since r58 P2.16 (reproduced:
+            #                                             two peers reusing one mid both got
+            #                                             ACKs; one body delivered) — legacy
+            #                                             bare entries stay honored
             if _already:
-                if mid in _seen_pending_durable and not _peer_seen_append_durable(mid):
+                _pend = _skey if _skey in _seen_pending_durable else mid
+                if _pend in _seen_pending_durable and not _peer_seen_append_durable(_pend):
                     return "drop", None              # delivered, but the dedupe record is not
                     #                                  durable yet — the ack waits (r56 P1.9)
                 return "ack", None                   # duplicate → re-ack, deliver nothing
             # Trust key = the true ORIGIN (the forwarding host stamps m["origin"]; else the direct peer).
             # Unknown host (a race before the kernel's notify lands) defaults to directed — never auto-inject.
-            origin = m.get("origin") or host
+            origin = _origin0
             prow = PEERS.get(origin)
             trust = (prow or {}).get("trust") or "directed"
             if prow is None and token_proven and not m.get("origin"):
@@ -4212,15 +4338,16 @@ def _relay_in(host, m, token_proven=False):
             # else isolated → ack and remember, but deliver nothing (no communication).
             # An isolated host normally never peers at all (the kernel forces its notify down), so this is
             # a defensive backstop for the checkin-peer path where the mobile dials our /peer-exchange.
-            if not _peer_seen_add_locked(mid):
+            if not _peer_seen_add_locked(_skey):
                 return "drop", None                  # the effect ran; the ack waits for the
                 #                                      durable dedupe record — the in-memory
                 #                                      window absorbs the retry (r56 P1.9)
         return "ack", None
-    _psc = peer_seen_check(mid)
-    if _psc is None:
+    _psc = peer_seen_check(_skey)
+    _psc2 = peer_seen_check(mid) if _psc is False else _psc   # legacy bare-mid entries
+    if _psc is None or _psc2 is None:
         return "drop", None                          # unreadable ledger: no verdict (r56 P1.9)
-    if _psc:
+    if _psc or _psc2:
         return "ack", None                           # a duplicate whose recipient has since vanished
     if (any(str(a["id"]) == to_id for a in local_agents()) if to_id
             else any(a["name"] == to for a in local_agents())):
@@ -4255,8 +4382,14 @@ def _bounced_done_load():
         d = json.loads(_bounced_done_path().read_text())
         if isinstance(d, dict):
             _bounced_done.update({str(k): v for k, v in d.items()})
+    except FileNotFoundError:
+        pass                                         # provably no ledger yet
     except Exception:
-        pass                                         # settlement degrades to the terminal log
+        # a FAULT never latches a fabricated-empty ledger (r58 P2.17, reproduced: one EIO
+        # at load re-noted an already-settled bounce AND kept believing empty after the
+        # fault cleared) — retry the load on the next call instead
+        _log("bounced-done ledger unreadable — retrying on the next settlement check")
+        return
     _bounced_done_loaded[0] = True
 
 
@@ -4333,14 +4466,20 @@ def _ack_arrived(host, mid):
         return True
     if msg.get("origin"):
         # the backward ack lands in the DURABLE queue BEFORE the downstream source dies
-        # (the r57 wave-2 verification, reproduced: the delete ran first — a crash before
-        # the save left the ack in no store, the exact P1.10 hole on the ack path; the
-        # bounce sibling already had this order)
+        # (the r57 wave-2 verification; r58 P1.10 closed the half-fix: a FAILED save still
+        # spent the source — now the source survives and the exchange re-sends)
         p = _pending(msg["origin"])
         with _peer_lock:
             if mid not in p["acks"]:
                 p["acks"].append(mid)
-            _backflow_save_locked()
+            _saved = _backflow_save_locked()
+        if not _saved:
+            with _peer_lock:
+                try:
+                    p["acks"].remove(mid)            # withdraw the memory-only half too —
+                except ValueError:                   # the retry re-runs the whole arm
+                    pass
+            return False
         outbox_del(host, mid)
         _peer_wake(msg["origin"]).set()
         return True
@@ -4375,8 +4514,15 @@ def _bounce_arrived(host, b):
         with _peer_lock:
             if bounce not in p["bounces"]:
                 p["bounces"].append(bounce)
-            _backflow_save_locked()      # durable BEFORE the downstream source dies (r57)
-        outbox_del(host, mid)                         # enqueue backward first; source remains on failure
+            _saved = _backflow_save_locked()   # durable BEFORE the downstream source dies (r57)
+        if not _saved:
+            with _peer_lock:
+                try:
+                    p["bounces"].remove(bounce)      # r58 P1.10: a failed save spends nothing
+                except ValueError:
+                    pass
+            return False                     # the exchange 503s; the peer re-sends
+        outbox_del(host, mid)
         _peer_wake(msg["origin"]).set()
         return True
     return _bounce_apply(host, bounce)
@@ -4401,8 +4547,11 @@ def _backflow_save_locked():
             _atomic_json_put(_backflow_path(), snap)
         else:
             _backflow_path().unlink(missing_ok=True)
+        return True
     except Exception as e:
         _log("peer-backflow ledger could not persist: %s" % e)
+        return False                     # r58 P1.10: callers that would spend their
+        #                                  downstream source on this save must NOT
 
 
 def _backflow_load():
@@ -4499,9 +4648,19 @@ def peer_exchange_handle(data):
     _log_peer_aliases(host)
     _p0 = _pending(host)
     _bfa = data.get("backflowAcks") if isinstance(data.get("backflowAcks"), dict) else {}
+    _legacy_dialer = "backflowAcks" not in data      # pre-r57-wave-2 peer: it will NEVER
+    #                                                  confirm, so its slice re-rode forever
+    #                                                  (the r58 audit's mixed-version note)
     with _peer_lock:
-        _p0.pop("_inflight_acks", None)              # legacy markers: bookkeeping only now
-        _p0.pop("_inflight_bounces", None)
+        _ifa = set(_p0.pop("_inflight_acks", []) or [])
+        _ifb = set(_p0.pop("_inflight_bounces", []) or [])
+        if _legacy_dialer and (_ifa or _ifb):
+            # the OLD contract for the old peer: any next request retires the last
+            # response's slice — with the old loss window that peer always had
+            _p0["acks"] = [a for a in _p0["acks"] if a not in _ifa]
+            _p0["bounces"] = [b for b in _p0["bounces"]
+                              if not isinstance(b, dict) or b.get("mid") not in _ifb]
+            _backflow_save_locked()
         _cfa = set(_peer_ack_ids(_bfa.get("acks")))
         _cfb = set(_peer_ack_ids(_bfa.get("bounces")))
         if _cfa or _cfb:
@@ -4551,7 +4710,8 @@ def peer_exchange_handle(data):
         # COPIED, not removed (the r57 audit's P1.10, executed there: removal at response
         # CONSTRUCTION lost every backward terminal when the HTTP response dropped). The
         # slice re-rides EVERY response until the dialer's backflowAcks names it applied
-        # (r57 wave 2) — every consumer is idempotent, so re-sends are safe.
+        # (r57 wave 2) — every consumer is idempotent, so re-sends are safe. The in-flight
+        # markers exist ONLY for legacy dialers that never confirm (r58 mixed-version).
         p = _pending(host)
         with _peer_lock:
             pending_acks = _peer_ack_ids(p["acks"])
@@ -4559,6 +4719,8 @@ def peer_exchange_handle(data):
             ack_room = max(0, PEER_LIST_LIMITS["acks"] - len(acks))
             bounce_room = max(0, PEER_LIST_LIMITS["bounces"] - len(bounces))
             a2, b2 = pending_acks[:ack_room], pending_bounces[:bounce_room]
+            p["_inflight_acks"] = list(a2)
+            p["_inflight_bounces"] = [b.get("mid") for b in b2]
         return a2, b2
 
     a2, b2 = _drain_backflow()

@@ -58,14 +58,26 @@ class HiddenFromFeed(unittest.TestCase):
         self.assertTrue(jd._hidden_from_feed(MUTED),
                         "unreadable flags with NO good read yet: hold off, never un-mute")
 
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
     def test_reader_serves_last_known_good_over_a_fault(self):
         self._mute(MUTED)
         self.assertTrue(jd._hidden_from_feed(MUTED))         # a good read primes the copy
-        (jd.STATE / "session-flags.json").write_text("{not valid json")
-        self.assertTrue(jd._hidden_from_feed(MUTED), "the fault serves the copy — still muted")
-        self.assertFalse(jd._hidden_from_feed(VISIBLE),
-                         "…and the copy answers for UNMUTED sessions too — planning goes on")
-        (jd.STATE / "session-flags.json").unlink()
+        p = jd.STATE / "session-flags.json"
+        os.chmod(p, 0)                    # SAME generation, unreadable window
+        try:
+            self.assertTrue(jd._hidden_from_feed(MUTED),
+                            "a same-generation fault serves the copy — still muted")
+            self.assertFalse(jd._hidden_from_feed(VISIBLE),
+                             "…and the copy answers for UNMUTED sessions too")
+        finally:
+            os.chmod(p, 0o644)
+        p.write_text("{not valid json")   # the world MOVED past the copy (new generation)
+        import contextlib, io
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(jd._hidden_from_feed(VISIBLE),
+                            "r58 P1.4: a stale permissive copy is never proof across a "
+                            "newer generation it cannot read — fail closed")
+        p.unlink()
         self.assertFalse(jd._hidden_from_feed(MUTED), "provably no flags: not hidden")
 
     def test_reader_treats_wrong_shape_as_a_fault(self):

@@ -268,6 +268,7 @@ class R57PostalDurability(unittest.TestCase):
         pm._bounced_done.clear()
         pm._bounced_done_loaded[0] = False
         pm._postal_off_cache[0] = None
+        pm._postal_off_key[0] = None
         for p in (pm._bounced_done_path(), pm._backflow_path(), pm.RECEIPTS_DONE,
                   pm.SESSION_FLAGS):
             try:
@@ -309,7 +310,10 @@ class R57PostalDurability(unittest.TestCase):
         try:
             self.assertFalse(pm._tl_append("messages.jsonl", {"t": 1}),
                              "an unsynced row must never report durable")
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises((RuntimeError, OSError)):
+                # r58 P1.7: the EFFECT write fsyncs too now, so the injected fault can
+                # surface there (OSError) or at the accounting row (RuntimeError) — either
+                # way nothing publishes
                 pm.deliver(SID, "peer", SID2, "hello")
         finally:
             pm.os.fsync = real
@@ -332,9 +336,9 @@ class R57PostalDurability(unittest.TestCase):
         pm.deliver(SID, "peer", SID2, "hello", relay_mid=mid, relay_via=via)
         pm.deliver(SID, "peer", SID2, "hello", relay_mid=mid, relay_via=via)  # crash replay
         files = [f.name for f in (pm._mailbox(SID) / "new").iterdir()]
-        self.assertEqual(files, ["r-" + mid],
+        self.assertEqual(files, [pm._relay_name("", mid)],
                          "the replay lands on the SAME unread file — one delivery (r57 "
-                         "P1.7), where the random name minted a duplicate")
+                         "P1.7; the name is the origin-scoped digest since r58 P1.8/P2.16)")
 
     def test_e_phase_marker_republishes_the_lost_final(self):
         # r57 P1.9, executed there: crash after link+failed-fsync lost the final's dir
@@ -409,8 +413,11 @@ class R57PostalDurability(unittest.TestCase):
         pm.SESSION_FLAGS.write_text(json.dumps({SID: {"postalServiceOff": False}}))
         self.assertFalse(pm._postal_off(SID))
         pm.SESSION_FLAGS.write_text("{not valid json")
-        self.assertFalse(pm._postal_off(SID), "…and un-isolation holds over a fault too")
-        pm._postal_off_cache[0] = None               # a fresh process with no history
+        self.assertTrue(pm._postal_off(SID),
+                        "r58 P1.4: the corrupt overwrite is a NEW generation — the stale "
+                        "permissive copy is never proof across it; fail closed")
+        pm._postal_off_cache[0] = None
+        pm._postal_off_key[0] = None               # a fresh process with no history
         self.assertTrue(pm._postal_off(SID),
                         "no history + unreadable: CLOSED — isolation is safety state")
         pm.SESSION_FLAGS.unlink()
@@ -444,6 +451,7 @@ class R57Wave2Postal(unittest.TestCase):
     def setUp(self):
         _reset()
         pm._postal_off_cache[0] = None
+        pm._postal_off_key[0] = None
         pm._postal_off_warned[0] = False
         pm._bounced_done.clear()
         pm._bounced_done_loaded[0] = False
@@ -470,7 +478,7 @@ class R57Wave2Postal(unittest.TestCase):
         self.assertEqual(list((pm._mailbox(SID) / "new").iterdir()), [],
                          "wave 2, reproduced: the crash replay minted a fresh UNREAD copy "
                          "of mail the agent had already read — delivered twice")
-        self.assertTrue((pm._mailbox(SID) / "cur" / ("r-" + mid)).exists())
+        self.assertTrue((pm._mailbox(SID) / "cur" / pm._relay_name("", mid)).exists())
 
     def test_b_replay_never_replaces_standing_different_bytes(self):
         mid = "ee" * 16
@@ -576,7 +584,10 @@ class R57Wave2Postal(unittest.TestCase):
                 p["acks"].append(mid)
                 pm._backflow_save_locked()
             req = {"host": self.HOST, "epoch": 1, "proto": pm.PEER_PROTO, "presence": [],
-                   "holds": [], "relays": [], "acks": [], "bounces": [], "wait": False}
+                   "holds": [], "relays": [], "acks": [], "bounces": [], "wait": False,
+                   "backflowAcks": {"acks": [], "bounces": []}}   # a MODERN dialer always
+            #                        sends the key — absence means a legacy peer, for which
+            #                        the old any-next-request retirement applies (r58)
             resp1, st1 = pm.peer_exchange_handle(dict(req))
             self.assertEqual(st1, 200)
             self.assertIn(mid, resp1.get("acks") or [])
@@ -638,7 +649,8 @@ class R57Wave2Postal(unittest.TestCase):
         os.environ["ROMP_SESSIONS_FILE"] = sessfile
         pm.SESSION_FLAGS.parent.mkdir(parents=True, exist_ok=True)
         pm.SESSION_FLAGS.write_text("{not valid json")
-        pm._postal_off_cache[0] = None               # cold cache: no history
+        pm._postal_off_cache[0] = None
+        pm._postal_off_key[0] = None               # cold cache: no history
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 verdict, bounce = pm._relay_in(
@@ -654,6 +666,257 @@ class R57Wave2Postal(unittest.TestCase):
                          "wave 2, reproduced: a no-information isolation verdict minted a "
                          "TERMINAL recipient-isolated bounce — the origin deleted its "
                          "source and blamed the recipient, over one transient read fault")
+
+
+
+
+class R58PostalAudit(unittest.TestCase):
+    """the v1.3.30 audit, postal half: the ACK outlived an unsynced delivery effect (P1.7),
+    long mids fell back to random names and lost crash idempotency (P1.8), the publication
+    phase record was best-effort and follow-happy (P1.9 + P2.20), a failed backflow save
+    still spent the downstream source (P1.10), _tl_append returned True past a dir-sync
+    fault (P1.11), bare-mid identity aliased two peers (P2.16), read faults read as absence
+    (P2.17), and junk consumed scanner budgets (P2.18)."""
+
+    HOST = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    HOST2 = "abababababababababababababababab"
+
+    def setUp(self):
+        _reset()
+        pm._postal_off_cache[0] = None
+        pm._postal_off_key[0] = None
+        pm._bounced_done.clear()
+        pm._bounced_done_loaded[0] = False
+        pm._seen_ids = None
+        for p in (pm._bounced_done_path(), pm._backflow_path(), pm.SESSION_FLAGS,
+                  pm.PEER_SEEN, pm.RECEIPTS_DONE):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        with pm._peer_lock:
+            pm._peer_pending.clear()
+        for h in (self.HOST, self.HOST2):
+            shutil.rmtree(pm.OUTBOX / h, ignore_errors=True)
+            shutil.rmtree(pm.RECEIPTBOX / h, ignore_errors=True)
+        shutil.rmtree(pm.MAILROOT / SID, ignore_errors=True)
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_two_origins_one_mid_both_deliver(self):
+        # r58 P2.16, reproduced there: identity was the bare mid — the second peer's
+        # message was ACKed while only the first body delivered
+        mid = "aa" * 16
+        n1 = pm.deliver(SID, "peer", "77" * 16, "from A", from_host=self.HOST,
+                        relay_mid=mid, relay_via=self.HOST)
+        n2 = pm.deliver(SID, "peer", "77" * 16, "from B", from_host=self.HOST2,
+                        relay_mid=mid, relay_via=self.HOST2)
+        self.assertNotEqual(n1, n2, "origin-scoped names: no aliasing")
+        got = sorted(m["body"] for m in pm.read_box(SID, consume=True))
+        self.assertEqual(got, ["from A", "from B"], "BOTH bodies delivered")
+
+    def test_b_long_mids_keep_crash_idempotency(self):
+        # r58 P1.8, reproduced there: a 127-byte mid's name fell back to RANDOM — a crash
+        # replay delivered twice
+        mid = "a" * 127
+        n1 = pm.deliver(SID, "peer", "77" * 16, "hello", from_host=self.HOST,
+                        relay_mid=mid, relay_via=self.HOST)
+        n2 = pm.deliver(SID, "peer", "77" * 16, "hello", from_host=self.HOST,
+                        relay_mid=mid, relay_via=self.HOST)   # the crash replay
+        self.assertEqual(n1, n2, "deterministic for ANY valid mid length")
+        self.assertEqual(len(list((pm._mailbox(SID) / "new").iterdir())), 1,
+                         "one delivery, not two")
+        self.assertTrue(pm._safe_id(n1), "…and the id passes every /handoff-done check")
+
+    def test_c_delivery_effect_is_durable_before_return(self):
+        # r58 P1.7, reproduced there: the effect vanished across a modeled crash while the
+        # fsync'd seen-append survived — the replay ACKed without restoring the mail
+        seen = []
+        real = os.fsync
+
+        def spy(fd):
+            seen.append(os.fstat(fd).st_ino)
+            real(fd)
+
+        pm.os.fsync = spy
+        try:
+            name = pm.deliver(SID, "peer", "77" * 16, "hello", from_host=self.HOST,
+                              relay_mid="bb" * 16, relay_via=self.HOST)
+        finally:
+            pm.os.fsync = real
+        f = pm._mailbox(SID) / "new" / name
+        self.assertIn(f.stat().st_ino, seen, "the mail file was fsync'd before return")
+        self.assertIn((pm._mailbox(SID) / "new").stat().st_ino, seen,
+                      "…and its directory entry too")
+
+    def test_d_tl_append_reports_a_failed_dir_sync(self):
+        # r58 P1.11: a swallowed EIO on the created log's dir sync returned True — callers
+        # then deleted their only retry source over an undurable record
+        real_fsync_dir = pm._fsync_dir
+
+        def boom(p):
+            raise OSError(5, "EIO")
+
+        pm._fsync_dir = boom
+        try:
+            self.assertFalse(pm._tl_append("fresh-log.jsonl", {"t": 1}),
+                             "a created log whose dir entry may not survive is NOT durable")
+        finally:
+            pm._fsync_dir = real_fsync_dir
+        try:
+            (pm.TLDIR / "fresh-log.jsonl").unlink()
+        except OSError:
+            pass
+
+    def test_e_phase_marker_failure_refuses_the_publish(self):
+        # r58 P1.9: the marker was best-effort and unsynced — combined with an uncertain
+        # publication, boot deleted the durable stage and recorded `unpublished`
+        d = pm.OUTBOX / self.HOST
+        d.mkdir(parents=True, exist_ok=True)
+        mid = "cc" * 16
+        st = d / (".stage-" + mid)
+        st.write_text(json.dumps({"mid": mid, "body": "payload"}))
+        real = os.fsync
+
+        def boom(fd):
+            raise OSError(5, "EIO")
+
+        pm.os.fsync = boom
+        try:
+            with self.assertRaises(pm._PublishNeverStarted):
+                pm.outbox_publish_stage(self.HOST, mid, st)
+        finally:
+            pm.os.fsync = real
+        self.assertTrue(st.exists(), "nothing started: the stage stands for retry")
+        self.assertFalse((d / (mid + ".json")).exists())
+
+    def test_f_phase_marker_never_follows_a_planted_symlink(self):
+        # r58 P2.20, reproduced there: the predictable path followed a symlink and its
+        # target was overwritten with "1"
+        d = pm.OUTBOX / self.HOST
+        d.mkdir(parents=True, exist_ok=True)
+        mid = "dd" * 16
+        st = d / (".stage-" + mid)
+        st.write_text(json.dumps({"mid": mid, "body": "payload"}))
+        victim = pm.STATE / "victim-r58.txt"
+        victim.write_text("precious")
+        os.symlink(victim, d / (".pubphase-" + mid))
+        try:
+            with self.assertRaises(pm._PublishNeverStarted):
+                pm.outbox_publish_stage(self.HOST, mid, st)
+            self.assertEqual(victim.read_text(), "precious",
+                             "O_NOFOLLOW: the planted link's target is untouched")
+        finally:
+            victim.unlink(missing_ok=True)
+            (d / (".pubphase-" + mid)).unlink(missing_ok=True)
+
+    def test_g_failed_backflow_save_spends_nothing(self):
+        # r58 P1.10, reproduced there: the save logged its failure and returned nothing —
+        # both callers deleted their source; after a restart the ack was in NO store
+        mid = "ee" * 16
+        d = pm.OUTBOX / self.HOST
+        d.mkdir(parents=True, exist_ok=True)
+        pm._atomic_json_put(d / (mid + ".json"),
+                            {"mid": mid, "to": "web", "frm": "peer", "frm_id": "x" * 32,
+                             "body": "hi", "origin": self.HOST2})
+        real = pm._atomic_json_put
+
+        def boom(path, obj):
+            if str(path) == str(pm._backflow_path()):
+                raise OSError(5, "EIO")
+            return real(path, obj)
+
+        pm._atomic_json_put = boom
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertFalse(pm._ack_arrived(self.HOST, mid),
+                                 "not durably applied — nothing confirms")
+        finally:
+            pm._atomic_json_put = real
+        self.assertTrue((d / (mid + ".json")).exists(),
+                        "the downstream source SURVIVES the failed save")
+        with pm._peer_lock:
+            self.assertNotIn(mid, pm._pending(self.HOST2)["acks"] if False else
+                             (pm._peer_pending.get(self.HOST2) or {}).get("acks") or [],
+                             "…and the memory-only half was withdrawn too")
+        self.assertTrue(pm._ack_arrived(self.HOST, mid), "the healed save applies")
+        self.assertFalse((d / (mid + ".json")).exists())
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_h_receipt_park_read_fault_is_not_absence(self):
+        # r58 P2.17: a fault reading the park settled under the RELAY id — the delivery id
+        # was lost and /handoff-done re-posted forever
+        rmid, dmid = "f1" * 16, "f2" * 16
+        pm.receiptbox_put(self.HOST, rmid, dmid=dmid)
+        park = pm.RECEIPTBOX / self.HOST / (rmid + ".json")
+        os.chmod(park, 0)
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                pm.receiptbox_del(self.HOST, rmid)
+            self.assertTrue(park.exists(), "the unreadable park is KEPT for retry")
+            self.assertEqual(pm._receipts_done(), {}, "…and nothing settled")
+        finally:
+            os.chmod(park, 0o644)
+        pm.receiptbox_del(self.HOST, rmid)
+        self.assertIn(dmid, pm._receipts_done(), "the healed read settles the DELIVERY id")
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_i_bounced_done_fault_never_latches_empty(self):
+        # r58 P2.17: one EIO at load latched a fabricated-empty ledger — an already-settled
+        # bounce re-noted the sender, and the belief survived the fault clearing
+        self.assertTrue(pm._bounced_done_add(self.HOST, "a1" * 16))
+        pm._bounced_done.clear()
+        pm._bounced_done_loaded[0] = False           # a fresh process…
+        os.chmod(pm._bounced_done_path(), 0)         # …booting under a fault
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertFalse(pm._bounced_done_has(self.HOST, "a1" * 16))
+            self.assertFalse(pm._bounced_done_loaded[0],
+                             "the fault never latches — the next call retries the load")
+        finally:
+            os.chmod(pm._bounced_done_path(), 0o644)
+        self.assertTrue(pm._bounced_done_has(self.HOST, "a1" * 16),
+                        "…and the healed load restores the settlement")
+
+    def test_j_junk_never_consumes_the_ack_budget(self):
+        cap = pm.PEER_LIST_LIMITS["acks"]
+        rows = [123] * (cap + 50) + ["99" * 16]
+        self.assertEqual(pm._peer_ack_ids(rows), ["99" * 16],
+                         "r58 P2.18: junk is discarded WITHOUT spending the cap")
+
+    def test_k_legacy_dialer_still_retires_its_slice(self):
+        # the disclosed mixed-version issue: a pre-r57-wave-2 peer never sends
+        # backflowAcks, so its slice re-rode forever — absence of the KEY restores the old
+        # any-next-request retirement for that peer alone
+        os.environ["ROMP_POSTAL_PEERS"] = "1"
+        try:
+            mid = "b2" * 16
+            p = pm._pending(self.HOST)
+            with pm._peer_lock:
+                p["acks"].append(mid)
+                pm._backflow_save_locked()
+            legacy_req = {"host": self.HOST, "epoch": 1, "proto": pm.PEER_PROTO,
+                          "presence": [], "holds": [], "relays": [], "acks": [],
+                          "bounces": [], "wait": False}   # NO backflowAcks key
+            resp1, _ = pm.peer_exchange_handle(dict(legacy_req))
+            self.assertIn(mid, resp1.get("acks") or [])
+            pm.peer_exchange_handle(dict(legacy_req))    # the legacy peer's next request
+            with pm._peer_lock:
+                self.assertNotIn(mid, (pm._peer_pending.get(self.HOST) or {}).get("acks")
+                                 or [], "the old contract holds for the old peer")
+        finally:
+            os.environ.pop("ROMP_POSTAL_PEERS", None)
+
+    def test_l_unsafe_outbox_ids_are_judged_aside(self):
+        # r58 P2.18: an id the ack path must refuse was listed forever, settled never
+        d = pm.OUTBOX / self.HOST
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "bad id.json").write_text(json.dumps({"mid": "bad id", "to": "web"}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            out = pm.outbox_list(self.HOST)
+        self.assertEqual(out, [], "never listed")
+        self.assertFalse((d / "bad id.json").exists(), "…and moved aside, not stranded")
 
 
 if __name__ == "__main__":
@@ -1036,7 +1299,15 @@ class R54PublishAndTypedReader(unittest.TestCase):
         stage = self.hd / (".stage-" + mid)
         stage.write_text(json.dumps({"mid": mid, "body": "hi"}))
         real = pm._fsync_dir
-        pm._fsync_dir = lambda p: (_ for _ in ()).throw(RuntimeError("forced"))
+        _calls = [0]
+        def _fail_after_marker(p):
+            # the r58 phase marker records intent durably BEFORE the link — its own dir
+            # fsync (call 1) must succeed for this test to reach the post-link arm
+            _calls[0] += 1
+            if _calls[0] > 1:
+                raise RuntimeError("forced")
+            return real(p)
+        pm._fsync_dir = _fail_after_marker
         try:
             with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
                 pm.outbox_publish_stage("TESTHOST2", mid, stage)   # must NOT raise
@@ -1167,9 +1438,15 @@ class R55PublishOutcomesAndSchema(unittest.TestCase):
         stage = self.hd / (".stage-" + mid)
         stage.write_text(json.dumps({"mid": mid, "body": "hi"}))
         real = os.fsync
-        def _boom(fd):
-            raise OSError(5, "EIO")
-        pm.os.fsync = _boom
+        _n = [0]
+        def _boom_after_marker(fd):
+            # the r58 phase marker fsyncs its file + dir first (calls 1-2, must land or the
+            # publish honestly refuses pre-link); the POST-link syncs are the ones failing
+            _n[0] += 1
+            if _n[0] > 2:
+                raise OSError(5, "EIO")
+            return real(fd)
+        pm.os.fsync = _boom_after_marker
         try:
             with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
                 pm.outbox_publish_stage("TESTHOST2", mid, stage)   # never raises post-link
