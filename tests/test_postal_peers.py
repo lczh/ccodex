@@ -299,11 +299,13 @@ class TwoBusExchange(unittest.TestCase):
         self.assertEqual(back[0]["from"], "romp-postal", "bus-authored, clearly not a peer message")
 
     def test_failed_bounce_append_keeps_the_parked_source_for_retry(self):
-        # RE-ORDERED in r56 wave 2: the terminal row lands FIRST (note-then-append meant a
-        # failed append 503'd AFTER the note was delivered — the peer's re-send noted the
-        # sender twice). The retry-source invariant now keys on the APPEND: a failed append
-        # keeps the record; a failed NOTE after a landed append is bounded loss, loudly
-        # logged, with the receipt standing and the source retired.
+        # The terminal row still lands FIRST (r56 wave 2: note-then-append meant a failed
+        # append 503'd AFTER the note was delivered — the peer's re-send noted the sender
+        # twice). But a failed NOTE is no longer bounded loss (r57 wave 2, reproduced:
+        # settling before the note made it at-most-once ACROSS RESTARTS — one crash in the
+        # window suppressed the sender's notification forever). The r53 rule decides: a
+        # duplicate note over a silently lost one, every time — so a failed note keeps the
+        # source and settlement waits until the note is user-visible.
         pm._bounced_done.clear()
         pm._bounced_done_loaded[0] = False
         try:
@@ -325,13 +327,19 @@ class TwoBusExchange(unittest.TestCase):
         pm.deliver = lambda *a, **k: (_ for _ in ()).throw(OSError("synthetic maildir failure"))
         try:
             self.assertIs(pm._bounce_apply("srv", {"mid": "bounce-retry",
-                                                   "code": pm.PEER_REFUSAL_CODE}), True)
+                                                   "code": pm.PEER_REFUSAL_CODE}), False)
         finally:
             pm.deliver = saved
+        self.assertIsNotNone(pm.outbox_get("srv", "bounce-retry"),
+                             "a failed NOTE keeps the source too — settlement waits for the "
+                             "user-visible half (r57 wave 2)")
+        self.assertFalse(pm._bounced_done_has("srv", "bounce-retry"),
+                         "…and nothing settled durably, so the retry re-notes")
+        self.assertIs(pm._bounce_apply("srv", {"mid": "bounce-retry",
+                                               "code": pm.PEER_REFUSAL_CODE}), True)
         self.assertIsNone(pm.outbox_get("srv", "bounce-retry"),
-                          "…while a failed NOTE after the landed receipt retires the source "
-                          "(bounded loss, logged) — never a second exchange round that "
-                          "would re-note the sender")
+                          "the retry delivered the note and retired the source")
+        self.assertTrue(pm._bounced_done_has("srv", "bounce-retry"))
 
     def test_return_mail_rides_the_response_and_acks_the_next_request(self):
         pmb.outbox_put("hosta", {"mid": "m4", "to": "alpha", "frm": "beta", "frm_id": "sid-b",

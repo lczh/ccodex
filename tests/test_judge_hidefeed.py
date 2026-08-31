@@ -34,6 +34,7 @@ class HiddenFromFeed(unittest.TestCase):
         jd._rebind_state(Path(self._td))   # rebind STATE *and* its derived dirs, not just STATE (avoid live-state leak)
         jd._hidden_lkg[0] = None           # the r57 last-known-good copy is process-global —
         #                                    a leftover verdict would leak across tests
+        jd._hidden_warned[0] = False
 
     def tearDown(self):
         jd._rebind_state(self._saved_state)
@@ -66,6 +67,19 @@ class HiddenFromFeed(unittest.TestCase):
                          "…and the copy answers for UNMUTED sessions too — planning goes on")
         (jd.STATE / "session-flags.json").unlink()
         self.assertFalse(jd._hidden_from_feed(MUTED), "provably no flags: not hidden")
+
+    def test_reader_treats_wrong_shape_as_a_fault(self):
+        self._mute(MUTED)
+        self.assertTrue(jd._hidden_from_feed(MUTED))         # primes the copy
+        (jd.STATE / "session-flags.json").write_text("[]")   # valid bytes, wrong shape
+        self.assertTrue(jd._hidden_from_feed(MUTED),
+                        "r57 wave 2, reproduced: []-shaped bytes took the success path and "
+                        "un-muted every session past a primed last-known-good")
+        jd._hidden_lkg[0] = None                             # a fresh process
+        import contextlib, io
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(jd._hidden_from_feed(MUTED),
+                            "wrong shape with no history: hidden — the safe direction")
 
     def test_postaloff_does_not_stop_tracking(self):
         self._mute(MUTED, flag="postalServiceOff")

@@ -3066,12 +3066,18 @@ class TimelinePanel {
             .then((r) => this.unionOpsAck({ ok: r.ok === true, opId: opId,
                                             unclaimed: (r.json && r.json.unclaimed) || [],
                                             unretired: (r.json && r.json.unretired) || [],
-                                            // NO parsed body = the kernel may have COMMITTED
-                                            // and the response died (r57 P1.1): indeterminate,
-                                            // never a definitive refusal
-                                            indeterminate: r.ok !== true && !r.json }))
+                                            // NO parsed body AND no received 4xx = the
+                                            // kernel may have COMMITTED and the response
+                                            // died (r57 P1.1): indeterminate. A received
+                                            // 4xx is a DEFINITIVE pre-commit refusal (r57
+                                            // wave 2, reproduced: a token-less panel's 403
+                                            // text read as "outcome unknown" — the gesture
+                                            // unwound with a "recovers by itself" message
+                                            // and re-403'd forever, silently losing the
+                                            // edit the definitive arm would have surfaced)
+                                            indeterminate: r.ok !== true && !r.json
+                                              && !(r.status >= 400 && r.status < 500) }))
             .catch(() => this.unionOpsAck({ ok: false, opId: opId, indeterminate: true }))
-            .catch(() => this.unionOpsAck({ ok: false, opId: opId }))
         );
         sent = true;
       }
@@ -3145,6 +3151,13 @@ class TimelinePanel {
     for (const g of (p.retired || [])) {
       if (_unret.has(g)) continue;   // skipped over a live claim (r57): the ledger KEEPS it
       if (this._journaledGids) this._journaledGids.delete(g);
+    }
+    if (_unret.size) {
+      // …and the kept retirement RE-SENDS on the payload pump (the r57 wave-2 verification,
+      // reproduced: without the dirty bit nothing ever re-sent — the deciding event, the
+      // claim clearing, notifies nobody, so a quiet panel stranded the settled rows in the
+      // journal forever). Each re-send is one paced POST; it lands when the claim clears.
+      this._unionSyncDirty = true;
     }
     for (const g of (p.tomb || [])) { if (this._retireUnionGids) this._retireUnionGids.delete(g); }
     if (gated) {
@@ -4669,7 +4682,11 @@ class TimelinePanel {
   // unreachable/unparseable). The /views caller needs the body: the kernel's response carries the
   // store's actual rev — 200 and 409 alike — the POST twin of the WS viewsAck frame.
   _kernelPost(route, body, wantJson) {
-    const fold = (ok, json) => (wantJson ? { ok: ok, json: json || null } : ok);
+    const fold = (ok, json, status) => (wantJson
+      ? { ok: ok, json: json || null, status: status || 0 } : ok);
+    //  ^ status rides for the union classifier (r57 wave 2): a RECEIVED 4xx proves the
+    //    kernel rejected the request before/without committing — discarding it made a
+    //    plain 403 read as "outcome unknown"
     try {
       if (typeof process === 'undefined' || !process.versions || !process.versions.electron)
         return Promise.resolve(fold(false));
@@ -4691,7 +4708,7 @@ class TimelinePanel {
         // write would race the very writers the refusal protects (the r44 verification);
         // only a NETWORK failure (the catch below) reads as kernel-down
         return r.json().catch(() => null).then((j) =>
-          fold((!r.ok || (j && j.ok === false)) ? 'refused' : true, j));
+          fold((!r.ok || (j && j.ok === false)) ? 'refused' : true, j, r.status));
       }).catch(() => fold(false));
     } catch (e) { return Promise.resolve(fold(false)); }
   }

@@ -33,6 +33,13 @@ def _set_flag(sid, postal_off):
 
 
 class PostalOff(unittest.TestCase):
+    def setUp(self):
+        # the r57 last-known-good copy is module-global: without this reset, the alphabetical
+        # neighbors primed it and the fault tests measured cross-test leakage, not the reader
+        # (the r57 wave-2 verification caught the OLD fail-open pin below passing exactly
+        # that way — green in a full run, red standalone)
+        pm._postal_off_cache[0] = None
+
     def tearDown(self):
         try:
             pm.SESSION_FLAGS.unlink()
@@ -54,9 +61,33 @@ class PostalOff(unittest.TestCase):
         pm.SESSION_FLAGS.write_text(json.dumps({SID: {"hideFromFeed": True}}))   # muted from feed, NOT postal
         self.assertFalse(pm._postal_off(SID), "hideFromFeed alone must not isolate from postal")
 
-    def test_malformed_flags_file_fails_open(self):
+    def test_malformed_flags_file_fails_closed_then_serves_history(self):
+        # r57 P1.4 REVERSED the old fail-open pin here: one unreadable window used to
+        # deliver into a durably-isolated session. With no good read yet, isolation is the
+        # safe answer; with history, the last-known-good copy answers.
+        pm.SESSION_FLAGS.parent.mkdir(parents=True, exist_ok=True)
         pm.SESSION_FLAGS.write_text("{not valid json")
-        self.assertFalse(pm._postal_off(SID), "a corrupt flags file must NOT wedge messaging (fail open)")
+        self.assertTrue(pm._postal_off(SID),
+                        "corrupt flags with NO history: closed, never fail-open delivery")
+        pm.SESSION_FLAGS.unlink()                    # the helper reads the file it writes
+        _set_flag(SID, False)
+        self.assertFalse(pm._postal_off(SID))        # a good read primes the copy
+        pm.SESSION_FLAGS.write_text("{not valid json")
+        self.assertFalse(pm._postal_off(SID),
+                         "…and the fault serves the last-known-good verdict")
+
+    def test_wrong_shape_flags_are_a_fault_not_an_empty_store(self):
+        # the r57 wave-2 verification, reproduced: []-shaped VALID bytes took the success
+        # path and un-isolated every session past a primed last-known-good
+        _set_flag(SID, True)
+        self.assertTrue(pm._postal_off(SID))         # primes the copy
+        for junk in ('[]', 'null', '0', '"oops"'):
+            pm.SESSION_FLAGS.write_text(junk)
+            self.assertTrue(pm._postal_off(SID),
+                            "%s must serve the last-known-good isolation, not un-isolate" % junk)
+        pm._postal_off_cache[0] = None               # a fresh process with no history
+        pm.SESSION_FLAGS.write_text("[]")
+        self.assertTrue(pm._postal_off(SID), "wrong shape with no history: closed")
 
     def test_read_box_holds_mail_while_isolated(self):
         box = pm.MAILROOT / SID / "new"

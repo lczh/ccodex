@@ -313,6 +313,154 @@ class R57AuditFixes(unittest.TestCase):
                          "the bytes move aside — a later writer can't silently erase them")
 
 
+
+
+class R57Wave2(unittest.TestCase):
+    """the r57 wave-2 verification round (30 confirmed second-order findings over the
+    wave-1 fixes, each reproduced by an adversarial skeptic): the whole-journal quarantine
+    read authoritative-empty one push later, the flags setter's cache clear destroyed the
+    last-known-good copy every fault arm depends on, the control caches primed on reads
+    only, wrong-shape valid bytes failed open in every safety reader, and /deliver's
+    kernel-side isolation gate failed open with no history."""
+
+    SID = "13131313-4242-5757-6868-424242424242"
+    SID2 = "14141414-4242-5757-6868-424242424242"
+
+    def setUp(self):
+        _scrub_state()
+        km._union_claims.clear()
+        km._union_retired_tombs.clear()
+        km._retry_paused_cache[0] = None
+        km._retry_pause_lkg["reason"] = ""
+        km._retry_pause_lkg["ts"] = 0.0
+        km._notify_cards_cache.clear()
+        km._postal_isolated_warned[0] = False
+        for name in ("union-gestures.json", "session-order.json", "auto-nudge.json",
+                     "retry-paused.json", "notify-cards.json"):
+            try:
+                (km.jd.STATE / name).unlink()
+            except OSError:
+                pass
+        for f in km.jd.STATE.glob("*.corrupt-*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    def tearDown(self):
+        self.setUp()
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_a_toggle_then_fault_serves_the_last_known_good(self):
+        km._set_session_flag(self.SID, "hideFromFeed", True)
+        self.assertTrue(km._session_flag(self.SID, "hideFromFeed"))
+        km._set_session_flag(self.SID2, "postalServiceOff", True)   # the toggle that CLEARED
+        p = km.jd.STATE / "session-flags.json"
+        os.utime(p, (1, 1))
+        os.chmod(p, 0)
+        try:
+            self.assertTrue(km._session_flag(self.SID, "hideFromFeed"),
+                            "wave 2, reproduced: the setter's cache clear destroyed the "
+                            "last-known-good copy — every toggle re-opened the {} window")
+            self.assertTrue(km._session_flag(self.SID2, "postalServiceOff"),
+                            "…and the just-written flag answers from the seed")
+        finally:
+            os.chmod(p, 0o644)
+
+    def test_b_wrong_shape_flags_are_a_fault(self):
+        km._set_session_flag(self.SID, "postalServiceOff", True)
+        self.assertTrue(km._session_flag(self.SID, "postalServiceOff"))
+        p = km.jd.STATE / "session-flags.json"
+        p.write_text("[]")                           # valid bytes, wrong shape
+        self.assertTrue(km._session_flag(self.SID, "postalServiceOff"),
+                        "wave 2, reproduced: []-shaped bytes took the success path and "
+                        "un-isolated every session past a primed last-known-good")
+        km._flags_cache.clear()
+        self.assertEqual(km._session_flags_read(), ({}, False),
+                         "no history: the {} is marked UNPROVED, never evidence")
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_c_postal_gate_fails_closed_on_unproved_flags(self):
+        p = km.jd.STATE / "session-flags.json"
+        p.write_text(json.dumps({}))
+        os.utime(p, (1, 1))
+        os.chmod(p, 0)
+        km._flags_cache.clear()
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertTrue(km._postal_isolated(self.SID),
+                                "wave 2, reproduced: /deliver's ONLY gate read the "
+                                "fabricated {} and injected into an isolated session")
+        finally:
+            os.chmod(p, 0o644)
+        self.assertFalse(km._postal_isolated(self.SID), "a readable store answers normally")
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_d_stop_then_fault_stays_paused(self):
+        self.assertFalse(km._retry_paused_on())      # caches the pre-Stop False
+        km._set_retry_paused(True, reason="spend")   # the user's Stop
+        p = km.jd.STATE / "retry-paused.json"
+        os.chmod(p, 0)
+        try:
+            self.assertTrue(km._retry_paused_on(),
+                            "wave 2, reproduced: the read-only cache served the pre-Stop "
+                            "False and retries kept firing over the explicit Stop")
+            self.assertEqual(km._retry_pause_reason(), "spend",
+                             "…and the spend classification survives the same window")
+            self.assertGreater(km._retry_pause_ts(), 0.0)
+        finally:
+            os.chmod(p, 0o644)
+        km._set_retry_paused(False)
+        self.assertFalse(km._retry_paused_on())
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_e_master_bell_toggle_reads_proved(self):
+        p = km.jd.STATE / "notify-cards.json"
+        p.write_text(json.dumps({"card-1": False}))  # a standing per-card override
+        os.chmod(p, 0)
+        km._notify_cards_cache.clear()
+        try:
+            with self.assertRaises(km._StateUnreadable):
+                km._set_notify_all(True)
+        finally:
+            os.chmod(p, 0o644)
+        self.assertEqual(json.loads(p.read_text()), {"card-1": False},
+                         "wave 2, reproduced: the lenient snapshot persisted the fabricated "
+                         "{} and erased every override under a 200")
+        km._set_notify_all(True)
+        d = json.loads(p.read_text())
+        self.assertIs(d.get(km.NOTIFY_ALL_KEY), True)
+        self.assertIs(d.get("card-1"), False, "the honored write keeps the overrides")
+
+    def test_f_inf_claim_gid_refuses_not_500(self):
+        self.assertIsNone(km._union_claim_grant(float("inf"), "cid:x"),
+                          "wave 2, reproduced: int(inf) raised OverflowError into a 500 on "
+                          "POST /union-claim, and the WS arm dropped the ack — the panel's "
+                          "_pendingClaims latched forever")
+
+    def test_g_malformed_journal_reminted_never_reads_empty_later(self):
+        km.jd.STATE.mkdir(parents=True, exist_ok=True)
+        km._union_ops_path().write_text("{{{garbage")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(km._union_ops_echo(), "the judged push has no information")
+        self.assertEqual(km._union_ops_path().read_text(), "[]",
+                         "the store re-mints in the SAME locked pass — the wave-1 ENOENT "
+                         "read as authoritative-empty and panels retired recovery copies")
+        self.assertEqual(len(list(km.jd.STATE.glob("union-gestures.json.corrupt-*"))), 1)
+        self.assertEqual(km._union_ops_echo(), [], "the next push reads a deliberate []")
+
+    def test_h_echo_quarantine_runs_under_the_identity_lock(self):
+        # the wave-2 verification reproduced the stat→unlink TOCTOU by scheduling a locked
+        # merge inside the UNLOCKED echo's quarantine window — the writer's fresh valid
+        # commit was deleted and the next echo answered authoritative-empty. The lock is
+        # the fix: every judgment and salvage now commits under the same lock the writers
+        # hold, so no rename can interleave.
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        fn = src.index("def _union_ops_echo():")
+        body = src[fn:src.index("def ", fn + 10)]
+        self.assertIn("with jd._identity_file_lock():", body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
@@ -2526,26 +2674,47 @@ class R56AuditFixes(unittest.TestCase):
               "name": "pool", "dispatched": False}])
         self.assertFalse(ok, "non-finite ids never persist")
         self.assertEqual(km._union_ops_load(), [])
-        # legacy poison already ON DISK makes the WHOLE journal unproved (r57 P1.3,
-        # superseding r56's silent filter: dropping the bad row let an unrelated acked
-        # merge treat the unresolved gesture as retired — no refusal, no quarantine, gone)
+        # legacy poison already ON DISK is SALVAGED at judgment (r57 P1.3 + wave 2: the r56
+        # silent filter let an acked merge retire the poisoned gesture; the wave-1
+        # refuse-and-quarantine-whole left the store ENOENT, which the NEXT echo read as
+        # authoritative-empty and panels retired every VALID recovery copy — reproduced.
+        # The salvage moves the original bytes aside whole and re-mints the valid rows.)
+        _good = ('{"host": "TESTHOST-B", "gid": 7, "edit": {}, "inverse": {}, "rt": {}, '
+                 '"name": "pool", "dispatched": false}')
         km.jd.STATE.mkdir(parents=True, exist_ok=True)
-        km._union_ops_path().write_text('[{"host": "TESTHOST-A", "gid": Infinity}]')
+        km._union_ops_path().write_text(
+            '[%s, {"host": "TESTHOST-A", "gid": Infinity}]' % _good)
         with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
             echo = km._union_ops_echo()
-        self.assertIsNone(echo, "one invalid stored row = NO INFORMATION, never a partial "
-                                "authoritative view")
+        self.assertEqual([r["gid"] for r in echo], [7],
+                         "the provably-valid rows survive the poison — never a partial "
+                         "SILENT filter, never an all-or-nothing wipe")
         q = list(km.jd.STATE.glob("union-gestures.json.corrupt-*"))
-        self.assertEqual(len(q), 1, "…and the bytes quarantined aside for forensics")
+        self.assertEqual(len(q), 1, "…the original bytes quarantined aside whole")
+        self.assertIn("Infinity", q[0].read_text())
         q[0].unlink()
-        # a MERGE over a poisoned journal refuses rather than persisting the drop
-        km._union_ops_path().write_text('[{"host": "TESTHOST-A", "gid": Infinity}]')
+        self.assertEqual([r["gid"] for r in km._union_ops_echo()], [7],
+                         "…and the NEXT echo still answers the valid rows — the wave-1 "
+                         "quarantine left ENOENT here, read as authoritative-empty")
+        # a MERGE over a poisoned journal salvages the same way and proceeds
+        km._union_ops_path().write_text(
+            '[%s, {"host": "TESTHOST-A", "gid": Infinity}]' % _good)
         with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
             ok, _, reason, _u4 = km._union_ops_merge(
                 [{"host": "TESTHOST-B", "gid": 5, "edit": {}, "inverse": {}, "rt": {},
                   "name": "pool", "dispatched": False}])
-        self.assertFalse(ok)
-        self.assertIn("quarantined", reason or "")
+        self.assertTrue(ok, reason)
+        self.assertEqual(sorted(r["gid"] for r in km._union_ops_load()), [5, 7],
+                         "the merge lands beside the salvaged rows; the poison is gone")
+        # mark_dispatched joins the discipline (wave 2: it bypassed the whole-journal rule
+        # and re-persisted stored poison under a True ack)
+        km._union_ops_path().write_text(
+            '[%s, {"host": "TESTHOST-A", "gid": Infinity}]' % _good)
+        with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+            self.assertTrue(km._union_ops_mark_dispatched(7, "TESTHOST-B"))
+        rows = km._union_ops_load()
+        self.assertEqual([(r["gid"], r["dispatched"]) for r in rows], [(7, True)],
+                         "the flip lands on the salvaged store, not on re-serialized poison")
         for q in km.jd.STATE.glob("union-gestures.json.corrupt-*"):
             q.unlink()
 

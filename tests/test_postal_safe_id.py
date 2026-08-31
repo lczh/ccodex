@@ -140,8 +140,11 @@ class HeaderInjection(unittest.TestCase):
         for field in ("from_name", "from_id", "kind", "from_host", "relay_mid", "relay_via"):
             with self.subTest(field=field):
                 pos = {"from_name": "web", "from_id": "id-web"}
+                # UNIQUE relay_mid per subtest (r57: relayed delivery is idempotent BY MID —
+                # reusing one mid made every later subtest a no-op replay of the first)
                 kw = {"kind": "question", "from_host": "TESTHOST",
-                      "relay_mid": "px-1700000000.1234_567.TESTHOST", "relay_via": "TESTHOST"}
+                      "relay_mid": "px-1700000000.1234_567.TESTHOST." + field,
+                      "relay_via": "TESTHOST"}
                 (pos if field in pos else kw)[field] = payload
                 mid = pm.deliver(self.TO, pos["from_name"], pos["from_id"],
                                  "the notes-api tests are green", **kw)

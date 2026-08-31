@@ -8402,6 +8402,7 @@ def _plan_session(fsid, path, now):
     save_goals(fsid, store)
     return placed
 _hidden_lkg = [None]                     # last-known-good session-flags (r57 P1.4)
+_hidden_warned = [False]                 # the fail-closed hold is announced once (r57 wave 2)
 
 
 def _hidden_from_feed(fsid):
@@ -8409,22 +8410,34 @@ def _hidden_from_feed(fsid):
     judge honours it by NOT tracking the session's goals — the planner + closer skip it — so muting takes a
     session OUT of task tracking, with no goal backlog accumulating while it's muted. The captioner/archiver
     (run_index) is deliberately NOT gated: a muted session stays captioned/archived for the dashboard.
-    Best-effort; any read error → not hidden (fail open)."""
+    A fault serves the last-known-good copy, else fails CLOSED — hidden (r57 P1.4: one
+    EIO used to UN-mute a muted session into planning; fail-open is the harm here)."""
     try:
         d = json.loads((STATE / "session-flags.json").read_text())
-        if isinstance(d, dict):
-            _hidden_lkg[0] = d                       # last-known-good (r57 P1.4)
-        f = d.get(fsid) if isinstance(d, dict) else None
+        if not isinstance(d, dict):
+            # VALID bytes, WRONG shape took the SUCCESS path and un-muted every session
+            # past a primed last-known-good (the r57 wave-2 verification, reproduced with
+            # []-shaped bytes) — a fault, same arms as an unreadable file
+            raise ValueError("session-flags is not a dict")
+        _hidden_lkg[0] = d                           # last-known-good (r57 P1.4)
+        f = d.get(fsid)
         return bool(isinstance(f, dict) and f.get("hideFromFeed"))
     except FileNotFoundError:
         _hidden_lkg[0] = {}
         return False
     except Exception:
         # an unreadable window must not UN-mute a session (the r57 audit's P1.4: a muted
-        # session re-entered judge planning through one EIO) — last-known-good, else hidden
+        # session re-entered judge planning through one EIO) — last-known-good, else hidden.
+        # The no-history verdict is said OUT LOUD (r57 wave 2: the silent hold read as a
+        # planner that just stopped, with nothing anywhere naming the corrupt file).
         if isinstance(_hidden_lkg[0], dict):
             f = _hidden_lkg[0].get(fsid)
             return bool(isinstance(f, dict) and f.get("hideFromFeed"))
+        if not _hidden_warned[0]:
+            _hidden_warned[0] = True
+            sys.stderr.write("judge: session-flags is unreadable with NO good read yet — "
+                             "holding every session out of planning (fail closed) until a "
+                             "readable copy appears\n")
         return True
 def run_plan(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
     """One TRIAGE-TIER planner pass: advance each session's goal tree. Per-session sequential

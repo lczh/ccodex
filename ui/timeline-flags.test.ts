@@ -1951,3 +1951,56 @@ test("r57: an indeterminate journal ack UNWINDS, skipped retirements re-ledger, 
       "…and the undo restores gid AND ogid AND olin");
   }
 });
+
+test("r57 wave 2: a received 4xx is DEFINITIVE, and the indeterminate/unretired arms are EXECUTED, not just pinned", () => {
+  assert.ok(SRC.indexOf("&& !(r.status >= 400 && r.status < 500) }))") > 0,
+    "a received 4xx (403 auth, 413 size) proves the kernel rejected pre-commit — only "
+    + "network death and json-less non-4xx stay indeterminate (wave 2, reproduced: a "
+    + "token-less panel's 403 text unwound with 'recovers by itself' and silently lost "
+    + "the edit forever, where the definitive arm surfaces an actionable error)");
+  assert.ok(SRC.indexOf("status: status || 0 } : ok)") > 0,
+    "_kernelPost's fold carries the HTTP status the classifier needs");
+  assert.ok(SRC.indexOf(".catch(() => this.unionOpsAck({ ok: false, opId: opId }))") < 0,
+    "the dead definitive-refusal synthesis is gone — chained after the indeterminate "
+    + "catch, it re-armed exactly the removed behavior if unionOpsAck ever threw");
+  {
+    // EXECUTED indeterminate ack (wave 2: every prior assertion was a source-grep pin —
+    // deleting the arm's `return` fell through into the definitive arm, fired the
+    // forbidden immediate retry, overwrote the error, and the full suite stayed green)
+    const panel = drawnPanel();
+    panel._unionOps = [{ gid: 41, host: "TESTHOST-A", edit: {}, inverse: {}, rt: {},
+                         name: "pool", dispatched: false }];
+    if (!panel._journaledGids) panel._journaledGids = new Set();
+    panel._journaledGids.add(40);                    // a retirement riding this sync
+    panel._pendingUnionSyncs = { op9: { entries: [], retired: [40], tomb: [] } };
+    panel._gatedDispatches = { op9: { gates: [{ gids: [41], name: "pool",
+      run: () => { throw new Error("the gated effects must NOT run on indeterminate"); } }] } };
+    let retries = 0;
+    panel._syncUnionOps = () => { retries += 1; return null; };
+    panel.unionOpsAck({ ok: false, opId: "op9", indeterminate: true });
+    assert.ok(panel._journaledGids.has(40),
+      "retire NOTHING: the ledger keeps the retirement for the paced re-send");
+    assert.equal(retries, 0,
+      "no immediate retry rides the unknown outcome (the deleted-return mutation fires one)");
+    assert.equal(panel._unionSyncDirty, true, "the paced re-send is armed");
+    assert.ok(panel._unionOps.every((o: any) => o.gid !== 41),
+      "the gated gesture's rows unwound from the mirror");
+    assert.ok(panel._tagEditErr && /connection dropped/.test(panel._tagEditErr.error),
+      "…and the user is told the outcome is unknown, never that the edit was refused");
+  }
+  {
+    // EXECUTED unretired re-ledger (wave 2, reproduced: the kept gid had NO re-send
+    // trigger — claim-clear notifies nobody, so a quiet panel stranded the settled rows
+    // in the journal forever)
+    const panel = drawnPanel();
+    if (!panel._journaledGids) panel._journaledGids = new Set();
+    panel._journaledGids.add(51);
+    panel._journaledGids.add(52);
+    panel._pendingUnionSyncs = { op10: { entries: [], retired: [51, 52], tomb: [] } };
+    panel._unionSyncDirty = false;
+    panel.unionOpsAck({ ok: true, opId: "op10", unclaimed: [], unretired: [52] });
+    assert.ok(!panel._journaledGids.has(51), "the honored retirement leaves the ledger");
+    assert.ok(panel._journaledGids.has(52), "the claim-skipped one stays…");
+    assert.equal(panel._unionSyncDirty, true, "…and ARMS the paced re-send");
+  }
+});

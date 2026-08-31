@@ -426,6 +426,236 @@ class R57PostalDurability(unittest.TestCase):
                       "the periodic monitor pumps queued terminal rows and parked bounces")
 
 
+
+
+class R57Wave2Postal(unittest.TestCase):
+    """the r57 wave-2 verification round, postal half — every finding below was REPRODUCED
+    by an adversarial skeptic against the wave-1 commit: the r- replay resurrected READ
+    mail and blind-replaced standing different bytes, the r- names broke the drain's
+    oldest-first contract and outgrew the 128-char id cap, the ack path deleted its source
+    before the backward ack was durable, durable settlement made the bounce note
+    at-most-once, "any next request" retired backflow a redial never applied, orphaned
+    phase markers leaked forever, and a no-information isolation verdict minted TERMINAL
+    bounces."""
+
+    HOST = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    ORIGIN = "abababababababababababababababab"
+
+    def setUp(self):
+        _reset()
+        pm._postal_off_cache[0] = None
+        pm._postal_off_warned[0] = False
+        pm._bounced_done.clear()
+        pm._bounced_done_loaded[0] = False
+        for p in (pm._bounced_done_path(), pm._backflow_path(), pm.SESSION_FLAGS):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        with pm._peer_lock:
+            pm._peer_pending.clear()
+        for h in (self.HOST, self.ORIGIN):
+            shutil.rmtree(pm.OUTBOX / h, ignore_errors=True)
+        shutil.rmtree(pm.MAILROOT / SID, ignore_errors=True)
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_replay_never_resurrects_read_mail(self):
+        mid = "cc" * 16
+        pm.deliver(SID, "peer", SID2, "hello", relay_mid=mid, relay_via="dd" * 16)
+        got = pm.read_box(SID, consume=True)
+        self.assertEqual([m["body"] for m in got], ["hello"])
+        pm.deliver(SID, "peer", SID2, "hello", relay_mid=mid, relay_via="dd" * 16)  # replay
+        self.assertEqual(list((pm._mailbox(SID) / "new").iterdir()), [],
+                         "wave 2, reproduced: the crash replay minted a fresh UNREAD copy "
+                         "of mail the agent had already read — delivered twice")
+        self.assertTrue((pm._mailbox(SID) / "cur" / ("r-" + mid)).exists())
+
+    def test_b_replay_never_replaces_standing_different_bytes(self):
+        mid = "ee" * 16
+        pm.deliver(SID, "peer", SID2, "original", relay_mid=mid, relay_via="dd" * 16)
+        pm.deliver(SID, "peer", SID2, "EDITED", relay_mid=mid, relay_via="dd" * 16)
+        files = list((pm._mailbox(SID) / "new").iterdir())
+        self.assertEqual(len(files), 1)
+        self.assertIn("original", files[0].read_text(),
+                      "wave 2, reproduced: the blind rename replaced standing unread mail "
+                      "with whatever bytes the replay carried")
+
+    def test_c_overlong_relay_mid_falls_back_to_a_receipt_safe_name(self):
+        mid = "a" * 127                    # passes _safe_id alone; "r-"+mid is 129 chars
+        name = pm.deliver(SID, "peer", SID2, "hello", relay_mid=mid, relay_via="dd" * 16)
+        self.assertTrue(pm._safe_id(name),
+                        "wave 2, reproduced: the 129-char delivery id failed every "
+                        "/handoff-done validation — the completion receipt could never "
+                        "file and the kernel re-posted forever")
+
+    def test_d_drain_order_is_arrival_not_filename(self):
+        mb = pm._mailbox(SID)
+        (mb / "new").mkdir(parents=True, exist_ok=True)
+        a = mb / "new" / ("r-" + "ff" * 16)
+        a.write_text("From: peer\nFrom-Id: x\nDate: now\n\nfirst\n")
+        os.utime(a, (100, 100))
+        b = mb / "new" / "1756600000-xyz"
+        b.write_text("From: peer\nFrom-Id: x\nDate: now\n\nsecond\n")
+        os.utime(b, (200, 200))
+        got = pm.read_box(SID, consume=False)
+        self.assertEqual([m["body"] for m in got], ["first", "second"],
+                         "wave 2, reproduced: 'r-' sorted after every epoch-named file, so "
+                         "the relayed message that arrived FIRST was injected LAST")
+
+    def test_e_forwarded_ack_is_durable_before_the_source_dies(self):
+        mid = "aa" * 16
+        d = pm.OUTBOX / self.HOST
+        d.mkdir(parents=True, exist_ok=True)
+        pm._atomic_json_put(d / (mid + ".json"),
+                            {"mid": mid, "to": "web", "frm": "peer", "frm_id": "x" * 32,
+                             "body": "hi", "origin": self.ORIGIN})
+        seen = []
+        real_del = pm.outbox_del
+
+        def spy(h, m):
+            try:
+                snap = json.loads(pm._backflow_path().read_text())
+            except Exception:
+                snap = {}
+            seen.append(mid in ((snap.get(self.ORIGIN) or {}).get("acks") or []))
+            return real_del(h, m)
+
+        pm.outbox_del = spy
+        try:
+            self.assertTrue(pm._ack_arrived(self.HOST, mid))
+        finally:
+            pm.outbox_del = real_del
+        self.assertEqual(seen, [True],
+                         "wave 2, reproduced: the delete ran FIRST — a crash before the "
+                         "save left the backward ack in NO durable store (P1.10, ack path)")
+        _po = pm._pending(self.ORIGIN)               # takes _peer_lock itself — never nest
+        with pm._peer_lock:
+            self.assertIn(mid, _po["acks"])
+
+    def test_f_bounce_note_precedes_durable_settlement(self):
+        mid = "bb" * 16
+        d = pm.OUTBOX / self.HOST
+        d.mkdir(parents=True, exist_ok=True)
+        pm._atomic_json_put(d / (mid + ".json"),
+                            {"mid": mid, "to": "web", "frm": "peer", "frm_id": SID,
+                             "body": "hi"})
+        real = pm.deliver
+
+        def boom(*a, **kw):
+            raise OSError("note delivery died")
+
+        pm.deliver = boom
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                settled = pm._bounce_apply(self.HOST,
+                                           {"mid": mid, "code": "recipient-unavailable"})
+        finally:
+            pm.deliver = real
+        self.assertFalse(settled, "an undelivered note is NOT settled — the park retries")
+        self.assertFalse(pm._bounced_done_has(self.HOST, mid),
+                         "wave 2, reproduced: settling FIRST made the sender's note "
+                         "at-most-once across restarts — a crash suppressed it forever")
+        self.assertTrue((d / (mid + ".json")).exists(), "the retry source survives")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(pm._bounce_apply(self.HOST,
+                                             {"mid": mid, "code": "recipient-unavailable"}))
+        self.assertTrue(pm._bounced_done_has(self.HOST, mid))
+        got = pm.read_box(SID, consume=True)
+        self.assertTrue(any("undeliverable" in m["body"] for m in got),
+                        "the retry delivered the note (r53 rule: a duplicate note over a "
+                        "silently lost one, every time)")
+
+    def test_g_backflow_retires_only_on_explicit_confirmation(self):
+        os.environ["ROMP_POSTAL_PEERS"] = "1"
+        try:
+            mid = "88" * 16
+            p = pm._pending(self.HOST)
+            with pm._peer_lock:
+                p["acks"].append(mid)
+                pm._backflow_save_locked()
+            req = {"host": self.HOST, "epoch": 1, "proto": pm.PEER_PROTO, "presence": [],
+                   "holds": [], "relays": [], "acks": [], "bounces": [], "wait": False}
+            resp1, st1 = pm.peer_exchange_handle(dict(req))
+            self.assertEqual(st1, 200)
+            self.assertIn(mid, resp1.get("acks") or [])
+            # a REDIAL after a dropped response confirms nothing — the slice re-rides
+            resp2, _ = pm.peer_exchange_handle(dict(req))
+            self.assertIn(mid, resp2.get("acks") or [],
+                          "wave 2, reproduced: 'any next request' treated a redial after a "
+                          "DROPPED response as proof of progress and deleted the unapplied "
+                          "ack — the P1.10 loss shifted one request later")
+            _ph = pm._pending(self.HOST)             # takes _peer_lock itself — never nest
+            with pm._peer_lock:
+                self.assertIn(mid, _ph["acks"])
+            # the dialer's explicit confirmation retires exactly the named entries
+            pm.peer_exchange_handle(dict(req, backflowAcks={"acks": [mid], "bounces": []}))
+            with pm._peer_lock:
+                self.assertNotIn(mid, _ph["acks"])
+        finally:
+            os.environ.pop("ROMP_POSTAL_PEERS", None)
+
+    def test_h_dialer_confirms_applied_response_backflow(self):
+        mid = "99" * 16
+        resp = {"host": self.HOST, "epoch": 1, "proto": pm.PEER_PROTO, "busId": "e" * 32,
+                "presence": [], "holds": [], "relays": [], "acks": [mid], "bounces": [],
+                "reads": [], "handoffDone": []}
+        req = pm.build_exchange_request(self.HOST, wait=False)
+        self.assertTrue(pm.peer_exchange_apply(self.HOST, req, resp))
+        p = pm._pending(self.HOST)
+        with pm._peer_lock:
+            self.assertIn(mid, (p.get("backflowAcks") or {}).get("acks") or [],
+                          "the applied response-carried ack is recorded for confirmation")
+        req2 = pm.build_exchange_request(self.HOST, wait=False)
+        self.assertIn(mid, (req2.get("backflowAcks") or {}).get("acks") or [],
+                      "…and rides the next request")
+        resp2 = dict(resp, acks=[])
+        self.assertTrue(pm.peer_exchange_apply(self.HOST, req2, resp2))
+        with pm._peer_lock:
+            self.assertNotIn(mid, (p.get("backflowAcks") or {}).get("acks") or [],
+                             "an answered request retires its own confirmations")
+
+    def test_i_orphaned_phase_markers_and_payload_temps_sweep(self):
+        d = pm.OUTBOX / self.HOST
+        d.mkdir(parents=True, exist_ok=True)
+        (d / (".pubphase-" + "11" * 16)).write_text("1")   # no stage: nothing to protect
+        (d / ".pub-x.deadbeef.tmp").write_text("payload")  # a crash-leaked payload copy
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm._reconcile_relay_stages()
+        self.assertEqual([f.name for f in d.iterdir()], [],
+                         "wave 2, reproduced: one orphaned marker per incident leaked "
+                         "forever — no sweeper matched either dotfile")
+
+    def test_j_unproved_isolation_drops_the_relay_never_bounces(self):
+        # BYO seam: another postal module pops ROMP_SESSIONS_FILE mid-suite (full-run only),
+        # so the test plants its own live-agent file and restores whatever was there
+        old_env = os.environ.get("ROMP_SESSIONS_FILE")
+        sessfile = os.path.join(tempfile.mkdtemp(), "sessions.json")
+        with open(sessfile, "w") as fh:
+            fh.write(json.dumps([{"id": SID, "name": "web", "dir": "",
+                                  "state": "waiting", "working": ""}]))
+        os.environ["ROMP_SESSIONS_FILE"] = sessfile
+        pm.SESSION_FLAGS.parent.mkdir(parents=True, exist_ok=True)
+        pm.SESSION_FLAGS.write_text("{not valid json")
+        pm._postal_off_cache[0] = None               # cold cache: no history
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                verdict, bounce = pm._relay_in(
+                    self.HOST, {"mid": "22" * 16, "to": "web", "frm": "peer",
+                                "frm_id": "77" * 16, "body": "hi"}, token_proven=True)
+        finally:
+            if old_env is None:
+                os.environ.pop("ROMP_SESSIONS_FILE", None)
+            else:
+                os.environ["ROMP_SESSIONS_FILE"] = old_env
+            pm.SESSION_FLAGS.unlink()
+        self.assertEqual((verdict, bounce), ("drop", None),
+                         "wave 2, reproduced: a no-information isolation verdict minted a "
+                         "TERMINAL recipient-isolated bounce — the origin deleted its "
+                         "source and blamed the recipient, over one transient read fault")
+
+
 if __name__ == "__main__":
     unittest.main()
 
