@@ -3079,7 +3079,7 @@ def _fsync_dir(path):
             os.close(fd)
 
 
-_proved_dirs = set()   # str(dir) -> this PROCESS proved the level durable (fsync'd it
+_proved_dirs = {}      # str(dir) -> (dev, ino) this PROCESS proved durable (fsync'd it
 #                        and its parent link). EXISTS is not PROVED (r61 P1.7, executed
 #                        four ways: a failed-fsync retry saw the dirs standing and
 #                        skipped every fsync; boot pre-created STATE/MAILROOT with plain
@@ -3098,7 +3098,16 @@ def _mkdirs_durable(path):
     root = STATE.parent
     chain = []
     q = p
-    while (not (str(q) in _proved_dirs and q.exists())
+
+    def _gen(dp):
+        try:
+            _st = dp.stat()
+            return (_st.st_dev, _st.st_ino)
+        except OSError:
+            return None
+    while (not (str(q) in _proved_dirs and _gen(q) == _proved_dirs[str(q)])
+           #   ^ the memo binds the INODE (r62 P2.10: a proved path renamed away and
+           #     recreated read as proved — zero fsyncs for the replacement)
            and (str(q) == str(root) or str(q).startswith(str(root) + os.sep))):
         chain.append(q)
         if str(q) == str(root):
@@ -3114,7 +3123,8 @@ def _mkdirs_durable(path):
     p.mkdir(parents=True, exist_ok=True)
     for d in [chain[-1].parent] + list(reversed(chain)):
         _fsync_dir(d)
-    _proved_dirs.update(str(d) for d in chain)
+    for d in chain:
+        _proved_dirs[str(d)] = _gen(d)
 
 
 def _atomic_text_put(path, text):
@@ -3163,7 +3173,10 @@ def _quarantine_corrupt_json(path, store, error, fingerprint=None):
             if now != fingerprint:
                 return                              # a concurrent atomic writer already replaced it
         dst_dir = CORRUPT / store
-        dst_dir.mkdir(parents=True, exist_ok=True)
+        _mkdirs_durable(dst_dir)             # first-generation corrupt/ dirs link
+        #                                      durably (r62 P2.11: a crash after the
+        #                                      source removal persisted could lose the
+        #                                      quarantined record with its directory)
         dst = dst_dir / ("%s.%d.%016x.corrupt" %
                          (path.name, int(time.time() * 1000), random.getrandbits(64)))
         os.replace(path, dst)
@@ -3622,6 +3635,10 @@ def _pending_bounce_park(host, mid, code):
     the snapshot-then-write let a stale {A} overwrite a concurrent {A,B}."""
     with _pending_bounces_lock:
         _k = "%s|%s" % (host, mid)
+        _durable = _pending_bounces_load()   # FOLD before the collision check (r62
+        #                                      P2.9: a fresh process consulted an empty
+        #                                      quarantine set, overwrote the preserved
+        #                                      row, and inherited its never-flush mark)
         if _k in _pending_bounces_quarantined:
             # a NEW legitimate park must neither overwrite the preserved garbage nor
             # inherit its never-flushed quarantine (r61 wave 2, executed both ways: the
@@ -3633,7 +3650,7 @@ def _pending_bounce_park(host, mid, code):
             _pending_bounces_quarantined.add(_aside)
             _log("pending-bounces: preserved row at %r moved aside to %r for a new "
                  "legitimate park" % (_k, _aside))
-        if not _pending_bounces_load():
+        if not _durable:
             _pending_bounces[_k] = {"host": str(host), "mid": str(mid),
                                     "code": str(code),
                                     "t": int(time.time())}
@@ -3913,8 +3930,10 @@ def receiptbox_del(host, mid, origin=""):
     _dmid = ""
     try:
         _row = json.loads(_f.read_text())
-        if (origin and _f.name == mid + ".json" and isinstance(_row, dict)
+        if (_f.name == mid + ".json" and isinstance(_row, dict)
                 and str(_row.get("origin") or "") not in ("", origin)):
+            # (r62 P1.5: an ORIGINLESS ack must not delete a bare park that RECORDS an
+            # origin either — that park belongs to a scoped ack)
             # the bare legacy park belongs to a DIFFERENT origin (r60 P1.5, reproduced:
             # an origin-A acknowledgment fell through both scoped spellings to origin
             # B's bare file — deleted it and marked B's receipt done). A bare park with
@@ -3953,11 +3972,11 @@ def _receipt_rows(value):
                 and _safe_id(row["mid"])):
             # STRING mids only (r59 P2.9, reproduced: {"mid":123} stringified, deleted the
             # real 123.json park, and marked its delivery complete)
-            if ("origin" in row and row.get("origin") is not None
-                    and not (isinstance(row["origin"], str) and _safe_id(row["origin"]))):
+            if ("origin" in row
+                    and not (isinstance(row.get("origin"), str) and _safe_id(row["origin"]))):
                 continue     # a malformed origin rejects the ROW (r61 P1.10: dropping
                 #              the field made the ack originless and it settled origin
-                #              B's legacy park)
+                #              B's legacy park; r62 P1.5: origin:null too)
             keep = {"mid": row["mid"]}
             if isinstance(row.get("origin"), str) and row["origin"]:
                 keep["origin"] = row["origin"]
@@ -4112,8 +4131,9 @@ def readbox_del(host, rec):
         f = READBOX / host / (mid + ".json")         # the pre-r59 bare spelling
     try:
         cur = json.loads(f.read_text())
-        if (_origin and f.name == mid + ".json" and isinstance(cur, dict)
+        if (f.name == mid + ".json" and isinstance(cur, dict)
                 and str(cur.get("origin") or "") not in ("", _origin)):
+            # (r62 P1.5: originless acks are content-bound too)
             # the bare legacy park belongs to a DIFFERENT origin (r60 P1.5): an
             # origin-A ack must never delete origin B's receipt; a park with no
             # recorded origin predates scoping and stays deletable
@@ -4246,11 +4266,12 @@ def _peer_read_ack_rows(value):
             continue     # a LITERAL bool only (r61 P1.10, executed: unread:"false"
             #              truth-coerced to True and the ack deleted the retraction
             #              park its content no longer matched)
-        if ("origin" in row and row.get("origin") is not None
-                and not (isinstance(row["origin"], str) and _safe_id(row["origin"]))):
+        if ("origin" in row
+                and not (isinstance(row.get("origin"), str) and _safe_id(row["origin"]))):
             continue     # a MALFORMED origin rejects the ROW, never just the field
             #              (r61 P1.10, executed: origin:123 was dropped and the
-            #              origin-less ack deleted origin B's legacy park)
+            #              origin-less ack deleted origin B's legacy park; r62 P1.5:
+            #              origin:null slipped the same way)
         keep = {"mid": mid, "unread": bool(row.get("unread"))}
         if isinstance(row.get("origin"), str) and row["origin"]:
             keep["origin"] = row["origin"]   # the scoped park's key (r59 wave 2:

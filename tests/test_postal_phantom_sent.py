@@ -2415,8 +2415,8 @@ class R60Wave2Postal(unittest.TestCase):
         finally:
             pm._fsync_dir = real
             shutil.rmtree(base, ignore_errors=True)
-            pm._proved_dirs.discard(str(base))
-            pm._proved_dirs.discard(str(base / "a"))
+            pm._proved_dirs.pop(str(base), None)
+            pm._proved_dirs.pop(str(base / "a"), None)
         for want in (base, base / "a"):
             self.assertIn(str(want), seen,
                           "the retry proved %s even though it already existed" % want)
@@ -2703,8 +2703,8 @@ class R61Wave2Postal(unittest.TestCase):
             seen.append(str(p))
             return real(p)
         root = pm.STATE.parent
-        pm._proved_dirs.discard(str(root))
-        pm._proved_dirs.discard(str(pm.STATE))
+        pm._proved_dirs.pop(str(root), None)
+        pm._proved_dirs.pop(str(pm.STATE), None)
         shutil.rmtree(pm.STATE / "root-probe", ignore_errors=True)
         pm._fsync_dir = spy
         try:
@@ -2733,3 +2733,113 @@ class R61Wave2Postal(unittest.TestCase):
         self.assertEqual([f.name for f in pm.QUARANTINE.glob("*.tmp*")], [],
                          "no stage survives a failed hold (r61 wave 2: one leaked .tmp "
                          "per failed attempt, unbounded)")
+
+
+class R62PostalAudit(unittest.TestCase):
+    """the v1.3.34 audit, postal half: origin:null acks slipped the typed readers and an
+    originless ack deleted a bare park that RECORDED an origin (P1.5); the pending-bounce
+    collision check ran before the fold (P2.9); the directory-proof memo ignored inode
+    replacement (P2.10); the corrupt-record destination chain was plain mkdir (P2.11)."""
+
+    HOST = "dedededededededededededededededede"[:32]
+
+    def setUp(self):
+        _reset()
+        pm._pending_bounces.clear()
+        pm._pending_bounces_loaded[0] = False
+        pm._pending_bounces_quarantined.clear()
+        try:
+            pm._pending_bounces_path().unlink()
+        except OSError:
+            pass
+        shutil.rmtree(pm.RECEIPTBOX / "peerX", ignore_errors=True)
+        shutil.rmtree(pm.READBOX / "peerX", ignore_errors=True)
+        shutil.rmtree(pm.CORRUPT, ignore_errors=True)
+        shutil.rmtree(pm.STATE / "inode-probe", ignore_errors=True)
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_origin_null_never_becomes_an_originless_deletion(self):
+        good = {"mid": "dd" * 16, "origin": self.HOST, "unread": False}
+        self.assertEqual(pm._peer_read_ack_rows([dict(good, origin=None)]), [],
+                         "readAck origin:null rejects the row (r62 P1.5)")
+        self.assertEqual(pm._receipt_rows([{"mid": "dd" * 16, "origin": None}]), [],
+                         "handoffDoneAck origin:null rejects the row")
+        # …and a genuinely ORIGINLESS ack is content-bound too: a bare park that RECORDS
+        # an origin belongs to a scoped ack and stays
+        d = pm.RECEIPTBOX / "peerX"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / ("ee" * 16 + ".json")).write_text(json.dumps({"mid": "ee" * 16,
+                                                          "origin": "ORIGIN-B"}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm.receiptbox_del("peerX", "ee" * 16)
+        self.assertTrue((d / ("ee" * 16 + ".json")).exists(),
+                        "the originless handoff ack left origin B's park alone")
+        r = pm.READBOX / "peerX"
+        r.mkdir(parents=True, exist_ok=True)
+        (r / ("ff" * 16 + ".json")).write_text(json.dumps({"mid": "ff" * 16,
+                                                          "origin": "ORIGIN-B",
+                                                          "unread": False}))
+        pm.readbox_del("peerX", {"mid": "ff" * 16, "unread": False})
+        self.assertTrue((r / ("ff" * 16 + ".json")).exists(),
+                        "the originless read ack left origin B's park alone")
+
+    def test_b_the_collision_check_runs_after_the_fold(self):
+        # r62 P2.9, executed: a fresh process consulted an EMPTY quarantine set, overwrote
+        # the preserved row, and inherited its never-flush mark
+        _k = "HOSTQ|" + "aa" * 16
+        pm._pending_bounces_path().parent.mkdir(parents=True, exist_ok=True)
+        pm._pending_bounces_path().write_text(json.dumps(
+            {_k: {"host": "OTHER", "mid": "zz" * 16, "code": "x", "t": 1}}))   # unbound
+        # fresh process: nothing loaded, nothing quarantined yet
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(pm._pending_bounce_park("HOSTQ", "aa" * 16, "code-1"))
+        d = json.loads(pm._pending_bounces_path().read_text())
+        self.assertEqual(d[_k]["code"], "code-1", "the real park owns its key")
+        self.assertEqual(len([k for k in d if ".quarantined-" in k]), 1,
+                         "the preserved row moved aside — never overwritten")
+        self.assertNotIn(_k, pm._pending_bounces_quarantined,
+                         "the live key carries no inherited quarantine mark")
+
+    def test_c_the_proof_memo_binds_the_inode(self):
+        # r62 P2.10, executed: a proved path renamed away and recreated read as proved —
+        # zero fsyncs for the replacement
+        base = pm.STATE / "inode-probe"
+        pm._mkdirs_durable(base / "a")
+        seen = []
+        real = pm._fsync_dir
+        def spy(p):
+            seen.append(str(p))
+            return real(p)
+        try:
+            (base).rename(pm.STATE / "inode-probe-moved")
+            pm._fsync_dir = spy
+            pm._mkdirs_durable(base / "a")           # the SAME path, a NEW inode
+        finally:
+            pm._fsync_dir = real
+            shutil.rmtree(pm.STATE / "inode-probe-moved", ignore_errors=True)
+        self.assertIn(str(base), seen, "the replaced directory is re-proved")
+        self.assertIn(str(base / "a"), seen)
+
+    def test_d_the_corrupt_record_destination_chain_is_proved(self):
+        # r62 P2.11: plain mkdir left both new ancestor links unproved — a crash after
+        # the source removal persisted could lose the quarantined record with its dir
+        victim = pm.STATE / "victim-ledger.json"
+        victim.write_text("{garbage")
+        seen = []
+        real = pm._fsync_dir
+        def spy(p):
+            seen.append(str(p))
+            return real(p)
+        pm._proved_dirs.pop(str(pm.CORRUPT), None)
+        pm._proved_dirs.pop(str(pm.CORRUPT / "victim"), None)
+        pm._fsync_dir = spy
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                pm._quarantine_corrupt_json(victim, "victim", ValueError("x"))
+        finally:
+            pm._fsync_dir = real
+        self.assertFalse(victim.exists())
+        self.assertIn(str(pm.CORRUPT), seen, "the new corrupt/ level is fsync'd")
+        self.assertIn(str(pm.CORRUPT / "victim"), seen, "…and its store subdir")

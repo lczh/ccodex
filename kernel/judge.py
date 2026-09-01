@@ -5213,11 +5213,18 @@ def canonicalize_retry_suppressed_identity(blob):
     for key, value in blob.items():
         mapped = canonicalize_session_identity(key) if isinstance(key, str) else key
         previous = out.get(mapped)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            if not isinstance(previous, (int, float)) or isinstance(previous, bool):
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and value == value and value not in (float("inf"), float("-inf"))):
+            # FINITE stamps only (r62 P2.8: a NaN passed through, every max-merge
+            # against it answered False, and a newer pending floor was cleared)
+            if (not isinstance(previous, (int, float)) or isinstance(previous, bool)
+                    or previous != previous):
                 out[mapped] = value
             else:
                 out[mapped] = max(previous, value)
+        elif isinstance(value, float) and (value != value
+                                           or value in (float("inf"), float("-inf"))):
+            continue                                  # dropped: never a floor
         elif mapped not in out:
             out[mapped] = value
     return out

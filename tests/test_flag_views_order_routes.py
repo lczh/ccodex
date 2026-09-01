@@ -3978,3 +3978,194 @@ class R61Wave2(unittest.TestCase):
         self.assertIsNotNone(rows)
         self.assertEqual(int(rows[0].get("t")), int(p.stat().st_mtime),
                          "the ABSENT t is stamped like the invalid one — mortal again")
+
+
+class R62AuditFixes(unittest.TestCase):
+    """the v1.3.34 audit, kernel half (5 P1 / 6 P2 against 92e2e3a9): a valid completion
+    smuggled a second group's completion past its CAS (P1.1), host SETS ignored row
+    multiplicity (P1.2), a rid-only successor bypassed the transaction (P1.3), the tomb
+    ledger accepted alias keys and future stamps and skipped the cap at load (P1.4),
+    gesture identity collided silently (P2.6), a future mtime defeated the refusal
+    expiry (P2.7), and the suppression overlay accepted NaN and iterated unlocked (P2.8)."""
+
+    ROW = {"host": "TESTHOST-A", "gid": 801, "edit": {}, "inverse": {}, "rt": {},
+           "name": "pool", "dispatched": False}
+    SUCC = {"host": "TESTHOST-A", "gid": 802, "ogid": 801, "olin": [801], "rid": 801,
+            "edit": {}, "inverse": {}, "rt": {}, "name": "pool", "dispatched": False}
+
+    def setUp(self):
+        _scrub_state()
+        km._union_claims.clear()
+        km._union_retired_tombs.clear()
+        km._union_tombs_loaded[0] = False
+        km._retry_suppress_cache.clear()
+        with km._retry_suppress_lock:
+            km._retry_suppress_pending.clear()
+        for name in ("union-gestures.json", "union-gestures.json.unproved",
+                     "union-tombs.json", "union-tombs.json.hold", "retry-suppressed.json"):
+            try:
+                (km.jd.STATE / name).unlink()
+            except OSError:
+                pass
+        for f in km.jd.STATE.glob("*.corrupt-*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_one_completion_cannot_smuggle_another(self):
+        # r62 P1.1, executed: a valid completion for A carried an unauthorized completion
+        # for B past B's STANDING refusal — the plain-successor guard was disabled
+        # request-wide by A's rekey
+        self.assertTrue(km._union_ops_set([dict(self.ROW), dict(self.ROW, gid=811)]))
+        self.assertTrue(km._union_ops_set(
+            [{"refusal": True, "gid": -811, "opId": "811", "host": "TESTHOST-A",
+              "name": "pool", "error": "refused", "t": int(time.time())}]))
+        ep = km._union_claim_grant(801, "ws:x")
+        b_succ = dict(self.SUCC, gid=812, ogid=811, olin=[811], rid=811)
+        ok, _, reason, _u = km._union_ops_merge(
+            [dict(self.SUCC), b_succ], [801, 811], ckey="ws:x",
+            rekey={"ogid": 801, "gid": 802, "epoch": ep})
+        self.assertFalse(ok, "B's successor rides no CAS — the write refuses")
+        self.assertIn("completion transaction", reason or "")
+        gids = sorted(r["gid"] for r in km._union_ops_load() if not r.get("refusal"))
+        self.assertEqual(gids, [801, 811], "neither group moved")
+
+    def test_b_successors_map_one_to_one(self):
+        # r62 P1.2, executed: {A,B} -> {A,A,B} passed the host-SET compare; the panel
+        # dispatched host A twice
+        self.assertTrue(km._union_ops_set([dict(self.ROW), dict(self.ROW, host="TESTHOST-B")]))
+        ep = km._union_claim_grant(801, "ws:x")
+        ok, _, reason, _u = km._union_ops_merge(
+            [dict(self.SUCC), dict(self.SUCC), dict(self.SUCC, host="TESTHOST-B")],
+            [801], ckey="ws:x", rekey={"ogid": 801, "gid": 802, "epoch": ep})
+        self.assertFalse(ok)
+        self.assertIn("exactly once", reason or "")
+        ok, _, reason, _u = km._union_ops_merge(
+            [dict(self.ROW, gid=900), dict(self.ROW, gid=900)], [], ckey="ws:x")
+        self.assertFalse(ok, "duplicate (gid, host) rows are malformed anywhere")
+        self.assertIn("duplicate", reason or "")
+
+    def test_c_a_rid_only_successor_is_vetted_like_any_other(self):
+        # r62 P1.3, executed: {gid:802, rid:801} + retired=[801] rode through — the
+        # detector knew only ogid/olin
+        self.assertTrue(km._union_ops_set([dict(self.ROW)]))
+        rid_only = {"host": "TESTHOST-A", "gid": 802, "rid": 801, "edit": {}, "inverse": {},
+                    "rt": {}, "name": "pool", "dispatched": False}
+        ok, _, reason, _u = km._union_ops_merge([rid_only], [801], ckey="ws:x")
+        self.assertFalse(ok, "rid ancestry is ancestry")
+        self.assertIn("completion transaction", reason or "")
+        # …and a STRAY rid-only successor beside its living original is dropped and
+        # named unclaimed, never inserted
+        ok, unclaimed, _, _u = km._union_ops_merge([rid_only], [], ckey="ws:x")
+        self.assertTrue(ok)
+        self.assertEqual([r["gid"] for r in km._union_ops_load()], [801])
+        self.assertIn(802, unclaimed)
+
+    def test_d_tomb_keys_are_canonical_stamps_bounded_cap_held_at_load(self):
+        # r62 P1.4, executed: "01"/"1" aliases folded into one gid keeping the OLDER
+        # stamp; century-future entries outlived every eviction while a current shield
+        # was evicted in their place
+        now = time.time()
+        (km.jd.STATE / "union-tombs.json").write_text(json.dumps({"01": now, "1": now - 5}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok, _, reason, _u = km._union_ops_merge([], [5], ckey="ws:x")
+        self.assertFalse(ok, "an alias key judges the whole ledger")
+        self.assertTrue((km.jd.STATE / "union-tombs.json.hold").exists())
+        # a fresh process: future stamps clamp, and the cap holds at LOAD
+        (km.jd.STATE / "union-tombs.json.hold").unlink()
+        km._union_tombs_loaded[0] = False
+        km._union_retired_tombs.clear()
+        real_max = km._UNION_TOMBS_MAX
+        km._UNION_TOMBS_MAX = 3
+        try:
+            (km.jd.STATE / "union-tombs.json").write_text(json.dumps(
+                {"11": now + 100 * 365 * 86400, "12": now - 40, "13": now - 30,
+                 "14": now - 20, "15": now - 10}))
+            with km.jd._identity_file_lock():
+                km._union_tombs_load_locked()
+        finally:
+            km._UNION_TOMBS_MAX = real_max
+        self.assertTrue(km._union_tombs_loaded[0])
+        self.assertLessEqual(km._union_retired_tombs.get(11, 0), now + 5,
+                             "the future stamp is clamped to now")
+        self.assertEqual(len(km._union_retired_tombs), 3, "the cap holds at load")
+        self.assertNotIn(12, km._union_retired_tombs, "oldest stamps evicted first")
+        self.assertIn(11, km._union_retired_tombs, "the clamped entry is current, kept")
+
+    def test_f_an_identity_collision_never_overwrites_the_claimed_row(self):
+        # r62 P2.6, executed: beta's same-(gid,host) row overwrote alpha's durable row
+        # BEFORE beta was told to yield
+        alpha = dict(self.ROW, gid=42, name="alpha")
+        ok, unclaimed, _, _u = km._union_ops_merge([alpha], [], ckey="ws:alpha")
+        self.assertTrue(ok)
+        self.assertEqual(unclaimed, [])
+        beta = dict(self.ROW, gid=42, name="beta")
+        ok, unclaimed, _, _u = km._union_ops_merge([beta], [], ckey="ws:beta")
+        self.assertTrue(ok)
+        self.assertIn(42, unclaimed, "beta is told to yield…")
+        self.assertEqual([r["name"] for r in km._union_ops_load()], ["alpha"],
+                         "…and alpha's durable row was never overwritten")
+
+    def test_g_the_standing_refusal_check_is_name_scoped(self):
+        self.assertTrue(km._union_ops_set([dict(self.ROW)]))
+        self.assertTrue(km._union_ops_set(
+            [{"refusal": True, "gid": -801, "opId": "801", "host": "TESTHOST-A",
+              "name": "otherTag", "error": "refused", "t": int(time.time())}]))
+        ep = km._union_claim_grant(801, "ws:x")
+        ok, _, reason, _u = km._union_ops_merge(
+            [dict(self.SUCC)], [801], ckey="ws:x",
+            rekey={"ogid": 801, "gid": 802, "epoch": ep})
+        self.assertTrue(ok, "a colliding refusal for ANOTHER tag never blocks this "
+                            "completion (r62 P2.6): %s" % reason)
+
+    def test_h_future_timestamps_never_defeat_the_refusal_expiry(self):
+        # r62 P2.7, executed: a century-ahead file mtime was copied into a legacy refusal
+        p = km.jd.STATE / "union-gestures.json"
+        p.write_text(json.dumps([
+            {"refusal": True, "gid": -9, "name": "pool", "error": "x", "host": "TESTHOST-A"}]))
+        far = time.time() + 100 * 365 * 86400
+        os.utime(p, (far, far))
+        rows = km._union_ops_echo()
+        self.assertLessEqual(rows[0]["t"], time.time() + 5, "the migrated stamp clamps to now")
+        self.assertFalse(km._union_row_valid(
+            {"refusal": True, "gid": -3, "name": "pool", "t": far}),
+            "an implausibly future live t is invalid")
+
+    def test_i_the_overlay_is_finite_and_lock_safe(self):
+        # r62 P2.8, executed: a NaN durable floor made every max-merge answer False and
+        # cleared a suppression despite a newer pending floor; an unlocked iteration
+        # raised RuntimeError under a concurrent writer
+        sid = "66666666-7777-8888-9999-000000000003"
+        p = km.jd.STATE / "retry-suppressed.json"
+        p.write_text('{"%s": NaN}' % sid)
+        with km._retry_suppress_lock:
+            km._retry_suppress_pending[sid] = 300.0
+        self.assertEqual(km._retry_suppress_data().get(sid), 300.0,
+                         "the pending floor wins over a NaN durable value")
+        self.assertEqual(km.jd.canonicalize_retry_suppressed_identity({sid: float("nan")}),
+                         {}, "the canonicalizer drops non-finite stamps")
+        # the iteration is lock-safe under a racing writer
+        stop = [False]
+        errs = []
+        def writer():
+            i = 0
+            while not stop[0]:
+                with km._retry_suppress_lock:
+                    km._retry_suppress_pending["w%d" % i] = float(i)
+                    if i > 50:
+                        km._retry_suppress_pending.pop("w%d" % (i - 50), None)
+                i += 1
+        def reader():
+            try:
+                for _ in range(300):
+                    km._suppress_overlay({})
+            except RuntimeError as e:
+                errs.append(e)
+        t1 = threading.Thread(target=writer)
+        t2 = threading.Thread(target=reader)
+        t1.start(); t2.start(); t2.join(); stop[0] = True; t1.join()
+        self.assertEqual(errs, [], "no 'dictionary changed size during iteration'")

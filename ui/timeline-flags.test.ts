@@ -2292,3 +2292,27 @@ test("r61 wave 2: the gate-cancel sweep is NAME-scoped — a colliding unrelated
   assert.equal(effects.length, 1, "the gesture ran — it was never cancelled");
   delete g.__rompTimelineSetUnionOps;
 });
+
+test("r62: the reload-path refusal correlation is NAME-scoped — a colliding foreign refusal fires nothing", () => {
+  // reproduced upstream: gids mint from independent per-panel seeds; a refusal for
+  // ANOTHER tag carrying a colliding opId/rid tombstoned and rolled back OUR gesture
+  const panel = drawnPanel();
+  panel._unionOps = [{ gid: 136, ogid: 135, olin: [104, 135], rid: 100,
+                       host: "TESTHOST-A", edit: {}, inverse: {},
+                       rt: { id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool" },
+                       name: "pool", dispatched: false }];
+  const fired: any[] = [];
+  panel.tagEditFailed = (m: any) => { fired.push(m); };
+  const base = { now, sessions: [sess("s1", "web", "#f7768e")], turns: {}, messages: [],
+                 judging: [], views: JSON.parse(JSON.stringify(VIEWS)) };
+  panel.update(Object.assign({}, base, {
+    unionOps: [{ refusal: true, gid: -136, opId: "136", rid: 100,
+                 host: "TESTHOST-A", name: "otherTag", error: "refused" }] }));
+  assert.equal(fired.length, 0, "a foreign-name refusal is not ours");
+  assert.ok(!(panel._retireUnionGids && panel._retireUnionGids.has(-136)),
+    "…and it is never tombstoned by this panel");
+  panel.update(Object.assign({}, base, {
+    unionOps: [{ refusal: true, gid: -136, opId: "136", rid: 100,
+                 host: "TESTHOST-A", name: "pool", error: "refused" }] }));
+  assert.equal(fired.length, 1, "the same-name refusal still replays");
+});

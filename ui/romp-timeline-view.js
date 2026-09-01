@@ -1802,7 +1802,13 @@ class TimelinePanel {
         const op = String(r.opId || '');
         if (!op) continue;
         const ours = this._handledRefusalOps.has(op) || this._mintedGids.has(Number(op))
-          || (this._unionOps || []).some((o) => String(o.gid || 0) === op
+          || (this._unionOps || []).some((o) => (!r.name || !o.name || o.name === r.name)
+                                                //  ^ NAME-scoped (r62 P2.6): gids mint from
+                                                //    independent per-panel seeds, so a
+                                                //    colliding foreign refusal must never
+                                                //    tombstone or roll back OUR gesture; a
+                                                //    legacy nameless refusal stays a wildcard
+                                                && (String(o.gid || 0) === op
                                                 || String(o.ogid || 0) === op
                                                 || (r.rid && String(o.rid || 0) === String(r.rid))
                                                 //  ^ the STABLE root id (r61 P2.1,
@@ -1811,7 +1817,7 @@ class TimelinePanel {
                                                 //    durable refusal was never replayed
                                                 //    and no rollback ever fired)
                                                 || (Array.isArray(o.olin)
-                                                    && o.olin.some((x) => String(x) === op)));
+                                                    && o.olin.some((x) => String(x) === op))));
         if (!ours) continue;
         this._retireUnionGids.add(r.gid);
         this._unionSyncDirty = true;
