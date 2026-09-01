@@ -2264,3 +2264,31 @@ test("r61: the durable refusal replay correlates by stable rid and passes it thr
     + "retained lineage entirely");
   assert.equal(fired[0].rid, 100, "…and the reconstructed frame carries the rid");
 });
+
+test("r61 wave 2: the gate-cancel sweep is NAME-scoped — a colliding unrelated refusal cancels nothing", () => {
+  // reproduced upstream: gids mint from independent random per-panel seeds, so an
+  // UNRELATED gesture's refusal can carry a colliding opId — the bare-id sweep
+  // cancelled a live completion and the gesture silently evaporated
+  const sent: any[] = [];
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any, rekey: any) => {
+    sent.push({ entries, retired, opId, rekey });
+  };
+  const panel = drawnPanel();
+  panel._unionOps = [{ gid: 42, host: "TESTHOST-A", edit: { add: ["s1"] }, inverse: {},
+                       rt: { id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool" },
+                       name: "pool", dispatched: false, post: {} }];
+  panel._claimEpochs = { 42: 7 };
+  const effects: any[] = [];
+  panel._editRemoteTag = (rt: any, edit: any) => { effects.push(edit); return true; };
+  panel._completeUnionGesture(42);
+  assert.equal(Object.keys(panel._gatedDispatches || {}).length, 1);
+  // an UNRELATED refusal (different name) carrying the colliding opId "42"
+  panel.tagEditFailed({ host: "TESTHOST-A", name: "otherTag", opId: "42",
+                        error: "refused" });
+  assert.equal(Object.keys(panel._gatedDispatches || {}).length, 1,
+    "the live completion's gate SURVIVES the colliding foreign refusal");
+  // the ack lands and the gesture completes normally
+  panel.unionOpsAck({ ok: true, opId: sent[0].opId, unclaimed: [], unretired: [] });
+  assert.equal(effects.length, 1, "the gesture ran — it was never cancelled");
+  delete g.__rompTimelineSetUnionOps;
+});

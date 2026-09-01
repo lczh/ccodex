@@ -2545,11 +2545,20 @@ class R53VerifyRound(unittest.TestCase):
         self.assertNotIn("dispatched", [k for r in km._union_ops_load() if r.get("refusal")
                                         for k in ("dispatched",) if k in r],
                          "refusal rows are events, never flipped")
-        # a re-keyed completion row still matches through its carried original id
-        self.assertTrue(km._union_ops_set([{"host": "TESTHOST-B", "gid": 77, "ogid": 11,
-                                            "edit": {}, "inverse": {}, "rt": {},
-                                            "name": "pool", "dispatched": False}], [11]))
-        self.assertTrue(km._union_ops_mark_dispatched("11", "TESTHOST-B"))
+        # a re-keyed completion row still matches through its carried original id —
+        # a FRESH gesture completed through the GATED transaction (r61 wave 2: the
+        # plain successor+retired shape is the CAS's sibling door and refuses now; and
+        # gesture 11 above carries a standing refusal, which rightly blocks completion)
+        self.assertTrue(km._union_ops_set(
+            [{"host": "TESTHOST-B", "gid": 21, "edit": {}, "inverse": {}, "rt": {},
+              "name": "pool", "dispatched": False}]))
+        _cep = km._union_claim_grant(21, "ws:completer")
+        _sok, _, _srsn, _u5 = km._union_ops_merge(
+            [{"host": "TESTHOST-B", "gid": 77, "ogid": 21, "olin": [21],
+              "edit": {}, "inverse": {}, "rt": {}, "name": "pool", "dispatched": False}],
+            [21], ckey="ws:completer", rekey={"ogid": 21, "gid": 77, "epoch": _cep})
+        self.assertTrue(_sok, _srsn)
+        self.assertTrue(km._union_ops_mark_dispatched("21", "TESTHOST-B"))
         self.assertEqual([r.get("dispatched") for r in km._union_ops_load()
                           if r.get("gid") == 77], [True], "ogid carries the correlation")
         self.assertFalse(km._union_ops_mark_dispatched("web7", "TESTHOST-A"),
@@ -3268,7 +3277,12 @@ class R60AuditFixes(unittest.TestCase):
         with km._union_claims_lock:
             km._union_retired_tombs[801] = __import__("time").time()
             km._union_tombs_save_locked()
-        ok, _, _, _u = km._union_ops_merge([dict(self.SUCC)], [801], ckey="ws:retry")
+        # the retry rides a FRESH rekey completion (r61 wave 2: the plain form was the
+        # CAS's sibling door — the twin re-claims and re-keys after any failed commit)
+        _rep = km._union_claim_grant(801, "ws:retry")
+        ok, _, _, _u = km._union_ops_merge(
+            [dict(self.SUCC)], [801], ckey="ws:retry",
+            rekey={"ogid": 801, "gid": 802, "epoch": _rep})
         self.assertTrue(ok)
         self.assertEqual([r["gid"] for r in km._union_ops_load()], [802],
                          "the retry lands the successor and retires the original")
@@ -3785,16 +3799,20 @@ class R61AuditFixes(unittest.TestCase):
         self.assertEqual([r["gid"] for r in km._union_ops_load()], [801],
                          "the plain successor was tomb-filtered, never admitted")
         self.assertIn(802, unclaimed)
-        # …while the half-committed RETRY (tomb on the ORIGINAL, retirement carried)
-        # still lands through the retirement-coupled exemption
+        # …while the half-committed RETRY still lands — as a FRESH, fully-gated rekey
+        # completion (r61 wave 2: the plain retirement-coupled form was the CAS's
+        # sibling door; the twin re-claims and re-keys after any failed commit)
         with km._union_claims_lock:
             km._union_retired_tombs.pop(802, None)
             km._union_retired_tombs[801] = time.time()
             km._union_tombs_save_locked()
-        ok, _, _, _u = km._union_ops_merge([dict(self.SUCC)], [801], ckey="ws:retry")
+        _rep = km._union_claim_grant(801, "ws:retry")
+        ok, _, _, _u = km._union_ops_merge(
+            [dict(self.SUCC)], [801], ckey="ws:retry",
+            rekey={"ogid": 801, "gid": 802, "epoch": _rep})
         self.assertTrue(ok)
         self.assertEqual([r["gid"] for r in km._union_ops_load()], [802],
-                         "recovery through the retirement-coupled exemption (r60 P1.2)")
+                         "half-committed recovery, fully gated (r60 P1.2 + r61 wave 2)")
 
     def test_d_a_part_corrupt_tombs_map_is_judged_whole(self):
         # r61 P1.4, executed: {"801":"not-a-time"} was skipped, the rest folded, loaded
@@ -3879,3 +3897,84 @@ class R61AuditFixes(unittest.TestCase):
         km._retry_suppress_pending[sid] = 300.0
         self.assertEqual(km._retry_suppress_data().get(sid), 300.0,
                          "…and a newer overlay still lands")
+
+
+class R61Wave2(unittest.TestCase):
+    """the r61 verify round's confirmed second-order defects, kernel half: the completion
+    CAS was rekey-gated only — a PLAIN write with successor rows + retired=[original]
+    performed the whole rekey-and-retire unvetted (the round's P1); a refusal queued in
+    the retry spool was invisible to the standing-refusal arm; and rows v1.3.33 already
+    persisted t-less stayed immortal."""
+
+    ROW = {"host": "TESTHOST-A", "gid": 801, "edit": {}, "inverse": {}, "rt": {},
+           "name": "pool", "dispatched": False}
+    SUCC = {"host": "TESTHOST-A", "gid": 802, "ogid": 801, "olin": [801], "rid": 801,
+            "edit": {}, "inverse": {}, "rt": {}, "name": "pool", "dispatched": False}
+
+    def setUp(self):
+        _scrub_state()
+        km._union_claims.clear()
+        km._union_retired_tombs.clear()
+        km._union_tombs_loaded[0] = False
+        with km._pending_refusal_lock:
+            km._pending_refusal_rows[:] = []
+        for name in ("union-gestures.json", "union-gestures.json.unproved",
+                     "union-tombs.json", "union-tombs.json.hold"):
+            try:
+                (km.jd.STATE / name).unlink()
+            except OSError:
+                pass
+        for f in km.jd.STATE.glob("*.corrupt-*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_the_plain_sibling_door_is_closed(self):
+        # the round's P1, reproduced end-to-end there: with a STANDING refusal for the
+        # gesture, the rekey completion was refused — and the IDENTICAL successor rows
+        # sent as a plain write with retired=[original] returned ok:True, retiring the
+        # original and committing the successors past every gate
+        self.assertTrue(km._union_ops_set([dict(self.ROW)]))
+        self.assertTrue(km._union_ops_set(
+            [{"refusal": True, "gid": -801, "opId": "801", "host": "TESTHOST-A",
+              "name": "pool", "error": "refused", "t": int(time.time())}]))
+        ok, _, reason, _u = km._union_ops_merge([dict(self.SUCC)], [801], ckey="ws:x")
+        self.assertFalse(ok, "the plain rekey-and-retire shape is REFUSED")
+        self.assertIn("completion transaction", reason or "")
+        gids = [r["gid"] for r in km._union_ops_load() if not r.get("refusal")]
+        self.assertEqual(gids, [801], "nothing was retired, nothing committed")
+        # an ORDINARY plain retirement (no successor rows) still settles fine
+        ok, _, _, _u = km._union_ops_merge([], [801], ckey="ws:x")
+        self.assertTrue(ok, "a bare retirement is not a completion shape")
+
+    def test_b_a_spooled_refusal_blocks_the_completion_too(self):
+        # r61 wave 2: a refusal whose journal save FAILED sat in _pending_refusal_rows,
+        # invisible to the standing-refusal arm — the exact packet-after-refusal window
+        # the arm exists to close, re-opened during a disk-fault episode
+        self.assertTrue(km._union_ops_set([dict(self.ROW)]))
+        with km._pending_refusal_lock:
+            km._pending_refusal_rows.append(
+                {"refusal": True, "gid": -801, "opId": "801", "host": "TESTHOST-A",
+                 "name": "pool", "error": "refused", "t": int(time.time())})
+        ep = km._union_claim_grant(801, "ws:x")
+        ok, _, reason, _u = km._union_ops_merge(
+            [dict(self.SUCC)], [801], ckey="ws:x",
+            rekey={"ogid": 801, "gid": 802, "epoch": ep})
+        self.assertFalse(ok, "the QUEUED refusal is a standing verdict too")
+        self.assertIn("refused", reason or "")
+
+    def test_c_a_v1333_tless_refusal_row_gets_the_files_mtime(self):
+        # r61 wave 2: the r61 P2.13 fix stamped only PRESENT invalid t — rows v1.3.33
+        # had already persisted WITHOUT t stayed outside the 7d backstop forever
+        p = km.jd.STATE / "union-gestures.json"
+        p.write_text(json.dumps([
+            {"refusal": True, "gid": -9, "name": "pool", "error": "x",
+             "host": "TESTHOST-A"}]))
+        rows = km._union_ops_echo()
+        self.assertIsNotNone(rows)
+        self.assertEqual(int(rows[0].get("t")), int(p.stat().st_mtime),
+                         "the ABSENT t is stamped like the invalid one — mortal again")

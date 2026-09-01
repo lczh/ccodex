@@ -2795,7 +2795,10 @@ _seen_order = None                         # oldest -> newest, unique; eviction 
 _seen_pending_durable = set()              # in-memory-seen mids whose fsync'd append has not landed (r56 P1.9)
 _seen_appends = 0                          # additions since the last atomic compaction
 _SEEN_COMPACT_EVERY = 256                  # disk stays within CAP + this many crash-safe append records
-_seen_lock = threading.Lock()              # check + delivery + receipt publish is one idempotence claim
+_seen_lock = threading.Lock()
+_peer_seen_link_proved = [False]           # this PROCESS proved the ledger file's own
+#                                            directory entry (r61 wave 2: EXISTS is not
+#                                            PROVED, the _mkdirs_durable lesson)              # check + delivery + receipt publish is one idempotence claim
 EXCHANGE_WAIT = int(os.environ.get("ROMP_POSTAL_EXCHANGE_WAIT", "20"))
 PEER_STATE = {}                            # host -> {"presence": [...], "epoch": int, "seenAt": t, "drift": str}
 _ALIAS_LOGGED = {}                         # (host, name) -> last id logged this process: a name
@@ -2980,15 +2983,18 @@ def _peer_seen_append_durable(mid):
     global _seen_appends
     try:
         _mkdirs_durable(PEER_SEEN.parent)
-        _created = not PEER_SEEN.exists()
+        _need_link = not _peer_seen_link_proved[0] or not PEER_SEEN.exists()
         with PEER_SEEN.open("a") as f:
             f.write(mid + "\n")
             f.flush()
             os.fsync(f.fileno())
-        if _created:
+        if _need_link:
             _fsync_dir(PEER_SEEN.parent)   # the FIRST ledger's own directory entry
-            #                                (r61 P1.7: the file was synced, its link
-            #                                was not, and the ack correlated anyway)
+            #                                (r61 P1.7) — keyed on a PROCESS MEMO, not
+            #                                EXISTS (r61 wave 2: a failed link fsync left
+            #                                the file standing, and the retry saw it,
+            #                                skipped the proof, and released the ack)
+            _peer_seen_link_proved[0] = True
         _seen_appends += 1
         _seen_pending_durable.discard(mid)
         return True
@@ -3026,15 +3032,16 @@ def _peer_seen_add_locked(mid):
         seen.discard(_victim)
     try:
         _mkdirs_durable(PEER_SEEN.parent)
-        _created = not PEER_SEEN.exists()
+        _need_link = not _peer_seen_link_proved[0] or not PEER_SEEN.exists()
         with PEER_SEEN.open("a") as f:
             f.write(mid + "\n")
             f.flush()
             os.fsync(f.fileno())                    # an ack means the receipt survives a process crash
-        if _created:
+        if _need_link:
             _fsync_dir(PEER_SEEN.parent)   # the FIRST ledger's own directory entry
-            #                                (r61 P1.7: file synced, link unsynced —
-            #                                the ack correlated with a losable ledger)
+            #                                (r61 P1.7), keyed on the process memo —
+            #                                never EXISTS (r61 wave 2)
+            _peer_seen_link_proved[0] = True
         _seen_appends += 1
         _seen_pending_durable.discard(mid)
         if _seen_appends >= _SEEN_COMPACT_EVERY:
@@ -3091,10 +3098,14 @@ def _mkdirs_durable(path):
     root = STATE.parent
     chain = []
     q = p
-    while not (str(q) in _proved_dirs and q.exists()):
-        if not str(q).startswith(str(root) + os.sep):
-            break                        # out-of-tree ancestors predate romp's state
+    while (not (str(q) in _proved_dirs and q.exists())
+           and (str(q) == str(root) or str(q).startswith(str(root) + os.sep))):
         chain.append(q)
+        if str(q) == str(root):
+            break                        # the ROOT joins the chain (r61 wave 2: its own
+        #                                  link into the state home was never fsync'd —
+        #                                  the P1.7 file-synced-link-unsynced class one
+        #                                  level up); its parent is fsync'd below
         q = q.parent
     if not chain:
         if not p.exists():               # an out-of-tree caller still gets its mkdir
@@ -3130,6 +3141,7 @@ def _peer_seen_compact_locked():
     try:
         _mkdirs_durable(PEER_SEEN.parent)
         _atomic_text_put(PEER_SEEN, "".join(mid + "\n" for mid in (_seen_order or [])))
+        _peer_seen_link_proved[0] = True   # _atomic_text_put fsyncs the parent
         _seen_appends = 0
         return True
     except Exception as e:
@@ -3559,6 +3571,12 @@ def _pending_bounces_load():
         return False
     if isinstance(d, dict):
         for k, v in d.items():
+            if ".quarantined-" in str(k):
+                # a row moved aside for a colliding legitimate park (r61 wave 2) —
+                # preserved verbatim forever, never re-keyed through the legacy arm
+                _pending_bounces[str(k)] = v
+                _pending_bounces_quarantined.add(str(k))
+                continue
             if not isinstance(v, dict):
                 # PRESERVE the unreadable row under its own key (r59 P2.11: skipping it
                 # let the next park's rewrite erase it) — the flush skips non-dicts
@@ -3603,13 +3621,25 @@ def _pending_bounce_park(host, mid, code):
     answered 200 and a process death lost the bounce). The write happens UNDER the lock —
     the snapshot-then-write let a stale {A} overwrite a concurrent {A,B}."""
     with _pending_bounces_lock:
+        _k = "%s|%s" % (host, mid)
+        if _k in _pending_bounces_quarantined:
+            # a NEW legitimate park must neither overwrite the preserved garbage nor
+            # inherit its never-flushed quarantine (r61 wave 2, executed both ways: the
+            # overwrite erased the forensic row, and the stale quarantine mark then
+            # blocked the real bounce from ever settling until a restart)
+            _aside = _k + ".quarantined-" + os.urandom(4).hex()
+            _pending_bounces[_aside] = _pending_bounces.pop(_k, None)
+            _pending_bounces_quarantined.discard(_k)
+            _pending_bounces_quarantined.add(_aside)
+            _log("pending-bounces: preserved row at %r moved aside to %r for a new "
+                 "legitimate park" % (_k, _aside))
         if not _pending_bounces_load():
-            _pending_bounces["%s|%s" % (host, mid)] = {"host": str(host), "mid": str(mid),
-                                                       "code": str(code),
-                                                       "t": int(time.time())}
+            _pending_bounces[_k] = {"host": str(host), "mid": str(mid),
+                                    "code": str(code),
+                                    "t": int(time.time())}
             return False                             # in-memory only: not durable
-        _pending_bounces["%s|%s" % (host, mid)] = {"host": str(host), "mid": str(mid),
-                                                   "code": str(code), "t": int(time.time())}
+        _pending_bounces[_k] = {"host": str(host), "mid": str(mid),
+                                "code": str(code), "t": int(time.time())}
         try:
             _atomic_json_put(_pending_bounces_path(), dict(_pending_bounces))
             return True
@@ -4400,11 +4430,16 @@ def _quarantine_put(origin, m, to_id, via=""):
         # the same class delivery closed in r60; unpredictable + O_EXCL leaves nothing
         # to plant and nothing to race)
         _qfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(_qfd, "w") as _qfh:
-            _qfh.write(json.dumps(rec))
-            _qfh.flush()
-            os.fsync(_qfh.fileno())      # durable BEFORE the ack correlates (r58 P1.7)
-        tmp.rename(QUARANTINE / _qname)               # atomic publish (the kernel may be reading the dir)
+        try:
+            with os.fdopen(_qfd, "w") as _qfh:
+                _qfh.write(json.dumps(rec))
+                _qfh.flush()
+                os.fsync(_qfh.fileno())  # durable BEFORE the ack correlates (r58 P1.7)
+            tmp.rename(QUARANTINE / _qname)           # atomic publish (the kernel may be reading the dir)
+        finally:
+            tmp.unlink(missing_ok=True)  # a FAILED hold never leaks its stage (r61
+            #                              wave 2: one .tmp per failed attempt, no
+            #                              sweeper); after the rename this is ENOENT
         _fsync_dir(QUARANTINE)
         _log("quarantine: held %s from %s -> %s (directed)" % (mid, origin, rec["to"]))
         return True

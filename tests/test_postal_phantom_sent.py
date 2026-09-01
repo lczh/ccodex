@@ -2606,3 +2606,130 @@ class R61PostalAudit(unittest.TestCase):
         self.assertEqual(sentinel.read_text(), "SENTINEL",
                          "the fixed name is never touched — nothing to plant against")
         self.assertTrue((pm.QUARANTINE / _qname).exists())
+
+
+class R61Wave2Postal(unittest.TestCase):
+    """the r61 verify round's confirmed second-order defects, postal half: a new park for
+    a quarantined key erased the preserved row and inherited its never-flush mark; the
+    peer-seen link proof keyed on EXISTS, so a failed link fsync released the next ack
+    unproven; the durability walk stopped below the state root, leaving the root's own
+    link unproven on first-ever creation; and a failed quarantine hold leaked its stage."""
+
+    def setUp(self):
+        _reset()
+        pm._pending_bounces.clear()
+        pm._pending_bounces_loaded[0] = False
+        pm._pending_bounces_quarantined.clear()
+        pm._peer_seen_link_proved[0] = False
+        try:
+            pm._pending_bounces_path().unlink()
+        except OSError:
+            pass
+        try:
+            pm.PEER_SEEN.unlink()
+        except OSError:
+            pass
+        shutil.rmtree(pm.QUARANTINE, ignore_errors=True)
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_a_new_park_moves_the_preserved_row_aside_and_flushes(self):
+        # r61 wave 2, executed both ways there: the overwrite erased the forensic row,
+        # and the stale quarantine mark blocked the REAL bounce from flushing
+        _k = "HOSTQ|" + "aa" * 16
+        pm._pending_bounces_path().parent.mkdir(parents=True, exist_ok=True)
+        pm._pending_bounces_path().write_text(json.dumps(
+            {_k: {"host": "OTHER", "mid": "zz" * 16, "code": "x", "t": 1}}))   # unbound
+        with contextlib.redirect_stderr(io.StringIO()):
+            with pm._pending_bounces_lock:
+                pm._pending_bounces_load()
+        self.assertIn(_k, pm._pending_bounces_quarantined)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(pm._pending_bounce_park("HOSTQ", "aa" * 16, "code-1"))
+        d = json.loads(pm._pending_bounces_path().read_text())
+        self.assertEqual(d[_k]["code"], "code-1", "the REAL park owns its key")
+        _aside = [k for k in d if ".quarantined-" in k]
+        self.assertEqual(len(_aside), 1, "the preserved row moved aside, never erased")
+        self.assertEqual(d[_aside[0]]["mid"], "zz" * 16)
+        settled = []
+        real = pm._bounce_arrived
+        pm._bounce_arrived = lambda h, b: settled.append((h, b)) or True
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                pm._flush_pending_bounces()
+        finally:
+            pm._bounce_arrived = real
+        self.assertEqual([x[1]["mid"] for x in settled], ["aa" * 16],
+                         "the real park FLUSHES; the aside row never does")
+        # …and a restart re-quarantines the aside key without re-keying it
+        pm._pending_bounces.clear()
+        pm._pending_bounces_loaded[0] = False
+        pm._pending_bounces_quarantined.clear()
+        with contextlib.redirect_stderr(io.StringIO()):
+            with pm._pending_bounces_lock:
+                pm._pending_bounces_load()
+        self.assertIn(_aside[0], pm._pending_bounces_quarantined)
+
+    def test_b_the_peer_seen_link_proof_is_a_memo_not_exists(self):
+        # r61 wave 2: the append succeeded, the LINK fsync failed (ack rightly withheld)
+        # — and the retry saw the file existing, skipped the proof, and released the ack
+        real = pm._fsync_dir
+        calls = []
+        def boom_once(p):
+            calls.append(str(p))
+            if len([c for c in calls if c == str(pm.PEER_SEEN.parent)]) == 1:
+                raise OSError(5, "EIO")
+            return real(p)
+        pm._fsync_dir = boom_once
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertFalse(pm._peer_seen_append_durable("ac" * 16),
+                                 "the failed link fsync withholds the ack")
+            self.assertTrue(pm.PEER_SEEN.exists(), "…but the file stands (the trap)")
+            n_before = calls.count(str(pm.PEER_SEEN.parent))
+            self.assertTrue(pm._peer_seen_append_durable("ad" * 16))
+            self.assertGreater(calls.count(str(pm.PEER_SEEN.parent)), n_before,
+                               "the retry RE-PROVED the link despite the file existing")
+        finally:
+            pm._fsync_dir = real
+
+    def test_c_the_state_roots_own_link_is_proved_on_first_creation(self):
+        # r61 wave 2: the walk stopped below the root — a fresh install's whole state
+        # tree could vanish while every inner fsync succeeded
+        seen = []
+        real = pm._fsync_dir
+        def spy(p):
+            seen.append(str(p))
+            return real(p)
+        root = pm.STATE.parent
+        pm._proved_dirs.discard(str(root))
+        pm._proved_dirs.discard(str(pm.STATE))
+        shutil.rmtree(pm.STATE / "root-probe", ignore_errors=True)
+        pm._fsync_dir = spy
+        try:
+            pm._mkdirs_durable(pm.STATE / "root-probe")
+        finally:
+            pm._fsync_dir = real
+            shutil.rmtree(pm.STATE / "root-probe", ignore_errors=True)
+        self.assertIn(str(root), seen, "the state root itself is in the chain")
+        self.assertIn(str(root.parent), seen,
+                      "…and its own link into the state home is fsync'd")
+
+    def test_d_a_failed_quarantine_hold_leaks_no_stage(self):
+        pm.QUARANTINE.mkdir(parents=True, exist_ok=True)
+        real = pm._fsync_dir
+        def boom(p):
+            raise OSError(5, "EIO")
+        pm._fsync_dir = boom              # the publish-side fsync fails after the rename
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                ok = pm._quarantine_put("hostA", {"mid": "qz" * 16, "to": "web",
+                                                  "frm": "api", "frm_id": "",
+                                                  "body": "b"}, SID)
+        finally:
+            pm._fsync_dir = real
+        self.assertFalse(ok)
+        self.assertEqual([f.name for f in pm.QUARANTINE.glob("*.tmp*")], [],
+                         "no stage survives a failed hold (r61 wave 2: one leaked .tmp "
+                         "per failed attempt, unbounded)")

@@ -2981,6 +2981,10 @@ class TimelinePanel {
     for (const k of Object.keys(this._gatedDispatches || {})) {
       const _gk = (this._gatedDispatches[k] || {}).gates || [];
       const _hitG = _gk.filter((g1) => g1.rekey
+        // NAME-scoped (r61 wave 2, reproduced: gids mint from independent random
+        // per-panel seeds, so an UNRELATED gesture's refusal can carry a colliding
+        // opId — the bare-id sweep cancelled a live completion and silently lost it)
+        && (!m.name || !g1.name || g1.name === m.name)
         && (gids.has(g1.rekey.gid) || gids.has(g1.rekey.ogid)
             || (m.opId && (String(g1.rekey.ogid) === String(m.opId)
                            || String(g1.rekey.gid) === String(m.opId)))));

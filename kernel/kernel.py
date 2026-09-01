@@ -2792,12 +2792,14 @@ def _union_store_read_locked(what="union-gestures"):
                     out[k] = json.dumps(base[k], default=str)
                 except (TypeError, ValueError):
                     out[k] = str(base[k])
-        if "t" in base and (isinstance(base.get("t"), bool)
-                            or not isinstance(base.get("t"), (int, float))):
+        if ("t" not in base or isinstance(base.get("t"), bool)
+                or not isinstance(base.get("t"), (int, float))):
             out = out if out is not None else dict(r)
             out["t"] = _fmtime           # the FILE's own stamp, never a deletion (r61
             #                              P2.2: a t-less refusal row was outside the 7d
-            #                              staleness backstop — immortal once persisted)
+            #                              staleness backstop — immortal once persisted;
+            #                              r61 wave 2: rows v1.3.33 ALREADY persisted
+            #                              t-less get the same stamp on read)
         return out if out is not None else r
     rows = [_coerce_legacy_refusal(r) for r in rows]
     bad = any(not _union_row_valid(r) for r in rows)   # NON-DICTS judged too (r58 P1.6:
@@ -3063,12 +3065,17 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             _olineage = {_ogid, (_orow.get("ogid") or 0)} | set(_orow.get("olin") or [])
             _olineage.discard(0)
             _olins = {str(x) for x in _olineage}
+            with _pending_refusal_lock:
+                _pend_ref = [r for r in _pending_refusal_rows if isinstance(r, dict)]
+            #   ^ a refusal whose journal save FAILED is still a standing verdict (r61
+            #     wave 2: the queued row was invisible to this check, re-opening the
+            #     exact packet-after-refusal window the arm exists to close)
             if any(r.get("refusal")
                    and ((isinstance(r.get("gid"), int) and not isinstance(r.get("gid"), bool)
                          and -r.get("gid") in _olineage)
                         or (r.get("opId") or "") in _olins
                         or (_orid and r.get("rid") == _orid))
-                   for r in cur):
+                   for r in list(cur) + _pend_ref):
                 # a JOURNALED refusal for this gesture STANDS (r61 P1.1, reproduced
                 # through the real bridge: a completion packet captured BEFORE the
                 # refusal was transmitted after it — the CAS passed and the acked gate
@@ -3135,6 +3142,24 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             # a rekey without the retirement left original and successor both standing —
             # two independently claimable identities for one gesture, double-run ready)
             return False, [], "the completion must retire the original", []
+        if not _rekey_gid:
+            _resident_pre = {r.get("gid") for r in cur if not r.get("refusal")}
+            for r in inc:
+                if (not r.get("refusal") and r.get("gid") not in _resident_pre
+                        and any(a in ret and a in _resident_pre
+                                for a in ([r.get("ogid") or 0]
+                                          + list(r.get("olin") or [])))):
+                    # the PLAIN sibling door of the completion CAS (r61 wave 2, the
+                    # round's P1, reproduced end-to-end: a plain write carrying the
+                    # successor rows plus retired=[original] performed the whole
+                    # rekey-and-retire with NO claim, epoch, refusal, host-set, or
+                    # lineage check — the exact packet shape the rekey path refuses
+                    # rode through unvetted, past a STANDING refusal). A new row that
+                    # descends from a resident ancestor retired in the same write IS a
+                    # completion; it must ride the completion transaction.
+                    return False, [], "a successor of a retiring gesture must ride " \
+                                      "its completion transaction — re-claim and " \
+                                      "retry", []
         _unretired = []
         if ret:
             with _union_claims_lock:
@@ -3165,20 +3190,18 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             _tombed = []
             for r in inc:
                 if (r.get("refusal") or r.get("gid") in _resident
-                        or (r.get("gid") not in _union_retired_tombs
-                            and any(a in ret for a in
-                                    ([r.get("ogid") or 0] + list(r.get("olin") or []))
-                                    if a in _resident))):
-                    # the ancestor exemption applies only while the row's OWN gid is
-                    # untombed (r60 wave 2: gids mint from a random 30-bit seed, so a
-                    # RETIRED successor's replay could name an ogid that collides with
-                    # an unrelated live gid — resident ancestry must never resurrect a
-                    # row the shield has personally retired) — AND only when this same
-                    # write RETIRES that resident ancestor (r61 P1.3, executed: a plain
-                    # unclaimed merge inserted a "successor" beside its living original
-                    # through bare residency — no rekey, no claim, no retirement — and
-                    # both stood independently claimable). The half-committed retry
-                    # carries retired=[ancestor], so recovery still lands (r60 P1.2).
+                        or (_rekey_gid and r.get("gid") == _rekey_gid
+                            and r.get("gid") not in _union_retired_tombs)):
+                    # the successor exemption belongs to THIS write's VALIDATED
+                    # completion alone (r61 wave 2: the retirement-coupled plain form
+                    # was the CAS's sibling door — a plain write with successor rows +
+                    # retired=[ancestor] performed the whole rekey-and-retire with no
+                    # gate at all; and bare residency before it admitted unclaimed
+                    # successors, r61 P1.3). Untombed only (r60 wave 2: a RETIRED
+                    # successor's replay must never resurrect through a colliding
+                    # ancestor). Half-committed recovery rides a FRESH rekey completion
+                    # — the twin re-claims and re-keys after any failed commit, so the
+                    # r60 P1.2 retry still lands, fully gated.
                     # a RESIDENT gesture's own update is never tombstone-dropped (the r56
                     # audit's P1.1, executed there: the committed successor's dispatched:true
                     # flip carries the tombstoned ogid — dropping it deleted the healthy
