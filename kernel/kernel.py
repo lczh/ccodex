@@ -2245,6 +2245,10 @@ def _union_tombs_load_locked():
         return
     try:
         d = json.loads(_union_tombs_path().read_text())
+        if not isinstance(d, dict):
+            sys.stderr.write("union-tombs: wrong-shaped ledger — holding (never loaded as "
+                             "empty; r59 P1.3)\n")
+            return
         if isinstance(d, dict):
             _floor = time.time() - 7 * 86400   # the refusal rows' staleness precedent
             #  (r58 wave 2: gids mint from a random 30-bit per-load seed, so an
@@ -2271,13 +2275,15 @@ def _union_tombs_save_locked():
     if not _union_tombs_loaded[0]:
         sys.stderr.write("union-tombs: durable copy not yet folded in — holding the save "
                          "so a load fault can never truncate the ledger\n")
-        return
+        return False
     try:
         _atomic_write(_union_tombs_path(),
                       json.dumps({str(k): v for k, v in _union_retired_tombs.items()}))
+        return True
     except Exception:
         sys.stderr.write("union-tombs: could not persist — retired-gesture shields are "
                          "process-local until the next successful save\n")
+        return False
 
 
 def _union_claim_stamp(gid, ckey):
@@ -2303,10 +2309,10 @@ def _union_claim_grant(gid, ckey, _rows=None):
     """Epoch when `ckey` holds gid's claim after this call, else None. The journal-row
     precondition (an extant, undispatched, non-refusal row) is checked under the identity
     lock unless the caller passes the rows it already read under it (r55 P1.4)."""
-    try:
-        gid = int(gid)
-    except (TypeError, ValueError, OverflowError):
-        return None                                  # inf rode json.loads (r57 wave 2)
+    if not (isinstance(gid, int) and not isinstance(gid, bool)):
+        # a REAL integer only (r59 P1.5, reproduced: claim id 1.9 passed through int() and
+        # claimed gid 1 — a neighbor the caller never named; inf rode json.loads in r57)
+        return None
     if gid <= 0 or gid > 2 ** 53 - 1 or not ckey:
         return None                                  # r58 P2.19: 2**53 itself was let in
     def _pending(rows):
@@ -2320,7 +2326,7 @@ def _union_claim_grant(gid, ckey, _rows=None):
         # _read_state_json, whose malformed arm quarantined WITH UNLINK and armed no
         # marker — one client claim against a corrupt store left ENOENT that the next
         # read answered as proved-empty, the exact P1.1 fail-open the round closed)
-        if rows is None:
+        if rows is None or _rstate != "proved":
             return None                # unproved/unreadable: no proof, no claim
         if not _pending(rows):
             return None                # settled/absent: nothing to complete (r55 P1.4)
@@ -2429,10 +2435,18 @@ def _quarantine_state_bytes(path, what, fingerprint=None, keep_source=False):
                     path.rename(qp)
                     # VERIFY the moved inode is the judged one (r58 P2.13: a concurrent
                     # writer's replacement landing between the check and the rename was
-                    # renamed instead) — an innocent grab goes straight back
+                    # renamed instead) — an innocent grab goes back EXCLUSIVELY (r59 P2.5,
+                    # reproduced: os.replace clobbered yet another writer's newer commit —
+                    # link fails EEXIST instead, and the newer commit wins)
                     _st4 = os.stat(str(qp))
                     if (_st4.st_dev, _st4.st_ino) != (_qst.st_dev, _qst.st_ino):
-                        os.replace(str(qp), str(path))
+                        try:
+                            os.link(str(qp), str(path))
+                            os.unlink(str(qp))
+                        except FileExistsError:
+                            os.unlink(str(qp))       # a newer valid commit stands — keep it
+                        except OSError:
+                            os.replace(str(qp), str(path))   # no links here: best effort
                         return
                 except OSError as e2:
                     _qerr = e2
@@ -2472,14 +2486,17 @@ def _quarantine_wrong_shape(path, what, is_expected):
         fp = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
         cur = json.loads(path.read_text())
     except FileNotFoundError:
-        return
+        return True                                  # consumed concurrently: nothing stands
     except OSError:
-        return                                       # no proof — judge nothing this pass
+        return False                                 # NO PROOF (r59 P2.2: this arm read as
+        #                                              "judged clean" and the caller then
+        #                                              defaulted-and-overwrote the source)
     except ValueError:
         cur = None                                   # malformed counts as wrong-shape here
     if is_expected(cur):
-        return                                       # a concurrent writer fixed it — keep it
+        return True                                  # a concurrent writer fixed it — keep it
     _quarantine_state_bytes(path, what, fingerprint=fp)
+    return True
 
 
 def _read_state_json(path, what):
@@ -2587,8 +2604,11 @@ def _union_store_read_locked(what="union-gestures"):
     #                                the isinstance pre-filter acked a mixed journal
     #                                while silently dropping its invalid rows)
     if bad:
-        # row-poison: SALVAGE (r57 wave 2), copy-first (r58 P1.2) — the poisoned file
-        # stands until the very rename that publishes the valid rows
+        # row-poison: SALVAGE the valid subset onto the store, copy-first (r58 P1.2) —
+        # but the store stays UNPROVED under the marker until a live panel reconstructs
+        # over this base (r59 P1.2, reproduced: an all-invalid journal salvaged to [] and
+        # cleared the marker — panels read the authoritative empty and deleted their live
+        # mirrors; a mixed journal likewise declared its dropped groups retired)
         _valid = [r for r in rows if _union_row_valid(r)]
         try:
             st = p.stat()
@@ -2596,8 +2616,15 @@ def _union_store_read_locked(what="union-gestures"):
                                     fingerprint=(st.st_dev, st.st_ino, st.st_size,
                                                  st.st_mtime_ns), keep_source=True)
         except OSError:
-            pass
+            # the forensic copy did NOT land (r59 P2.4): re-minting now would overwrite
+            # the only copy of the poisoned bytes — hold instead
+            try:
+                _atomic_write(marker, "1")
+            except OSError:
+                pass
+            return None, "unproved"
         try:
+            _atomic_write(marker, "1")   # the marker outlives the salvage (r59 P1.2)
             _atomic_write(p, json.dumps(_valid, allow_nan=False))
         except (OSError, ValueError):
             try:
@@ -2606,17 +2633,13 @@ def _union_store_read_locked(what="union-gestures"):
                 pass
             return None, "unproved"
         sys.stderr.write("union-gestures: invalid stored row(s) quarantined aside; "
-                         "%d valid row(s) salvaged\n" % len(_valid))
-        try:
-            marker.unlink()
-        except OSError:
-            pass
+                         "%d valid row(s) salvaged as the UNPROVED reconstruction base\n"
+                         % len(_valid))
         return _valid, "salvaged"
     if marker.exists():
-        try:
-            marker.unlink()              # a proven read retires a stale marker
-        except OSError:
-            pass
+        # a valid store UNDER the marker is a salvaged base awaiting reconstruction —
+        # only the merge's evidence-carrying commit clears the marker (r59 P1.2)
+        return rows, "salvaged"
     return rows, "proved"
 
 
@@ -2633,7 +2656,7 @@ def _union_ops_echo():
     # fresh VALID commit was deleted and the next echo answered authoritative-empty)
     with jd._identity_file_lock():
         rows, _state = _union_store_read_locked()
-        return list(rows) if rows is not None else None
+        return list(rows) if (rows is not None and _state == "proved") else None
 
 
 def _union_row_valid(r):
@@ -2669,7 +2692,11 @@ def _union_row_valid(r):
     if "rid" in r and r.get("rid") not in (None, 0) and not _safe_int(r.get("rid"), 1, _MAX):
         return False
     if r.get("refusal"):
-        return _safe_int(r.get("gid"), -_MAX, -1) or _safe_int(r.get("gid"), 1, _MAX)
+        if not (_safe_int(r.get("gid"), -_MAX, -1) or _safe_int(r.get("gid"), 1, _MAX)):
+            return False
+        # the refusal branch used to SHORT-CIRCUIT every deeper check (r59 P2.3: a refusal
+        # row carrying Infinity/NaN rode the wire and poisoned the whole browser frame)
+        return _finite({k: v for k, v in r.items() if k != "gid"})
     if not _safe_int(r.get("gid"), 1, _MAX):
         return False
     if "ogid" in r and r.get("ogid") not in (None, 0) and not _safe_int(r.get("ogid"), 1, _MAX):
@@ -2717,6 +2744,11 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
         _union_tombs_load_locked()
         cur, _rstate = _union_store_read_locked()
         _reconstructing = False
+        if _rstate == "salvaged":
+            # the salvaged base persists through reconstruction (r59 P1.2: rebuilding from
+            # cur=[] dropped every group whose owner had not yet synced) — the marker still
+            # clears only on an evidence-carrying commit
+            _reconstructing = True
         if cur is None:
             if _rstate == "unreadable":
                 # the v1.3.24 audit's P1.1: EIO used to read as an EMPTY journal — the
@@ -2735,7 +2767,12 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                 return False, [], "the journal is held for reconstruction — retry", []
             cur = []
             _reconstructing = True
-        inc = [r for r in (entries if isinstance(entries, list) else []) if isinstance(r, dict)]
+        if isinstance(entries, list) and any(not isinstance(r, dict) for r in entries):
+            # REJECT, never silently drop (r59 P1.5, reproduced: [validRow, "invalid"] was
+            # acked after quietly losing the string — the journal then lacked a row its
+            # sender believed durable)
+            return False, [], "malformed entry (every entry must be an object)", []
+        inc = list(entries) if isinstance(entries, list) else []
         if any(not _union_row_valid(r) for r in inc):
             # REJECT the whole write (the r56 audit's P1.5): one gid:[] row wedged every
             # later merge; one 1e309 rode the wire as Infinity and the browser refused the
@@ -2774,10 +2811,12 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                for r in inc]
         ret = set()
         for g in (retired if isinstance(retired, list) else []):
-            try:
-                ret.add(int(g))
-            except (TypeError, ValueError, OverflowError):
-                pass
+            if not (isinstance(g, int) and not isinstance(g, bool)
+                    and 0 < g <= 2 ** 53 - 1):
+                # REJECT the write (r59 P1.5, reproduced: retirement id 1.9 passed through
+                # int() and deleted gid 1 — a NEIGHBOR the sender never named)
+                return False, [], "malformed retirement (ids must be integers)", []
+            ret.add(g)
         _unretired = []
         if ret:
             with _union_claims_lock:
@@ -2826,11 +2865,11 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             if _tombed:
                 inc = [r for r in inc if r.get("gid") not in _tombed]
         rows += [r for r in inc if r.get("gid") not in ret]
-        if _reconstructing and not any(not r.get("refusal") for r in rows):
-            # NOTHING survived the filters (r58 wave 2, reproduced twice: a stale replay
-            # carrying only tombstoned gids, and a lone refusal row journaled during the
-            # hold, each cleared the marker and minted a (near-)empty store from evidence
-            # that reconstructs nothing). The hold stands; the write is refused retryable.
+        if _reconstructing and not any(isinstance(r, dict) and not r.get("refusal")
+                                       for r in inc):
+            # no LIVE-PANEL evidence survived the filters (r58 wave 2, reproduced twice; a
+            # salvaged base alone is kernel bookkeeping, not a vouching mirror — r59 P1.2).
+            # The hold stands; the write is refused retryable.
             return False, [], "the journal is held for reconstruction — retry", []
         if len(rows) > _UNION_OPS_MAX:
             sys.stderr.write("union-gestures: %d rows exceed the %d high-water mark — "
@@ -2856,9 +2895,13 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                 _union_retired_tombs[g] = time.time()
             while len(_union_retired_tombs) > _UNION_TOMBS_MAX:
                 _union_retired_tombs.pop(next(iter(_union_retired_tombs)))
-            _union_tombs_save_locked()   # DURABLE (r58 P2.14: process-local tombstones let
-            #                              retired gestures resurrect through a stale
-            #                              panel's replay after a kernel restart)
+            _tombs_durable = _union_tombs_save_locked() if ret else True
+        if ret and not _tombs_durable:
+            # the rows are gone from the journal (idempotent on the retry) but the SHIELD
+            # is not durable (r59 P1.3, reproduced: an injected ENOSPC still acked, and a
+            # modeled restart let a stale replay resurrect and reclaim the retired
+            # gesture) — refuse retryable; the twin re-sends and the save retries
+            return False, [], "the retirement's tombstone could not be persisted — retry", []
         # the implicit writer claims decide against the rows JUST written, under the same
         # lock pass (r55 P1.4) — never a separate read the world can move between
         unclaimed = _union_claim_entries(inc, ckey, _rows=rows) if ckey else []
@@ -2866,6 +2909,28 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             if g not in unclaimed:
                 unclaimed.append(g)              # tombstoned: the replaying gate must yield
         return True, unclaimed, None, _unretired
+
+
+def _union_rid_for(op_id):
+    """The stable root id of the journal row op_id names (gid/ogid/olin/rid — any
+    generation), or 0. Rides tagEditFailed frames (r59 P2.1: a refusal naming an
+    intermediate generation fell outside the 32-entry lineage after enough takeovers and
+    was never compensated — the ROOT id survives every re-key)."""
+    try:
+        g = int(op_id)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if g <= 0:
+        return 0
+    with jd._identity_file_lock():
+        rows, _st = _union_store_read_locked()
+    for r in rows or []:
+        if r.get("refusal"):
+            continue
+        if (r.get("gid") == g or r.get("ogid") == g or g in (r.get("olin") or [])
+                or r.get("rid") == g):
+            return r.get("rid") or 0
+    return 0
 
 
 def _union_ops_mark_dispatched(gid, host):
@@ -2890,7 +2955,7 @@ def _union_ops_mark_dispatched(gid, host):
         return False                     # past the JS safe-integer domain (r58 P2.19)
     with jd._identity_file_lock():
         rows, _rstate = _union_store_read_locked()
-        if rows is None:
+        if rows is None or _rstate != "proved":
             return False                 # unreadable or held-for-reconstruction: no flip —
             #                              the client-side flip remains the writer
         hit = False
@@ -4233,7 +4298,10 @@ def _proved_ledger_read(path, what, default):
     wrong-shape valid bytes quarantine aside."""
     raw = _read_state_json(path, what)
     if raw is not None and raw is not _QUARANTINED and not isinstance(raw, dict):
-        _quarantine_wrong_shape(path, what, lambda v: isinstance(v, dict))
+        if _quarantine_wrong_shape(path, what, lambda v: isinstance(v, dict)) is False:
+            # the re-judgment could not read the file (r59 P2.2, reproduced: this path
+            # returned the default and _set_push_sub overwrote the unproved source)
+            raise _StateUnreadable("%s: wrong-shaped and unjudgeable — refusing" % what)
         raw = _QUARANTINED
     return dict(raw) if isinstance(raw, dict) else dict(default)
 
@@ -6348,25 +6416,38 @@ def _auto_resume_retry(now, tmux):
 # how an interrupt already suppresses auto-NUDGE (_interrupt_suppresses_nudge). State:
 # STATE/retry-suppressed.json {sid: stop_ts}. A sid present = suppressed; stop_ts is the re-arm floor (only a
 # successful turn AFTER it lifts the suppression). _auto_resume_session_retry clears re-armed sids each tick.
-_retry_suppress_cache = {}   # str(path) -> ((mtime_ns,size), dict)
+_retry_suppress_cache = {}   # str(path) -> ((dev,ino,mtime_ns,size), dict)
+_retry_suppress_pending = {}   # sid -> t: suppressions minted while the store was
+#                                unreadable (r59 P1.4) — consulted by the membership read
+#                                and folded into the next successful RMW, so an interrupt
+#                                always lands and a fault never erases siblings
 
 
 def _retry_suppress_data():
     p = jd.STATE / "retry-suppressed.json"
     try:
         stt = p.stat()
-        key = (stt.st_mtime_ns, stt.st_size)
-    except OSError:
+        key = (stt.st_dev, stt.st_ino, stt.st_mtime_ns, stt.st_size)
+    except FileNotFoundError:
         return {}
+    except OSError:
+        hit = _retry_suppress_cache.get(str(p))
+        return hit[1] if hit else {}                 # LKG, never a cached fabrication
     hit = _retry_suppress_cache.get(str(p))
     if hit and hit[0] == key:
         return hit[1]
     try:
         d = jd.canonicalize_retry_suppressed_identity(json.loads(p.read_text()))
         if not isinstance(d, dict):
-            d = {}
+            raise ValueError("retry-suppressed is not a dict")   # wrong shape = fault
+    except FileNotFoundError:
+        return {}
     except Exception:
-        d = {}
+        # a fault serves the last-known-good copy and CACHES NOTHING (r59 P1.4,
+        # reproduced: the fabricated {} was cached under the real generation — standing
+        # suppressions read as gone, and the next arm erased the siblings durably)
+        hit = _retry_suppress_cache.get(str(p))
+        return hit[1] if hit else {}
     _retry_suppress_cache[str(p)] = (key, d)
     return d
 
@@ -6375,7 +6456,7 @@ def _session_retry_suppressed(sid):
     """True while auto-retry is suppressed for this ONE session (the user interrupted its retry/API-error
     storm and hasn't landed a successful turn since). Cheap membership read — the re-arm/clear lives in
     _auto_resume_session_retry; the apiRetry gate + the chat status flag both read this."""
-    return str(sid) in _retry_suppress_data()
+    return str(sid) in _retry_suppress_data() or str(sid) in _retry_suppress_pending
 
 
 def _suppress_session_retry(sid):
@@ -6385,13 +6466,22 @@ def _suppress_session_retry(sid):
         sid = jd.canonicalize_session_identity(str(sid))
         p = jd.STATE / "retry-suppressed.json"
         try:
-            d = jd.canonicalize_retry_suppressed_identity(json.loads(p.read_text()))
+            d = jd.canonicalize_retry_suppressed_identity(
+                _proved_ledger_read(p, "retry-suppressed", {}))
             if not isinstance(d, dict):
                 d = {}
-        except Exception:
-            d = {}
+        except _StateUnreadable:
+            # the store is unreadable: the suppression LANDS in memory (the storm stays
+            # dead) and folds into the next successful RMW — never a fabricated {} written
+            # over standing siblings (r59 P1.4, reproduced: arming s3 persisted ONLY s3)
+            _retry_suppress_pending[sid] = time.time()
+            sys.stderr.write("retry-suppressed: store unreadable — suppression for %s "
+                             "held in memory until it reads again\n" % sid)
+            return
+        d.update(_retry_suppress_pending)
         d[sid] = time.time()
         _atomic_write(p, json.dumps(d, sort_keys=True))
+        _retry_suppress_pending.clear()
         _retry_suppress_cache.clear()
 
 
@@ -6400,12 +6490,22 @@ def _clear_session_retry_suppress(sid):
         sid = jd.canonicalize_session_identity(str(sid))
         p = jd.STATE / "retry-suppressed.json"
         try:
-            d = jd.canonicalize_retry_suppressed_identity(json.loads(p.read_text()))
+            d = jd.canonicalize_retry_suppressed_identity(
+                _proved_ledger_read(p, "retry-suppressed", {}))
             if not isinstance(d, dict):
                 d = {}
-        except Exception:
-            d = {}
-        if d.pop(sid, None) is not None:
+        except _StateUnreadable:
+            # an unpersistable clear only drops the memory overlay: the durable suppression
+            # STANDS until the store reads again — suppressed is the safe direction (r59
+            # P1.4: the fabricated-{} write erased every sibling suppression)
+            _retry_suppress_pending.pop(sid, None)
+            sys.stderr.write("retry-suppressed: store unreadable — the durable clear for "
+                             "%s waits until it reads again\n" % sid)
+            return False
+        d.update(_retry_suppress_pending)
+        _had = d.pop(sid, None) is not None or sid in _retry_suppress_pending
+        _retry_suppress_pending.pop(sid, None)
+        if _had:
             _atomic_write(p, json.dumps(d, sort_keys=True))
             _retry_suppress_cache.clear()
             return True
@@ -29567,7 +29667,12 @@ if(window.__rompFed){window.__rompFed.inbound("",msg);}else{window.dispatchEvent
 // kernel restart), + RETRY (don't blind-reload — on a real outage the reload just fails into a dead page).
 ws.onclose=function(){netState("down");try{window.dispatchEvent(new Event("romp:wsdown"));}catch(e){}setTimeout(connect,1500);};
 ws.onerror=function(){try{ws.close();}catch(e){}};}
-function send(m){var s=JSON.stringify(m);if(ws&&ws.readyState===1)ws.send(s);else queue.push(s);}
+function send(m){var s=JSON.stringify(m);if(ws&&ws.readyState===1)ws.send(s);
+else if(m&&(m.type==="setUnionOps"||m.type==="claimUnionGesture")){/* DROP, never queue (r59
+P1.1, reproduced: a stale serialized body flushed on reconnect BEFORE the panel's
+unionTransportReset and forked one gesture into two claimable identities). The panel's own
+reset machinery re-sends CURRENT state; claims are socket-scoped by design. */}
+else queue.push(s);}
 window.__rompLocalSend=send;window.__rompApp=APP;   // federation.ts (the multi-kernel manager) routes local sends + knows the app through these
 var SK="romp-vscode-state-%s";   // persist webview state to localStorage so UI prefs survive a refresh
 window.acquireVsCodeApi=function(){return{postMessage:function(m){if(window.__rompFed){window.__rompFed.outbound(m);}else{send(m);}},
@@ -34919,8 +35024,13 @@ class Handler(BaseHTTPRequestHandler):
                 ans, err = _forward_tag_edit(host, body)
                 if err or not (ans or {}).get("ok", False):
                     _rmsg = err or (ans or {}).get("error") or "refused"
+                    try:
+                        _rrid = _union_rid_for(op_id)
+                    except Exception:
+                        _rrid = 0
                     _send_to_view("timeline", {"type": "tagEditFailed", "host": host, "name": nm,
                                                **({"opId": op_id} if op_id else {}),
+                                               **({"rid": _rrid} if _rrid else {}),
                                                "error": _rmsg},
                                   (client or {}).get("wid") or "")
                     # the refusal is journaled beside the gestures (the r50 verification: the

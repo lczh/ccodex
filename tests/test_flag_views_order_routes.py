@@ -557,8 +557,19 @@ class R58AuditFixes(unittest.TestCase):
         self.assertEqual(km._union_ops_path().read_text(), poisoned,
                          "the judged bytes STAND at the path — never an ENOENT window")
         with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual([r["gid"] for r in km._union_ops_echo()], [7],
-                             "…and the healed write completes the salvage")
+            self.assertIsNone(km._union_ops_echo(),
+                              "the healed salvage is an UNPROVED base (r59 P1.2) — echoes "
+                              "hold until a live panel reconstructs over it")
+        self.assertEqual([r["gid"] for r in json.loads(km._union_ops_path().read_text())],
+                         [7], "…the valid rows re-minted as that base")
+        self.assertTrue(km._union_unproved_marker().exists())
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok, _, _, _u = km._union_ops_merge(
+                [{"host": "TESTHOST-B", "gid": 7, "edit": {}, "inverse": {}, "rt": {},
+                  "name": "pool", "dispatched": False}], [], ckey="ws:x")
+        self.assertTrue(ok)
+        self.assertEqual([r["gid"] for r in km._union_ops_echo()], [7],
+                         "…and the mirror-vouched reconstruction proves it")
 
     def test_b_non_dict_rows_are_judged_not_silently_dropped(self):
         # r58 P1.6: the isinstance pre-filter acked a mixed journal while silently dropping
@@ -568,9 +579,12 @@ class R58AuditFixes(unittest.TestCase):
                  '"name": "pool", "dispatched": false}')
         km._union_ops_path().write_text('[123, %s]' % _good)
         with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual([r["gid"] for r in km._union_ops_echo()], [7])
+            self.assertIsNone(km._union_ops_echo(),
+                              "a mixed journal is UNPROVED (r59 P1.2): a partial view "
+                              "declared the dropped groups retired")
         self.assertEqual(len(list(km.jd.STATE.glob("union-gestures.json.corrupt-*"))), 1,
                          "the mixed journal was JUDGED (bytes aside), not silently filtered")
+        self.assertTrue(km._union_unproved_marker().exists())
 
     def test_c_nested_infinity_is_rejected_at_the_gate(self):
         # r58 P1.6: a nested non-finite passed the top-level checks and either raised at
@@ -713,8 +727,10 @@ class R58AuditFixes(unittest.TestCase):
         try:
             self.assertTrue(km._union_ops_set([dict(self.ROW, gid=920)]))
             with contextlib.redirect_stderr(io.StringIO()):
-                ok, _, _, _u = km._union_ops_merge([], [920], ckey="ws:x")
-            self.assertTrue(ok)
+                ok, _, reason, _u = km._union_ops_merge([], [920], ckey="ws:x")
+            self.assertFalse(ok, "r59 P1.3: a retirement whose SHIELD cannot persist is "
+                                 "refused retryable, never acked")
+            self.assertIn("tombstone", reason or "")
         finally:
             os.chmod(km.jd.STATE / "union-tombs.json", 0o644)
         self.assertIn("777", json.loads((km.jd.STATE / "union-tombs.json").read_text()),
@@ -754,6 +770,95 @@ class R58AuditFixes(unittest.TestCase):
             km._union_tombs_load_locked()
         self.assertNotIn(801, km._union_retired_tombs, "the stale shield expired")
         self.assertIn(802, km._union_retired_tombs, "the fresh one stands")
+
+
+
+
+class R59AuditFixes(unittest.TestCase):
+    """the v1.3.31 audit, kernel half (9 P1 / 13 P2 against 4fb688fe): coercive wire
+    identities claimed/retired NEIGHBORS (P1.5), the suppression ledger failed open and
+    erased siblings (P1.4), refusal rows short-circuited the finite checks (P2.3), and
+    refusal correlation died past the lineage cap (P2.1)."""
+
+    ROW = {"host": "TESTHOST-A", "gid": 7, "edit": {}, "inverse": {}, "rt": {},
+           "name": "pool", "dispatched": False}
+
+    def setUp(self):
+        _scrub_state()
+        km._union_claims.clear()
+        km._union_retired_tombs.clear()
+        km._union_tombs_loaded[0] = False
+        km._retry_suppress_cache.clear()
+        km._retry_suppress_pending.clear()
+        for name in ("union-gestures.json", "union-gestures.json.unproved",
+                     "union-tombs.json", "retry-suppressed.json"):
+            try:
+                (km.jd.STATE / name).unlink()
+            except OSError:
+                pass
+        for f in km.jd.STATE.glob("*.corrupt-*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_float_identities_never_touch_neighbors(self):
+        # r59 P1.5, reproduced there: retirement id 1.9 deleted gid 1, claim id 1.9
+        # claimed gid 1 — int() coercion named a NEIGHBOR the sender never meant
+        self.assertTrue(km._union_ops_set([dict(self.ROW, gid=1)]))
+        self.assertIsNone(km._union_claim_grant(1.9, "cid:x"))
+        ok, _, reason, _u = km._union_ops_merge([], [1.9], ckey="ws:x")
+        self.assertFalse(ok, "a float retirement rejects the WHOLE write")
+        self.assertIn("malformed", reason or "")
+        self.assertEqual([r["gid"] for r in km._union_ops_load()], [1],
+                         "gid 1 was never touched")
+
+    def test_b_refusal_rows_validate_their_payloads(self):
+        # r59 P2.3: the refusal branch short-circuited the finite checks — Infinity/NaN in
+        # a refusal payload poisoned the whole browser frame
+        self.assertTrue(km._union_row_valid(
+            {"refusal": True, "gid": -3, "name": "pool", "t": 5}))
+        self.assertFalse(km._union_row_valid(
+            {"refusal": True, "gid": -3, "name": "pool", "why": {"x": float("inf")}}))
+        self.assertFalse(km._union_row_valid(
+            {"refusal": True, "gid": -3, "t": float("nan")}))
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_c_suppression_lands_in_memory_and_never_erases_siblings(self):
+        # r59 P1.4, reproduced there: an EIO read {} cached under the real generation, and
+        # arming s3 persisted ONLY s3 — the user-interrupted retry storms restarted
+        p = km.jd.STATE / "retry-suppressed.json"
+        km._suppress_session_retry("11111111-2222-3333-4444-555555555551")
+        km._suppress_session_retry("11111111-2222-3333-4444-555555555552")
+        before = json.loads(p.read_text())
+        self.assertEqual(len(before), 2)
+        os.chmod(p, 0)
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                km._suppress_session_retry("11111111-2222-3333-4444-555555555553")
+            self.assertTrue(km._session_retry_suppressed(
+                "11111111-2222-3333-4444-555555555553"),
+                "the interrupt's suppression LANDS (memory overlay) even under the fault")
+        finally:
+            os.chmod(p, 0o644)
+        self.assertEqual(json.loads(p.read_text()), before,
+                         "…and the fault never persisted a fabricated {} over the siblings")
+        km._suppress_session_retry("11111111-2222-3333-4444-555555555554")
+        after = json.loads(p.read_text())
+        self.assertEqual(len(after), 4, "the healed RMW folds the pending overlay in")
+
+    def test_d_rid_resolves_through_any_generation(self):
+        # r59 P2.1: a refusal naming an intermediate generation past the lineage cap was
+        # never compensated — the kernel resolves the stable ROOT id from its journal
+        self.assertTrue(km._union_ops_set(
+            [dict(self.ROW, gid=905, ogid=903, olin=[901, 902, 903], rid=901)]))
+        for named in (901, 902, 903, 905):
+            self.assertEqual(km._union_rid_for(named), 901,
+                             "generation %d resolves to the root" % named)
+        self.assertEqual(km._union_rid_for(999), 0, "an unknown id resolves to nothing")
 
 
 if __name__ == "__main__":
@@ -1327,10 +1432,13 @@ class PerFileOpSpool(unittest.TestCase):
         self.assertTrue(km._union_ops_set([], retired=[3]))
         self.assertEqual([r["gid"] for r in km._union_ops_load()], [9],
                          "retirement is an EXPLICIT tombstone, and it lands")
-        self.assertTrue(km._union_ops_set(["junk", {"host": "TESTHOST-B", "gid": 9}],
-                                          retired=[9]))
+        self.assertFalse(km._union_ops_set(["junk", {"host": "TESTHOST-B", "gid": 9}],
+                                           retired=[9]),
+                         "r59 P1.5: non-dict junk REJECTS the whole write — the silent "
+                         "drop acked a journal missing a row its sender believed durable")
+        self.assertTrue(km._union_ops_set([{"host": "TESTHOST-B", "gid": 9}], retired=[9]))
         self.assertEqual(km._union_ops_load(), [],
-                         "non-dict junk drops, a retired gid wins over its own upsert")
+                         "a retired gid wins over its own upsert")
 
     def test_ops_compose_with_a_foreign_edit_instead_of_erasing_it(self):
         # the audited erase shape, executed at the store: a foreign client's tag lands between
@@ -2982,36 +3090,34 @@ class R56AuditFixes(unittest.TestCase):
         km._union_ops_path().write_text(
             '[%s, {"host": "TESTHOST-A", "gid": Infinity}]' % _good)
         with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
-            echo = km._union_ops_echo()
-        self.assertEqual([r["gid"] for r in echo], [7],
-                         "the provably-valid rows survive the poison — never a partial "
-                         "SILENT filter, never an all-or-nothing wipe")
+            self.assertIsNone(km._union_ops_echo(),
+                              "the poison judged: the salvaged base is UNPROVED (r59 "
+                              "P1.2) — no partial silent filter, no all-or-nothing wipe, "
+                              "and no partial view either")
         q = list(km.jd.STATE.glob("union-gestures.json.corrupt-*"))
         self.assertEqual(len(q), 1, "…the original bytes quarantined aside whole")
         self.assertIn("Infinity", q[0].read_text())
         q[0].unlink()
-        self.assertEqual([r["gid"] for r in km._union_ops_echo()], [7],
-                         "…and the NEXT echo still answers the valid rows — the wave-1 "
-                         "quarantine left ENOENT here, read as authoritative-empty")
-        # a MERGE over a poisoned journal salvages the same way and proceeds
-        km._union_ops_path().write_text(
-            '[%s, {"host": "TESTHOST-A", "gid": Infinity}]' % _good)
+        self.assertEqual([r["gid"] for r in json.loads(km._union_ops_path().read_text())],
+                         [7], "the valid rows stand re-minted as the base")
+        # a MERGE carrying live-panel rows reconstructs OVER the base and proves it
         with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
             ok, _, reason, _u4 = km._union_ops_merge(
                 [{"host": "TESTHOST-B", "gid": 5, "edit": {}, "inverse": {}, "rt": {},
                   "name": "pool", "dispatched": False}])
         self.assertTrue(ok, reason)
         self.assertEqual(sorted(r["gid"] for r in km._union_ops_load()), [5, 7],
-                         "the merge lands beside the salvaged rows; the poison is gone")
-        # mark_dispatched joins the discipline (wave 2: it bypassed the whole-journal rule
-        # and re-persisted stored poison under a True ack)
+                         "the base SURVIVES reconstruction (r59 P1.2: rebuilding from [] "
+                         "dropped every group whose owner had not yet synced)")
+        self.assertEqual(sorted(r["gid"] for r in km._union_ops_echo()), [5, 7])
+        # mark_dispatched still refuses over an unproved store
         km._union_ops_path().write_text(
             '[%s, {"host": "TESTHOST-A", "gid": Infinity}]' % _good)
         with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
-            self.assertTrue(km._union_ops_mark_dispatched(7, "TESTHOST-B"))
-        rows = km._union_ops_load()
-        self.assertEqual([(r["gid"], r["dispatched"]) for r in rows], [(7, True)],
-                         "the flip lands on the salvaged store, not on re-serialized poison")
+            self.assertFalse(km._union_ops_mark_dispatched(7, "TESTHOST-B"),
+                             "no flip while the store is held (the client-side flip "
+                             "remains the writer)")
+        km._union_unproved_marker().unlink(missing_ok=True)
         for q in km.jd.STATE.glob("union-gestures.json.corrupt-*"):
             q.unlink()
 

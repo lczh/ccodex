@@ -60,7 +60,7 @@ class OtherStagingWriters(unittest.TestCase):
         # the staging name derives from the SENDER's message id — a planted FIFO hung the
         # bus thread (the r34 verification)
         src = open(os.path.join(ROOT, "bin", "romp-postal-service")).read()
-        i = src.index('tmp = QUARANTINE / (mid + ".tmp")')
+        i = src.index('tmp = QUARANTINE / (_qname + ".tmp")')   # origin-scoped since r59 P1.8
         window = src[i:i + 600]   # widened for the r58 fsync'd fd write (durable effect
         #                           before the ack correlates — the O_NOFOLLOW open is the
         #                           symlink half; the unlink-first stays the FIFO half)

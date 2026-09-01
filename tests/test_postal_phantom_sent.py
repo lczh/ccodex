@@ -942,6 +942,201 @@ class R58PostalAudit(unittest.TestCase):
                          "the legacy spelling satisfies the skip — nothing re-delivers")
 
 
+
+
+class R59PostalAudit(unittest.TestCase):
+    """the v1.3.31 audit, postal half: an unreadable backflow ledger was overwritten
+    (P1.6), a first delivery's mailbox ancestors were unsynced (P1.7), origin scoping
+    stopped at the seen ledger (P1.8), a failed withdraw recorded live mail unpublished
+    (P1.9), an unreadable settlement re-noted the sender (P2.7), receipts-done folded
+    faults to {} and one add erased every confirmation (P2.12), and a planted FIFO at the
+    phase-marker path hung publication forever (P2.13)."""
+
+    HOST = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    HOST2 = "abababababababababababababababab"
+
+    def setUp(self):
+        _reset()
+        pm._postal_off_cache[0] = None
+        pm._bounced_done.clear()
+        pm._bounced_done_loaded[0] = False
+        pm._backflow_loaded[0] = False
+        for p in (pm._bounced_done_path(), pm._backflow_path(), pm.SESSION_FLAGS,
+                  pm.RECEIPTS_DONE):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        with pm._peer_lock:
+            pm._peer_pending.clear()
+        for h in (self.HOST, self.HOST2):
+            shutil.rmtree(pm.OUTBOX / h, ignore_errors=True)
+            shutil.rmtree(pm.READBOX / h, ignore_errors=True)
+        shutil.rmtree(pm.MAILROOT / SID, ignore_errors=True)
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_readbox_parks_scope_by_origin(self):
+        # r59 P1.8: two origins' same-mid reads through one hub overwrote one bare-mid
+        # park — a read receipt was permanently lost
+        mid = "c1" * 16
+        pm.readbox_put(self.HOST, {"mid": mid, "origin": self.HOST2, "unread": False})
+        pm.readbox_put(self.HOST, {"mid": mid,
+                                   "origin": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+                                   "unread": False})
+        rows = pm.readbox_list(self.HOST)
+        self.assertEqual(len(rows), 2, "both origins' receipts park independently")
+        pm.readbox_del(self.HOST, {"mid": mid, "origin": self.HOST2, "unread": False})
+        self.assertEqual(len(pm.readbox_list(self.HOST)), 1, "the other stands")
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_b_unreadable_backflow_is_never_overwritten(self):
+        # r59 P1.6, reproduced there: an injected read EIO over a durable old ACK, then
+        # one new ACK — the rewrite kept only the new host
+        with pm._peer_lock:
+            pm._pending(self.HOST) if False else None
+        p = pm._pending(self.HOST)
+        with pm._peer_lock:
+            p["acks"].append("d1" * 16)
+            self.assertTrue(pm._backflow_save_locked())
+        with pm._peer_lock:
+            pm._peer_pending.clear()                 # the process died
+        pm._backflow_loaded[0] = False               # …and reboots under a read fault
+        os.chmod(pm._backflow_path(), 0)
+        p2 = pm._pending(self.HOST2)
+        try:
+            with pm._peer_lock:
+                p2["acks"].append("d2" * 16)
+                self.assertFalse(pm._backflow_save_locked(),
+                                 "the save is HELD while the ledger is unfolded")
+        finally:
+            os.chmod(pm._backflow_path(), 0o644)
+        with pm._peer_lock:
+            self.assertTrue(pm._backflow_save_locked(), "the healed save lands")
+        d = json.loads(pm._backflow_path().read_text())
+        self.assertIn(self.HOST, d, "the durable old ack SURVIVED the fault window")
+        self.assertIn(self.HOST2, d)
+
+    def test_c_first_delivery_syncs_the_mailbox_ancestors(self):
+        # r59 P1.7, reproduced there: the message and new/ were synced but the freshly
+        # created MAILROOT/<sid> entry was not — the modeled crash lost the whole mailbox
+        # while the durable seen receipt survived
+        seen = []
+        real = os.fsync
+
+        def spy(fd):
+            seen.append(os.fstat(fd).st_ino)
+            real(fd)
+
+        pm.os.fsync = spy
+        try:
+            pm.deliver(SID, "peer", "77" * 16, "hello")
+        finally:
+            pm.os.fsync = real
+        self.assertIn(pm._mailbox(SID).stat().st_ino, seen, "the sid dir entry is durable")
+        self.assertIn(pm.MAILROOT.stat().st_ino, seen, "…and the mailroot's")
+
+    def test_d_failed_withdraw_is_live_not_unpublished(self):
+        # r59 P1.9, reproduced there: dir-sync fails AND the withdraw fails — the mail is
+        # visible, yet an `unpublished` event was appended; replay then ACKed the final,
+        # leaving contradictory permanent accounting
+        real_fsync_dir = pm._fsync_dir
+        real_unlink = pm.Path.unlink
+        mb = pm._mailbox(SID)
+
+        def boom_dir(p):
+            if str(p) == str(mb / "new"):
+                raise OSError(5, "EIO")
+            return real_fsync_dir(p)
+
+        def boom_unlink(self, *a, **kw):
+            if str(self).startswith(str(mb / "new")):
+                raise OSError(5, "EIO")
+            return real_unlink(self, *a, **kw)
+
+        pm._fsync_dir = boom_dir
+        pm.Path.unlink = boom_unlink
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                name = pm.deliver(SID, "peer", "77" * 16, "hello")
+        finally:
+            pm._fsync_dir = real_fsync_dir
+            pm.Path.unlink = real_unlink
+        self.assertTrue((mb / "new" / name).exists(), "the mail is LIVE")
+        rows = [json.loads(l) for l in
+                (pm.TLDIR / "messages.jsonl").read_text().splitlines() if l.strip()]
+        self.assertFalse(any(r.get("ev") == "unpublished" and r.get("id") == name
+                             for r in rows),
+                         "…and NO contradictory unpublished row was filed")
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_e_unreadable_settlement_holds_the_bounce(self):
+        # r59 P2.7: "not settled" was a GUESS under an unreadable ledger — the sender was
+        # re-noted and a duplicate terminal row filed
+        self.assertTrue(pm._bounced_done_add(self.HOST, "e1" * 16))
+        d = pm.OUTBOX / self.HOST
+        d.mkdir(parents=True, exist_ok=True)
+        pm._atomic_json_put(d / (("e1" * 16) + ".json"),
+                            {"mid": "e1" * 16, "to": "web", "frm_id": SID, "body": "x"})
+        pm._bounced_done.clear()
+        pm._bounced_done_loaded[0] = False
+        os.chmod(pm._bounced_done_path(), 0)
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertFalse(pm._bounce_apply(
+                    self.HOST, {"mid": "e1" * 16, "code": "recipient-unavailable"}),
+                    "held, not re-noted")
+        finally:
+            os.chmod(pm._bounced_done_path(), 0o644)
+        self.assertEqual(pm.read_box(SID, consume=True), [], "no duplicate note landed")
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_f_receipts_done_never_rewrites_through_a_fault(self):
+        # r59 P2.12: read faults folded to {} — one new confirmation overwrote them all
+        pm._atomic_json_put(pm.RECEIPTS_DONE, {"old-one": 1})
+        os.chmod(pm.RECEIPTS_DONE, 0)
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                pm._receipts_done_add("f1" * 16)
+        finally:
+            os.chmod(pm.RECEIPTS_DONE, 0o644)
+        self.assertEqual(json.loads(pm.RECEIPTS_DONE.read_text()), {"old-one": 1},
+                         "the fault persisted NOTHING over the standing confirmations")
+        pm._receipts_done_add("f1" * 16)
+        self.assertIn("old-one", json.loads(pm.RECEIPTS_DONE.read_text()))
+        self.assertIn("f1" * 16, json.loads(pm.RECEIPTS_DONE.read_text()))
+
+    def test_g_planted_fifo_never_blocks_publication(self):
+        # r59 P2.13, reproduced there: O_NOFOLLOW does not reject FIFOs and the blocking
+        # write-only open hung the bus thread forever
+        d = pm.OUTBOX / self.HOST
+        d.mkdir(parents=True, exist_ok=True)
+        mid = "f2" * 16
+        st = d / (".stage-" + mid)
+        st.write_text(json.dumps({"mid": mid, "body": "x"}))
+        os.mkfifo(d / (".pubphase-" + mid))
+        try:
+            with self.assertRaises(pm._PublishNeverStarted):
+                pm.outbox_publish_stage(self.HOST, mid, st)   # returns, never hangs
+            self.assertTrue(st.exists(), "the stage stands for retry")
+        finally:
+            (d / (".pubphase-" + mid)).unlink(missing_ok=True)
+
+    def test_h_preserved_bounce_rows_survive_rewrites(self):
+        # r59 P2.11: an invalid standing row was skipped at load, and the next park's
+        # rewrite erased it
+        pm._atomic_json_put(pm._pending_bounces_path(),
+                            {"weird|row": "NOT-A-DICT", "ok|row": {
+                                "host": self.HOST, "mid": "a1" * 16,
+                                "code": "recipient-unavailable"}})
+        pm._pending_bounces.clear()
+        pm._pending_bounces_loaded[0] = False
+        pm._pending_bounce_park(self.HOST, "a2" * 16, "recipient-unavailable")
+        d = json.loads(pm._pending_bounces_path().read_text())
+        self.assertIn("weird|row", d, "the unreadable row RIDES every rewrite untouched")
+
+
 if __name__ == "__main__":
     unittest.main()
 

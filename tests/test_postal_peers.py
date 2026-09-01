@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from importlib.machinery import SourceFileLoader
 from unittest import mock
@@ -117,12 +118,15 @@ class PeerMode(unittest.TestCase):
         import shutil
         shutil.rmtree(pm.OUTBOX / "TESTHOST", ignore_errors=True)
         real_replace = pm.os.replace
-        rendezvous = threading.Barrier(2)
         sources = []
 
         def delayed_replace(src, dst):
+            # a widened race window, NOT a rendezvous: outbox_put serializes under
+            # _outbox_pub_lock since r59 P2.6 (a put raced the linkless publish between
+            # its absence check and rename), so two writers can never sit inside
+            # os.replace at once — a barrier here would deadlock by design
             sources.append(str(src))
-            rendezvous.wait(timeout=2)
+            time.sleep(0.05)
             return real_replace(src, dst)
 
         def write(body):

@@ -2925,8 +2925,11 @@ class TimelinePanel {
       || String(o.rid || 0) === String(id)   // the STABLE root id (r58 P2.19): survives
       //                                        past the bounded lineage's 32-entry cap
       || (Array.isArray(o.olin) && o.olin.some((x) => String(x) === String(id)));
-    const ops = matched.filter((o) => m.opId ? _lin(o, m.opId)
-                                             : ((o.gid || 0) === newestGid && !o.confirmed));
+    const ops = matched.filter((o) => m.opId
+      ? (_lin(o, m.opId) || (m.rid && String(o.rid || 0) === String(m.rid)))
+      //  ^ the kernel-resolved ROOT id (r59 P2.1): a refusal naming an intermediate
+      //    generation past the lineage cap still finds its gesture
+      : ((o.gid || 0) === newestGid && !o.confirmed));
     if (m.opId && ops.length) this._handledRefusalOps.add(String(m.opId));   // compensated
     //                                                                          — handled (r52)
     this._unionOps = (this._unionOps || []).filter((o) => ops.indexOf(o) < 0);

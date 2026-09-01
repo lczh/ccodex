@@ -16,11 +16,15 @@ export const INTENT_OPS: ReadonlySet<string> = new Set([
   "answerAsk", "submitAsk", "toggleAsk", "navAsk", "cancelAsk",
   "setSessionFlag", "setSessionColor", "setGlobalRetryPaused", "setTimelineViews",
   "setTimelineViewsOps", "openTagsDialog",
-  // the tag-transaction halves (the v1.3.24 audit's P1.3): a reconnect used to replay the
-  // LOCAL half (setTimelineViewsOps) while dropping the REMOTE edits and the compensation
-  // journal — the multi-host gesture landed one-legged with no rollback record. FIFO order
-  // is the queue's own; classifying all three keeps the transaction whole.
-  "editTag", "setUnionOps",
+  // the tag-transaction REMOTE half (the v1.3.24 audit's P1.3): a reconnect used to replay
+  // the LOCAL half (setTimelineViewsOps) while dropping the remote edits — editTag frames
+  // dispatch only after their journal ack, so replaying one delivers an already-journaled
+  // effect (at-least-once; refusals compensate). setUnionOps is deliberately NOT retained
+  // since r59 P1.1 (reproduced: a retained journal body replayed after reconnect carried
+  // the PRE-reset world and forked one gesture into two claimable identities — the panel's
+  // unionTransportReset re-sends CURRENT state, and the r56 rule says a completion's CAS
+  // can never survive its socket anyway).
+  "editTag",
   "reorderTabs", "closeTab",
 ]);
 

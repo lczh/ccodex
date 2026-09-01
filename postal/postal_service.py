@@ -39,6 +39,7 @@ import base64
 import errno
 import fcntl
 import hashlib
+import stat
 import hmac
 import itertools
 import json
@@ -468,11 +469,21 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
         tmp.rename(mb / "new" / name)   # atomic within the same filesystem — the PUBLISH point
         try:
             _fsync_dir(mb / "new")       # the ENTRY outlives the crash too (r58 P1.7)
+            _fsync_dir(mb)               # …and the ANCESTOR entries: a first delivery
+            _fsync_dir(MAILROOT)         # into a NEW mailbox lost the whole box while the
+            #                              durable seen receipt survived (r59 P1.7)
         except OSError:
             try:
                 (mb / "new" / name).unlink()   # withdraw: never let an un-durable publish
-            except OSError:                    # correlate with a durable seen-append
-                pass
+            except OSError:
+                # the withdraw ALSO failed: the mail is VISIBLE and possibly durable —
+                # raising here fed the unpublished-compensation arm while the file lived,
+                # leaving contradictory permanent accounting (r59 P1.9, reproduced).
+                # Treat as delivered-with-degraded-durability, loudly.
+                sys.stderr.write("postal: %s delivered but its durability could not be "
+                                 "proven NOR withdrawn — treating as live\n" % name)
+                _mark_pending(to_id)
+                return name
             raise
     except Exception:
         try:
@@ -3084,7 +3095,10 @@ def outbox_put(host, msg):
         return
     d = OUTBOX / host
     d.mkdir(parents=True, exist_ok=True)
-    _atomic_json_put(d / (mid + ".json"), msg)
+    with _outbox_pub_lock:               # ONE no-replace arbitration for every outbox
+        #                                  writer (r59 P2.6: this put raced the linkless
+        #                                  publish between its absence check and rename)
+        _atomic_json_put(d / (mid + ".json"), msg)
     _peer_wake(host).set()
 
 _outbox_pub_lock = threading.Lock()    # serializes THIS process's linkless publishes
@@ -3109,9 +3123,14 @@ def outbox_publish_stage(host, mid, stagef):
     # attempted, outcome unknown": boot RE-PUBLISHES from the stage instead of spending it.
     _phasef = d / (".pubphase-" + mid)
     try:
-        _pfd = os.open(str(_phasef), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        #      ^ no-follow (r58 P2.20: the predictable path followed a planted symlink and
-        #        overwrote its target)
+        _pfd = os.open(str(_phasef),
+                       os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        #      ^ no-follow (r58 P2.20) + NONBLOCK (r59 P2.13, reproduced: O_NOFOLLOW does
+        #        not reject FIFOs, and a planted FIFO's blocking open hung publication
+        #        forever — a writer-side nonblocking FIFO open fails ENXIO instead)
+        if not stat.S_ISREG(os.fstat(_pfd).st_mode):
+            os.close(_pfd)
+            raise _PublishNeverStarted("the publication-phase path is not a regular file")
         with os.fdopen(_pfd, "w") as _pfh:
             _pfh.write("1")
             _pfh.flush()
@@ -3450,6 +3469,9 @@ def _pending_bounces_load():
     if isinstance(d, dict):
         for k, v in d.items():
             if not isinstance(v, dict):
+                # PRESERVE the unreadable row under its own key (r59 P2.11: skipping it
+                # let the next park's rewrite erase it) — the flush skips non-dicts
+                _pending_bounces[str(k)] = v
                 continue
             if not v.get("mid"):
                 # a pre-r56 ledger keyed rows by BARE mid with no mid field (the r56 wave-2
@@ -3499,6 +3521,9 @@ def _flush_pending_bounces():
         _pending_bounces_load()
         items = list(_pending_bounces.values())
     for v in items:
+        if not isinstance(v, dict):
+            continue                     # a preserved-unreadable row (r59 P2.11): it rides
+            #                              every rewrite untouched until repaired by hand
         # through _bounce_arrived, never _bounce_apply directly (the r55 wave-2
         # verification: the direct call skipped the forwarded-vs-ours arbitration and a
         # HUB's parked bounce delivered its return note to a REMOTE frm_id as local mail
@@ -3552,15 +3577,26 @@ def outbox_del(host, mid):
     except Exception:
         return False
 
-def _receipts_done():
+def _receipts_done(_for_write=False):
     try:
         d = json.loads(RECEIPTS_DONE.read_text())
         return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
     except Exception:
+        if _for_write:
+            raise _OutboxUnreadable("receipts-done unreadable")   # r59 P2.12: the {} fold
+            #   let one new confirmation overwrite every existing one
         return {}
 
+
 def _receipts_done_add(mid):
-    d = _receipts_done()
+    try:
+        d = _receipts_done(_for_write=True)
+    except _OutboxUnreadable:
+        _log("receipts-done unreadable — confirmation for %s not persisted this pass "
+             "(the kernel re-posts; the re-park is harmless)" % mid)
+        return
     if mid in d:
         return
     d[mid] = int(time.time())
@@ -3573,6 +3609,13 @@ def _receipt_park_name(mid, origin=""):
     """The park FILENAME, origin-scoped when the receipt names one (r58 wave 2: two
     origins' same-mid mail through one hub parked on one bare-mid file — the second
     receipt silently replaced the first and one sender never learned its mail landed)."""
+    return (mid + ("." + hashlib.sha256(origin.encode()).hexdigest()[:16] if origin else "")
+            + ".json")                   # 64-bit scope (r59 P2.8: a 32-bit collision
+    #                                      replaced a standing park at 62k candidates)
+
+
+def _receipt_park_name_v58(mid, origin=""):
+    """The v1.3.31 8-hex spelling — resolved on delete/bind so upgrade-window parks settle."""
     return (mid + ("." + hashlib.sha256(origin.encode()).hexdigest()[:8] if origin else "")
             + ".json")
 
@@ -3633,7 +3676,8 @@ def receiptbox_list(host, limit=None):
                           # wave 2: parks are origin-scoped now; legacy bare-mid files
                           # keep their old binding)
                           and f.name in (_rmid + ".json",
-                                         _receipt_park_name(_rmid, _rorig)))
+                                         _receipt_park_name(_rmid, _rorig),
+                                         _receipt_park_name_v58(_rmid, _rorig)))
                 if _bound:
                     keep = {"mid": _rmid}
                     if _rorig:
@@ -3653,8 +3697,11 @@ def receiptbox_list(host, limit=None):
 def receiptbox_del(host, mid, origin=""):
     if not (_safe_id(host) and _safe_id(mid)) or (origin and not _safe_id(origin)):
         return
-    # the origin-scoped spelling first (r58 wave 2), the bare pre-r58 spelling second
+    # the origin-scoped spelling first (r58 wave 2), the v1.3.31 8-hex spelling second,
+    # the bare pre-r58 spelling last
     _f = RECEIPTBOX / host / _receipt_park_name(mid, origin)
+    if origin and not _f.exists():
+        _f = RECEIPTBOX / host / _receipt_park_name_v58(mid, origin)
     if origin and not _f.exists():
         _f = RECEIPTBOX / host / (mid + ".json")
     _dmid = ""
@@ -3687,10 +3734,13 @@ def _receipt_rows(value):
     for row in value:                    # validate WHILE collecting (r58 P2.18)
         if len(out) >= PEER_LIST_LIMITS["handoffDone"]:
             break
-        if isinstance(row, dict) and _safe_id(str(row.get("mid") or "")):
-            keep = {"mid": str(row["mid"])}
-            if _safe_id(str(row.get("origin") or "")):
-                keep["origin"] = str(row["origin"])
+        if (isinstance(row, dict) and isinstance(row.get("mid"), str)
+                and _safe_id(row["mid"])):
+            # STRING mids only (r59 P2.9, reproduced: {"mid":123} stringified, deleted the
+            # real 123.json park, and marked its delivery complete)
+            keep = {"mid": row["mid"]}
+            if isinstance(row.get("origin"), str) and _safe_id(row["origin"]):
+                keep["origin"] = row["origin"]
             out.append(keep)
     return out
 
@@ -3763,7 +3813,11 @@ def readbox_put(host, rec):
         return
     d = READBOX / host
     d.mkdir(parents=True, exist_ok=True)
-    _atomic_json_put(d / (mid + ".json"), rec)
+    _origin = str((rec or {}).get("origin") or "")
+    _atomic_json_put(d / _receipt_park_name(mid, _origin if _safe_id(_origin) else ""),
+                     rec)                # origin-scoped (r59 P1.8: two origins through one
+    #                                      hub overwrote one bare-mid park — one read
+    #                                      receipt permanently lost)
     _peer_wake(host).set()
 
 def readbox_list(host, limit=None, byte_limit=None):
@@ -3789,8 +3843,16 @@ def readbox_list(host, limit=None, byte_limit=None):
                 continue
             try:
                 row = json.loads(raw)
-                if not (isinstance(row, dict) and _safe_id(str(row.get("mid") or ""))
-                        and str(row.get("mid") or "") == f.stem):
+                _rmid0 = row.get("mid") if isinstance(row, dict) else None
+                _rorig0 = (str(row.get("origin") or "") if isinstance(row, dict) else "")
+                if not (isinstance(row, dict) and isinstance(_rmid0, str)
+                        and _safe_id(_rmid0)
+                        and (not _rorig0 or _safe_id(_rorig0))
+                        # both spellings (r59 P1.8); isinstance str kills the numeric-mid
+                        # coercion that consumed the budget (r59 P2.10)
+                        and f.name in (_rmid0 + ".json",
+                                       _receipt_park_name(_rmid0, _rorig0),
+                                       _receipt_park_name_v58(_rmid0, _rorig0))):
                     # schema + filename binding BEFORE the row consumes the bounded budget
                     # (the r56 audit's P2.15: 512 []-shaped rows starved a valid receipt
                     # sorted behind them)
@@ -3819,7 +3881,10 @@ def readbox_del(host, rec):
     mid = (rec or {}).get("mid") or ""
     if not (_safe_id(host) and _safe_id(mid)):   # host/mid are path components — block traversal
         return
-    f = READBOX / host / (mid + ".json")
+    _origin = str((rec or {}).get("origin") or "")
+    f = READBOX / host / _receipt_park_name(mid, _origin if _safe_id(_origin) else "")
+    if not f.exists():
+        f = READBOX / host / (mid + ".json")         # the pre-r59 bare spelling
     try:
         cur = json.loads(f.read_text())
         if bool(cur.get("unread")) == bool((rec or {}).get("unread")):
@@ -4025,6 +4090,13 @@ def _bounce_apply(host, b):
         #                then lost both); the park stays until the terminal actually lands
     if not msg:
         return True
+    if not _bounced_done_loaded[0]:
+        _bounced_done_load()
+        if not _bounced_done_loaded[0]:
+            # the settlement ledger is unreadable: "not settled" is a GUESS that re-notes
+            # the sender (r59 P2.7) — park and retry when it reads
+            _log("bounce for %s/%s held: settlement ledger unreadable" % (host, mid))
+            return False
     if _bounced_done_has(host, mid):
         # ALREADY settled (the r56 audit's P2.14; durable + host-keyed since r57 P1.11) —
         # retry the deletion alone
@@ -4105,7 +4177,8 @@ def _quarantine_put(origin, m, to_id, via=""):
            "origin": origin, "via": via or origin, "at": int(time.time())}
     try:
         QUARANTINE.mkdir(parents=True, exist_ok=True)
-        tmp = QUARANTINE / (mid + ".tmp")
+        _qname = _receipt_park_name(mid, origin if _safe_id(str(origin or "")) else "")
+        tmp = QUARANTINE / (_qname + ".tmp")
         tmp.unlink(missing_ok=True)   # the staging name derives from the SENDER's mid — a
         #                               planted FIFO hung the bus thread (the r34 verification)
         _qfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
@@ -4113,7 +4186,7 @@ def _quarantine_put(origin, m, to_id, via=""):
             _qfh.write(json.dumps(rec))
             _qfh.flush()
             os.fsync(_qfh.fileno())      # durable BEFORE the ack correlates (r58 P1.7)
-        tmp.rename(QUARANTINE / (mid + ".json"))      # atomic publish (the kernel may be reading the dir)
+        tmp.rename(QUARANTINE / _qname)               # atomic publish (the kernel may be reading the dir)
         _fsync_dir(QUARANTINE)
         _log("quarantine: held %s from %s -> %s (directed)" % (mid, origin, rec["to"]))
         return True
@@ -4134,22 +4207,34 @@ def quarantine_list():
     out.sort(key=lambda r: r.get("at") or 0, reverse=True)
     return out
 
-def quarantine_get(mid):
+def _quarantine_paths(mid):
+    """Every held file for `mid`: the origin-scoped spelling(s) plus the legacy bare one
+    (r59 P1.8 — holds are origin-scoped now; 128-bit mids make multi-origin same-mid holds
+    an attack shape, and ALL of them are the mid's holds)."""
     if not _safe_id(mid):
-        return None
-    try:
-        return json.loads((QUARANTINE / (mid + ".json")).read_text())
-    except (OSError, ValueError):
-        return None
+        return []
+    out = [p for p in QUARANTINE.glob(mid + ".*.json")]
+    if (QUARANTINE / (mid + ".json")).exists():
+        out.append(QUARANTINE / (mid + ".json"))
+    return out
+
+def quarantine_get(mid):
+    for p in _quarantine_paths(mid):
+        try:
+            return json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+    return None
 
 def quarantine_del(mid):
-    if not _safe_id(mid):
-        return False
-    try:
-        (QUARANTINE / (mid + ".json")).unlink()
-        return True
-    except OSError:
-        return False
+    ok = False
+    for p in _quarantine_paths(mid):
+        try:
+            p.unlink()
+            ok = True
+        except OSError:
+            pass
+    return ok
 
 def quarantine_decide(mid, action, text=None, feedback=None):
     """Approve (deliver, optionally with human-edited text) or deny (drop) a held message. Returns
@@ -4573,6 +4658,12 @@ def _backflow_save_locked():
     forwarded ack's durable downstream source was deleted with the backward state held only
     in memory — one dropped HTTP response and the origin never learned its mail landed).
     Caller holds _peer_lock. Best-effort with a loud log: the queues still run in memory."""
+    if not _backflow_loaded[0]:
+        _backflow_load_locked()          # one retry per save attempt (caller holds the lock)
+    if not _backflow_loaded[0]:
+        _log("peer-backflow ledger still unfolded — save held (r59 P1.6, reproduced: the "
+             "rewrite kept only the new host and lost a durable ack)")
+        return False
     snap = {}
     for h, p in _peer_pending.items():
         if p.get("acks") or p.get("bounces"):
@@ -4591,14 +4682,30 @@ def _backflow_save_locked():
         #                                  downstream source on this save must NOT
 
 
+_backflow_loaded = [False]
+
+
 def _backflow_load():
+    with _peer_lock:
+        _backflow_load_locked()
+
+
+def _backflow_load_locked():
+    """Fold the durable ledger in — the CALLER holds _peer_lock (r59 wave: the save's
+    retry-load nested the lock and deadlocked the exchange thread)."""
     try:
         d = json.loads(_backflow_path().read_text())
+    except FileNotFoundError:
+        _backflow_loaded[0] = True                   # provably no ledger yet
+        return
     except Exception:
+        _log("peer-backflow ledger unreadable — holding every save until it reads (r59 "
+             "P1.6: a save over the unfolded ledger overwrote a durable ack)")
         return
     if not isinstance(d, dict):
+        _log("peer-backflow ledger wrong-shaped — holding (never loaded as empty)")
         return
-    with _peer_lock:
+    if True:
         for h, q in d.items():
             if not (_safe_id(str(h)) and isinstance(q, dict)):
                 continue
@@ -4610,6 +4717,7 @@ def _backflow_load():
             for b in q.get("bounces") or []:
                 if isinstance(b, dict) and b not in p["bounces"]:
                     p["bounces"].append(b)
+    _backflow_loaded[0] = True
 
 
 def _pending(host):

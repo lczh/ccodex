@@ -267,7 +267,9 @@ test("source: tagEditFailed compensates SIBLING hosts — inverse remote edits; 
   // falls back to the newest-gid heuristic (the r46 verification: host+name alone also swept
   // OTHER gestures' entries into the rollback)
   assert.match(win, /const newestGid = matched\.reduce\(\(g, o\) => Math\.max\(g, o\.gid \|\| 0\), 0\);/);
-  assert.ok(win.indexOf("const ops = matched.filter((o) => m.opId ? _lin(o, m.opId)") > 0
+  assert.ok(win.indexOf("const ops = matched.filter((o) => m.opId") > 0
+    && win.indexOf("(_lin(o, m.opId) || (m.rid && String(o.rid || 0) === String(m.rid)))") > 0
+    //  ^ the kernel-resolved ROOT id joined the matcher in r59 P2.1
     && win.indexOf("|| (Array.isArray(o.olin) && o.olin.some((x) => String(x) === String(id)))") > 0
     && win.indexOf(": ((o.gid || 0) === newestGid && !o.confirmed));") > 0,
     "the opId-less fallback never sweeps a poll-CONFIRMED gesture (r48); a refusal naming "
@@ -2075,4 +2077,17 @@ test("r58 wave 2: a voided queued send treats its gates like the transport reset
   assert.ok(win.indexOf("const _plain = _gates.filter((x) => !x.rekey);") > 0
     && win.indexOf("this._syncUnionOps(_plain);") > 0,
     "…and voided plain gates re-gate on a CURRENT-world send");
+});
+
+test("r59: union frames never queue across a reconnect in the browser shim", () => {
+  // reproduced upstream: the webview shim's send() queued setUnionOps while the socket
+  // was down and flushed the stale body on reconnect BEFORE unionTransportReset — the
+  // kernel accepted the pre-reset rows and forked the gesture
+  const kern = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
+  const i = kern.indexOf("function send(m){");
+  assert.ok(i > 0);
+  const win = kern.slice(i, i + 600);
+  assert.ok(win.indexOf('m.type==="setUnionOps"||m.type==="claimUnionGesture"') > 0
+    && win.indexOf("queue.push(s);}") > win.indexOf('m.type==="setUnionOps"'),
+    "setUnionOps/claimUnionGesture DROP when the socket is down — everything else queues");
 });

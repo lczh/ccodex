@@ -31,12 +31,18 @@ test("non-strings never classify as intent", () => {
   assert.ok(!intentOp(42));
   assert.ok(!INTENT_OPS.has(""));
 });
-test("the tag-transaction halves are ALL intent — a reconnect must not land one leg (r52)", () => {
-  // the v1.3.24 audit's P1.3, reproduced there: queued [editTag, editTag,
-  // setTimelineViewsOps, setUnionOps] replayed as [setTimelineViewsOps] — the local edit
-  // landed while the remote edits and the compensation journal disappeared
-  for (const op of ["editTag", "setUnionOps", "setTimelineViewsOps"]) {
+test("tag-edit legs survive a reconnect; the union JOURNAL body never replays (r59 P1.1)", () => {
+  // the v1.3.24 audit's P1.3: queued [editTag, setTimelineViewsOps] must both land. But
+  // setUnionOps is a WORLD-SCOPED journal mirror, not user intent — the r59 audit
+  // reproduced a retained body replaying after reconnect with the PRE-reset rows and
+  // forking one gesture into two claimable identities (both completion CASes succeeded).
+  // The panel's unionTransportReset re-sends CURRENT state; the retained replay is the bug.
+  for (const op of ["editTag", "setTimelineViewsOps"]) {
     assert.ok(INTENT_OPS.has(op), op + " must survive a reconnect");
   }
+  assert.ok(!INTENT_OPS.has("setUnionOps"),
+    "the journal mirror is rebuilt from the live panel, never replayed from a dead world");
+  assert.ok(!INTENT_OPS.has("claimUnionGesture"),
+    "claims are socket-scoped by design (r54) — a replayed claim is always stale");
 });
 
