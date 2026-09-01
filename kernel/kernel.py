@@ -2807,7 +2807,10 @@ def _union_store_read_locked(what="union-gestures"):
                 except (TypeError, ValueError):
                     out[k] = str(base[k])
         if ("t" not in base or isinstance(base.get("t"), bool)
-                or not isinstance(base.get("t"), (int, float))):
+                or not isinstance(base.get("t"), (int, float))
+                or base.get("t") > _fmtime + 86400):
+            #  ^ a numeric FUTURE stamp clamps too (r62 wave 2): the stored row stays
+            #    valid and mortal instead of poisoning the journal
             out = out if out is not None else dict(r)
             out["t"] = _fmtime           # the FILE's own stamp, never a deletion (r61
             #                              P2.2: a t-less refusal row was outside the 7d
@@ -2922,10 +2925,12 @@ def _union_row_valid(r):
         if not (_safe_int(r.get("gid"), -_MAX, -1) or _safe_int(r.get("gid"), 1, _MAX)):
             return False
         if "t" in r and not (isinstance(r.get("t"), (int, float))
-                             and not isinstance(r.get("t"), bool)
-                             and r.get("t") <= time.time() + 86400):
+                             and not isinstance(r.get("t"), bool)):
             return False   # a non-numeric t would reach the 7d staleness compare (r60
-            #                P1.4); an IMPLAUSIBLY future t defeats it (r62 P2.7)
+            #                P1.4). The future-t bound lives at INGRESS only (r62 wave
+            #                2: here it judged STORED rows too — one v1.3.34-persisted
+            #                future stamp, or a >24h backward clock step, row-poisoned
+            #                the whole journal and held it unproved)
         if ("ogid" in r and r.get("ogid") not in (None, 0)
                 and not _safe_int(r.get("ogid"), 1, _MAX)):
             return False
@@ -3041,6 +3046,11 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             # sender believed durable)
             return False, [], "malformed entry (every entry must be an object)", []
         inc = list(entries) if isinstance(entries, list) else []
+        if any(isinstance(r, dict) and r.get("refusal")
+               and isinstance(r.get("t"), (int, float)) and not isinstance(r.get("t"), bool)
+               and r.get("t") > time.time() + 86400 for r in inc):
+            return False, [], "malformed row (implausibly future timestamp)", []   # r62
+            #   P2.7 at the WIRE only — stored rows clamp on read instead (r62 wave 2)
         if any(not _union_row_valid(r) for r in inc):
             # REJECT the whole write (the r56 audit's P1.5): one gid:[] row wedged every
             # later merge; one 1e309 rode the wire as Infinity and the browser refused the
@@ -3172,7 +3182,12 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             return False, [], "the completion must retire the original", []
         _resident_pre = {r.get("gid") for r in cur if not r.get("refusal")}
         _stray = []
-        if not _reconstructing:
+        if _resident_pre:
+            # keyed on RESIDENT rows, not on the reconstruction flag (r62 wave 2,
+            # reproduced: a SALVAGED store — valid rows under the .unproved marker —
+            # set _reconstructing while cur held real rows, so the whole vetting block
+            # was skipped and the plain sibling door stood open exactly while the
+            # gated rekey path refused "held for reconstruction")
             # EVERY new row that declares ancestry is vetted — not just the ones in a
             # rekey-less write (r62 P1.1, executed: one valid completion for A smuggled
             # an unvetted completion for B past B's standing refusal, because the
@@ -3225,6 +3240,19 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                          or (_c.get("rt") or {}) != (r.get("rt") or {}))):
                 if r.get("gid") not in _collide:
                     _collide.append(r.get("gid"))
+            elif _c is None and r.get("gid") in _resident_pre:
+                # a NEW host joining a RESIDENT group (r62 wave 2: the same-(gid,host)
+                # rule left this door open — a colliding gid on another host merged a
+                # foreign, differently-named row INTO a stranger's claimed gesture, whose
+                # later refusal then correlated to the whole group). A writer extends
+                # its own group under its own claim; nobody else adds hosts to it.
+                _gname = next((x.get("name") for x in cur
+                               if not x.get("refusal") and x.get("gid") == r.get("gid")),
+                              None)
+                if ((_gname or "") != (r.get("name") or "")
+                        or _claims_snap.get(r.get("gid")) not in (None, ckey)):
+                    if r.get("gid") not in _collide:
+                        _collide.append(r.get("gid"))
         if _collide:
             inc = [r for r in inc if r.get("gid") not in _collide]
         _gk = [(r.get("gid"), r.get("host")) for r in inc if not r.get("refusal")]

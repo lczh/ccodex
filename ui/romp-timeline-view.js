@@ -1801,7 +1801,13 @@ class TimelinePanel {
         if (this._retireUnionGids.has(r.gid)) continue;         // consumed; tombstone in flight
         const op = String(r.opId || '');
         if (!op) continue;
-        const ours = this._handledRefusalOps.has(op) || this._mintedGids.has(Number(op))
+        // every arm is NAME-scoped (r62 wave 2: the minted/handled short-circuits stayed
+        // bare, so a foreign refusal whose opId collided with a gid THIS panel minted was
+        // judged ours and its journal row tombstoned — the one record the other gesture's
+        // reloading panel needed)
+        const _nm = (map, key) => !r.name || !map || !map.get(key) || map.get(key) === r.name;
+        const ours = (this._handledRefusalOps.has(op) && _nm(this._handledRefusalNames, op))
+          || (this._mintedGids.has(Number(op)) && _nm(this._mintedNames, Number(op)))
           || (this._unionOps || []).some((o) => (!r.name || !o.name || o.name === r.name)
                                                 //  ^ NAME-scoped (r62 P2.6): gids mint from
                                                 //    independent per-panel seeds, so a
@@ -2953,7 +2959,11 @@ class TimelinePanel {
       //  ^ the kernel-resolved ROOT id (r59 P2.1): a refusal naming an intermediate
       //    generation past the lineage cap still finds its gesture
       : ((o.gid || 0) === newestGid && !o.confirmed));
-    if (m.opId && ops.length) this._handledRefusalOps.add(String(m.opId));   // compensated
+    if (m.opId && ops.length) {
+      this._handledRefusalOps.add(String(m.opId));   // compensated
+      if (!this._handledRefusalNames) this._handledRefusalNames = new Map();
+      this._handledRefusalNames.set(String(m.opId), m.name || '');   // name-scoped (r62 w2)
+    }
     //                                                                          — handled (r52)
     this._unionOps = (this._unionOps || []).filter((o) => ops.indexOf(o) < 0);
     for (const o of ops) {
@@ -3417,6 +3427,8 @@ class TimelinePanel {
     const ngid = ++unionGestureSeq;
     if (!this._mintedGids) this._mintedGids = new Set();
     this._mintedGids.add(ngid);
+    if (!this._mintedNames) this._mintedNames = new Map();
+    this._mintedNames.set(ngid, (group[0] || {}).name || '');   // name-scoped (r62 w2)
     const prior = group.map((x) => ({ x: x, gid: x.gid, ogid: x.ogid,
                                       olin: (x.olin || []).slice() }));
     for (const x of group) {

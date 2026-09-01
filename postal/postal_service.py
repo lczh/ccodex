@@ -3105,7 +3105,11 @@ def _mkdirs_durable(path):
             return (_st.st_dev, _st.st_ino)
         except OSError:
             return None
-    while (not (str(q) in _proved_dirs and _gen(q) == _proved_dirs[str(q)])
+    while (not (str(q) in _proved_dirs and _proved_dirs[str(q)] is not None
+                and _gen(q) == _proved_dirs[str(q)])
+           #   ^ a None generation (the dir is gone) is never proved (r62 wave 2: a
+           #     sweep between the fsync and the memo stored None, and None == None
+           #     then read as proved — zero fsyncs on the recreate)
            #   ^ the memo binds the INODE (r62 P2.10: a proved path renamed away and
            #     recreated read as proved — zero fsyncs for the replacement)
            and (str(q) == str(root) or str(q).startswith(str(root) + os.sep))):
@@ -3124,7 +3128,11 @@ def _mkdirs_durable(path):
     for d in [chain[-1].parent] + list(reversed(chain)):
         _fsync_dir(d)
     for d in chain:
-        _proved_dirs[str(d)] = _gen(d)
+        _g2 = _gen(d)
+        if _g2 is not None:
+            _proved_dirs[str(d)] = _g2
+        else:
+            _proved_dirs.pop(str(d), None)   # vanished before the memo: unproven
 
 
 def _atomic_text_put(path, text):
@@ -3180,8 +3188,10 @@ def _quarantine_corrupt_json(path, store, error, fingerprint=None):
         dst = dst_dir / ("%s.%d.%016x.corrupt" %
                          (path.name, int(time.time() * 1000), random.getrandbits(64)))
         os.replace(path, dst)
-        _fsync_dir(path.parent)
-        _fsync_dir(dst_dir)
+        _fsync_dir(dst_dir)                  # the NEW link first (r62 wave 2: persisting
+        _fsync_dir(path.parent)              # the source removal first left a crash
+        #                                      window in which the judged bytes were gone
+        #                                      from both names — P2.11 one level down)
         _log("%s: quarantined unreadable durable record %s -> %s (%s)" %
              (store, path, dst, str(error)[:160]))
     except FileNotFoundError:
@@ -3837,6 +3847,15 @@ def _receipt_park_name(mid, origin=""):
     #                                      replaced a standing park at 62k candidates)
 
 
+def _park_siblings(d, mid, bare_name):
+    """Other parks for the same mid beside the bare spelling — the scoped/v58 spellings
+    (r62 wave 2: the ambiguity an originless ack must not resolve by deletion)."""
+    try:
+        return [f for f in d.glob(mid + ".*.json") if f.name != bare_name]
+    except OSError:
+        return []
+
+
 def _receipt_park_name_v58(mid, origin=""):
     """The v1.3.31 8-hex spelling — resolved on delete/bind so upgrade-window parks settle."""
     return (mid + ("." + hashlib.sha256(origin.encode()).hexdigest()[:8] if origin else "")
@@ -3931,9 +3950,13 @@ def receiptbox_del(host, mid, origin=""):
     try:
         _row = json.loads(_f.read_text())
         if (_f.name == mid + ".json" and isinstance(_row, dict)
-                and str(_row.get("origin") or "") not in ("", origin)):
+                and str(_row.get("origin") or "") not in ("", origin)
+                and (origin or _park_siblings(_f.parent, mid, _f.name))):
             # (r62 P1.5: an ORIGINLESS ack must not delete a bare park that RECORDS an
-            # origin either — that park belongs to a scoped ack)
+            # origin when a same-mid SIBLING park exists — the ambiguity the audit
+            # executed; r62 wave 2: over a LONE such park it is a pre-scoping peer
+            # clearing its own pre-scoping park — the only ack it can ever send — and
+            # refusing it stranded the park forever with no recovery event)
             # the bare legacy park belongs to a DIFFERENT origin (r60 P1.5, reproduced:
             # an origin-A acknowledgment fell through both scoped spellings to origin
             # B's bare file — deleted it and marked B's receipt done). A bare park with
@@ -4132,8 +4155,11 @@ def readbox_del(host, rec):
     try:
         cur = json.loads(f.read_text())
         if (f.name == mid + ".json" and isinstance(cur, dict)
-                and str(cur.get("origin") or "") not in ("", _origin)):
-            # (r62 P1.5: originless acks are content-bound too)
+                and str(cur.get("origin") or "") not in ("", _origin)
+                and (_origin or _park_siblings(f.parent, mid, f.name))):
+            # (r62 P1.5: originless acks are content-bound when a same-mid sibling
+            # makes the bare park ambiguous; r62 wave 2: a LONE one is a legacy peer
+            # clearing its own pre-scoping park — refusing it stranded the park)
             # the bare legacy park belongs to a DIFFERENT origin (r60 P1.5): an
             # origin-A ack must never delete origin B's receipt; a park with no
             # recorded origin predates scoping and stays deletable

@@ -4131,9 +4131,10 @@ class R62AuditFixes(unittest.TestCase):
         os.utime(p, (far, far))
         rows = km._union_ops_echo()
         self.assertLessEqual(rows[0]["t"], time.time() + 5, "the migrated stamp clamps to now")
-        self.assertFalse(km._union_row_valid(
-            {"refusal": True, "gid": -3, "name": "pool", "t": far}),
-            "an implausibly future live t is invalid")
+        ok, _, reason, _u = km._union_ops_merge(
+            [{"refusal": True, "gid": -3, "name": "pool", "t": far}], [], ckey="ws:x")
+        self.assertFalse(ok, "an implausibly future live t is refused at the WIRE")
+        self.assertIn("future", reason or "")
 
     def test_i_the_overlay_is_finite_and_lock_safe(self):
         # r62 P2.8, executed: a NaN durable floor made every max-merge answer False and
@@ -4169,3 +4170,80 @@ class R62AuditFixes(unittest.TestCase):
         t2 = threading.Thread(target=reader)
         t1.start(); t2.start(); t2.join(); stop[0] = True; t1.join()
         self.assertEqual(errs, [], "no 'dictionary changed size during iteration'")
+
+
+
+class R62Wave2(unittest.TestCase):
+    """the r62 verify round's confirmed second-order defects, kernel half: ancestry
+    vetting was skipped for a SALVAGED store (real rows, plain door open while the gated
+    path refused); a colliding gid on a NEW host merged a foreign row into a stranger's
+    claimed group; and the future-t bound judged STORED rows, poisoning a journal over one
+    v1.3.34-persisted stamp or a backward clock step."""
+
+    ROW = {"host": "TESTHOST-A", "gid": 801, "edit": {}, "inverse": {}, "rt": {},
+           "name": "pool", "dispatched": False}
+    SUCC = {"host": "TESTHOST-A", "gid": 802, "ogid": 801, "olin": [801], "rid": 801,
+            "edit": {}, "inverse": {}, "rt": {}, "name": "pool", "dispatched": False}
+
+    def setUp(self):
+        _scrub_state()
+        km._union_claims.clear()
+        km._union_retired_tombs.clear()
+        km._union_tombs_loaded[0] = False
+        for name in ("union-gestures.json", "union-gestures.json.unproved",
+                     "union-tombs.json", "union-tombs.json.hold"):
+            try:
+                (km.jd.STATE / name).unlink()
+            except OSError:
+                pass
+        for f in km.jd.STATE.glob("*.corrupt-*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_a_salvaged_store_vets_ancestry_too(self):
+        # the round's headline, reproduced: valid rows under the .unproved marker set the
+        # reconstruction flag, the vetting block was skipped, and a plain successor +
+        # retired=[original] performed the rekey-and-retire unvetted — while the gated
+        # rekey path refused "held for reconstruction"
+        self.assertTrue(km._union_ops_set([dict(self.ROW)]))
+        km._union_unproved_marker().write_text("1")          # a salvaged store
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok, _, reason, _u = km._union_ops_merge([dict(self.SUCC)], [801],
+                                                    ckey="ws:bystander")
+        self.assertFalse(ok, "the plain door is shut in the salvaged state too")
+        self.assertIn("completion transaction", reason or "")
+        self.assertEqual([r["gid"] for r in km._union_ops_load()], [801])
+
+    def test_b_a_new_host_cannot_join_a_strangers_claimed_group(self):
+        alpha = dict(self.ROW, gid=500, name="pool")
+        ok, _, _, _u = km._union_ops_merge([alpha], [], ckey="ws:alpha")
+        self.assertTrue(ok)
+        beta = dict(self.ROW, gid=500, host="TESTHOST-B", name="other")
+        ok, unclaimed, _, _u = km._union_ops_merge([beta], [], ckey="ws:beta")
+        self.assertTrue(ok)
+        self.assertIn(500, unclaimed, "beta yields…")
+        self.assertEqual([(r["host"], r["name"]) for r in km._union_ops_load()],
+                         [("TESTHOST-A", "pool")],
+                         "…and its foreign row never joined alpha's group")
+        # the OWNER extending its own group is still fine
+        mine = dict(self.ROW, gid=500, host="TESTHOST-B", name="pool")
+        ok, unclaimed, _, _u = km._union_ops_merge([mine], [], ckey="ws:alpha")
+        self.assertTrue(ok)
+        self.assertEqual(len(km._union_ops_load()), 2)
+
+    def test_c_a_stored_future_stamp_clamps_instead_of_poisoning(self):
+        far = int(time.time()) + 2 * 86400
+        (km.jd.STATE / "union-gestures.json").write_text(json.dumps([
+            dict(self.ROW),
+            {"refusal": True, "gid": -777, "opId": "777", "name": "lake",
+             "host": "TESTHOST-B", "error": "x", "t": far}]))
+        rows = km._union_ops_echo()
+        self.assertIsNotNone(rows, "the journal reads PROVED — no upgrade hold")
+        self.assertFalse(km._union_unproved_marker().exists())
+        _ref = [r for r in rows if r.get("refusal")][0]
+        self.assertLessEqual(_ref["t"], time.time() + 5, "the stored stamp clamps on read")

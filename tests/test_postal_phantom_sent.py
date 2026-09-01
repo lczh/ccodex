@@ -2768,22 +2768,38 @@ class R62PostalAudit(unittest.TestCase):
                          "handoffDoneAck origin:null rejects the row")
         # …and a genuinely ORIGINLESS ack is content-bound too: a bare park that RECORDS
         # an origin belongs to a scoped ack and stays
+        # …when a same-mid SIBLING park makes the bare one ambiguous (the audit's
+        # executed shape). A LONE bare park is a legacy peer clearing its own
+        # pre-scoping park — the only ack it can send — and clears (r62 wave 2).
         d = pm.RECEIPTBOX / "peerX"
         d.mkdir(parents=True, exist_ok=True)
         (d / ("ee" * 16 + ".json")).write_text(json.dumps({"mid": "ee" * 16,
                                                           "origin": "ORIGIN-B"}))
+        (d / pm._receipt_park_name("ee" * 16, "ORIGIN-A")).write_text(
+            json.dumps({"mid": "ee" * 16, "origin": "ORIGIN-A"}))
         with contextlib.redirect_stderr(io.StringIO()):
             pm.receiptbox_del("peerX", "ee" * 16)
         self.assertTrue((d / ("ee" * 16 + ".json")).exists(),
-                        "the originless handoff ack left origin B's park alone")
+                        "ambiguous: the originless handoff ack left origin B's park alone")
+        (d / pm._receipt_park_name("ee" * 16, "ORIGIN-A")).unlink()
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm.receiptbox_del("peerX", "ee" * 16)
+        self.assertFalse((d / ("ee" * 16 + ".json")).exists(),
+                         "lone: the legacy peer's originless ack clears its park")
         r = pm.READBOX / "peerX"
         r.mkdir(parents=True, exist_ok=True)
         (r / ("ff" * 16 + ".json")).write_text(json.dumps({"mid": "ff" * 16,
                                                           "origin": "ORIGIN-B",
                                                           "unread": False}))
+        (r / pm._receipt_park_name("ff" * 16, "ORIGIN-A")).write_text(
+            json.dumps({"mid": "ff" * 16, "origin": "ORIGIN-A", "unread": False}))
         pm.readbox_del("peerX", {"mid": "ff" * 16, "unread": False})
         self.assertTrue((r / ("ff" * 16 + ".json")).exists(),
-                        "the originless read ack left origin B's park alone")
+                        "ambiguous: the originless read ack left origin B's park alone")
+        (r / pm._receipt_park_name("ff" * 16, "ORIGIN-A")).unlink()
+        pm.readbox_del("peerX", {"mid": "ff" * 16, "unread": False})
+        self.assertFalse((r / ("ff" * 16 + ".json")).exists(),
+                         "lone: the legacy peer's originless read ack clears its park")
 
     def test_b_the_collision_check_runs_after_the_fold(self):
         # r62 P2.9, executed: a fresh process consulted an EMPTY quarantine set, overwrote
@@ -2843,3 +2859,71 @@ class R62PostalAudit(unittest.TestCase):
         self.assertFalse(victim.exists())
         self.assertIn(str(pm.CORRUPT), seen, "the new corrupt/ level is fsync'd")
         self.assertIn(str(pm.CORRUPT / "victim"), seen, "…and its store subdir")
+
+
+
+class R62Wave2Postal(unittest.TestCase):
+    """the r62 verify round, postal half: the proof memo stored None and then read a
+    missing directory as proved; the quarantine move persisted the source removal before
+    the destination link."""
+
+    def setUp(self):
+        _reset()
+        shutil.rmtree(pm.STATE / "none-probe", ignore_errors=True)
+        shutil.rmtree(pm.CORRUPT, ignore_errors=True)
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_a_vanished_directory_is_never_memoized_as_proved(self):
+        base = pm.STATE / "none-probe"
+        real_gen_stat = pm.Path.stat
+        # the dir vanishes between the fsync and the memo stat
+        calls = []
+        def racing_fsync(p):
+            calls.append(str(p))
+            if str(p) == str(base / "a"):
+                shutil.rmtree(base, ignore_errors=True)   # the sweep lands right here
+        real = pm._fsync_dir
+        pm._fsync_dir = racing_fsync
+        try:
+            pm._mkdirs_durable(base / "a")
+        finally:
+            pm._fsync_dir = real
+        self.assertNotIn(str(base), pm._proved_dirs, "a gone dir is not memoized")
+        self.assertNotIn(str(base / "a"), pm._proved_dirs)
+        seen = []
+        def spy(p):
+            seen.append(str(p))
+            return real(p)
+        pm._fsync_dir = spy
+        try:
+            pm._mkdirs_durable(base / "a")               # the recreate
+        finally:
+            pm._fsync_dir = real
+        self.assertIn(str(base / "a"), seen, "the recreate is fsync'd, never skipped")
+
+    def test_b_the_quarantine_move_links_the_destination_before_unlinking_the_source(self):
+        victim = pm.STATE / "victim2.json"
+        victim.write_text("{garbage")
+        order = []
+        real = pm._fsync_dir
+        def spy(p):
+            order.append(str(p))
+            return real(p)
+        pm._fsync_dir = spy
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                pm._quarantine_corrupt_json(victim, "victim2", ValueError("x"))
+        finally:
+            pm._fsync_dir = real
+        dst = str(pm.CORRUPT / "victim2")
+        src = str(pm.STATE)
+        self.assertIn(dst, order)
+        self.assertIn(src, order)
+        # the chain proof fsyncs STATE early (as corrupt/'s parent) — the ORDERING that
+        # matters is the post-replace pair: the LAST dst fsync before the LAST src fsync
+        last_dst = len(order) - 1 - order[::-1].index(dst)
+        last_src = len(order) - 1 - order[::-1].index(src)
+        self.assertLess(last_dst, last_src,
+                        "the destination link is durable BEFORE the source removal")

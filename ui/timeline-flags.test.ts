@@ -2316,3 +2316,21 @@ test("r62: the reload-path refusal correlation is NAME-scoped — a colliding fo
                  host: "TESTHOST-A", name: "pool", error: "refused" }] }));
   assert.equal(fired.length, 1, "the same-name refusal still replays");
 });
+
+test("r62 wave 2: a colliding foreign refusal on a gid THIS panel minted is not tombstoned", () => {
+  // the minted/handled short-circuits stayed bare after r62 P2.6 — a foreign refusal
+  // whose opId equalled a gid this panel minted was judged ours and its journal row
+  // tombstoned, the one record the other gesture's reloading panel needed
+  const panel = drawnPanel();
+  panel._mintedGids = new Set([136]);
+  panel._mintedNames = new Map([[136, "pool"]]);
+  const fired: any[] = [];
+  panel.tagEditFailed = (m: any) => { fired.push(m); };
+  panel.update({ now, sessions: [sess("s1", "web", "#f7768e")], turns: {}, messages: [],
+                 judging: [], views: JSON.parse(JSON.stringify(VIEWS)),
+                 unionOps: [{ refusal: true, gid: -136, opId: "136", host: "TESTHOST-A",
+                              name: "otherTag", error: "refused" }] });
+  assert.ok(!(panel._retireUnionGids && panel._retireUnionGids.has(-136)),
+    "the foreign-name refusal is never tombstoned by this panel");
+  assert.equal(fired.length, 0);
+});
