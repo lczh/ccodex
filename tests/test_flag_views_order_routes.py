@@ -701,9 +701,12 @@ class R58AuditFixes(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             ok, _, reason, _u = km._union_ops_merge(
                 [{"host": "TESTHOST-A", "gid": -5, "refusal": True, "t": 1, "name": "x"}])
-        self.assertFalse(ok, "a refusal row reconstructs NOTHING")
-        self.assertIn("reconstruction", reason)
-        self.assertTrue(km._union_unproved_marker().exists(), "the hold stands")
+        self.assertTrue(ok, "a refusal JOURNALS even during the hold (r59 wave 2: memory-"
+                            "queued refusals were lost on restart)…")
+        self.assertTrue(km._union_unproved_marker().exists(),
+                        "…but it reconstructs NOTHING — the hold stands")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(km._union_ops_echo(), "echoes still hold")
         with contextlib.redirect_stderr(io.StringIO()):
             ok, _, reason, _u = km._union_ops_merge(
                 [dict(self.ROW, gid=911)], [], ckey="ws:y")

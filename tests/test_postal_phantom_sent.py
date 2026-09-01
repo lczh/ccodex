@@ -358,6 +358,8 @@ class R57PostalDurability(unittest.TestCase):
 
     def test_f_backflow_survives_the_restart(self):
         mid, bmid = "11" * 16, "22" * 16
+        pm._backflow_load()              # latch (ENOENT = provably empty): the save
+        #                                  refuses while unfolded since r59
         with pm._peer_lock:
             p = pm._peer_pending.setdefault(self.HOST, {"acks": [], "bounces": [],
                                                         "readAcks": [], "handoffDoneAcks": []})
@@ -994,8 +996,7 @@ class R59PostalAudit(unittest.TestCase):
     def test_b_unreadable_backflow_is_never_overwritten(self):
         # r59 P1.6, reproduced there: an injected read EIO over a durable old ACK, then
         # one new ACK — the rewrite kept only the new host
-        with pm._peer_lock:
-            pm._pending(self.HOST) if False else None
+        pm._backflow_load()              # latch (ENOENT = provably empty)
         p = pm._pending(self.HOST)
         with pm._peer_lock:
             p["acks"].append("d1" * 16)
@@ -1012,6 +1013,8 @@ class R59PostalAudit(unittest.TestCase):
                                  "the save is HELD while the ledger is unfolded")
         finally:
             os.chmod(pm._backflow_path(), 0o644)
+        pm._backflow_load()              # the heal folds BEFORE any save (r59 wave 2: the
+        #                                  save's own retry-fold resurrected retired acks)
         with pm._peer_lock:
             self.assertTrue(pm._backflow_save_locked(), "the healed save lands")
         d = json.loads(pm._backflow_path().read_text())
@@ -1059,11 +1062,15 @@ class R59PostalAudit(unittest.TestCase):
         pm.Path.unlink = boom_unlink
         try:
             with contextlib.redirect_stderr(io.StringIO()):
-                name = pm.deliver(SID, "peer", "77" * 16, "hello")
+                with self.assertRaises(pm._DeliverUndurable) as _ctx:
+                    pm.deliver(SID, "peer", "77" * 16, "hello")
+            name = str(_ctx.exception)
         finally:
             pm._fsync_dir = real_fsync_dir
             pm.Path.unlink = real_unlink
-        self.assertTrue((mb / "new" / name).exists(), "the mail is LIVE")
+        self.assertTrue((mb / "new" / name).exists(),
+                        "the mail is LIVE — and the DISTINCT raise means no ack ever "
+                        "correlates with it (r59 wave 2)")
         rows = [json.loads(l) for l in
                 (pm.TLDIR / "messages.jsonl").read_text().splitlines() if l.strip()]
         self.assertFalse(any(r.get("ev") == "unpublished" and r.get("id") == name

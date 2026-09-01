@@ -486,7 +486,18 @@ class KernelPipe {
   send(m: any) {
     const s = JSON.stringify(m);
     if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(s);
-    else {
+    else if (m?.type === "setUnionOps" || m?.type === "claimUnionGesture") {
+      // NEVER queued (r59 P1.1, reproduced: a retained journal body replaying after the
+      // reconnect carried the pre-reset world and forked one gesture into two claimable
+      // identities). And never SILENT either (r59 wave 2: the bare drop discarded a
+      // multi-owner tag edit with no journal, no dispatch, no error): the panel gets an
+      // INDETERMINATE ack through the same channel real kernel frames ride, so it unwinds
+      // and shows the may-not-have-saved error.
+      if (m.type === "setUnionOps" && m.opId) {
+        this.onDown({ type: "unionOpsAck", ok: false, opId: String(m.opId),
+                      indeterminate: true });
+      }
+    } else {
       // Held, not dropped — and the pane is told, so a message sent into a
       // down pipe never reads as delivered while it sits in limbo.
       this.queue.push({ s, intent: intentOp(m?.type) });

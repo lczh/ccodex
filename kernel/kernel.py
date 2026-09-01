@@ -2244,10 +2244,25 @@ def _union_tombs_load_locked():
     if _union_tombs_loaded[0]:
         return
     try:
-        d = json.loads(_union_tombs_path().read_text())
+        try:
+            d = json.loads(_union_tombs_path().read_text())
+        except ValueError:
+            d = None                                 # malformed = judged, like wrong-shape
         if not isinstance(d, dict):
-            sys.stderr.write("union-tombs: wrong-shaped ledger — holding (never loaded as "
-                             "empty; r59 P1.3)\n")
+            # JUDGED-bad bytes move aside and the ledger self-heals empty (r59 wave 2,
+            # reproduced: the bare hold was a PERMANENT wedge — every retirement refused
+            # for the life of the install with no repair path). The shield is bounded and
+            # expiring by design; a judged reset is honest. Transient faults still hold.
+            try:
+                _union_tombs_path().rename(_union_tombs_path().with_name(
+                    "union-tombs.json.corrupt-%d-%s" % (os.getpid(), os.urandom(8).hex())))
+                sys.stderr.write("union-tombs: judged-bad ledger moved aside — the shield "
+                                 "restarts empty\n")
+            except OSError:
+                sys.stderr.write("union-tombs: judged-bad ledger could not move aside — "
+                                 "holding this pass\n")
+                return
+            _union_tombs_loaded[0] = True
             return
         if isinstance(d, dict):
             _floor = time.time() - 7 * 86400   # the refusal rows' staleness precedent
@@ -2812,9 +2827,12 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
         ret = set()
         for g in (retired if isinstance(retired, list) else []):
             if not (isinstance(g, int) and not isinstance(g, bool)
-                    and 0 < g <= 2 ** 53 - 1):
+                    and g != 0 and -(2 ** 53 - 1) <= g <= 2 ** 53 - 1):
                 # REJECT the write (r59 P1.5, reproduced: retirement id 1.9 passed through
-                # int() and deleted gid 1 — a NEIGHBOR the sender never named)
+                # int() and deleted gid 1 — a NEIGHBOR the sender never named). NEGATIVE
+                # ids are the twin's refusal-row tombstones (r59 wave 2, reproduced: the
+                # positive-only bound rejected them and ONE refusal bricked every later
+                # sync from that panel).
                 return False, [], "malformed retirement (ids must be integers)", []
             ret.add(g)
         _unretired = []
@@ -2865,24 +2883,45 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             if _tombed:
                 inc = [r for r in inc if r.get("gid") not in _tombed]
         rows += [r for r in inc if r.get("gid") not in ret]
-        if _reconstructing and not any(isinstance(r, dict) and not r.get("refusal")
-                                       for r in inc):
-            # no LIVE-PANEL evidence survived the filters (r58 wave 2, reproduced twice; a
-            # salvaged base alone is kernel bookkeeping, not a vouching mirror — r59 P1.2).
-            # The hold stands; the write is refused retryable.
-            return False, [], "the journal is held for reconstruction — retry", []
+        _evidence = any(isinstance(r, dict) and not r.get("refusal") for r in inc)
+        if _reconstructing and not _evidence:
+            if any(isinstance(r, dict) and r.get("refusal") for r in inc) and not ret:
+                # REFUSAL rows journal even during the hold (r59 wave 2: they were queued
+                # in process memory and a restart silently lost the one compensation
+                # record) — they append to the salvaged base WITHOUT clearing the marker
+                pass
+            else:
+                # no LIVE-PANEL evidence survived the filters (r58 wave 2, reproduced
+                # twice; a salvaged base alone is kernel bookkeeping, not a vouching
+                # mirror — r59 P1.2). The hold stands; the write is refused retryable.
+                return False, [], "the journal is held for reconstruction — retry", []
         if len(rows) > _UNION_OPS_MAX:
             sys.stderr.write("union-gestures: %d rows exceed the %d high-water mark — "
                              "retaining ALL (rows retire on acked evidence or a refusal's "
                              "7d backstop, never by eviction)\n" % (len(rows), _UNION_OPS_MAX))
+        if ret:
+            # the SHIELD lands first (r59 wave 2, reproduced end-to-end: commit-then-refuse
+            # made the twin's definitive-refusal arm retire the already-committed successor
+            # — its effects never ran and the compensation record was erased everywhere).
+            # A shield for rows still resident is harmless: the resident exemption keeps
+            # them, and the 7d expiry retires unfinished shields.
+            with _union_claims_lock:
+                for g in ret:
+                    _union_retired_tombs[g] = time.time()
+                while len(_union_retired_tombs) > _UNION_TOMBS_MAX:
+                    _union_retired_tombs.pop(next(iter(_union_retired_tombs)))
+                if not _union_tombs_save_locked():
+                    return False, [], "the retirement's tombstone could not be persisted " \
+                                      "— retry", []
         try:
             _atomic_write(_union_ops_path(), json.dumps(rows, allow_nan=False))
         except Exception:
             sys.stderr.write("union-gestures save: %s\n" % traceback.format_exc())
             return False, [], "the journal write failed", []
-        if _reconstructing:
+        if _reconstructing and _evidence:
             # the panel's mirror REBUILT the judged store — the commit above replaced the
-            # preserved corrupt bytes atomically; the marker retires with them (r58 P1.1)
+            # preserved corrupt bytes atomically; the marker retires with them (r58 P1.1).
+            # A refusal-only append keeps the marker: the hold is not over (r59 wave 2).
             try:
                 _union_unproved_marker().unlink()
             except OSError:
@@ -2892,16 +2931,6 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
         with _union_claims_lock:
             for g in ret:
                 _union_claims.pop(g, None)       # claims retire WITH their rows (r55 P3.19)
-                _union_retired_tombs[g] = time.time()
-            while len(_union_retired_tombs) > _UNION_TOMBS_MAX:
-                _union_retired_tombs.pop(next(iter(_union_retired_tombs)))
-            _tombs_durable = _union_tombs_save_locked() if ret else True
-        if ret and not _tombs_durable:
-            # the rows are gone from the journal (idempotent on the retry) but the SHIELD
-            # is not durable (r59 P1.3, reproduced: an injected ENOSPC still acked, and a
-            # modeled restart let a stale replay resurrect and reclaim the retired
-            # gesture) — refuse retryable; the twin re-sends and the save retries
-            return False, [], "the retirement's tombstone could not be persisted — retry", []
         # the implicit writer claims decide against the rows JUST written, under the same
         # lock pass (r55 P1.4) — never a separate read the world can move between
         unclaimed = _union_claim_entries(inc, ckey, _rows=rows) if ckey else []
@@ -6417,6 +6446,7 @@ def _auto_resume_retry(now, tmux):
 # STATE/retry-suppressed.json {sid: stop_ts}. A sid present = suppressed; stop_ts is the re-arm floor (only a
 # successful turn AFTER it lifts the suppression). _auto_resume_session_retry clears re-armed sids each tick.
 _retry_suppress_cache = {}   # str(path) -> ((dev,ino,mtime_ns,size), dict)
+_suppress_boot_warned = [False]
 _retry_suppress_pending = {}   # sid -> t: suppressions minted while the store was
 #                                unreadable (r59 P1.4) — consulted by the membership read
 #                                and folded into the next successful RMW, so an interrupt
@@ -6432,7 +6462,13 @@ def _retry_suppress_data():
         return {}
     except OSError:
         hit = _retry_suppress_cache.get(str(p))
-        return hit[1] if hit else {}                 # LKG, never a cached fabrication
+        d = dict(hit[1]) if hit else {}              # LKG, never a cached fabrication
+        d.update(_retry_suppress_pending)
+        if not hit and not _retry_suppress_pending and not _suppress_boot_warned[0]:
+            _suppress_boot_warned[0] = True
+            sys.stderr.write("retry-suppressed: unreadable with NO history — standing "
+                             "suppressions are invisible until it reads (r59 wave 2)\n")
+        return d
     hit = _retry_suppress_cache.get(str(p))
     if hit and hit[0] == key:
         return hit[1]
@@ -6447,8 +6483,16 @@ def _retry_suppress_data():
         # reproduced: the fabricated {} was cached under the real generation — standing
         # suppressions read as gone, and the next arm erased the siblings durably)
         hit = _retry_suppress_cache.get(str(p))
-        return hit[1] if hit else {}
+        d = dict(hit[1]) if hit else {}
+        d.update(_retry_suppress_pending)
+        return d
     _retry_suppress_cache[str(p)] = (key, d)
+    if _retry_suppress_pending:
+        return dict(d, **_retry_suppress_pending)    # the overlay is VISIBLE (r59 wave 2,
+        #                                              reproduced: _auto_resume_session_retry
+        #                                              iterated the durable map only, so an
+        #                                              overlay-held suppression could never
+        #                                              be lifted by the successful turn)
     return d
 
 
@@ -6466,21 +6510,38 @@ def _suppress_session_retry(sid):
         sid = jd.canonicalize_session_identity(str(sid))
         p = jd.STATE / "retry-suppressed.json"
         try:
-            d = jd.canonicalize_retry_suppressed_identity(
-                _proved_ledger_read(p, "retry-suppressed", {}))
-            if not isinstance(d, dict):
-                d = {}
-        except _StateUnreadable:
-            # the store is unreadable: the suppression LANDS in memory (the storm stays
-            # dead) and folds into the next successful RMW — never a fabricated {} written
-            # over standing siblings (r59 P1.4, reproduced: arming s3 persisted ONLY s3)
+            raw = p.read_text()
+        except FileNotFoundError:
+            d = {}
+        except OSError:
             _retry_suppress_pending[sid] = time.time()
             sys.stderr.write("retry-suppressed: store unreadable — suppression for %s "
                              "held in memory until it reads again\n" % sid)
             return
+        else:
+            try:
+                d = jd.canonicalize_retry_suppressed_identity(json.loads(raw))
+                if not isinstance(d, dict):
+                    raise ValueError("retry-suppressed is not a dict")
+            except Exception:
+                # MALFORMED/wrong-shape is a fault here too (r59 wave 2: the quarantining
+                # proved-read defaulted to {} and the write erased every sibling the
+                # judged-aside bytes still held) — the overlay holds; the bytes stand
+                _retry_suppress_pending[sid] = time.time()
+                sys.stderr.write("retry-suppressed: store malformed — suppression for %s "
+                                 "held in memory; the bytes stand for repair\n" % sid)
+                return
         d.update(_retry_suppress_pending)
         d[sid] = time.time()
-        _atomic_write(p, json.dumps(d, sort_keys=True))
+        try:
+            _atomic_write(p, json.dumps(d, sort_keys=True))
+        except OSError:
+            # a WRITE fault also lands in the overlay (r59 wave 2: ENOSPC raised into the
+            # interrupt handler and the suppression evaporated — the storm resumed)
+            _retry_suppress_pending[sid] = time.time()
+            sys.stderr.write("retry-suppressed: write failed — suppression for %s held "
+                             "in memory until the store accepts writes\n" % sid)
+            return
         _retry_suppress_pending.clear()
         _retry_suppress_cache.clear()
 

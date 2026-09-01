@@ -379,7 +379,15 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
         #  ^ the v1.3.30 spelling (r58 wave 2: pre-upgrade unread/read files wore r-<mid>;
         #    invisible to the digest skip, a crash replay re-delivered them — read included)
         try:
-            if ((mb / "new" / name).exists() or (mb / "cur" / name).exists()
+            if (mb / "new" / name).exists():
+                try:
+                    _fsync_dir(mb / "new")           # the replay retries the durability a
+                    _fsync_dir(mb)                   # _DeliverUndurable delivery missed
+                    _fsync_dir(MAILROOT)             # (r59 wave 2)
+                except OSError:
+                    raise _DeliverUndurable(name)
+                return name
+            if ((mb / "cur" / name).exists()
                     or (_legacy and ((mb / "new" / _legacy).exists()
                                      or (mb / "cur" / _legacy).exists()))):
                 # the SAME relayed delivery already stands — unread or already READ (the
@@ -476,15 +484,18 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
             try:
                 (mb / "new" / name).unlink()   # withdraw: never let an un-durable publish
             except OSError:
-                # the withdraw ALSO failed: the mail is VISIBLE and possibly durable —
-                # raising here fed the unpublished-compensation arm while the file lived,
-                # leaving contradictory permanent accounting (r59 P1.9, reproduced).
-                # Treat as delivered-with-degraded-durability, loudly.
-                sys.stderr.write("postal: %s delivered but its durability could not be "
-                                 "proven NOR withdrawn — treating as live\n" % name)
+                # the withdraw ALSO failed: the mail is VISIBLE but unproven — a DISTINCT
+                # raise (r59 wave 2, reproduced: treating it as delivered let the durable
+                # seen-append correlate with mail a crash could lose; and the plain raise
+                # fed the unpublished-compensation arm while the file lived). No ack, no
+                # compensation: the peer re-sends and the replay's skip retries the fsyncs.
+                sys.stderr.write("postal: %s is visible but not provably durable — no ack; "
+                                 "the sender re-sends\n" % name)
                 _mark_pending(to_id)
-                return name
+                raise _DeliverUndurable(name)
             raise
+    except _DeliverUndurable:
+        raise                           # visible-but-unproven: NEVER compensated (r59 wave 2)
     except Exception:
         try:
             tmp.unlink()                # a failed publish must not leave a tmp/ file that reads
@@ -1922,7 +1933,10 @@ class Handler(BaseHTTPRequestHandler):
             mid = str(data.get("mid") or "")       # blocked card via the kernel; approve delivers, deny drops
             action = str(data.get("action") or "").strip().lower()
             text = data.get("text")                # optional human-edited body for approve
-            ok, err = quarantine_decide(mid, action, text, feedback=data.get("feedback"))
+            ok, err = quarantine_decide(mid, action, text, feedback=data.get("feedback"),
+                                        origin=(str(data.get("origin"))
+                                                if _safe_id(str(data.get("origin") or ""))
+                                                else None))
             return self._send({"ok": ok} if ok else {"ok": False, "error": err}, 200 if ok else 400)
         self._send({"error": "not found"}, 404)
 
@@ -3380,6 +3394,13 @@ class _ExchangeNotDurable(Exception):
     an error instead of 200, so the peer re-sends — every arm is idempotent."""
 
 
+class _DeliverUndurable(RuntimeError):
+    """The mail is VISIBLE in new/ but neither its durability nor its withdrawal could be
+    proven (r59 wave 2, reproduced: returning it as delivered let the durable seen-append
+    correlate with mail a crash could still lose — the r58 P1.7 shape through the
+    double-fault arm). Callers drop WITHOUT acking; the replay retries the fsyncs."""
+
+
 class _PublishNeverStarted(OSError):
     """Typed pre-publication failure (the r55 audit's P1.7): ONLY this may reach the
     caller's `unpublished` compensation. Any failure past the point publication may have
@@ -4010,7 +4031,12 @@ def _peer_read_ack_rows(value):
             continue
         mid = row.get("mid")
         if isinstance(mid, str) and _safe_id(mid):
-            out.append({"mid": mid, "unread": bool(row.get("unread"))})
+            keep = {"mid": mid, "unread": bool(row.get("unread"))}
+            if isinstance(row.get("origin"), str) and _safe_id(row["origin"]):
+                keep["origin"] = row["origin"]   # the scoped park's key (r59 wave 2:
+                #                                  origin-less acks could never clear it
+                #                                  and the receipt re-rode forever)
+            out.append(keep)
     return out
 
 
@@ -4207,28 +4233,44 @@ def quarantine_list():
     out.sort(key=lambda r: r.get("at") or 0, reverse=True)
     return out
 
-def _quarantine_paths(mid):
-    """Every held file for `mid`: the origin-scoped spelling(s) plus the legacy bare one
-    (r59 P1.8 — holds are origin-scoped now; 128-bit mids make multi-origin same-mid holds
-    an attack shape, and ALL of them are the mid's holds)."""
+def _quarantine_paths(mid, origin=None):
+    """Every held file for EXACTLY `mid`: content-matched, never globbed (r59 wave 2,
+    reproduced: dots are legal in mids, so the mid-M glob reached mid M.x's holds). With
+    an origin, exactly that origin's hold (both hash spellings) plus the legacy bare one."""
     if not _safe_id(mid):
         return []
-    out = [p for p in QUARANTINE.glob(mid + ".*.json")]
-    if (QUARANTINE / (mid + ".json")).exists():
-        out.append(QUARANTINE / (mid + ".json"))
+    if origin is not None and origin != "":
+        out = []
+        for name in (_receipt_park_name(mid, origin), _receipt_park_name_v58(mid, origin),
+                     mid + ".json"):
+            p = QUARANTINE / name
+            if p.exists():
+                out.append(p)
+        return out
+    out = []
+    try:
+        for p in QUARANTINE.glob("*.json"):
+            try:
+                rec = json.loads(p.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(rec, dict) and rec.get("mid") == mid:
+                out.append(p)
+    except OSError:
+        pass
     return out
 
-def quarantine_get(mid):
-    for p in _quarantine_paths(mid):
+def quarantine_get(mid, origin=None):
+    for p in _quarantine_paths(mid, origin):
         try:
             return json.loads(p.read_text())
         except (OSError, ValueError):
             continue
     return None
 
-def quarantine_del(mid):
+def quarantine_del(mid, origin=None):
     ok = False
-    for p in _quarantine_paths(mid):
+    for p in _quarantine_paths(mid, origin):
         try:
             p.unlink()
             ok = True
@@ -4236,7 +4278,7 @@ def quarantine_del(mid):
             pass
     return ok
 
-def quarantine_decide(mid, action, text=None, feedback=None):
+def quarantine_decide(mid, action, text=None, feedback=None, origin=None):
     """Approve (deliver, optionally with human-edited text) or deny (drop) a held message. Returns
     (ok, error). Approve replays the deliver() the gate would have run for a trusted peer, so the
     message lands as normal postal mail (from-attribution intact). The mid was already peer_seen'd at
@@ -4246,11 +4288,41 @@ def quarantine_decide(mid, action, text=None, feedback=None):
     origin host's outbox as ordinary store-and-forward mail from the postal service (so the sender's
     agent learns why instead of waiting forever), delivered on the next exchange and judged by the
     origin host's own trust gate like any inbound mail."""
-    rec = quarantine_get(mid)
-    if rec is None:
+    _paths = _quarantine_paths(mid, origin)
+    _recs = []
+    for _p in _paths:
+        try:
+            _r = json.loads(_p.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(_r, dict):
+            _recs.append((_p, _r))
+    if not _recs:
         return False, "no held message '%s'" % mid
+    if action == "approve" and text is not None and str(text).strip() and len(_recs) > 1:
+        # the human edited ONE body they saw — applying it to EVERY origin's hold would
+        # deliver words no sender wrote (r59 wave 2: one verdict acted on an arbitrary
+        # origin's record and unlinked ALL same-mid holds)
+        return False, ("%d different origins hold mid '%s' — decide each origin's message "
+                       "separately" % (len(_recs), mid))
+    _first_err = None
+    for _p, rec in _recs:
+        _ok, _err = _quarantine_decide_one(_p, rec, action, text, feedback)
+        if not _ok and _first_err is None:
+            _first_err = _err
+    return (_first_err is None), _first_err
+
+
+def _quarantine_decide_one(path, rec, action, text, feedback):
+    """One verdict, one HOLD (r59 wave 2): each origin's record delivers its OWN body and
+    unlinks its OWN file — never a sibling's."""
+    def quarantine_del_one():
+        try:
+            path.unlink()
+        except OSError:
+            pass
     if action == "deny":
-        quarantine_del(mid)
+        quarantine_del_one()
         note = " ".join(str(feedback or "").split())
         if note and rec.get("origin") and rec.get("frm"):
             gist = " ".join(str(rec.get("body") or "").split())[:60]
@@ -4282,7 +4354,7 @@ def quarantine_decide(mid, action, text=None, feedback=None):
         deliver(to_id, rec.get("frm") or "?", rec.get("frmId") or "", body, kind=rec.get("kind") or "",
                 from_host=rec.get("origin") or "",
                 relay_mid=rec.get("mid") or "", relay_via=rec.get("via") or rec.get("origin") or "")
-        quarantine_del(mid)
+        quarantine_del_one()
         return True, None
     return False, "unknown action '%s' (approve|deny)" % action
 
@@ -4449,9 +4521,14 @@ def _relay_in(host, m, token_proven=False):
                     htrust = "trusted"               # token possession is already full control here (see docstring)
                 trust = least_trust(trust, htrust)
             if trust == "trusted":
-                deliver(match[0]["id"], m.get("frm") or "?", m.get("frm_id") or "", m.get("body") or "",
-                        kind=m.get("kind") or "", from_host=origin,
-                        relay_mid=mid, relay_via=host)   # read-receipt route: back through the direct peer
+                try:
+                    deliver(match[0]["id"], m.get("frm") or "?", m.get("frm_id") or "",
+                            m.get("body") or "", kind=m.get("kind") or "", from_host=origin,
+                            relay_mid=mid, relay_via=host)   # read-receipt route: back through the direct peer
+                except _DeliverUndurable:
+                    return "drop", None              # visible-but-unproven (r59 wave 2):
+                    #                                  no seen entry, no ack — the peer
+                    #                                  re-sends and the replay retries
             elif trust == "directed":
                 if not _quarantine_put(origin, m, match[0]["id"], via=host):
                     return "drop", None              # no ack: retry after the local write failure
@@ -4500,7 +4577,18 @@ def _bounced_done_load():
         return
     try:
         d = json.loads(_bounced_done_path().read_text())
-        if isinstance(d, dict):
+        if not isinstance(d, dict):
+            # JUDGED-bad: move aside and restart empty (r59 wave 2: loaded-as-empty PLUS
+            # latched meant the unreadable-settlement hold never engaged and the sender
+            # was re-noted) — the r53 duplicate-over-lost trade, but judged and loud
+            try:
+                _bounced_done_path().rename(_bounced_done_path().with_name(
+                    "bounced-done.json.corrupt-%d-%s" % (os.getpid(), os.urandom(8).hex())))
+                _log("bounced-done ledger wrong-shaped — moved aside; settlement restarts")
+            except OSError:
+                _log("bounced-done ledger wrong-shaped and immovable — holding")
+                return
+        else:
             _bounced_done.update({str(k): v for k, v in d.items()})
     except FileNotFoundError:
         pass                                         # provably no ledger yet
@@ -4596,6 +4684,8 @@ def _ack_arrived(host, mid):
         # spent the source — now the source survives and the exchange re-sends)
         p = _pending(msg["origin"])
         with _peer_lock:
+            if not _backflow_loaded[0]:
+                _backflow_load_locked()  # fold before mutating (r59 wave 2)
             if mid not in p["acks"]:
                 p["acks"].append(mid)
             _saved = _backflow_save_locked()
@@ -4637,6 +4727,8 @@ def _bounce_arrived(host, b):
     if msg and msg.get("origin"):
         p = _pending(msg["origin"])
         with _peer_lock:
+            if not _backflow_loaded[0]:
+                _backflow_load_locked()  # fold before mutating (r59 wave 2)
             if bounce not in p["bounces"]:
                 p["bounces"].append(bounce)
             _saved = _backflow_save_locked()   # durable BEFORE the downstream source dies (r57)
@@ -4658,8 +4750,6 @@ def _backflow_save_locked():
     forwarded ack's durable downstream source was deleted with the backward state held only
     in memory — one dropped HTTP response and the origin never learned its mail landed).
     Caller holds _peer_lock. Best-effort with a loud log: the queues still run in memory."""
-    if not _backflow_loaded[0]:
-        _backflow_load_locked()          # one retry per save attempt (caller holds the lock)
     if not _backflow_loaded[0]:
         _log("peer-backflow ledger still unfolded — save held (r59 P1.6, reproduced: the "
              "rewrite kept only the new host and lost a durable ack)")
@@ -4797,6 +4887,10 @@ def peer_exchange_handle(data):
     #                                                  confirm, so its slice re-rode forever
     #                                                  (the r58 audit's mixed-version note)
     with _peer_lock:
+        if not _backflow_loaded[0]:
+            _backflow_load_locked()      # fold BEFORE mutating (r59 wave 2: folding inside
+            #                              the SAVE resurrected acks this very section had
+            #                              just retired)
         _ifa = set(_p0.pop("_inflight_acks", []) or [])
         _ifb = set(_p0.pop("_inflight_bounces", []) or [])
         if _legacy_dialer and (_ifa or _ifb):
@@ -4995,7 +5089,8 @@ def peer_exchange_apply(host, req_sent, resp):
         if _read_arrived(host, r) is False:
             continue   # not durably applied (r56 P1.10): no ack — the remote keeps its copy
         with _peer_lock:
-            p["readAcks"].append({"mid": r.get("mid"), "unread": bool(r.get("unread"))})
+            p["readAcks"].append(dict({"mid": r.get("mid"), "unread": bool(r.get("unread"))},
+                                      **({"origin": r["origin"]} if r.get("origin") else {})))
     for hd in _receipt_rows(resp.get("handoffDone")):   # completion receipts: same apply-then-ack
         if _handoff_done_arrived(host, hd) is False:
             continue   # not durably applied (r56 P1.10): no ack — the remote keeps its copy
