@@ -209,12 +209,14 @@ class R57AuditFixes(unittest.TestCase):
 
     def test_d_inf_rekey_refuses_instead_of_500(self):
         # r57 P2.14: json.loads accepts bare Infinity; int(float('inf')) raised
-        # OverflowError past the (TypeError, ValueError) net and 500'd the POST
+        # OverflowError past the (TypeError, ValueError) net and 500'd the POST.
+        # Since r60 P1.1 the refusal is the STRICT malformed-ids arm (never coerced),
+        # still a clean refusal, never a 500 — the point this test pins.
         self.assertTrue(km._union_ops_set([dict(self.ROW)]))
         ok, _, reason, _u = km._union_ops_merge(
             [], [], ckey="ws:x", rekey={"ogid": float("inf"), "gid": 8, "epoch": 1})
         self.assertFalse(ok)
-        self.assertIn("claim", reason, "an unparseable rekey is a stale-claim refusal")
+        self.assertIn("malformed", reason, "an unparseable rekey refuses loudly, never 500s")
 
     def test_e_foreign_claimed_retirement_is_skipped_and_named(self):
         # r57 P2.12: the skip protected the claimant but was SILENT — the bystander panel
@@ -1422,13 +1424,15 @@ class PerFileOpSpool(unittest.TestCase):
         rows = [{"host": "TESTHOST-A", "name": "pool", "gid": 3,
                  "edit": {"remove": ["s1"]}, "inverse": {"tag": "g1", "add": ["s1"]},
                  "rt": {"id": "TESTHOST-A:r1", "host": "TESTHOST-A", "name": "pool"},
-                 "oldName": "pool", "oldColor": "", "post": {}, "confirmed": False}]
+                 "oldName": "pool", "oldColor": "", "post": {}, "confirmed": False,
+                 "dispatched": False}]
         self.assertTrue(km._union_ops_set(rows))
         self.assertEqual(km._union_ops_load(), rows)
         # per-gid MERGE (the r49 verification): a second panel's sync must not clobber this
         # entry — omission is not retirement
         other = [{"host": "TESTHOST-B", "name": "crew", "gid": 9, "edit": {}, "inverse": {},
-                  "rt": {}, "oldName": "crew", "oldColor": "", "post": {}, "confirmed": False}]
+                  "rt": {}, "oldName": "crew", "oldColor": "", "post": {}, "confirmed": False,
+                  "dispatched": False}]
         self.assertTrue(km._union_ops_set(other))
         got = km._union_ops_load()
         self.assertEqual(len(got), 2, "both panels' entries coexist — no last-writer-wins")
@@ -1439,7 +1443,8 @@ class PerFileOpSpool(unittest.TestCase):
                                            retired=[9]),
                          "r59 P1.5: non-dict junk REJECTS the whole write — the silent "
                          "drop acked a journal missing a row its sender believed durable")
-        self.assertTrue(km._union_ops_set([{"host": "TESTHOST-B", "gid": 9}], retired=[9]))
+        self.assertTrue(km._union_ops_set(
+            [{"host": "TESTHOST-B", "gid": 9, "dispatched": False}], retired=[9]))
         self.assertEqual(km._union_ops_load(), [],
                          "a retired gid wins over its own upsert")
 
@@ -1492,7 +1497,7 @@ class R50UnionJournalLock(unittest.TestCase):
                 km._union_ops_set([{"host": "TESTHOST-%d" % w, "name": "t%d" % gid,
                                     "gid": gid, "edit": {}, "inverse": {}, "rt": {},
                                     "oldName": "", "oldColor": "", "post": {},
-                                    "confirmed": False}])
+                                    "confirmed": False, "dispatched": False}])
         ts = [threading.Thread(target=worker, args=(w,)) for w in range(n)]
         for t in ts:
             t.start()
@@ -1542,7 +1547,8 @@ class R50RefusalExpiryAndCap(unittest.TestCase):
     def test_gesture_entries_never_expire_by_age(self):
         now = int(__import__("time").time())
         km._union_ops_set([{"host": "TESTHOST-A", "gid": 5, "t": now - 30 * 86400,
-                            "edit": {}, "inverse": {}, "rt": {}, "name": "pool"}])
+                            "edit": {}, "inverse": {}, "rt": {}, "name": "pool",
+                            "dispatched": False}])
         km._union_ops_set([])
         self.assertEqual([r["gid"] for r in km._union_ops_load()], [5],
                          "in-flight GESTURES settle on evidence, never a clock")
@@ -1554,11 +1560,13 @@ class R50RefusalExpiryAndCap(unittest.TestCase):
         # are the panel's un-acknowledged writes: an ok ack means EVERY one of them persisted;
         # _UNION_OPS_MAX is a loud high-water mark now, never an eviction.
         rows = [{"host": "TESTHOST-A", "gid": i, "edit": {}, "inverse": {}, "rt": {},
-                 "name": "t%d" % i} for i in range(1, km._UNION_OPS_MAX + 1)]
+                 "name": "t%d" % i, "dispatched": False}
+                for i in range(1, km._UNION_OPS_MAX + 1)]
         self.assertTrue(km._union_ops_set(rows))
         with contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertTrue(km._union_ops_set([{"host": "TESTHOST-B", "gid": 9999, "edit": {},
-                                                "inverse": {}, "rt": {}, "name": "fresh"}]))
+                                                "inverse": {}, "rt": {}, "name": "fresh",
+                                                "dispatched": False}]))
         gids = [r["gid"] for r in km._union_ops_load()]
         self.assertIn(9999, gids, "the row the ok:true ack just promised persisted")
         self.assertEqual(len(gids), km._UNION_OPS_MAX + 1,
@@ -2120,13 +2128,15 @@ class R52ProvedReads(unittest.TestCase):
 
     def test_the_union_merge_refuses_an_unproved_read(self):
         self.assertTrue(km._union_ops_set([{"host": "TESTHOST-A", "gid": 1, "edit": {},
-                                            "inverse": {}, "rt": {}, "name": "pool"}]))
+                                            "inverse": {}, "rt": {}, "name": "pool",
+                                            "dispatched": False}]))
         real = km._union_ops_path
         try:
             km._union_ops_path = lambda: self._BadPath(real())
             with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
                 ok = km._union_ops_set([{"host": "TESTHOST-B", "gid": 2, "edit": {},
-                                         "inverse": {}, "rt": {}, "name": "crew"}])
+                                         "inverse": {}, "rt": {}, "name": "crew",
+                                         "dispatched": False}])
         finally:
             km._union_ops_path = real
         self.assertFalse(ok, "EIO used to read as an EMPTY journal — the merge then "
@@ -2334,7 +2344,8 @@ class R53ProvedSnapshots(unittest.TestCase):
 
     def test_the_journal_echo_marks_unavailability(self):
         self.assertTrue(km._union_ops_set([{"host": "TESTHOST-A", "gid": 7, "edit": {},
-                                            "inverse": {}, "rt": {}, "name": "pool"}]))
+                                            "inverse": {}, "rt": {}, "name": "pool",
+                                            "dispatched": False}]))
         real = km._union_ops_path
         try:
             km._union_ops_path = lambda: self._BadPath(real())
@@ -3163,3 +3174,302 @@ class R56AuditFixes(unittest.TestCase):
         self.assertEqual([s["sid"] for s in out], [s["sid"] for s in sessions],
                          "input-ordered render this pass")
         self.assertEqual(km._session_order(), [self.SID], "…and the saved order is UNTOUCHED")
+
+
+class R60AuditFixes(unittest.TestCase):
+    """the v1.3.32 audit, kernel half (9 P1 / 5 P2 against c8607b6f): the rekey CAS never
+    required its successor rows (P1.1), the tomb/journal transaction was not failure-atomic
+    (P1.2), a judged-bad tomb ledger failed OPEN (P1.3), the row validator accepted missing
+    dispatched and string booleans (P1.4), the suppression overlay vanished on cache-hit and
+    ENOENT arms (P2.3), and the portable quarantine restore could clobber a newer commit
+    (P2.5)."""
+
+    ROW = {"host": "TESTHOST-A", "gid": 801, "edit": {}, "inverse": {}, "rt": {},
+           "name": "pool", "dispatched": False}
+    SUCC = {"host": "TESTHOST-A", "gid": 802, "ogid": 801, "olin": [801], "rid": 801,
+            "edit": {}, "inverse": {}, "rt": {}, "name": "pool", "dispatched": False}
+
+    def setUp(self):
+        _scrub_state()
+        km._union_claims.clear()
+        km._union_retired_tombs.clear()
+        km._union_tombs_loaded[0] = False
+        km._retry_suppress_cache.clear()
+        km._retry_suppress_pending.clear()
+        for name in ("union-gestures.json", "union-gestures.json.unproved",
+                     "union-tombs.json", "union-tombs.json.hold", "retry-suppressed.json"):
+            try:
+                (km.jd.STATE / name).unlink()
+            except OSError:
+                pass
+        for f in list(km.jd.STATE.glob("*.corrupt-*")) + list(km.jd.STATE.glob("pq-*")):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def _fold_tombs(self):
+        with km.jd._identity_file_lock():
+            km._union_tombs_load_locked()
+
+    def test_a_completion_with_no_successor_rows_is_refused(self):
+        # r60 P1.1, the audit's exact executed shape: a queued Electron completion whose
+        # gesture a refusal consumed rebuilt its body at the send head — entries=[] with
+        # the STALE rekey — and the kernel accepted it, retiring the original against
+        # nothing while the acked gate ran the rolled-back effects
+        self.assertTrue(km._union_ops_set([dict(self.ROW)]))
+        ep = km._union_claim_grant(801, "ws:x")
+        self.assertIsNotNone(ep)
+        ok, _, reason, _u = km._union_ops_merge(
+            [], [801], ckey="ws:x", rekey={"ogid": 801, "gid": 802, "epoch": ep})
+        self.assertFalse(ok, "an empty-bodied completion is refused")
+        self.assertIn("successor", reason or "")
+        self.assertEqual([r["gid"] for r in km._union_ops_load()], [801],
+                         "the original row stands — nothing was retired against nothing")
+        ok, _, _, _u = km._union_ops_merge(
+            [dict(self.SUCC)], [801], ckey="ws:x",
+            rekey={"ogid": 801, "gid": 802, "epoch": ep})
+        self.assertTrue(ok, "the same completion CARRYING its successor commits")
+        self.assertEqual([r["gid"] for r in km._union_ops_load()], [802])
+
+    def test_b_rekey_ids_are_strict_never_coerced(self):
+        # r60 P1.1: int() accepted fractional ids — a rekey naming ogid 801.9 cleared the
+        # CAS against gid 801, a neighbor the panel never named
+        self.assertTrue(km._union_ops_set([dict(self.ROW)]))
+        ep = km._union_claim_grant(801, "ws:x")
+        for bad in ({"ogid": 801.9, "gid": 802, "epoch": ep},
+                    {"ogid": 801, "gid": 802.5, "epoch": ep},
+                    {"ogid": 801, "gid": 802, "epoch": float(ep)},
+                    {"ogid": 801, "gid": 0, "epoch": ep},
+                    {"ogid": 801, "gid": True, "epoch": ep}):
+            ok, _, reason, _u = km._union_ops_merge(
+                [dict(self.SUCC)], [801], ckey="ws:x", rekey=bad)
+            self.assertFalse(ok, "coerced rekey ids are refused: %r" % (bad,))
+            self.assertIn("malformed", reason or "")
+        self.assertEqual([r["gid"] for r in km._union_ops_load()], [801])
+
+    def test_c_half_committed_retirement_retry_keeps_the_successor(self):
+        # r60 P1.2(a), reproduced by the audit: tomb saved, journal write failed, restart —
+        # the retry's successor hit its ogid's standing tomb, was DROPPED, and the merge
+        # acked an EMPTY journal over the live gesture. A row whose ancestor still stands
+        # in cur is a live completion of an UNRETIRED gesture, never a replay.
+        self.assertTrue(km._union_ops_set([dict(self.ROW)]))
+        self._fold_tombs()
+        with km._union_claims_lock:
+            km._union_retired_tombs[801] = __import__("time").time()
+            km._union_tombs_save_locked()
+        ok, _, _, _u = km._union_ops_merge([dict(self.SUCC)], [801], ckey="ws:retry")
+        self.assertTrue(ok)
+        self.assertEqual([r["gid"] for r in km._union_ops_load()], [802],
+                         "the retry lands the successor and retires the original")
+        # …while a replay of a FULLY-retired gesture (rows gone) still drops
+        ok, _, _, _u = km._union_ops_merge([dict(self.ROW)], [], ckey="ws:ghost")
+        self.assertTrue(ok)
+        self.assertNotIn(801, [r["gid"] for r in km._union_ops_load()],
+                         "a tombstoned replay with no resident ancestor stays dead")
+
+    def test_d_tomb_save_failure_restores_the_evicted_shields(self):
+        # r60 P1.2(b), reproduced by the audit: an ENOSPC save at the cap evicted an older
+        # shield from MEMORY even though nothing persisted — a same-process replay of that
+        # retired gesture was accepted
+        self._fold_tombs()
+        now = __import__("time").time()
+        with km._union_claims_lock:
+            for g in (11, 12, 13):
+                km._union_retired_tombs[g] = now
+            self.assertTrue(km._union_tombs_save_locked())
+        real_max = km._UNION_TOMBS_MAX
+        km._UNION_TOMBS_MAX = 3
+        real_write = km._atomic_write
+        def failing_write(path, data):
+            if "union-tombs" in str(path):
+                raise OSError(28, "No space left on device")
+            return real_write(path, data)
+        try:
+            km._atomic_write = failing_write
+            with contextlib.redirect_stderr(io.StringIO()):
+                ok, _, reason, _u = km._union_ops_merge([], [99], ckey="ws:x")
+        finally:
+            km._atomic_write = real_write
+            km._UNION_TOMBS_MAX = real_max
+        self.assertFalse(ok)
+        self.assertIn("tombstone", reason or "")
+        self.assertEqual(sorted(km._union_retired_tombs), [11, 12, 13],
+                         "the failed transaction left the shield map EXACTLY as it was — "
+                         "no eviction spent, no unpersisted mint standing")
+
+    def test_e_judged_bad_tombs_ledger_holds_then_expires(self):
+        # r60 P1.3, reproduced by the audit: judged-bad bytes moved aside and the shield
+        # restarted EMPTY — a stale replay of a retired completion was accepted and
+        # claimable again. Now: a durable hold for the shield's own 7d horizon (the r59
+        # permanent wedge is gone — the hold retires itself when every tomb it could have
+        # protected has expired anyway).
+        (km.jd.STATE / "union-tombs.json").write_text("{corrupt")
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok, _, reason, _u = km._union_ops_merge([], [55], ckey="ws:x")
+        self.assertFalse(ok, "a retirement under the judged-bad shield refuses retryable")
+        self.assertIn("tombstone", reason or "")
+        self.assertTrue((km.jd.STATE / "union-tombs.json.hold").exists(),
+                        "the hold marker is durable")
+        self.assertFalse((km.jd.STATE / "union-tombs.json").exists(),
+                         "the judged bytes moved aside for forensics")
+        # non-retirement merges still flow during the hold
+        ok, _, _, _u = km._union_ops_merge([dict(self.ROW)], [], ckey="ws:x")
+        self.assertTrue(ok, "plain merges are not hostage to the shield hold")
+        # the horizon passes: the hold retires itself and the shield restarts empty
+        (km.jd.STATE / "union-tombs.json.hold").write_text(
+            "%d" % int(__import__("time").time() - 8 * 86400))
+        km._union_tombs_loaded[0] = False
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok, _, _, _u = km._union_ops_merge([], [55], ckey="ws:x")
+        self.assertTrue(ok, "after 7d every held shield has expired — retirement resumes")
+        self.assertFalse((km.jd.STATE / "union-tombs.json.hold").exists())
+
+    def test_f_a_fifo_at_the_tombs_path_never_blocks_the_lock(self):
+        # r60 P2.13: a FIFO planted at the ledger path blocked the read while the identity
+        # lock was held — every union write on the kernel stalled behind it
+        os.mkfifo(km.jd.STATE / "union-tombs.json")
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                ok, _, reason, _u = km._union_ops_merge([], [66], ckey="ws:x")
+            self.assertFalse(ok, "the non-regular ledger is judged, not read")
+            self.assertTrue((km.jd.STATE / "union-tombs.json.hold").exists())
+        finally:
+            try:
+                (km.jd.STATE / "union-tombs.json").unlink()
+            except OSError:
+                pass
+
+    def test_g_the_row_schema_is_exact(self):
+        # r60 P1.4, reproduced by the audit: executed rows missing dispatched, carrying
+        # confirmed:"false" / lapplied:"false", and malformed operation fields were
+        # accepted and persisted — the UI reads those differently from literal booleans
+        good = dict(self.ROW)
+        self.assertTrue(km._union_row_valid(good))
+        self.assertFalse(km._union_row_valid({k: v for k, v in good.items()
+                                              if k != "dispatched"}),
+                         "dispatched is REQUIRED on a normal row")
+        self.assertFalse(km._union_row_valid({k: v for k, v in good.items()
+                                              if k != "host"}),
+                         "host is REQUIRED on a normal row")
+        self.assertFalse(km._union_row_valid(dict(good, confirmed="false")))
+        self.assertFalse(km._union_row_valid(dict(good, lapplied="false")))
+        self.assertTrue(km._union_row_valid(dict(good, confirmed=True, lapplied=False)))
+        self.assertFalse(km._union_row_valid(dict(good, edit="rename")),
+                         "operation fields are objects, never strings")
+        self.assertFalse(km._union_row_valid(dict(good, post={"x": float("inf")})),
+                         "the WHOLE row is finite-checked, post included")
+        self.assertTrue(km._union_row_valid(
+            {"refusal": True, "gid": -3, "name": "pool", "t": 5, "error": "x"}))
+        self.assertFalse(km._union_row_valid(
+            {"refusal": True, "gid": -3, "t": "yesterday"}),
+            "a refusal's t is a number — it feeds the 7d staleness compare")
+        self.assertFalse(km._union_row_valid(
+            {"refusal": True, "gid": -3, "error": ["x"]}))
+
+    def test_h_suppression_overlay_rides_every_return_arm(self):
+        # r60 P2.3, reproduced by the audit: a pending suppression minted during EIO was
+        # OMITTED once a durable cache hit existed — the healthy-session rearm never saw
+        # it and could never clear it. ENOENT had the same gap.
+        p = km.jd.STATE / "retry-suppressed.json"
+        sid = "66666666-7777-8888-9999-000000000001"
+        km._retry_suppress_pending[sid] = 1.0
+        self.assertIn(sid, km._retry_suppress_data(), "ENOENT arm merges the overlay")
+        p.write_text("{}")
+        d1 = km._retry_suppress_data()               # fresh read, primes the cache
+        self.assertIn(sid, d1)
+        d2 = km._retry_suppress_data()               # cache-hit arm
+        self.assertIn(sid, d2, "the cache-hit arm merges the overlay too")
+        st = p.stat()
+        self.assertEqual(km._retry_suppress_cache[str(p)][1], {},
+                         "…without mutating the cached copy")
+
+    def test_i_the_carried_rid_survives_any_lineage_depth(self):
+        # r60 P2.1: with the named generation aged past the 32-entry retained lineage,
+        # _union_rid_for answers 0 — the DISPATCH-carried rid correlates the refusal
+        # anyway, and rides the journaled refusal row for reloading panels
+        sent = []
+        real_fwd, real_send = km._forward_tag_edit, km._send_to_view
+        real_journal = km._journal_refusal
+        journaled = []
+        km._forward_tag_edit = lambda host, body: (None, "owner down")
+        km._send_to_view = lambda view, m, wid="": sent.append(m)
+        km._journal_refusal = lambda row: journaled.append(row)
+        try:
+            km.Handler._dispatch_ws(None, {"type": "editTag",
+                                           "edit": {"host": "TESTHOST-B", "name": "pool",
+                                                    "opId": "101", "rid": "100",
+                                                    "add": []}},
+                                    {"send": lambda s: None, "wid": ""})
+        finally:
+            km._forward_tag_edit, km._send_to_view = real_fwd, real_send
+            km._journal_refusal = real_journal
+        fails = [m for m in sent if m.get("type") == "tagEditFailed"]
+        self.assertEqual(len(fails), 1)
+        self.assertEqual(fails[0].get("rid"), 100,
+                         "the refusal carries the dispatch-stamped root id even though "
+                         "the journal holds NO row for generation 101")
+        self.assertEqual(journaled[0].get("rid"), 100,
+                         "…and the reload-surviving journal twin carries it too")
+
+    def test_j_portable_restore_never_clobbers_a_newer_commit(self):
+        # r60 P2.5, executed by the audit: on a no-hardlink filesystem the innocent-grab
+        # restore fell back to os.replace and put the OLDER grabbed inode back over a
+        # THIRD writer's newer commit (A -> B -> C ended with B replacing C)
+        p = km.jd.STATE / "pq-restore.json"
+        p.write_text("JUDGED")
+        real_rename = km.Path.rename
+        real_replace = os.replace
+        def fake_rename(self_p, target):
+            if str(self_p) == str(p):
+                tmp = p.with_name("pq-w2.tmp")
+                tmp.write_text("WRITER2")
+                real_replace(str(tmp), str(p))       # writer 2 lands before the grab
+                real_rename(self_p, target)          # the grab takes WRITER2's inode
+                tmp3 = p.with_name("pq-w3.tmp")
+                tmp3.write_text("WRITER3")
+                real_replace(str(tmp3), str(p))      # writer 3 lands after the grab
+                return
+            return real_rename(self_p, target)
+        replaces = []
+        def forbidden_replace(a, b):
+            replaces.append((str(a), str(b)))
+            raise AssertionError("pathname replace after a failed exclusive restore")
+        with mock.patch.object(km.Path, "rename", fake_rename), \
+             mock.patch.object(km.os, "link", side_effect=OSError("no links")), \
+             mock.patch.object(km.os, "replace", side_effect=forbidden_replace), \
+             contextlib.redirect_stderr(io.StringIO()):
+            km._quarantine_state_bytes(p, "pq-restore")
+        self.assertEqual(p.read_text(), "WRITER3", "the newest commit stands at the path")
+        self.assertEqual(replaces, [], "no pathname replace ever ran")
+        kept = [f for f in km.jd.STATE.glob("pq-restore.json.corrupt-*")]
+        self.assertEqual(len(kept), 1, "the innocent grab is kept aside for recovery")
+        self.assertEqual(kept[0].read_text(), "WRITER2")
+
+    def test_k_two_origins_same_mid_wear_two_cards(self):
+        # r60 P1.5 (kernel leg), reproduced by the audit: two origins holding the same mid
+        # shared one card id — a Clear dismissed both and the decision named only the mid
+        qdir = km.jd.STATE / "postal" / "quarantine"
+        qdir.mkdir(parents=True, exist_ok=True)
+        try:
+            (qdir / "a.json").write_text(json.dumps(
+                {"mid": "m1", "to": "web", "toId": SID, "frm": "api", "origin": "hostA",
+                 "body": "hello from A", "at": 5}))
+            (qdir / "b.json").write_text(json.dumps(
+                {"mid": "m1", "to": "web", "toId": SID, "frm": "api", "origin": "hostB",
+                 "body": "hello from B", "at": 6}))
+            cards = km._quarantine_cards(10, set())
+            self.assertEqual(len(cards), 2)
+            ids = {c["itemId"] for c in cards}
+            self.assertEqual(len(ids), 2, "each origin's hold wears its OWN card id")
+            self.assertEqual({c["blocked"]["originId"] for c in cards},
+                             {"hostA", "hostB"},
+                             "the raw origin rides the card for the decision body")
+            self.assertEqual(km._quarantine_cards(10, {"quarantine:m1"}), [],
+                             "a legacy bare-mid dismissal still hides both")
+        finally:
+            import shutil
+            shutil.rmtree(km.jd.STATE / "postal", ignore_errors=True)

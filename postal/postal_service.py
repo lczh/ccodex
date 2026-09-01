@@ -270,7 +270,8 @@ def _mailbox(sid):
         raise ValueError("unsafe session id")
     mb = MAILROOT / sid
     for d in ("tmp", "new", "cur"):
-        (mb / d).mkdir(parents=True, exist_ok=True)
+        _mkdirs_durable(mb / d)          # every created level synced into its parent,
+        #                                  MAILROOT's own link included (r60 P1.6)
     return mb
 
 def _unique():
@@ -330,7 +331,7 @@ def _tl_append(fname, obj):
     A caller that memos "already logged" (e.g. _log_peer_aliases) must key its memo on the
     return, or one failed append suppresses every retry and the row never lands."""
     try:
-        TLDIR.mkdir(parents=True, exist_ok=True)
+        _mkdirs_durable(TLDIR)           # the first log's dir links durably (r60 P1.6)
         p = TLDIR / fname
         _created = not p.exists()
         with open(p, "a") as fh:
@@ -424,7 +425,12 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
     if h["relay_mid"] and h["relay_via"]:
         hdr += "X-Peer-Mid: %s\nX-Peer-Via: %s\n" % (h["relay_mid"], h["relay_via"])
     try:
-        _dfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        tmp.unlink(missing_ok=True)      # the staging name is DETERMINISTIC for relayed
+        #   mail (r-<digest of origin|mid>), so a planted FIFO there blocked this
+        #   O_WRONLY open while the caller held _seen_lock, stalling every relay behind
+        #   it (r60 P2.13) — unlink-first + O_EXCL only ever writes a file THIS call
+        #   created, and a replant between the two fails loudly instead of hanging
+        _dfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(_dfd, "w") as _dfh:
             _dfh.write(hdr + "\n" + body + "\n")
             _dfh.flush()
@@ -491,6 +497,18 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
                 # compensation: the peer re-sends and the replay's skip retries the fsyncs.
                 sys.stderr.write("postal: %s is visible but not provably durable — no ack; "
                                  "the sender re-sends\n" % name)
+                _mark_pending(to_id)
+                raise _DeliverUndurable(name)
+            try:
+                _fsync_dir(mb / "new")   # the WITHDRAWAL must be durable before the
+                #   compensation calls this mail unpublished (r60 P1.7, reproduced: a
+                #   crash that lost the buffered unlink RESTORED live mail while the log
+                #   stood sent+unpublished — the replay then ACKed mail whose sender had
+                #   been told it never went out)
+            except OSError:
+                sys.stderr.write("postal: %s was withdrawn but the withdrawal is not "
+                                 "provably durable — no ack, no compensation; the sender "
+                                 "re-sends\n" % name)
                 _mark_pending(to_id)
                 raise _DeliverUndurable(name)
             raise
@@ -1835,7 +1853,7 @@ class Handler(BaseHTTPRequestHandler):
                 # a standing stage means exactly "the publish never happened".
                 _stagef = OUTBOX / phost / (".stage-" + mid)
                 try:
-                    (OUTBOX / phost).mkdir(parents=True, exist_ok=True)
+                    _mkdirs_durable(OUTBOX / phost)   # OUTBOX's own link too (r60 P1.6)
                     with _stagef.open("x") as _sf:
                         json.dump(relay_msg, _sf)
                         _sf.flush()
@@ -3040,6 +3058,29 @@ def _fsync_dir(path):
             os.close(fd)
 
 
+def _mkdirs_durable(path):
+    """mkdir -p with every NEWLY CREATED directory fsync'd into its parent, bottom-up —
+    including the parent of the topmost created level (r60 P1.6, reproduced: the
+    first-ever delivery created MAILROOT but nothing synced the directory that OWNS it,
+    so a crash lost the whole mailbox while the durable seen record survived and the
+    replay ACKed without restoring the mail; initial quarantine/outbox dirs had the
+    same gap). No-op when the path already exists; raises OSError like mkdir."""
+    p = Path(path)
+    missing = []
+    q = p
+    while not q.exists():
+        missing.append(q)
+        parent = q.parent
+        if parent == q:
+            break
+        q = parent
+    if not missing:
+        return
+    p.mkdir(parents=True, exist_ok=True)
+    for d in [q] + list(reversed(missing)):
+        _fsync_dir(d)
+
+
 def _atomic_text_put(path, text):
     """Durably publish text with a unique same-directory temporary and atomic replace."""
     tmp = path.with_name(".%s.%d.%d.%016x.tmp" %
@@ -3528,6 +3569,13 @@ def _pending_bounce_park(host, mid, code):
 def _pending_bounce_clear(host, mid):
     with _pending_bounces_lock:
         _pending_bounces.pop("%s|%s" % (host, mid), None)
+        if not _pending_bounces_loaded[0]:
+            # the durable ledger is UNFOLDED: neither the rewrite nor the unlink can be
+            # truthful about rows this process never read (r60 P1.9, reproduced: a
+            # memory-only park settled while the load kept failing, memory emptied, and
+            # the unlink erased a durable park for a DIFFERENT host/mid). The memory
+            # settle stands; the durable row settles idempotently after the next fold.
+            return
         try:
             if _pending_bounces:
                 _atomic_json_put(_pending_bounces_path(), dict(_pending_bounces))
@@ -3539,7 +3587,10 @@ def _pending_bounce_clear(host, mid):
 
 def _flush_pending_bounces():
     with _pending_bounces_lock:
-        _pending_bounces_load()
+        if not _pending_bounces_load():
+            return                       # NEVER settle from an unfolded ledger (r60 P1.9:
+            #                              the flush settled a memory-only row and the
+            #                              clear unlinked the durable file it never read)
         items = list(_pending_bounces.values())
     for v in items:
         if not isinstance(v, dict):
@@ -3598,33 +3649,51 @@ def outbox_del(host, mid):
     except Exception:
         return False
 
+_receipts_done_lock = threading.Lock()
+
+
 def _receipts_done(_for_write=False):
     try:
-        d = json.loads(RECEIPTS_DONE.read_text())
-        return d if isinstance(d, dict) else {}
+        raw = RECEIPTS_DONE.read_text()
     except FileNotFoundError:
         return {}
-    except Exception:
+    except OSError:
         if _for_write:
             raise _OutboxUnreadable("receipts-done unreadable")   # r59 P2.12: the {} fold
             #   let one new confirmation overwrite every existing one
         return {}
+    try:
+        d = json.loads(raw)
+        if not isinstance(d, dict):
+            raise ValueError("receipts-done is not a dict")
+    except ValueError as e:
+        # JUDGED garbage, not a transient fault (r60 P2.11, reproduced: a stored []
+        # read as proved-empty and the next confirmation OVERWROTE it silently) — the
+        # bytes move aside for repair and the ledger restarts empty: a lost
+        # confirmation only re-parks its receipt, harmlessly.
+        _quarantine_corrupt_json(RECEIPTS_DONE, "receipts-done", e)
+        return {}
+    return d
 
 
 def _receipts_done_add(mid):
-    try:
-        d = _receipts_done(_for_write=True)
-    except _OutboxUnreadable:
-        _log("receipts-done unreadable — confirmation for %s not persisted this pass "
-             "(the kernel re-posts; the re-park is harmless)" % mid)
-        return
-    if mid in d:
-        return
-    d[mid] = int(time.time())
-    if len(d) > 4096:                                # bounded: oldest confirmations age out — the
-        for k in sorted(d, key=d.get)[:len(d) - 4096]:   # kernel's re-post then re-parks, harmlessly
-            d.pop(k, None)
-    _atomic_json_put(RECEIPTS_DONE, d)
+    with _receipts_done_lock:            # ONE read-modify-write at a time (r60 P2.11,
+        #                                  reproduced: two barrier-synchronized adds each
+        #                                  loaded the same base and one confirmation
+        #                                  vanished under the other's write)
+        try:
+            d = _receipts_done(_for_write=True)
+        except _OutboxUnreadable:
+            _log("receipts-done unreadable — confirmation for %s not persisted this pass "
+                 "(the kernel re-posts; the re-park is harmless)" % mid)
+            return
+        if mid in d:
+            return
+        d[mid] = int(time.time())
+        if len(d) > 4096:                            # bounded: oldest confirmations age out — the
+            for k in sorted(d, key=d.get)[:len(d) - 4096]:   # kernel's re-post then re-parks, harmlessly
+                d.pop(k, None)
+        _atomic_json_put(RECEIPTS_DONE, d)
 
 def _receipt_park_name(mid, origin=""):
     """The park FILENAME, origin-scoped when the receipt names one (r58 wave 2: two
@@ -3653,7 +3722,7 @@ def receiptbox_put(host, mid, origin="", dmid=""):
         _log("receiptbox_put: refusing unsafe host/mid/origin %r/%r/%r" % (host, mid, origin))
         return
     d = RECEIPTBOX / host
-    d.mkdir(parents=True, exist_ok=True)
+    _mkdirs_durable(d)                   # the first park's dir links durably (r60 P1.6)
     row = {"mid": mid}
     if dmid and _safe_id(dmid):
         row["dmid"] = dmid   # the DELIVERY id RECEIPTS_DONE is keyed by (r57: confirming a
@@ -3728,6 +3797,15 @@ def receiptbox_del(host, mid, origin=""):
     _dmid = ""
     try:
         _row = json.loads(_f.read_text())
+        if (origin and _f.name == mid + ".json" and isinstance(_row, dict)
+                and str(_row.get("origin") or "") not in ("", origin)):
+            # the bare legacy park belongs to a DIFFERENT origin (r60 P1.5, reproduced:
+            # an origin-A acknowledgment fell through both scoped spellings to origin
+            # B's bare file — deleted it and marked B's receipt done). A bare park with
+            # NO recorded origin predates scoping and stays deletable.
+            _log("receiptbox_del %s/%s: the bare park records origin %s — kept"
+                 % (host, mid, _row.get("origin")))
+            return
         if isinstance(_row, dict) and _safe_id(str(_row.get("dmid") or "")):
             _dmid = str(_row["dmid"])
     except FileNotFoundError:
@@ -3833,7 +3911,7 @@ def readbox_put(host, rec):
         _log("readbox_put: refusing unsafe host/mid %r/%r" % (host, mid))
         return
     d = READBOX / host
-    d.mkdir(parents=True, exist_ok=True)
+    _mkdirs_durable(d)                   # the first park's dir links durably (r60 P1.6)
     _origin = str((rec or {}).get("origin") or "")
     _atomic_json_put(d / _receipt_park_name(mid, _origin if _safe_id(_origin) else ""),
                      rec)                # origin-scoped (r59 P1.8: two origins through one
@@ -3903,11 +3981,20 @@ def readbox_del(host, rec):
     if not (_safe_id(host) and _safe_id(mid)):   # host/mid are path components — block traversal
         return
     _origin = str((rec or {}).get("origin") or "")
-    f = READBOX / host / _receipt_park_name(mid, _origin if _safe_id(_origin) else "")
+    _origin = _origin if _safe_id(_origin) else ""
+    f = READBOX / host / _receipt_park_name(mid, _origin)
+    if _origin and not f.exists():
+        f = READBOX / host / _receipt_park_name_v58(mid, _origin)   # the v1.3.31 spelling
     if not f.exists():
         f = READBOX / host / (mid + ".json")         # the pre-r59 bare spelling
     try:
         cur = json.loads(f.read_text())
+        if (_origin and f.name == mid + ".json" and isinstance(cur, dict)
+                and str(cur.get("origin") or "") not in ("", _origin)):
+            # the bare legacy park belongs to a DIFFERENT origin (r60 P1.5): an
+            # origin-A ack must never delete origin B's receipt; a park with no
+            # recorded origin predates scoping and stays deletable
+            return
         if bool(cur.get("unread")) == bool((rec or {}).get("unread")):
             f.unlink()
     except Exception:
@@ -4202,7 +4289,7 @@ def _quarantine_put(origin, m, to_id, via=""):
            "toWireId": m.get("to_id") or "",   # id-addressed mail stays id-addressed at approve
            "origin": origin, "via": via or origin, "at": int(time.time())}
     try:
-        QUARANTINE.mkdir(parents=True, exist_ok=True)
+        _mkdirs_durable(QUARANTINE)      # the FIRST hold's dir links durably (r60 P1.6)
         _qname = _receipt_park_name(mid, origin if _safe_id(str(origin or "")) else "")
         tmp = QUARANTINE / (_qname + ".tmp")
         tmp.unlink(missing_ok=True)   # the staging name derives from the SENDER's mid — a
@@ -4244,8 +4331,21 @@ def _quarantine_paths(mid, origin=None):
         for name in (_receipt_park_name(mid, origin), _receipt_park_name_v58(mid, origin),
                      mid + ".json"):
             p = QUARANTINE / name
-            if p.exists():
-                out.append(p)
+            if not p.exists():
+                continue
+            if name == mid + ".json":
+                # the bare legacy spelling carries no origin in its NAME — verify the
+                # record's own origin before an origin-scoped verdict touches it (r60
+                # P1.5, reproduced: origin A's approval resolved to origin B's bare
+                # hold and delivered B's message under A's verdict)
+                try:
+                    _brec = json.loads(p.read_text())
+                except (OSError, ValueError):
+                    continue             # unprovable ownership: never act origin-scoped
+                if not (isinstance(_brec, dict)
+                        and str(_brec.get("origin") or "") in ("", origin)):
+                    continue
+            out.append(p)
         return out
     out = []
     try:
@@ -4299,6 +4399,13 @@ def quarantine_decide(mid, action, text=None, feedback=None, origin=None):
             _recs.append((_p, _r))
     if not _recs:
         return False, "no held message '%s'" % mid
+    if (origin in (None, "")
+            and len({str(r.get("origin") or "") for _p, r in _recs}) > 1):
+        # an UNSCOPED verdict over holds from DIFFERENT origins (r60 P1.5, reproduced:
+        # one mid-only approval delivered BOTH origins' messages; one denial dropped
+        # both) — the human saw ONE message; the verdict must name whose
+        return False, ("%d origins hold mid '%s' — decide each origin's message "
+                       "separately" % (len(_recs), mid))
     if action == "approve" and text is not None and str(text).strip() and len(_recs) > 1:
         # the human edited ONE body they saw — applying it to EVERY origin's hold would
         # deliver words no sender wrote (r59 wave 2: one verdict acted on an arbitrary
@@ -4755,8 +4862,17 @@ def _backflow_save_locked():
              "rewrite kept only the new host and lost a durable ack)")
         return False
     snap = {}
+    for h, q in list(_backflow_preserved.items()):
+        snap[h] = q      # judged-invalid rows ride EVERY save verbatim (r60 P1.8,
+        #                  reproduced: a skipped invalid row latched loaded=True and the
+        #                  next save erased it) — until repaired by hand or superseded
+        #                  by a live entry for the same host below
     for h, p in _peer_pending.items():
         if p.get("acks") or p.get("bounces"):
+            if h in _backflow_preserved:
+                _backflow_preserved.pop(h, None)
+                _log("peer-backflow: live entry for %r supersedes its preserved "
+                     "invalid row" % h)
             snap[h] = {"acks": list(p.get("acks") or []),
                        "bounces": [b for b in (p.get("bounces") or [])
                                    if isinstance(b, dict)]}
@@ -4773,6 +4889,11 @@ def _backflow_save_locked():
 
 
 _backflow_loaded = [False]
+_backflow_preserved = {}   # host-key -> the VERBATIM row that failed validation (r60
+#                            P1.8, reproduced: a skipped invalid row latched loaded=True
+#                            and the next save erased it durably) — rides every save
+#                            untouched until repaired by hand or superseded by a live
+#                            entry for the same host
 
 
 def _backflow_load():
@@ -4780,32 +4901,72 @@ def _backflow_load():
         _backflow_load_locked()
 
 
+def _backflow_row_valid(q):
+    """COMPLETE validation of one host's queue row before ANY of it folds (r60 P1.8,
+    reproduced three ways: acks:"VICTIM" folded as six single-letter acks; an integer
+    acks raised TypeError out of the exchange thread; a part-invalid row was skipped
+    and the next save erased it). acks is a list of path-safe strings; bounces a list
+    of dicts each carrying a path-safe string mid."""
+    if not isinstance(q, dict):
+        return False
+    a = q.get("acks")
+    if a is not None and not (isinstance(a, list)
+                              and all(isinstance(x, str) and _safe_id(x) for x in a)):
+        return False
+    b = q.get("bounces")
+    if b is not None and not (isinstance(b, list)
+                              and all(isinstance(x, dict) and isinstance(x.get("mid"), str)
+                                      and _safe_id(x["mid"]) for x in b)):
+        return False
+    return True
+
+
 def _backflow_load_locked():
     """Fold the durable ledger in — the CALLER holds _peer_lock (r59 wave: the save's
-    retry-load nested the lock and deadlocked the exchange thread)."""
+    retry-load nested the lock and deadlocked the exchange thread). A transient fault
+    holds; JUDGED garbage quarantines aside and restarts empty (r60 P1.8: the bare
+    wrong-shape hold was a permanent wedge with no repair path); rows that fail
+    validation are PRESERVED verbatim, never folded and never erased by a save."""
     try:
         d = json.loads(_backflow_path().read_text())
     except FileNotFoundError:
         _backflow_loaded[0] = True                   # provably no ledger yet
         return
-    except Exception:
+    except OSError:
         _log("peer-backflow ledger unreadable — holding every save until it reads (r59 "
              "P1.6: a save over the unfolded ledger overwrote a durable ack)")
         return
+    except ValueError as e:
+        # JUDGED garbage (malformed/undecodable bytes): move aside for repair and
+        # restart empty — origins re-learn through the peers' at-least-once re-sends
+        _quarantine_corrupt_json(_backflow_path(), "peer-backflow", e)
+        if _backflow_path().exists():
+            _log("peer-backflow: judged-bad ledger could not move aside — holding")
+            return
+        _backflow_loaded[0] = True
+        return
     if not isinstance(d, dict):
-        _log("peer-backflow ledger wrong-shaped — holding (never loaded as empty)")
+        _quarantine_corrupt_json(_backflow_path(), "peer-backflow",
+                                 ValueError("wrong-shaped root"))
+        if _backflow_path().exists():
+            _log("peer-backflow: wrong-shaped ledger could not move aside — holding")
+            return
+        _backflow_loaded[0] = True
         return
     if True:
         for h, q in d.items():
-            if not (_safe_id(str(h)) and isinstance(q, dict)):
+            if not (_safe_id(str(h)) and _backflow_row_valid(q)):
+                _backflow_preserved[str(h)] = q      # verbatim, save-proof (r60 P1.8)
+                _log("peer-backflow: row %r failed validation — preserved verbatim for "
+                     "repair; it rides every save untouched" % str(h))
                 continue
             p = _peer_pending.setdefault(str(h), {"acks": [], "bounces": [], "readAcks": [],
                                                   "handoffDoneAcks": []})
             for a in q.get("acks") or []:
-                if isinstance(a, str) and _safe_id(a) and a not in p["acks"]:
+                if a not in p["acks"]:
                     p["acks"].append(a)
             for b in q.get("bounces") or []:
-                if isinstance(b, dict) and b not in p["bounces"]:
+                if b not in p["bounces"]:
                     p["bounces"].append(b)
     _backflow_loaded[0] = True
 

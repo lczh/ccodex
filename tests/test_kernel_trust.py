@@ -174,7 +174,9 @@ class QuarantineCards(unittest.TestCase):
         cards = km._quarantine_cards(2000, set())
         self.assertEqual(len(cards), 1)
         c = cards[0]
-        self.assertEqual(c["itemId"], "quarantine:qc-1")
+        self.assertEqual(c["itemId"], "quarantine:qc-1@TESTHOST",
+                         "origin-scoped since r60 P1.5: two origins holding one mid "
+                         "must wear two cards")
         self.assertEqual(c["column"], "needs_input")
         self.assertEqual(c["blocked"]["state"], "quarantine")
         self.assertEqual(c["blocked"]["frm"], "api")

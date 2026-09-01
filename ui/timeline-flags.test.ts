@@ -2068,7 +2068,7 @@ test("r58 wave 2: a voided queued send treats its gates like the transport reset
   // reproduced upstream: the silent gate delete let a voided COMPLETION's re-keyed rows
   // ride a later plain mirror sync as an un-CAS'd merge (the r56 P1.2 regression), and a
   // voided PLAIN gate's effects simply never ran — no unwind, no error
-  const sy = SRC.indexOf("if (_sendEpoch !== (this._unionEpoch || 0)) {");
+  const sy = SRC.indexOf("if (_sendEpoch !== (this._unionEpoch || 0) || _rekeyGone) {");
   assert.ok(sy > 0);
   const win = SRC.slice(sy, sy + 1600);
   assert.ok(win.indexOf("for (const g1 of _gates.filter((x) => x.rekey)) {") > 0
@@ -2090,4 +2090,60 @@ test("r59: union frames never queue across a reconnect in the browser shim", () 
   assert.ok(win.indexOf('m.type==="setUnionOps"||m.type==="claimUnionGesture"') > 0
     && win.indexOf("queue.push(s);}") > win.indexOf('m.type==="setUnionOps"'),
     "setUnionOps/claimUnionGesture DROP when the socket is down — everything else queues");
+});
+
+test("r60 executed: a queued completion whose gesture a refusal consumed is VOID — no stale rekey rides, no effects run", async () => {
+  // reproduced upstream (the v1.3.32 audit's P1.1): _postChain blocked, tagEditFailed
+  // delivered, POST released — the send-head rebuild sent entries=[] with the STALE
+  // rekey, the kernel CAS accepted it, and the acked gate ran the effects the refusal
+  // had just rolled back (effectsAfterAck=1, localRollbacks=1)
+  const panel = drawnPanel();
+  const posts: any[] = [];
+  (panel as any)._kernelPost = (route: string, body: any) => {
+    posts.push(body);
+    return Promise.resolve({ ok: true, json: { ok: true }, status: 200 });
+  };
+  const realProcess = (globalThis as any).process;
+  (globalThis as any).process = { versions: { electron: "1" } };
+  try {
+    panel._unionOps = [{ gid: 81, host: "TESTHOST-A", edit: { add: ["s1"] }, inverse: {},
+                         rt: { id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool" },
+                         name: "pool", dispatched: false, post: {} }];
+    panel._claimEpochs = { 81: 7 };
+    const effects: any[] = [];
+    panel._editRemoteTag = (rt: any, edit: any) => { effects.push(edit); return true; };
+    panel._completeUnionGesture(81);               // queues the rekey POST behind the chain
+    // the refusal lands WHILE the POST sits queued — it consumes the re-keyed group
+    panel.tagEditFailed({ host: "TESTHOST-A", name: "pool", opId: "81", error: "refused" });
+    await panel._postChain;
+    assert.ok(posts.every((b) => !b.rekey),
+      "the stale rekey never reached the kernel — the send-head check voided the "
+      + "completion when its gesture vanished from the mirror");
+    assert.equal(effects.length, 0,
+      "the voided gate's effects NEVER ran (the audit measured effectsAfterAck=1)");
+    assert.equal(Object.keys(panel._gatedDispatches || {}).length, 0,
+      "the voided gate is unwound, not stranded");
+  } finally {
+    (globalThis as any).process = realProcess;
+  }
+});
+
+test("r60: the dispatch carries its stable root id — refusal correlation without a journal lookup", () => {
+  // the v1.3.32 audit's P2.1: with the named generation aged past the 32-entry retained
+  // lineage, the kernel's _union_rid_for answered 0 and the refusal was never
+  // compensated — the panel stamps the rid onto the editTag wire instead
+  const wires: any[] = [];
+  g.__rompTimelineEditTag = (w: any) => { wires.push(w); };
+  const panel = drawnPanel();
+  panel._unionOps = [{ gid: 136, ogid: 135, olin: [104, 135], rid: 100,
+                       host: "TESTHOST-A", edit: {}, inverse: {},
+                       rt: { id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool" },
+                       name: "pool", dispatched: false }];
+  panel._editRemoteTag({ id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool" },
+                       { add: ["s1"] }, 136);
+  assert.equal(wires.length, 1);
+  assert.equal(wires[0].opId, "136");
+  assert.equal(wires[0].rid, "100",
+    "the STABLE root rides the dispatch — any-depth lineage still correlates");
+  delete g.__rompTimelineEditTag;
 });

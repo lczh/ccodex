@@ -2237,32 +2237,99 @@ def _union_tombs_path():
     return jd.STATE / "union-tombs.json"
 
 
+def _union_tombs_hold_path():
+    # the JUDGED-CORRUPTION hold marker (r60 P1.3): "move aside and restart empty" let a
+    # stale replay of a RETIRED completion be accepted and claimed again — the exact
+    # rerun the shield exists to block — while the r59 bare hold was a permanent wedge
+    # with no repair path. The marker holds retirement for the shield's OWN 7d replay
+    # horizon: after that, every tomb the lost ledger could have held has expired anyway,
+    # so restarting empty is exactly equivalent to having kept it.
+    return jd.STATE / "union-tombs.json.hold"
+
+
+def _read_regular_text(path):
+    """Read a REGULAR file's text without following a symlink or blocking on a planted
+    FIFO (r60 P2.13: a FIFO at a state path hung the reader while it held the identity
+    lock, stalling every union write behind it). Not-a-regular-file raises ValueError —
+    a judgment, like malformed bytes; OS faults raise OSError as usual."""
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("not a regular file")
+        buf, chunk = b"", os.read(fd, 1 << 20)
+        while chunk:
+            buf += chunk
+            chunk = os.read(fd, 1 << 20)
+        return buf.decode("utf-8")
+    finally:
+        os.close(fd)
+
+
 def _union_tombs_load_locked():
     """Fold the durable tombstones in, once per process — caller holds the identity lock.
-    Best-effort: an unreadable ledger degrades to the process-local map (the journal rows
-    stay the durable truth; tombstones only shield replays)."""
+    A transient fault holds and retries; JUDGED corruption arms a durable hold marker
+    (shield-first, before the bytes move aside) and the ledger stays unfolded — saves
+    refuse, so retirements refuse retryable — until the marker outlives the shield's 7d
+    horizon, when it retires itself and the ledger restarts empty (r60 P1.3)."""
     if _union_tombs_loaded[0]:
         return
+    hold = _union_tombs_hold_path()
+    try:
+        _hraw = _read_regular_text(hold)
+    except FileNotFoundError:
+        _hraw = None
+    except ValueError:
+        _hraw = ""                       # a garbage marker re-mints below: never fail-open
+    except OSError:
+        return                           # the hold state is unprovable: hold this pass
+    if _hraw is not None:
+        try:
+            _ht = float(_hraw.strip())
+        except ValueError:
+            _ht = None
+        if _ht is None or not (0 < _ht <= time.time() + 86400):
+            # an unreadable or absurd mint time cannot prove the horizon passed —
+            # re-mint it so the 7d clock restarts from now instead of failing open
+            try:
+                _atomic_write(hold, "%d" % int(time.time()))
+            except OSError:
+                pass
+            sys.stderr.write("union-tombs: hold marker unreadable — re-minted; the "
+                             "shield stays held\n")
+            return
+        if time.time() - _ht < 7 * 86400:
+            sys.stderr.write("union-tombs: judged-corrupt ledger is held — retirements "
+                             "refuse until the shield's 7d horizon passes\n")
+            return                       # loaded stays False: saves + retirements refuse
+        try:
+            hold.unlink()
+        except OSError:
+            return                       # the hold must provably end before folding
+        sys.stderr.write("union-tombs: the 7d hold expired — every shield it protected "
+                         "has expired with it; the ledger restarts\n")
     try:
         try:
-            d = json.loads(_union_tombs_path().read_text())
+            d = json.loads(_read_regular_text(_union_tombs_path()))
         except ValueError:
-            d = None                                 # malformed = judged, like wrong-shape
+            d = None                                 # malformed/non-regular = judged
         if not isinstance(d, dict):
-            # JUDGED-bad bytes move aside and the ledger self-heals empty (r59 wave 2,
-            # reproduced: the bare hold was a PERMANENT wedge — every retirement refused
-            # for the life of the install with no repair path). The shield is bounded and
-            # expiring by design; a judged reset is honest. Transient faults still hold.
+            # JUDGED-bad bytes: arm the durable hold FIRST (the shield-first ordering,
+            # r59 wave 2), then move the bytes aside for forensics. Held for the 7d
+            # horizon — never fail-open (r60 P1.3), never a permanent wedge (r59 wave 2).
+            try:
+                _atomic_write(hold, "%d" % int(time.time()))
+            except OSError:
+                sys.stderr.write("union-tombs: judged-bad ledger and the hold marker "
+                                 "could not arm — holding this pass\n")
+                return
             try:
                 _union_tombs_path().rename(_union_tombs_path().with_name(
                     "union-tombs.json.corrupt-%d-%s" % (os.getpid(), os.urandom(8).hex())))
-                sys.stderr.write("union-tombs: judged-bad ledger moved aside — the shield "
-                                 "restarts empty\n")
+                sys.stderr.write("union-tombs: judged-bad ledger moved aside — held for "
+                                 "the shield's 7d horizon\n")
             except OSError:
                 sys.stderr.write("union-tombs: judged-bad ledger could not move aside — "
-                                 "holding this pass\n")
-                return
-            _union_tombs_loaded[0] = True
+                                 "held under the marker\n")
             return
         if isinstance(d, dict):
             _floor = time.time() - 7 * 86400   # the refusal rows' staleness precedent
@@ -2461,7 +2528,15 @@ def _quarantine_state_bytes(path, what, fingerprint=None, keep_source=False):
                         except FileExistsError:
                             os.unlink(str(qp))       # a newer valid commit stands — keep it
                         except OSError:
-                            os.replace(str(qp), str(path))   # no links here: best effort
+                            # NEVER a pathname replace after the exclusive restore fails
+                            # (r60 P2.5, executed: on a no-hardlink filesystem the
+                            # os.replace fallback put the OLDER grabbed inode back over
+                            # a THIRD writer's newer commit). The innocent grab stays
+                            # aside under its quarantine name — loud, recoverable.
+                            sys.stderr.write("%s: an innocently-grabbed commit is kept "
+                                             "aside as %s (no hardlinks here); a newer "
+                                             "commit at the path is never overwritten\n"
+                                             % (what, qp.name))
                         return
                 except OSError as e2:
                     _qerr = e2
@@ -2675,10 +2750,15 @@ def _union_ops_echo():
 
 
 def _union_row_valid(r):
-    """SCHEMA for one journal row (the r56 audit's P1.5, executed there: gid:[] wedged every
-    later merge with a TypeError; gid:1e309 persisted as Infinity, then raised OverflowError
-    AND rode the timeline frame as invalid JSON the browser refused whole). Ids are finite
-    positive safe integers; refusal gids are negative ints; every string field is a string."""
+    """EXACT discriminated SCHEMA for one journal row (the r56 audit's P1.5, executed
+    there: gid:[] wedged every later merge with a TypeError; gid:1e309 persisted as
+    Infinity, then raised OverflowError AND rode the timeline frame as invalid JSON the
+    browser refused whole; r60 P1.4, reproduced: an executed row MISSING dispatched and
+    string booleans like confirmed:"false" were accepted and persisted — the UI reads
+    those differently from literal booleans, so undispatched work could present as
+    complete). Ids are finite positive safe integers; refusal gids are nonzero ints;
+    normal rows REQUIRE a host and a literal-bool dispatched; every boolean is a real
+    boolean; every nested field is finite."""
     if not isinstance(r, dict):
         return False
     def _safe_int(v, lo, hi):
@@ -2701,28 +2781,48 @@ def _union_row_valid(r):
         if isinstance(v, list):
             return all(_finite(x, depth + 1) for x in v)
         return False
-    for k in ("edit", "inverse", "rt"):
-        if k in r and r[k] is not None and not _finite(r[k]):
-            return False
+    if not _finite(r):
+        return False     # the WHOLE row, post/lop/error included (r60 P1.4: only
+        #                  edit/inverse/rt were finite-checked — an Infinity in post
+        #                  rode the wire and poisoned the browser frame)
     if "rid" in r and r.get("rid") not in (None, 0) and not _safe_int(r.get("rid"), 1, _MAX):
         return False
     if r.get("refusal"):
         if not (_safe_int(r.get("gid"), -_MAX, -1) or _safe_int(r.get("gid"), 1, _MAX)):
             return False
-        # the refusal branch used to SHORT-CIRCUIT every deeper check (r59 P2.3: a refusal
-        # row carrying Infinity/NaN rode the wire and poisoned the whole browser frame)
-        return _finite({k: v for k, v in r.items() if k != "gid"})
+        if "t" in r and not (isinstance(r.get("t"), (int, float))
+                             and not isinstance(r.get("t"), bool)):
+            return False   # a non-numeric t would reach the 7d staleness compare (r60 P1.4)
+        if ("ogid" in r and r.get("ogid") not in (None, 0)
+                and not _safe_int(r.get("ogid"), 1, _MAX)):
+            return False
+        for k in ("host", "name", "error", "opId"):
+            if k in r and r[k] is not None and not isinstance(r[k], str):
+                return False
+        return True
     if not _safe_int(r.get("gid"), 1, _MAX):
         return False
+    if not (isinstance(r.get("host"), str) and r.get("host")):
+        return False     # host REQUIRED: the journal upserts per-(gid,host) (r60 P1.4)
+    if not isinstance(r.get("dispatched"), bool):
+        return False     # REQUIRED literal bool (r60 P1.4: a MISSING flag read as
+        #                  "not False" to the ratchet and as falsy to the completion
+        #                  pass — the same row presented as both executed and pending;
+        #                  r57: dispatched:0 slid through the is-False checks)
+    for k in ("confirmed", "lapplied"):
+        if k in r and not isinstance(r[k], bool):
+            return False   # "false" (a string) is truthy — never coerced (r60 P1.4)
+    for k in ("edit", "inverse", "rt", "post", "lop"):
+        if k in r and r[k] is not None and not isinstance(r[k], dict):
+            return False   # operation fields are OBJECTS (r60 P1.4: a string edit
+            #                raised at the completion pass's Object.assign twin)
     if "ogid" in r and r.get("ogid") not in (None, 0) and not _safe_int(r.get("ogid"), 1, _MAX):
         return False
     if "olin" in r and r.get("olin"):
         if not (isinstance(r["olin"], list)
                 and all(_safe_int(x, 1, _MAX) for x in r["olin"])):
             return False
-    if "dispatched" in r and not isinstance(r.get("dispatched"), bool):
-        return False     # r57: dispatched:0 slid through the is-False checks as truthy-ish
-    for k in ("host", "name", "oldName", "oldColor"):
+    for k in ("name", "oldName", "oldColor"):
         if k in r and r[k] is not None and not isinstance(r[k], str):
             return False
     return True
@@ -2793,15 +2893,23 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             # later merge; one 1e309 rode the wire as Infinity and the browser refused the
             # whole timeline frame
             return False, [], "malformed entry (ids must be finite safe integers; "                               "string fields must be strings)", []
+        _rekey_gid = 0
         if rekey:
             # the completion CAS (r55 P1.4): the claim must still be THIS claimant's epoch,
             # and the original rows must still stand — both checked under the SAME lock the
-            # merge commits under, so nothing can settle or steal between check and write
-            try:
-                _ogid = int(rekey.get("ogid") or 0)
-                _epoch = int(rekey.get("epoch") or 0)
-            except (TypeError, ValueError, OverflowError):
-                _ogid, _epoch = 0, 0     # r57: float('inf') raised OverflowError into a 500
+            # merge commits under, so nothing can settle or steal between check and write.
+            # STRICT ids, never coerced (r60 P1.1, reproduced: int() accepted fractional
+            # ids, and rekey.gid was never read at all — see the successor binding below)
+            def _rk_int(v):
+                return v if (isinstance(v, int) and not isinstance(v, bool)
+                             and 0 < v <= 2 ** 53 - 1) else 0
+            _ogid = _rk_int(rekey.get("ogid"))
+            _epoch = rekey.get("epoch")
+            _epoch = _epoch if (isinstance(_epoch, int) and not isinstance(_epoch, bool)
+                                and _epoch > 0) else 0
+            _rekey_gid = _rk_int(rekey.get("gid"))
+            if not (_ogid and _epoch and _rekey_gid):
+                return False, [], "malformed completion (rekey ids must be integers)", []
             with _union_claims_lock:
                 _ccur = _union_claims.get(_ogid)
             if not (_ccur and _ccur.get("epoch") == _epoch and _ccur.get("ckey") == ckey):
@@ -2813,6 +2921,13 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                 return False, [], "the journal is held for reconstruction — retry", []
             if not any(r.get("gid") == _ogid and not r.get("refusal") for r in cur):
                 return False, [], "the gesture settled while the claim was held", []
+            if not any(r.get("gid") == _rekey_gid and not r.get("refusal") for r in inc):
+                # the completion transaction must CARRY its successor rows (r60 P1.1,
+                # reproduced end-to-end: a queued Electron body rebuilt at the send head
+                # AFTER a refusal consumed the group sent entries=[] with the STALE
+                # rekey — the CAS passed, the original was retired against nothing, and
+                # the acked gate ran effects the refusal had just rolled back)
+                return False, [], "the completion carries no successor rows — retry", []
         # the DISPATCH RATCHET (the r53 wave-3 verification): 'the effects ran' is one-way
         # evidence — an adopter panel's full-replace mirror of rows it seeded BEFORE the
         # writer's dispatched:true flip regressed the journal to false and re-armed the
@@ -2864,11 +2979,19 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
         with _union_claims_lock:
             _tombed = []
             for r in inc:
-                if r.get("refusal") or r.get("gid") in _resident:
+                if (r.get("refusal") or r.get("gid") in _resident
+                        or (r.get("ogid") or 0) in _resident
+                        or any(x in _resident for x in (r.get("olin") or []))):
                     # a RESIDENT gesture's own update is never tombstone-dropped (the r56
                     # audit's P1.1, executed there: the committed successor's dispatched:true
                     # flip carries the tombstoned ogid — dropping it deleted the healthy
-                    # completion's own compensation journal and answered unclaimed over it)
+                    # completion's own compensation journal and answered unclaimed over it).
+                    # A row whose ANCESTOR still stands in cur is likewise a live completion
+                    # of an UNRETIRED gesture, not a replay: the tomb shields gestures whose
+                    # rows are GONE. The half-committed retry lands through this arm (r60
+                    # P1.2, reproduced: tomb saved, journal write failed, restart — the
+                    # retry's successor hit its ogid's standing tomb, was dropped, and the
+                    # merge acked an EMPTY journal over the live gesture).
                     continue
                 if _reconstructing and r.get("gid") not in _union_retired_tombs:
                     # cur=[] blinds the resident-successor exemption during reconstruction
@@ -2882,6 +3005,11 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                         _tombed.append(r.get("gid"))
             if _tombed:
                 inc = [r for r in inc if r.get("gid") not in _tombed]
+        if _rekey_gid and not any(r.get("gid") == _rekey_gid and not r.get("refusal")
+                                  for r in inc):
+            # the successor did not SURVIVE the tombstone filter: the lineage is already
+            # retired — committing would retire the original against nothing (r60 P1.1)
+            return False, [], "the completion's successor rows are already retired", []
         rows += [r for r in inc if r.get("gid") not in ret]
         _evidence = any(isinstance(r, dict) and not r.get("refusal") for r in inc)
         if _reconstructing and not _evidence:
@@ -2906,11 +3034,17 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             # A shield for rows still resident is harmless: the resident exemption keeps
             # them, and the 7d expiry retires unfinished shields.
             with _union_claims_lock:
+                _tsnap = dict(_union_retired_tombs)   # restored WHOLE on a failed persist
+                #   (r60 P1.2, reproduced: the cap eviction survived an ENOSPC save — an
+                #   older shield left MEMORY while the durable copy kept it, and a same-
+                #   process replay of that retired gesture was accepted and claimable)
                 for g in ret:
                     _union_retired_tombs[g] = time.time()
                 while len(_union_retired_tombs) > _UNION_TOMBS_MAX:
                     _union_retired_tombs.pop(next(iter(_union_retired_tombs)))
                 if not _union_tombs_save_locked():
+                    _union_retired_tombs.clear()
+                    _union_retired_tombs.update(_tsnap)
                     return False, [], "the retirement's tombstone could not be persisted " \
                                       "— retry", []
         try:
@@ -6459,7 +6593,11 @@ def _retry_suppress_data():
         stt = p.stat()
         key = (stt.st_dev, stt.st_ino, stt.st_mtime_ns, stt.st_size)
     except FileNotFoundError:
-        return {}
+        # the overlay rides EVERY return arm (r60 P2.3, reproduced: a pending
+        # suppression minted during a fault was invisible on the ENOENT and cache-hit
+        # arms — the healthy-session rearm iterated a map without it and could never
+        # clear it)
+        return dict(_retry_suppress_pending) if _retry_suppress_pending else {}
     except OSError:
         hit = _retry_suppress_cache.get(str(p))
         d = dict(hit[1]) if hit else {}              # LKG, never a cached fabrication
@@ -6471,13 +6609,15 @@ def _retry_suppress_data():
         return d
     hit = _retry_suppress_cache.get(str(p))
     if hit and hit[0] == key:
-        return hit[1]
+        return (dict(hit[1], **_retry_suppress_pending)
+                if _retry_suppress_pending else hit[1])   # overlay on the HIT arm too
+        #                                                   (r60 P2.3)
     try:
         d = jd.canonicalize_retry_suppressed_identity(json.loads(p.read_text()))
         if not isinstance(d, dict):
             raise ValueError("retry-suppressed is not a dict")   # wrong shape = fault
     except FileNotFoundError:
-        return {}
+        return dict(_retry_suppress_pending) if _retry_suppress_pending else {}
     except Exception:
         # a fault serves the last-known-good copy and CACHES NOTHING (r59 P1.4,
         # reproduced: the fabricated {} was cached under the real generation — standing
@@ -25854,8 +25994,13 @@ def _quarantine_cards(now, cleared):
         mid = rec.get("mid") or ""
         if not mid:
             continue
-        item_id = "quarantine:" + mid
-        if item_id in cleared:
+        _orig = str(rec.get("origin") or "")
+        # ORIGIN-scoped card identity (r60 P1.5, reproduced: two origins holding the
+        # same mid shared one card id — one Clear dismissed both, and the decision body
+        # named only the mid, so one approval delivered both messages). Legacy bare-mid
+        # dismissals in cleared.jsonl keep hiding the card.
+        item_id = "quarantine:" + mid + (("@" + _orig) if _orig else "")
+        if item_id in cleared or ("quarantine:" + mid) in cleared:
             continue
         frm, to, origin = rec.get("frm") or "?", rec.get("to") or "?", rec.get("origin") or "?"
         t = int(rec.get("at") or now)
@@ -25875,6 +26020,8 @@ def _quarantine_cards(now, cleared):
             "summary": None, "blockSummary": None, "background": None, "summaryAnchorUuid": None, "warns": None,
             "nudged": None,
             "blocked": {"state": "quarantine", "mid": mid, "frm": frm, "to": to, "origin": origin,
+                        "originId": _orig,   # the RAW origin for the decision body (r60
+                        #                      P1.5) — `origin` above is display-defaulted
                         "body": rec.get("body") or "",
                         "gist": " ".join(str(rec.get("body") or "").split())[:90],
                         "what": "an incoming postal message from %s (held because peer %s is DIRECTED) is "
@@ -35085,10 +35232,24 @@ class Handler(BaseHTTPRequestHandler):
                 ans, err = _forward_tag_edit(host, body)
                 if err or not (ans or {}).get("ok", False):
                     _rmsg = err or (ans or {}).get("error") or "refused"
+                    _rrid = 0
                     try:
-                        _rrid = _union_rid_for(op_id)
-                    except Exception:
+                        # the dispatch CARRIES its stable root id now (r60 P2.1,
+                        # reproduced: a refusal naming a generation older than the
+                        # 32-entry retained lineage matched no journal row, so
+                        # _union_rid_for answered 0 and the refusal was never
+                        # compensated — the panel-stamped rid survives ANY lineage
+                        # depth); the journal lookup stays as the older-panel fallback
+                        _crid = int(str(e.get("rid") or "0"))
+                        if 0 < _crid <= 2 ** 53 - 1:
+                            _rrid = _crid
+                    except (TypeError, ValueError, OverflowError):
                         _rrid = 0
+                    if not _rrid:
+                        try:
+                            _rrid = _union_rid_for(op_id)
+                        except Exception:
+                            _rrid = 0
                     _send_to_view("timeline", {"type": "tagEditFailed", "host": host, "name": nm,
                                                **({"opId": op_id} if op_id else {}),
                                                **({"rid": _rrid} if _rrid else {}),
@@ -35111,6 +35272,7 @@ class Handler(BaseHTTPRequestHandler):
                         _rgid = -(int(time.time() * 1000) % 0x40000000)
                     _journal_refusal({"refusal": True, "host": host, "name": nm,
                                       "opId": op_id, "error": _rmsg,
+                                      **({"rid": _rrid} if _rrid else {}),
                                       "t": int(time.time()), "gid": _rgid})
                 else:
                     _migrate_refs_after_remote_edit(host, nm, body, ans)
@@ -35176,6 +35338,11 @@ class Handler(BaseHTTPRequestHandler):
             # the card on the next build (event-based — no cleared.jsonl needed). Failure warn-toasts.
             _qmid = str(msg["mid"])
             _qbody = {"mid": _qmid, "action": str(msg.get("action") or "").strip().lower()}
+            if msg.get("origin"):
+                # the verdict names WHICH origin's hold it judges (r60 P1.5: without it
+                # the bus acted on every same-mid hold — one approval delivered two
+                # different origins' messages, one denial dropped both)
+                _qbody["origin"] = str(msg["origin"])
             if msg.get("text") is not None:
                 _qbody["text"] = str(msg["text"])
             if msg.get("feedback"):                # deny-with-note: the bus mails it back to the sender

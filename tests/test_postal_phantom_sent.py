@@ -2092,3 +2092,275 @@ class R56DurableBeforeAck(unittest.TestCase):
         self.assertIsInstance(out, list,
                               "recall survives schema poison — a [] record used to raise "
                               "AttributeError and abort the WHOLE recall (P2.18)")
+
+
+class R60PostalAudit(unittest.TestCase):
+    """the v1.3.32 audit, postal half: origin scoping stopped before verdicts and legacy
+    cleanup (P1.5), first-generation dirs were not durably linked into their parents
+    (P1.6), a successful-but-unsynced withdrawal was recorded as definite non-publication
+    (P1.7), backflow part-validated a ledger and then authorized destructive rewrites
+    (P1.8), pending-bounce cleanup erased a durable ledger it never read (P1.9),
+    receipts-done was neither proved nor concurrency-safe (P2.11), and a FIFO at the
+    deterministic relay staging name hung delivery under _seen_lock (P2.13)."""
+
+    HOST = "fefefefefefefefefefefefefefefefe"
+
+    def setUp(self):
+        _reset()
+        pm._backflow_loaded[0] = False
+        pm._backflow_preserved.clear()
+        pm._pending_bounces.clear()
+        pm._pending_bounces_loaded[0] = False
+        with pm._peer_lock:
+            pm._peer_pending.clear()
+        for p in (pm._backflow_path(), pm._pending_bounces_path(), pm.RECEIPTS_DONE):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        for d in (pm.QUARANTINE, pm.RECEIPTBOX / self.HOST, pm.READBOX / self.HOST,
+                  pm.CORRUPT, pm.MAILROOT / SID):
+            shutil.rmtree(d, ignore_errors=True)
+
+    def tearDown(self):
+        self.setUp()
+
+    # ── P1.5: origin scoping through verdicts and legacy cleanup ────────────────────
+
+    def test_a_unscoped_verdict_over_two_origins_is_refused(self):
+        # reproduced by the audit: one mid-only approval delivered BOTH origins' held
+        # messages; one denial dropped both
+        m = {"mid": "m1" * 8, "to": "web", "frm": "api", "frm_id": "", "body": "from A"}
+        self.assertTrue(pm._quarantine_put("hostA", m, SID))
+        self.assertTrue(pm._quarantine_put("hostB", dict(m, body="from B"), SID))
+        ok, err = pm.quarantine_decide("m1" * 8, "deny")
+        self.assertFalse(ok, "an unscoped verdict over two origins must refuse")
+        self.assertIn("origins hold", err or "")
+        ok, err = pm.quarantine_decide("m1" * 8, "deny", origin="hostA")
+        self.assertTrue(ok, err)
+        self.assertIsNone(pm.quarantine_get("m1" * 8, origin="hostA"),
+                          "origin A's hold is decided")
+        self.assertIsNotNone(pm.quarantine_get("m1" * 8, origin="hostB"),
+                             "origin B's hold STANDS — the verdict never touched it")
+
+    def test_b_bare_quarantine_hold_is_origin_verified(self):
+        # the legacy bare-mid spelling carries no origin in its NAME: an origin-scoped
+        # verdict must verify the record before acting on it
+        pm.QUARANTINE.mkdir(parents=True, exist_ok=True)
+        (pm.QUARANTINE / ("m2" * 8 + ".json")).write_text(json.dumps(
+            {"mid": "m2" * 8, "to": "web", "toId": SID, "frm": "api",
+             "origin": "hostB", "body": "B's held mail", "at": 1}))
+        self.assertEqual(pm._quarantine_paths("m2" * 8, origin="hostA"), [],
+                         "origin A's verdict never reaches origin B's bare hold")
+        self.assertEqual(len(pm._quarantine_paths("m2" * 8, origin="hostB")), 1)
+
+    def test_c_receiptbox_del_verifies_the_bare_parks_origin(self):
+        # reproduced by the audit: an origin-A acknowledgment fell through both scoped
+        # spellings to origin B's bare legacy file — deleted it and marked B's done
+        d = pm.RECEIPTBOX / self.HOST
+        d.mkdir(parents=True, exist_ok=True)
+        bare = d / ("m3" * 8 + ".json")
+        bare.write_text(json.dumps({"mid": "m3" * 8, "origin": "hostB"}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm.receiptbox_del(self.HOST, "m3" * 8, origin="hostA")
+        self.assertTrue(bare.exists(), "origin B's park survives A's ack")
+        self.assertNotIn("m3" * 8, pm._receipts_done())
+        pm.receiptbox_del(self.HOST, "m3" * 8, origin="hostB")
+        self.assertFalse(bare.exists(), "the OWNING origin's ack still settles it")
+
+    def test_d_readbox_del_verifies_the_bare_parks_origin(self):
+        d = pm.READBOX / self.HOST
+        d.mkdir(parents=True, exist_ok=True)
+        bare = d / ("m4" * 8 + ".json")
+        bare.write_text(json.dumps({"mid": "m4" * 8, "origin": "hostB", "unread": False}))
+        pm.readbox_del(self.HOST, {"mid": "m4" * 8, "origin": "hostA", "unread": False})
+        self.assertTrue(bare.exists(), "origin B's read receipt survives A's ack")
+        pm.readbox_del(self.HOST, {"mid": "m4" * 8, "origin": "hostB", "unread": False})
+        self.assertFalse(bare.exists())
+
+    # ── P1.6: durable directory chains ──────────────────────────────────────────────
+
+    def test_e_mkdirs_durable_syncs_every_created_level_into_its_parent(self):
+        seen = []
+        real = pm._fsync_dir
+        def spy(p):
+            seen.append(str(p))
+            return real(p)
+        base = pm.STATE / "mkd-test"
+        shutil.rmtree(base, ignore_errors=True)
+        pm._fsync_dir = spy
+        try:
+            pm._mkdirs_durable(base / "a" / "b")
+        finally:
+            pm._fsync_dir = real
+        for want in (pm.STATE, base, base / "a", base / "a" / "b"):
+            self.assertIn(str(want), seen,
+                          "%s is fsync'd — the chain includes the PARENT of the topmost "
+                          "created level (r60 P1.6)" % want)
+        seen.clear()
+        pm._fsync_dir = spy
+        try:
+            pm._mkdirs_durable(base / "a" / "b")
+        finally:
+            pm._fsync_dir = real
+            shutil.rmtree(base, ignore_errors=True)
+        self.assertEqual(seen, [], "an existing chain costs nothing")
+
+    def test_f_first_ever_delivery_links_mailroot_into_state(self):
+        # the audit's crash model: two ACKs while the first mailbox disappeared — the
+        # parent that OWNS a newly created MAILROOT was never synced
+        shutil.rmtree(pm.MAILROOT, ignore_errors=True)
+        seen = []
+        real = os.fsync
+        def spy(fd):
+            seen.append(os.fstat(fd).st_ino)
+            real(fd)
+        pm.os.fsync = spy
+        try:
+            pm.deliver(SID, "peer", "77" * 16, "hello")
+        finally:
+            pm.os.fsync = real
+        self.assertIn(pm.MAILROOT.stat().st_ino, seen)
+        self.assertIn(pm.STATE.stat().st_ino, seen,
+                      "the directory that OWNS the new MAILROOT is synced too")
+
+    # ── P1.7: the withdrawal itself must be durable before the compensation ─────────
+
+    def test_g_unsynced_withdrawal_is_uncertain_not_unpublished(self):
+        # reproduced by the audit: publish-fsync failed, the unlink succeeded, and
+        # `unpublished` was appended — a crash that lost the buffered unlink restored
+        # live mail while the log said it never went out; replay then ACKed it
+        mb = pm._mailbox(SID)
+        real = pm._fsync_dir
+        def always_boom(p):
+            if str(p) == str(mb / "new"):
+                raise OSError(5, "EIO")
+            return real(p)
+        pm._fsync_dir = always_boom
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(pm._DeliverUndurable):
+                    pm.deliver(SID, "peer", "88" * 16, "boom")
+        finally:
+            pm._fsync_dir = real
+        self.assertNotIn("unpublished", {r.get("ev") for r in _rows()},
+                         "an UNPROVEN withdrawal never records definite non-publication")
+
+    def test_h_synced_withdrawal_still_compensates_truthfully(self):
+        mb = pm._mailbox(SID)
+        real = pm._fsync_dir
+        calls = [0]
+        def boom_once(p):
+            if str(p) == str(mb / "new"):
+                calls[0] += 1
+                if calls[0] == 1:
+                    raise OSError(5, "EIO")     # the publish fsync
+            return real(p)                      # the withdrawal fsync SUCCEEDS
+        pm._fsync_dir = boom_once
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(OSError):
+                    pm.deliver(SID, "peer", "99" * 16, "boom")
+        finally:
+            pm._fsync_dir = real
+        self.assertIn("unpublished", {r.get("ev") for r in _rows()},
+                      "a DURABLE withdrawal earns the truthful compensation")
+
+    # ── P1.8: backflow validates the WHOLE ledger; invalid rows are save-proof ──────
+
+    def test_i_invalid_backflow_rows_are_preserved_never_erased(self):
+        pm._backflow_path().write_text(json.dumps({
+            "badhost": {"acks": "VICTIM"},
+            "inthost": {"acks": 123},
+            "goodhost": {"acks": ["aa" * 16], "bounces": []}}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm._backflow_load()
+        self.assertTrue(pm._backflow_loaded[0])
+        with pm._peer_lock:
+            self.assertEqual(pm._peer_pending.get("goodhost", {}).get("acks"),
+                             ["aa" * 16], "the fully-valid row folds")
+            self.assertNotIn("badhost", pm._peer_pending,
+                             "acks:'VICTIM' never folds as six single-letter acks")
+            self.assertTrue(pm._backflow_save_locked())
+        d = json.loads(pm._backflow_path().read_text())
+        self.assertEqual(d["badhost"], {"acks": "VICTIM"},
+                         "the invalid row rides the save VERBATIM — repairable, not erased")
+        self.assertEqual(d["inthost"], {"acks": 123},
+                         "…including the integer shape that used to raise TypeError")
+        self.assertIn("goodhost", d)
+
+    def test_j_wrong_shaped_backflow_root_quarantines_and_restarts(self):
+        # the r59 bare hold was a PERMANENT wedge with no repair path — judged garbage
+        # now moves aside (forensics kept) and the ledger restarts empty, loudly
+        pm._backflow_path().write_text("[]")
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm._backflow_load()
+        self.assertTrue(pm._backflow_loaded[0], "the judged reset folds")
+        self.assertFalse(pm._backflow_path().exists())
+        kept = list((pm.CORRUPT / "peer-backflow").glob("*.corrupt"))
+        self.assertEqual(len(kept), 1, "the judged bytes are kept for repair")
+
+    # ── P1.9: pending-bounce cleanup never touches an unfolded ledger ───────────────
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 0 does not block reads for root")
+    def test_k_unfolded_pending_bounces_are_never_flushed_or_unlinked(self):
+        pm._pending_bounces_path().parent.mkdir(parents=True, exist_ok=True)
+        pm._pending_bounces_path().write_text(json.dumps(
+            {"OLDHOST|om1": {"host": "OLDHOST", "mid": "om1", "code": "x", "t": 1}}))
+        os.chmod(pm._pending_bounces_path(), 0)
+        settled = []
+        real = pm._bounce_arrived
+        pm._bounce_arrived = lambda h, b: settled.append((h, b)) or True
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertFalse(pm._pending_bounce_park(self.HOST, "nm1", "code"))
+                pm._flush_pending_bounces()
+            self.assertEqual(settled, [], "NOTHING settles from an unfolded ledger")
+            pm._pending_bounce_clear(self.HOST, "nm1")
+        finally:
+            pm._bounce_arrived = real
+            os.chmod(pm._pending_bounces_path(), 0o644)
+        self.assertTrue(pm._pending_bounces_path().exists(),
+                        "the durable ledger survives the unfolded clear (the audit's "
+                        "repro ended file_exists=False over a row this process never read)")
+        d = json.loads(pm._pending_bounces_path().read_text())
+        self.assertIn("OLDHOST|om1", d, "the durable park is untouched")
+
+    # ── P2.11: receipts-done is proved and locked ───────────────────────────────────
+
+    def test_l_wrong_shaped_receipts_done_is_judged_not_overwritten(self):
+        pm.RECEIPTS_DONE.write_text("[]")
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm._receipts_done_add("rd" * 16)
+        self.assertEqual(set(json.loads(pm.RECEIPTS_DONE.read_text())), {"rd" * 16})
+        kept = list((pm.CORRUPT / "receipts-done").glob("*.corrupt"))
+        self.assertEqual(len(kept), 1, "the judged [] bytes are kept for repair")
+
+    def test_m_concurrent_receipts_done_adds_both_land(self):
+        # reproduced by the audit: two barrier-synchronized additions produced one
+        # surviving confirmation — the RMW was unlocked
+        import threading
+        bar = threading.Barrier(2)
+        def add(mid):
+            bar.wait()
+            pm._receipts_done_add(mid)
+        ts = [threading.Thread(target=add, args=("cc" * 16,)),
+              threading.Thread(target=add, args=("dd" * 16,))]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        d = json.loads(pm.RECEIPTS_DONE.read_text())
+        self.assertIn("cc" * 16, d)
+        self.assertIn("dd" * 16, d)
+
+    # ── P2.13: the deterministic relay staging name is plant-proof ──────────────────
+
+    def test_n_a_fifo_at_the_relay_staging_name_never_hangs_delivery(self):
+        mb = pm._mailbox(SID)
+        name = pm._relay_name("hostA", "mm" * 16)
+        os.mkfifo(mb / "tmp" / name)
+        got = pm.deliver(SID, "peer", "55" * 16, "body",
+                         from_host="hostA", relay_mid="mm" * 16, relay_via="hostA")
+        self.assertEqual(got, name, "delivery completes — no blocking open, no hang")
+        self.assertTrue((mb / "new" / name).exists())

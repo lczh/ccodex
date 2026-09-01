@@ -33,16 +33,18 @@ test("the quarantine card is compact: Approve/Deny buttons + a one-line sender/g
   assert.match(FEED, /a\._qApprove = qApprove; a\._qDeny = qDeny; a\._qBody = qbody;/);
 });
 
-test("the blocked type carries the quarantine fields (incl. the gist)", () => {
-  assert.match(FEED, /mid\?: string; frm\?: string; to\?: string; origin\?: string; body\?: string; gist\?: string \};\s*\/\/ quarantine/);
+test("the blocked type carries the quarantine fields (incl. the gist and the raw origin)", () => {
+  assert.match(FEED, /mid\?: string; frm\?: string; to\?: string; origin\?: string; originId\?: string; body\?: string; gist\?: string \};\s*\/\/ quarantine/);
 });
 
 test("the decision carries the card's sid so a remote hold's verdict reaches the holding kernel", () => {
   assert.match(FEED, /const isQuar = it\.blocked\?\.state === "quarantine"/);
   // the block chip is suppressed for a quarantine card — its own buttons carry the decision
   assert.match(FEED, /it\.blocked\.state !== "quarantine"/);
-  // sid rides the op — federation's routeOutbound keys on it (same shape as the askClear fix, 2026-07-02)
-  assert.match(FEED, /vscodeApi\?\.postMessage\(\{ type: "quarantineDecision", mid, action, text, sid: it\.sid, feedback \}\)/);
+  // sid rides the op — federation's routeOutbound keys on it (same shape as the askClear fix, 2026-07-02);
+  // and the RAW origin rides too (r60 P1.5: two origins can hold one mid — a mid-only
+  // verdict acted on both)
+  assert.match(FEED, /vscodeApi\?\.postMessage\(\{ type: "quarantineDecision", mid, action, text, sid: it\.sid, feedback,\s*\n\s*origin: it\.blocked\?\.originId \|\| undefined \}\)/);
   assert.match(FEED, /a\._qApprove\.onclick = [\s\S]*?decide\("approve", "Delivering…", it\.blocked!\.body \|\| ""\)/);
   // the card's Deny goes through the dialog's feedback step, never a blind drop
   assert.match(FEED, /a\._qDeny\.onclick = [\s\S]*?showQuarantineDialog\(\.\.\.ends\(\), it\.blocked!\.body \|\| "", decide, true\)/);

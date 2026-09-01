@@ -2865,6 +2865,11 @@ class TimelinePanel {
                    color: edit.color, add: edit.add, remove: edit.remove,
                    delete: !!edit.delete };
     if (gid) wire.opId = String(gid);   // the kernel echoes it back on this edit's refusal
+    const _ro = gid ? (this._unionOps || []).find((o) => o.gid === gid || o.ogid === gid
+      || (Array.isArray(o.olin) && o.olin.indexOf(gid) >= 0)) : null;
+    if (_ro && _ro.rid) wire.rid = String(_ro.rid);   // the STABLE root id rides the
+    //   DISPATCH (r60 P2.1): a refusal naming a generation past the 32-entry retained
+    //   lineage still correlates — the kernel echoes this back without a journal lookup
     window.__rompTimelineEditTag(wire);
     this.draw();
     return true;
@@ -3088,7 +3093,13 @@ class TimelinePanel {
         this._unionEpoch = this._unionEpoch || 0;
         const _sendEpoch = this._unionEpoch;
         this._postChain = (this._postChain || Promise.resolve()).then(() => {
-          if (_sendEpoch !== (this._unionEpoch || 0)) {
+          // a queued COMPLETION whose gesture vanished from the mirror is as void as a
+          // moved world (r60 P1.1, reproduced: a tagEditFailed consumed the re-keyed
+          // group while this POST sat behind the chain — the send-head rebuild then
+          // sent entries=[] with the STALE rekey, the kernel's CAS accepted it, and
+          // the acked gate ran effects the refusal had just rolled back)
+          const _rekeyGone = rekey && !(this._unionOps || []).some((o) => o.gid === rekey.gid);
+          if (_sendEpoch !== (this._unionEpoch || 0) || _rekeyGone) {
             // the world moved past this queued send. Its GATES get the transport-reset
             // treatment, not a silent delete (r58 wave 2, both reproduced: a voided
             // completion gate's re-keyed rows later rode a plain mirror sync as an

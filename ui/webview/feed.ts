@@ -93,7 +93,7 @@ interface AskItem {
               refusal?: boolean;   // apiError: the model's safeguards refused the prompt itself (on you → rewrite it or drop the thread; never auto-retried — deterministic on the same input, the user 2026-08-15)
               mode?: string; since?: number;   // judgeAuth adds these: which billing its judges ride ('key'|'login') + the first refusal time — romp can't analyze the session until the credential is fixed (the user 2026-08-12)
               toName?: string; toSid?: string;    // parkedHandoff adds to*
-              mid?: string; frm?: string; to?: string; origin?: string; body?: string; gist?: string };   // quarantine (held peer mail) adds these; gist = the bus's 90-char collapse for the compact card line
+              mid?: string; frm?: string; to?: string; origin?: string; originId?: string; body?: string; gist?: string };   // quarantine (held peer mail) adds these; originId = the RAW origin for decisions (origin is display-defaulted); gist = the bus's 90-char collapse for the compact card line
   summary?: string | null;                         // distiller's key takeaway for a COMPLETED goal → the done card's one auto-written line (kernel asks.append); null until produced
   distillState?: "completed" | "blocked" | null;   // the GENUINE resolution state the distiller line keys on, so the brief/takeaway rides the real block instead of the transient `column` (which recheck/rejudging flicker to working) — the user 2026-07-21; absent from older/remote payloads → fall back to column
   blockSummary?: string | null;                    // block-distiller's decision brief for a BLOCKED goal → the blocked card's one auto-written line (kernel 466393c); null until produced
@@ -2101,7 +2101,11 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
     a._qApprove.disabled = false; a._qApprove.textContent = "Approve";
     a._qDeny.disabled = false; a._qDeny.textContent = "Deny";
     const decide = (action: string, busy: string, text: string, feedback?: string) => {
-      vscodeApi?.postMessage({ type: "quarantineDecision", mid, action, text, sid: it.sid, feedback });
+      // the verdict names WHICH origin's hold it judges (r60): two origins can hold the
+      // same mid, and a mid-only decision acted on both — originId is the card's raw
+      // origin (blocked.origin is display-defaulted to "?")
+      vscodeApi?.postMessage({ type: "quarantineDecision", mid, action, text, sid: it.sid, feedback,
+                               origin: it.blocked?.originId || undefined });
       for (const b of [a._qApprove, a._qDeny] as HTMLButtonElement[]) b.disabled = true;
       (action === "deny" ? a._qDeny : a._qApprove).textContent = busy;
     };
