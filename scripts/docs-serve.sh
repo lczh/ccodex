@@ -23,7 +23,11 @@ cd "$REPO"
 tree_id() {
   {
     git rev-parse HEAD 2>/dev/null || true
-    git status --porcelain -- docs mkdocs.yml overrides 2>/dev/null || true
+    # a READ-ONLY poll must never take index.lock: plain `git status` opportunistically
+    # rewrites the index, and on a slow runner that write collided with the test's own
+    # `git add` — "Unable to create .git/index.lock: File exists", twice in a row on
+    # the v1.3.35 macOS gate (r62). --no-optional-locks (git >= 2.15) makes it a pure read.
+    git --no-optional-locks status --porcelain -- docs mkdocs.yml overrides 2>/dev/null || true
   } | shasum | cut -d' ' -f1
 }
 

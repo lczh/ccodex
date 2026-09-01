@@ -85,3 +85,9 @@ runs() { [ -f "$RUNS" ] && wc -l < "$RUNS" | tr -d ' ' || echo 0; }
     sleep 1.5
     [ "$(runs)" -ge 2 ]
 }
+
+@test "the watcher's status poll never takes index.lock (--no-optional-locks)" {
+    # r62 release gate: plain `git status` rewrote the index during its poll and
+    # collided with a concurrent `git add` — twice, deterministically, on macOS
+    grep -q -- 'git --no-optional-locks status --porcelain' "$REPO/scripts/docs-serve.sh"
+}
