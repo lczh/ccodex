@@ -1719,6 +1719,8 @@ class TimelinePanel {
           if (this._yieldAbsentSeen.has(g4)) {
             this._yieldedGids.delete(g4);       // TWO consecutive absent echoes: settled
             this._yieldAbsentSeen.delete(g4);
+            if (this._refusalConsumed) this._refusalConsumed.delete(g4);   // the owed
+            //   retirement PROVED OUT — the bar on re-completion lifts with it (r60 w2)
           } else {
             this._yieldAbsentSeen.add(g4);
           }
@@ -3110,6 +3112,27 @@ class TimelinePanel {
             if (this._gatedDispatches) delete this._gatedDispatches[opId];
             const _gates = _held ? (_held.gates || []) : [];
             for (const g1 of _gates.filter((x) => x.rekey)) {
+              if (_rekeyGone && g1.rekey === rekey) {
+                // the gesture was REFUSAL-CONSUMED while this completion sat queued (r60
+                // wave 2, reproduced end-to-end: the plain yield below DELETED the
+                // original gid from _journaledGids, so the retirement the refusal owed
+                // the journal was never sent — the live rows rode every echo, the panel
+                // re-claimed its own still-held claim, unsuppressed, re-adopted, and
+                // RE-COMPLETED the gesture, re-running effects the refusal had rolled
+                // back and splitting the hosts). The compensation already ran; what the
+                // journal is owed is a RETIREMENT: keep the ledger entry so the paced
+                // re-send names it, suppress re-adoption meanwhile, and bar completion
+                // until the retirement proves out as absence from a proven echo.
+                if (!this._journaledGids) this._journaledGids = new Set();
+                this._journaledGids.add(g1.rekey.ogid);
+                if (!this._yieldedGids) this._yieldedGids = new Set();
+                this._yieldedGids.add(g1.rekey.gid);
+                this._yieldedGids.add(g1.rekey.ogid);
+                if (!this._refusalConsumed) this._refusalConsumed = new Set();
+                this._refusalConsumed.add(g1.rekey.ogid);
+                if (this._claimEpochs) delete this._claimEpochs[g1.rekey.ogid];
+                continue;
+              }
               this._yieldUnionGids([g1.rekey.gid, g1.rekey.ogid]);   // unwind (r56 rule)
             }
             const _plain = _gates.filter((x) => !x.rekey);
@@ -3303,6 +3326,14 @@ class TimelinePanel {
     if (m.ok !== true) return;           // another panel owns it — its completion flips the rows
     if (!this._claimEpochs) this._claimEpochs = {};
     this._claimEpochs[m.gid] = m.epoch;  // the rekey-and-retire CAS token (r55 P1.4)
+    if (this._refusalConsumed && this._refusalConsumed.has(m.gid)) {
+      // a granted claim proves NOTHING here: the kernel refreshes THIS panel's own
+      // still-held claim on the same ckey, so "the completer died" cannot be inferred
+      // from it (r60 wave 2, reproduced: the refresh unsuppressed a refusal-consumed
+      // gesture and the panel re-completed it). The gesture owes the journal a
+      // retirement; only its proven absence lifts the bar.
+      return;
+    }
     if (this._yieldedGids && this._yieldedGids.has(m.gid)) {
       // the granted claim PROVES the completer died (its socket would have held it) — the
       // suppression ends and the next payload's adoption hands this panel the rows; the
@@ -3323,6 +3354,8 @@ class TimelinePanel {
   // finds the group through ogid.
   _completeUnionGesture(gid) {
     if (this._views && this._views.unproved) return;   // no judgment from an unproved payload
+    if (this._refusalConsumed && this._refusalConsumed.has(gid)) return;   // the refusal
+    //   already compensated this gesture — it owes a retirement, never a re-run (r60 w2)
     const group = (this._unionOps || []).filter((x) => x.gid === gid);
     const pend = group.filter((x) => x.dispatched === false);
     if (!pend.length) return;

@@ -2364,3 +2364,109 @@ class R60PostalAudit(unittest.TestCase):
                          from_host="hostA", relay_mid="mm" * 16, relay_via="hostA")
         self.assertEqual(got, name, "delivery completes — no blocking open, no hang")
         self.assertTrue((mb / "new" / name).exists())
+
+
+class R60Wave2Postal(unittest.TestCase):
+    """the r60 verify round's confirmed second-order defects, postal half: _mkdirs_durable
+    latched a failed fsync as created-forever, the deterministic staging name raced a
+    concurrent same-(origin,mid) delivery into publishing unfsynced bytes, invalid-UTF-8
+    receipts-done bytes escaped the judged arm uncaught, a failed move-aside still
+    authorized the overwrite of judged bytes, and the fingerprint-less quarantine could
+    move a concurrent writer's fresh valid ledger aside."""
+
+    def setUp(self):
+        _reset()
+        for p in (pm.RECEIPTS_DONE,):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        shutil.rmtree(pm.CORRUPT, ignore_errors=True)
+        shutil.rmtree(pm.MAILROOT / SID, ignore_errors=True)
+        shutil.rmtree(pm.STATE / "mkd2-test", ignore_errors=True)
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_a_failed_fsync_never_latches_the_chain_as_proven(self):
+        base = pm.STATE / "mkd2-test"
+        real = pm._fsync_dir
+        boom = [True]
+        seen = []
+        def spy(p):
+            if boom[0]:
+                raise OSError(5, "EIO")
+            seen.append(str(p))
+            return real(p)
+        pm._fsync_dir = spy
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(OSError):
+                    pm._mkdirs_durable(base / "a")
+            self.assertFalse(base.exists(),
+                             "the failed chain is UNDONE so the retry re-proves it "
+                             "(wave 1 latched it as created and every later call "
+                             "skipped the durability proof forever)")
+            boom[0] = False
+            pm._mkdirs_durable(base / "a")
+        finally:
+            pm._fsync_dir = real
+            shutil.rmtree(base, ignore_errors=True)
+        for want in (pm.STATE, base, base / "a"):
+            self.assertIn(str(want), seen, "the retry proved %s" % want)
+
+    def test_b_staging_never_shares_or_touches_the_deterministic_name(self):
+        # the verify round: a quarantine approve retrying against a still-running first
+        # attempt shared one deterministic staging name — the loser's unlink orphaned the
+        # winner's fsynced inode and the winner PUBLISHED the loser's unfsynced bytes
+        mb = pm._mailbox(SID)
+        name = pm._relay_name("hostA", "aa" * 16)
+        sentinel = mb / "tmp" / name
+        sentinel.write_text("SENTINEL")              # another in-flight call's stage
+        got = pm.deliver(SID, "peer", "44" * 16, "body",
+                         from_host="hostA", relay_mid="aa" * 16, relay_via="hostA")
+        self.assertEqual(got, name)
+        self.assertTrue((mb / "new" / name).exists())
+        self.assertEqual(sentinel.read_text(), "SENTINEL",
+                         "the other call's stage was never unlinked or written through")
+
+    def test_c_invalid_utf8_receipts_done_is_judged_not_a_crash(self):
+        pm.RECEIPTS_DONE.write_bytes(b"\xff\xfe{}")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(pm._receipts_done(), {},
+                             "undecodable bytes are JUDGED (wave 1 raised "
+                             "UnicodeDecodeError past the OSError arm and every "
+                             "/handoff-done errored forever)")
+            pm._receipts_done_add("ee" * 16)
+        self.assertIn("ee" * 16, json.loads(pm.RECEIPTS_DONE.read_text()))
+        self.assertEqual(len(list((pm.CORRUPT / "receipts-done").glob("*.corrupt"))), 1)
+
+    def test_d_a_failed_move_aside_never_authorizes_the_overwrite(self):
+        pm.RECEIPTS_DONE.write_text("[]")
+        pm.CORRUPT.mkdir(parents=True, exist_ok=True)
+        (pm.CORRUPT / "receipts-done").write_text("blocking file")   # the move-aside fails
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm._receipts_done_add("ff" * 16)
+        self.assertEqual(pm.RECEIPTS_DONE.read_text(), "[]",
+                         "the judged bytes STAND — wave 1 overwrote them in place when "
+                         "the quarantine silently failed")
+
+    def test_e_the_judged_verdict_is_fingerprinted(self):
+        # the verify round: a stale fingerprint-less verdict from the unlocked
+        # handoff_done_apply reader moved a concurrent writer's FRESH VALID ledger aside
+        pm.RECEIPTS_DONE.write_text("[]")
+        captured = []
+        real = pm._quarantine_corrupt_json
+        def spy(path, store, error, fingerprint=None):
+            captured.append(fingerprint)
+            return real(path, store, error, fingerprint)
+        pm._quarantine_corrupt_json = spy
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                pm._receipts_done()
+        finally:
+            pm._quarantine_corrupt_json = real
+        self.assertEqual(len(captured), 1)
+        self.assertIsNotNone(captured[0],
+                             "the verdict carries the stat generation it judged — a "
+                             "concurrent writer's replacement is never moved aside")

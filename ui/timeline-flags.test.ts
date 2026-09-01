@@ -2070,7 +2070,7 @@ test("r58 wave 2: a voided queued send treats its gates like the transport reset
   // voided PLAIN gate's effects simply never ran — no unwind, no error
   const sy = SRC.indexOf("if (_sendEpoch !== (this._unionEpoch || 0) || _rekeyGone) {");
   assert.ok(sy > 0);
-  const win = SRC.slice(sy, sy + 1600);
+  const win = SRC.slice(sy, sy + 3600);   // widened for the r60 wave-2 refusal-consumed arm
   assert.ok(win.indexOf("for (const g1 of _gates.filter((x) => x.rekey)) {") > 0
     && win.indexOf("this._yieldUnionGids([g1.rekey.gid, g1.rekey.ogid]);") > 0,
     "a voided completion gate UNWINDS both identities (the r56 rule)");
@@ -2146,4 +2146,57 @@ test("r60: the dispatch carries its stable root id — refusal correlation witho
   assert.equal(wires[0].rid, "100",
     "the STABLE root rides the dispatch — any-depth lineage still correlates");
   delete g.__rompTimelineEditTag;
+});
+
+test("r60 wave 2 executed: a refusal-consumed completion RETIRES the gesture — never re-claims and re-runs it", async () => {
+  // the verify round's P1, reproduced end-to-end there: the wave-1 void arm's plain
+  // yield deleted the original gid from the ledger, so the retirement the refusal owed
+  // was never sent — the rows rode every echo, the kernel refreshed the panel's OWN
+  // still-held claim (same ckey), the suppression lifted on that refresh, and the panel
+  // re-adopted and RE-COMPLETED the gesture, re-running effects the refusal rolled back
+  const panel = drawnPanel();
+  const posts: any[] = [];
+  (panel as any)._kernelPost = (route: string, body: any) => {
+    posts.push(body);
+    return Promise.resolve({ ok: true, json: { ok: true }, status: 200 });
+  };
+  const realProcess = (globalThis as any).process;
+  (globalThis as any).process = { versions: { electron: "1" } };
+  try {
+    panel._unionOps = [{ gid: 81, host: "TESTHOST-A", edit: { add: ["s1"] }, inverse: {},
+                         rt: { id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool" },
+                         name: "pool", dispatched: false, post: {} }];
+    if (!panel._journaledGids) panel._journaledGids = new Set();
+    panel._journaledGids.add(81);                  // the adopted gesture is ledgered
+    panel._claimEpochs = { 81: 7 };
+    const effects: any[] = [];
+    panel._editRemoteTag = (rt: any, edit: any) => { effects.push(edit); return true; };
+    panel._completeUnionGesture(81);
+    panel.tagEditFailed({ host: "TESTHOST-A", name: "pool", opId: "81", error: "refused" });
+    await panel._postChain;
+    // the RETIREMENT rode a later sync instead of being forgotten
+    const retiredEver = posts.some((b) => (b.retired || []).indexOf(81) >= 0);
+    assert.ok(retiredEver,
+      "the refusal-consumed gesture's ORIGINAL gid is retired (wave 1 deleted it from "
+      + "the ledger and the live rows stranded in the kernel journal forever)");
+    assert.ok(panel._refusalConsumed && panel._refusalConsumed.has(81),
+      "…and the gesture is barred from re-completion until the retirement proves out");
+    // a granted claim is NO unsuppression here: the kernel refreshes this panel's OWN
+    // still-held claim, which proves nothing about a dead completer
+    panel._pendingClaims = { 81: true };
+    panel.unionClaimAck({ gid: 81, ok: true, epoch: 9 });
+    assert.ok(panel._yieldedGids && panel._yieldedGids.has(81),
+      "the suppression survives the same-ckey claim refresh");
+    panel._completeUnionGesture(81);
+    assert.equal(effects.length, 0, "no effect ever re-ran after the refusal's rollback");
+    // the retirement PROVES OUT: two consecutive echoes without the gid lift the bar
+    for (let i = 0; i < 2; i += 1) {
+      panel.update({ now, sessions: [sess("s1", "web", "#f7768e")], turns: {}, messages: [],
+                     judging: [], views: JSON.parse(JSON.stringify(VIEWS)), unionOps: [] });
+    }
+    assert.ok(!(panel._refusalConsumed && panel._refusalConsumed.has(81)),
+      "proven absence retires the bar with the suppression");
+  } finally {
+    (globalThis as any).process = realProcess;
+  }
 });

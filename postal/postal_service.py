@@ -398,7 +398,14 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
                 return name
         except OSError:
             pass                                     # can't prove — fall through and deliver
-    tmp = mb / "tmp" / name
+    tmp = mb / "tmp" / (name + "." + os.urandom(8).hex() + ".tmp")
+    # a PER-CALL unique staging name (r60 wave 2, reproduced: the deterministic name let a
+    # concurrent same-(origin,mid) delivery — a quarantine approve retrying against a still-
+    # running first attempt — unlink the winner's inode mid-write and PUBLISH the loser's
+    # unfsynced bytes; and its predictability let a planted FIFO block the open, r60 P2.13).
+    # Unpredictable, exclusive, never shared: nothing to plant, nothing to race; the publish
+    # rename target (new/<name>) stays deterministic so a crash replay is still idempotent.
+    # Orphaned tmps are ignored by the boot reconcile and swept with the maildir.
     # THE header write point — every value that lands in a header line goes through _hdr_val
     # first, because a line break in any ONE of them rewrites all the others (see _hdr_val).
     # Doing it here and not at the callers covers all four of them at once: /send, an inbound
@@ -425,11 +432,6 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
     if h["relay_mid"] and h["relay_via"]:
         hdr += "X-Peer-Mid: %s\nX-Peer-Via: %s\n" % (h["relay_mid"], h["relay_via"])
     try:
-        tmp.unlink(missing_ok=True)      # the staging name is DETERMINISTIC for relayed
-        #   mail (r-<digest of origin|mid>), so a planted FIFO there blocked this
-        #   O_WRONLY open while the caller held _seen_lock, stalling every relay behind
-        #   it (r60 P2.13) — unlink-first + O_EXCL only ever writes a file THIS call
-        #   created, and a replant between the two fails loudly instead of hanging
         _dfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(_dfd, "w") as _dfh:
             _dfh.write(hdr + "\n" + body + "\n")
@@ -3077,8 +3079,23 @@ def _mkdirs_durable(path):
     if not missing:
         return
     p.mkdir(parents=True, exist_ok=True)
-    for d in [q] + list(reversed(missing)):
-        _fsync_dir(d)
+    try:
+        for d in [q] + list(reversed(missing)):
+            _fsync_dir(d)
+    except OSError:
+        # UNDO the creation so the caller's RETRY re-proves the chain (r60 wave 2,
+        # reproduced: one fsync fault latched the dirs as created — every later call
+        # found nothing missing and skipped the durability proof for the directory's
+        # lifetime, while the durable seen record outlived the unproven quarantine dir).
+        # Deepest-first; a dir a concurrent writer already occupied stays, loudly.
+        for d in missing:
+            try:
+                d.rmdir()
+            except OSError:
+                _log("_mkdirs_durable: %s could not be undone after a failed fsync — "
+                     "the chain stands UNPROVEN until a retry succeeds" % d)
+                break
+        raise
 
 
 def _atomic_text_put(path, text):
@@ -3652,15 +3669,46 @@ def outbox_del(host, mid):
 _receipts_done_lock = threading.Lock()
 
 
+def _receipts_done_judged(e, fp, for_write):
+    """One judged-garbage verdict on the receipts-done ledger: quarantine the bytes aside
+    (FINGERPRINTED — r60 wave 2, reproduced: a stale fingerprint-less verdict from the
+    unlocked handoff_done_apply reader moved a concurrent writer's FRESH VALID ledger
+    into corrupt/) and restart empty. If the move-aside FAILED the judged bytes still
+    stand — a write must NOT proceed, or it destroys them in place (r60 wave 2)."""
+    _quarantine_corrupt_json(RECEIPTS_DONE, "receipts-done", e, fp)
+    try:
+        _still = RECEIPTS_DONE.exists()
+    except OSError:
+        _still = True
+    if _still and for_write:
+        raise _OutboxUnreadable("receipts-done judged bad and could not move aside")
+    return {}
+
+
 def _receipts_done(_for_write=False):
     try:
-        raw = RECEIPTS_DONE.read_text()
+        _st = RECEIPTS_DONE.stat()
+        _fp = (_st.st_dev, _st.st_ino, _st.st_size, _st.st_mtime_ns)
     except FileNotFoundError:
         return {}
     except OSError:
         if _for_write:
             raise _OutboxUnreadable("receipts-done unreadable")   # r59 P2.12: the {} fold
             #   let one new confirmation overwrite every existing one
+        return {}
+    try:
+        raw = RECEIPTS_DONE.read_text()
+    except FileNotFoundError:
+        return {}
+    except UnicodeDecodeError as e:
+        # undecodable bytes never REACH json.loads — read_text itself raises, and
+        # UnicodeDecodeError is a ValueError, not an OSError (r60 wave 2, reproduced:
+        # it escaped this reader uncaught, every /handoff-done errored forever, and
+        # receiptbox_del had already unlinked the park before the crash point)
+        return _receipts_done_judged(e, _fp, _for_write)
+    except OSError:
+        if _for_write:
+            raise _OutboxUnreadable("receipts-done unreadable")
         return {}
     try:
         d = json.loads(raw)
@@ -3671,8 +3719,7 @@ def _receipts_done(_for_write=False):
         # read as proved-empty and the next confirmation OVERWROTE it silently) — the
         # bytes move aside for repair and the ledger restarts empty: a lost
         # confirmation only re-parks its receipt, harmlessly.
-        _quarantine_corrupt_json(RECEIPTS_DONE, "receipts-done", e)
-        return {}
+        return _receipts_done_judged(e, _fp, _for_write)
     return d
 
 
