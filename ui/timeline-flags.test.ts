@@ -260,7 +260,8 @@ test("source: union-op entries carry rt + gesture id + pre-edit name/color at no
 
 test("source: tagEditFailed compensates SIBLING hosts — inverse remote edits; delete is loud, never silent", () => {
   const fn = SRC.indexOf("tagEditFailed(m) {");
-  const win = SRC.slice(fn, fn + 9600);   // widened for the r52 handled-gate note
+  const win = SRC.slice(fn, fn + 12200);   // widened for the r52 handled-gate note
+  //                                           and the r61 gate-cancel sweep
   assert.ok(win.indexOf("_applyLocalOp(o.inverse)") > 0, "the local rollback survives untouched");
   // a refusal carrying the opId the edit was stamped with compensates EXACTLY that gesture (the
   // 2026-08-26 audit's Finding C — the kernel echoes it); an opId-less frame (an old kernel)
@@ -2199,4 +2200,67 @@ test("r60 wave 2 executed: a refusal-consumed completion RETIRES the gesture —
   } finally {
     (globalThis as any).process = realProcess;
   }
+});
+
+test("r61 executed: a refusal cancels the standing completion gate — a stale success ack runs nothing", () => {
+  // reproduced upstream through the real bridge (renderer -> timeline-boot -> extension
+  // pipe): the completion packet was captured BEFORE the refusal and transmitted after
+  // it — the r60 send-head guard never saw it (the send had already left the renderer),
+  // the gate survived, and the stale success ack invoked g1.run() on the exact effects
+  // the refusal had rolled back (effects_after_refusal=1)
+  const sent: any[] = [];
+  g.__rompTimelineSetUnionOps = (entries: any, retired: any, opId: any, rekey: any) => {
+    sent.push({ entries, retired, opId, rekey });
+  };
+  const panel = drawnPanel();
+  panel._unionOps = [{ gid: 81, host: "TESTHOST-A", edit: { add: ["s1"] }, inverse: {},
+                       rt: { id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool" },
+                       name: "pool", dispatched: false, post: {} }];
+  if (!panel._journaledGids) panel._journaledGids = new Set();
+  panel._journaledGids.add(81);
+  panel._claimEpochs = { 81: 7 };
+  const effects: any[] = [];
+  panel._editRemoteTag = (rt: any, edit: any) => { effects.push(edit); return true; };
+  panel._completeUnionGesture(81);                 // the packet leaves the renderer NOW
+  assert.equal(sent.length, 1);
+  const opId = sent[0].opId;
+  assert.ok(sent[0].rekey, "the completion rode the wire pre-refusal");
+  // the refusal lands while the packet is still crossing the bridge
+  panel.tagEditFailed({ host: "TESTHOST-A", name: "pool", opId: "81", error: "refused" });
+  assert.equal(Object.keys(panel._gatedDispatches || {}).length, 0,
+    "the refusal CANCELLED the standing gate");
+  // the stale success ack arrives — the kernel committed before it saw the refusal
+  panel.unionOpsAck({ ok: true, opId, unclaimed: [], unretired: [] });
+  assert.equal(effects.length, 0,
+    "no effect ran after the refusal's rollback (the audit measured 1)");
+  // the stale packet itself CARRIED retired=[81] and the ok ack settled it — what is
+  // still owed is the possibly-committed successor identity
+  const body = panel._unionSyncBody();
+  assert.ok(body.retired.some((x: number) => x === sent[0].rekey.gid),
+    "the possibly-committed successor identity is owed a retirement");
+  assert.ok(panel._refusalConsumed && panel._refusalConsumed.has(81)
+    && panel._refusalConsumed.has(sent[0].rekey.gid),
+    "re-completion stays barred for BOTH identities until the retirement proves out");
+  delete g.__rompTimelineSetUnionOps;
+});
+
+test("r61: the durable refusal replay correlates by stable rid and passes it through", () => {
+  // reproduced upstream: past 32 rekeys the journal-scan matched only opId against the
+  // bounded lineage — rowsAfterJournalScan=1, rollbacks=0, the durable refusal was
+  // never replayed and the split went permanent
+  const panel = drawnPanel();
+  panel._unionOps = [{ gid: 136, ogid: 135, olin: [104, 135], rid: 100,
+                       host: "TESTHOST-A", edit: {}, inverse: {},
+                       rt: { id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool" },
+                       name: "pool", dispatched: false }];
+  const fired: any[] = [];
+  panel.tagEditFailed = (m: any) => { fired.push(m); };
+  panel.update({ now, sessions: [sess("s1", "web", "#f7768e")], turns: {}, messages: [],
+                 judging: [], views: JSON.parse(JSON.stringify(VIEWS)),
+                 unionOps: [{ refusal: true, gid: -101, opId: "101", rid: 100,
+                              host: "TESTHOST-A", name: "pool", error: "refused" }] });
+  assert.equal(fired.length, 1,
+    "the stored refusal correlated through its rid — generation 101 is outside the "
+    + "retained lineage entirely");
+  assert.equal(fired[0].rid, 100, "…and the reconstructed frame carries the rid");
 });

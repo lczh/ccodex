@@ -1804,14 +1804,24 @@ class TimelinePanel {
         const ours = this._handledRefusalOps.has(op) || this._mintedGids.has(Number(op))
           || (this._unionOps || []).some((o) => String(o.gid || 0) === op
                                                 || String(o.ogid || 0) === op
+                                                || (r.rid && String(o.rid || 0) === String(r.rid))
+                                                //  ^ the STABLE root id (r61 P2.1,
+                                                //    executed: past 32 rekeys the
+                                                //    lineage match found nothing — the
+                                                //    durable refusal was never replayed
+                                                //    and no rollback ever fired)
                                                 || (Array.isArray(o.olin)
                                                     && o.olin.some((x) => String(x) === op)));
         if (!ours) continue;
         this._retireUnionGids.add(r.gid);
         this._unionSyncDirty = true;
         if (!this._handledRefusalOps.has(op)) {
-          // the reload path: fire the compensation the lost frame would have carried
-          this.tagEditFailed({ host: r.host, name: r.name, opId: r.opId, error: r.error });
+          // the reload path: fire the compensation the lost frame would have carried —
+          // WITH the stored rid, so the reconstructed frame correlates past the
+          // lineage cap exactly like the live frame does (r61 P2.1)
+          const _rf = { host: r.host, name: r.name, opId: r.opId, error: r.error };
+          if (r.rid) _rf.rid = r.rid;
+          this.tagEditFailed(_rf);
         }
       }
     }
@@ -2961,6 +2971,39 @@ class TimelinePanel {
     // slower sibling refuses).
     const gids = new Set();
     for (const o of ops) if (o.gid) gids.add(o.gid);
+    // CANCEL any standing completion gate this refusal consumed (r61 P1.1, reproduced
+    // through the real bridge: a completion packet captured BEFORE the refusal was
+    // transmitted after it — the gate survived this rollback, and the stale success ack
+    // then ran g1.run() on the exact effects compensated below). The gesture owes a
+    // retirement for BOTH identities: the kernel may or may not have committed the
+    // rekey by the time the packets settle, and retiring an absent gid is a harmless
+    // tombstone. Re-completion stays barred until the retirement proves out as absence.
+    for (const k of Object.keys(this._gatedDispatches || {})) {
+      const _gk = (this._gatedDispatches[k] || {}).gates || [];
+      const _hitG = _gk.filter((g1) => g1.rekey
+        && (gids.has(g1.rekey.gid) || gids.has(g1.rekey.ogid)
+            || (m.opId && (String(g1.rekey.ogid) === String(m.opId)
+                           || String(g1.rekey.gid) === String(m.opId)))));
+      if (!_hitG.length) continue;
+      for (const g1 of _hitG) {
+        if (!this._journaledGids) this._journaledGids = new Set();
+        this._journaledGids.add(g1.rekey.ogid);
+        this._journaledGids.add(g1.rekey.gid);
+        if (!this._yieldedGids) this._yieldedGids = new Set();
+        this._yieldedGids.add(g1.rekey.gid);
+        this._yieldedGids.add(g1.rekey.ogid);
+        if (!this._refusalConsumed) this._refusalConsumed = new Set();
+        this._refusalConsumed.add(g1.rekey.ogid);
+        this._refusalConsumed.add(g1.rekey.gid);
+        if (this._claimEpochs) {
+          delete this._claimEpochs[g1.rekey.ogid];
+          delete this._claimEpochs[g1.rekey.gid];
+        }
+      }
+      this._gatedDispatches[k].gates = _gk.filter((g1) => _hitG.indexOf(g1) < 0);
+      if (!this._gatedDispatches[k].gates.length) delete this._gatedDispatches[k];
+      this._unionSyncDirty = true;
+    }
     const sibs = (this._unionOps || []).filter((o) => o.gid && gids.has(o.gid)
       && o.host !== (m.host || ''));
     this._unionOps = (this._unionOps || []).filter((o) => sibs.indexOf(o) < 0);

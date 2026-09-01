@@ -664,7 +664,7 @@ def read_box(sid, consume):
     if not newd.is_dir():
         return []
     if consume:
-        (mb / "cur").mkdir(parents=True, exist_ok=True)
+        _mkdirs_durable(mb / "cur")
     # Parse the whole candidate batch before claiming any file.  A consumer must never move the
     # first messages to cur/ and then lose ownership of them because a later read/rename failed.
     # The rename pass below also rolls back anything it moved before a mid-batch race or I/O error;
@@ -760,7 +760,7 @@ def restore(sid, mid):
     except OSError:
         head = ""
     try:
-        (MAILROOT / sid / "new").mkdir(parents=True, exist_ok=True)
+        _mkdirs_durable(MAILROOT / sid / "new")
         src.rename(MAILROOT / sid / "new" / mid)
     except OSError:
         return False
@@ -2312,8 +2312,10 @@ def _reconcile_markers():
         _log("marker reconcile failed: %s" % e)
 
 def serve():
-    STATE.mkdir(parents=True, exist_ok=True)
-    MAILROOT.mkdir(parents=True, exist_ok=True)
+    _mkdirs_durable(STATE)               # boot pre-creation joins the durability
+    _mkdirs_durable(MAILROOT)            # contract (r61 P1.7: plain mkdir here meant
+    #                                      the first delivery synced MAILROOT but never
+    #                                      the directory that owns it)
     _reconcile_markers()
     try:
         httpd = ThreadingHTTPServer((HOST, PORT), Handler)
@@ -2977,11 +2979,16 @@ def _peer_seen_append_durable(mid):
     P1.9): the effect ran, its ack is withheld until this lands. Caller holds _seen_lock."""
     global _seen_appends
     try:
-        PEER_SEEN.parent.mkdir(parents=True, exist_ok=True)
+        _mkdirs_durable(PEER_SEEN.parent)
+        _created = not PEER_SEEN.exists()
         with PEER_SEEN.open("a") as f:
             f.write(mid + "\n")
             f.flush()
             os.fsync(f.fileno())
+        if _created:
+            _fsync_dir(PEER_SEEN.parent)   # the FIRST ledger's own directory entry
+            #                                (r61 P1.7: the file was synced, its link
+            #                                was not, and the ack correlated anyway)
         _seen_appends += 1
         _seen_pending_durable.discard(mid)
         return True
@@ -3018,11 +3025,16 @@ def _peer_seen_add_locked(mid):
         _seen_order.remove(_victim)
         seen.discard(_victim)
     try:
-        PEER_SEEN.parent.mkdir(parents=True, exist_ok=True)
+        _mkdirs_durable(PEER_SEEN.parent)
+        _created = not PEER_SEEN.exists()
         with PEER_SEEN.open("a") as f:
             f.write(mid + "\n")
             f.flush()
             os.fsync(f.fileno())                    # an ack means the receipt survives a process crash
+        if _created:
+            _fsync_dir(PEER_SEEN.parent)   # the FIRST ledger's own directory entry
+            #                                (r61 P1.7: file synced, link unsynced —
+            #                                the ack correlated with a losable ledger)
         _seen_appends += 1
         _seen_pending_durable.discard(mid)
         if _seen_appends >= _SEEN_COMPACT_EVERY:
@@ -3060,42 +3072,38 @@ def _fsync_dir(path):
             os.close(fd)
 
 
+_proved_dirs = set()   # str(dir) -> this PROCESS proved the level durable (fsync'd it
+#                        and its parent link). EXISTS is not PROVED (r61 P1.7, executed
+#                        four ways: a failed-fsync retry saw the dirs standing and
+#                        skipped every fsync; boot pre-created STATE/MAILROOT with plain
+#                        mkdir; the first peer-seen ledger synced the file but never its
+#                        directory; outbox_put never synced a first-generation host dir).
+
+
 def _mkdirs_durable(path):
-    """mkdir -p with every NEWLY CREATED directory fsync'd into its parent, bottom-up —
-    including the parent of the topmost created level (r60 P1.6, reproduced: the
-    first-ever delivery created MAILROOT but nothing synced the directory that OWNS it,
-    so a crash lost the whole mailbox while the durable seen record survived and the
-    replay ACKed without restoring the mail; initial quarantine/outbox dirs had the
-    same gap). No-op when the path already exists; raises OSError like mkdir."""
+    """mkdir -p where EXISTS is not PROVED: every level under the state root that this
+    process has not yet proven durable is fsync'd, plus the parent of the topmost
+    unproven level (it owns that link) — so a failed fsync simply leaves the levels
+    unproven and the RETRY re-proves them, whether or not the directories stand (r60
+    P1.6 + r61 P1.7). A proved level that has since been DELETED (sweeps, tests)
+    re-enters the chain: existence is checked alongside the memo."""
     p = Path(path)
-    missing = []
+    root = STATE.parent
+    chain = []
     q = p
-    while not q.exists():
-        missing.append(q)
-        parent = q.parent
-        if parent == q:
-            break
-        q = parent
-    if not missing:
+    while not (str(q) in _proved_dirs and q.exists()):
+        if not str(q).startswith(str(root) + os.sep):
+            break                        # out-of-tree ancestors predate romp's state
+        chain.append(q)
+        q = q.parent
+    if not chain:
+        if not p.exists():               # an out-of-tree caller still gets its mkdir
+            p.mkdir(parents=True, exist_ok=True)
         return
     p.mkdir(parents=True, exist_ok=True)
-    try:
-        for d in [q] + list(reversed(missing)):
-            _fsync_dir(d)
-    except OSError:
-        # UNDO the creation so the caller's RETRY re-proves the chain (r60 wave 2,
-        # reproduced: one fsync fault latched the dirs as created — every later call
-        # found nothing missing and skipped the durability proof for the directory's
-        # lifetime, while the durable seen record outlived the unproven quarantine dir).
-        # Deepest-first; a dir a concurrent writer already occupied stays, loudly.
-        for d in missing:
-            try:
-                d.rmdir()
-            except OSError:
-                _log("_mkdirs_durable: %s could not be undone after a failed fsync — "
-                     "the chain stands UNPROVEN until a retry succeeds" % d)
-                break
-        raise
+    for d in [chain[-1].parent] + list(reversed(chain)):
+        _fsync_dir(d)
+    _proved_dirs.update(str(d) for d in chain)
 
 
 def _atomic_text_put(path, text):
@@ -3120,7 +3128,7 @@ def _peer_seen_compact_locked():
     """Replace the receipt log with exactly the in-memory window. Caller holds _seen_lock."""
     global _seen_appends
     try:
-        PEER_SEEN.parent.mkdir(parents=True, exist_ok=True)
+        _mkdirs_durable(PEER_SEEN.parent)
         _atomic_text_put(PEER_SEEN, "".join(mid + "\n" for mid in (_seen_order or [])))
         _seen_appends = 0
         return True
@@ -3166,7 +3174,9 @@ def outbox_put(host, msg):
         _log("outbox_put: refusing unsafe host/mid %r/%r" % (host, mid))
         return
     d = OUTBOX / host
-    d.mkdir(parents=True, exist_ok=True)
+    _mkdirs_durable(d)                   # a first-generation host dir links durably
+    #                                      (r61 P1.7: plain mkdir let first-generation
+    #                                      outbox mail vanish after its source was spent)
     with _outbox_pub_lock:               # ONE no-replace arbitration for every outbox
         #                                  writer (r59 P2.6: this put raced the linkless
         #                                  publish between its absence check and rename)
@@ -3516,6 +3526,8 @@ _pending_bounces = {}                  # "host|mid" -> {host, mid, code, t} (r56
 #                                        mid-only key aliased the same mid from two hosts)
 _pending_bounces_lock = threading.Lock()
 _pending_bounces_loaded = [False]
+_pending_bounces_quarantined = set()   # keys whose rows failed key-binding/schema (r61
+#                                        P1.8) — preserved in every rewrite, never flushed
 
 
 def _pending_bounces_path():
@@ -3551,12 +3563,36 @@ def _pending_bounces_load():
                 # PRESERVE the unreadable row under its own key (r59 P2.11: skipping it
                 # let the next park's rewrite erase it) — the flush skips non-dicts
                 _pending_bounces[str(k)] = v
+                _pending_bounces_quarantined.add(str(k))
                 continue
-            if not v.get("mid"):
+            if "mid" in v:
+                # the row must be BOUND to its durable key (r61 P1.8, executed: a row
+                # stored under HOSTA|MIDA but naming HOSTB|VICTIM-MID settled the
+                # VICTIM — deleted its outbox record, noted its sender, and filed a
+                # bounced terminal the real message never earned)
+                if (not isinstance(v.get("mid"), str) or not _safe_id(v["mid"])
+                        or not isinstance(v.get("host") or "", str)
+                        or not isinstance(v.get("code") or "", str)
+                        or "%s|%s" % (v.get("host") or "", v["mid"]) != str(k)):
+                    _pending_bounces[str(k)] = v     # preserved verbatim, never settled
+                    _pending_bounces_quarantined.add(str(k))
+                    _log("pending-bounces: row %r is not bound to its key — preserved "
+                         "for repair, never flushed" % str(k))
+                    continue
+            else:
                 # a pre-r56 ledger keyed rows by BARE mid with no mid field (the r56 wave-2
                 # verification, confirmed three ways: those parks flushed mid="" forever and
                 # never settled — the exchange had 200'd, so the peer would never re-send)
-                v = dict(v, mid=str(k).split("|")[-1])
+                _lmid = str(k).split("|")[-1]
+                if (not _safe_id(_lmid)
+                        or not isinstance(v.get("host") or "", str)
+                        or not isinstance(v.get("code") or "", str)):
+                    _pending_bounces[str(k)] = v
+                    _pending_bounces_quarantined.add(str(k))
+                    _log("pending-bounces: legacy row %r failed validation — preserved "
+                         "for repair, never flushed" % str(k))
+                    continue
+                v = dict(v, mid=_lmid)
             _pending_bounces["%s|%s" % (v.get("host") or "", v["mid"])] = v
     _pending_bounces_loaded[0] = True
     return True
@@ -3608,11 +3644,14 @@ def _flush_pending_bounces():
             return                       # NEVER settle from an unfolded ledger (r60 P1.9:
             #                              the flush settled a memory-only row and the
             #                              clear unlinked the durable file it never read)
-        items = list(_pending_bounces.values())
-    for v in items:
-        if not isinstance(v, dict):
-            continue                     # a preserved-unreadable row (r59 P2.11): it rides
-            #                              every rewrite untouched until repaired by hand
+        items = [(k, v) for k, v in _pending_bounces.items()]
+    for k, v in items:
+        if not isinstance(v, dict) or k in _pending_bounces_quarantined:
+            continue                     # a preserved-unreadable or key-unbound row (r59
+            #                              P2.11 + r61 P1.8): it rides every rewrite
+            #                              untouched until repaired by hand
+        if "%s|%s" % (str(v.get("host") or ""), str(v.get("mid") or "")) != k:
+            continue                     # the flush-side binding backstop (r61 P1.8)
         # through _bounce_arrived, never _bounce_apply directly (the r55 wave-2
         # verification: the direct call skipped the forwarded-vs-ours arbitration and a
         # HUB's parked bounce delivered its return note to a REMOTE frm_id as local mail
@@ -3884,8 +3923,13 @@ def _receipt_rows(value):
                 and _safe_id(row["mid"])):
             # STRING mids only (r59 P2.9, reproduced: {"mid":123} stringified, deleted the
             # real 123.json park, and marked its delivery complete)
+            if ("origin" in row and row.get("origin") is not None
+                    and not (isinstance(row["origin"], str) and _safe_id(row["origin"]))):
+                continue     # a malformed origin rejects the ROW (r61 P1.10: dropping
+                #              the field made the ack originless and it settled origin
+                #              B's legacy park)
             keep = {"mid": row["mid"]}
-            if isinstance(row.get("origin"), str) and _safe_id(row["origin"]):
+            if isinstance(row.get("origin"), str) and row["origin"]:
                 keep["origin"] = row["origin"]
             out.append(keep)
     return out
@@ -3927,10 +3971,12 @@ def _handoff_done_arrived(host, row):
     bounce backward-relay's shape — the r44 verification: hub-forwarded delegations' receipts
     stranded at the hub). Otherwise record it durably (idempotent by mid) — recording is the
     safe fallback: an alias mismatch on the sender's own bus still lands the join locally."""
-    mid = str((row or {}).get("mid") or "")
-    if not _safe_id(mid):
-        return True
-    origin = str((row or {}).get("origin") or "")
+    mid = (row or {}).get("mid")
+    if not (isinstance(mid, str) and _safe_id(mid)):
+        return True      # typed, never stringified (r61 P1.10, executed: mid:123 became
+        #                  "123" and a completion was recorded for mail never delegated)
+    origin = (row or {}).get("origin")
+    origin = origin if isinstance(origin, str) else ""
     if (origin and _safe_id(origin) and origin != host and origin != self_host()
             and (PEERS.get(origin) or {}).get("port")):
         try:
@@ -4164,13 +4210,23 @@ def _peer_read_ack_rows(value):
         if not isinstance(row, dict):
             continue
         mid = row.get("mid")
-        if isinstance(mid, str) and _safe_id(mid):
-            keep = {"mid": mid, "unread": bool(row.get("unread"))}
-            if isinstance(row.get("origin"), str) and _safe_id(row["origin"]):
-                keep["origin"] = row["origin"]   # the scoped park's key (r59 wave 2:
-                #                                  origin-less acks could never clear it
-                #                                  and the receipt re-rode forever)
-            out.append(keep)
+        if not (isinstance(mid, str) and _safe_id(mid)):
+            continue
+        if "unread" in row and not isinstance(row.get("unread"), bool):
+            continue     # a LITERAL bool only (r61 P1.10, executed: unread:"false"
+            #              truth-coerced to True and the ack deleted the retraction
+            #              park its content no longer matched)
+        if ("origin" in row and row.get("origin") is not None
+                and not (isinstance(row["origin"], str) and _safe_id(row["origin"]))):
+            continue     # a MALFORMED origin rejects the ROW, never just the field
+            #              (r61 P1.10, executed: origin:123 was dropped and the
+            #              origin-less ack deleted origin B's legacy park)
+        keep = {"mid": mid, "unread": bool(row.get("unread"))}
+        if isinstance(row.get("origin"), str) and row["origin"]:
+            keep["origin"] = row["origin"]   # the scoped park's key (r59 wave 2:
+            #                                  origin-less acks could never clear it
+            #                                  and the receipt re-rode forever)
+        out.append(keep)
     return out
 
 
@@ -4338,10 +4394,12 @@ def _quarantine_put(origin, m, to_id, via=""):
     try:
         _mkdirs_durable(QUARANTINE)      # the FIRST hold's dir links durably (r60 P1.6)
         _qname = _receipt_park_name(mid, origin if _safe_id(str(origin or "")) else "")
-        tmp = QUARANTINE / (_qname + ".tmp")
-        tmp.unlink(missing_ok=True)   # the staging name derives from the SENDER's mid — a
-        #                               planted FIFO hung the bus thread (the r34 verification)
-        _qfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        tmp = QUARANTINE / (_qname + "." + os.urandom(8).hex() + ".tmp")
+        # a PER-CALL unique, EXCLUSIVE staging name (r61 P3.1: the fixed name's
+        # unlink-then-open window let a same-user FIFO replant block the bus thread —
+        # the same class delivery closed in r60; unpredictable + O_EXCL leaves nothing
+        # to plant and nothing to race)
+        _qfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(_qfd, "w") as _qfh:
             _qfh.write(json.dumps(rec))
             _qfh.flush()
@@ -4912,17 +4970,19 @@ def _backflow_save_locked():
     for h, q in list(_backflow_preserved.items()):
         snap[h] = q      # judged-invalid rows ride EVERY save verbatim (r60 P1.8,
         #                  reproduced: a skipped invalid row latched loaded=True and the
-        #                  next save erased it) — until repaired by hand or superseded
-        #                  by a live entry for the same host below
+        #                  next save erased it)
     for h, p in _peer_pending.items():
         if p.get("acks") or p.get("bounces"):
+            _live = {"acks": list(p.get("acks") or []),
+                     "bounces": [b for b in (p.get("bounces") or [])
+                                 if isinstance(b, dict)]}
             if h in _backflow_preserved:
-                _backflow_preserved.pop(h, None)
-                _log("peer-backflow: live entry for %r supersedes its preserved "
-                     "invalid row" % h)
-            snap[h] = {"acks": list(p.get("acks") or []),
-                       "bounces": [b for b in (p.get("bounces") or [])
-                                   if isinstance(b, dict)]}
+                # EMBEDDED beside the live state, never superseded away (r61 P1.9,
+                # executed: the r60 pop erased a preserved row — and the valid
+                # unresolved bounce inside it — the moment a new ack landed for the
+                # same host). It rides every save until repaired by hand.
+                _live["preserved"] = _backflow_preserved[h]
+            snap[h] = _live
     try:
         if snap:
             _atomic_json_put(_backflow_path(), snap)
@@ -5002,17 +5062,28 @@ def _backflow_load_locked():
         return
     if True:
         for h, q in d.items():
-            if not (_safe_id(str(h)) and _backflow_row_valid(q)):
+            _pres = None
+            _qv = q
+            if isinstance(q, dict) and "preserved" in q:
+                # a live row carrying an EMBEDDED preserved sibling (r61 P1.9): the
+                # preserved half stays save-proof; the live half folds normally
+                _pres = q["preserved"]
+                _qv = {k2: v2 for k2, v2 in q.items() if k2 != "preserved"}
+            if not (_safe_id(str(h)) and _backflow_row_valid(_qv)):
                 _backflow_preserved[str(h)] = q      # verbatim, save-proof (r60 P1.8)
                 _log("peer-backflow: row %r failed validation — preserved verbatim for "
                      "repair; it rides every save untouched" % str(h))
                 continue
+            if _pres is not None:
+                _backflow_preserved[str(h)] = _pres
+                _log("peer-backflow: host %r carries a preserved row awaiting repair"
+                     % str(h))
             p = _peer_pending.setdefault(str(h), {"acks": [], "bounces": [], "readAcks": [],
                                                   "handoffDoneAcks": []})
-            for a in q.get("acks") or []:
+            for a in _qv.get("acks") or []:
                 if a not in p["acks"]:
                     p["acks"].append(a)
-            for b in q.get("bounces") or []:
+            for b in _qv.get("bounces") or []:
                 if b not in p["bounces"]:
                     p["bounces"].append(b)
     _backflow_loaded[0] = True

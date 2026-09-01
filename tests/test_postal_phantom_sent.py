@@ -2389,6 +2389,9 @@ class R60Wave2Postal(unittest.TestCase):
         self.setUp()
 
     def test_a_a_failed_fsync_never_latches_the_chain_as_proven(self):
+        # r61 P1.7 (superseding the r60 rollback design, which met a concurrent occupant
+        # and then saw "exists" as proved): EXISTS is not PROVED — a failed fsync leaves
+        # the levels unproven and the retry re-fsyncs them whether or not they stand.
         base = pm.STATE / "mkd2-test"
         real = pm._fsync_dir
         boom = [True]
@@ -2403,17 +2406,20 @@ class R60Wave2Postal(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(OSError):
                     pm._mkdirs_durable(base / "a")
-            self.assertFalse(base.exists(),
-                             "the failed chain is UNDONE so the retry re-proves it "
-                             "(wave 1 latched it as created and every later call "
-                             "skipped the durability proof forever)")
+            # the dirs may STAND (a concurrent occupant blocks any undo) — what matters
+            # is that nothing was marked proved
+            self.assertNotIn(str(base), pm._proved_dirs)
+            self.assertNotIn(str(base / "a"), pm._proved_dirs)
             boom[0] = False
             pm._mkdirs_durable(base / "a")
         finally:
             pm._fsync_dir = real
             shutil.rmtree(base, ignore_errors=True)
-        for want in (pm.STATE, base, base / "a"):
-            self.assertIn(str(want), seen, "the retry proved %s" % want)
+            pm._proved_dirs.discard(str(base))
+            pm._proved_dirs.discard(str(base / "a"))
+        for want in (base, base / "a"):
+            self.assertIn(str(want), seen,
+                          "the retry proved %s even though it already existed" % want)
 
     def test_b_staging_never_shares_or_touches_the_deterministic_name(self):
         # the verify round: a quarantine approve retrying against a still-running first
@@ -2470,3 +2476,133 @@ class R60Wave2Postal(unittest.TestCase):
         self.assertIsNotNone(captured[0],
                              "the verdict carries the stat generation it judged — a "
                              "concurrent writer's replacement is never moved aside")
+
+
+class R61PostalAudit(unittest.TestCase):
+    """the v1.3.33 audit, postal half: directory durability still had four holes (P1.7),
+    pending-bounce rows were unbound from their durable key (P1.8), preserved backflow
+    rows were erased by newer live state (P1.9), ack readers coerced mid/origin/unread
+    (P1.10), and quarantine staging kept the fixed-name unlink-then-open window (P3.1)."""
+
+    HOST = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+
+    def setUp(self):
+        _reset()
+        pm._backflow_loaded[0] = False
+        pm._backflow_preserved.clear()
+        pm._pending_bounces.clear()
+        pm._pending_bounces_loaded[0] = False
+        pm._pending_bounces_quarantined.clear()
+        with pm._peer_lock:
+            pm._peer_pending.clear()
+        for p in (pm._backflow_path(), pm._pending_bounces_path(), pm.PEER_SEEN):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        shutil.rmtree(pm.QUARANTINE, ignore_errors=True)
+        shutil.rmtree(pm.CORRUPT, ignore_errors=True)
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_the_first_peer_seen_ledger_links_durably(self):
+        # r61 P1.7: the first creation fsynced the FILE but never its directory entry —
+        # the ack correlated with a ledger a crash could lose whole
+        seen_dirs = []
+        real = pm._fsync_dir
+        def spy(p):
+            seen_dirs.append(str(p))
+            return real(p)
+        pm._fsync_dir = spy
+        try:
+            self.assertTrue(pm._peer_seen_append_durable("ab" * 16))
+        finally:
+            pm._fsync_dir = real
+        self.assertIn(str(pm.PEER_SEEN.parent), seen_dirs,
+                      "the first ledger's own directory entry is synced")
+
+    def test_b_a_pending_bounce_row_is_bound_to_its_durable_key(self):
+        # r61 P1.8, executed: a row stored under HOSTA|MIDA but naming HOSTB|VICTIM
+        # settled the VICTIM — deleted its outbox record, noted its sender, and filed a
+        # bounced terminal the real message never earned
+        pm._pending_bounces_path().parent.mkdir(parents=True, exist_ok=True)
+        pm._pending_bounces_path().write_text(json.dumps(
+            {"HOSTA|" + "aa" * 16: {"host": "HOSTB", "mid": "ee" * 16, "code": "x",
+                                    "t": 1}}))
+        settled = []
+        real = pm._bounce_arrived
+        pm._bounce_arrived = lambda h, b: settled.append((h, b)) or True
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                pm._flush_pending_bounces()
+        finally:
+            pm._bounce_arrived = real
+        self.assertEqual(settled, [], "the unbound row NEVER settles")
+        pm._pending_bounce_clear("nosuch", "nn" * 16)            # any rewrite path
+        d = json.loads(pm._pending_bounces_path().read_text())
+        self.assertIn("HOSTA|" + "aa" * 16, d,
+                      "…and it rides every rewrite VERBATIM for repair")
+        self.assertEqual(d["HOSTA|" + "aa" * 16]["mid"], "ee" * 16)
+
+    def test_c_a_preserved_backflow_row_survives_newer_live_state(self):
+        # r61 P1.9, executed: the r60 pop erased a preserved row — and the valid
+        # unresolved bounce inside it — the moment a new ack landed for the same host
+        bounce = {"mid": "bb" * 16, "code": "recipient-unavailable"}
+        pm._backflow_path().write_text(json.dumps(
+            {self.HOST: {"acks": "VICTIM", "bounces": [bounce]}}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm._backflow_load()
+        p = pm._pending(self.HOST)
+        with pm._peer_lock:
+            p["acks"].append("cc" * 16)              # the newer live state
+            self.assertTrue(pm._backflow_save_locked())
+        d = json.loads(pm._backflow_path().read_text())
+        self.assertEqual(d[self.HOST]["acks"], ["cc" * 16], "the live ack persisted")
+        self.assertEqual(d[self.HOST]["preserved"],
+                         {"acks": "VICTIM", "bounces": [bounce]},
+                         "the preserved row rides EMBEDDED — the unresolved bounce "
+                         "inside it is never erased")
+        # …and a fresh process folds both halves back
+        pm._backflow_loaded[0] = False
+        pm._backflow_preserved.clear()
+        with pm._peer_lock:
+            pm._peer_pending.clear()
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm._backflow_load()
+        with pm._peer_lock:
+            self.assertEqual(pm._peer_pending[self.HOST]["acks"], ["cc" * 16])
+            self.assertEqual(pm._backflow_preserved[self.HOST],
+                             {"acks": "VICTIM", "bounces": [bounce]})
+
+    def test_d_ack_readers_reject_malformed_fields_whole_row(self):
+        # r61 P1.10, executed three ways: mid:123 stringified into a false completion;
+        # origin:123 dropped to an originless ack that deleted origin B's legacy park;
+        # unread:"false" truth-coerced to True and deleted the retraction park
+        good = {"mid": "dd" * 16, "origin": self.HOST, "unread": False}
+        self.assertEqual(len(pm._peer_read_ack_rows([good])), 1)
+        self.assertEqual(pm._peer_read_ack_rows(
+            [dict(good, origin=123)]), [], "a malformed origin rejects the ROW")
+        self.assertEqual(pm._peer_read_ack_rows(
+            [dict(good, unread="false")]), [], "unread is a LITERAL bool")
+        self.assertEqual(pm._receipt_rows([{"mid": "dd" * 16, "origin": 123}]), [],
+                         "the handoffDoneAck reader rejects malformed origins too")
+        before = len(_rows())
+        self.assertTrue(pm._handoff_done_arrived("peer1", {"mid": 123}))
+        self.assertEqual(len(_rows()), before,
+                         "a numeric mid records NOTHING — never a stringified "
+                         "completion for mail nobody delegated")
+
+    def test_e_quarantine_staging_is_unique_and_exclusive(self):
+        # r61 P3.1: the fixed-name unlink-then-open window admitted a same-user FIFO
+        # replant — the executed thread stayed blocked past 400ms
+        pm.QUARANTINE.mkdir(parents=True, exist_ok=True)
+        _qname = pm._receipt_park_name("qq" * 16, "hostA")
+        sentinel = pm.QUARANTINE / (_qname + ".tmp")
+        sentinel.write_text("SENTINEL")              # the old fixed staging name
+        ok = pm._quarantine_put("hostA", {"mid": "qq" * 16, "to": "web", "frm": "api",
+                                          "frm_id": "", "body": "b"}, SID)
+        self.assertTrue(ok, "the hold lands")
+        self.assertEqual(sentinel.read_text(), "SENTINEL",
+                         "the fixed name is never touched — nothing to plant against")
+        self.assertTrue((pm.QUARANTINE / _qname).exists())

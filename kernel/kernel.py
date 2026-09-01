@@ -2322,6 +2322,23 @@ def _union_tombs_load_locked():
             d = json.loads(_read_regular_text(_union_tombs_path()))
         except ValueError:
             d = None                                 # malformed/non-regular = judged
+        if isinstance(d, dict):
+            # the WHOLE map validates before ANY of it folds (r61 P1.4, executed:
+            # {"801":"not-a-time"} was silently skipped, the rest folded, loaded
+            # latched True — and gid 801's replay was accepted and claimable with no
+            # hold anywhere). One invalid key or stamp judges the whole ledger.
+            for k, v in d.items():
+                try:
+                    _kg = int(str(k))
+                    _kv = float(v)
+                except (TypeError, ValueError, OverflowError):
+                    d = None
+                    break
+                if (_kg == 0 or not (-(2 ** 53 - 1) <= _kg <= 2 ** 53 - 1)
+                        or isinstance(v, bool) or _kv != _kv
+                        or _kv in (float("inf"), float("-inf"))):
+                    d = None
+                    break
         if not isinstance(d, dict):
             if _expired:
                 # the SAME judged bytes still stand at expiry (a crash in the mint
@@ -2746,27 +2763,41 @@ def _union_store_read_locked(what="union-gestures"):
             except OSError:
                 pass
         return None, "unproved"
+    try:
+        _fmtime = int(p.stat().st_mtime)
+    except OSError:
+        _fmtime = int(time.time())
+
     def _coerce_legacy_refusal(r):
-        # v1.3.32 journaled refusal rows with non-string error/host/name/opId (its
-        # validator's refusal branch accepted any finite shape) — the exact schema would
-        # judge those journals row-poisoned on UPGRADE and hold healthy stores UNPROVED
-        # (r60 wave 2, reproduced: one dict-error refusal held a whole journal behind a
-        # reconstruction no headless kernel could ever perform). Narrow read-side
-        # normalization, refusal rows only.
-        if not (isinstance(r, dict) and r.get("refusal")):
+        # Older journals hold refusal rows the exact schema now rejects: non-string
+        # error/host/name/opId (v1.3.32's refusal branch accepted any finite shape),
+        # truthy non-bool discriminators (pre-r61 read refusal:"false" as a refusal),
+        # and non-numeric t. The exact schema would judge those journals row-poisoned
+        # on UPGRADE and hold healthy stores UNPROVED (r60 wave 2, reproduced: one
+        # dict-error refusal held a whole journal behind a reconstruction no headless
+        # kernel could ever perform). Narrow read-side normalization, refusal rows only.
+        if not isinstance(r, dict) or "refusal" not in r:
             return r
         out = None
+        if r["refusal"] is not True and r["refusal"] is not False:
+            out = dict(r)
+            out["refusal"] = bool(r["refusal"])   # the old truthy read, made literal
+        base = out if out is not None else r
+        if not base.get("refusal"):
+            return base
         for k in ("error", "host", "name", "opId"):
-            if k in r and r[k] is not None and not isinstance(r[k], str):
-                out = out or dict(r)
+            if k in base and base[k] is not None and not isinstance(base[k], str):
+                out = out if out is not None else dict(r)
                 try:
-                    out[k] = json.dumps(r[k], default=str)
+                    out[k] = json.dumps(base[k], default=str)
                 except (TypeError, ValueError):
-                    out[k] = str(r[k])
-        if "t" in r and (isinstance(r.get("t"), bool)
-                         or not isinstance(r.get("t"), (int, float))):
-            out = out or dict(r)
-            del out["t"]
+                    out[k] = str(base[k])
+        if "t" in base and (isinstance(base.get("t"), bool)
+                            or not isinstance(base.get("t"), (int, float))):
+            out = out if out is not None else dict(r)
+            out["t"] = _fmtime           # the FILE's own stamp, never a deletion (r61
+            #                              P2.2: a t-less refusal row was outside the 7d
+            #                              staleness backstop — immortal once persisted)
         return out if out is not None else r
     rows = [_coerce_legacy_refusal(r) for r in rows]
     bad = any(not _union_row_valid(r) for r in rows)   # NON-DICTS judged too (r58 P1.6:
@@ -2866,6 +2897,11 @@ def _union_row_valid(r):
         #                  rode the wire and poisoned the browser frame)
     if "rid" in r and r.get("rid") not in (None, 0) and not _safe_int(r.get("rid"), 1, _MAX):
         return False
+    if "refusal" in r and r["refusal"] is not True and r["refusal"] is not False:
+        return False     # a LITERAL-BOOL discriminator (r61 P1.6, executed:
+        #                  refusal:"false" — a truthy string — validated as a refusal,
+        #                  journaled while the shield was held, and the browser treated
+        #                  it as a compensation event)
     if r.get("refusal"):
         if not (_safe_int(r.get("gid"), -_MAX, -1) or _safe_int(r.get("gid"), 1, _MAX)):
             return False
@@ -2891,7 +2927,12 @@ def _union_row_valid(r):
     for k in ("confirmed", "lapplied"):
         if k in r and not isinstance(r[k], bool):
             return False   # "false" (a string) is truthy — never coerced (r60 P1.4)
-    for k in ("edit", "inverse", "rt", "post", "lop"):
+    for k in ("edit", "inverse", "rt"):
+        if not isinstance(r.get(k), dict):
+            return False   # REQUIRED operation objects (r61 P1.6, executed:
+            #                {gid, host, dispatched} alone validated, and the real
+            #                panel's completion pass raised TypeError reading rt.host)
+    for k in ("post", "lop"):
         if k in r and r[k] is not None and not isinstance(r[k], dict):
             return False   # operation fields are OBJECTS (r60 P1.4: a string edit
             #                raised at the completion pass's Object.assign twin)
@@ -3013,15 +3054,53 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                 # reconstruction base (r58 wave 2 — the definitive verdict made the twin
                 # retire a live gesture); hold the completion until the store is rebuilt
                 return False, [], "the journal is held for reconstruction — retry", []
-            if not any(r.get("gid") == _ogid and not r.get("refusal") for r in cur):
+            _orows = [r for r in cur if r.get("gid") == _ogid and not r.get("refusal")]
+            if not _orows:
                 return False, [], "the gesture settled while the claim was held", []
-            if not any(r.get("gid") == _rekey_gid and not r.get("refusal") for r in inc):
+            _orow = _orows[0]
+            _oroot = _orow.get("ogid") or _ogid
+            _orid = _orow.get("rid") or 0
+            _olineage = {_ogid, (_orow.get("ogid") or 0)} | set(_orow.get("olin") or [])
+            _olineage.discard(0)
+            _olins = {str(x) for x in _olineage}
+            if any(r.get("refusal")
+                   and ((isinstance(r.get("gid"), int) and not isinstance(r.get("gid"), bool)
+                         and -r.get("gid") in _olineage)
+                        or (r.get("opId") or "") in _olins
+                        or (_orid and r.get("rid") == _orid))
+                   for r in cur):
+                # a JOURNALED refusal for this gesture STANDS (r61 P1.1, reproduced
+                # through the real bridge: a completion packet captured BEFORE the
+                # refusal was transmitted after it — the CAS passed and the acked gate
+                # re-ran effects every panel's compensation had just rolled back). The
+                # refusal is the gesture's verdict; there is nothing left to complete.
+                return False, [], "the gesture was refused — nothing to complete", []
+            _succ = [r for r in inc if r.get("gid") == _rekey_gid and not r.get("refusal")]
+            if not _succ:
                 # the completion transaction must CARRY its successor rows (r60 P1.1,
                 # reproduced end-to-end: a queued Electron body rebuilt at the send head
                 # AFTER a refusal consumed the group sent entries=[] with the STALE
                 # rekey — the CAS passed, the original was retired against nothing, and
                 # the acked gate ran effects the refusal had just rolled back)
                 return False, [], "the completion carries no successor rows — retry", []
+            if ({r.get("host") for r in _succ}
+                    != {r.get("host") for r in _orows}):
+                # the WHOLE-GROUP contract (r61 P1.2, executed: a successor carrying
+                # only host A of an {A,B} original committed — B's half silently left
+                # the compensation journal and its operation was lost outright)
+                return False, [], "the completion must carry every host of the " \
+                                  "original", []
+            for r in _succ:
+                if ((r.get("ogid") or 0) != _oroot
+                        or (_ogid != _oroot and _ogid not in (r.get("olin") or []))
+                        # ^ completing the ROOT generation is proven by ogid equality
+                        #   alone; completing a LATER generation must name it in olin
+                        or (_orid and (r.get("rid") or 0) != _orid)):
+                    # ...and the successor must DESCEND from the original (r61 P1.2,
+                    # executed: ogid/olin/rid=999 was accepted for original 801 — a
+                    # later refusal of the successor could then never correlate back)
+                    return False, [], "the completion's lineage does not descend " \
+                                      "from the original", []
         # the DISPATCH RATCHET (the r53 wave-3 verification): 'the effects ran' is one-way
         # evidence — an adopter panel's full-replace mirror of rows it seeded BEFORE the
         # writer's dispatched:true flip regressed the journal to false and re-armed the
@@ -3051,6 +3130,11 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             # nothing, tombstoned BOTH ids, and acked ok over an emptied lineage)
             return False, [], "malformed completion (the successor cannot be retired in " \
                               "the same write)", []
+        if _rekey_gid and _ogid not in ret:
+            # the completion is ONE transaction: re-key AND retire (r61 P1.2, executed:
+            # a rekey without the retirement left original and successor both standing —
+            # two independently claimable identities for one gesture, double-run ready)
+            return False, [], "the completion must retire the original", []
         _unretired = []
         if ret:
             with _union_claims_lock:
@@ -3082,13 +3166,19 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             for r in inc:
                 if (r.get("refusal") or r.get("gid") in _resident
                         or (r.get("gid") not in _union_retired_tombs
-                            and ((r.get("ogid") or 0) in _resident
-                                 or any(x in _resident for x in (r.get("olin") or []))))):
+                            and any(a in ret for a in
+                                    ([r.get("ogid") or 0] + list(r.get("olin") or []))
+                                    if a in _resident))):
                     # the ancestor exemption applies only while the row's OWN gid is
                     # untombed (r60 wave 2: gids mint from a random 30-bit seed, so a
                     # RETIRED successor's replay could name an ogid that collides with
                     # an unrelated live gid — resident ancestry must never resurrect a
-                    # row the shield has personally retired).
+                    # row the shield has personally retired) — AND only when this same
+                    # write RETIRES that resident ancestor (r61 P1.3, executed: a plain
+                    # unclaimed merge inserted a "successor" beside its living original
+                    # through bare residency — no rekey, no claim, no retirement — and
+                    # both stood independently claimable). The half-committed retry
+                    # carries retired=[ancestor], so recovery still lands (r60 P1.2).
                     # a RESIDENT gesture's own update is never tombstone-dropped (the r56
                     # audit's P1.1, executed there: the committed successor's dispatched:true
                     # flip carries the tombstoned ogid — dropping it deleted the healthy
@@ -3148,7 +3238,12 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                 for g in ret:
                     _union_retired_tombs[g] = time.time()
                 while len(_union_retired_tombs) > _UNION_TOMBS_MAX:
-                    _union_retired_tombs.pop(next(iter(_union_retired_tombs)))
+                    # evict the OLDEST STAMP, never insertion order (r61 P1.5, executed:
+                    # a refreshed gid kept its old dict position and next(iter(...))
+                    # evicted the freshly re-shielded entry — its replay was accepted)
+                    _victim = min(_union_retired_tombs,
+                                  key=lambda k2: (_union_retired_tombs[k2], k2))
+                    _union_retired_tombs.pop(_victim)
                 if not _union_tombs_save_locked():
                     _union_retired_tombs.clear()
                     _union_retired_tombs.update(_tsnap)
@@ -6715,6 +6810,19 @@ _retry_suppress_pending = {}   # sid -> t: suppressions minted while the store w
 #                                always lands and a fault never erases siblings
 
 
+def _suppress_overlay(d):
+    """Fold the pending overlay in WITHOUT regressing a newer durable floor (r61 P2.3,
+    executed: dict.update let an OLDER pending stamp overwrite a newer durable one —
+    the healthy-turn rearm then cleared a suppression the user's later interrupt had
+    refreshed, and the retry storm resumed)."""
+    for k, v in _retry_suppress_pending.items():
+        _cur = d.get(k)
+        if (not isinstance(_cur, (int, float)) or isinstance(_cur, bool)
+                or v > _cur):
+            d[k] = v
+    return d
+
+
 def _retry_suppress_data():
     p = jd.STATE / "retry-suppressed.json"
     try:
@@ -6729,7 +6837,7 @@ def _retry_suppress_data():
     except OSError:
         hit = _retry_suppress_cache.get(str(p))
         d = dict(hit[1]) if hit else {}              # LKG, never a cached fabrication
-        d.update(_retry_suppress_pending)
+        _suppress_overlay(d)
         if not hit and not _retry_suppress_pending and not _suppress_boot_warned[0]:
             _suppress_boot_warned[0] = True
             sys.stderr.write("retry-suppressed: unreadable with NO history — standing "
@@ -6737,7 +6845,7 @@ def _retry_suppress_data():
         return d
     hit = _retry_suppress_cache.get(str(p))
     if hit and hit[0] == key:
-        return (dict(hit[1], **_retry_suppress_pending)
+        return (_suppress_overlay(dict(hit[1]))
                 if _retry_suppress_pending else hit[1])   # overlay on the HIT arm too
         #                                                   (r60 P2.3)
     try:
@@ -6752,11 +6860,11 @@ def _retry_suppress_data():
         # suppressions read as gone, and the next arm erased the siblings durably)
         hit = _retry_suppress_cache.get(str(p))
         d = dict(hit[1]) if hit else {}
-        d.update(_retry_suppress_pending)
+        _suppress_overlay(d)
         return d
     _retry_suppress_cache[str(p)] = (key, d)
     if _retry_suppress_pending:
-        return dict(d, **_retry_suppress_pending)    # the overlay is VISIBLE (r59 wave 2,
+        return _suppress_overlay(dict(d))            # the overlay is VISIBLE (r59 wave 2,
         #                                              reproduced: _auto_resume_session_retry
         #                                              iterated the durable map only, so an
         #                                              overlay-held suppression could never
@@ -6799,7 +6907,8 @@ def _suppress_session_retry(sid):
                 sys.stderr.write("retry-suppressed: store malformed — suppression for %s "
                                  "held in memory; the bytes stand for repair\n" % sid)
                 return
-        d.update(_retry_suppress_pending)
+        _suppress_overlay(d)             # max-merge: never regress a newer durable
+        #                                   floor (r61 P2.3)
         d[sid] = time.time()
         try:
             _atomic_write(p, json.dumps(d, sort_keys=True))
@@ -6831,7 +6940,8 @@ def _clear_session_retry_suppress(sid):
             sys.stderr.write("retry-suppressed: store unreadable — the durable clear for "
                              "%s waits until it reads again\n" % sid)
             return False
-        d.update(_retry_suppress_pending)
+        _suppress_overlay(d)             # max-merge: never regress a newer durable
+        #                                   floor (r61 P2.3)
         _had = d.pop(sid, None) is not None or sid in _retry_suppress_pending
         _retry_suppress_pending.pop(sid, None)
         if _had:

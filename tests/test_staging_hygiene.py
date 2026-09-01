@@ -56,17 +56,17 @@ class JudgeStagingWriters(unittest.TestCase):
 
 
 class OtherStagingWriters(unittest.TestCase):
-    def test_the_postal_quarantine_stager_unlinks_first(self):
-        # the staging name derives from the SENDER's message id — a planted FIFO hung the
-        # bus thread (the r34 verification)
+    def test_the_postal_quarantine_stager_is_unique_and_exclusive(self):
+        # the staging name used to derive from the SENDER's message id — a planted FIFO
+        # hung the bus thread (the r34 verification), and the unlink-then-open window
+        # still admitted a same-user replant (r61 P3.1). The stage is a PER-CALL unique
+        # O_EXCL name now: nothing to plant, nothing to race.
         src = open(os.path.join(ROOT, "bin", "romp-postal-service")).read()
-        i = src.index('tmp = QUARANTINE / (_qname + ".tmp")')   # origin-scoped since r59 P1.8
-        window = src[i:i + 600]   # widened for the r58 fsync'd fd write (durable effect
-        #                           before the ack correlates — the O_NOFOLLOW open is the
-        #                           symlink half; the unlink-first stays the FIFO half)
-        self.assertIn("tmp.unlink(missing_ok=True)", window)
-        self.assertLess(window.index("tmp.unlink(missing_ok=True)"),
-                        window.index("os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW"))
+        i = src.index('tmp = QUARANTINE / (_qname + "." + os.urandom(8).hex() + ".tmp")')
+        window = src[i:i + 700]
+        self.assertIn("os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW", window,
+                      "the unique stage opens exclusively — a replant fails loudly, "
+                      "never blocks")
 
     def test_the_node_copy_stagers_remove_the_plant_first(self):
         # BOTH node copiers: the login-time one (node-launch) and the install-time twin in
