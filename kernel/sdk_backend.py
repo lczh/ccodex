@@ -973,20 +973,21 @@ def is_launch_limit(text: str) -> bool:
     return bool(text and _LAUNCH_LIMIT_RE.search(text))
 
 
-def task_death_notice(tasks: list) -> str:
+def task_death_notice(tasks: list, cause: str = "a restart or crash") -> str:
     """The visible romp notice for BACKGROUND TASKS that died with their claude process. Bg tasks are
     the CLI's children, so a kernel restart or CLI crash silently kills a session's timers/watchers —
     and a session idle-waiting on one would wait FOREVER for a completion notification that can never
     arrive (nimbus's dead campaign watcher, the user 2026-07-11). The notice names what was lost (the
     task descriptions from the lifecycle stream) so the session can relaunch exactly what still
-    matters. Enqueued by _on_session_gone (CLI died, kernel alive) or the boot reconcile (kernel died;
-    read from the reg's bgTasks mirror)."""
+    matters. Enqueued by _on_session_gone (CLI died, kernel alive), the boot reconcile (kernel died;
+    read from the reg's bgTasks mirror), and _drop_live_work (a settings switch reconnected the CLI —
+    `cause` names that, so the session is told the truth about why its work vanished)."""
     n = len(tasks)
     descs = "; ".join(d for d in ((t.get("desc") or "").strip() for t in tasks[:4]) if d)
     return ("<!-- romp-injected --><!-- romp-system -->[romp] %d background task%s this session had "
-            "running died with its claude process (a restart or crash)%s. Their completion "
+            "running died with its claude process (%s)%s. Their completion "
             "notifications will never arrive — relaunch any that are still needed, or carry on if "
-            "they aren't." % (n, "" if n == 1 else "s", (": " + descs) if descs else ""))
+            "they aren't." % (n, "" if n == 1 else "s", cause, (": " + descs) if descs else ""))
 
 # The marker only SDK-driven claude CLIs carry (the kernel drives them over stdin); a tmux session's
 # interactive `claude --resume` never has it, so the orphan reap can never touch a tmux CLI.
@@ -1442,9 +1443,11 @@ class SdkSession:
         self.retry_info = None                        # the CURRENT storm's latest api_retry detail (attempt/max, error status+message, next-attempt epoch) → the chat retrying element's extra context (the user 2026-07-10); lives and dies with `retrying`
         self._interrupted = False                    # user interrupted the in-flight turn → snapshot reads 'waiting' (display only; inflight stays event-driven)
         self._intr_level = 0                         # interrupt escalation rung this episode (interrupt_action); reset on settle / fresh turn
-        self._subagents: dict[str, dict] = {}        # LIVE Task-spawned subagents: agent_id -> {"type","since"}. Fed
-        #   by the SubagentStart/SubagentStop hooks — the exact, event-based "what's running right now" signal the
-        #   tmux backend never had. Keeps the session 'working' while any run and surfaces a live count on the lane.
+        self._subagents: dict[str, dict] = {}        # LIVE subagents (Task/Agent AND Workflow-run agents): agent_id ->
+        #   {"type","since"}. Fed by the SubagentStart hook — the exact, event-based "what's running right now"
+        #   signal the tmux backend never had; drained by SubagentStop, a Workflow run's per-agent progress list,
+        #   the agent's own task end, and the client teardown (see _reconcile_workflow_agents / _drop_live_work).
+        #   Keeps the session 'working' while any run and surfaces a live count on the lane.
         self._bg_tasks: dict[str, dict] = {}         # LIVE background tasks (a run_in_background Bash, a bg agent):
         #   task_id -> {"desc","type","since","toolUseId","lastTool"}. Fed by the CLI's DESIGNED task lifecycle
         #   stream (system/task_started..task_updated — see _on_message), terminal statuses clear — so an idle
@@ -1452,6 +1455,12 @@ class SdkSession:
         #   2026-07-11: nimbus's 20-minute campaign timer). Replaces transcript-scrape liveness for SDK sessions.
         self._sub_lock = threading.Lock()            #   hooks mutate on the loop thread; snapshot() reads from the kernel thread
         #                                                (guards _subagents AND _bg_tasks)
+        self._wf_agents: dict[str, set] = {}         # LIVE Workflow runs: task_id -> the agent ids its progress
+        #   lists have named (the roster). The CLI fires SubagentStart for every workflow agent but SubagentStop
+        #   ONLY for the ones that finish cleanly (probe-verified on CLI 2.1.257, 2026-09-02: a failed agent
+        #   leaves no stop hook), so a run's own per-agent list is what retires the rest — _reconcile_workflow_agents.
+        self._wf_slots: dict[str, dict] = {}         # task_id -> {slot index: the agent id it last held}: a retried
+        #   slot is re-minted with a NEW id, and the displaced id is over the moment the slot changes hands
         self.chosen_model = reg.get("model") or ""   # the alias the user picked (opus/sonnet/…); self.model is the display name
         self._model_pending = ""                     # target ALIAS while a /model switch is resolving: the badge shows
         #   animated dots until the LIVE model actually reflects the pick (the user 2026-07-03: a switch stamped the
@@ -2125,6 +2134,9 @@ class SdkSession:
             self._wake.clear()
             self._reconnect = False
             self._ping_feeding = False   # a reconnect restarts the feed — a stale hold must not wedge it
+            # the abandoned client's live subagents and background tasks died with it — retire them on
+            # the teardown event itself (and tell the session what it lost, as a CLI death does)
+            self._drop_live_work("reconnect")
             # settle + recover anything the abandoned client stranded — see _reconcile_stranded
             self._reconcile_stranded()
             opts = self.backend._options(self, ClaudeAgentOptions)
@@ -2771,9 +2783,10 @@ class SdkSession:
     # ---- subagent tracking (the transparency tmux never had) ----
 
     async def _subagent_start_hook(self, inp, tool_use_id, context):
-        """A Task-spawned subagent just STARTED. Record it live (agent_id -> type + start time) so the session
-        reads 'working' while it runs and the lane can show how many are in flight. The SDK's SubagentStart
-        hook input carries agent_id + agent_type. Best-effort; never raises inside the hook."""
+        """A subagent just STARTED — a Task/Agent one or a Workflow run's (agent_type "workflow-subagent").
+        Record it live (agent_id -> type + start time) so the session reads 'working' while it runs and the
+        lane can show how many are in flight. The SDK's SubagentStart hook input carries agent_id +
+        agent_type. Best-effort; never raises inside the hook."""
         aid = inp.get("agent_id") if isinstance(inp, dict) else None
         if aid:
             with self._sub_lock:
@@ -2782,9 +2795,11 @@ class SdkSession:
         return {}
 
     async def _subagent_stop_hook(self, inp, tool_use_id, context):
-        """A Task-spawned subagent FINISHED — drop it from the live set (SubagentStop carries the same agent_id).
-        When the last one clears, the session falls back to its real state (working if the main turn is still in
-        flight, else idle)."""
+        """A subagent FINISHED CLEANLY — drop it from the live set (SubagentStop carries the same agent_id).
+        The CLI fires this only for clean finishes; a failed agent's end arrives through its run's progress
+        list or its own task end instead (see _reconcile_workflow_agents / _on_task_event). When the last
+        one clears, the session falls back to its real state (working if the main turn is still in flight,
+        else idle)."""
         aid = inp.get("agent_id") if isinstance(inp, dict) else None
         if aid:
             with self._sub_lock:
@@ -2798,6 +2813,92 @@ class SdkSession:
         with self._sub_lock:
             return sorted((dict(v) for v in self._subagents.values()), key=lambda d: d.get("since") or 0)
 
+    def _drop_live_work(self, reason: str):
+        """The CLI process is gone — a reconnect (an effort/fast/auth switch) abandons the old client — so
+        the live work INSIDE it is gone too: forget every subagent (and every run's roster and slots), and
+        retire every lifecycle background task, telling the session which ones it lost the way
+        _on_session_gone does when a CLI dies under a live kernel (their completion notifications can
+        never arrive on the new connection; a session idle-waiting on one would wait forever) — with the
+        cause named truthfully. Event-based on the teardown itself, not on age. Left alone on purpose:
+        the launch ledger (reg bgLedger), which the next Stop hook reconciles as before. Logged when it
+        actually dropped something, so a stale count that healed here stays visible."""
+        with self._sub_lock:
+            n = len(self._subagents)
+            self._subagents.clear()
+            self._wf_agents.clear()
+            self._wf_slots.clear()
+            died = sorted((dict(v) for v in self._bg_tasks.values()), key=lambda d: d.get("since") or 0)
+            self._bg_tasks.clear()
+        if died:
+            note = task_death_notice(died, cause=self._RECONNECT_CAUSE)
+            with self._lock:
+                if note not in self._pending:      # a flapping reconnect must not stack the same notice
+                    self._pending.append(note)
+            self._persist_queue()
+            try:
+                self.backend._update_reg(self.sid, bgTasks=[])   # reported — never re-notify these deaths
+            except Exception as e:
+                self.backend._log("live work (%s): bgTasks mirror clear failed: %s" % (self.name, e))
+        if n or died:
+            self.backend._log("live work (%s): dropped %d subagent%s and %d background task%s on %s — they ran "
+                              "inside the abandoned CLI" % (self.name, n, "" if n == 1 else "s",
+                                                            len(died), "" if len(died) == 1 else "s", reason))
+            self.backend._poke()
+
+    _RECONNECT_CAUSE = "a settings switch restarted it"   # the death notice's cause on a reconnect
+
+    _WF_AGENT_ENDED = frozenset(("done", "error"))
+
+    def _reconcile_workflow_agents(self, tid: str, progress, terminal: bool):
+        """Retire the live workflow-subagent entries the Workflow run `tid` has finished with, from the run's
+        OWN per-agent progress list — the `workflow_progress` the CLI ships on the run's task_progress
+        events: one slot per agent (`index`, `agentId`, `state`), updated in place from start → progress →
+        done/error and never capped (only the run's log lines are trimmed), the full list re-sent on every
+        state change. Called on the run's task-stream events, never a timer.
+
+        Why not the stop hook alone: the CLI fires SubagentStart for every workflow agent but SubagentStop
+        only for the ones that finish CLEANLY (probe-verified on 2.1.257, 2026-09-02: a run with one agent
+        on a nonexistent model got one stop hook; the failed agent's slot read state "error" and nothing
+        else). Left to the hooks the live set only grows — three sessions carried 192, 37 and 10 stale
+        entries, each EXACTLY the number of agents its runs recorded as failed, and read Working with
+        "37 subagents" for hours (the user 2026-09-02).
+
+        Three exact ends: a slot's done/error state; a slot re-minted with a NEW agent id (a retried
+        attempt — the displaced id is over the moment the slot changes hands); and the run's END, which
+        ends every agent it ever listed whatever state it last showed. An agent NO run has listed is left
+        alone on purpose: retiring it because "no run is live any more" would infer its death from the
+        absence of something else rather than from an event about the agent, and every retirement here
+        keys on an exact event (an earlier draft had that inference; review 2026-09-02). Such an agent
+        ends on its own stop hook, its task's end, or the client teardown."""
+        ended = set()
+        with self._sub_lock:
+            seen = self._wf_agents.setdefault(tid, set())
+            slots = self._wf_slots.setdefault(tid, {})
+            for e in (progress if isinstance(progress, list) else []):
+                if not isinstance(e, dict) or e.get("type") != "workflow_agent":
+                    continue
+                aid = str(e.get("agentId") or "")
+                if not aid:
+                    continue
+                seen.add(aid)
+                idx = e.get("index")
+                if isinstance(idx, int):
+                    prev = slots.get(idx)
+                    if prev and prev != aid:
+                        ended.add(prev)          # the slot was re-minted — its previous attempt is over
+                    slots[idx] = aid
+                if e.get("state") in self._WF_AGENT_ENDED:
+                    ended.add(aid)
+            drop = [a for a in ended if a in self._subagents]
+            if terminal:
+                drop += [a for a in seen if a in self._subagents and a not in ended]
+                self._wf_agents.pop(tid, None)
+                self._wf_slots.pop(tid, None)
+            for a in drop:
+                self._subagents.pop(a, None)
+        if drop:
+            self.backend._poke()
+
     # ---- background-task tracking (the CLI's task lifecycle stream) ----
 
     _TERMINAL_TASK = frozenset(("killed", "failed", "stopped", "completed"))
@@ -2806,11 +2907,20 @@ class SdkSession:
         """One system/task_* lifecycle message → the live _bg_tasks set. task_started adds; task_progress
         refreshes (and SELF-HEALS an unknown id — a backend that attached mid-task still converges);
         task_notification always ends its task; task_updated ends it only on a terminal patch.status.
-        Pokes a push only when the set actually changed, so progress chatter stays cheap."""
+        Pokes a push only when the set actually changed, so progress chatter stays cheap.
+
+        Two live-subagent retirements ride the same stream (2026-09-02), for the agents whose
+        SubagentStop never comes (a failed agent leaves none — see _reconcile_workflow_agents): a
+        Task/Agent subagent's lifecycle task carries the AGENT ID as its task_id (probe-verified on
+        2.1.257), so the task's end is the agent's end; and a Workflow run's progress events carry its
+        per-agent list, its end the roster's end."""
         tid = str(d.get("task_id") or "")
         if not tid:
             return
         changed = False
+        ended = False            # this event ENDED the task (a notification, or a terminal patch status)
+        wf = False               # the task is a Workflow run — its agents report through its progress list
+        sub_changed = False
         with self._sub_lock:
             if subtype in ("task_started", "task_progress"):
                 entry = self._bg_tasks.get(tid)
@@ -2823,11 +2933,25 @@ class SdkSession:
                     entry["desc"] = str(d.get("description"))
                 if d.get("last_tool_name"):
                     entry["lastTool"] = str(d.get("last_tool_name"))
+                if isinstance(d.get("workflow_progress"), list) and not entry.get("type"):
+                    # only a Workflow run ships a per-agent list; a self-healed entry (no task_started seen)
+                    # learns its type from it, so the run's later events reach _reconcile_workflow_agents
+                    entry["type"] = "local_workflow"
+                wf = entry.get("type") == "local_workflow" or tid in self._wf_agents
             else:
                 status = (d.get("status") if subtype == "task_notification"
                           else (d.get("patch") or {}).get("status") if isinstance(d.get("patch"), dict) else None)
                 if subtype == "task_notification" or (isinstance(status, str) and status in self._TERMINAL_TASK):
-                    changed = self._bg_tasks.pop(tid, None) is not None
+                    gone = self._bg_tasks.pop(tid, None)
+                    changed = gone is not None
+                    ended = True
+                    wf = (gone or {}).get("type") == "local_workflow" or tid in self._wf_agents
+            if ended and self._subagents.pop(tid, None) is not None:
+                sub_changed = True   # a Task agent's own task ended — with or without its SubagentStop
+        if wf and (ended or isinstance(d.get("workflow_progress"), list)):
+            # pokes when it retires anything; a progress event without the list (a throttled
+            # pure-progress tick) carries no agent states and is skipped
+            self._reconcile_workflow_agents(tid, d.get("workflow_progress"), terminal=ended)
         if changed:
             # MIRROR the live set to the reg: bg tasks die with the CLI, and the in-memory set dies with
             # the backend — the persisted mirror is what lets a later boot's reconcile tell the session
@@ -2839,6 +2963,7 @@ class SdkSession:
                 self.backend._update_reg(self.sid, bgTasks=self._live_bg_tasks())
             except Exception as e:
                 self.backend._log("background tasks (%s): registry mirror write failed: %s" % (self.name, e))
+        if changed or sub_changed:
             self.backend._poke()
 
     def request_stop_task(self, tool_use_id: str) -> bool:

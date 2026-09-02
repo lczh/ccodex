@@ -3213,5 +3213,199 @@ class WriteNameStaging(unittest.TestCase):
                              "rendered as a phantom session (the r32/r33 verifications)")
 
 
+class LiveSubagentsRetire(unittest.TestCase):
+    """The lane's live subagent count only ever GREW (the user 2026-09-02, whose session read Working with
+    37 subagents for hours). The CLI fires SubagentStart for every workflow agent but SubagentStop only
+    for the ones that finish cleanly (probe-verified on CLI 2.1.257: a run with one agent on a nonexistent
+    model got one stop hook; the failed agent's slot in the run's `workflow_progress` list read state
+    "error" and nothing else), so the set is retired on the events that DO arrive: a run's per-agent
+    progress list (an end state, or a slot re-minted for a retry), the run's end, a Task agent's own
+    task end (its task_id IS the agent id), and the client teardown. Every id and uuid here is synthetic."""
+
+    SID = "11111111-2222-3333-4444-666666666666"
+
+    def _sess(self):
+        self.logs, self.pokes = [], []
+        be = sb.SdkBackend(tempfile.mkdtemp(), "/bin/true", lambda *a, **k: None, log=self.logs.append,
+                           poke=lambda: self.pokes.append(1))
+        s = sb.SdkSession(be, {"sid": self.SID, "name": "web", "cwd": "/tmp"})
+        s.inflight = 0                                          # the main turn is idle throughout
+        return s
+
+    def _start(self, s, aid, kind="workflow-subagent"):
+        import asyncio
+        asyncio.run(s._subagent_start_hook({"agent_id": aid, "agent_type": kind}, None, None))
+
+    @staticmethod
+    def _wf(index, aid, state, label="reader"):
+        e = {"type": "workflow_agent", "index": index, "label": label, "state": state, "queuedAt": 1}
+        if aid:
+            e["agentId"] = aid
+            e["startedAt"] = 2
+        return e
+
+    def test_a_failed_workflow_agent_retires_on_the_runs_progress_list(self):
+        """The shape the probe recorded: the run's task_progress re-ships the whole per-agent list on every
+        state change; the failed agent's slot flips to "error" with no SubagentStop ever following."""
+        s = self._sess()
+        s._on_task_event("task_started", {"task_id": "w1", "task_type": "local_workflow", "description": "review"})
+        self._start(s, "a1"); self._start(s, "a2")
+        s._on_task_event("task_progress", {"task_id": "w1", "workflow_progress": [
+            self._wf(1, "a1", "start"), self._wf(2, "a2", "start"), self._wf(3, None, "start")]})   # 3rd still queued
+        self.assertEqual(set(s._subagents), {"a1", "a2"}, "start states retire nothing")
+        self.assertEqual(s.snapshot()["state"], "working", "live agents keep the session working")
+        n0 = len(self.pokes)
+        s._on_task_event("task_progress", {"task_id": "w1", "workflow_progress": [
+            self._wf(1, "a1", "progress"), self._wf(2, "a2", "error"), self._wf(3, None, "start")]})
+        self.assertEqual(set(s._subagents), {"a1"}, "the failed agent retires on its error state — no stop hook came")
+        self.assertGreater(len(self.pokes), n0, "the retirement pushes a build now, not at the backstop")
+        n1 = len(self.pokes)
+        s._on_task_event("task_progress", {"task_id": "w1"})   # a throttled tick without the list changes nothing
+        self.assertEqual(set(s._subagents), {"a1"})
+        self.assertEqual(len(self.pokes), n1, "…and a tick that changed nothing pushes nothing")
+        s._on_task_event("task_progress", {"task_id": "w1", "workflow_progress": [
+            self._wf(1, "a1", "done"), self._wf(2, "a2", "error")]})
+        self.assertEqual(s._subagents, {}, "a done state retires too (its stop hook would only be a no-op)")
+        self.assertEqual(s.snapshot()["state"], "waiting", "and the session idles once the set empties")
+
+    def test_b_the_runs_end_retires_every_agent_it_listed(self):
+        """A run's end is the end of everything it ever listed, whatever state the slot last showed."""
+        s = self._sess()
+        s._on_task_event("task_started", {"task_id": "w1", "task_type": "local_workflow"})
+        self._start(s, "a1"); self._start(s, "a2")
+        s._on_task_event("task_progress", {"task_id": "w1", "workflow_progress": [
+            self._wf(1, "a1", "start"), self._wf(2, "a2", "progress")]})
+        s._on_task_event("task_notification", {"task_id": "w1", "status": "completed"})
+        self.assertEqual(s._subagents, {}, "both listed agents retire at the run's end")
+        self.assertNotIn("w1", s._wf_agents, "the run's roster is dropped with it")
+        self.assertEqual(s.snapshot()["state"], "waiting")
+
+    def test_c_an_agent_no_run_listed_is_never_inferred_dead(self):
+        """Every retirement keys on an event about the agent. An agent no run has listed yet is NOT retired
+        because some other run ended and "no run is live any more" — that is inference from absence, and an
+        earlier draft that did it would have retired a live agent had the events ever landed in this order
+        (review 2026-09-02). It stays until its own end arrives: here its run's list naming it done."""
+        s = self._sess()
+        s._on_task_event("task_started", {"task_id": "w1", "task_type": "local_workflow"})
+        self._start(s, "b1")                                    # w2's first agent — its task_started still queued
+        s._on_task_event("task_notification", {"task_id": "w1", "status": "completed"})
+        self.assertEqual(set(s._subagents), {"b1"}, "w1's end says nothing about an agent w1 never listed")
+        self.assertEqual(s.snapshot()["state"], "working", "the live agent still holds the session working")
+        s._on_task_event("task_started", {"task_id": "w2", "task_type": "local_workflow"})
+        s._on_task_event("task_progress", {"task_id": "w2", "workflow_progress": [self._wf(1, "b1", "done")]})
+        self.assertEqual(s._subagents, {}, "its own run's list is what ends it")
+
+    def test_c2_a_retried_slot_ends_the_attempt_it_displaced(self):
+        """A retried workflow agent is re-minted with a NEW id in the SAME slot; the first attempt got a
+        SubagentStart and nothing else, so the slot changing hands is its end."""
+        s = self._sess()
+        s._on_task_event("task_started", {"task_id": "w1", "task_type": "local_workflow"})
+        self._start(s, "a1")
+        s._on_task_event("task_progress", {"task_id": "w1", "workflow_progress": [self._wf(1, "a1", "start")]})
+        self._start(s, "a1r")                                   # the retry, same slot
+        s._on_task_event("task_progress", {"task_id": "w1", "workflow_progress": [self._wf(1, "a1r", "start")]})
+        self.assertEqual(set(s._subagents), {"a1r"}, "the displaced attempt is over; the retry is live")
+        s._on_task_event("task_progress", {"task_id": "w1", "workflow_progress": [self._wf(1, "a1r", "done")]})
+        self.assertEqual(s._subagents, {})
+        s._on_task_event("task_notification", {"task_id": "w1", "status": "completed"})
+        self.assertNotIn("w1", s._wf_slots, "the run's slots are dropped with it")
+
+    def test_d_a_task_agents_own_task_end_retires_it(self):
+        """A Task/Agent subagent's lifecycle task carries the agent id as its task_id (probe-verified), so
+        the task ending — here as a failure, which leaves no SubagentStop — retires the agent."""
+        s = self._sess()
+        self._start(s, "t1", "general-purpose")
+        s._on_task_event("task_started", {"task_id": "t1", "task_type": "local_agent", "subagent_type": "general-purpose"})
+        self.assertEqual(s.snapshot()["state"], "working")
+        s._on_task_event("task_notification", {"task_id": "t1", "status": "failed"})
+        self.assertEqual(s._subagents, {}, "the task's end is the agent's end")
+        self.assertEqual(s._bg_tasks, {}, "the task itself cleared as before")
+        self.assertEqual(s.snapshot()["state"], "waiting")
+
+    def test_e_a_task_agents_progress_never_touches_the_workflow_path(self):
+        """A local_agent task's progress is not a workflow list; nothing retires and nothing raises."""
+        s = self._sess()
+        self._start(s, "t1", "Explore")
+        s._on_task_event("task_started", {"task_id": "t1", "task_type": "local_agent"})
+        s._on_task_event("task_progress", {"task_id": "t1", "last_tool_name": "Read"})
+        self.assertEqual(set(s._subagents), {"t1"})
+        self.assertEqual(s._wf_agents, {}, "no roster is minted for a non-workflow task")
+
+    def test_f_the_client_teardown_drops_the_abandoned_clients_agents_and_tasks(self):
+        """A reconnect abandons the CLI process the agents and background tasks ran inside: they died with
+        it and their hooks/notifications can never arrive, so the loop top forgets the agents, retires the
+        tasks, queues the same death notice a CLI death does (once), clears the reg mirror, and logs."""
+        s = self._sess()
+        sb.write_reg(s.backend.state_dir, self.SID, {"sid": self.SID, "name": "web", "cwd": "/tmp", "alive": True})
+        s._on_task_event("task_started", {"task_id": "w1", "task_type": "local_workflow", "description": "review sweep"})
+        s._on_task_event("task_started", {"task_id": "b1", "task_type": "local_bash", "description": "watch the build"})
+        self._start(s, "a1"); self._start(s, "a2")
+        s._on_task_event("task_progress", {"task_id": "w1", "workflow_progress": [self._wf(1, "a1", "start")]})
+        self.assertEqual(s.snapshot()["state"], "working")
+        s._drop_live_work("reconnect")
+        self.assertEqual(s._subagents, {})
+        self.assertEqual(s._wf_agents, {})
+        self.assertEqual(s._wf_slots, {})
+        self.assertEqual(s._bg_tasks, {}, "the tasks died with the CLI too — their notifications can never arrive")
+        self.assertEqual(s.snapshot()["state"], "waiting")
+        self.assertEqual(s.snapshot()["bgTasks"], [])
+        notes = [q for q in s.pending() if "background task" in q]
+        self.assertEqual(len(notes), 1, "the session is told what it lost: %r" % s.pending())
+        self.assertEqual(notes[0], sb.task_death_notice([{"desc": "review sweep"}, {"desc": "watch the build"}],
+                                                        cause=sb.SdkSession._RECONNECT_CAUSE),
+                         "the very copy the session reads, with the cause named truthfully")
+        self.assertIn("settings switch", notes[0])
+        self.assertNotIn("crash", notes[0], "a reconnect is neither a crash nor an unexplained restart")
+        self.assertEqual(sb.read_reg(s.backend.state_dir, self.SID).get("bgTasks"), [], "mirror cleared: reported once")
+        self.assertTrue(any("dropped 2 subagents and 2 background tasks on reconnect" in str(m) for m in self.logs), self.logs)
+        self.logs.clear()
+        s._drop_live_work("reconnect")
+        self.assertFalse(self.logs, "an empty set drops silently — the first connect is not an event worth a line")
+        self.assertEqual(len([q for q in s.pending() if "background task" in q]), 1, "no second notice for nothing")
+
+    def test_f2_a_flapping_reconnect_does_not_stack_the_same_notice(self):
+        s = self._sess()
+        for _ in range(2):
+            s._on_task_event("task_started", {"task_id": "b1", "task_type": "local_bash", "description": "watch"})
+            s._drop_live_work("reconnect")
+        self.assertEqual(len([q for q in s.pending() if "background task" in q]), 1, s.pending())
+
+    def test_g_the_reconnect_loop_top_calls_the_drop_before_reconciling(self):
+        """Pin the wiring: the drop runs at the loop top, before _reconcile_stranded, every iteration."""
+        src = open(os.path.join(BIN, "romp_sdk_backend.py"), encoding="utf-8").read()
+        i = src.index('self._drop_live_work("reconnect")')
+        j = src.index("self._reconcile_stranded()")
+        self.assertLess(i, j, "the drop precedes the stranded-turn reconcile at the loop top")
+        k = src.rfind("while not self.ended:", 0, i)
+        self.assertGreater(k, 0)
+        self.assertNotIn("async with ClaudeSDKClient", src[k:i], "…inside the reconnect loop, before the connect")
+
+    def test_i_a_run_seen_only_through_its_progress_list_still_retires(self):
+        """A backend that attached mid-run never saw the run's task_started (the self-heal path); the
+        per-agent list is shipped only by Workflow runs, so its presence types the entry and the run's
+        error states and end retire its agents like any other."""
+        s = self._sess()
+        self._start(s, "a1"); self._start(s, "a2")
+        s._on_task_event("task_progress", {"task_id": "w7", "workflow_progress": [
+            self._wf(1, "a1", "error"), self._wf(2, "a2", "progress")]})
+        self.assertEqual(s._bg_tasks["w7"]["type"], "local_workflow", "the entry learned what it is from the list")
+        self.assertEqual(set(s._subagents), {"a2"}, "the failed agent retired on the first list seen")
+        s._on_task_event("task_notification", {"task_id": "w7", "status": "completed"})
+        self.assertEqual(s._subagents, {}, "the run's end retires the rest")
+
+    def test_h_a_clean_stop_hook_still_retires_exactly_its_own_agent(self):
+        """The designed path is untouched: a SubagentStop retires its agent and no other, and a later
+        progress list naming it as done is a harmless no-op."""
+        import asyncio
+        s = self._sess()
+        s._on_task_event("task_started", {"task_id": "w1", "task_type": "local_workflow"})
+        self._start(s, "a1"); self._start(s, "a2")
+        asyncio.run(s._subagent_stop_hook({"agent_id": "a1", "agent_type": "workflow-subagent"}, None, None))
+        self.assertEqual(set(s._subagents), {"a2"})
+        s._on_task_event("task_progress", {"task_id": "w1", "workflow_progress": [
+            self._wf(1, "a1", "done"), self._wf(2, "a2", "progress")]})
+        self.assertEqual(set(s._subagents), {"a2"})
+
+
 if __name__ == "__main__":
     unittest.main()
