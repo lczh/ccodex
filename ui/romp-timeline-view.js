@@ -2882,7 +2882,12 @@ class TimelinePanel {
       for (const x of (edit.add || [])) if (next.members.indexOf(x) < 0) next.members.push(x);
       if (edit.remove) next.members = next.members.filter((x) => edit.remove.indexOf(x) < 0);
     }
-    if (gid) (this._mintedGids = this._mintedGids || new Set()).add(gid);   // ownership: this panel's refusals are its own to consume (r50)
+    if (gid) {
+      (this._mintedGids = this._mintedGids || new Set()).add(gid);   // ownership: this panel's refusals are its own to consume (r50)
+      (this._mintedNames = this._mintedNames || new Map()).set(gid, rt.name || '');   // name-scoped
+      //   (r63 P1.1: only the re-key mint recorded a name, so an ORDINARY gesture's colliding
+      //   foreign refusal was still judged ours and tombstoned)
+    }
     this._pendingTagEdits[rt.id] = { tag: next, age: 0, gid: gid || 0 };   // gid scopes the
     //                                 refusal's overlay drop (the v1.3.20 audit's residual)
     const wire = { host: rt.host, name: rt.name, rename: edit.rename,
@@ -3312,6 +3317,13 @@ class TimelinePanel {
       this._unionSyncDirty = true;
     }
     for (const g of (p.tomb || [])) { if (this._retireUnionGids) this._retireUnionGids.delete(g); }
+    if (!gated && Array.isArray(m.unclaimed) && m.unclaimed.length) {
+      // a PLAIN mirror sync told to yield (r63 P1.1: the kernel named a colliding or
+      // stranger-claimed gesture unclaimed, and the ungated ack path ignored it — the
+      // mirror re-sent the rows on every later sync). Only rows this panel still holds.
+      const _mine = m.unclaimed.filter((g) => (this._unionOps || []).some((o) => o.gid === g));
+      if (_mine.length) this._yieldUnionGids(_mine);
+    }
     if (gated) {
       const uncl = new Set(Array.isArray(m.unclaimed) ? m.unclaimed : []);
       let ran = false;

@@ -2334,3 +2334,31 @@ test("r62 wave 2: a colliding foreign refusal on a gid THIS panel minted is not 
     "the foreign-name refusal is never tombstoned by this panel");
   assert.equal(fired.length, 0);
 });
+
+test("r63: an ORDINARY mint records its name — a colliding foreign refusal is not tombstoned", () => {
+  const panel = drawnPanel();
+  g.__rompTimelineEditTag = (_w: any) => {};
+  panel._editRemoteTag({ id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "pool" }, { add: ["s1"] }, 136);
+  delete g.__rompTimelineEditTag;
+  assert.equal(panel._mintedNames && panel._mintedNames.get(136), "pool");
+  const fired: any[] = [];
+  panel.tagEditFailed = (m: any) => { fired.push(m); };
+  panel.update({ now, sessions: [sess("s1", "web", "#f7768e")], turns: {}, messages: [],
+                 judging: [], views: JSON.parse(JSON.stringify(VIEWS)),
+                 unionOps: [{ refusal: true, gid: -136, opId: "136", host: "TESTHOST-A",
+                              name: "otherTag", error: "refused" }] });
+  assert.ok(!(panel._retireUnionGids && panel._retireUnionGids.has(-136)));
+  assert.equal(fired.length, 0);
+});
+
+test("r63: a PLAIN sync's unclaimed list makes the mirror yield those gestures", () => {
+  const panel = drawnPanel();
+  panel._unionOps = [{ gid: 42, host: "TESTHOST-A", edit: {}, inverse: {}, rt: {},
+                       name: "beta", dispatched: false }];
+  if (!panel._journaledGids) panel._journaledGids = new Set();
+  panel._journaledGids.add(42);
+  panel._pendingUnionSyncs = { "op-1": { entries: panel._unionOps.slice(), retired: [], tomb: [] } };
+  panel.unionOpsAck({ ok: true, opId: "op-1", unclaimed: [42], unretired: [] });
+  assert.equal((panel._unionOps || []).length, 0,
+    "the colliding/stranger-claimed gesture left this panel's mirror (r63 P1.1)");
+});

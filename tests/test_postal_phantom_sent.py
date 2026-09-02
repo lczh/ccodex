@@ -2649,7 +2649,7 @@ class R61Wave2Postal(unittest.TestCase):
             self.assertTrue(pm._pending_bounce_park("HOSTQ", "aa" * 16, "code-1"))
         d = json.loads(pm._pending_bounces_path().read_text())
         self.assertEqual(d[_k]["code"], "code-1", "the REAL park owns its key")
-        _aside = [k for k in d if ".quarantined-" in k]
+        _aside = [k for k in d if k.count("|") >= 2]
         self.assertEqual(len(_aside), 1, "the preserved row moved aside, never erased")
         self.assertEqual(d[_aside[0]]["mid"], "zz" * 16)
         settled = []
@@ -2813,7 +2813,7 @@ class R62PostalAudit(unittest.TestCase):
             self.assertTrue(pm._pending_bounce_park("HOSTQ", "aa" * 16, "code-1"))
         d = json.loads(pm._pending_bounces_path().read_text())
         self.assertEqual(d[_k]["code"], "code-1", "the real park owns its key")
-        self.assertEqual(len([k for k in d if ".quarantined-" in k]), 1,
+        self.assertEqual(len([k for k in d if k.count("|") >= 2]), 1,
                          "the preserved row moved aside — never overwritten")
         self.assertNotIn(_k, pm._pending_bounces_quarantined,
                          "the live key carries no inherited quarantine mark")
@@ -2927,3 +2927,157 @@ class R62Wave2Postal(unittest.TestCase):
         last_src = len(order) - 1 - order[::-1].index(src)
         self.assertLess(last_dst, last_src,
                         "the destination link is durable BEFORE the source removal")
+
+
+class R63PostalAudit(unittest.TestCase):
+    """the v1.3.35 audit, postal half: originless ack arbitration deleted another origin's
+    record and read EIO as "no siblings" (P1.3); inbound read rows coerced origin:null and
+    unread:"false" (P1.4); the quarantine move was check-then-move (P1.5); the proof memo
+    could memoize a replaced inode (P1.6); a legal host containing ".quarantined-" never
+    flushed (P2.10); a swallowed post-move fsync failure gave no verdict (P2.11); the
+    sibling resolver had both directions wrong (P2.12)."""
+
+    def setUp(self):
+        _reset()
+        pm._pending_bounces.clear()
+        pm._pending_bounces_loaded[0] = False
+        pm._pending_bounces_quarantined.clear()
+        try:
+            pm._pending_bounces_path().unlink()
+        except OSError:
+            pass
+        try:
+            pm.RECEIPTS_DONE.unlink()
+        except OSError:
+            pass
+        shutil.rmtree(pm.RECEIPTBOX / "peerY", ignore_errors=True)
+        shutil.rmtree(pm.READBOX / "peerY", ignore_errors=True)
+        shutil.rmtree(pm.CORRUPT, ignore_errors=True)
+        shutil.rmtree(pm.STATE / "swap-probe", ignore_errors=True)
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_sibling_arbitration_is_exact_and_unknown_holds(self):
+        d = pm.RECEIPTBOX / "peerY"
+        d.mkdir(parents=True, exist_ok=True)
+        mid = "aa" * 16
+        # an unrelated dotted mid is NOT a sibling (r63 P2.12)
+        (d / (mid + ".other.json")).write_text(json.dumps({"mid": mid + ".other"}))
+        self.assertEqual(pm._park_siblings(d, mid, mid + ".json"), [])
+        # a listing FAULT is unknown, never empty (r63 P1.3)
+        self.assertIsNone(pm._park_siblings(d / (mid + ".other.json"), mid, mid + ".json"))
+        # an originless ack clears exactly ONE scoped-only park (r63 P2.12)…
+        scoped = d / pm._receipt_park_name(mid, "ORIGIN-S")
+        scoped.write_text(json.dumps({"mid": mid, "origin": "ORIGIN-S"}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm.receiptbox_del("peerY", mid)
+        self.assertFalse(scoped.exists(), "the lone scoped park clears")
+        # …but never an ambiguous pair
+        s1 = d / pm._receipt_park_name(mid, "ORIGIN-S")
+        s2 = d / pm._receipt_park_name(mid, "ORIGIN-T")
+        s1.write_text(json.dumps({"mid": mid, "origin": "ORIGIN-S"}))
+        s2.write_text(json.dumps({"mid": mid, "origin": "ORIGIN-T"}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm.receiptbox_del("peerY", mid)
+        self.assertTrue(s1.exists() and s2.exists(), "two candidates: nothing clears")
+
+    def test_b_a_scoped_ack_never_clears_an_originless_legacy_park(self):
+        # r63 P1.3: a delayed duplicate of a settled scoped ack fell through to the
+        # legacy bare park of a DIFFERENT delivery and marked its id done
+        d = pm.RECEIPTBOX / "peerY"
+        d.mkdir(parents=True, exist_ok=True)
+        mid = "bb" * 16
+        bare = d / (mid + ".json")
+        bare.write_text(json.dumps({"mid": mid, "dmid": "cc" * 16}))   # no origin recorded
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm.receiptbox_del("peerY", mid, origin="ORIGIN-A")
+        self.assertTrue(bare.exists(), "the scoped ack left the legacy park alone")
+        self.assertNotIn("cc" * 16, pm._receipts_done(), "…and marked nothing done")
+        r = pm.READBOX / "peerY"
+        r.mkdir(parents=True, exist_ok=True)
+        rb = r / (mid + ".json")
+        rb.write_text(json.dumps({"mid": mid, "unread": False}))
+        pm.readbox_del("peerY", {"mid": mid, "unread": False, "origin": "ORIGIN-A"})
+        self.assertTrue(rb.exists(), "same for read parks")
+
+    def test_c_inbound_read_rows_reject_malformed_fields(self):
+        good = {"mid": "dd" * 16, "origin": "ORIGIN-S", "unread": True}
+        self.assertEqual(len(pm._peer_read_rows([good])), 1)
+        self.assertEqual(pm._peer_read_rows([dict(good, origin=None)]), [],
+                         "origin:null rejects the row (r63 P1.4)")
+        self.assertEqual(pm._peer_read_rows([dict(good, unread="false")]), [],
+                         'unread:"false" rejects the row')
+        self.assertNotIn("unread", pm._peer_read_rows([dict(good, unread=False)])[0])
+
+    def test_d_the_quarantine_move_is_inode_bound_and_reports_durability(self):
+        # r63 P1.5: a valid atomic replacement published after the fingerprint check was
+        # moved into corrupt/ instead of the judged bytes
+        victim = pm.STATE / "victim3.json"
+        victim.write_text("{garbage")
+        st = victim.stat()
+        fp = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+        tmp = pm.STATE / "victim3.json.tmp"
+        tmp.write_text(json.dumps({"valid": True}))
+        os.replace(str(tmp), str(victim))                # the concurrent VALID commit
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(pm._quarantine_corrupt_json(victim, "victim3",
+                                                         ValueError("x"), fp))
+        self.assertEqual(json.loads(victim.read_text()), {"valid": True},
+                         "the newer valid commit was never moved")
+        # r63 P2.11: a failed post-move fsync is a FALSE verdict, and the receipts-done
+        # writer then refuses instead of overwriting
+        pm.RECEIPTS_DONE.write_text("[]")
+        real = pm._fsync_dir
+        def boom(p):
+            if str(p) == str(pm.CORRUPT / "receipts-done"):
+                raise OSError(5, "EIO")
+            return real(p)
+        pm._fsync_dir = boom
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(pm._OutboxUnreadable):
+                    pm._receipts_done(_for_write=True)
+        finally:
+            pm._fsync_dir = real
+
+    def test_e_a_directory_replaced_mid_proof_is_never_memoized(self):
+        # r63 P1.6: the replacement inode was memoized as proved — zero fsyncs next call
+        base = pm.STATE / "swap-probe"
+        real = pm._fsync_dir
+        def swap(p):
+            if str(p) == str(base / "a"):
+                shutil.rmtree(base)
+                (base / "a").mkdir(parents=True)     # a NEW inode under the same path
+            return real(p)
+        pm._fsync_dir = swap
+        try:
+            pm._mkdirs_durable(base / "a")
+        finally:
+            pm._fsync_dir = real
+        seen = []
+        def spy(p):
+            seen.append(str(p))
+            return real(p)
+        pm._fsync_dir = spy
+        try:
+            pm._mkdirs_durable(base / "a")
+        finally:
+            pm._fsync_dir = real
+        self.assertIn(str(base / "a"), seen, "the replacement is proved on the next call")
+
+    def test_f_a_host_containing_the_old_sentinel_flushes_normally(self):
+        # r63 P2.10: ".quarantined-" was a legal mid substring
+        host = "node.quarantined-test"
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(pm._pending_bounce_park(host, "ee" * 16, "code-1"))
+        self.assertNotIn(host + "|" + "ee" * 16, pm._pending_bounces_quarantined)
+        settled = []
+        real = pm._bounce_arrived
+        pm._bounce_arrived = lambda h, b: settled.append(h) or True
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                pm._flush_pending_bounces()
+        finally:
+            pm._bounce_arrived = real
+        self.assertEqual(settled, [host], "the legitimate park flushes")

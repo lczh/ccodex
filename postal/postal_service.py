@@ -3099,10 +3099,24 @@ def _mkdirs_durable(path):
     chain = []
     q = p
 
+    def _gen_full(dp):
+        try:
+            _st = dp.stat()
+            return (_st.st_dev, _st.st_ino, _st.st_ctime_ns)   # the within-call compare
+            #   needs ctime too: an rmtree + mkdir can REUSE the inode number (r63)
+        except OSError:
+            return None
+
     def _gen(dp):
         try:
             _st = dp.stat()
             return (_st.st_dev, _st.st_ino)
+            # (dev, ino) — NOT ctime: a directory's ctime moves on every child create or
+            # unlink, so a ctime memo invalidated STATE/MAILROOT on every delivery and put
+            # an fsync pair on the hot path (r63). The replaced-inode hole is closed by
+            # the before/after compare below; a rename-away/rename-back of a live state
+            # directory (same inode, re-linked parent) is a documented residual — no
+            # sweeper or flow performs it.
         except OSError:
             return None
     while (not (str(q) in _proved_dirs and _proved_dirs[str(q)] is not None
@@ -3125,14 +3139,17 @@ def _mkdirs_durable(path):
             p.mkdir(parents=True, exist_ok=True)
         return
     p.mkdir(parents=True, exist_ok=True)
+    _before = {str(d): _gen_full(d) for d in chain}   # what we are about to prove (r63
+    #   P1.6: a directory replaced between the fsync and a later stat had its
+    #   REPLACEMENT inode memoized as proved — zero fsyncs on the next call)
     for d in [chain[-1].parent] + list(reversed(chain)):
         _fsync_dir(d)
     for d in chain:
-        _g2 = _gen(d)
-        if _g2 is not None:
-            _proved_dirs[str(d)] = _g2
+        _g2 = _gen_full(d)
+        if _g2 is not None and _g2 == _before.get(str(d)):
+            _proved_dirs[str(d)] = _g2[:2]
         else:
-            _proved_dirs.pop(str(d), None)   # vanished before the memo: unproven
+            _proved_dirs.pop(str(d), None)   # vanished or replaced mid-proof: unproven
 
 
 def _atomic_text_put(path, text):
@@ -3173,31 +3190,66 @@ def _atomic_json_put(path, value):
 
 
 def _quarantine_corrupt_json(path, store, error, fingerprint=None):
-    """Move a stable unreadable final aside and report it, so a durable retry is never skipped forever."""
+    """Move a stable unreadable final aside and report it, so a durable retry is never
+    skipped forever. INODE-bound (r63 P1.5, executed: the stat-then-replace window moved a
+    VALID atomic replacement into corrupt/ instead of the judged bytes): the judged inode is
+    opened, fingerprint-verified on the fd, linked into corrupt/ by fd, and the source is
+    unlinked only while the path still bears that inode. Returns True only when the record
+    is quarantined DURABLY (r63 P2.11: a swallowed post-move fsync failure left the caller
+    believing the judged bytes were safe)."""
     try:
-        if fingerprint is not None:
-            cur = path.stat()
-            now = (cur.st_dev, cur.st_ino, cur.st_size, cur.st_mtime_ns)
-            if now != fingerprint:
-                return                              # a concurrent atomic writer already replaced it
-        dst_dir = CORRUPT / store
-        _mkdirs_durable(dst_dir)             # first-generation corrupt/ dirs link
-        #                                      durably (r62 P2.11: a crash after the
-        #                                      source removal persisted could lose the
-        #                                      quarantined record with its directory)
-        dst = dst_dir / ("%s.%d.%016x.corrupt" %
-                         (path.name, int(time.time() * 1000), random.getrandbits(64)))
-        os.replace(path, dst)
-        _fsync_dir(dst_dir)                  # the NEW link first (r62 wave 2: persisting
-        _fsync_dir(path.parent)              # the source removal first left a crash
-        #                                      window in which the judged bytes were gone
-        #                                      from both names — P2.11 one level down)
+        try:
+            _qfd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return False                             # consumed/replaced concurrently
+        try:
+            _qst = os.fstat(_qfd)
+            if fingerprint is not None and ((_qst.st_dev, _qst.st_ino, _qst.st_size,
+                                             _qst.st_mtime_ns) != fingerprint):
+                return False                         # a concurrent atomic writer replaced it
+            dst_dir = CORRUPT / store
+            _mkdirs_durable(dst_dir)         # first-generation corrupt/ dirs link
+            #                                  durably (r62 P2.11)
+            dst = dst_dir / ("%s.%d.%016x.corrupt" %
+                             (path.name, int(time.time() * 1000), random.getrandbits(64)))
+            try:
+                os.link("/proc/self/fd/%d" % _qfd, str(dst), follow_symlinks=True)
+            except OSError:
+                # no /proc (or no links): rename, then VERIFY the moved inode is the
+                # judged one; an innocent grab of a newer commit goes back exclusively
+                os.replace(str(path), str(dst))
+                _st3 = os.stat(str(dst))
+                if (_st3.st_dev, _st3.st_ino) != (_qst.st_dev, _qst.st_ino):
+                    try:
+                        os.link(str(dst), str(path))
+                        os.unlink(str(dst))
+                    except FileExistsError:
+                        os.unlink(str(dst))          # a newer commit stands — keep it
+                    except OSError:
+                        _log("%s: an innocently-grabbed commit is kept aside as %s — "
+                             "recover it by hand" % (store, dst.name))
+                    return False
+            else:
+                # retire the source ONLY while the path still bears the judged inode
+                try:
+                    _st2 = os.stat(str(path))
+                    if (_st2.st_dev, _st2.st_ino) == (_qst.st_dev, _qst.st_ino):
+                        os.unlink(str(path))
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(_qfd)
+        _fsync_dir(dst_dir)                  # the NEW link first (r62 wave 2), then the
+        _fsync_dir(path.parent)              # source removal
         _log("%s: quarantined unreadable durable record %s -> %s (%s)" %
              (store, path, dst, str(error)[:160]))
+        return True
     except FileNotFoundError:
-        pass                                         # consumed/replaced concurrently
+        return False                                 # consumed/replaced concurrently
     except Exception as e:
-        _log("%s: unreadable durable record %s could not be quarantined: %s" % (store, path, e))
+        _log("%s: unreadable durable record %s could not be quarantined DURABLY: %s"
+             % (store, path, e))
+        return False
 
 def outbox_put(host, msg):
     """Park one cross-host message for `host` and poke its exchange (long-poll release + dialer).
@@ -3594,9 +3646,12 @@ def _pending_bounces_load():
         return False
     if isinstance(d, dict):
         for k, v in d.items():
-            if ".quarantined-" in str(k):
-                # a row moved aside for a colliding legitimate park (r61 wave 2) —
-                # preserved verbatim forever, never re-keyed through the legacy arm
+            if str(k).count("|") >= 2:
+                # a row moved aside for a colliding legitimate park (r61 wave 2; the
+                # two-pipe sentinel since r63 P2.10) — preserved verbatim forever, never
+                # re-keyed through the legacy arm. (v1.3.35's ".quarantined-" aside keys
+                # fall to the key-binding check below: their mid never matches, so they
+                # quarantine there instead.)
                 _pending_bounces[str(k)] = v
                 _pending_bounces_quarantined.add(str(k))
                 continue
@@ -3654,7 +3709,9 @@ def _pending_bounce_park(host, mid, code):
             # inherit its never-flushed quarantine (r61 wave 2, executed both ways: the
             # overwrite erased the forensic row, and the stale quarantine mark then
             # blocked the real bounce from ever settling until a restart)
-            _aside = _k + ".quarantined-" + os.urandom(4).hex()
+            _aside = _k + "|quarantined-" + os.urandom(4).hex()   # a SECOND pipe: no
+            #   valid host|mid key carries one (r63 P2.10: ".quarantined-" was a legal
+            #   mid substring, so a host like node.quarantined-test never flushed)
             _pending_bounces[_aside] = _pending_bounces.pop(_k, None)
             _pending_bounces_quarantined.discard(_k)
             _pending_bounces_quarantined.add(_aside)
@@ -3771,13 +3828,15 @@ def _receipts_done_judged(e, fp, for_write):
     unlocked handoff_done_apply reader moved a concurrent writer's FRESH VALID ledger
     into corrupt/) and restart empty. If the move-aside FAILED the judged bytes still
     stand — a write must NOT proceed, or it destroys them in place (r60 wave 2)."""
-    _quarantine_corrupt_json(RECEIPTS_DONE, "receipts-done", e, fp)
+    _durable = _quarantine_corrupt_json(RECEIPTS_DONE, "receipts-done", e, fp)
     try:
         _still = RECEIPTS_DONE.exists()
     except OSError:
         _still = True
-    if _still and for_write:
-        raise _OutboxUnreadable("receipts-done judged bad and could not move aside")
+    if (_still or not _durable) and for_write:
+        # judged bytes still standing, OR moved but not PROVED (r63 P2.11) — a write
+        # over either state destroys the only record
+        raise _OutboxUnreadable("receipts-done judged bad and not durably quarantined")
     return {}
 
 
@@ -3848,12 +3907,15 @@ def _receipt_park_name(mid, origin=""):
 
 
 def _park_siblings(d, mid, bare_name):
-    """Other parks for the same mid beside the bare spelling — the scoped/v58 spellings
-    (r62 wave 2: the ambiguity an originless ack must not resolve by deletion)."""
+    """Other parks for the same mid beside the bare spelling — EXACTLY the scoped (16-hex)
+    and v58 (8-hex) spellings (r63 P2.12: a glob on mid.*.json made an unrelated dotted
+    mid look like a sibling and held an ack forever). None when the listing FAILS: unknown
+    is not empty (r63 P1.3: an EIO read as "no siblings" and the deletion proceeded)."""
+    _pat = re.compile(re.escape(mid) + r"\.(?:[0-9a-f]{16}|[0-9a-f]{8})\.json$")
     try:
-        return [f for f in d.glob(mid + ".*.json") if f.name != bare_name]
+        return [f for f in d.iterdir() if f.name != bare_name and _pat.match(f.name)]
     except OSError:
-        return []
+        return None
 
 
 def _receipt_park_name_v58(mid, origin=""):
@@ -3946,12 +4008,29 @@ def receiptbox_del(host, mid, origin=""):
         _f = RECEIPTBOX / host / _receipt_park_name_v58(mid, origin)
     if origin and not _f.exists():
         _f = RECEIPTBOX / host / (mid + ".json")
+    if not origin and not _f.exists():
+        # an ORIGINLESS ack with no bare park: a legacy peer clearing a park the modern
+        # side parked SCOPED — clear exactly ONE sibling, never an ambiguous set (r63 P2.12)
+        _sib = _park_siblings(_f.parent, mid, mid + ".json")
+        if _sib is None or len(_sib) != 1:
+            return
+        _f = _sib[0]
     _dmid = ""
     try:
         _row = json.loads(_f.read_text())
+        _sibs = (_park_siblings(_f.parent, mid, _f.name)
+                 if _f.name == mid + ".json" else [])
+        if (_f.name == mid + ".json" and isinstance(_row, dict)
+                and origin and not _row.get("origin")):
+            # a SCOPED ack never clears a bare park that records NO origin (r63 P1.3,
+            # executed: a delayed duplicate of a settled scoped ack fell through to the
+            # legacy bare park of a different delivery and marked its id done)
+            _log("receiptbox_del %s/%s: scoped ack over an origin-less legacy park — kept"
+                 % (host, mid))
+            return
         if (_f.name == mid + ".json" and isinstance(_row, dict)
                 and str(_row.get("origin") or "") not in ("", origin)
-                and (origin or _park_siblings(_f.parent, mid, _f.name))):
+                and (origin or _sibs is None or _sibs)):
             # (r62 P1.5: an ORIGINLESS ack must not delete a bare park that RECORDS an
             # origin when a same-mid SIBLING park exists — the ambiguity the audit
             # executed; r62 wave 2: over a LONE such park it is a pre-scoping peer
@@ -4152,11 +4231,20 @@ def readbox_del(host, rec):
         f = READBOX / host / _receipt_park_name_v58(mid, _origin)   # the v1.3.31 spelling
     if not f.exists():
         f = READBOX / host / (mid + ".json")         # the pre-r59 bare spelling
+    if not _origin and not f.exists():
+        _sib = _park_siblings(f.parent, mid, mid + ".json")   # (r63 P2.12: one scoped
+        if _sib is None or len(_sib) != 1:                     #  sibling, or nothing)
+            return
+        f = _sib[0]
     try:
         cur = json.loads(f.read_text())
+        _sibs = _park_siblings(f.parent, mid, f.name) if f.name == mid + ".json" else []
+        if (f.name == mid + ".json" and isinstance(cur, dict)
+                and _origin and not cur.get("origin")):
+            return                                   # scoped ack, origin-less park (r63 P1.3)
         if (f.name == mid + ".json" and isinstance(cur, dict)
                 and str(cur.get("origin") or "") not in ("", _origin)
-                and (_origin or _park_siblings(f.parent, mid, f.name))):
+                and (_origin or _sibs is None or _sibs)):
             # (r62 P1.5: originless acks are content-bound when a same-mid sibling
             # makes the bare park ambiguous; r62 wave 2: a LONE one is a legacy peer
             # clearing its own pre-scoping park — refusing it stranded the park)
@@ -4256,8 +4344,11 @@ def _peer_read_rows(value):
         if not isinstance(mid, str) or not _safe_id(mid):
             continue
         clean = {"mid": mid}
-        origin = row.get("origin")
-        if origin:
+        if "origin" in row:
+            # a PRESENT origin must be a valid string — null/junk rejects the ROW (r63
+            # P1.4: origin:null became an originless local row, durably applied and
+            # acked, and the sender dropped its retry record)
+            origin = row.get("origin")
             if not isinstance(origin, str) or not _safe_id(origin):
                 continue
             clean["origin"] = origin
@@ -4270,7 +4361,9 @@ def _peer_read_rows(value):
             clean["t"] = max(0, int(row.get("t") or 0))
         except (TypeError, ValueError, OverflowError):
             clean["t"] = 0
-        if row.get("unread"):
+        if "unread" in row and not isinstance(row.get("unread"), bool):
+            continue                                 # unread:"false" is not True (r63 P1.4)
+        if row.get("unread") is True:
             clean["unread"] = True
         out.append(clean)
     return out

@@ -2231,6 +2231,10 @@ _union_retired_tombs = {}              # gid -> t, FIFO-capped; MIRRORED to
 #                                        completion CAS operations then succeeded)
 _UNION_TOMBS_MAX = 4096
 _union_tombs_loaded = [False]
+_union_tomb_names = {}                 # gid -> the retired gesture's tag NAME (r63 P1.1: gids
+#                                        mint from independent per-panel seeds, so a bare-id
+#                                        tomb on a colliding rid/ogid dropped an UNRELATED
+#                                        live gesture); durable beside the stamp as {"t","n"}
 
 
 def _union_tombs_path():
@@ -2330,7 +2334,14 @@ def _union_tombs_load_locked():
             for k, v in d.items():
                 try:
                     _kg = int(str(k))
-                    _kv = float(v)
+                    if isinstance(v, dict):
+                        # the r63 shape: {"t": stamp, "n": name}
+                        if (not isinstance(v.get("n", ""), str)
+                                or isinstance(v.get("t"), bool)):
+                            raise ValueError("tomb shape")
+                        _kv = float(v.get("t"))
+                    else:
+                        _kv = float(v)
                 except (TypeError, ValueError, OverflowError):
                     d = None
                     break
@@ -2386,14 +2397,23 @@ def _union_tombs_load_locked():
             #  everlasting shield eventually swallows a legitimately-reused id; every
             #  replay the shield exists for happens within a session's working life)
             _now = time.time()
+            _clamped = False
             for k, v in d.items():
                 try:
-                    _tv = min(float(v), _now)   # a FUTURE stamp is clamped to now (r62
-                    #                             P1.4: century-ahead entries outlived
-                    #                             every eviction while a current shield
-                    #                             was evicted in their place)
+                    _raw = float(v.get("t")) if isinstance(v, dict) else float(v)
+                    _tv = _raw
+                    if _raw > _now + 86400:
+                        # a stamp beyond plausible clock skew is clamped to now — and
+                        # the clamp is PERSISTED below (r63 P1.2: re-clamping the disk
+                        # copy to "now" on every restart made a far-future tomb immortal);
+                        # a stamp within a day of now is left alone, so a backward clock
+                        # step under a day never lowers a legitimate shield
+                        _tv = _now
+                        _clamped = True
                     if _tv >= _floor:
                         _union_retired_tombs.setdefault(int(k), _tv)
+                        if isinstance(v, dict) and v.get("n"):
+                            _union_tomb_names.setdefault(int(k), v["n"])
                 except (TypeError, ValueError, OverflowError):
                     continue
             while len(_union_retired_tombs) > _UNION_TOMBS_MAX:
@@ -2401,6 +2421,10 @@ def _union_tombs_load_locked():
                 _victim = min(_union_retired_tombs,
                               key=lambda k2: (_union_retired_tombs[k2], k2))
                 _union_retired_tombs.pop(_victim)
+                _union_tomb_names.pop(_victim, None)
+            if _clamped:
+                _union_tombs_loaded[0] = True
+                _union_tombs_save_locked()   # the clamp is written once, not re-derived
     except FileNotFoundError:
         pass
     except Exception:
@@ -2419,7 +2443,8 @@ def _union_tombs_save_locked():
         return False
     try:
         _atomic_write(_union_tombs_path(),
-                      json.dumps({str(k): v for k, v in _union_retired_tombs.items()}))
+                      json.dumps({str(k): {"t": v, "n": _union_tomb_names.get(k, "")}
+                                  for k, v in _union_retired_tombs.items()}))
         return True
     except Exception:
         sys.stderr.write("union-tombs: could not persist — retired-gesture shields are "
@@ -2819,6 +2844,18 @@ def _union_store_read_locked(what="union-gestures"):
             #                              t-less get the same stamp on read)
         return out if out is not None else r
     rows = [_coerce_legacy_refusal(r) for r in rows]
+    # v1.3.34 accepted duplicate (gid, host) rows; v1.3.35 refuses every completion over
+    # them (r63 P2.8) — the read-side migration keeps the LAST copy (the ratcheted one)
+    _seen_keys = set()
+    _dedup = []
+    for r in reversed(rows):
+        if isinstance(r, dict) and not r.get("refusal") and r.get("gid") and r.get("host"):
+            _k2 = (r.get("gid"), r.get("host"))
+            if _k2 in _seen_keys:
+                continue
+            _seen_keys.add(_k2)
+        _dedup.append(r)
+    rows = list(reversed(_dedup))
     bad = any(not _union_row_valid(r) for r in rows)   # NON-DICTS judged too (r58 P1.6:
     #                                the isinstance pre-filter acked a mixed journal
     #                                while silently dropping its invalid rows)
@@ -3135,7 +3172,17 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                 # the compensation journal and its operation was lost outright)
                 return False, [], "the completion must carry every host of the " \
                                   "original", []
+            _oby_host = {r.get("host"): r for r in _orows}
             for r in _succ:
+                _om = _oby_host.get(r.get("host"))
+                if (_om is not None
+                        and ((_om.get("name") or "") != (r.get("name") or "")
+                             or (_om.get("rt") or {}) != (r.get("rt") or {}))):
+                    # row IDENTITY is immutable across a completion (r63 P2.7, executed:
+                    # (H, alpha) was re-keyed into (H, beta) and later refusals could no
+                    # longer correlate)
+                    return False, [], "the completion must preserve each row's tag " \
+                                      "identity", []
                 if ((r.get("ogid") or 0) != _oroot
                         or (_ogid != _oroot and _ogid not in (r.get("olin") or []))
                         # ^ completing the ROOT generation is proven by ogid equality
@@ -3235,9 +3282,12 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             if r.get("refusal"):
                 continue
             _c = _cur_by_key.get((r.get("gid"), r.get("host")))
-            if (_c is not None and _claims_snap.get(r.get("gid")) not in (None, ckey)
+            if (_c is not None
                     and ((_c.get("name") or "") != (r.get("name") or "")
                          or (_c.get("rt") or {}) != (r.get("rt") or {}))):
+                # regardless of claims (r63 P1.1: a DISCONNECTED writer's claim is
+                # released on socket close, and its durable row was then overwritten by
+                # the collider) — a resident row never changes identity through an upsert
                 if r.get("gid") not in _collide:
                     _collide.append(r.get("gid"))
             elif _c is None and r.get("gid") in _resident_pre:
@@ -3284,6 +3334,10 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                 and not (r.get("refusal") and isinstance(r.get("t"), (int, float))
                          and r["t"] < _cutoff)]
         _resident = {r.get("gid") for r in cur if not r.get("refusal")}
+        _names_by_gid = {}
+        for r in list(cur) + list(inc):
+            if isinstance(r, dict) and r.get("gid") and r.get("name"):
+                _names_by_gid.setdefault(r.get("gid"), r.get("name"))
         with _union_claims_lock:
             _tombed = []
             for r in inc:
@@ -3316,10 +3370,17 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                     # (r58 wave 2): a live SUCCESSOR row hits only through its ogid/olin —
                     # dropping it killed the healthy completion, now restart-durably
                     continue
-                if (r.get("gid") in _union_retired_tombs
-                        or (r.get("ogid") or 0) in _union_retired_tombs
-                        or (r.get("rid") or 0) in _union_retired_tombs
-                        or any(x in _union_retired_tombs for x in (r.get("olin") or []))):
+                def _tombed_id(x):
+                    # NAME-scoped (r63 P1.1): a tomb whose recorded name differs from
+                    # the row's is another gesture's shield, not this one's
+                    if x not in _union_retired_tombs:
+                        return False
+                    _tn = _union_tomb_names.get(x, "")
+                    return (not _tn) or (not r.get("name")) or _tn == r.get("name")
+                if (_tombed_id(r.get("gid"))
+                        or _tombed_id(r.get("ogid") or 0)
+                        or _tombed_id(r.get("rid") or 0)
+                        or any(_tombed_id(x) for x in (r.get("olin") or []))):
                     if r.get("gid") not in _tombed:
                         _tombed.append(r.get("gid"))
             if _tombed:
@@ -3359,6 +3420,8 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                 #   process replay of that retired gesture was accepted and claimable)
                 for g in ret:
                     _union_retired_tombs[g] = time.time()
+                    if _names_by_gid.get(g):
+                        _union_tomb_names[g] = _names_by_gid[g]
                 while len(_union_retired_tombs) > _UNION_TOMBS_MAX:
                     # evict the OLDEST STAMP, never insertion order (r61 P1.5, executed:
                     # a refreshed gid kept its old dict position and next(iter(...))
@@ -3366,6 +3429,7 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                     _victim = min(_union_retired_tombs,
                                   key=lambda k2: (_union_retired_tombs[k2], k2))
                     _union_retired_tombs.pop(_victim)
+                    _union_tomb_names.pop(_victim, None)
                 if not _union_tombs_save_locked():
                     _union_retired_tombs.clear()
                     _union_retired_tombs.update(_tsnap)
@@ -7104,8 +7168,10 @@ def _auto_resume_session_retry(now, tmux):
     for s in _alive_sessions(now, tmux):
         sid = str(s.get("sid"))
         floor = d.get(sid)
-        if not floor:
-            continue
+        if not floor or not isinstance(floor, (int, float)) or isinstance(floor, bool):
+            continue                     # a non-numeric floor is junk, never a compare
+            #                              operand (r63 P2.9: a stored string raised
+            #                              TypeError here and the rearm pass died)
         path = s.get("path")
         session = (_parse_cached(path) if path else None) or {"turns": []}
         if _last_human_msg_t(session["turns"]) <= floor:

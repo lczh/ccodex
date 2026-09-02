@@ -4247,3 +4247,129 @@ class R62Wave2(unittest.TestCase):
         self.assertFalse(km._union_unproved_marker().exists())
         _ref = [r for r in rows if r.get("refusal")][0]
         self.assertLessEqual(_ref["t"], time.time() + 5, "the stored stamp clamps on read")
+
+
+class R63AuditFixes(unittest.TestCase):
+    """the v1.3.35 audit, kernel half (6 P1 / 6 P2 against 515e9865): bare-id tombs and
+    claim-conditional collision rules left gid collisions unsafe (P1.1), tomb stamps were
+    re-clamped on every restart without persisting (P1.2), the CAS ignored row identity
+    (P2.7), v1.3.34 duplicate rows loaded proved but refused every completion (P2.8), and
+    the suppression canonicalizer passed strings/dicts/future stamps (P2.9)."""
+
+    ROW = {"host": "TESTHOST-A", "gid": 801, "edit": {}, "inverse": {}, "rt": {},
+           "name": "pool", "dispatched": False}
+    SUCC = {"host": "TESTHOST-A", "gid": 802, "ogid": 801, "olin": [801], "rid": 801,
+            "edit": {}, "inverse": {}, "rt": {}, "name": "pool", "dispatched": False}
+
+    def setUp(self):
+        _scrub_state()
+        km._union_claims.clear()
+        km._union_retired_tombs.clear()
+        km._union_tomb_names.clear()
+        km._union_tombs_loaded[0] = False
+        km._retry_suppress_cache.clear()
+        with km._retry_suppress_lock:
+            km._retry_suppress_pending.clear()
+        for name in ("union-gestures.json", "union-gestures.json.unproved",
+                     "union-tombs.json", "union-tombs.json.hold", "retry-suppressed.json"):
+            try:
+                (km.jd.STATE / name).unlink()
+            except OSError:
+                pass
+        for f in km.jd.STATE.glob("*.corrupt-*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_tombs_are_name_scoped_and_durably_named(self):
+        # r63 P1.1: a bare-id tomb on a colliding rid/ogid dropped an UNRELATED live gesture
+        self.assertTrue(km._union_ops_set([dict(self.ROW, gid=900, name="other")]))
+        ok, _, _, _u = km._union_ops_merge([], [900], ckey="ws:x")
+        self.assertTrue(ok)
+        d = json.loads((km.jd.STATE / "union-tombs.json").read_text())
+        self.assertEqual(d["900"]["n"], "other", "the tomb records the retired NAME")
+        # a colliding id for a DIFFERENT tag is not this shield's business
+        ok, unclaimed, _, _u = km._union_ops_merge(
+            [dict(self.ROW, gid=900, name="pool")], [], ckey="ws:y")
+        self.assertTrue(ok)
+        self.assertIn(900, [r["gid"] for r in km._union_ops_load()],
+                      "the unrelated same-id gesture is ADMITTED")
+        # …while the retired gesture's own replay still drops
+        ok, unclaimed, _, _u = km._union_ops_merge(
+            [dict(self.ROW, gid=900, host="TESTHOST-B", name="other")], [], ckey="ws:z")
+        self.assertTrue(ok)
+        self.assertNotIn("TESTHOST-B", [r["host"] for r in km._union_ops_load()
+                                        if r["gid"] == 900])
+        self.assertIn(900, unclaimed)
+        # legacy numeric tombs still load
+        km._union_retired_tombs.clear(); km._union_tomb_names.clear()
+        km._union_tombs_loaded[0] = False
+        (km.jd.STATE / "union-tombs.json").write_text(json.dumps({"55": time.time()}))
+        with km.jd._identity_file_lock():
+            km._union_tombs_load_locked()
+        self.assertIn(55, km._union_retired_tombs)
+
+    def test_b_a_future_tomb_stamp_is_clamped_ONCE_and_persisted(self):
+        # r63 P1.2: re-clamping the disk copy to "now" on every restart made a
+        # far-future tomb immortal; a within-skew stamp is left alone
+        now = time.time()
+        far = now + 100 * 365 * 86400
+        (km.jd.STATE / "union-tombs.json").write_text(json.dumps(
+            {"11": far, "12": now + 3600}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            with km.jd._identity_file_lock():
+                km._union_tombs_load_locked()
+        d = json.loads((km.jd.STATE / "union-tombs.json").read_text())
+        self.assertLessEqual(d["11"]["t"], now + 5, "the clamp is PERSISTED")
+        self.assertAlmostEqual(d["12"]["t"], now + 3600, delta=5,
+                               msg="a within-skew stamp is untouched")
+
+    def test_c_a_disconnected_writers_row_is_never_overwritten(self):
+        # r63 P1.1: the collider rule keyed on a LIVE claim; the disconnected writer's
+        # claim had been released, and its durable row was overwritten
+        alpha = dict(self.ROW, gid=42, name="alpha")
+        ok, _, _, _u = km._union_ops_merge([alpha], [], ckey="ws:alpha")
+        self.assertTrue(ok)
+        km._union_claims_release("ws:alpha")             # the socket closed
+        beta = dict(self.ROW, gid=42, name="beta")
+        ok, unclaimed, _, _u = km._union_ops_merge([beta], [], ckey="ws:beta")
+        self.assertTrue(ok)
+        self.assertEqual([r["name"] for r in km._union_ops_load()], ["alpha"])
+        self.assertIn(42, unclaimed)
+
+    def test_d_the_completion_preserves_row_identity(self):
+        # r63 P2.7: (H, alpha) was re-keyed into (H, beta)
+        self.assertTrue(km._union_ops_set([dict(self.ROW, name="alpha")]))
+        ep = km._union_claim_grant(801, "ws:x")
+        ok, _, reason, _u = km._union_ops_merge(
+            [dict(self.SUCC, name="beta")], [801], ckey="ws:x",
+            rekey={"ogid": 801, "gid": 802, "epoch": ep})
+        self.assertFalse(ok)
+        self.assertIn("identity", reason or "")
+
+    def test_e_v1334_duplicate_rows_dedupe_on_read_and_complete(self):
+        # r63 P2.8: duplicates loaded proved, and every completion refused forever
+        (km.jd.STATE / "union-gestures.json").write_text(json.dumps(
+            [dict(self.ROW), dict(self.ROW, dispatched=True)]))
+        rows = km._union_ops_echo()
+        self.assertEqual(len(rows), 1, "the LAST copy wins")
+        self.assertIs(rows[0]["dispatched"], True)
+        ep = km._union_claim_grant(801, "ws:x")
+        self.assertIsNone(ep, "the surviving copy is dispatched — nothing to complete")
+
+    def test_f_the_suppression_canonicalizer_keeps_only_plausible_numbers(self):
+        # r63 P2.9: strings and dicts survived (TypeError at the rearm compare) and a
+        # century-ahead stamp suppressed forever
+        sid = "66666666-7777-8888-9999-000000000004"
+        far = time.time() + 100 * 365 * 86400
+        out = km.jd.canonicalize_retry_suppressed_identity(
+            {sid: "yesterday", "x": {"t": 1}, "y": far, "z": 100.0})
+        self.assertEqual(out, {"z": 100.0})
+        p = km.jd.STATE / "retry-suppressed.json"
+        p.write_text(json.dumps({sid: "yesterday"}))
+        self.assertEqual(km._retry_suppress_data(), {},
+                         "a stored string is never served as a floor")
