@@ -4633,3 +4633,65 @@ class R64AuditFixes(unittest.TestCase):
         km._suppress_session_retry(sid)
         self.assertIn(sid, km._retry_suppress_data(),
                       "immediately after arming, membership is TRUE (no stale-cache window)")
+
+
+
+class R64Wave2(unittest.TestCase):
+    """the r64 verify round, kernel half: the hold marker kept the day threshold; a gen-less
+    v1.3.36 names file was trusted on upgrade; the suppression reader took three separate
+    snapshots."""
+
+    def setUp(self):
+        _scrub_state()
+        km._union_claims.clear()
+        km._union_retired_tombs.clear()
+        km._union_tomb_names.clear()
+        km._union_tombs_loaded[0] = False
+        km._retry_suppress_cache.clear()
+        with km._retry_suppress_lock:
+            km._retry_suppress_pending.clear()
+        for name in ("union-gestures.json", "union-tombs.json", "union-tombs.json.hold",
+                     "union-tombs.names.json", "retry-suppressed.json"):
+            try:
+                (km.jd.STATE / name).unlink()
+            except OSError:
+                pass
+        for f in km.jd.STATE.glob("*.corrupt-*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_the_hold_marker_is_not_lowered_by_a_month_long_clock_step(self):
+        (km.jd.STATE / "union-tombs.json").write_text("{corrupt")
+        _mint = time.time() + 30 * 86400            # "future" under a stepped-back clock
+        (km.jd.STATE / "union-tombs.json.hold").write_text("%d" % int(_mint))
+        with contextlib.redirect_stderr(io.StringIO()):
+            with km.jd._identity_file_lock():
+                km._union_tombs_load_locked()
+        self.assertEqual(int((km.jd.STATE / "union-tombs.json.hold").read_text()),
+                         int(_mint), "the hold's start is never re-minted lower (r64 w2)")
+        self.assertFalse(km._union_tombs_loaded[0], "…and the hold stands")
+
+    def test_b_a_gen_less_names_file_is_never_trusted(self):
+        (km.jd.STATE / "union-tombs.json").write_text(json.dumps({"801": time.time()}))
+        (km.jd.STATE / "union-tombs.names.json").write_text(json.dumps({"801": ["alpha"]}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            with km.jd._identity_file_lock():
+                km._union_tombs_load_locked()
+        self.assertIn(801, km._union_retired_tombs)
+        self.assertFalse(km._union_tomb_names.get(801),
+                         "the v1.3.36 flat shape is unbound — wildcard, never a stale scope")
+
+    def test_c_the_reader_snapshots_hit_and_overlay_together(self):
+        sid = "66666666-7777-8888-9999-000000000007"
+        p = km.jd.STATE / "retry-suppressed.json"
+        p.write_text(json.dumps({}))
+        km._retry_suppress_data()
+        with km._retry_suppress_lock:
+            km._retry_suppress_pending[sid] = time.time()
+        self.assertIn(sid, km._retry_suppress_data(),
+                      "an overlay entry is visible on the cache-hit arm (r64 w2)")

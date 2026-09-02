@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import tempfile
+from pathlib import Path
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -3166,12 +3167,12 @@ class R64PostalAudit(unittest.TestCase):
 
     def test_e_publishers_and_the_quarantine_mover_share_one_lock(self):
         # r64 P1.9: no pathname check closes the stat-then-unlink window — serialization does
-        self.assertTrue(hasattr(pm, "_json_store_lock"))
+        self.assertTrue(hasattr(pm, "_json_store_lock_for"))   # per-DIRECTORY since r64 w2
         src = open(os.path.join(BIN, "romp-postal-service")).read()
         i = src.index("def _atomic_text_put(path, text):")
-        self.assertIn("with _json_store_lock:", src[i:i + 700])
+        self.assertIn("with _json_store_lock_for(path.parent):", src[i:i + 700])
         j = src.index("def _quarantine_corrupt_json(path, store, error, fingerprint=None):")
-        self.assertIn("with _json_store_lock:", src[j:j + 1800])
+        self.assertIn("with _json_store_lock_for(path.parent):", src[j:j + 1900])
 
     def test_f_a_fifo_never_blocks_a_scanner_and_an_unproved_move_holds_writes(self):
         d = pm.RECEIPTBOX / "peerZ"
@@ -3215,7 +3216,9 @@ class R64PostalAudit(unittest.TestCase):
         good = {"mid": "bb" * 16, "t": 100, "dmid": "cc" * 16}
         self.assertEqual(len(pm._peer_read_rows([good])), 1)
         self.assertEqual(pm._peer_read_rows([dict(good, t="100")]), [], "t is a number")
-        self.assertEqual(pm._peer_read_rows([dict(good, t=1e18)]), [], "…bounded")
+        _far = pm._peer_read_rows([dict(good, t=1e18)])
+        self.assertEqual(len(_far), 1, "a far-future t is KEPT (r64 w2: dropping stranded it)")
+        self.assertLessEqual(_far[0]["t"], time.time() + 366 * 86400, "…and clamped")
         self.assertEqual(pm._peer_read_rows([dict(good, dmid="")]), [],
                          "a PRESENT falsey dmid rejects the row (r64 P2.14)")
 
@@ -3236,3 +3239,116 @@ class R64PostalAudit(unittest.TestCase):
         d = json.loads(pm._pending_bounces_path().read_text())
         self.assertEqual(len([k for k in d if k.count("|") >= 2]), 2,
                          "BOTH forensic rows survive a forced collision (r64 P3.16)")
+
+
+
+class R64Wave2Postal(unittest.TestCase):
+    """the r64 verify round, postal half: the symlink refusal fired on the operator's own
+    state root (bus dead at boot); ack-side readers and ledgers still blocked on a FIFO —
+    now under a shared lock; an unproved-quarantine hold had no release once corrupt/ was
+    removed by hand; receiptbox_put raced its marker scan; one process-wide lock queued
+    every store's fsync; a far-future read t was dropped and the park stranded; the .multi
+    marker stranded a bare origin-less park."""
+
+    def setUp(self):
+        _reset()
+        pm._quarantine_unproved.clear()
+        shutil.rmtree(pm.RECEIPTBOX / "peerW", ignore_errors=True)
+        shutil.rmtree(pm.READBOX / "peerW", ignore_errors=True)
+        shutil.rmtree(pm.CORRUPT, ignore_errors=True)
+        try:
+            pm.RECEIPTS_DONE.unlink()
+        except OSError:
+            pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_a_symlinked_state_root_still_proves_and_parks(self):
+        # the round's P1: the operator relocates state behind a link — an ordinary setup
+        real_root = pm.STATE.parent
+        link_home = Path(tempfile.mkdtemp())
+        link_root = link_home / "romp"
+        link_root.symlink_to(real_root)
+        saved = (pm.STATE, pm.OUTBOX)
+        try:
+            pm.STATE = link_root / "postal"
+            pm.OUTBOX = pm.STATE / "outbox"
+            pm._mkdirs_durable(pm.OUTBOX / "peerW")   # must NOT raise
+            self.assertTrue((real_root / "postal" / "outbox" / "peerW").is_dir())
+            # …while a planted link at a MINTED level (depth >= 3) is still refused
+            (real_root / "postal" / "outbox" / "planted").symlink_to("/tmp")
+            with self.assertRaises(OSError):
+                pm._mkdirs_durable(pm.OUTBOX / "planted" / "x")
+        finally:
+            pm.STATE, pm.OUTBOX = saved
+            try:
+                (real_root / "postal" / "outbox" / "planted").unlink()
+            except OSError:
+                pass
+            shutil.rmtree(real_root / "postal" / "outbox" / "peerW", ignore_errors=True)
+            shutil.rmtree(link_home, ignore_errors=True)
+
+    def test_b_ack_side_readers_never_block_on_a_fifo(self):
+        d = pm.RECEIPTBOX / "peerW"
+        d.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(str(d / ("aa" * 16 + ".json")))
+        r = pm.READBOX / "peerW"
+        r.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(str(r / ("bb" * 16 + ".json")))
+        done = []
+        def go():
+            with contextlib.redirect_stderr(io.StringIO()):
+                pm.receiptbox_del("peerW", "aa" * 16)
+                pm.readbox_del("peerW", {"mid": "bb" * 16, "unread": False})
+            done.append(True)
+        t = threading.Thread(target=go)
+        t.start(); t.join(5)
+        self.assertFalse(t.is_alive(), "both del paths returned — no FIFO block (r64 w2)")
+        self.assertTrue((d / ("aa" * 16 + ".json")).exists(), "the FIFO is left in place")
+
+    def test_c_an_unproved_quarantine_releases_when_its_destination_is_gone(self):
+        pm._quarantine_unproved[str(pm.RECEIPTS_DONE)] = pm.CORRUPT / "receipts-done"
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(pm._receipts_done(_for_write=True), {},
+                             "a hand-removed corrupt/ dir releases the hold (r64 w2)")
+        self.assertNotIn(str(pm.RECEIPTS_DONE), pm._quarantine_unproved)
+
+    def test_d_receiptbox_put_serializes_its_marker_scan(self):
+        self.assertIs(type(pm._receiptbox_lock), type(threading.Lock()))
+        bar = threading.Barrier(2)
+        def park(origin):
+            bar.wait(3)
+            pm.receiptbox_put("peerW", "cc" * 16, origin=origin)
+        ts = [threading.Thread(target=park, args=(o,)) for o in ("ORIGIN-A", "ORIGIN-B")]
+        for t in ts: t.start()
+        for t in ts: t.join(5)
+        self.assertTrue((pm.RECEIPTBOX / "peerW" / ("cc" * 16 + ".multi")).exists(),
+                        "two concurrent origins still leave the durable marker (r64 w2)")
+
+    def test_e_store_locks_are_per_directory(self):
+        a = pm._json_store_lock_for(pm.STATE / "x")
+        b = pm._json_store_lock_for(pm.STATE / "y")
+        self.assertIsNot(a, b, "unrelated stores never queue behind one fsync (r64 w2)")
+        self.assertIs(a, pm._json_store_lock_for(pm.STATE / "x"))
+
+    def test_f_a_far_future_read_t_clamps_instead_of_stranding(self):
+        far = time.time() + 5 * 365 * 86400
+        rows = pm._peer_read_rows([{"mid": "dd" * 16, "t": far}])
+        self.assertEqual(len(rows), 1, "the row is kept — never a silent drop (r64 w2)")
+        self.assertLessEqual(rows[0]["t"], time.time() + 366 * 86400)
+
+    def test_g_the_marker_never_strands_a_bare_origin_less_park(self):
+        d = pm.RECEIPTBOX / "peerW"
+        d.mkdir(parents=True, exist_ok=True)
+        mid = "ee" * 16
+        (d / (mid + ".json")).write_text(json.dumps({"mid": mid}))      # legacy, no origin
+        pm.receiptbox_put("peerW", mid, origin="ORIGIN-A")               # a scoped sibling
+        self.assertFalse((d / (mid + ".multi")).exists(),
+                         "a bare park recording NO origin is not another origin (r64 w2)")
+        (d / (mid + ".multi")).write_text("1")                           # even if one stood…
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm.receiptbox_del("peerW", mid)                              # originless ack
+        self.assertFalse((d / (mid + ".json")).exists(),
+                         "…the legacy peer's one possible ack still clears its own park")
+        self.assertTrue((d / pm._receipt_park_name(mid, "ORIGIN-A")).exists())

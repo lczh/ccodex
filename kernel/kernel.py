@@ -2310,7 +2310,9 @@ def _union_tombs_load_locked():
             _ht = float(_hraw.strip())
         except ValueError:
             _ht = None
-        if _ht is None or not (0 < _ht <= time.time() + 86400):
+        if _ht is None or not (0 < _ht <= time.time() + 365 * 86400):   # a YEAR (r64 w2:
+            #   the day bound re-minted the hold at a stepped-back clock — a durable
+            #   LOWERING of the hold's start, and the corrected clock expired it early)
             # an unreadable or absurd mint time cannot prove the horizon passed —
             # re-mint it so the 7d clock restarts from now instead of failing open
             try:
@@ -2442,9 +2444,13 @@ def _union_tombs_load_locked():
                 if (isinstance(_nd, dict) and isinstance(_nd.get("names"), dict)
                         and _nd.get("gen") == hashlib.sha256(_mraw.encode()).hexdigest()):
                     _nd = _nd["names"]
-                elif isinstance(_nd, dict) and "gen" in _nd:
-                    sys.stderr.write("union-tombs: names side file is for another ledger "
-                                     "generation — shields read as wildcards this pass\n")
+                else:
+                    # unbound names — another generation, OR the gen-less shape v1.3.36
+                    # wrote (r64 wave 2: a stale gen-less file is EXACTLY the P1.1 fault
+                    # state carried across the upgrade; trusting it unshielded the newest
+                    # retired name for one boot). Wildcards until the next save rebinds.
+                    sys.stderr.write("union-tombs: names side file is not bound to this "
+                                     "ledger — shields read as wildcards this pass\n")
                     _nd = {}
                 if isinstance(_nd, dict):
                     for k, v in _nd.items():
@@ -7114,13 +7120,15 @@ _retry_suppress_pending = {}   # sid -> t: suppressions minted while the store w
 #                                always lands and a fault never erases siblings
 
 
-def _suppress_overlay(d):
+def _suppress_overlay(d, _items=None):
     """Fold the pending overlay in WITHOUT regressing a newer durable floor (r61 P2.3,
     executed: dict.update let an OLDER pending stamp overwrite a newer durable one —
     the healthy-turn rearm then cleared a suppression the user's later interrupt had
-    refreshed, and the retry storm resumed)."""
-    with _retry_suppress_lock:
-        _items = list(_retry_suppress_pending.items())
+    refreshed, and the retry storm resumed). `_items` is a snapshot taken by a caller
+    that already holds the lock together with its cache read (r64 wave 2)."""
+    if _items is None:
+        with _retry_suppress_lock:
+            _items = list(_retry_suppress_pending.items())
     for k, v in _items:
         if not (isinstance(v, (int, float)) and not isinstance(v, bool) and v == v):
             continue                                 # a non-finite overlay value is junk
@@ -7156,9 +7164,12 @@ def _retry_suppress_data():
         return d
     with _retry_suppress_lock:
         hit = _retry_suppress_cache.get(str(p))
+        _pend = list(_retry_suppress_pending.items())   # ONE snapshot with the hit (r64
+        #   wave 2: three separate reads let a writer land between the cache read and the
+        #   pending check — the old map came back without the sid the file now held)
     if hit and hit[0] == key:
-        return (_suppress_overlay(dict(hit[1]))
-                if _retry_suppress_pending else hit[1])   # overlay on the HIT arm too
+        return (_suppress_overlay(dict(hit[1]), _items=_pend)
+                if _pend else hit[1])                     # overlay on the HIT arm too
         #                                                   (r60 P2.3)
     try:
         d = jd.canonicalize_retry_suppressed_identity(json.loads(p.read_text()))

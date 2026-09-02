@@ -3099,11 +3099,22 @@ def _mkdirs_durable(path):
     chain = []
     q = p
 
+    def _plantable(dp):
+        # the symlink refusal (r64 P2.13) applies to directories the bus MINTS from peer
+        # or session input — per-host / per-sid levels at depth >= 3 under the root. The
+        # root itself, STATE and the fixed top-level layout are the OPERATOR's, and a
+        # relocated state directory behind a symlink is an ordinary setup (r64 wave 2,
+        # reproduced: refusing the root bricked every park and the bus at boot)
+        try:
+            return len(dp.relative_to(root).parts) >= 3
+        except ValueError:
+            return False
+
     def _gen_full(dp):
         try:
-            _st = os.stat(str(dp), follow_symlinks=False)   # never through a symlink (r64
-            if not stat.S_ISDIR(_st.st_mode):                 # P2.13): a planted link is
-                return None                                   # not a proved directory
+            _st = os.stat(str(dp), follow_symlinks=not _plantable(dp))
+            if not stat.S_ISDIR(_st.st_mode):                 # a planted link is not a
+                return None                                   # proved directory
             return (_st.st_dev, _st.st_ino, _st.st_ctime_ns)   # the within-call compare
             #   needs ctime too: an rmtree + mkdir can REUSE the inode number (r63)
         except OSError:
@@ -3111,7 +3122,7 @@ def _mkdirs_durable(path):
 
     def _gen(dp):
         try:
-            _st = os.stat(str(dp), follow_symlinks=False)
+            _st = os.stat(str(dp), follow_symlinks=not _plantable(dp))
             if not stat.S_ISDIR(_st.st_mode):
                 return None
             return (_st.st_dev, _st.st_ino)
@@ -3155,6 +3166,8 @@ def _mkdirs_durable(path):
             return
         return _mkdirs_durable(path)     # one re-walk with the memo cleared
     for d in chain:
+        if not _plantable(d):
+            continue                     # the operator's levels may be symlinks (r64 w2)
         try:
             _lst = os.lstat(str(d))
         except FileNotFoundError:
@@ -3178,10 +3191,21 @@ def _mkdirs_durable(path):
             _proved_dirs.pop(str(d), None)   # vanished or replaced mid-proof: unproven
 
 
-_json_store_lock = threading.RLock()   # EVERY json-record publisher and the quarantine
-#   mover share it (r64 P1.9: the mover's stat-then-unlink of the source could not be closed
-#   by more pathname checks — a valid replacement published between them was unlinked;
-#   only shared serialization closes it). RLock: a publisher may already hold it.
+_json_store_locks = {}                 # str(dir) -> RLock: every json-record publisher and
+_json_store_locks_mutex = threading.Lock()   # the quarantine mover serialize PER DIRECTORY
+#   (r64 P1.9: the mover's stat-then-unlink of the source could not be closed by more
+#   pathname checks — a valid replacement published between them was unlinked; only shared
+#   serialization closes it. r64 wave 2: ONE process-wide lock queued every store's fsync
+#   pair behind every other's — per-directory locks keep unrelated stores independent.)
+
+
+def _json_store_lock_for(dirpath):
+    k = str(dirpath)
+    with _json_store_locks_mutex:
+        lk = _json_store_locks.get(k)
+        if lk is None:
+            lk = _json_store_locks[k] = threading.RLock()
+        return lk
 
 
 class _NotRegular(OSError):
@@ -3212,7 +3236,7 @@ def _atomic_text_put(path, text):
     """Durably publish text with a unique same-directory temporary and atomic replace."""
     tmp = path.with_name(".%s.%d.%d.%016x.tmp" %
                          (path.name, os.getpid(), threading.get_ident(), random.getrandbits(64)))
-    with _json_store_lock:
+    with _json_store_lock_for(path.parent):
         try:
             with tmp.open("x") as f:
                 f.write(text)
@@ -3255,7 +3279,7 @@ def _quarantine_corrupt_json(path, store, error, fingerprint=None):
     is quarantined DURABLY (r63 P2.11: a swallowed post-move fsync failure left the caller
     believing the judged bytes were safe)."""
     try:
-      with _json_store_lock:               # publishers and the mover serialize (r64 P1.9)
+      with _json_store_lock_for(path.parent):   # publishers and the mover serialize (r64 P1.9)
         try:
             _qfd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:
@@ -3345,6 +3369,13 @@ def _quarantine_reprove(path):
     try:
         _fsync_dir(_dd)
         _fsync_dir(Path(path).parent)
+    except FileNotFoundError:
+        # the corrupt/ destination was removed by hand — there is nothing left to prove
+        # and holding every write forever helps nobody (r64 wave 2); the release is loud
+        _log("quarantine: %s's unproved destination %s is gone — releasing the write hold"
+             % (path, _dd))
+        _quarantine_unproved.pop(str(path), None)
+        return True
     except OSError:
         return False
     _quarantine_unproved.pop(str(path), None)
@@ -3607,7 +3638,7 @@ def outbox_list(host, limit=None, byte_limit=None):
             try:
                 st = f.stat()
                 fingerprint = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
-                raw = f.read_bytes().decode("utf-8")   # a decode failure is PROVEN garbage —
+                raw = _read_record_text(f)   # non-blocking, regular only (r64 w2)   # a decode failure is PROVEN garbage —
                 #   read_text's UnicodeDecodeError escaped BOTH arms to the outer handler and
                 #   one torn record wedged the whole host's relay listing forever (r54 wave 2)
             except UnicodeDecodeError as e:
@@ -3959,7 +3990,7 @@ def _receipts_done(_for_write=False):
             #   let one new confirmation overwrite every existing one
         return {}
     try:
-        raw = RECEIPTS_DONE.read_text()
+        raw = _read_record_text(RECEIPTS_DONE)   # non-blocking, regular only (r64 w2)
     except FileNotFoundError:
         return {}
     except UnicodeDecodeError as e:
@@ -4014,6 +4045,8 @@ def _receipt_park_name(mid, origin=""):
 
 
 _readbox_lock = threading.Lock()       # readbox put/del serialize (r64 P1.7)
+_receiptbox_lock = threading.Lock()    # receiptbox put/del serialize (r64 wave 2: the
+#                                        marker scan + publish raced two origins' puts)
 
 
 def _mark_multi_origin(d, mid, origin):
@@ -4022,10 +4055,21 @@ def _mark_multi_origin(d, mid, origin):
     ORIGINLESS ack — the decision must not depend on how many files happen to exist at ack
     time (a delayed duplicate deleted origin B after origin A's park had settled)."""
     try:
-        others = [f for f in (_park_siblings(d, mid, mid + ".json") or [])
-                  if f.name != _receipt_park_name(mid, origin)]
-        if (d / (mid + ".json")).exists() and origin:
-            others.append(d / (mid + ".json"))
+        others = []
+        for f in (_park_siblings(d, mid, mid + ".json") or []) + [d / (mid + ".json")]:
+            if f.name == _receipt_park_name(mid, origin) or not f.exists():
+                continue
+            try:
+                _rec = json.loads(_read_record_text(f))
+            except (OSError, ValueError):
+                continue
+            _ro = _rec.get("origin") if isinstance(_rec, dict) else None
+            # "another origin" means another RECORDED origin (r64 wave 2: a bare park
+            # recording NO origin is a legacy unknown — counting it minted a marker that
+            # stranded the one ack its legacy peer can send; one origin's own v58 spelling
+            # is not another origin either)
+            if isinstance(_ro, str) and _ro and _ro != origin:
+                others.append(f)
         if others and not (d / (mid + ".multi")).exists():
             _atomic_text_put(d / (mid + ".multi"), "1")
     except OSError as e:
@@ -4083,8 +4127,9 @@ def receiptbox_put(host, mid, origin="", dmid=""):
     if origin:
         row["origin"] = origin
     _fname = _receipt_park_name(mid, origin)
-    _mark_multi_origin(d, mid, origin)
-    _atomic_json_put(d / _fname, row)
+    with _receiptbox_lock:
+        _mark_multi_origin(d, mid, origin)
+        _atomic_json_put(d / _fname, row)
     _peer_wake(host).set()
 
 def receiptbox_list(host, limit=None):
@@ -4150,10 +4195,8 @@ def receiptbox_del(host, mid, origin=""):
         _f = RECEIPTBOX / host / _receipt_park_name_v58(mid, origin)
     if origin and not _f.exists():
         _f = RECEIPTBOX / host / (mid + ".json")
-    if not origin and (_f.parent / (mid + ".multi")).exists():
-        _log("receiptbox_del %s/%s: originless ack over a multi-origin mid — kept (r64 P1.6)"
-             % (host, mid))
-        return
+    _multi = not origin and (_f.parent / (mid + ".multi")).exists()   # checked against
+    #   the SELECTED row below: a bare park recording no origin stays clearable (r64 w2)
     if not origin and not _f.exists():
         # an ORIGINLESS ack with no bare park: a legacy peer clearing a park the modern
         # side parked SCOPED — clear exactly ONE sibling, never an ambiguous set (r63 P2.12)
@@ -4163,7 +4206,11 @@ def receiptbox_del(host, mid, origin=""):
         _f = _sib[0]
     _dmid = ""
     try:
-        _row = json.loads(_f.read_text())
+        _row = json.loads(_read_record_text(_f))   # non-blocking, regular only (r64 w2)
+        if _multi and isinstance(_row, dict) and _row.get("origin"):
+            _log("receiptbox_del %s/%s: originless ack over a multi-origin mid — kept "
+                 "(r64 P1.6)" % (host, mid))
+            return
         _sibs = (_park_siblings(_f.parent, mid, _f.name)
                  if _f.name == mid + ".json" else [])
         if (_f.name == mid + ".json" and isinstance(_row, dict)
@@ -4386,8 +4433,7 @@ def readbox_del(host, rec):
         f = READBOX / host / _receipt_park_name_v58(mid, _origin)   # the v1.3.31 spelling
     if not f.exists():
         f = READBOX / host / (mid + ".json")         # the pre-r59 bare spelling
-    if not _origin and (f.parent / (mid + ".multi")).exists():
-        return                                       # multi-origin mid (r64 P1.6)
+    _multi = not _origin and (f.parent / (mid + ".multi")).exists()   # (r64 P1.6 / w2)
     if not _origin and not f.exists():
         _sib = _park_siblings(f.parent, mid, mid + ".json")   # (r63 P2.12: one scoped
         if _sib is None or len(_sib) != 1:                     #  sibling, or nothing)
@@ -4395,7 +4441,9 @@ def readbox_del(host, rec):
         f = _sib[0]
     with _readbox_lock:                              # read/compare/unlink is ONE step (r64 P1.7)
         try:
-            cur = json.loads(f.read_text())
+            cur = json.loads(_read_record_text(f))   # non-blocking, regular only (r64 w2)
+            if _multi and isinstance(cur, dict) and cur.get("origin"):
+                return                               # multi-origin mid (r64 P1.6)
             _sibs = _park_siblings(f.parent, mid, f.name) if f.name == mid + ".json" else []
             if (f.name == mid + ".json" and isinstance(cur, dict)
                     and _origin and not cur.get("origin")):
@@ -4518,11 +4566,12 @@ def _peer_read_rows(value):
                 #                                      dropped and acked — correlation lost)
             clean["dmid"] = dmid
         _t = row.get("t", 0)
-        if (isinstance(_t, bool) or not isinstance(_t, (int, float)) or _t != _t
-                or _t < 0 or _t > time.time() + 365 * 86400):
-            continue                                 # a LITERAL bounded number (r64 P2.14:
-            #                                          strings/fractions/objects coerced)
-        clean["t"] = int(_t)
+        if isinstance(_t, bool) or not isinstance(_t, (int, float)) or _t != _t or _t < 0:
+            continue                                 # a LITERAL non-negative number (r64
+            #                                          P2.14: strings/objects coerced)
+        clean["t"] = int(min(_t, time.time() + 365 * 86400))   # a far-future t CLAMPS
+        #   (r64 wave 2: dropping it made the receiver skip a row the dialer then deleted
+        #   on its own clock, and a stored one was never sent — a permanent hold)
         if "unread" in row and not isinstance(row.get("unread"), bool):
             continue                                 # unread:"false" is not True (r63 P1.4)
         if row.get("unread") is True:
@@ -5372,7 +5421,7 @@ def _backflow_load_locked():
     wrong-shape hold was a permanent wedge with no repair path); rows that fail
     validation are PRESERVED verbatim, never folded and never erased by a save."""
     try:
-        d = json.loads(_backflow_path().read_text())
+        d = json.loads(_read_record_text(_backflow_path()))
     except FileNotFoundError:
         _backflow_loaded[0] = True                   # provably no ledger yet
         return
