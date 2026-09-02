@@ -3220,6 +3220,9 @@ class TimelinePanel {
             .then((r) => this.unionOpsAck({ ok: r.ok === true, opId: opId,
                                             unclaimed: (r.json && r.json.unclaimed) || [],
                                             unretired: (r.json && r.json.unretired) || [],
+                                            dropped: (r.json && r.json.dropped) || [],   // r64 P2.10:
+                                            //   the POST projection lost the kernel's drop verdict
+                                            //   and the plain mirror re-posted the collision forever
                                             // NO parsed body AND no received 4xx = the
                                             // kernel may have COMMITTED and the response
                                             // died (r57 P1.1): indeterminate. A received
@@ -3486,6 +3489,7 @@ class TimelinePanel {
       // corrupted a second-generation row — its ogid/olin claimed a rekey that never was)
       for (const pr of prior) { pr.x.gid = pr.gid; pr.x.ogid = pr.ogid; pr.x.olin = pr.olin; }
       this._mintedGids.delete(ngid);
+      if (this._mintedNames) this._mintedNames.delete(ngid);
     }
     this.draw();
   }
@@ -3503,6 +3507,7 @@ class TimelinePanel {
     for (const g of s) {
       if (this._journaledGids) this._journaledGids.delete(g);
       if (this._mintedGids) this._mintedGids.delete(g);
+      if (this._mintedNames) this._mintedNames.delete(g);   // no leak past the gid (r64 P3.15)
       if (this._adoptedGids) this._adoptedGids.delete(g);
       // SUPPRESSED until proof (r55 P1.5): a stale echo used to re-adopt the yielded rows
       // immediately, and the next unrelated sync republished rows the completer had

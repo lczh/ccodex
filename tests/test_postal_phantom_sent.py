@@ -11,6 +11,7 @@ sender never sees a phantom as pending. Synthetic data only per CLAUDE.md.
 
 Run:    python3 tests/test_postal_phantom_sent.py
 """
+import threading
 import contextlib
 import io
 import json
@@ -3081,3 +3082,157 @@ class R63PostalAudit(unittest.TestCase):
         finally:
             pm._bounce_arrived = real
         self.assertEqual(settled, [host], "the legitimate park flushes")
+
+
+
+class R64PostalAudit(unittest.TestCase):
+    """the v1.3.36 audit, postal half: filename-shaped siblings aliased legal dotted mids
+    (P1.5), originless-ack arbitration depended on current file cardinality (P1.6), a stale
+    read ack raced a retraction's publish (P1.7), disk and wire schemas disagreed (P1.8),
+    the quarantine mover's stat-then-unlink lost a valid replacement (P1.9), a FIFO blocked
+    scanners and an unproved move read as {} (P2.12), directory proofs followed symlinks
+    (P2.13), read rows coerced t/dmid (P2.14), aside names collided (P3.16)."""
+
+    def setUp(self):
+        _reset()
+        pm._pending_bounces.clear()
+        pm._pending_bounces_loaded[0] = False
+        pm._pending_bounces_quarantined.clear()
+        pm._quarantine_unproved.clear()
+        for p in (pm._pending_bounces_path(), pm.RECEIPTS_DONE):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        shutil.rmtree(pm.RECEIPTBOX / "peerZ", ignore_errors=True)
+        shutil.rmtree(pm.READBOX / "peerZ", ignore_errors=True)
+        shutil.rmtree(pm.CORRUPT, ignore_errors=True)
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_a_legal_dotted_mid_is_never_a_sibling(self):
+        d = pm.RECEIPTBOX / "peerZ"
+        d.mkdir(parents=True, exist_ok=True)
+        # "abc.deadbeef" is a LEGAL bare mid wearing the 8-hex scoped spelling of "abc"
+        (d / "abc.deadbeef.json").write_text(json.dumps({"mid": "abc.deadbeef",
+                                                         "dmid": "dd" * 16}))
+        self.assertEqual(pm._park_siblings(d, "abc", "abc.json"), [],
+                         "the RECORDED mid decides, not the filename shape (r64 P1.5)")
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm.receiptbox_del("peerZ", "abc")
+        self.assertTrue((d / "abc.deadbeef.json").exists(), "…so it is never deleted for it")
+        self.assertNotIn("dd" * 16, pm._receipts_done())
+
+    def test_b_a_multi_origin_mid_carries_a_durable_marker(self):
+        # r64 P1.6: ownership was decided from CURRENT sibling cardinality — after origin A
+        # settled, a delayed originless duplicate deleted origin B
+        pm.receiptbox_put("peerZ", "ee" * 16, origin="ORIGIN-A")
+        pm.receiptbox_put("peerZ", "ee" * 16, origin="ORIGIN-B")
+        d = pm.RECEIPTBOX / "peerZ"
+        self.assertTrue((d / ("ee" * 16 + ".multi")).exists(), "the ambiguity is DURABLE")
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm.receiptbox_del("peerZ", "ee" * 16, origin="ORIGIN-A")   # A settles (scoped)
+        self.assertFalse((d / pm._receipt_park_name("ee" * 16, "ORIGIN-A")).exists())
+        with contextlib.redirect_stderr(io.StringIO()):
+            pm.receiptbox_del("peerZ", "ee" * 16)                       # the originless dup
+        self.assertTrue((d / pm._receipt_park_name("ee" * 16, "ORIGIN-B")).exists(),
+                        "B survives: exactly-one-file is not ownership")
+
+    def test_c_read_park_put_and_del_are_one_step(self):
+        # r64 P1.7: read/compare then a separate unlink — a retraction published between
+        # them was deleted by the stale unread:false ack. The lock exists and is shared.
+        self.assertIs(type(pm._readbox_lock), type(threading.Lock()))
+        src = open(os.path.join(BIN, "romp-postal-service")).read()
+        i = src.index("def readbox_put(host, rec):")
+        self.assertIn("with _readbox_lock:", src[i:i + 1400])
+        j = src.index("def readbox_del(host, rec):")
+        self.assertIn("with _readbox_lock:", src[j:j + 2200])
+
+    def test_d_the_disk_schema_is_the_wire_schema(self):
+        d = pm.READBOX / "peerZ"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / ("ff" * 16 + ".json")).write_text(json.dumps({"mid": "ff" * 16, "origin": None,
+                                                          "unread": False}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            rows = pm.readbox_list("peerZ")
+        self.assertEqual(rows, [], "origin:null on disk is schema-invalid (r64 P1.8)")
+        r = pm.RECEIPTBOX / "peerZ"
+        r.mkdir(parents=True, exist_ok=True)
+        (r / "123.json").write_text(json.dumps({"mid": 123}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            rows = pm.receiptbox_list("peerZ")
+        self.assertEqual(rows, [], "a numeric mid is never stringified into a receipt")
+
+    def test_e_publishers_and_the_quarantine_mover_share_one_lock(self):
+        # r64 P1.9: no pathname check closes the stat-then-unlink window — serialization does
+        self.assertTrue(hasattr(pm, "_json_store_lock"))
+        src = open(os.path.join(BIN, "romp-postal-service")).read()
+        i = src.index("def _atomic_text_put(path, text):")
+        self.assertIn("with _json_store_lock:", src[i:i + 700])
+        j = src.index("def _quarantine_corrupt_json(path, store, error, fingerprint=None):")
+        self.assertIn("with _json_store_lock:", src[j:j + 1800])
+
+    def test_f_a_fifo_never_blocks_a_scanner_and_an_unproved_move_holds_writes(self):
+        d = pm.RECEIPTBOX / "peerZ"
+        d.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(str(d / ("aa" * 16 + ".json")))
+        done = []
+        t = threading.Thread(target=lambda: done.append(pm.receiptbox_list("peerZ")))
+        t.start(); t.join(5)
+        self.assertFalse(t.is_alive(), "the scanner returned — no FIFO block (r64 P2.12)")
+        self.assertEqual(done, [[]])
+        # an unproved quarantine move holds receipts-done writes until re-proved
+        pm.RECEIPTS_DONE.write_text("[]")
+        real = pm._fsync_dir
+        def boom(p):
+            if str(p) == str(pm.CORRUPT / "receipts-done"):
+                raise OSError(5, "EIO")
+            return real(p)
+        pm._fsync_dir = boom
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(pm._OutboxUnreadable):
+                    pm._receipts_done(_for_write=True)
+                with self.assertRaises(pm._OutboxUnreadable):
+                    pm._receipts_done(_for_write=True)   # the NEXT call holds too
+        finally:
+            pm._fsync_dir = real
+        self.assertEqual(pm._receipts_done(_for_write=True), {},
+                         "…until the fsync retry proves the move")
+
+    def test_g_directory_proofs_never_follow_a_symlink(self):
+        base = pm.STATE / "link-probe"
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "a").symlink_to("/tmp")
+        try:
+            with self.assertRaises(OSError):
+                pm._mkdirs_durable(base / "a" / "b")
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_h_read_rows_take_literal_bounded_fields(self):
+        good = {"mid": "bb" * 16, "t": 100, "dmid": "cc" * 16}
+        self.assertEqual(len(pm._peer_read_rows([good])), 1)
+        self.assertEqual(pm._peer_read_rows([dict(good, t="100")]), [], "t is a number")
+        self.assertEqual(pm._peer_read_rows([dict(good, t=1e18)]), [], "…bounded")
+        self.assertEqual(pm._peer_read_rows([dict(good, dmid="")]), [],
+                         "a PRESENT falsey dmid rejects the row (r64 P2.14)")
+
+    def test_i_aside_names_never_overwrite(self):
+        _k = "HOSTQ|" + "aa" * 16
+        pm._pending_bounces_path().parent.mkdir(parents=True, exist_ok=True)
+        pm._pending_bounces_path().write_text(json.dumps(
+            {_k: {"host": "OTHER", "mid": "zz" * 16, "code": "x", "t": 1}}))
+        real = os.urandom
+        pm.os.urandom = lambda n: b"\x01" * n                 # force a collision
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertTrue(pm._pending_bounce_park("HOSTQ", "aa" * 16, "c1"))
+                pm._pending_bounces_quarantined.add(_k)         # quarantine it again
+                self.assertTrue(pm._pending_bounce_park("HOSTQ", "aa" * 16, "c2"))
+        finally:
+            pm.os.urandom = real
+        d = json.loads(pm._pending_bounces_path().read_text())
+        self.assertEqual(len([k for k in d if k.count("|") >= 2]), 2,
+                         "BOTH forensic rows survive a forced collision (r64 P3.16)")

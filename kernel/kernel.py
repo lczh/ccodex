@@ -11,6 +11,7 @@ zero protocol change at switchover. WS is hand-rolled on the stdlib socket (no d
 
 Run:  bin/romp-kernel   → opens http://127.0.0.1:29855
 """
+import hashlib
 import json, os, queue, random, re, signal, socket, stat, sys, time, threading, traceback, base64, bisect, errno, fcntl, hashlib, hmac, struct, subprocess, shutil, shlex, http.client, uuid, tempfile
 from pathlib import Path
 from datetime import datetime, timezone
@@ -2411,12 +2412,15 @@ def _union_tombs_load_locked():
                 try:
                     _raw = float(v.get("t")) if isinstance(v, dict) else float(v)
                     _tv = _raw
-                    if _raw > _now + 86400:
-                        # a stamp beyond plausible clock skew is clamped to now — and
-                        # the clamp is PERSISTED below (r63 P1.2: re-clamping the disk
-                        # copy to "now" on every restart made a far-future tomb immortal);
-                        # a stamp within a day of now is left alone, so a backward clock
-                        # step under a day never lowers a legitimate shield
+                    if _raw > _now + 365 * 86400:
+                        # a stamp beyond a YEAR of skew is clamped to now — and the clamp
+                        # is PERSISTED below (r63 P1.2: re-clamping the disk copy to "now"
+                        # on every restart made a far-future tomb immortal). The threshold
+                        # is a year, not a day (r64 P1.3: a 30-day backward clock step made
+                        # legitimate stamps look "future", the day-threshold clamp lowered
+                        # them durably, and the corrected clock then expired the shields
+                        # early — a replay was accepted). No plausible clock step is a
+                        # year; only garbage is.
                         _tv = _now
                         _clamped = True
                     if _tv >= _floor:
@@ -2433,6 +2437,15 @@ def _union_tombs_load_locked():
                 _union_tomb_names.pop(_victim, None)
             try:
                 _nd = json.loads(_read_regular_text(_union_tomb_names_path()))
+                # generation-bound (r64 P1.1): the names must describe THIS main file
+                _mraw = _read_regular_text(_union_tombs_path())
+                if (isinstance(_nd, dict) and isinstance(_nd.get("names"), dict)
+                        and _nd.get("gen") == hashlib.sha256(_mraw.encode()).hexdigest()):
+                    _nd = _nd["names"]
+                elif isinstance(_nd, dict) and "gen" in _nd:
+                    sys.stderr.write("union-tombs: names side file is for another ledger "
+                                     "generation — shields read as wildcards this pass\n")
+                    _nd = {}
                 if isinstance(_nd, dict):
                     for k, v in _nd.items():
                         try:
@@ -2462,28 +2475,36 @@ def _union_tombs_save_locked():
     lock; both writes are cheap). Best-effort with a loud log. NEVER writes while the
     durable copy is unfolded (r58 wave 2: one transient load fault followed by any retire
     truncated the whole ledger to the in-memory map). The MAIN ledger stays numeric
-    (gid -> stamp) so a v1.3.35 rollback loads it; the names ride a SIDE file (r63 wave 2)."""
+    (gid -> stamp) so a v1.3.35 rollback loads it; the names ride a SIDE file that is
+    GENERATION-BOUND to the main bytes (r64 P1.1: the two files were not one transaction —
+    a names write failure left a STALE names file beside a new ledger, and after a restart
+    the newly-retired name was missing, so that gesture's replay was accepted). The names
+    file is written FIRST carrying the hash of the main bytes about to land; the loader
+    discards names whose hash does not match the main file it read (→ wildcards, the
+    conservative direction); a names-write failure REFUSES the retirement."""
     if not _union_tombs_loaded[0]:
         sys.stderr.write("union-tombs: durable copy not yet folded in — holding the save "
                          "so a load fault can never truncate the ledger\n")
         return False
+    _main = json.dumps({str(k): v for k, v in _union_retired_tombs.items()})
+    _gen = hashlib.sha256(_main.encode()).hexdigest()
     try:
-        _atomic_write(_union_tombs_path(),
-                      json.dumps({str(k): v for k, v in _union_retired_tombs.items()}))
+        _atomic_write(_union_tomb_names_path(),
+                      json.dumps({"gen": _gen,
+                                  "names": {str(k): sorted(_union_tomb_names.get(k, set()))
+                                            for k in _union_retired_tombs}}))
+    except Exception:
+        sys.stderr.write("union-tombs: the names side file could not persist — the "
+                         "retirement is refused (a stale names file would unshield the "
+                         "retired name after a restart)\n")
+        return False
+    try:
+        _atomic_write(_union_tombs_path(), _main)
+        return True
     except Exception:
         sys.stderr.write("union-tombs: could not persist — retired-gesture shields are "
                          "process-local until the next successful save\n")
         return False
-    try:
-        _atomic_write(_union_tomb_names_path(),
-                      json.dumps({str(k): sorted(_union_tomb_names.get(k, set()))
-                                  for k in _union_retired_tombs}))
-    except Exception:
-        # advisory: a missing/failed names file reads every tomb as a NAMELESS wildcard —
-        # the conservative direction (it drops more, never less) until the next save
-        sys.stderr.write("union-tombs: the names side file could not persist — shields "
-                         "read as wildcards until the next save\n")
-    return True
 
 
 def _union_claim_stamp(gid, ckey):
@@ -2874,7 +2895,7 @@ def _union_store_read_locked(what="union-gestures"):
                     out[k] = str(base[k])
         if ("t" not in base or isinstance(base.get("t"), bool)
                 or not isinstance(base.get("t"), (int, float))
-                or base.get("t") > _fmtime + 86400):
+                or base.get("t") > _fmtime + 365 * 86400):   # a YEAR (r64 P1.3)
             #  ^ a numeric FUTURE stamp clamps too (r62 wave 2): the stored row stays
             #    valid and mortal instead of poisoning the journal
             out = out if out is not None else dict(r)
@@ -2887,8 +2908,9 @@ def _union_store_read_locked(what="union-gestures"):
     rows = [_coerce_legacy_refusal(r) for r in rows]
     # v1.3.34 accepted duplicate (gid, host) rows; v1.3.35 refuses every completion over
     # them (r63 P2.8) — the read-side migration keeps the LAST copy (the ratcheted one)
-    _seen_keys = set()
+    _kept_by_key = {}
     _dedup = []
+    _dup_conflict = False
     for r in reversed(rows):
         if (isinstance(r, dict) and not r.get("refusal")
                 and isinstance(r.get("gid"), (int, str)) and r.get("gid")
@@ -2897,12 +2919,24 @@ def _union_store_read_locked(what="union-gestures"):
             # of the reader before the row judge could salvage the store — every read
             # and merge crashed, no marker, no recovery event)
             _k2 = (r.get("gid"), r.get("host"))
-            if _k2 in _seen_keys:
+            _kept = _kept_by_key.get(_k2)
+            if _kept is not None:
+                # a duplicate: EXACT copies ratchet their monotonic flags; CONFLICTING
+                # operation bytes judge the store (r64 P1.4: "last wins" kept a
+                # dispatched:false row over a dispatched:true one — an executed effect
+                # became claimable again)
+                _immut = ("name", "rt", "edit", "inverse", "ogid", "olin", "rid")
+                if any(_kept.get(k3) != r.get(k3) for k3 in _immut):
+                    _dup_conflict = True
+                else:
+                    for k3 in ("dispatched", "confirmed", "lapplied"):
+                        if r.get(k3) is True and _kept.get(k3) is not True:
+                            _kept[k3] = True
                 continue
-            _seen_keys.add(_k2)
+            _kept_by_key[_k2] = r
         _dedup.append(r)
     rows = list(reversed(_dedup))
-    bad = any(not _union_row_valid(r) for r in rows)   # NON-DICTS judged too (r58 P1.6:
+    bad = _dup_conflict or any(not _union_row_valid(r) for r in rows)   # NON-DICTS judged too (r58 P1.6:
     #                                the isinstance pre-filter acked a mixed journal
     #                                while silently dropping its invalid rows)
     if bad:
@@ -3131,7 +3165,7 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None, _out=None):
         inc = list(entries) if isinstance(entries, list) else []
         if any(isinstance(r, dict) and r.get("refusal")
                and isinstance(r.get("t"), (int, float)) and not isinstance(r.get("t"), bool)
-               and r.get("t") > time.time() + 86400 for r in inc):
+               and r.get("t") > time.time() + 365 * 86400 for r in inc):   # r64 P1.3
             return False, [], "malformed row (implausibly future timestamp)", []   # r62
             #   P2.7 at the WIRE only — stored rows clamp on read instead (r62 wave 2)
         if any(not _union_row_valid(r) for r in inc):
@@ -3223,7 +3257,11 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None, _out=None):
                 _om = _oby_host.get(r.get("host"))
                 if (_om is not None
                         and ((_om.get("name") or "") != (r.get("name") or "")
-                             or (_om.get("rt") or {}) != (r.get("rt") or {}))):
+                             or (_om.get("rt") or {}) != (r.get("rt") or {})
+                             or json.dumps([_om.get("edit"), _om.get("inverse")],
+                                           sort_keys=True, default=str)
+                             != json.dumps([r.get("edit"), r.get("inverse")],
+                                           sort_keys=True, default=str))):
                     # row IDENTITY is immutable across a completion (r63 P2.7, executed:
                     # (H, alpha) was re-keyed into (H, beta) and later refusals could no
                     # longer correlate)
@@ -3323,6 +3361,16 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None, _out=None):
         with _union_claims_lock:
             _claims_snap = {g: c.get("ckey") for g, c in _union_claims.items()}
         _cur_by_key = {(r.get("gid"), r.get("host")): r for r in cur if not r.get("refusal")}
+
+        def _opfp(r):
+            # the immutable OPERATION (r64 P1.2: identity compared only name and rt, so a
+            # same-gid/same-name foreign writer's DIFFERENT edit overwrote the durable
+            # row, and a claimed completion turned a color op into a deletion)
+            try:
+                return json.dumps([r.get("edit"), r.get("inverse")], sort_keys=True,
+                                  separators=(",", ":"), default=str)
+            except (TypeError, ValueError):
+                return repr([r.get("edit"), r.get("inverse")])
         _collide = []
         for r in inc:
             if r.get("refusal"):
@@ -3330,7 +3378,8 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None, _out=None):
             _c = _cur_by_key.get((r.get("gid"), r.get("host")))
             if (_c is not None
                     and ((_c.get("name") or "") != (r.get("name") or "")
-                         or (_c.get("rt") or {}) != (r.get("rt") or {}))):
+                         or (_c.get("rt") or {}) != (r.get("rt") or {})
+                         or _opfp(_c) != _opfp(r))):
                 # regardless of claims (r63 P1.1: a DISCONNECTED writer's claim is
                 # released on socket close, and its durable row was then overwritten by
                 # the collider) — a resident row never changes identity through an upsert
@@ -7096,7 +7145,8 @@ def _retry_suppress_data():
         with _retry_suppress_lock:
             return dict(_retry_suppress_pending) if _retry_suppress_pending else {}
     except OSError:
-        hit = _retry_suppress_cache.get(str(p))
+        with _retry_suppress_lock:
+            hit = _retry_suppress_cache.get(str(p))
         d = dict(hit[1]) if hit else {}              # LKG, never a cached fabrication
         _suppress_overlay(d)
         if not hit and not _retry_suppress_pending and not _suppress_boot_warned[0]:
@@ -7104,7 +7154,8 @@ def _retry_suppress_data():
             sys.stderr.write("retry-suppressed: unreadable with NO history — standing "
                              "suppressions are invisible until it reads (r59 wave 2)\n")
         return d
-    hit = _retry_suppress_cache.get(str(p))
+    with _retry_suppress_lock:
+        hit = _retry_suppress_cache.get(str(p))
     if hit and hit[0] == key:
         return (_suppress_overlay(dict(hit[1]))
                 if _retry_suppress_pending else hit[1])   # overlay on the HIT arm too
@@ -7120,11 +7171,13 @@ def _retry_suppress_data():
         # a fault serves the last-known-good copy and CACHES NOTHING (r59 P1.4,
         # reproduced: the fabricated {} was cached under the real generation — standing
         # suppressions read as gone, and the next arm erased the siblings durably)
-        hit = _retry_suppress_cache.get(str(p))
+        with _retry_suppress_lock:
+            hit = _retry_suppress_cache.get(str(p))
         d = dict(hit[1]) if hit else {}
         _suppress_overlay(d)
         return d
-    _retry_suppress_cache[str(p)] = (key, d)
+    with _retry_suppress_lock:
+        _retry_suppress_cache[str(p)] = (key, d)
     if _retry_suppress_pending:
         return _suppress_overlay(dict(d))            # the overlay is VISIBLE (r59 wave 2,
         #                                              reproduced: _auto_resume_session_retry
@@ -7185,8 +7238,10 @@ def _suppress_session_retry(sid):
                              "in memory until the store accepts writes\n" % sid)
             return
         with _retry_suppress_lock:
-            _retry_suppress_pending.clear()
-        _retry_suppress_cache.clear()
+            _retry_suppress_cache.clear()    # the cache goes FIRST (r64 P2.11: pending was
+            _retry_suppress_pending.clear()  # popped while the cache still served the old
+            #                                  map — membership answered False for a sid the
+            #                                  durable file already held)
 
 
 def _clear_session_retry_suppress(sid):
@@ -7214,7 +7269,8 @@ def _clear_session_retry_suppress(sid):
             _retry_suppress_pending.pop(sid, None)
         if _had:
             _atomic_write(p, json.dumps(d, sort_keys=True))
-            _retry_suppress_cache.clear()
+            with _retry_suppress_lock:
+                _retry_suppress_cache.clear()
             return True
     return False
 

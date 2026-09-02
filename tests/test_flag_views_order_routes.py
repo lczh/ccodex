@@ -9,6 +9,7 @@ import io
 import json
 import os
 import tempfile
+import hashlib
 import threading
 import time
 import unittest
@@ -4240,7 +4241,7 @@ class R62Wave2(unittest.TestCase):
         self.assertEqual(len(km._union_ops_load()), 2)
 
     def test_c_a_stored_future_stamp_clamps_instead_of_poisoning(self):
-        far = int(time.time()) + 2 * 86400
+        far = int(time.time()) + 2 * 365 * 86400   # beyond the YEAR threshold (r64 P1.3)
         (km.jd.STATE / "union-gestures.json").write_text(json.dumps([
             dict(self.ROW),
             {"refusal": True, "gid": -777, "opId": "777", "name": "lake",
@@ -4297,7 +4298,10 @@ class R63AuditFixes(unittest.TestCase):
         self.assertIsInstance(d["900"], (int, float),
                               "the MAIN ledger stays numeric (a v1.3.35 rollback loads it)")
         nd = json.loads((km.jd.STATE / "union-tombs.names.json").read_text())
-        self.assertEqual(nd["900"], ["other"], "the side file records the retired NAME")
+        self.assertEqual(nd["names"]["900"], ["other"], "the side file records the retired NAME")
+        self.assertEqual(nd["gen"], hashlib.sha256(
+            (km.jd.STATE / "union-tombs.json").read_bytes()).hexdigest(),
+            "…generation-bound to the main ledger bytes (r64 P1.1)")
         # a colliding id for a DIFFERENT tag is not this shield's business
         ok, unclaimed, _, _u = km._union_ops_merge(
             [dict(self.ROW, gid=900, name="pool")], [], ckey="ws:y")
@@ -4493,3 +4497,139 @@ class R63Wave2(unittest.TestCase):
             [dict(self.ROW, gid=42, name="beta")], [], ckey="ws:beta", _out=_out)
         self.assertTrue(ok)
         self.assertEqual(_out.get("dropped"), [42], "the collider is named DROPPED")
+
+
+
+class R64AuditFixes(unittest.TestCase):
+    """the v1.3.36 audit, kernel half (9 P1 / 5 P2 / 2 P3 against 163deef3): tomb + names
+    were not one transaction (P1.1), row identity excluded the operation (P1.2), clock steps
+    durably lowered safety stamps (P1.3), the duplicate migration kept a conflicting last row
+    (P1.4), and the suppression handoff was not linearized (P2.11)."""
+
+    ROW = {"host": "TESTHOST-A", "gid": 801, "edit": {"add": ["s1"]}, "inverse": {"remove": ["s1"]},
+           "rt": {}, "name": "pool", "dispatched": False}
+    SUCC = {"host": "TESTHOST-A", "gid": 802, "ogid": 801, "olin": [801], "rid": 801,
+            "edit": {"add": ["s1"]}, "inverse": {"remove": ["s1"]}, "rt": {}, "name": "pool",
+            "dispatched": False}
+
+    def setUp(self):
+        _scrub_state()
+        km._union_claims.clear()
+        km._union_retired_tombs.clear()
+        km._union_tomb_names.clear()
+        km._union_tombs_loaded[0] = False
+        km._retry_suppress_cache.clear()
+        with km._retry_suppress_lock:
+            km._retry_suppress_pending.clear()
+        for name in ("union-gestures.json", "union-gestures.json.unproved",
+                     "union-tombs.json", "union-tombs.json.hold", "union-tombs.names.json",
+                     "retry-suppressed.json"):
+            try:
+                (km.jd.STATE / name).unlink()
+            except OSError:
+                pass
+        for f in km.jd.STATE.glob("*.corrupt-*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_a_stale_names_file_never_unshields_a_retired_name(self):
+        # r64 P1.1, executed: main wrote, names failed, restart — the newly retired name was
+        # missing and its replay was accepted
+        self.assertTrue(km._union_ops_set([dict(self.ROW, name="alpha")]))
+        ok, _, _, _u = km._union_ops_merge([], [801], ckey="ws:c")
+        self.assertTrue(ok)
+        self.assertTrue(km._union_ops_set([dict(self.ROW, host="TESTHOST-B", name="beta")]))
+        real = km._atomic_write
+        def failing(path, data):
+            if str(path).endswith("union-tombs.names.json"):
+                raise OSError(28, "ENOSPC")
+            return real(path, data)
+        km._atomic_write = failing
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                ok, _, reason, _u = km._union_ops_merge([], [801], ckey="ws:b")
+        finally:
+            km._atomic_write = real
+        self.assertFalse(ok, "a names-file failure REFUSES the retirement")
+        self.assertIn("tombstone", reason or "")
+        # …and a names file for ANOTHER ledger generation is discarded (wildcards), never
+        # trusted as this ledger's names
+        (km.jd.STATE / "union-tombs.names.json").write_text(json.dumps(
+            {"gen": "0" * 64, "names": {"801": ["gamma"]}}))
+        km._union_retired_tombs.clear(); km._union_tomb_names.clear()
+        km._union_tombs_loaded[0] = False
+        with contextlib.redirect_stderr(io.StringIO()):
+            with km.jd._identity_file_lock():
+                km._union_tombs_load_locked()
+        self.assertIn(801, km._union_retired_tombs)
+        self.assertFalse(km._union_tomb_names.get(801), "mismatched names are not folded")
+
+    def test_b_row_identity_includes_the_operation(self):
+        # r64 P1.2, executed both ways: a same-gid/same-name foreign writer's DIFFERENT edit
+        # overwrote the durable row; a claimed completion turned a color op into a deletion
+        self.assertTrue(km._union_ops_set([dict(self.ROW)]))
+        km._union_claims_release("ws:x")
+        other = dict(self.ROW, edit={"delete": True}, inverse={})
+        ok, unclaimed, _, _u = km._union_ops_merge([other], [], ckey="ws:foreign")
+        self.assertTrue(ok)
+        self.assertIn(801, unclaimed)
+        self.assertEqual(km._union_ops_load()[0]["edit"], {"add": ["s1"]},
+                         "the durable operation was never overwritten")
+        ep = km._union_claim_grant(801, "ws:x")
+        ok, _, reason, _u = km._union_ops_merge(
+            [dict(self.SUCC, edit={"delete": True})], [801], ckey="ws:x",
+            rekey={"ogid": 801, "gid": 802, "epoch": ep})
+        self.assertFalse(ok, "a completion cannot change the operation")
+        self.assertIn("identity", reason or "")
+
+    def test_c_a_month_long_backward_clock_step_lowers_no_safety_stamp(self):
+        # r64 P1.3: a 30-day rollback made stamps look "future"; the day-threshold clamp
+        # lowered them durably and the corrected clock expired the shields early
+        now = time.time()
+        (km.jd.STATE / "union-tombs.json").write_text(json.dumps({"11": now + 30 * 86400}))
+        with km.jd._identity_file_lock():
+            km._union_tombs_load_locked()
+        d = json.loads((km.jd.STATE / "union-tombs.json").read_text())
+        self.assertAlmostEqual(d["11"], now + 30 * 86400, delta=5,
+                               msg="a month of apparent skew is left alone")
+        self.assertAlmostEqual(km._union_retired_tombs[11], now + 30 * 86400, delta=5)
+        sid = "66666666-7777-8888-9999-000000000005"
+        out = km.jd.canonicalize_retry_suppressed_identity({sid: now + 30 * 86400})
+        self.assertAlmostEqual(out[sid], now + 30 * 86400, delta=5,
+                               msg="suppression floors are not lowered either")
+        p = km.jd.STATE / "union-gestures.json"
+        p.write_text(json.dumps([{"refusal": True, "gid": -9, "name": "pool", "error": "x",
+                                  "host": "TESTHOST-A", "t": int(now + 30 * 86400)}]))
+        rows = km._union_ops_echo()
+        self.assertEqual(rows[0]["t"], int(now + 30 * 86400), "nor refusal stamps")
+
+    def test_d_conflicting_duplicates_judge_the_store_exact_ones_ratchet(self):
+        # r64 P1.4: "last wins" kept dispatched:false over an executed dispatched:true
+        (km.jd.STATE / "union-gestures.json").write_text(json.dumps(
+            [dict(self.ROW, dispatched=True), dict(self.ROW, dispatched=False)]))
+        rows = km._union_ops_echo()
+        self.assertEqual(len(rows), 1)
+        self.assertIs(rows[0]["dispatched"], True, "the monotonic flag RATCHETS")
+        self.assertIsNone(km._union_claim_grant(801, "ws:x"), "nothing to complete")
+        # conflicting operation bytes: the store is judged, never silently resolved
+        km._union_claims.clear()
+        (km.jd.STATE / "union-gestures.json").write_text(json.dumps(
+            [dict(self.ROW), dict(self.ROW, edit={"delete": True})]))
+        with contextlib.redirect_stderr(io.StringIO()):
+            rows = km._union_ops_echo()
+        self.assertIsNone(rows, "conflicting duplicates hold the store unproved")
+
+    def test_e_the_suppression_handoff_is_linearized(self):
+        # r64 P2.11: pending was popped while the cache still served the old map
+        sid = "66666666-7777-8888-9999-000000000006"
+        p = km.jd.STATE / "retry-suppressed.json"
+        p.write_text(json.dumps({}))
+        km._retry_suppress_data()                   # warm the cache with the EMPTY map
+        km._suppress_session_retry(sid)
+        self.assertIn(sid, km._retry_suppress_data(),
+                      "immediately after arming, membership is TRUE (no stale-cache window)")

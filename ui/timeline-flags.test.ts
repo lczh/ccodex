@@ -2367,3 +2367,17 @@ test("r63: a PLAIN sync's unclaimed list makes the mirror yield those gestures",
   assert.equal((panel._unionOps || []).length, 0,
     "a gesture the kernel DROPPED (collider/stray/tombed) leaves this panel's mirror (r63 P1.1)");
 });
+
+
+test("r64: the POST projection forwards the kernel's dropped verdict; _mintedNames never leaks", () => {
+  const SRC2 = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "romp-timeline-view.js"), "utf8");
+  assert.ok(SRC2.indexOf("dropped: (r.json && r.json.dropped) || []") > 0,
+    "the Electron/Obsidian POST ack carries `dropped` (r64 P2.10)");
+  const panel = drawnPanel();
+  panel._mintedGids = new Set([1, 2, 3]);
+  panel._mintedNames = new Map([[1, "a"], [2, "b"], [3, "c"]]);
+  panel._unionOps = [];
+  panel._yieldUnionGids([1, 2, 3]);
+  assert.equal(panel._mintedGids.size, 0);
+  assert.equal(panel._mintedNames.size, 0, "names leave with their gids (r64 P3.15)");
+});

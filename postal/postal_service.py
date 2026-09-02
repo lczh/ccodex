@@ -3101,7 +3101,9 @@ def _mkdirs_durable(path):
 
     def _gen_full(dp):
         try:
-            _st = dp.stat()
+            _st = os.stat(str(dp), follow_symlinks=False)   # never through a symlink (r64
+            if not stat.S_ISDIR(_st.st_mode):                 # P2.13): a planted link is
+                return None                                   # not a proved directory
             return (_st.st_dev, _st.st_ino, _st.st_ctime_ns)   # the within-call compare
             #   needs ctime too: an rmtree + mkdir can REUSE the inode number (r63)
         except OSError:
@@ -3109,7 +3111,9 @@ def _mkdirs_durable(path):
 
     def _gen(dp):
         try:
-            _st = dp.stat()
+            _st = os.stat(str(dp), follow_symlinks=False)
+            if not stat.S_ISDIR(_st.st_mode):
+                return None
             return (_st.st_dev, _st.st_ino)
             # (dev, ino) — NOT ctime: a directory's ctime moves on every child create or
             # unlink, so a ctime memo invalidated STATE/MAILROOT on every delivery and put
@@ -3135,9 +3139,31 @@ def _mkdirs_durable(path):
         #                                  level up); its parent is fsync'd below
         q = q.parent
     if not chain:
-        if not p.exists():               # an out-of-tree caller still gets its mkdir
-            p.mkdir(parents=True, exist_ok=True)
-        return
+        if _gen(p) is not None:
+            return                       # proved and standing
+        # the memo said proved but the directory is GONE (deleted after the compare —
+        # r64 P2.13: mkdir here recreated it with zero fsyncs); forget the memo for the
+        # whole in-tree path and prove it again
+        q = p
+        while str(q) == str(root) or str(q).startswith(str(root) + os.sep):
+            _proved_dirs.pop(str(q), None)
+            if str(q) == str(root):
+                break
+            q = q.parent
+        if not (str(p) == str(root) or str(p).startswith(str(root) + os.sep)):
+            p.mkdir(parents=True, exist_ok=True)   # out-of-tree: plain mkdir
+            return
+        return _mkdirs_durable(path)     # one re-walk with the memo cleared
+    for d in chain:
+        try:
+            _lst = os.lstat(str(d))
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(_lst.st_mode):
+            # a SYMLINK (or file) where a state directory belongs is refused before any
+            # mkdir can follow it elsewhere (r64 P2.13: mkdir -p followed the link and the
+            # "proof" fsync'd a directory outside the state tree)
+            raise NotADirectoryError(errno.ENOTDIR, "not a real directory (symlink?)", str(d))
     p.mkdir(parents=True, exist_ok=True)
     _before = {str(d): _gen_full(d) for d in chain}   # what we are about to prove (r63
     #   P1.6: a directory replaced between the fsync and a later stat had its
@@ -3152,22 +3178,53 @@ def _mkdirs_durable(path):
             _proved_dirs.pop(str(d), None)   # vanished or replaced mid-proof: unproven
 
 
+_json_store_lock = threading.RLock()   # EVERY json-record publisher and the quarantine
+#   mover share it (r64 P1.9: the mover's stat-then-unlink of the source could not be closed
+#   by more pathname checks — a valid replacement published between them was unlinked;
+#   only shared serialization closes it). RLock: a publisher may already hold it.
+
+
+class _NotRegular(OSError):
+    """A record path that is not a regular file (FIFO, device, symlink) — kept, never read."""
+
+
+def _read_record_text(path):
+    """Read one record file WITHOUT blocking on a planted FIFO and WITHOUT following a
+    symlink (r64 P2.12: a FIFO at a record path parked every scanner forever). Raises
+    _NotRegular (an OSError) for special files, OSError on faults, UnicodeDecodeError on
+    undecodable bytes."""
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise _NotRegular(errno.EINVAL, "not a regular file", str(path))
+        chunks = []
+        while True:
+            b = os.read(fd, 1 << 16)
+            if not b:
+                break
+            chunks.append(b)
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8")
+
+
 def _atomic_text_put(path, text):
     """Durably publish text with a unique same-directory temporary and atomic replace."""
     tmp = path.with_name(".%s.%d.%d.%016x.tmp" %
                          (path.name, os.getpid(), threading.get_ident(), random.getrandbits(64)))
-    try:
-        with tmp.open("x") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-        _fsync_dir(path.parent)
-    finally:
+    with _json_store_lock:
         try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
+            with tmp.open("x") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            _fsync_dir(path.parent)
+        finally:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _peer_seen_compact_locked():
@@ -3198,12 +3255,18 @@ def _quarantine_corrupt_json(path, store, error, fingerprint=None):
     is quarantined DURABLY (r63 P2.11: a swallowed post-move fsync failure left the caller
     believing the judged bytes were safe)."""
     try:
+      with _json_store_lock:               # publishers and the mover serialize (r64 P1.9)
         try:
-            _qfd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+            _qfd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:
             return False                             # consumed/replaced concurrently
         try:
             _qst = os.fstat(_qfd)
+            if not stat.S_ISREG(_qst.st_mode):
+                # a FIFO/device planted at a record path blocks nothing here (O_NONBLOCK)
+                # and is never "quarantined" by moving a special file around (r64 P2.12)
+                _log("%s: %s is not a regular file — left in place, refused" % (store, path))
+                return False
             if fingerprint is not None and ((_qst.st_dev, _qst.st_ino, _qst.st_size,
                                              _qst.st_mtime_ns) != fingerprint):
                 return False                         # a concurrent atomic writer replaced it
@@ -3249,8 +3312,17 @@ def _quarantine_corrupt_json(path, store, error, fingerprint=None):
                     pass
         finally:
             os.close(_qfd)
-        _fsync_dir(dst_dir)                  # the NEW link first (r62 wave 2), then the
-        _fsync_dir(path.parent)              # source removal
+        try:
+            _fsync_dir(dst_dir)              # the NEW link first (r62 wave 2), then the
+            _fsync_dir(path.parent)          # source removal
+        except OSError as e:
+            # the record MOVED but its new link is unproved (r64 P2.12: the caller's
+            # one-call hold expired and the next read saw the missing source as an
+            # authoritative {} and overwrote the ledger) — remember it until an fsync
+            # retry proves it
+            _quarantine_unproved[str(path)] = dst_dir
+            _log("%s: %s moved to %s but the move is UNPROVED: %s" % (store, path, dst, e))
+            return False
         _log("%s: quarantined unreadable durable record %s -> %s (%s)" %
              (store, path, dst, str(error)[:160]))
         return True
@@ -3260,6 +3332,23 @@ def _quarantine_corrupt_json(path, store, error, fingerprint=None):
         _log("%s: unreadable durable record %s could not be quarantined DURABLY: %s"
              % (store, path, e))
         return False
+
+
+_quarantine_unproved = {}   # str(source path) -> dst_dir whose post-move fsync failed (r64)
+
+
+def _quarantine_reprove(path):
+    """True when no unproved quarantine stands for `path` (retrying its fsync first)."""
+    _dd = _quarantine_unproved.get(str(path))
+    if _dd is None:
+        return True
+    try:
+        _fsync_dir(_dd)
+        _fsync_dir(Path(path).parent)
+    except OSError:
+        return False
+    _quarantine_unproved.pop(str(path), None)
+    return True
 
 def outbox_put(host, msg):
     """Park one cross-host message for `host` and poke its exchange (long-poll release + dialer).
@@ -3719,9 +3808,15 @@ def _pending_bounce_park(host, mid, code):
             # inherit its never-flushed quarantine (r61 wave 2, executed both ways: the
             # overwrite erased the forensic row, and the stale quarantine mark then
             # blocked the real bounce from ever settling until a restart)
-            _aside = _k + "|quarantined-" + os.urandom(4).hex()   # a SECOND pipe: no
+            _aside = _k + "|quarantined-" + os.urandom(8).hex()   # a SECOND pipe: no
             #   valid host|mid key carries one (r63 P2.10: ".quarantined-" was a legal
             #   mid substring, so a host like node.quarantined-test never flushed)
+            _n = 0
+            while _aside in _pending_bounces:                     # never overwrite an
+                _n += 1                                           # earlier forensic row
+                _aside = "%s|quarantined-%s-%d" % (_k, os.urandom(8).hex(), _n)
+            #   (r64 P3.16: 32 random bits and an unconditional assignment replaced one;
+            #   the attempt counter keeps even a degenerate RNG from spinning)
             _pending_bounces[_aside] = _pending_bounces.pop(_k, None)
             _pending_bounces_quarantined.discard(_k)
             _pending_bounces_quarantined.add(_aside)
@@ -3851,6 +3946,8 @@ def _receipts_done_judged(e, fp, for_write):
 
 
 def _receipts_done(_for_write=False):
+    if _for_write and not _quarantine_reprove(RECEIPTS_DONE):
+        raise _OutboxUnreadable("receipts-done: a prior quarantine move is unproved")   # r64
     try:
         _st = RECEIPTS_DONE.stat()
         _fp = (_st.st_dev, _st.st_ino, _st.st_size, _st.st_mtime_ns)
@@ -3916,6 +4013,25 @@ def _receipt_park_name(mid, origin=""):
     #                                      replaced a standing park at 62k candidates)
 
 
+_readbox_lock = threading.Lock()       # readbox put/del serialize (r64 P1.7)
+
+
+def _mark_multi_origin(d, mid, origin):
+    """A DURABLE ambiguity record (r64 P1.6): when a second origin parks the same mid under
+    one peer host, the bare/legacy spelling of that mid can never again be settled by an
+    ORIGINLESS ack — the decision must not depend on how many files happen to exist at ack
+    time (a delayed duplicate deleted origin B after origin A's park had settled)."""
+    try:
+        others = [f for f in (_park_siblings(d, mid, mid + ".json") or [])
+                  if f.name != _receipt_park_name(mid, origin)]
+        if (d / (mid + ".json")).exists() and origin:
+            others.append(d / (mid + ".json"))
+        if others and not (d / (mid + ".multi")).exists():
+            _atomic_text_put(d / (mid + ".multi"), "1")
+    except OSError as e:
+        _log("multi-origin marker for %s could not be written: %s" % (mid, e))
+
+
 def _park_siblings(d, mid, bare_name):
     """Other parks for the same mid beside the bare spelling — EXACTLY the scoped (16-hex)
     and v58 (8-hex) spellings (r63 P2.12: a glob on mid.*.json made an unrelated dotted
@@ -3923,9 +4039,21 @@ def _park_siblings(d, mid, bare_name):
     is not empty (r63 P1.3: an EIO read as "no siblings" and the deletion proceeded)."""
     _pat = re.compile(re.escape(mid) + r"\.(?:[0-9a-f]{16}|[0-9a-f]{8})\.json$")
     try:
-        return [f for f in d.iterdir() if f.name != bare_name and _pat.match(f.name)]
+        _cands = [f for f in d.iterdir() if f.name != bare_name and _pat.match(f.name)]
     except OSError:
         return None
+    out = []
+    for f in _cands:
+        # the filename shape is NOT identity (r64 P1.5: a legal bare mid "abc.deadbeef"
+        # wore the scoped spelling of "abc" and was deleted for it) — the record's own
+        # mid decides; an unreadable candidate is UNKNOWN, never absent
+        try:
+            _rec = json.loads(_read_record_text(f))
+        except (OSError, ValueError):
+            return None
+        if isinstance(_rec, dict) and _rec.get("mid") == mid:
+            out.append(f)
+    return out
 
 
 def _receipt_park_name_v58(mid, origin=""):
@@ -3955,6 +4083,7 @@ def receiptbox_put(host, mid, origin="", dmid=""):
     if origin:
         row["origin"] = origin
     _fname = _receipt_park_name(mid, origin)
+    _mark_multi_origin(d, mid, origin)
     _atomic_json_put(d / _fname, row)
     _peer_wake(host).set()
 
@@ -3970,7 +4099,7 @@ def receiptbox_list(host, limit=None):
             try:
                 st = f.stat()
                 fingerprint = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
-                raw = f.read_bytes().decode("utf-8")
+                raw = _read_record_text(f)           # non-blocking, regular files only (r64)
             except OSError:
                 # a TRANSIENT fault is not corruption (the r55 audit's P2.17, executed:
                 # one injected EIO moved a VALID receipt into corrupt/ and its completion
@@ -3982,9 +4111,12 @@ def receiptbox_list(host, limit=None):
                 continue
             try:
                 row = json.loads(raw)
-                _rmid = str(row.get("mid") or "") if isinstance(row, dict) else ""
-                _rorig = str(row.get("origin") or "") if isinstance(row, dict) else ""
+                _rmid = row.get("mid") if isinstance(row, dict) else None
+                _rmid = _rmid if isinstance(_rmid, str) else ""    # never str(123) (r64 P1.8)
+                _rorig = row.get("origin", "") if isinstance(row, dict) else ""
+                _rorig = _rorig if isinstance(_rorig, str) else None
                 _bound = (isinstance(row, dict) and _safe_id(_rmid)
+                          and _rorig is not None
                           and (not _rorig or _safe_id(_rorig))
                           # filename binding accepts the row's OWN two spellings (r58
                           # wave 2: parks are origin-scoped now; legacy bare-mid files
@@ -4018,6 +4150,10 @@ def receiptbox_del(host, mid, origin=""):
         _f = RECEIPTBOX / host / _receipt_park_name_v58(mid, origin)
     if origin and not _f.exists():
         _f = RECEIPTBOX / host / (mid + ".json")
+    if not origin and (_f.parent / (mid + ".multi")).exists():
+        _log("receiptbox_del %s/%s: originless ack over a multi-origin mid — kept (r64 P1.6)"
+             % (host, mid))
+        return
     if not origin and not _f.exists():
         # an ORIGINLESS ack with no bare park: a legacy peer clearing a park the modern
         # side parked SCOPED — clear exactly ONE sibling, never an ambiguous set (r63 P2.12)
@@ -4167,10 +4303,15 @@ def readbox_put(host, rec):
     d = READBOX / host
     _mkdirs_durable(d)                   # the first park's dir links durably (r60 P1.6)
     _origin = str((rec or {}).get("origin") or "")
-    _atomic_json_put(d / _receipt_park_name(mid, _origin if _safe_id(_origin) else ""),
-                     rec)                # origin-scoped (r59 P1.8: two origins through one
-    #                                      hub overwrote one bare-mid park — one read
-    #                                      receipt permanently lost)
+    _origin = _origin if _safe_id(_origin) else ""
+    with _readbox_lock:                  # put and del serialize (r64 P1.7: a stale read
+        #                                  ack's read/compare/unlink raced a retraction's
+        #                                  publish and deleted the newer unread:true park)
+        _mark_multi_origin(d, mid, _origin)
+        _atomic_json_put(d / _receipt_park_name(mid, _origin),
+                         rec)            # origin-scoped (r59 P1.8: two origins through one
+        #                                  hub overwrote one bare-mid park — one read
+        #                                  receipt permanently lost)
     _peer_wake(host).set()
 
 def readbox_list(host, limit=None, byte_limit=None):
@@ -4186,7 +4327,7 @@ def readbox_list(host, limit=None, byte_limit=None):
             try:
                 st = f.stat()
                 fingerprint = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
-                raw = f.read_bytes().decode("utf-8")
+                raw = _read_record_text(f)           # non-blocking, regular files only (r64)
             except OSError:
                 _log("readbox: %s unreadable this pass — kept (transient faults never "
                      "quarantine, r55 P2.17)" % f.name)
@@ -4197,9 +4338,13 @@ def readbox_list(host, limit=None, byte_limit=None):
             try:
                 row = json.loads(raw)
                 _rmid0 = row.get("mid") if isinstance(row, dict) else None
-                _rorig0 = (str(row.get("origin") or "") if isinstance(row, dict) else "")
+                _rorig0 = row.get("origin", "") if isinstance(row, dict) else ""
+                _rorig0 = _rorig0 if isinstance(_rorig0, str) else None   # null/junk: invalid
                 if not (isinstance(row, dict) and isinstance(_rmid0, str)
                         and _safe_id(_rmid0)
+                        and _rorig0 is not None      # the DISK schema is the WIRE schema
+                        #                              (r64 P1.8: origin:null files consumed
+                        #                              the listing budget and hid a valid record)
                         and (not _rorig0 or _safe_id(_rorig0))
                         # both spellings (r59 P1.8); isinstance str kills the numeric-mid
                         # coercion that consumed the budget (r59 P2.10)
@@ -4241,31 +4386,34 @@ def readbox_del(host, rec):
         f = READBOX / host / _receipt_park_name_v58(mid, _origin)   # the v1.3.31 spelling
     if not f.exists():
         f = READBOX / host / (mid + ".json")         # the pre-r59 bare spelling
+    if not _origin and (f.parent / (mid + ".multi")).exists():
+        return                                       # multi-origin mid (r64 P1.6)
     if not _origin and not f.exists():
         _sib = _park_siblings(f.parent, mid, mid + ".json")   # (r63 P2.12: one scoped
         if _sib is None or len(_sib) != 1:                     #  sibling, or nothing)
             return
         f = _sib[0]
-    try:
-        cur = json.loads(f.read_text())
-        _sibs = _park_siblings(f.parent, mid, f.name) if f.name == mid + ".json" else []
-        if (f.name == mid + ".json" and isinstance(cur, dict)
-                and _origin and not cur.get("origin")):
-            return                                   # scoped ack, origin-less park (r63 P1.3)
-        if (f.name == mid + ".json" and isinstance(cur, dict)
-                and str(cur.get("origin") or "") not in ("", _origin)
-                and (_origin or _sibs is None or _sibs)):
-            # (r62 P1.5: originless acks are content-bound when a same-mid sibling
-            # makes the bare park ambiguous; r62 wave 2: a LONE one is a legacy peer
-            # clearing its own pre-scoping park — refusing it stranded the park)
-            # the bare legacy park belongs to a DIFFERENT origin (r60 P1.5): an
-            # origin-A ack must never delete origin B's receipt; a park with no
-            # recorded origin predates scoping and stays deletable
-            return
-        if bool(cur.get("unread")) == bool((rec or {}).get("unread")):
-            f.unlink()
-    except Exception:
-        pass
+    with _readbox_lock:                              # read/compare/unlink is ONE step (r64 P1.7)
+        try:
+            cur = json.loads(f.read_text())
+            _sibs = _park_siblings(f.parent, mid, f.name) if f.name == mid + ".json" else []
+            if (f.name == mid + ".json" and isinstance(cur, dict)
+                    and _origin and not cur.get("origin")):
+                return                               # scoped ack, origin-less park (r63 P1.3)
+            if (f.name == mid + ".json" and isinstance(cur, dict)
+                    and str(cur.get("origin") or "") not in ("", _origin)
+                    and (_origin or _sibs is None or _sibs)):
+                # (r62 P1.5: originless acks are content-bound when a same-mid sibling
+                # makes the bare park ambiguous; r62 wave 2: a LONE one is a legacy peer
+                # clearing its own pre-scoping park — refusing it stranded the park)
+                # the bare legacy park belongs to a DIFFERENT origin (r60 P1.5): an
+                # origin-A ack must never delete origin B's receipt; a park with no
+                # recorded origin predates scoping and stays deletable
+                return
+            if bool(cur.get("unread")) == bool((rec or {}).get("unread")):
+                f.unlink()
+        except Exception:
+            pass
 
 def _peer_ack_ids(value):
     """Accept only bounded path-safe ack ids from an exchange list. Validation happens
@@ -4362,15 +4510,19 @@ def _peer_read_rows(value):
             if not isinstance(origin, str) or not _safe_id(origin):
                 continue
             clean["origin"] = origin
-        dmid = row.get("dmid")
-        if dmid:
+        if "dmid" in row:
+            dmid = row.get("dmid")
             if not isinstance(dmid, str) or not _safe_id(dmid):
-                continue
+                continue                             # a PRESENT dmid must be valid (r64
+                #                                      P2.14: a falsey one was silently
+                #                                      dropped and acked — correlation lost)
             clean["dmid"] = dmid
-        try:
-            clean["t"] = max(0, int(row.get("t") or 0))
-        except (TypeError, ValueError, OverflowError):
-            clean["t"] = 0
+        _t = row.get("t", 0)
+        if (isinstance(_t, bool) or not isinstance(_t, (int, float)) or _t != _t
+                or _t < 0 or _t > time.time() + 365 * 86400):
+            continue                                 # a LITERAL bounded number (r64 P2.14:
+            #                                          strings/fractions/objects coerced)
+        clean["t"] = int(_t)
         if "unread" in row and not isinstance(row.get("unread"), bool):
             continue                                 # unread:"false" is not True (r63 P1.4)
         if row.get("unread") is True:

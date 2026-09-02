@@ -5211,7 +5211,9 @@ def canonicalize_retry_suppressed_identity(blob):
         return blob
     out = {}
     _now = time.time()
-    _horizon = _now + 86400
+    _horizon = _now + 365 * 86400   # a YEAR (r64 P1.3: a day-threshold clamp lowered
+    #   legitimate floors after a 30-day backward clock step, and the corrected clock
+    #   then read a message that PRECEDED the interrupt as newer — suppression cleared)
     for key, value in blob.items():
         mapped = canonicalize_session_identity(key) if isinstance(key, str) else key
         previous = out.get(mapped)
@@ -5230,7 +5232,11 @@ def canonicalize_retry_suppressed_identity(blob):
                 out[mapped] = value
             else:
                 out[mapped] = max(previous, value)
-        # anything else — NaN, inf, string, dict — is dropped: never a floor
+        else:
+            # anything else — NaN, inf, string, dict — is dropped: never a floor, and
+            # LOUDLY (r64 P2.11: a silent drop is a fail-open nobody can see)
+            sys.stderr.write("retry-suppressed: dropping a non-numeric floor for %r "
+                             "(%r)\n" % (mapped, type(value).__name__))
     return out
 
 
