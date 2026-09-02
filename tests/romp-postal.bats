@@ -44,7 +44,10 @@ setup() {
     # (a 2026-08-17 CI runner hit exactly this: pid dead at setup, green on rerun).
     local up=0 attempt _
     for attempt in 1 2; do
-        "$POSTAL" serve >/dev/null 2>&1 &
+        # the bus's stderr is KEPT (r63 release gate: three setups died twice on one runner
+        # with alive=no and nothing to read — an EADDRINUSE on an ephemeral-range port, or
+        # a boot crash, look identical with stderr discarded)
+        "$POSTAL" serve >/dev/null 2>"$TEST_DIR/bus-$attempt.err" &
         BUS_PID=$!
         for _ in $(seq 1 100); do
             curl -s "127.0.0.1:$ROMP_POSTAL_PORT/ping" >/dev/null 2>&1 && { up=1; break; }
@@ -58,6 +61,9 @@ setup() {
     if [ "$up" != 1 ]; then
         local alive=no; kill -0 "$BUS_PID" 2>/dev/null && alive=yes
         echo "# setup: postal bus never came up on 127.0.0.1:$ROMP_POSTAL_PORT (pid $BUS_PID, alive=$alive)" >&2
+        for attempt in 1 2; do
+            [ -s "$TEST_DIR/bus-$attempt.err" ] && { echo "# bus stderr (attempt $attempt):" >&2; sed 's/^/#   /' "$TEST_DIR/bus-$attempt.err" | tail -12 >&2; }
+        done
         return 1
     fi
 }
