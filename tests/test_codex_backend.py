@@ -541,7 +541,10 @@ class Lifecycle(unittest.TestCase):
             be._client_retry_at = 0.0                  # the explicit release, not a timer race
         for _, s in be._session_items():
             s.kick.set()
-        self.assertTrue(until(lambda: len(attempts) >= 2 and not be.busy(sid), timeout=3))
+        # a GENEROUS bound: the recovery is event-shaped (the explicit release above is
+        # the event), so only "eventually" matters — the 3s bound starved the worker
+        # thread on a runner at load 20+ (the r63 release gate: a 55-minute full suite)
+        self.assertTrue(until(lambda: len(attempts) >= 2 and not be.busy(sid), timeout=20))
         self.assertEqual(len(fake.called("thread_start")), 1,
                          "the pending placeholder must become a real Codex thread")
         self.assertFalse(be.pending_queued(sid))
