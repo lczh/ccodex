@@ -2231,14 +2231,23 @@ _union_retired_tombs = {}              # gid -> t, FIFO-capped; MIRRORED to
 #                                        completion CAS operations then succeeded)
 _UNION_TOMBS_MAX = 4096
 _union_tombs_loaded = [False]
-_union_tomb_names = {}                 # gid -> the retired gesture's tag NAME (r63 P1.1: gids
+_union_tomb_names = {}                 # gid -> SET of retired gesture tag NAMES (r63 P1.1: gids
 #                                        mint from independent per-panel seeds, so a bare-id
 #                                        tomb on a colliding rid/ogid dropped an UNRELATED
-#                                        live gesture); durable beside the stamp as {"t","n"}
+#                                        live gesture; r63 wave 2: a SET, because a second
+#                                        differently-named gesture retired on the same gid
+#                                        must never evict the first gesture's shield).
+#                                        Durable in union-tombs.names.json — a SIDE file, so
+#                                        the main ledger stays numeric and a v1.3.35 rollback
+#                                        loads it instead of judging it corrupt for 7 days.
 
 
 def _union_tombs_path():
     return jd.STATE / "union-tombs.json"
+
+
+def _union_tomb_names_path():
+    return jd.STATE / "union-tombs.names.json"
 
 
 def _union_tombs_hold_path():
@@ -2413,7 +2422,7 @@ def _union_tombs_load_locked():
                     if _tv >= _floor:
                         _union_retired_tombs.setdefault(int(k), _tv)
                         if isinstance(v, dict) and v.get("n"):
-                            _union_tomb_names.setdefault(int(k), v["n"])
+                            _union_tomb_names.setdefault(int(k), set()).add(v["n"])
                 except (TypeError, ValueError, OverflowError):
                     continue
             while len(_union_retired_tombs) > _UNION_TOMBS_MAX:
@@ -2422,6 +2431,22 @@ def _union_tombs_load_locked():
                               key=lambda k2: (_union_retired_tombs[k2], k2))
                 _union_retired_tombs.pop(_victim)
                 _union_tomb_names.pop(_victim, None)
+            try:
+                _nd = json.loads(_read_regular_text(_union_tomb_names_path()))
+                if isinstance(_nd, dict):
+                    for k, v in _nd.items():
+                        try:
+                            _kn = int(str(k))
+                        except (TypeError, ValueError):
+                            continue
+                        if _kn in _union_retired_tombs and isinstance(v, list):
+                            _union_tomb_names.setdefault(_kn, set()).update(
+                                x for x in v if isinstance(x, str) and x)
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError):
+                sys.stderr.write("union-tombs: names side file unreadable — shields read "
+                                 "as wildcards this pass\n")
             if _clamped:
                 _union_tombs_loaded[0] = True
                 _union_tombs_save_locked()   # the clamp is written once, not re-derived
@@ -2436,20 +2461,29 @@ def _union_tombs_save_locked():
     """Persist the tombstone map — caller holds the identity lock (and usually the claims
     lock; both writes are cheap). Best-effort with a loud log. NEVER writes while the
     durable copy is unfolded (r58 wave 2: one transient load fault followed by any retire
-    truncated the whole ledger to the in-memory map)."""
+    truncated the whole ledger to the in-memory map). The MAIN ledger stays numeric
+    (gid -> stamp) so a v1.3.35 rollback loads it; the names ride a SIDE file (r63 wave 2)."""
     if not _union_tombs_loaded[0]:
         sys.stderr.write("union-tombs: durable copy not yet folded in — holding the save "
                          "so a load fault can never truncate the ledger\n")
         return False
     try:
         _atomic_write(_union_tombs_path(),
-                      json.dumps({str(k): {"t": v, "n": _union_tomb_names.get(k, "")}
-                                  for k, v in _union_retired_tombs.items()}))
-        return True
+                      json.dumps({str(k): v for k, v in _union_retired_tombs.items()}))
     except Exception:
         sys.stderr.write("union-tombs: could not persist — retired-gesture shields are "
                          "process-local until the next successful save\n")
         return False
+    try:
+        _atomic_write(_union_tomb_names_path(),
+                      json.dumps({str(k): sorted(_union_tomb_names.get(k, set()))
+                                  for k in _union_retired_tombs}))
+    except Exception:
+        # advisory: a missing/failed names file reads every tomb as a NAMELESS wildcard —
+        # the conservative direction (it drops more, never less) until the next save
+        sys.stderr.write("union-tombs: the names side file could not persist — shields "
+                         "read as wildcards until the next save\n")
+    return True
 
 
 def _union_claim_stamp(gid, ckey):
@@ -2568,7 +2602,14 @@ def _quarantine_state_bytes(path, what, fingerprint=None, keep_source=False):
                 # link the VERIFIED INODE, not the pathname (the r57 audit's P1.2, executed
                 # there: a concurrent locked writer replaced the path between the fingerprint
                 # check and a pathname link, and the writer's VALID commit was quarantined)
-                os.link("/proc/self/fd/%d" % _qfd, str(qp), follow_symlinks=True)
+                _pdfd = os.open(str(qp.parent), os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.link("/proc/self/fd/%d" % _qfd, qp.name, dst_dir_fd=_pdfd,
+                            follow_symlinks=True)   # linkat(): a bare os.link() is link(2),
+                    #   which never follows the procfs magic link — EXDEV every time, so this
+                    #   arm was dead code since r57 (r63 wave 2)
+                finally:
+                    os.close(_pdfd)
             except FileExistsError:
                 continue                             # fresh name, try again
             except OSError:
@@ -2849,7 +2890,12 @@ def _union_store_read_locked(what="union-gestures"):
     _seen_keys = set()
     _dedup = []
     for r in reversed(rows):
-        if isinstance(r, dict) and not r.get("refusal") and r.get("gid") and r.get("host"):
+        if (isinstance(r, dict) and not r.get("refusal")
+                and isinstance(r.get("gid"), (int, str)) and r.get("gid")
+                and isinstance(r.get("host"), str) and r.get("host")):
+            # hashable SCALAR ids only (r63 wave 2: a list/dict gid raised TypeError out
+            # of the reader before the row judge could salvage the store — every read
+            # and merge crashed, no marker, no recovery event)
             _k2 = (r.get("gid"), r.get("host"))
             if _k2 in _seen_keys:
                 continue
@@ -3015,7 +3061,7 @@ def _union_ops_set(entries, retired=None):
     return ok
 
 
-def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
+def _union_ops_merge(entries, retired=None, ckey=None, rekey=None, _out=None):
     """Per-gid MERGE, never a whole replace (the r49 verification): each open timeline panel
     mirrors only ITS OWN in-flight list — a full replace last-writer-wins'd between panels, so
     any gesture in a second panel erased the first's journal and re-opened the audited reload
@@ -3335,9 +3381,12 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                          and r["t"] < _cutoff)]
         _resident = {r.get("gid") for r in cur if not r.get("refusal")}
         _names_by_gid = {}
+        _all_gids = set()
         for r in list(cur) + list(inc):
-            if isinstance(r, dict) and r.get("gid") and r.get("name"):
-                _names_by_gid.setdefault(r.get("gid"), r.get("name"))
+            if isinstance(r, dict) and r.get("gid"):
+                _all_gids.add(r.get("gid"))
+                if r.get("name"):
+                    _names_by_gid.setdefault(r.get("gid"), r.get("name"))
         with _union_claims_lock:
             _tombed = []
             for r in inc:
@@ -3375,8 +3424,8 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                     # the row's is another gesture's shield, not this one's
                     if x not in _union_retired_tombs:
                         return False
-                    _tn = _union_tomb_names.get(x, "")
-                    return (not _tn) or (not r.get("name")) or _tn == r.get("name")
+                    _tn = _union_tomb_names.get(x)
+                    return (not _tn) or (not r.get("name")) or (r.get("name") in _tn)
                 if (_tombed_id(r.get("gid"))
                         or _tombed_id(r.get("ogid") or 0)
                         or _tombed_id(r.get("rid") or 0)
@@ -3418,10 +3467,18 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                 #   (r60 P1.2, reproduced: the cap eviction survived an ENOSPC save — an
                 #   older shield left MEMORY while the durable copy kept it, and a same-
                 #   process replay of that retired gesture was accepted and claimable)
+                _nsnap = {k2: set(v2) for k2, v2 in _union_tomb_names.items()}   # r63 w2
                 for g in ret:
+                    if g not in _all_gids:
+                        # a retirement naming a gid with NO rows anywhere retires nothing
+                        # and shields nothing (r63 wave 2: it minted a NAMELESS wildcard
+                        # tomb — the bare-id shield P1.1 removed, re-minted for 7 days —
+                        # and the twin emits such retirements routinely after a refused
+                        # write leaves a never-stored gid in its ledger)
+                        continue
                     _union_retired_tombs[g] = time.time()
                     if _names_by_gid.get(g):
-                        _union_tomb_names[g] = _names_by_gid[g]
+                        _union_tomb_names.setdefault(g, set()).add(_names_by_gid[g])
                 while len(_union_retired_tombs) > _UNION_TOMBS_MAX:
                     # evict the OLDEST STAMP, never insertion order (r61 P1.5, executed:
                     # a refreshed gid kept its old dict position and next(iter(...))
@@ -3433,6 +3490,8 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
                 if not _union_tombs_save_locked():
                     _union_retired_tombs.clear()
                     _union_retired_tombs.update(_tsnap)
+                    _union_tomb_names.clear()
+                    _union_tomb_names.update(_nsnap)   # names roll back WITH the stamps
                     return False, [], "the retirement's tombstone could not be persisted " \
                                       "— retry", []
         try:
@@ -3460,6 +3519,12 @@ def _union_ops_merge(entries, retired=None, ckey=None, rekey=None):
             if g not in unclaimed:
                 unclaimed.append(g)              # tombstoned / stray / colliding: the
                 #                                  writing gate must yield (r62)
+        if _out is not None:
+            # the gids this write DROPPED, distinct from `unclaimed` (which also names
+            # rows merely held by another live client): a plain mirror sync yields only
+            # these (r63 wave 2 — yielding on `unclaimed` removed an adopted mirror that
+            # was the only in-process retirer once the claim holder died)
+            _out["dropped"] = sorted({g for g in _tombed + _stray + _collide})
         return True, unclaimed, None, _unretired
 
 
@@ -34846,13 +34911,17 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(400, json.dumps({"ok": False,
                                                        "error": "entries must be a JSON list"}),
                                       "application/json")
+                _uextra = {}
                 ok, _ucl, _ureason, _unret = _union_ops_merge(
                     b["entries"], b.get("retired"),
                     ckey=("cid:" + str(b["cid"])[:64]) if b.get("cid") else None,
-                    rekey=b.get("rekey") if isinstance(b.get("rekey"), dict) else None)
+                    rekey=b.get("rekey") if isinstance(b.get("rekey"), dict) else None,
+                    _out=_uextra)
                 _uans = {"ok": ok}
                 if _ucl:
                     _uans["unclaimed"] = _ucl         # a completer owns these (r54 P1.3)
+                if _uextra.get("dropped"):
+                    _uans["dropped"] = _uextra["dropped"]   # rows this write DROPPED (r63 w2)
                 if _unret:
                     _uans["unretired"] = _unret       # skipped over a live claim (r57)
                 if not ok and _ureason:
@@ -35582,10 +35651,12 @@ class Handler(BaseHTTPRequestHandler):
             # panel mirrors its whole in-flight compensation list here on every change (small,
             # idempotent — a full replace, no per-op protocol to desync), and re-seeds from the
             # payload echo after a reload
+            _uextra = {}
             try:
                 _uok, _unclaimed, _ureason, _unret = _union_ops_merge(
                     msg["entries"], msg.get("retired"), ckey="ws:%d" % id(client),
-                    rekey=msg.get("rekey") if isinstance(msg.get("rekey"), dict) else None)
+                    rekey=msg.get("rekey") if isinstance(msg.get("rekey"), dict) else None,
+                    _out=_uextra)
             except Exception:
                 _uok, _unclaimed, _ureason, _unret = False, [], "internal error", []
                 sys.stderr.write("setUnionOps: %s\n" % traceback.format_exc())
@@ -35595,6 +35666,8 @@ class Handler(BaseHTTPRequestHandler):
                 _uans = {"type": "unionOpsAck", "ok": bool(_uok)}
                 if _unclaimed:
                     _uans["unclaimed"] = _unclaimed   # a completer owns these — the gate yields (r54)
+                if _uextra.get("dropped"):
+                    _uans["dropped"] = _uextra["dropped"]   # rows this write DROPPED (r63 w2)
                 if _unret:
                     _uans["unretired"] = _unret   # skipped over a live claim (r57 P2: the
                     #                               silent skip let the panel drop its ledger

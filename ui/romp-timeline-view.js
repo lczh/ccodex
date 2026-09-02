@@ -3317,11 +3317,14 @@ class TimelinePanel {
       this._unionSyncDirty = true;
     }
     for (const g of (p.tomb || [])) { if (this._retireUnionGids) this._retireUnionGids.delete(g); }
-    if (!gated && Array.isArray(m.unclaimed) && m.unclaimed.length) {
-      // a PLAIN mirror sync told to yield (r63 P1.1: the kernel named a colliding or
-      // stranger-claimed gesture unclaimed, and the ungated ack path ignored it — the
-      // mirror re-sent the rows on every later sync). Only rows this panel still holds.
-      const _mine = m.unclaimed.filter((g) => (this._unionOps || []).some((o) => o.gid === g));
+    if (!gated && Array.isArray(m.dropped) && m.dropped.length) {
+      // a PLAIN mirror sync told to yield (r63 P1.1: the kernel DROPPED a colliding,
+      // stray or tombed gesture from the write, and the ungated ack path ignored it —
+      // the mirror re-sent the rows on every later sync). `dropped` names ONLY those
+      // (r63 wave 2: `unclaimed` also names rows merely held by ANOTHER live client —
+      // yielding an adopted mirror on that removed the only in-process retirer when
+      // the claim holder died after dispatching). Only rows this panel still holds.
+      const _mine = m.dropped.filter((g) => (this._unionOps || []).some((o) => o.gid === g));
       if (_mine.length) this._yieldUnionGids(_mine);
     }
     if (gated) {

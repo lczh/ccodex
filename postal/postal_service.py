@@ -3213,7 +3213,17 @@ def _quarantine_corrupt_json(path, store, error, fingerprint=None):
             dst = dst_dir / ("%s.%d.%016x.corrupt" %
                              (path.name, int(time.time() * 1000), random.getrandbits(64)))
             try:
-                os.link("/proc/self/fd/%d" % _qfd, str(dst), follow_symlinks=True)
+                # linkat(AT_FDCWD, "/proc/self/fd/N", dst_dir_fd, name, AT_SYMLINK_FOLLOW):
+                # the dst_dir_fd form is what makes CPython issue linkat() — a bare
+                # os.link() is link(2), which never dereferences the procfs magic link
+                # and failed EXDEV on every call, so the inode-bound arm was dead code
+                # and the fallback ran instead (r63 wave 2, confirmed on this host)
+                _ddfd = os.open(str(dst_dir), os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.link("/proc/self/fd/%d" % _qfd, dst.name, dst_dir_fd=_ddfd,
+                            follow_symlinks=True)
+                finally:
+                    os.close(_ddfd)
             except OSError:
                 # no /proc (or no links): rename, then VERIFY the moved inode is the
                 # judged one; an innocent grab of a newer commit goes back exclusively

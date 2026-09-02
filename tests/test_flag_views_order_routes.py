@@ -3833,21 +3833,24 @@ class R61AuditFixes(unittest.TestCase):
             km._union_tombs_load_locked()
         now = time.time()
         with km._union_claims_lock:
-            km._union_retired_tombs.update({11: now - 30, 12: now - 20, 13: now - 10})
+            # INSERTION order 11, 12, 13 — STAMP order puts 12 oldest (r63 wave 2 rewrite:
+            # a retirement naming a row-less gid no longer "refreshes" a tomb, so the
+            # out-of-order stamps are seeded directly)
+            km._union_retired_tombs.update({11: now - 10, 12: now - 30, 13: now - 20})
             km._union_tombs_save_locked()
+        self.assertTrue(km._union_ops_set([dict(self.ROW, gid=14)]))
         real_max = km._UNION_TOMBS_MAX
         km._UNION_TOMBS_MAX = 3
         try:
-            ok, _, _, _u = km._union_ops_merge([], [11], ckey="ws:x")   # REFRESH 11
-            self.assertTrue(ok)
             ok, _, _, _u = km._union_ops_merge([], [14], ckey="ws:x")   # overflow
             self.assertTrue(ok)
         finally:
             km._UNION_TOMBS_MAX = real_max
         self.assertIn(11, km._union_retired_tombs,
-                      "the refreshed shield SURVIVES the cap")
+                      "the FIRST-inserted shield survives — insertion order is not the key")
         self.assertNotIn(12, km._union_retired_tombs,
                          "the oldest STAMP was the eviction")
+        self.assertIn(14, km._union_retired_tombs)
 
     def test_f_the_discriminator_is_a_literal_bool_and_op_objects_are_required(self):
         # r61 P1.6, executed: refusal:"false" (truthy string) validated as a refusal and
@@ -4291,7 +4294,10 @@ class R63AuditFixes(unittest.TestCase):
         ok, _, _, _u = km._union_ops_merge([], [900], ckey="ws:x")
         self.assertTrue(ok)
         d = json.loads((km.jd.STATE / "union-tombs.json").read_text())
-        self.assertEqual(d["900"]["n"], "other", "the tomb records the retired NAME")
+        self.assertIsInstance(d["900"], (int, float),
+                              "the MAIN ledger stays numeric (a v1.3.35 rollback loads it)")
+        nd = json.loads((km.jd.STATE / "union-tombs.names.json").read_text())
+        self.assertEqual(nd["900"], ["other"], "the side file records the retired NAME")
         # a colliding id for a DIFFERENT tag is not this shield's business
         ok, unclaimed, _, _u = km._union_ops_merge(
             [dict(self.ROW, gid=900, name="pool")], [], ckey="ws:y")
@@ -4324,8 +4330,8 @@ class R63AuditFixes(unittest.TestCase):
             with km.jd._identity_file_lock():
                 km._union_tombs_load_locked()
         d = json.loads((km.jd.STATE / "union-tombs.json").read_text())
-        self.assertLessEqual(d["11"]["t"], now + 5, "the clamp is PERSISTED")
-        self.assertAlmostEqual(d["12"]["t"], now + 3600, delta=5,
+        self.assertLessEqual(d["11"], now + 5, "the clamp is PERSISTED")
+        self.assertAlmostEqual(d["12"], now + 3600, delta=5,
                                msg="a within-skew stamp is untouched")
 
     def test_c_a_disconnected_writers_row_is_never_overwritten(self):
@@ -4368,8 +4374,122 @@ class R63AuditFixes(unittest.TestCase):
         far = time.time() + 100 * 365 * 86400
         out = km.jd.canonicalize_retry_suppressed_identity(
             {sid: "yesterday", "x": {"t": 1}, "y": far, "z": 100.0})
-        self.assertEqual(out, {"z": 100.0})
+        self.assertEqual(out["z"], 100.0)
+        self.assertNotIn(sid, out)
+        self.assertNotIn("x", out)
+        self.assertLessEqual(out["y"], time.time() + 5,
+                             "a future stamp CLAMPS to now — never dropped (r63 wave 2: "
+                             "dropping erased a user-armed suppression on a clock step)")
         p = km.jd.STATE / "retry-suppressed.json"
         p.write_text(json.dumps({sid: "yesterday"}))
         self.assertEqual(km._retry_suppress_data(), {},
                          "a stored string is never served as a floor")
+
+
+
+class R63Wave2(unittest.TestCase):
+    """the r63 verify round's confirmed second-order defects, kernel half: a second
+    same-gid gesture's retirement overwrote the first's tomb name; row-less retirements
+    minted nameless wildcard tombs; a failed save rolled stamps back without names; the
+    {"t","n"} ledger shape would have wedged a v1.3.35 rollback for 7 days; the read-side
+    dedupe hashed unhashable ids before the judge; the suppression canonicalizer dropped
+    future stamps that every writer then persisted away; and the plain-sync yield acted on
+    `unclaimed` (rows merely held by another live client) instead of `dropped`."""
+
+    ROW = {"host": "TESTHOST-A", "gid": 801, "edit": {}, "inverse": {}, "rt": {},
+           "name": "pool", "dispatched": False}
+
+    def setUp(self):
+        _scrub_state()
+        km._union_claims.clear()
+        km._union_retired_tombs.clear()
+        km._union_tomb_names.clear()
+        km._union_tombs_loaded[0] = False
+        for name in ("union-gestures.json", "union-gestures.json.unproved",
+                     "union-tombs.json", "union-tombs.json.hold", "union-tombs.names.json"):
+            try:
+                (km.jd.STATE / name).unlink()
+            except OSError:
+                pass
+        for f in km.jd.STATE.glob("*.corrupt-*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_a_a_later_same_gid_retirement_never_evicts_the_first_shield(self):
+        # the round's headline, reproduced there: B's retirement of (801, beta) flipped the
+        # tomb's name from alpha to beta, and A's dead-writer replay of (801, alpha) was
+        # accepted and claimable — the r55 P3.19 resurrection
+        self.assertTrue(km._union_ops_set([dict(self.ROW, name="alpha")]))
+        ok, _, _, _u = km._union_ops_merge([], [801], ckey="ws:c")
+        self.assertTrue(ok)
+        ok, _, _, _u = km._union_ops_merge(
+            [dict(self.ROW, host="TESTHOST-B", name="beta")], [], ckey="ws:b")
+        self.assertTrue(ok, "a differently-named same-gid gesture is admitted")
+        ok, _, _, _u = km._union_ops_merge([], [801], ckey="ws:b")
+        self.assertTrue(ok)
+        self.assertEqual(km._union_tomb_names[801], {"alpha", "beta"},
+                         "BOTH names shield")
+        ok, unclaimed, _, _u = km._union_ops_merge(
+            [dict(self.ROW, name="alpha")], [], ckey="ws:a2")
+        self.assertTrue(ok)
+        self.assertEqual(km._union_ops_load(), [], "alpha's replay is still dropped")
+        self.assertIn(801, unclaimed)
+
+    def test_b_a_row_less_retirement_mints_no_wildcard(self):
+        ok, _, _, _u = km._union_ops_merge([], [555], ckey="ws:x")
+        self.assertTrue(ok)
+        self.assertNotIn(555, km._union_retired_tombs,
+                         "nothing was retired — nothing is shielded (a nameless tomb "
+                         "would have dropped a neighbour's legitimate gesture)")
+        ok, unclaimed, _, _u = km._union_ops_merge(
+            [dict(self.ROW, gid=555)], [], ckey="ws:y")
+        self.assertTrue(ok)
+        self.assertEqual([r["gid"] for r in km._union_ops_load()], [555])
+        self.assertEqual(unclaimed, [])
+
+    def test_c_a_failed_save_rolls_names_back_with_the_stamps(self):
+        with km.jd._identity_file_lock():
+            km._union_tombs_load_locked()
+        with km._union_claims_lock:
+            km._union_retired_tombs.update({901: time.time() - 30, 902: time.time() - 20})
+            km._union_tomb_names.update({901: {"n901"}, 902: {"n902"}})
+            km._union_tombs_save_locked()
+        self.assertTrue(km._union_ops_set([dict(self.ROW, gid=903, name="n903")]))
+        real_max, real_write = km._UNION_TOMBS_MAX, km._atomic_write
+        def failing(path, data):
+            if str(path).endswith("union-tombs.json"):
+                raise OSError(28, "ENOSPC")
+            return real_write(path, data)
+        km._UNION_TOMBS_MAX = 2
+        km._atomic_write = failing
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                ok, _, _, _u = km._union_ops_merge([], [903], ckey="ws:x")
+        finally:
+            km._UNION_TOMBS_MAX, km._atomic_write = real_max, real_write
+        self.assertFalse(ok)
+        self.assertEqual(km._union_tomb_names.get(901), {"n901"},
+                         "the evicted-then-restored shield keeps its name")
+        self.assertNotIn(903, km._union_tomb_names, "no orphan name for the refused mint")
+
+    def test_d_an_unhashable_stored_id_is_judged_not_a_crash(self):
+        (km.jd.STATE / "union-gestures.json").write_text(json.dumps([
+            dict(self.ROW), dict(self.ROW, gid=[1, 2])]))
+        with contextlib.redirect_stderr(io.StringIO()):
+            rows = km._union_ops_echo()
+        self.assertIsNone(rows, "the store is judged and held — never a TypeError")
+        self.assertTrue(km._union_unproved_marker().exists())
+
+    def test_e_the_plain_ack_names_dropped_gids(self):
+        # r63 wave 2: the twin yields on `dropped` — the kernel must report it
+        self.assertTrue(km._union_ops_set([dict(self.ROW, gid=42, name="alpha")]))
+        _out = {}
+        ok, unclaimed, _, _u = km._union_ops_merge(
+            [dict(self.ROW, gid=42, name="beta")], [], ckey="ws:beta", _out=_out)
+        self.assertTrue(ok)
+        self.assertEqual(_out.get("dropped"), [42], "the collider is named DROPPED")

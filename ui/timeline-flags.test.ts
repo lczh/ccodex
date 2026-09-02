@@ -2359,6 +2359,11 @@ test("r63: a PLAIN sync's unclaimed list makes the mirror yield those gestures",
   panel._journaledGids.add(42);
   panel._pendingUnionSyncs = { "op-1": { entries: panel._unionOps.slice(), retired: [], tomb: [] } };
   panel.unionOpsAck({ ok: true, opId: "op-1", unclaimed: [42], unretired: [] });
+  assert.equal((panel._unionOps || []).length, 1,
+    "`unclaimed` alone (held by another LIVE client) does NOT yield an adopted mirror — "
+    + "it may be the only retirer left if that holder dies (r63 wave 2)");
+  panel._pendingUnionSyncs = { "op-2": { entries: panel._unionOps.slice(), retired: [], tomb: [] } };
+  panel.unionOpsAck({ ok: true, opId: "op-2", unclaimed: [42], dropped: [42], unretired: [] });
   assert.equal((panel._unionOps || []).length, 0,
-    "the colliding/stranger-claimed gesture left this panel's mirror (r63 P1.1)");
+    "a gesture the kernel DROPPED (collider/stray/tombed) leaves this panel's mirror (r63 P1.1)");
 });
