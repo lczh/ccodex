@@ -1300,7 +1300,8 @@ class CodexBackend:
                 s.turn_id = None
                 s.state = "waiting"
                 s.since = time.time()
-            self.push_session(s.sid)
+            self.poke()                    # the turn END is the kernel's cue (parked ops deliver on it): every
+            self.push_session(s.sid)       # in-loop poke above fired while turn_id was set, i.e. busy() True
         return True
 
     # ── chat tail ────────────────────────────────────────────────────────────────────────────────

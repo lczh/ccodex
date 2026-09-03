@@ -577,6 +577,19 @@ class Lifecycle(unittest.TestCase):
                          "the pending placeholder must become a real Codex thread")
         self.assertFalse(be.pending_queued(sid))
 
+    def test_turn_end_pokes_after_busy_clears(self):
+        # the kernel's parked-op drain wakes on the poke (2026-09-03): every in-loop poke fires while the
+        # turn is still open (turn_id set → busy() True), so the finally must poke once more AFTER it clears,
+        # or a parked op on a Codex session waits out the pusher's backstop instead of firing on the event
+        be, fake, _ = build()
+        sid = be.spawn("web", "/TESTDIR")
+        seen = []
+        real = be.poke
+        be.poke = lambda: (seen.append(be.busy(sid)), real())
+        self.assertTrue(be.send(sid, "one"))
+        self.assertTrue(until(lambda: not be.busy(sid)))
+        self.assertTrue(until(lambda: False in seen), "a poke observed the settled turn (busy() False)")
+
     def test_kill_interrupts_an_active_turn_and_worker_exits(self):
         be, fake, _ = build()
         fake.hold_open = True

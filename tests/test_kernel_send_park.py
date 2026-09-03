@@ -28,6 +28,11 @@ km = SourceFileLoader("romp_kernel_sendpark", os.path.join(BIN, "romp-kernel")).
 # limit. Pinning it off keeps them hermetic.
 km._limit_hold = lambda sid: None
 
+# The tmux PROMPT HOLD (_hold_drain: a tmux-shaped delivery holds the sid for a moment, tested in
+# tests/test_kernel_parked_ops_liveness.py) is a separate axis: off here, so back-to-back
+# _apply_pending_ops calls stand for successive cycles.
+km._TMUX_PROMPT_HOLD_S = 0.0
+
 SID = "11111111-2222-3333-4444-555555555555"
 
 
@@ -62,11 +67,13 @@ class OpQueueParkOrDeliver(unittest.TestCase):
         km._optimistic_echo = lambda sid, text, author="human": self.echoes.append((text, author))
         km._working_now = lambda sid: False            # explicit: each test picks the busy state
         km._pending_ops.clear()
+        km._refused_heads.clear()
 
     def tearDown(self):
         (km._compacting_now, km.Sessions.backend_for, km._push_all, km._optimistic_echo,
          km._working_now) = self._saved
         km._pending_ops.clear()
+        km._refused_heads.clear()
 
     def test_not_compacting_everything_applies_immediately(self):
         km._compacting_now = lambda sid: False
@@ -231,10 +238,16 @@ class OpQueueParkOrDeliver(unittest.TestCase):
         self.assertEqual(km._pending_ops.get(SID), [("send", "please retry me", "human")])
         self.assertEqual(self.echoes, [])
 
-    def test_producer_ticks_the_apply(self):
+    def test_the_pusher_cycle_delivers_the_parked_queue_not_the_producer(self):
+        # 2026-09-03: delivery moved OFF the judge producer's tail — a pass can run for hours (one session's
+        # closer sweep, alarm-killed turn after turn) and held every parked op hostage. It rides the pusher
+        # cycle now, woken by the settle itself, and runs FIRST so the delivered op's echo rides the push.
         import inspect
-        src = inspect.getsource(km._producer)
-        self.assertIn("_apply_pending_ops()", src, "the producer tick delivers the parked queue")
+        self.assertNotIn("_apply_pending_ops()", inspect.getsource(km._producer),
+                         "the judge pass no longer gates delivery")
+        src = inspect.getsource(km._pusher_cycle_jobs)
+        self.assertIn("_apply_pending_ops()", src, "the pusher cycle delivers the parked queue")
+        self.assertLess(src.index("_apply_pending_ops()"), src.index("_push_all("), "…ahead of the push")
 
 
 class _FakeForwardBackend:
@@ -284,11 +297,13 @@ class SdkForwardsAndBatch(unittest.TestCase):
         km._compacting_now = lambda sid: False
         km._working_now = lambda sid: False
         km._pending_ops.clear()
+        km._refused_heads.clear()
 
     def tearDown(self):
         (km._compacting_now, km.Sessions.backend_for, km._push_all, km._optimistic_echo,
          km._working_now) = self._saved
         km._pending_ops.clear()
+        km._refused_heads.clear()
 
     def test_sdk_send_while_working_is_handed_over_not_parked(self):
         km._working_now = lambda sid: True             # a turn IS in flight
@@ -457,9 +472,11 @@ class CancelParked(unittest.TestCase):
 
     def setUp(self):
         km._pending_ops.clear()
+        km._refused_heads.clear()
 
     def tearDown(self):
         km._pending_ops.clear()
+        km._refused_heads.clear()
 
     def test_removes_the_indexed_op(self):
         km._pending_ops[SID] = [("model", "opus"), ("send", "now do the thing", "human")]
@@ -575,11 +592,13 @@ class SlashCommandParksWhileTurnOpen(unittest.TestCase):
         km._compacting_now = lambda sid: False
         km._working_now = lambda sid: True             # a turn is OPEN throughout, unless a test says otherwise
         km._pending_ops.clear()
+        km._refused_heads.clear()
 
     def tearDown(self):
         (km._compacting_now, km.Sessions.backend_for, km._push_all, km._optimistic_echo,
          km._working_now) = self._saved
         km._pending_ops.clear()
+        km._refused_heads.clear()
 
     def test_shape_matcher_commands_yes_paths_and_prose_no(self):
         for t in ("/autocompact auto", "/compact", "/model opus", "/mcp__srv__tool go", "/loop 5m /foo"):

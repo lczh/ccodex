@@ -2099,6 +2099,12 @@ class SdkSession:
                     blocked = blocked or self._ping_feeding   # the ping's record must not share its window
                     item = self._pending.pop(0) if (self._pending and not blocked) else None
                     fresh = item is not None and self.inflight == 0     # starting from idle, not mid-turn
+                    if item is not None:
+                        # under the SAME lock as the pop: busy() reads inflight>0 or _pending, and the kernel's
+                        # parked-op drain re-runs right after a delivery (2026-09-03) — a gap between the pop
+                        # and this increment read as idle and could feed the op behind into this very turn
+                        self.inflight += 1
+                        self._inflight_texts.append(item)   # the fed-turn twin — see its init comment
                 if item is None:
                     await self._input_wake.wait()   # idle, or holding behind a wedged turn → wait for a change
                     continue
@@ -2107,8 +2113,6 @@ class SdkSession:
                     self.since = int(time.time())    # a new turn starts now (mid-turn forwards keep the turn's clock)
                     self._interrupted = False        # a fresh turn → clear any stale interrupt flag
                     self._intr_level = 0             #   ...and its escalation episode (a new stop starts polite)
-                self.inflight += 1
-                self._inflight_texts.append(item)   # the fed-turn twin — see its init comment
                 if item.startswith(RENAME_PING_HEAD):
                     self._ping_feeding = True       # hold feeds until this turn's first streamed message
                 self._mark("working")
@@ -2164,7 +2168,7 @@ class SdkSession:
                     # The CLI is demonstrably up, so any recorded launch failure is HISTORY — clear it
                     # here, at the proof, rather than on a timer. This is what lifts the usage-limit
                     # hold once the window resets: the next _ensure connects, the error record goes, and
-                    # the queue the limit was holding drains on the following producer pass.
+                    # the queue the limit was holding drains on the following pusher cycle.
                     self.backend._clear_launch_error(self.sid)
                     # A pending /effort switch is APPLIED the instant this (re)connect lands (--effort rode _options
                     # above) → clear the switching-dots + "Reloading session…" notice (the user 2026-07-06). Covers
@@ -4125,7 +4129,7 @@ class SdkBackend:
             try:
                 self._poke_cb()
             except Exception as e:
-                self._log("producer wake failed: %s" % e)
+                self._log("kernel wake failed: %s" % e)
 
     # ---- SDK option assembly (mirrors the tmux launch flags) ----
     def _options(self, sess: SdkSession, ClaudeAgentOptions):
@@ -4513,7 +4517,7 @@ class SdkBackend:
             return False
         if _is_compact_cmd(text):
             # Delivering /compact: mark the session compacting NOW (authoritative), covering the gap between
-            # this send and the CLI actually starting the turn — so a drive op the producer tick checks in
+            # this send and the CLI actually starting the turn — so a drive op the pusher's drain checks in
             # that window still parks. Cleared event-based by the boundary / the turn's ResultMessage.
             s._compacting = True
         if _is_clear_cmd(text):

@@ -40,10 +40,16 @@ km = SourceFileLoader("romp_kernel_headless", os.path.join(BIN, "romp-kernel")).
 # limit. Pinning it off keeps them hermetic.
 km._limit_hold = lambda sid: None
 
+# The tmux PROMPT HOLD (_hold_drain: a tmux-shaped delivery holds the sid for a moment, tested in
+# tests/test_kernel_parked_ops_liveness.py) is a separate axis: off here, so back-to-back
+# _apply_pending_ops calls stand for successive cycles.
+km._TMUX_PROMPT_HOLD_S = 0.0
+
 
 class PendingOpsPersistence(unittest.TestCase):
     def setUp(self):
         km._pending_ops.clear()
+        km._refused_heads.clear()
         try:
             os.unlink(km._PENDING_OPS_FILE)
         except OSError:
@@ -156,6 +162,55 @@ class HeadlessRoutes(unittest.TestCase):
         self.assertEqual((code, resp), (200, {"ok": True}))
         fake.kill.assert_called_once()
         self.assertIn(("chat", {"type": "closed", "id": fake.kill.call_args[0][0]}), sent)
+
+    def test_send_route_reports_queued_vs_sent(self):
+        # `queued` says which arm the send took (2026-09-03): an agent sending ITSELF a slash command from
+        # inside its own turn read 'ok' and could not know the command was parked until that turn ended
+        fake = mock.Mock()
+        fake.busy.return_value = None
+        km._pending_ops.clear()
+        try:
+            with mock.patch.object(km.Sessions, "backend_for", staticmethod(lambda sid: fake)), \
+                 mock.patch.object(km, "_compacting_now", lambda sid, **k: False), \
+                 mock.patch.object(km, "_working_now", lambda sid: True):
+                code, resp = self._post("/send", {"id": "sid-q", "text": "/frobnicate now"})
+            self.assertEqual((code, resp), (200, {"ok": True, "queued": True}))
+            self.assertEqual(list(km._pending_ops.values()), [[("command", "/frobnicate now", None)]])
+            fake.send.assert_not_called()
+            km._pending_ops.clear()
+            with mock.patch.object(km.Sessions, "backend_for", staticmethod(lambda sid: fake)), \
+                 mock.patch.object(km, "_compacting_now", lambda sid, **k: False), \
+                 mock.patch.object(km, "_working_now", lambda sid: False):
+                code, resp = self._post("/send", {"id": "sid-q", "text": "/frobnicate now"})
+            self.assertEqual((code, resp), (200, {"ok": True, "queued": False}))
+            fake.send.assert_called_once()
+            self.assertEqual(fake.send.call_args[0][1], "/frobnicate now")
+        finally:
+            km._pending_ops.clear()
+
+    def test_send_route_passes_a_remote_kernels_queued_through(self):
+        # a session living on another kernel: its answer's `queued` rides back to the caller; an older
+        # remote without the field reads as not queued (today's behaviour)
+        with mock.patch.object(km, "_host_for_sid", lambda sid: {"host": "TESTHOST"}), \
+             mock.patch.object(km, "_remote_forward", lambda r, path, body: {"ok": True, "queued": True}):
+            code, resp = self._post("/send", {"id": "sid-r", "text": "/frobnicate now"})
+        self.assertEqual((code, resp), (200, {"ok": True, "queued": True}))
+        with mock.patch.object(km, "_host_for_sid", lambda sid: {"host": "TESTHOST"}), \
+             mock.patch.object(km, "_remote_forward", lambda r, path, body: {"ok": True}):
+            code, resp = self._post("/send", {"id": "sid-r", "text": "hello"})
+        self.assertEqual((code, resp), (200, {"ok": True, "queued": False}))
+
+    def test_tick_is_a_kernel_poke_for_the_refused_head_retry(self):
+        # the hooks' /tick is the same cue as a backend's settle/resume poke: a session may have come back,
+        # so the refused-head marks are cleared and the drain's next visit re-asks them
+        # (tests/test_kernel_parked_ops_liveness.py drives the re-ask itself)
+        km._refused_heads.add("sid-refused")
+        km._pusher_wake.clear()
+        km._producer_wake.clear()
+        code, resp = self._post("/tick", {})
+        self.assertEqual((code, resp), (200, {"ok": True, "woke": True}))
+        self.assertNotIn("sid-refused", km._refused_heads, "a tick is a kernel poke: the refused marks are cleared")
+        self.assertTrue(km._pusher_wake.is_set() and km._producer_wake.is_set(), "…and still both wakes")
 
     def test_missing_who_is_a_400(self):
         code, resp = self._post("/interrupt", {})

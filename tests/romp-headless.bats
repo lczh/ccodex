@@ -124,6 +124,23 @@ PY
     [[ "$output" == *"usage: romp send"* ]]
 }
 
+@test "romp send reports queued when the kernel parked it" {
+    # a sender inside the target's own open turn (an agent sending itself a slash command) must learn
+    # the command has not run yet (2026-09-03: a parked /clear read 'ok' and never fired)
+    start_fake_kernel '{"ok": true, "queued": true}'
+    run "$ROMP_SCRIPT" send busy1 "/frobnicate now"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"romp send: queued (busy1)"* ]]
+    [[ "$output" == *"delivers when the session can take it"* ]]
+}
+
+@test "romp send still says ok on queued:false and on a bare ok reply" {
+    start_fake_kernel '{"ok": true, "queued": false}'
+    run "$ROMP_SCRIPT" send web "hello"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"romp send: ok (web)"* ]]
+}
+
 @test "a kernel refusal is loud: non-zero exit + the kernel's answer" {
     start_fake_kernel '{"ok": false, "error": "id or name required"}'
     run "$ROMP_SCRIPT" interrupt ghost

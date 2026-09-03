@@ -3495,5 +3495,31 @@ class WorkflowProgressShapeIsLoud(unittest.TestCase):
         self.assertEqual(buf.getvalue(), "")
 
 
+class SettleBeforePoke(unittest.TestCase):
+    """The kernel's parked-op drain wakes on the backend's turn-end poke (2026-09-03) and reads busy() to
+    decide whether the session is quiet — so the settle must CLOSE the turn (inflight 0, compaction over)
+    before the poke fires, or the woken cycle reads the session as still working and delivery slips to
+    the pusher's backstop with every test green. Codex got the same pin in tests/test_codex_backend.py."""
+
+    def test_the_result_branch_settles_before_it_pokes(self):
+        import inspect
+        src = inspect.getsource(sb.SdkSession._on_message)
+        i = src.index("elif isinstance(msg, ResultMessage):")
+        zero, comp, poke = (src.index("self.inflight = 0", i), src.index("self._compacting = False", i),
+                            src.index("self.backend._poke()", i))
+        self.assertLess(zero, poke, "inflight is zeroed before the poke")
+        self.assertLess(comp, poke, "…and the compaction cue is cleared before it")
+
+    def test_the_fed_turn_counts_as_in_flight_under_the_pop_lock(self):
+        # busy() is inflight>0 or _pending; the input generator pops _pending and must count the turn in
+        # flight under the SAME lock, or a drain re-running right after a delivery reads the gap as idle
+        src = open(os.path.join(BIN, "romp_sdk_backend.py"), encoding="utf-8").read()
+        body = src[src.index("async def inputs():"):src.index("async def drain(client):")]
+        self.assertLess(body.index("self.inflight += 1"), body.index("if item is None:"),
+                        "the increment sits inside the lock block that popped the item")
+        self.assertLess(body.index("self.inflight += 1"), body.index("self._persist_queue()"),
+                        "…before the registry write that used to separate them")
+
+
 if __name__ == "__main__":
     unittest.main()

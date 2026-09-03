@@ -1310,6 +1310,13 @@ print(json.dumps(d))' "$_who" "$_when")"
                   -H 'Content-Type: application/json' -d "$_payload")" \
         || { echo "romp $_verb: kernel not reachable on :$_kport (is romp running?)" >&2; exit 1; }
     if [[ "$_resp" == *'"ok": true'* || "$_resp" == *'"ok":true'* ]]; then
+        if [[ "$_verb" == "send" && ( "$_resp" == *'"queued": true'* || "$_resp" == *'"queued":true'* ) ]]; then
+            # the kernel PARKED it (a turn is open / compacting / the account is limit-held / the backend
+            # could not take it yet) and delivers it when the session can take it. Said out loud so a sender
+            # inside that very turn — an agent sending itself a slash command — knows it has NOT run yet.
+            echo "romp send: queued ($_who) — delivers when the session can take it"
+            exit 0
+        fi
         echo "romp $_verb: ok ($_who)"
         exit 0
     fi

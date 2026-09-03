@@ -38,6 +38,11 @@ SourceFileLoader("romp_judge", os.path.join(BIN, "romp-judge")).load_module()
 os.environ["ROMP_KERNEL_NO_OPEN"] = "1"
 os.environ.setdefault("ROMP_SERVE_TOKEN", "testtok")
 km = SourceFileLoader("romp_kernel_limitqueue", os.path.join(BIN, "romp-kernel")).load_module()
+
+# The tmux PROMPT HOLD (_hold_drain: a tmux-shaped delivery holds the sid for a moment, tested in
+# tests/test_kernel_parked_ops_liveness.py) is a separate axis from the ACCOUNT gate this module covers:
+# off here, so back-to-back _apply_pending_ops calls stand for successive cycles.
+km._TMUX_PROMPT_HOLD_S = 0.0
 jd = km.jd
 
 SID = "11111111-2222-3333-4444-555555555555"
@@ -85,12 +90,14 @@ class _Base(unittest.TestCase):
         km._path_of = lambda sid: None            # no transcript → the spend arm reads only the pause flag
         km.Sessions.backend_for = staticmethod(lambda sid: self.be)
         km._pending_ops.clear()
+        km._refused_heads.clear()
 
     def tearDown(self):
         for n, v in self._saved.items():
             setattr(km, n, v)
         km.Sessions.backend_for = self._saved_backend
         km._pending_ops.clear()
+        km._refused_heads.clear()
         jd.STATE = self.saved_state
         self.td.cleanup()
 
