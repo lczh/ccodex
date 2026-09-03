@@ -56,17 +56,6 @@ KINDS = {"bars": {"turns": "dictlist:id", "judging": "bykeys:sid,t,judge,t1", "m
 SEP = "\u001f"
 
 
-def _key(kind, it, prefix=""):
-    if not isinstance(it, dict):
-        return None
-    if kind == "byid" or kind.startswith("dictlist:"):
-        f = "id" if kind == "byid" else kind.split(":", 1)[1]
-        return None if it.get(f) is None else prefix + str(it[f])
-    if kind.startswith("bykeys:"):
-        return prefix + SEP.join(str(it.get(f)) for f in kind.split(":", 1)[1].split(","))
-    return None
-
-
 def _assemble(kind, order, items):
     if kind == "dict":
         return {kk: items[kk] for kk in order if kk in items}
@@ -109,27 +98,22 @@ def _py_apply(last, d):
     return m
 
 
-def _py_maps(msg):
+def _py_maps(msg, keys):
+    """The shim's buildMaps: the kernel's key list zipped onto the payload positionally, per kind."""
     maps = {}
     for name, kind in KINDS[msg["type"]].items():
-        v = msg.get(name); order, items = [], {}
-        def put(kk, val):
-            if kk is None or kk in items:
-                kk = "#%d" % len(order)
-            order.append(kk); items[kk] = val
-        if kind == "dict":
-            for kk, vv in (v or {}).items():
-                put(str(kk), vv)
-        elif kind == "byid" or kind.startswith("bykeys:"):
-            for it in v or []:
-                put(_key(kind, it), it)
-        elif kind.startswith("dictlist:"):
-            for dk, lst in (v or {}).items():
-                pre = str(dk) + SEP
-                if not isinstance(lst, list) or not lst:
-                    put(pre, lst); continue
-                for it in lst:
-                    put(_key(kind, it, pre), it)
+        v = msg.get(name); order = list((keys or {}).get(name) or []); items = {}; pos = {}
+        for i, kk in enumerate(order):
+            if kind == "dict":
+                items[kk] = v[kk]
+            elif kind.startswith("dictlist:"):
+                dk, _, rest = kk.partition(SEP); lane = v[dk]
+                if rest == "":
+                    items[kk] = lane
+                else:
+                    j = pos.get(dk, 0); pos[dk] = j + 1; items[kk] = lane[j]
+            else:
+                items[kk] = v[i]
         maps[name] = {"order": order, "items": items}
     return maps
 
@@ -151,7 +135,9 @@ class _Stream:
                 assert out is not None, "the mirror rejected a delta the kernel sent: %r" % fr
             else:
                 self.fulls += 1
-                self.last = {"rev": 0, "msg": fr, "maps": _py_maps(fr)}
+                keys = fr.get("_keys")                       # the frame itself stays as the wire carried it
+                msg = {kk: v for kk, v in fr.items() if kk != "_keys"}
+                self.last = {"rev": 0, "msg": msg, "maps": _py_maps(msg, keys)} if keys is not None else None
         return self.c.frames[n0:]
 
     @property
@@ -377,7 +363,7 @@ class ShimDecoderMatchesTheKernel(unittest.TestCase):
 var frames=JSON.parse(require("fs").readFileSync(process.argv[2],"utf8"));var out=[];
 for(var i=0;i<frames.length;i++){var msg=frames[i];
 if(msg.type==="delta"){var full=applyDelta(msg);if(!full){out.push({error:"rejected",at:i});break;}msg=full;}
-else if(DELTA_KINDS[msg.type]){LAST[msg.type]={rev:0,msg:msg,maps:buildMaps(msg)};}
+else if(DELTA_KINDS[msg.type]){var keys=msg._keys;delete msg._keys;LAST[msg.type]=keys?{rev:0,msg:msg,maps:buildMaps(msg,keys)}:null;}
 out.push(msg);}
 process.stdout.write(JSON.stringify(out));"""
         with open(os.path.join(fx, "run.js"), "w") as f:
@@ -398,7 +384,7 @@ process.stdout.write(JSON.stringify(out));"""
             self.skipTest("node not installed")
         fx = tempfile.mkdtemp()
         script = self._shim_functions() + r"""
-LAST.bars={rev:0,msg:{type:"bars",turns:{},judging:[],messages:[],now:1},maps:buildMaps({type:"bars",turns:{},judging:[],messages:[]})};
+LAST.bars={rev:0,msg:{type:"bars",turns:{},judging:[],messages:[],now:1},maps:buildMaps({type:"bars",turns:{},judging:[],messages:[]},{turns:[],judging:[],messages:[]})};
 var r=applyDelta({type:"delta",slot:"bars",base:3,rev:4,coll:{}});
 process.stdout.write(JSON.stringify({refused:r===null,rev:LAST.bars.rev}));"""
         with open(os.path.join(fx, "run.js"), "w") as f:

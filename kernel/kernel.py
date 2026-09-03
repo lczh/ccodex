@@ -28410,28 +28410,33 @@ def _keepalive_all(now=None):
         # `sock`) are never judged: they cannot be shut down, and they cannot have been pinged.
         pa = c.get("pingAt")                     # any pong or message clears this (see _note_ws_inbound), so an
         if pa is not None and c.get("sock") is not None and (now - pa) >= WS_DEAD_S:   # outstanding ping IS the silence…
+            why = None
             # …only while the handler thread is parked in its READ. Inside a dispatch (`ready` builds every
             # tab synchronously on that thread — tens of seconds on a cold kernel) the pong sits unread in
             # the receive buffer: unread is not missing. The handler resets the clock when it re-enters the
             # read (review 2026-09-03).
             if not c.get("inRead", True):
+                pass
+            else:
+                # …and never a peer that is still DRAINING: sendall returning means the ping entered the socket,
+                # not that it left the machine — a slow tunnel with megabytes queued ahead of it cannot pong in
+                # time. Unsent bytes that fell since the last beat prove the peer alive; unsent bytes that have
+                # not moved for a whole window prove it gone (a zero window nobody drains).
+                oq = _ws_outq(c["sock"])
+                if oq:
+                    prev = c.get("outq")
+                    if prev is None or prev[0] != oq:
+                        c["outq"] = (oq, now)         # draining (or first look) → alive, judge again next beat
+                    elif (now - prev[1]) >= WS_DEAD_S:
+                        why = "not acknowledging: %d bytes unsent for %ds" % (oq, int(now - prev[1]))
+                else:
+                    why = "no pong for %ds (last heard %ds ago)" % (int(now - pa), int(now - c.get("lastIn", 0)))
+            if why:
+                _drop_dead_ws_client(c, why)
                 continue
-            # …and never a peer that is still DRAINING: sendall returning means the ping entered the socket,
-            # not that it left the machine — a slow tunnel with megabytes queued ahead of it cannot pong in
-            # time. Unsent bytes that fell since the last beat prove the peer alive; unsent bytes that have
-            # not moved for a whole window prove it gone (a zero window nobody drains).
-            oq = _ws_outq(c["sock"])
-            if oq:
-                prev = c.get("outq")
-                if prev is None or prev[0] != oq:
-                    c["outq"] = (oq, now)             # draining (or first look) → alive, judge again next beat
-                    continue
-                if (now - prev[1]) < WS_DEAD_S:
-                    continue
-                _drop_dead_ws_client(c, "not acknowledging: %d bytes unsent for %ds" % (oq, int(now - prev[1])))
-                continue
-            _drop_dead_ws_client(c, "no pong for %ds (last heard %ds ago)" % (int(now - pa), int(now - c.get("lastIn", 0))))
-            continue
+            # not judged this beat — but still BEATEN: the ka must keep flowing to a client the kernel is
+            # busy serving, or the shim's own silence watchdog closes a connection that is merely waiting
+            # on a long build (review 2026-09-03, residual).
         try:
             c["send"](s)
             if c.get("sock") is not None:
@@ -28743,9 +28748,9 @@ def _delta_split(kind, value):
     shim rebuilds in key order, just less delta-friendly."""
     ents, order = {}, []
     enc = json.JSONEncoder(default=str).encode          # one encoder for the thousand entries, not one each
-    def put(kk, v):
+    def put(kk, v, pre=""):
         if kk is None or kk in ents:
-            kk = "#%d" % len(order)
+            kk = pre + "#%d" % len(order)          # keeps its lane prefix, so the shim still files it by lane
         ents[kk] = (v, enc(v)); order.append(kk)
     if kind == "dict" and isinstance(value, dict):
         for kk, v in value.items():
@@ -28755,12 +28760,14 @@ def _delta_split(kind, value):
             put(_delta_key(kind, it), it)
     elif kind.startswith("dictlist:") and isinstance(value, dict):
         for dk, lst in value.items():
+            if _DELTA_SEP in str(dk):
+                raise ValueError("lane key carries the separator")
             pre = str(dk) + _DELTA_SEP
             if not isinstance(lst, list) or not lst:
                 put(pre, lst)                      # an empty or non-list lane: one entry under its bare prefix
                 continue
             for it in lst:
-                put(_delta_key(kind, it, pre), it)
+                put(_delta_key(kind, it, pre), it, pre)
     return ents, order
 
 
@@ -28770,10 +28777,14 @@ def _delta_parts(ftype, payload):
     if hit is not None and hit[0] is payload:
         return hit[1]
     kinds = _DELTA_SLOTS[ftype][1]
-    colls = {name: _delta_split(kind, payload.get(name)) for name, kind in kinds.items()}
-    rest = {kk: v for kk, v in payload.items() if kk not in kinds}
-    rest_sig = json.dumps({kk: v for kk, v in rest.items() if kk not in _DEDUP_VOLATILE}, sort_keys=True, default=str)
-    parts = (colls, rest, rest_sig)
+    try:
+        colls = {name: _delta_split(kind, payload.get(name)) for name, kind in kinds.items()}
+    except ValueError:
+        parts = None                                   # a payload the protocol cannot key: this build goes whole
+    else:
+        rest = {kk: v for kk, v in payload.items() if kk not in kinds}
+        rest_sig = json.dumps({kk: v for kk, v in rest.items() if kk not in _DEDUP_VOLATILE}, sort_keys=True, default=str)
+        parts = (colls, rest, rest_sig)
     _delta_parts_cache[ftype] = (payload, parts)
     return parts
 
@@ -28817,12 +28828,22 @@ def _send_slot(c, ftype, payload, pre, sig):
     if not c.get("delta"):
         _send_client(c, key, payload, pre=pre, sig=sig)
         return
-    colls, rest, rest_sig = _delta_parts(ftype, payload)
+    parts = _delta_parts(ftype, payload)
     states = c.setdefault("dstate", {})
+    if parts is None:                                  # cannot be keyed: whole, and the client holds nothing
+        states.pop(ftype, None)
+        _send_client(c, key, payload, pre=pre, sig=sig)
+        return
+    colls, rest, rest_sig = parts
     st = states.get(ftype)
     now = time.time()
     if st is None:                                     # nothing held → the full frame, and remember it
-        _send_client(c, key, payload, pre=pre, sig=sig)
+        # The frame carries the kernel's key list per collection (`_keys`, which the shim strips before the
+        # bundle sees the message): every key is minted HERE, once — a shim deriving keys from field values
+        # would spell null/None, true/True, 1/1.0 differently from Python and hold keys the kernel never sent.
+        keys = json.dumps({n: o for n, (_e, o) in colls.items()})
+        pre_k = pre[:-1] + ',"_keys":' + keys + "}" if pre.endswith("}") else json.dumps(dict(payload, _keys=json.loads(keys)), default=str)
+        _send_client(c, key, payload, pre=pre_k, sig=sig)
         if c.get("sent", {}).get(key, (None,))[0] == sig:      # it went (or was already held) → rebase
             states[ftype] = {"rev": 0, "rest": rest_sig,
                              "coll": {n: {kk: e[1] for kk, e in ents.items()} for n, (ents, _o) in colls.items()},
@@ -31102,7 +31123,7 @@ if(freshPending){freshPending=false;clearStale();}
 // entries; reassemble the full message from what this pane holds and hand the bundle exactly what it
 // used to receive. A delta whose base is not the revision held here cannot be applied → ask for a full.
 if(msg&&msg.type==="delta"){var full=applyDelta(msg);if(!full){send({type:"needSlot",slot:msg.slot});return;}msg=full;}
-else if(msg&&DELTA_KINDS[msg.type]){LAST[msg.type]={rev:0,msg:msg,maps:buildMaps(msg)};}
+else if(msg&&DELTA_KINDS[msg.type]){var keys=msg._keys;delete msg._keys;LAST[msg.type]=keys?{rev:0,msg:msg,maps:buildMaps(msg,keys)}:null;}
 if(window.__rompFed){window.__rompFed.inbound("",msg);}else{window.dispatchEvent(new MessageEvent("message",{data:msg}));}};
 // onclose: flag the shell, RE-SHOW this pane's romp loader (the user 2026-06-29, who wanted the swirling loader on
 // kernel restart), + RETRY (don't blind-reload — on a real outage the reload just fails into a dead page).
@@ -31120,19 +31141,16 @@ else queue.push(s);}
 // full message handed to the bundle, and per-collection maps {order:[keys], items:{key:value}}. A delta
 // builds a NEW message object (the bundle may still hold the previous one) reusing every unchanged part.
 var DELTA_KINDS={bars:{turns:"dictlist:id",judging:"bykeys:sid,t,judge,t1",messages:"byid"},feed:{asks:"byid"}};var LAST={};var SEP="\u001f";
-function deltaKey(kind,it,prefix){if(!it||typeof it!=="object")return null;
-if(kind==="byid"||kind.indexOf("dictlist:")===0){var f=kind==="byid"?"id":kind.slice(9);return it[f]==null?null:(prefix||"")+String(it[f]);}
-if(kind.indexOf("bykeys:")===0){var fs=kind.slice(7).split(","),parts=[];for(var i=0;i<fs.length;i++)parts.push(String(it[fs[i]]));return (prefix||"")+parts.join(SEP);}return null;}
-function buildMaps(m){var kinds=DELTA_KINDS[m.type]||{},maps={};for(var name in kinds){var kind=kinds[name],v=m[name],order=[],items={};
-var put=function(kk,val){if(kk===null||items.hasOwnProperty(kk))kk="#"+order.length;order.push(kk);items[kk]=val;};
-if(kind==="dict"&&v&&typeof v==="object"){for(var kk in v)put(kk,v[kk]);}
-else if((kind==="byid"||kind.indexOf("bykeys:")===0)&&Array.isArray(v)){for(var i=0;i<v.length;i++)put(deltaKey(kind,v[i]),v[i]);}
-else if(kind.indexOf("dictlist:")===0&&v&&typeof v==="object"){for(var dk in v){var lst=v[dk],pre=dk+SEP;if(!Array.isArray(lst)||!lst.length){put(pre,lst);continue;}for(var j=0;j<lst.length;j++)put(deltaKey(kind,lst[j],pre),lst[j]);}}
+function buildMaps(m,keys){var kinds=DELTA_KINDS[m.type]||{},maps={};for(var name in kinds){var kind=kinds[name],v=m[name],order=((keys||{})[name]||[]).slice(),items={},pos={};
+for(var i=0;i<order.length;i++){var kk=order[i];
+if(kind==="dict"){items[kk]=v[kk];}
+else if(kind.indexOf("dictlist:")===0){var cut=kk.indexOf(SEP),dk=cut<0?kk:kk.slice(0,cut),rest=cut<0?"":kk.slice(cut+1),lane=v[dk];if(rest===""){items[kk]=lane;}else{var j=pos[dk]||0;pos[dk]=j+1;items[kk]=lane[j];}}
+else{items[kk]=v[i];}}
 maps[name]={order:order,items:items};}return maps;}
 function assemble(kind,map){var i,kk;if(kind==="dict"){var o={};for(i=0;i<map.order.length;i++){kk=map.order[i];if(map.items.hasOwnProperty(kk))o[kk]=map.items[kk];}return o;}
 if(kind.indexOf("dictlist:")===0){var d={};for(i=0;i<map.order.length;i++){kk=map.order[i];if(!map.items.hasOwnProperty(kk))continue;var cut=kk.indexOf(SEP);var dk=cut<0?kk:kk.slice(0,cut),rest=cut<0?"":kk.slice(cut+1);
-if(rest===""&&!Array.isArray(map.items[kk])){d[dk]=map.items[kk];continue;}   // a bare-prefix entry: the lane's own (non-list or empty) value
-if(rest===""){d[dk]=map.items[kk];continue;}if(!d.hasOwnProperty(dk))d[dk]=[];d[dk].push(map.items[kk]);}return d;}
+if(rest===""){d[dk]=map.items[kk];continue;}   // a bare-prefix entry: the lane's own (empty or non-list) value
+if(!d.hasOwnProperty(dk))d[dk]=[];d[dk].push(map.items[kk]);}return d;}
 var out=[];for(i=0;i<map.order.length;i++){kk=map.order[i];if(map.items.hasOwnProperty(kk))out.push(map.items[kk]);}return out;}
 function applyDelta(d){var last=LAST[d.slot];if(!last||last.rev!==d.base)return null;var kinds=DELTA_KINDS[d.slot]||{};var m={};for(var k0 in last.msg)m[k0]=last.msg[k0];
 if(d.rest){for(var rk in d.rest)m[rk]=d.rest[rk];}

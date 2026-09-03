@@ -213,6 +213,20 @@ class PhantomPanesAreDropped(unittest.TestCase):
         km._keepalive_all(now=self.clock[0])                        # …judged on its own fresh window
         self.assertFalse(client["alive"], "back in the read and still silent for a whole window → dropped")
 
+    def test_c3b_a_peer_the_kernel_declines_to_judge_still_gets_its_beat(self):
+        """Not judging a client mid-dispatch must not also starve it: the ka is what the shim's own silence
+        watchdog listens for, and a long build sends nothing else for tens of seconds (review 2026-09-03)."""
+        client, peer, handler = self._connect(pongs=False)
+        t0 = self.clock[0]
+        client["inRead"] = False
+        km._keepalive_all(now=t0)
+        self.assertTrue(self._settle(lambda: len(peer.texts) >= 1 and client["pingAt"] == t0))
+        self.clock[0] = t0 + 3 * km.WS_DEAD_S
+        km._keepalive_all(now=self.clock[0])                        # ancient stamp, but the handler is busy
+        self.assertTrue(client["alive"])
+        self.assertTrue(self._settle(lambda: len(peer.texts) >= 2), "the beat still crossed to the peer")
+        self.assertEqual(json.loads(peer.texts[-1])["type"], "ka")
+
     def test_c4_a_peer_still_draining_its_backlog_is_alive_and_one_that_stopped_acknowledging_is_not(self):
         client, peer, handler = self._connect(pongs=False)
         t0 = self.clock[0]
