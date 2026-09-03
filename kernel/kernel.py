@@ -28721,7 +28721,7 @@ _DELTA_SLOTS = {
     # cross whole because one bar was appended (measured 2026-09-03: 507 KB per appended segment at lane
     # granularity, ~2 KB at bar granularity).
     "bars": (("timelinebars",), {"turns": "dictlist:id", "judging": "bykeys:sid,t,judge,t1", "messages": "byid"}),
-    "feed": (("feed",), {"asks": "byid"}),
+    "feed": (("feed",), {"asks": "byid:itemId"}),   # a card's identity across builds is its itemId, not an id
 }
 _DELTA_SEP = "\u001f"          # joins composite keys; never appears in an id or a sid
 _DELTA_MAX_FRACTION = 0.6      # a delta this large a fraction of the full payload is sent as the full instead
@@ -28733,10 +28733,10 @@ def _delta_key(kind, it, prefix=""):
     (then the caller falls back to a positional key, which is still exact)."""
     if not isinstance(it, dict):
         return None
-    if kind == "byid" or kind.startswith("dictlist:"):
+    if kind.startswith(("byid", "dictlist:")):
         field = "id" if kind == "byid" else kind.split(":", 1)[1]
         v = it.get(field)
-        return None if v is None else prefix + str(v)
+        return None if v is None or v == "" else prefix + str(v)   # "" would spell a lane's bare-prefix marker
     if kind.startswith("bykeys:"):
         return prefix + _DELTA_SEP.join(str(it.get(f)) for f in kind.split(":", 1)[1].split(","))
     return None
@@ -28750,12 +28750,17 @@ def _delta_split(kind, value):
     enc = json.JSONEncoder(default=str).encode          # one encoder for the thousand entries, not one each
     def put(kk, v, pre=""):
         if kk is None or kk in ents:
-            kk = pre + "#%d" % len(order)          # keeps its lane prefix, so the shim still files it by lane
+            n = len(order)
+            while True:                            # positional, with its lane prefix so the shim files it by lane —
+                kk = pre + "#%d" % n               # and never on a real id that happens to spell "#n"
+                if kk not in ents:
+                    break
+                n += 1
         ents[kk] = (v, enc(v)); order.append(kk)
     if kind == "dict" and isinstance(value, dict):
         for kk, v in value.items():
             put(str(kk), v)
-    elif (kind == "byid" or kind.startswith("bykeys:")) and isinstance(value, list):
+    elif kind.startswith(("byid", "bykeys:")) and isinstance(value, list):
         for it in value:
             put(_delta_key(kind, it), it)
     elif kind.startswith("dictlist:") and isinstance(value, dict):
@@ -28795,7 +28800,9 @@ def _js_key_order(keys):
     predict it to know what the client holds."""
     idx, rest = [], []
     for kk in keys:
-        (idx if (kk.isdigit() and (kk == "0" or kk[0] != "0") and int(kk) < 4294967295) else rest).append(kk)
+        is_index = (kk.isascii() and kk.isdigit() and len(kk) <= 10 and (kk == "0" or kk[0] != "0")
+                    and int(kk) < 4294967295)      # canonical array index: ASCII digits only, below 2^32-1
+        (idx if is_index else rest).append(kk)
     return sorted(idx, key=int) + rest
 
 
@@ -28828,6 +28835,24 @@ def _send_slot(c, ftype, payload, pre, sig):
     if not c.get("delta"):
         _send_client(c, key, payload, pre=pre, sig=sig)
         return
+    try:
+        _send_slot_delta(c, key, ftype, payload, pre, sig)
+    except Exception:
+        # One client's frame must never take the pusher down with it (every dashboard would freeze until a
+        # restart): say so, forget what that client holds, and send the whole payload — which carries no
+        # key list, so the client holds nothing either and the next cycle starts the stream afresh.
+        sys.stderr.write("view-delta %s: %s\n" % (ftype, traceback.format_exc()))
+        c.get("dstate", {}).pop(ftype, None)
+        c.get("sent", {}).pop(key, None)
+        _send_client(c, key, payload, pre=pre, sig=sig)
+
+
+def _send_slot_delta(c, key, ftype, payload, pre, sig):
+    rs = c.get("resync")
+    if rs and ftype in rs:                             # the shim said it could not apply a delta (a base it does
+        rs.discard(ftype)                              # not hold): forget what we believe it holds; whole, re-based
+        c.get("dstate", {}).pop(ftype, None)
+        c.get("sent", {}).pop(key, None)
     parts = _delta_parts(ftype, payload)
     states = c.setdefault("dstate", {})
     if parts is None:                                  # cannot be keyed: whole, and the client holds nothing
@@ -28852,7 +28877,7 @@ def _send_slot(c, ftype, payload, pre, sig):
     frame = {"type": "delta", "slot": ftype, "base": st["rev"], "rev": st["rev"] + 1, "coll": {}}
     changed = False
     if rest_sig != st["rest"]:
-        frame["rest"] = rest; changed = True
+        frame["rest"] = rest; frame["restAll"] = 1; changed = True    # the WHOLE remainder: keys it lacks are gone
     else:
         for vk in _DEDUP_VOLATILE:                     # the clock fields still ride, so the pane's `now` advances
             if vk in rest:
@@ -31140,7 +31165,7 @@ else queue.push(s);}
 // "bysid" (a list grouped by item sid, one entry per group). LAST holds, per slot, the revision, the last
 // full message handed to the bundle, and per-collection maps {order:[keys], items:{key:value}}. A delta
 // builds a NEW message object (the bundle may still hold the previous one) reusing every unchanged part.
-var DELTA_KINDS={bars:{turns:"dictlist:id",judging:"bykeys:sid,t,judge,t1",messages:"byid"},feed:{asks:"byid"}};var LAST={};var SEP="\u001f";
+var DELTA_KINDS={bars:{turns:"dictlist:id",judging:"bykeys:sid,t,judge,t1",messages:"byid"},feed:{asks:"byid:itemId"}};var LAST={};var SEP="\u001f";
 function buildMaps(m,keys){var kinds=DELTA_KINDS[m.type]||{},maps={};for(var name in kinds){var kind=kinds[name],v=m[name],order=((keys||{})[name]||[]).slice(),items={},pos={};
 for(var i=0;i<order.length;i++){var kk=order[i];
 if(kind==="dict"){items[kk]=v[kk];}
@@ -31153,7 +31178,7 @@ if(rest===""){d[dk]=map.items[kk];continue;}   // a bare-prefix entry: the lane'
 if(!d.hasOwnProperty(dk))d[dk]=[];d[dk].push(map.items[kk]);}return d;}
 var out=[];for(i=0;i<map.order.length;i++){kk=map.order[i];if(map.items.hasOwnProperty(kk))out.push(map.items[kk]);}return out;}
 function applyDelta(d){var last=LAST[d.slot];if(!last||last.rev!==d.base)return null;var kinds=DELTA_KINDS[d.slot]||{};var m={};for(var k0 in last.msg)m[k0]=last.msg[k0];
-if(d.rest){for(var rk in d.rest)m[rk]=d.rest[rk];}
+if(d.rest){if(d.restAll){for(var k1 in m){if(!kinds[k1]&&!(k1 in d.rest))delete m[k1];}}for(var rk in d.rest)m[rk]=d.rest[rk];}
 var coll=d.coll||{};for(var name in coll){var kind=kinds[name];if(!kind)continue;var c=coll[name],map=last.maps[name]||{order:[],items:{}};var items={};for(var ik in map.items)items[ik]=map.items[ik];var order=map.order.slice();
 if(c.del){for(var x=0;x<c.del.length;x++){delete items[c.del[x]];}}
 if(c.set){for(var sk in c.set){if(!items.hasOwnProperty(sk))order.push(sk);items[sk]=c.set[sk];}}
@@ -36286,10 +36311,10 @@ class Handler(BaseHTTPRequestHandler):
             # The shim could not apply a view delta (its base revision did not match what it holds — a
             # frame it never saw, a reload mid-stream): forget what we believe it holds and re-send the
             # whole slot now, from which the delta stream re-bases (the chat's needFull, for views).
-            ftype = str(msg["slot"])
-            client.get("dstate", {}).pop(ftype, None)
-            client.get("sent", {}).pop(_DELTA_SLOTS[ftype][0], None)
-            self._push_one(client)
+            # Flagged for the pusher's thread rather than done here: the pusher may be mid-frame for this very
+            # client, and two threads over its held state would rebase a full the dedup then swallowed.
+            client.setdefault("resync", set()).add(str(msg["slot"]))
+            _pusher_wake.set()
             return
         if msg and msg.get("type") == "needFull" and msg.get("id"):
             # The client REJECTED a delta because it started past what it holds (render.ts chatTail's gap

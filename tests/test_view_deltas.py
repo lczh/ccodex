@@ -52,7 +52,7 @@ class _Client(dict):
         self["send"] = lambda s: self.frames.append(json.loads(s))
 
 
-KINDS = {"bars": {"turns": "dictlist:id", "judging": "bykeys:sid,t,judge,t1", "messages": "byid"}, "feed": {"asks": "byid"}}
+KINDS = {"bars": {"turns": "dictlist:id", "judging": "bykeys:sid,t,judge,t1", "messages": "byid"}, "feed": {"asks": "byid:itemId"}}
 SEP = "\u001f"
 
 
@@ -79,6 +79,9 @@ def _py_apply(last, d):
     if last is None or last["rev"] != d["base"]:
         return None
     m = dict(last["msg"])
+    if d.get("rest") is not None and d.get("restAll"):
+        for k in [k for k in m if k not in KINDS[d["slot"]] and k not in d["rest"]]:
+            del m[k]                                    # a full remainder retires the keys it no longer carries
     for k, v in (d.get("rest") or {}).items():
         m[k] = v
     for name, c in (d.get("coll") or {}).items():
@@ -244,11 +247,64 @@ class BarsDeltas(unittest.TestCase):
         p1 = _bars({S1: self._turn(S1, 1)}, [], []); st.push(p1)
         p2 = _bars({S1: self._turn(S1, 2)}, [], [], now=1005); st.push(p2)
         self.assertEqual(st.c["dstate"]["bars"]["rev"], 1)
-        # the shim could not apply a delta → the kernel forgets what the client holds
-        st.c["dstate"].pop("bars"); st.c["sent"].pop(("timelinebars",), None)
+        # the shim could not apply a delta → the socket handler flags the slot for the PUSHER (not its own
+        # thread: two threads over one client's held state would rebase a full the dedup then swallowed)
+        st.c.setdefault("resync", set()).add("bars")
         p3 = _bars({S1: self._turn(S1, 3)}, [], [], now=1010)
-        self.assertEqual([f["type"] for f in st.push(p3)], ["bars"])
-        self.assertEqual(st.held, p3)
+        fr = st.push(p3)
+        self.assertEqual([f["type"] for f in fr], ["bars"]); self.assertIn("_keys", fr[0])
+        self.assertEqual(st.held, p3); self.assertEqual(st.c["resync"], set())
+        src = open(km.__file__, encoding="utf-8").read()
+        h = src[src.index('msg.get("type") == "needSlot"'):]
+        h = h[:h.index("return")]
+        self.assertIn('client.setdefault("resync", set()).add(', h, "the handler flags the slot…")
+        self.assertIn("_pusher_wake.set()", h, "…and wakes the pusher, which sends on its own thread")
+        self.assertNotIn("_push_one", h)
+
+    def test_i_a_top_level_key_that_leaves_the_payload_leaves_the_client(self):
+        st = _Stream("bars")
+        st.push(_bars({S1: self._turn(S1, 1)}, [], [], warming=True))
+        p2 = _bars({S1: self._turn(S1, 1)}, [], [], now=1005); del p2["warming"]
+        fr = st.push(p2)
+        self.assertEqual(fr[0].get("restAll"), 1); self.assertNotIn("warming", fr[0]["rest"])
+        self.assertEqual(st.held, p2, "the remainder is replaced, not merged: a dropped key is gone")
+
+    def test_j_an_empty_id_and_a_positional_key_spelling_a_real_id_stay_exact(self):
+        st = _Stream("bars")
+        lane = [{"id": "", "t": 1}, {"id": "b2", "t": 2}]
+        msgs = [{"id": "#2", "x": 0}, {"x": 1}, {"x": 2}]
+        p1 = _bars({S1: lane}, [], msgs); st.push(p1)
+        self.assertEqual(st.held, p1)
+        keys = st.c["dstate"]["bars"]["order"]
+        self.assertEqual(keys["turns"], [S1 + SEP + "#0", S1 + SEP + "b2"], "an empty id is positional, in its lane")
+        self.assertEqual(keys["messages"], ["#2", "#1", "#3"], "the positional key steps past the real '#2'")
+        p2 = _bars({S1: [{"id": "", "t": 1}, {"id": "b2", "t": 3}]}, [], [{"id": "#2", "x": 0}, {"x": 1}, {"x": 5}], now=1005)
+        st.push(p2)
+        self.assertEqual(st.held, p2)
+
+    def test_k_javascript_index_keys_are_ascii_and_bounded(self):
+        odd = ["\u00b2", "\u0661", "\uff11\uff12", "9" * 5000, "10", "9", "x", "4294967295", "4294967294"]
+        self.assertEqual(km._js_key_order(odd), ["9", "10", "4294967294", "\u00b2", "\u0661", "\uff11\uff12", "9" * 5000, "x", "4294967295"])
+
+    def test_l_a_failing_delta_never_takes_the_pusher_down(self):
+        import io, contextlib
+        st = _Stream("bars")
+        p1 = _bars({S1: self._turn(S1, 1)}, [], [])
+        real = km._delta_parts
+        def boom(ftype, payload): raise RuntimeError("synthetic")
+        km._delta_parts = boom
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                fr = st.push(p1)
+        finally:
+            km._delta_parts = real
+        self.assertEqual([f["type"] for f in fr], ["bars"]); self.assertNotIn("_keys", fr[0])
+        self.assertIn("view-delta bars", err.getvalue()); self.assertIn("synthetic", err.getvalue())
+        self.assertNotIn("bars", st.c.get("dstate", {}))
+        self.assertIsNone(st.last, "a full frame without keys leaves the client holding nothing")
+        fr = st.push(_bars({S1: self._turn(S1, 2)}, [], [], now=1005))
+        self.assertEqual([f["type"] for f in fr], ["bars"]); self.assertIn("_keys", fr[0], "the stream starts afresh")
 
 
     def test_g_a_bar_appended_to_an_earlier_lane_crosses_alone_and_lands_in_its_lane(self):
@@ -295,7 +351,7 @@ class FeedDeltas(unittest.TestCase):
         km._DELTA_MAX_FRACTION = self._frac
 
     def _ask(self, i, column="working", text="do the thing"):
-        return {"id": "g%d" % i, "sid": S1, "column": column, "text": text, "color": None, "trail": [1, 2, 3]}
+        return {"itemId": "awaiting:g%d" % i, "sid": S1, "column": column, "text": text, "color": None, "trail": [1, 2, 3]}
 
     def test_a_only_the_card_that_moved_crosses(self):
         st = _Stream("feed")
@@ -304,7 +360,7 @@ class FeedDeltas(unittest.TestCase):
         p2 = _feed([self._ask(1), self._ask(2, column="done"), self._ask(3)], now=1005)
         frames = st.push(p2)
         self.assertEqual(frames[0]["type"], "delta")
-        self.assertEqual(set(frames[0]["coll"]["asks"]["set"]), {"g2"})
+        self.assertEqual(set(frames[0]["coll"]["asks"]["set"]), {"awaiting:g2"})
         self.assertEqual(st.held, p2)
 
     def test_b_the_remainder_rides_only_when_it_changed(self):
@@ -314,6 +370,19 @@ class FeedDeltas(unittest.TestCase):
         fr = st.push(p2)
         self.assertEqual(fr[0]["type"], "delta")
         self.assertIn("showDismissed", fr[0]["rest"]); self.assertEqual(fr[0]["coll"], {})
+        self.assertEqual(st.held, p2)
+
+
+    def test_c_a_card_inserted_at_the_top_costs_one_card_and_the_order(self):
+        """Cards are keyed by itemId, so an insert anywhere ships that card plus the key order — never the feed."""
+        km._DELTA_MAX_FRACTION = self._frac                    # the real threshold
+        st = _Stream("feed")
+        st.push(_feed([self._ask(i, text="x" * 300) for i in range(30)]))
+        p2 = _feed([self._ask(99, text="y" * 300)] + [self._ask(i, text="x" * 300) for i in range(30)], now=1005)
+        fr = st.push(p2)
+        self.assertEqual(fr[0]["type"], "delta")
+        self.assertEqual(set(fr[0]["coll"]["asks"]["set"]), {"awaiting:g99"})
+        self.assertEqual(fr[0]["coll"]["asks"]["order"][0], "awaiting:g99")
         self.assertEqual(st.held, p2)
 
 
@@ -349,6 +418,9 @@ class ShimDecoderMatchesTheKernel(unittest.TestCase):
             _bars({S1: turn(S1, 3), S3: turn(S3, 1)}, [], [msg("10", 1), msg("11", 2), msg("30", 3), msg("9", 4)], now=1025),
             # the first lane empties to a bare value, the last lane grows: bare-prefix entry + append
             _bars({S1: [], S3: turn(S3, 2)}, [], [msg("9", 4)], now=1030),
+            # an empty id and a real id spelling a positional key; then the `warming` key leaves the payload
+            _bars({S1: [{"id": "", "t": 1}, {"id": "b2", "t": 2}], S3: turn(S3, 2)}, [], [{"id": "#1", "x": 0}, {"x": 1}], now=1035, warming=True),
+            dict((kk, v) for kk, v in _bars({S1: [{"id": "", "t": 1}, {"id": "b2", "t": 3}], S3: turn(S3, 2)}, [], [{"id": "#1", "x": 0}, {"x": 5}], now=1040).items() if kk != "warming"),
         ]
         frames = []
         for p in payloads:
