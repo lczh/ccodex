@@ -28128,13 +28128,24 @@ WS_QUEUE_BYTES = int(os.environ.get("ROMP_WS_QUEUE_BYTES", str(16 * 1024 * 1024)
 # Isolating the blocking write on a thread the shared loops never wait for is what actually holds.
 def _ws_sender(q, sock, lock, client):
     """Drain one client's queue onto its socket. Blocking here is FINE and is the entire point — it blocks
-    only this client's own thread. A dead socket ends the thread and marks the client for reaping."""
+    only this client's own thread. A dead socket ends the thread and marks the client for reaping.
+    A `str` item is a text message to frame; a `bytes` item is an already-framed CONTROL frame (the
+    liveness ping) written as-is under the same lock, so it can never interleave with a text frame."""
     while True:
         s = q.get()
         if s is None:                          # teardown sentinel from the handler's finally
             return
         try:
-            _ws_send(sock, lock, s)
+            if isinstance(s, bytes):
+                with lock:
+                    sock.sendall(s)
+                # The liveness clock starts when the ping actually LEAVES, not when the beat queued it: a
+                # slow-but-alive peer (a 300 KB/s tunnel behind a large payload) must not be judged dead for
+                # a ping that was still sitting behind its backlog. Only the oldest unanswered ping counts.
+                if s[:1] == b"\x89" and client.get("pingAt") is None:
+                    client["pingAt"] = _ws_clock()
+            else:
+                _ws_send(sock, lock, s)
         except OSError:
             client["alive"] = False
             return
@@ -28161,6 +28172,52 @@ def _mk_ws_send(q, sock, client):
             client["qbytes"] += len(s)
         q.put(s)                               # unbounded; the byte budget above is the real bound
     return send
+
+
+_ws_clock = time.time   # the liveness clock — one seam, so the tests can drive the beats deterministically
+
+
+def _ws_ping_frame(payload: bytes) -> bytes:
+    """A PING control frame (RFC 6455 §5.5.2: FIN + opcode 0x9, payload ≤125 bytes). Every conforming peer —
+    a browser, Node's `ws`, wscat — answers it with a PONG echoing the payload, with no application code."""
+    data = payload[:125]
+    return bytes([0x89, len(data)]) + data
+
+
+def _new_ws_client(app, wid, sock, lock=None, q=None, start_sender=True):
+    """One connected dashboard pane: its queue, its sender thread and the liveness bookkeeping the heartbeat
+    reads. `since` and `lastIn` stamp the last moment the PEER proved itself alive (any inbound frame: a
+    message or a pong); `pingAt` is the send time of the OLDEST unanswered ping, None when nothing is
+    outstanding. Factored out of the handler so the liveness rules are testable on a loopback pair."""
+    q = q if q is not None else queue.Queue()
+    lock = lock if lock is not None else threading.Lock()
+    now = _ws_clock()
+    client = {"app": app, "wid": wid, "alive": True, "qbytes": 0, "qlock": threading.Lock(),
+              "sock": sock, "since": now, "lastIn": now, "pingAt": None}
+    client["send"] = _mk_ws_send(q, sock, client)
+    client["q"] = q
+    if start_sender:
+        threading.Thread(target=_ws_sender, args=(q, sock, lock, client), daemon=True, name="ws-send").start()
+    return client, q, lock
+
+
+def _note_ws_inbound(client, now=None):
+    """The peer spoke (a message or a pong): it is alive as of now, and no ping is outstanding."""
+    client["lastIn"] = now if now is not None else _ws_clock()
+    client["pingAt"] = None
+
+
+def _drop_dead_ws_client(client, why):
+    """Mark a peer dead and shut its socket: the handler thread's blocking read returns EOF, its finally
+    removes the client from _clients, and the sender thread ends on the sentinel. Logged once per client."""
+    if not client.get("alive"):
+        return
+    client["alive"] = False
+    sys.stderr.write("ws: dropping %s client — %s\n" % (client.get("app"), why))
+    try:
+        client["sock"].shutdown(socket.SHUT_RDWR)
+    except (OSError, AttributeError):
+        pass
 
 
 def _ws_send(sock, lock, text):
@@ -28228,7 +28285,7 @@ def _ws_recv(rfile):
 _WS_MAX_MESSAGE = 80 * 1024 * 1024
 
 
-def _ws_recv_message(rfile, on_ping):
+def _ws_recv_message(rfile, on_ping, on_pong=None):
     """Read frames until one COMPLETE data message is assembled → (opcode, payload), or (None, None)
     on close/EOF/overrun. Browsers FRAGMENT large sends (RFC 6455 §5.4 — Chrome splits at ~128 KB),
     and the old per-frame loop handed each fragment straight to json.loads: a phone photo's dropFile
@@ -28245,7 +28302,9 @@ def _ws_recv_message(rfile, on_ping):
         if op == 0x9:                          # ping → pong (libraries ping by default and hang up without one)
             on_ping(payload or b"")
             continue
-        if op == 0xA:                          # unsolicited pong — nothing to do
+        if op == 0xA:                          # a pong — the peer is alive (answers our liveness ping)
+            if on_pong is not None:
+                on_pong(payload or b"")
             continue
         if op == 0x0:                          # continuation of an in-flight fragmented message
             if frag is None:
@@ -28281,19 +28340,39 @@ def _send_to_app(app, msg):
 # client on a fixed cadence (bypassing the dedup); the shim stamps lastRecv on every frame and force-reconnects
 # when the keepalive stops arriving (→ onclose → reconnect → reload-resync). 'ka' frames are ignored by bundles.
 KEEPALIVE_S = float(os.environ.get("ROMP_WS_KEEPALIVE", "10"))   # heartbeat cadence (s); the shim re-connects at ~3x this
+# How long a PING may go unanswered before the peer is dead (s). The keepalive used to be one-way: the
+# kernel sent a frame and expected nothing back, so a peer whose forwarder swallowed the close — VS Code's
+# port forwarder keeps the devbox-side connection open after the browser pane has gone — stayed a "live
+# dashboard" forever, receiving every full payload the pusher built. Measured 2026-09-03: 84 client
+# connections on one kernel, 73 of them silent for over five minutes, all phantoms, all sharing one
+# multiplexed channel with the three real panes. Now every beat is also a PING (RFC 6455), which every
+# conforming peer answers without application code; a peer that has not answered the oldest outstanding
+# ping within this window is dropped — the missing pong is the event. Three beats, like the shim's own
+# silence watchdog on the other side.
+WS_DEAD_S = float(os.environ.get("ROMP_WS_DEAD", "0")) or 3 * KEEPALIVE_S
 
-def _keepalive_all():
+def _keepalive_all(now=None):
     # `dv` = the current dist build token (the same value baked into every page's ?v= urls). Riding the
     # keepalive makes build-drift detection EVENT-based on every surface with a live socket: a page whose
     # LOADEDV is older raises the reload banner within one heartbeat of a rebuild — no per-page /version
     # polling. The VS Code extension compares it against its bundled build stamp the same way (the user
     # 2026-07-13: a stale tab sat silent through several rebuilds; drift must always show a banner).
     s = json.dumps({"type": "ka", "dv": _dist_ver()})
+    now = _ws_clock() if now is None else now
     with _clients_lock:
         targets = list(_clients)
     for c in targets:
+        # LIVENESS (2026-09-03): a ping whose pong never came within WS_DEAD_S means the peer is gone —
+        # however open the forwarder in between keeps the socket. Clients from before the factory (no
+        # `sock`) are never judged: they cannot be shut down, and they cannot have been pinged.
+        pa = c.get("pingAt")                     # any pong or message clears this (see _note_ws_inbound), so an
+        if pa is not None and c.get("sock") is not None and (now - pa) >= WS_DEAD_S:   # outstanding ping IS the silence
+            _drop_dead_ws_client(c, "no pong for %ds (last heard %ds ago)" % (int(now - pa), int(now - c.get("lastIn", 0))))
+            continue
         try:
             c["send"](s)
+            if c.get("sock") is not None:
+                c["send"](_ws_ping_frame(str(int(now)).encode()))   # pingAt is stamped by the sender, on the wire
         except Exception:
             c["alive"] = False
 
@@ -36797,11 +36876,7 @@ class Handler(BaseHTTPRequestHandler):
         # Frames are ENQUEUED, never written by the caller: one wedged client must not stall the shared
         # push/heartbeat loops (see _ws_sender). Pongs still ride self.wfile — they are ≤125-byte control
         # frames answered on this client's own handler thread, and both paths serialise on the same `lock`.
-        q = queue.Queue()
-        client = {"app": app, "wid": wid, "alive": True, "qbytes": 0, "qlock": threading.Lock()}
-        client["send"] = _mk_ws_send(q, self.connection, client)
-        threading.Thread(target=_ws_sender, args=(q, self.connection, lock, client),
-                         daemon=True, name="ws-send").start()
+        client, q, lock = _new_ws_client(app, wid, self.connection, lock=lock)
         if active:
             client["active"] = active                  # active-tab-first streaming (the user 2026-06-24)
         with _clients_lock:
@@ -36811,9 +36886,11 @@ class Handler(BaseHTTPRequestHandler):
                 # one COMPLETE message per iteration — fragments reassembled, pings answered inline
                 # (browsers fragment large sends: a phone photo's dropFile spans dozens of frames)
                 op, payload = _ws_recv_message(
-                    self.rfile, lambda payload: _ws_pong(self.wfile, lock, payload or b""))
+                    self.rfile, lambda payload: _ws_pong(self.wfile, lock, payload or b""),
+                    on_pong=lambda payload: _note_ws_inbound(client))
                 if op is None:                         # EOF / close / a client overran the reassembly cap
                     break
+                _note_ws_inbound(client)               # any message proves the peer alive
                 # webview→kernel messages: on "ready", push the initial state to this client
                 try:
                     msg = json.loads(payload.decode("utf-8", "replace"))
