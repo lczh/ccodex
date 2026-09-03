@@ -235,6 +235,26 @@ class DeliveryRidesTheSettle(_Drain):
         self.assertEqual(self.be.calls[-1], ("model", "opus"))
         self.assertTrue(km._pusher_wake.is_set(), "a real delivery wakes the push that retires the chip")
 
+    def test_a_cycle_resolves_a_held_sids_path_once(self):
+        # review find on #904: the drain's gates each resolved a held sid's transcript path (a discover
+        # fingerprint) every cycle; inside a cycle the resolution is memoized on the cycle's scope, and a
+        # caller outside a cycle (a WS handler) still resolves fresh
+        calls = []
+        with mock.patch.object(km, "_sessions", lambda now: (calls.append(1), [])[1]):
+            km._path_of(SID)
+            km._path_of(SID)
+            self.assertEqual(len(calls), 2, "outside a cycle every ask resolves fresh")
+            calls.clear()
+            km._live_scope.paths = {}
+            try:
+                km._path_of(SID)
+                km._path_of(SID)
+            finally:
+                km._live_scope.paths = None
+            self.assertEqual(len(calls), 1, "inside a cycle the second ask is the memo")
+        km._pusher_cycle()
+        self.assertIsNone(getattr(km._live_scope, "paths", None), "the memo ends with the cycle")
+
     def test_cancel_parked_logs_sid_and_kind_only(self):
         km._pending_ops[SID] = [("send", "a private sentence", "human")]
         buf = io.StringIO()

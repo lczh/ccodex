@@ -1371,10 +1371,19 @@ def _sessions(now, window=None, forks=True):
 
 def _path_of(sid, now=None):
     """The transcript path for a sid (discover-cached → cheap), or None. Lets the sid-keyed backend API
-    resolve a session's transcript without the caller threading the path through (e.g. pending_queued)."""
+    resolve a session's transcript without the caller threading the path through (e.g. pending_queued).
+    Inside a pusher cycle the answer is memoized on the cycle's scope (_live_scope.paths, opened by
+    _pusher_cycle, thread-confined like its liveness snapshot): the parked-op drain asks for a held sid's
+    path in up to three gates per cycle, and each ask was a discover fingerprint (review find, #904)."""
+    memo = getattr(_live_scope, "paths", None)
+    if memo is not None and sid in memo:
+        return memo[sid]
     now = int(time.time()) if now is None else now
     s = next((s for s in _sessions(now) if s["sid"] == sid), None)
-    return s["path"] if s else None
+    p = s["path"] if s else None
+    if memo is not None:
+        memo[sid] = p
+    return p
 
 
 def _has_tmux():
@@ -30389,9 +30398,14 @@ def _pusher_cycle():
     #                                       however deep it hides (_bg_live_norm, _compacting_now,
     #                                       build_feed's per-session gates) — see _live_scope
     try:
+        _live_scope.paths = {}                  # …and the cycle's sid→path memo (_path_of): the parked-op drain
+        #                                         otherwise resolves a held sid's path once per gate per cycle.
+        #                                         INSIDE the try: a raise here must still hit the finally, or
+        #                                         the liveness scope above leaks set
         _pusher_cycle_jobs(now, tmux, any_client)
     finally:
         _live_scope.snapshot = None
+        _live_scope.paths = None
 
 
 def _pusher_cycle_jobs(now, tmux, any_client):
@@ -34760,6 +34774,8 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(200, json.dumps({"ok": False, "error":   # pretend it was delivered
                             "the remote kernel for this session (%s) isn't answering — message not delivered"
                             % r.get("host", "?")}), "application/json")
+                    if isinstance(res, dict) and res.get("ok") is False:
+                        return self._send(200, json.dumps(res), "application/json")   # its refusal, verbatim
                     # the far kernel's `queued` rides through (an older remote without the field reads False)
                     return self._send(200, json.dumps({"ok": True, "queued": bool(isinstance(res, dict)
                                                                                   and res.get("queued"))}),

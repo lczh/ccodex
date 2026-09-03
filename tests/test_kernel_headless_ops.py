@@ -199,6 +199,12 @@ class HeadlessRoutes(unittest.TestCase):
              mock.patch.object(km, "_remote_forward", lambda r, path, body: {"ok": True}):
             code, resp = self._post("/send", {"id": "sid-r", "text": "hello"})
         self.assertEqual((code, resp), (200, {"ok": True, "queued": False}))
+        # …and a far kernel's REFUSAL rides back as itself, never rewritten into an ok (review find, #904)
+        refusal = {"ok": False, "error": "isolation: the target session's mailbox is OFF"}
+        with mock.patch.object(km, "_host_for_sid", lambda sid: {"host": "TESTHOST"}), \
+             mock.patch.object(km, "_remote_forward", lambda r, path, body: dict(refusal)):
+            code, resp = self._post("/send", {"id": "sid-r", "text": "hello"})
+        self.assertEqual((code, resp), (200, refusal))
 
     def test_tick_is_a_kernel_poke_for_the_refused_head_retry(self):
         # the hooks' /tick is the same cue as a backend's settle/resume poke: a session may have come back,

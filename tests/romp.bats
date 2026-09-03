@@ -121,6 +121,7 @@ echo "curl $*" >> "$MOCK_LOG"
 url=""
 for a in "$@"; do [[ "$a" == http* ]] && url="$a"; done
 if [[ -n "${MOCK_CURL_FAIL_SEND:-}" && "$url" == */send ]]; then exit 22; fi
+if [[ -n "${MOCK_CURL_SEND_QUEUED:-}" && "$url" == */send ]]; then echo '{"ok": true, "queued": true}'; exit 0; fi
 echo '{"ok": true}'
 MOCK
     chmod +x "$MOCK_DIR/curl"
@@ -152,6 +153,19 @@ MOCK
     [ "$status" -eq 2 ]
     [[ "$output" == *"-m needs the default (SDK) session"* ]]
     [ "$(grep -c 'tmux new-session' "$MOCK_LOG")" -eq 0 ]
+}
+
+@test "new -m: a first prompt the kernel PARKED is reported as queued, not delivered" {
+    # the /send route says which arm it took (2026-09-03); a fresh session that is not quiet yet holds the
+    # prompt, and the CLI must not claim a delivery that has not happened
+    _stub_curl
+    touch "$MOCK_LOG"
+    export ROMP_SERVE_TOKEN=testtok MOCK_CURL_SEND_QUEUED=1
+    run run_romp new -m "look into the flaky test" ideabox
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"first prompt queued"* ]]
+    [[ "$output" == *"delivers when the session can take it"* ]]
+    [[ "$output" != *"first prompt delivered"* ]]
 }
 
 @test "new -m: one command spawns AND delivers the first prompt (POST /new, then /send)" {

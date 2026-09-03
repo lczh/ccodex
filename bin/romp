@@ -1742,7 +1742,12 @@ print(json.dumps(d))' "$session_arg" "$msg_arg" "$tag_arg")"
                           -H 'Content-Type: application/json' -d "$_mpayload")" \
                 || { echo "romp new: session is up but the message did NOT land (kernel send failed). Retry: romp send $session_arg '<text>'" >&2; exit 1; }
             if [[ "$_mresp" == *'"ok": true'* || "$_mresp" == *'"ok":true'* ]]; then
-                echo "romp new: first prompt delivered"
+                if [[ "$_mresp" == *'"queued": true'* || "$_mresp" == *'"queued":true'* ]]; then
+                    # the kernel PARKED it (the fresh session cannot take it yet): it delivers when it can
+                    echo "romp new: first prompt queued — delivers when the session can take it"
+                else
+                    echo "romp new: first prompt delivered"
+                fi
             else
                 echo "romp new: session is up but the kernel refused the message: $_mresp. Retry: romp send $session_arg '<text>'" >&2
                 exit 1
