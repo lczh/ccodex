@@ -28709,36 +28709,58 @@ def _dedup_sig(msg, s):
 # kernel keeps what the client holds as serialized strings (the compare is a string compare; the memory
 # is the payload's own size), and a client that cannot apply a delta says so (needSlot) and gets a full.
 _DELTA_SLOTS = {
-    # frame type: (dedup key, {collection: how its entries are keyed})
-    "bars": (("timelinebars",), {"turns": "dict", "judging": "bysid", "messages": "byid"}),
+    # frame type: (dedup key, {collection: how its entries are keyed}). Kinds — "dict": an object keyed by its
+    # own keys; "byid": a list keyed by item id; "bykeys:a,b,c": a list keyed by a composite of item fields
+    # (an id-less list whose items are unique on those fields); "dictlist:id": an object of lists, every
+    # item keyed by (object key, item field) — the timeline's lanes, where a lane of 200 bars must not
+    # cross whole because one bar was appended (measured 2026-09-03: 507 KB per appended segment at lane
+    # granularity, ~2 KB at bar granularity).
+    "bars": (("timelinebars",), {"turns": "dictlist:id", "judging": "bykeys:sid,t,judge,t1", "messages": "byid"}),
     "feed": (("feed",), {"asks": "byid"}),
 }
+_DELTA_SEP = "\u001f"          # joins composite keys; never appears in an id or a sid
 _DELTA_MAX_FRACTION = 0.6      # a delta this large a fraction of the full payload is sent as the full instead
 _delta_parts_cache = {}        # frame type -> (payload object identity, parts) — one split per BUILD, shared by clients
 
 
+def _delta_key(kind, it, prefix=""):
+    """The key of one list item under `kind` ('byid' / 'bykeys:…'), or None when the item cannot be keyed
+    (then the caller falls back to a positional key, which is still exact)."""
+    if not isinstance(it, dict):
+        return None
+    if kind == "byid" or kind.startswith("dictlist:"):
+        field = "id" if kind == "byid" else kind.split(":", 1)[1]
+        v = it.get(field)
+        return None if v is None else prefix + str(v)
+    if kind.startswith("bykeys:"):
+        return prefix + _DELTA_SEP.join(str(it.get(f)) for f in kind.split(":", 1)[1].split(","))
+    return None
+
+
 def _delta_split(kind, value):
-    """Entries of one collection as {key: (object, json)} plus the key order — 'dict' keyed by its own keys,
-    'byid' a list keyed by item id, 'bysid' a list grouped by item sid (each group one entry)."""
+    """Entries of one collection as {key: (object, json)} plus the key order, per the kind table above. A
+    list item that cannot be keyed, or a duplicate key, takes a positional key ('#n') — exact, since the
+    shim rebuilds in key order, just less delta-friendly."""
     ents, order = {}, []
+    enc = json.JSONEncoder(default=str).encode          # one encoder for the thousand entries, not one each
+    def put(kk, v):
+        if kk is None or kk in ents:
+            kk = "#%d" % len(order)
+        ents[kk] = (v, enc(v)); order.append(kk)
     if kind == "dict" and isinstance(value, dict):
         for kk, v in value.items():
-            ents[str(kk)] = (v, json.dumps(v, default=str)); order.append(str(kk))
-    elif kind == "byid" and isinstance(value, list):
+            put(str(kk), v)
+    elif (kind == "byid" or kind.startswith("bykeys:")) and isinstance(value, list):
         for it in value:
-            kk = str((it or {}).get("id")) if isinstance(it, dict) else None
-            if kk is None or kk in ents:
-                kk = "#%d" % len(order)            # id-less or duplicate → positional, still exact
-            ents[kk] = (it, json.dumps(it, default=str)); order.append(kk)
-    elif kind == "bysid" and isinstance(value, list):
-        groups = {}
-        for it in value:
-            kk = str((it or {}).get("sid")) if isinstance(it, dict) else "#"
-            if kk not in groups:
-                groups[kk] = []; order.append(kk)
-            groups[kk].append(it)
-        for kk, g in groups.items():
-            ents[kk] = (g, json.dumps(g, default=str))
+            put(_delta_key(kind, it), it)
+    elif kind.startswith("dictlist:") and isinstance(value, dict):
+        for dk, lst in value.items():
+            pre = str(dk) + _DELTA_SEP
+            if not isinstance(lst, list) or not lst:
+                put(pre, lst)                      # an empty or non-list lane: one entry under its bare prefix
+                continue
+            for it in lst:
+                put(_delta_key(kind, it, pre), it)
     return ents, order
 
 
@@ -28754,6 +28776,37 @@ def _delta_parts(ftype, payload):
     parts = (colls, rest, rest_sig)
     _delta_parts_cache[ftype] = (payload, parts)
     return parts
+
+
+def _js_key_order(keys):
+    """The order JavaScript enumerates these object keys in: canonical array indices ascending first, then
+    the rest in insertion order — the order the shim appends a delta's new keys in, so the kernel must
+    predict it to know what the client holds."""
+    idx, rest = [], []
+    for kk in keys:
+        (idx if (kk.isdigit() and (kk == "0" or kk[0] != "0") and int(kk) < 4294967295) else rest).append(kk)
+    return sorted(idx, key=int) + rest
+
+
+def _client_order(held, order, ents):
+    """The flat key order a client derives from a delta that carries no `order`: its held keys that survive,
+    then the new keys as it enumerates the frame's `set`."""
+    have = set(ents)
+    kept = [kk for kk in held if kk in have]
+    seen = set(held)
+    return kept + _js_key_order([kk for kk in order if kk not in seen])
+
+
+def _order_shape(kind, order):
+    """What a key order means for the assembled value: for a dict-of-lists, the groups in first-appearance
+    order each with its keys in relative order (a bar appended to the FIRST lane lands at the end of the
+    flat order and still assembles into its own lane); for the rest, the order itself."""
+    if not kind.startswith("dictlist:"):
+        return order
+    groups = {}
+    for kk in order:
+        groups.setdefault(kk.partition(_DELTA_SEP)[0], []).append(kk)
+    return list(groups.items())
 
 
 def _send_slot(c, ftype, payload, pre, sig):
@@ -28783,6 +28836,8 @@ def _send_slot(c, ftype, payload, pre, sig):
         for vk in _DEDUP_VOLATILE:                     # the clock fields still ride, so the pane's `now` advances
             if vk in rest:
                 frame.setdefault("rest", {})[vk] = rest[vk]
+    kinds = _DELTA_SLOTS[ftype][1]
+    next_order = {}
     for name, (ents, order) in colls.items():
         held = st["coll"].get(name, {})
         set_ = {kk: e[0] for kk, e in ents.items() if held.get(kk) != e[1]}
@@ -28792,8 +28847,13 @@ def _send_slot(c, ftype, payload, pre, sig):
             entry["set"] = set_
         if dele:
             entry["del"] = dele
-        if order != st["order"].get(name, []):
-            entry["order"] = order
+        # the order crosses only when what the client would derive on its own assembles differently; and
+        # the kernel remembers the order the CLIENT holds, which is that derived order, not the payload's
+        implied = _client_order(st["order"].get(name, []), order, ents)
+        if _order_shape(kinds[name], implied) != _order_shape(kinds[name], order):
+            entry["order"] = order; next_order[name] = list(order)
+        else:
+            next_order[name] = implied
         if entry:
             frame["coll"][name] = entry; changed = True
     if not changed:
@@ -28812,9 +28872,9 @@ def _send_slot(c, ftype, payload, pre, sig):
         c["alive"] = False
         return
     st["rev"] += 1; st["rest"] = rest_sig; st["at"] = now
-    for name, (ents, order) in colls.items():
+    for name, (ents, _order) in colls.items():
         st["coll"][name] = {kk: e[1] for kk, e in ents.items()}
-        st["order"][name] = list(order)
+        st["order"][name] = next_order[name]
     c.setdefault("sent", {})[key] = (sig, now)          # the dedup slot follows, so a later full send dedups honestly
 
 
@@ -31059,14 +31119,21 @@ else queue.push(s);}
 // "bysid" (a list grouped by item sid, one entry per group). LAST holds, per slot, the revision, the last
 // full message handed to the bundle, and per-collection maps {order:[keys], items:{key:value}}. A delta
 // builds a NEW message object (the bundle may still hold the previous one) reusing every unchanged part.
-var DELTA_KINDS={bars:{turns:"dict",judging:"bysid",messages:"byid"},feed:{asks:"byid"}};var LAST={};
+var DELTA_KINDS={bars:{turns:"dictlist:id",judging:"bykeys:sid,t,judge,t1",messages:"byid"},feed:{asks:"byid"}};var LAST={};var SEP="\u001f";
+function deltaKey(kind,it,prefix){if(!it||typeof it!=="object")return null;
+if(kind==="byid"||kind.indexOf("dictlist:")===0){var f=kind==="byid"?"id":kind.slice(9);return it[f]==null?null:(prefix||"")+String(it[f]);}
+if(kind.indexOf("bykeys:")===0){var fs=kind.slice(7).split(","),parts=[];for(var i=0;i<fs.length;i++)parts.push(String(it[fs[i]]));return (prefix||"")+parts.join(SEP);}return null;}
 function buildMaps(m){var kinds=DELTA_KINDS[m.type]||{},maps={};for(var name in kinds){var kind=kinds[name],v=m[name],order=[],items={};
-if(kind==="dict"&&v&&typeof v==="object"){for(var kk in v){order.push(kk);items[kk]=v[kk];}}
-else if(kind==="byid"&&Array.isArray(v)){for(var i=0;i<v.length;i++){var it=v[i],key=(it&&it.id!=null)?String(it.id):null;if(key===null||items.hasOwnProperty(key))key="#"+order.length;order.push(key);items[key]=it;}}
-else if(kind==="bysid"&&Array.isArray(v)){for(var j=0;j<v.length;j++){var it2=v[j],sk=(it2&&it2.sid!=null)?String(it2.sid):"#";if(!items.hasOwnProperty(sk)){order.push(sk);items[sk]=[];}items[sk].push(it2);}}
+var put=function(kk,val){if(kk===null||items.hasOwnProperty(kk))kk="#"+order.length;order.push(kk);items[kk]=val;};
+if(kind==="dict"&&v&&typeof v==="object"){for(var kk in v)put(kk,v[kk]);}
+else if((kind==="byid"||kind.indexOf("bykeys:")===0)&&Array.isArray(v)){for(var i=0;i<v.length;i++)put(deltaKey(kind,v[i]),v[i]);}
+else if(kind.indexOf("dictlist:")===0&&v&&typeof v==="object"){for(var dk in v){var lst=v[dk],pre=dk+SEP;if(!Array.isArray(lst)||!lst.length){put(pre,lst);continue;}for(var j=0;j<lst.length;j++)put(deltaKey(kind,lst[j],pre),lst[j]);}}
 maps[name]={order:order,items:items};}return maps;}
-function assemble(kind,map){if(kind==="dict"){var o={};for(var i=0;i<map.order.length;i++){var kk=map.order[i];if(map.items.hasOwnProperty(kk))o[kk]=map.items[kk];}return o;}
-var out=[];for(var j=0;j<map.order.length;j++){var k2=map.order[j];if(!map.items.hasOwnProperty(k2))continue;if(kind==="bysid"){out=out.concat(map.items[k2]);}else{out.push(map.items[k2]);}}return out;}
+function assemble(kind,map){var i,kk;if(kind==="dict"){var o={};for(i=0;i<map.order.length;i++){kk=map.order[i];if(map.items.hasOwnProperty(kk))o[kk]=map.items[kk];}return o;}
+if(kind.indexOf("dictlist:")===0){var d={};for(i=0;i<map.order.length;i++){kk=map.order[i];if(!map.items.hasOwnProperty(kk))continue;var cut=kk.indexOf(SEP);var dk=cut<0?kk:kk.slice(0,cut),rest=cut<0?"":kk.slice(cut+1);
+if(rest===""&&!Array.isArray(map.items[kk])){d[dk]=map.items[kk];continue;}   // a bare-prefix entry: the lane's own (non-list or empty) value
+if(rest===""){d[dk]=map.items[kk];continue;}if(!d.hasOwnProperty(dk))d[dk]=[];d[dk].push(map.items[kk]);}return d;}
+var out=[];for(i=0;i<map.order.length;i++){kk=map.order[i];if(map.items.hasOwnProperty(kk))out.push(map.items[kk]);}return out;}
 function applyDelta(d){var last=LAST[d.slot];if(!last||last.rev!==d.base)return null;var kinds=DELTA_KINDS[d.slot]||{};var m={};for(var k0 in last.msg)m[k0]=last.msg[k0];
 if(d.rest){for(var rk in d.rest)m[rk]=d.rest[rk];}
 var coll=d.coll||{};for(var name in coll){var kind=kinds[name];if(!kind)continue;var c=coll[name],map=last.maps[name]||{order:[],items:{}};var items={};for(var ik in map.items)items[ik]=map.items[ik];var order=map.order.slice();

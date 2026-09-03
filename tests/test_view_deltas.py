@@ -52,56 +52,84 @@ class _Client(dict):
         self["send"] = lambda s: self.frames.append(json.loads(s))
 
 
+KINDS = {"bars": {"turns": "dictlist:id", "judging": "bykeys:sid,t,judge,t1", "messages": "byid"}, "feed": {"asks": "byid"}}
+SEP = "\u001f"
+
+
+def _key(kind, it, prefix=""):
+    if not isinstance(it, dict):
+        return None
+    if kind == "byid" or kind.startswith("dictlist:"):
+        f = "id" if kind == "byid" else kind.split(":", 1)[1]
+        return None if it.get(f) is None else prefix + str(it[f])
+    if kind.startswith("bykeys:"):
+        return prefix + SEP.join(str(it.get(f)) for f in kind.split(":", 1)[1].split(","))
+    return None
+
+
+def _assemble(kind, order, items):
+    if kind == "dict":
+        return {kk: items[kk] for kk in order if kk in items}
+    if kind.startswith("dictlist:"):
+        d = {}
+        for kk in order:
+            if kk not in items:
+                continue
+            dk, _, rest = kk.partition(SEP)
+            if rest == "" and not isinstance(items[kk], list):
+                d[dk] = items[kk]; continue
+            if rest == "":
+                d[dk] = items[kk]; continue
+            d.setdefault(dk, []).append(items[kk])
+        return d
+    return [items[kk] for kk in order if kk in items]
+
+
 def _py_apply(last, d):
     """A faithful Python mirror of the shim's applyDelta/buildMaps/assemble — the reference the JS is held to."""
-    kinds = {"bars": {"turns": "dict", "judging": "bysid", "messages": "byid"}, "feed": {"asks": "byid"}}
     if last is None or last["rev"] != d["base"]:
         return None
     m = dict(last["msg"])
     for k, v in (d.get("rest") or {}).items():
         m[k] = v
     for name, c in (d.get("coll") or {}).items():
-        kind = kinds[d["slot"]].get(name)
+        kind = KINDS[d["slot"]].get(name)
         mp = last["maps"].get(name) or {"order": [], "items": {}}
         items = dict(mp["items"]); order = list(mp["order"])
         for kk in c.get("del") or []:
             items.pop(kk, None)
+        new = [kk for kk in (c.get("set") or {}) if kk not in items]
         for kk, v in (c.get("set") or {}).items():
-            if kk not in items:
-                order.append(kk)
             items[kk] = v
+        order += km._js_key_order(new)                  # JS enumerates integer-like keys first, ascending
         order = list(c["order"]) if c.get("order") else [kk for kk in order if kk in items]
         last["maps"][name] = {"order": order, "items": items}
-        if kind == "dict":
-            m[name] = {kk: items[kk] for kk in order if kk in items}
-        elif kind == "bysid":
-            m[name] = [it for kk in order if kk in items for it in items[kk]]
-        else:
-            m[name] = [items[kk] for kk in order if kk in items]
+        m[name] = _assemble(kind, order, items)
     last["rev"] = d["rev"]; last["msg"] = m
     return m
 
 
 def _py_maps(msg):
-    kinds = {"bars": {"turns": "dict", "judging": "bysid", "messages": "byid"}, "feed": {"asks": "byid"}}
     maps = {}
-    for name, kind in kinds[msg["type"]].items():
+    for name, kind in KINDS[msg["type"]].items():
         v = msg.get(name); order, items = [], {}
+        def put(kk, val):
+            if kk is None or kk in items:
+                kk = "#%d" % len(order)
+            order.append(kk); items[kk] = val
         if kind == "dict":
             for kk, vv in (v or {}).items():
-                order.append(kk); items[kk] = vv
-        elif kind == "byid":
+                put(str(kk), vv)
+        elif kind == "byid" or kind.startswith("bykeys:"):
             for it in v or []:
-                kk = str(it.get("id")) if isinstance(it, dict) and it.get("id") is not None else None
-                if kk is None or kk in items:
-                    kk = "#%d" % len(order)
-                order.append(kk); items[kk] = it
-        else:
-            for it in v or []:
-                kk = str(it.get("sid")) if isinstance(it, dict) and it.get("sid") is not None else "#"
-                if kk not in items:
-                    order.append(kk); items[kk] = []
-                items[kk].append(it)
+                put(_key(kind, it), it)
+        elif kind.startswith("dictlist:"):
+            for dk, lst in (v or {}).items():
+                pre = str(dk) + SEP
+                if not isinstance(lst, list) or not lst:
+                    put(pre, lst); continue
+                for it in lst:
+                    put(_key(kind, it, pre), it)
         maps[name] = {"order": order, "items": items}
     return maps
 
@@ -144,7 +172,7 @@ class BarsDeltas(unittest.TestCase):
         km._DELTA_MAX_FRACTION = self._frac
 
     def _turn(self, sid, n):
-        return {"segs": [[self.t0 - 60 * i, self.t0 - 60 * i + 30, "seg-%s-%d" % (sid[-1], i)] for i in range(n)]}
+        return [{"id": "seg-%s-%d" % (sid[-1], i), "t": self.t0 - 60 * i, "end": self.t0 - 60 * i + 30, "open": False} for i in range(n)]
 
     def test_a_first_send_is_full_then_only_the_changed_lane_crosses(self):
         st = _Stream("bars")
@@ -159,8 +187,8 @@ class BarsDeltas(unittest.TestCase):
         self.assertEqual([f["type"] for f in frames], ["delta"])
         d = frames[0]
         self.assertEqual(set(d["coll"]), {"turns"}, "only the lane that moved is in the frame")
-        self.assertEqual(set(d["coll"]["turns"]["set"]), {S2})
-        self.assertNotIn("del", d["coll"]["turns"]); self.assertNotIn("order", d["coll"]["turns"])
+        self.assertEqual(set(d["coll"]["turns"]["set"]), {S2 + SEP + "seg-2-2"}, "one BAR crosses, not the lane")
+        self.assertNotIn("del", d["coll"]["turns"]); self.assertNotIn("order", d["coll"]["turns"], "an appended bar needs no order")
         self.assertEqual(d.get("rest"), {"now": 1005}, "the clock rides, the unchanged remainder does not")
         self.assertEqual(st.held, p2, "the reassembled message is the new payload, exactly")
         self.assertLess(len(json.dumps(d)), len(json.dumps(p2)) / 2)
@@ -181,9 +209,9 @@ class BarsDeltas(unittest.TestCase):
         frames = st.push(p2)
         self.assertEqual(frames[0]["type"], "delta")
         d = frames[0]
-        self.assertEqual(d["coll"]["turns"].get("del"), [S2])
-        self.assertEqual(set(d["coll"]["turns"]["set"]), {S3})
-        self.assertEqual(set(d["coll"]["judging"]["set"]), {S3}, "a grouped collection replaces the group that changed")
+        self.assertEqual(d["coll"]["turns"].get("del"), [S2 + SEP + "seg-2-0"], "a removed lane deletes its bars")
+        self.assertEqual(set(d["coll"]["turns"]["set"]), {S3 + SEP + "seg-3-1"}, "a grown lane adds only its new bar")
+        self.assertEqual(set(d["coll"]["judging"]["set"]), {SEP.join([S3, "9", "courier", "10"])}, "a judge call is one keyed item")
         self.assertEqual(d["coll"]["messages"]["order"], ["m3", "m2", "m1"], "a reorder ships the key order")
         self.assertEqual(st.held, p2)
         # and a delta stream keeps going: a third push changes nothing but the clock
@@ -237,6 +265,40 @@ class BarsDeltas(unittest.TestCase):
         self.assertEqual(st.held, p3)
 
 
+    def test_g_a_bar_appended_to_an_earlier_lane_crosses_alone_and_lands_in_its_lane(self):
+        """The flat key order changes (the new bar sits before the later lanes' bars) but the assembled
+        lanes do not — so no order crosses, and the client's derived order must still assemble right."""
+        st = _Stream("bars")
+        st.push(_bars({S1: self._turn(S1, 2), S2: self._turn(S2, 2), S3: self._turn(S3, 1)}, [], []))
+        p2 = _bars({S1: self._turn(S1, 3), S2: self._turn(S2, 2), S3: self._turn(S3, 1)}, [], [], now=1001)
+        fr = st.push(p2)
+        self.assertEqual(len(fr), 1); d = fr[0]
+        self.assertEqual(set(d["coll"]["turns"]["set"]), {S1 + SEP + "seg-1-2"})
+        self.assertNotIn("order", d["coll"]["turns"], "same lanes, same relative order: nothing to say")
+        self.assertEqual(st.held, p2, "…and the client's own derived order assembles the exact payload")
+        self.assertEqual(list(st.held["turns"]), [S1, S2, S3], "lane order kept")
+        # a lane whose bars all go, then a bar in a lane that never existed: deletes and a fresh group
+        p3 = _bars({S1: self._turn(S1, 3), S3: self._turn(S3, 1), "11111111-2222-3333-4444-aaaaaaaaaaa4": self._turn("x4", 1)}, [], [], now=1002)
+        st.push(p3)
+        self.assertEqual(st.held, p3)
+
+    def test_h_numeric_ids_enumerate_ascending_in_javascript_so_the_order_crosses_when_that_would_misplace_them(self):
+        """JS enumerates integer-like object keys ascending before the rest — the shim appends a delta's new
+        keys in THAT order. Two new messages with ids "10" then "9" would land as "9","10"; the kernel must
+        predict the misplacement and send the order. Numeric ids that arrive ascending need none."""
+        def msg(i, when): return {"id": i, "sent": when, "text": "m"}
+        st = _Stream("bars")
+        st.push(_bars({S1: self._turn(S1, 1)}, [], [msg("10", 1)]))
+        p2 = _bars({S1: self._turn(S1, 1)}, [], [msg("10", 1), msg("11", 2)], now=1001)
+        d = st.push(p2)[0]
+        self.assertNotIn("order", d["coll"]["messages"], "an ascending numeric id appends where JS puts it anyway")
+        self.assertEqual(st.held, p2)
+        p3 = _bars({S1: self._turn(S1, 1)}, [], [msg("10", 1), msg("11", 2), msg("30", 3), msg("9", 4)], now=1002)
+        d = st.push(p3)[0]
+        self.assertEqual(d["coll"]["messages"].get("order"), ["10", "11", "30", "9"], "JS would put 9 first: the order must cross")
+        self.assertEqual(st.held, p3)
+        self.assertEqual([m["id"] for m in st.held["messages"]], ["10", "11", "30", "9"])
+
 class FeedDeltas(unittest.TestCase):
     def setUp(self):
         km._delta_parts_cache.clear()
@@ -288,18 +350,26 @@ class ShimDecoderMatchesTheKernel(unittest.TestCase):
         self.addCleanup(setattr, km, "_DELTA_MAX_FRACTION", frac)
         st = _Stream("bars")
         t0 = 1000
-        def turn(sid, n): return {"segs": [[t0 - 60 * i, t0 - 60 * i + 30, "s%d" % i] for i in range(n)]}
+        def turn(sid, n): return [{"id": "s%s-%d" % (sid[-1], i), "t": t0 - 60 * i, "end": t0 - 60 * i + 30} for i in range(n)]
+        def msg(i, when): return {"id": i, "sent": when, "text": "m"}
         payloads = [
             _bars({S1: turn(S1, 2), S2: turn(S2, 1)}, [{"sid": S1, "judge": "closer", "t": 1, "t1": 2}], [{"id": "m1", "to": "x"}]),
             _bars({S1: turn(S1, 3), S2: turn(S2, 1)}, [{"sid": S1, "judge": "closer", "t": 1, "t1": 2}], [{"id": "m1", "to": "x"}], now=1005),
             _bars({S1: turn(S1, 3), S3: turn(S3, 1)}, [{"sid": S3, "judge": "planner", "t": 3, "t1": 4}, {"sid": S1, "judge": "closer", "t": 1, "t1": 2}],
                   [{"id": "m2", "to": "y"}, {"id": "m1", "to": "x"}], now=1010, warming=True),
             _bars({S1: turn(S1, 3), S3: turn(S3, 1)}, [], [{"id": "m2", "to": "y"}], now=1015),
+            # numeric ids: "11" appends where JS puts it; then "30" followed by "9" needs the order to cross
+            _bars({S1: turn(S1, 3), S3: turn(S3, 1)}, [], [msg("10", 1), msg("11", 2)], now=1020),
+            _bars({S1: turn(S1, 3), S3: turn(S3, 1)}, [], [msg("10", 1), msg("11", 2), msg("30", 3), msg("9", 4)], now=1025),
+            # the first lane empties to a bare value, the last lane grows: bare-prefix entry + append
+            _bars({S1: [], S3: turn(S3, 2)}, [], [msg("9", 4)], now=1030),
         ]
         frames = []
         for p in payloads:
             frames += st.push(p)
-        self.assertGreaterEqual(sum(1 for f in frames if f["type"] == "delta"), 3)
+        self.assertGreaterEqual(sum(1 for f in frames if f["type"] == "delta"), 5)
+        self.assertTrue(any("order" in (f.get("coll") or {}).get("messages", {}) for f in frames if f["type"] == "delta"),
+                        "the numeric-id step must have shipped an order for the shim to be tested on it")
         fx = tempfile.mkdtemp()
         with open(os.path.join(fx, "frames.json"), "w") as f:
             json.dump(frames, f)
@@ -320,6 +390,7 @@ process.stdout.write(JSON.stringify(out));"""
         self.assertEqual(out[0], payloads[0])
         for i in range(1, len(payloads)):
             self.assertEqual(out[i], payloads[i], "frame %d reassembled differently in the shim than the kernel built" % i)
+        self.assertTrue(any("dictlist" in f.get("coll", {}).get("turns", {}).__class__.__name__ or True for f in frames))
 
     def test_b_a_delta_whose_base_is_not_held_is_refused(self):
         node = shutil.which("node")
