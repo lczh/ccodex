@@ -141,6 +141,51 @@ class RiderCap(_Riders):
                         "two landed calls drained the whole backlog")
         self.assertEqual(len(store.get("closedTurns") or []), 2)
 
+    def test_never_looked_riders_outrank_re_armed_ones_under_the_cap(self):
+        # review find 2026-09-03: every landed reply's own filing re-arms the riders an EARLIER call stamped
+        # (_filed_since), and those are older-minted — so under plain mint order a backlog past twice the
+        # room never drained while the top kept receiving filings: the same six rode every call, the rest
+        # never rode once. Here every landed call files one more done under the top (the wrapped
+        # apply_close); with 20 riders against a room of CLOSE_RIDER_CAP each call must still admit riders
+        # that have never been looked at, so the whole backlog rides within ceil(20 / room) landed calls.
+        s = _store()
+        _node(s, "P", "Ship the notes-api search", trail=["seg-a", "seg-b"])
+        leaves = _starved_leaves(s, "P", 20, first=0)
+        jd.save_goals(SID, s)
+        n_turns = 6
+        recs = []
+        for k in range(n_turns):
+            t = T0 + 200 * (k + 1)
+            recs.append(_uline(t, "step %d please" % k, "u%d" % k, ("a%d" % (k - 1)) if k else None))
+            recs.append(_aline(t + 30, "Done with step %d." % k, "a%d" % k, "u%d" % k))
+        path = os.path.join(self.td, SID + ".jsonl")
+        Path(path).write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        real_apply = jd.apply_close
+        filed = [0]
+
+        def apply_and_file(store, menu, verdicts, t=None, **kw):
+            out = real_apply(store, menu, verdicts, t=t, **kw)
+            filed[0] += 1                                  # the top receives one more filing per landed call
+            _node(store, "P-filed%d" % filed[0], "another shipped step", parent="P", done=True,
+                  log=[{"ev_t": (t or T0) + 1, "src": "planner", "kind": "done", "at": (t or T0) + 1}])
+            return out
+        jd.apply_close = apply_and_file
+        try:
+            jd._close_session(SID, path, T0 + 5000)
+        finally:
+            jd.apply_close = real_apply
+        room = jd.CLOSE_RIDER_CAP
+        self.assertEqual(len(self.menus), n_turns, "one landed call per ended turn")
+        need = -(-20 // room)                              # ceil(20 / room)
+        rode_by_need = set()
+        for m in self.menus[:need]:
+            rode_by_need |= set(m)
+        self.assertTrue(set(leaves) <= rode_by_need,
+                        "every rider must ride within %d calls; never rode: %s"
+                        % (need, sorted(set(leaves) - rode_by_need)))
+        for k in range(1, n_turns):
+            self.assertTrue(set(self.menus[k]) & set(leaves), "each call still carries riders (the drain never idles)")
+
     def test_the_turns_own_menu_is_never_capped(self):
         # the cap is on RIDERS: a turn whose own menu exceeds the cap (a segment placed on the deepest
         # step of a long open chain — _turn_menu lists the node plus every open ancestor) still asks
@@ -228,6 +273,40 @@ class StatusPriority(_Riders):
         menu = self.menus[0]
         self.assertEqual(set(menu), set(tops), "every status rider rides, past the cap; no starved fits this call")
         self.assertFalse(any(s["nodes"][i].get("closerLookT") for i in lt), "the cut riders stay armed")
+
+
+class SweepCutDrain(_Riders):
+    def test_a_cut_walk_rotates_a_dead_session_to_the_back_of_the_death_drain(self):
+        # review find 2026-09-03: a dead session's marker stays pending after a cut walk (its turns are
+        # reachable only through the death drain), and _death_pending drains the OLDEST marker first — so
+        # a turn whose call dies the same way every pass would hold the head of the queue for good, and
+        # DEATH_DRAIN_PER_PASS such sessions would starve every newer dead session. The cut now touches the
+        # marker: it waits at the back, one doomed call per pass, and is never finalized off the cut walk.
+        s = _store()
+        _node(s, "P", "Ship the notes-api search", trail=["seg-a", "seg-b"])
+        _starved_leaves(s, "P", 3, first=0)
+        jd.save_goals(SID, s)
+        path = os.path.join(self.td, SID + ".jsonl")
+        recs = [_uline(T0, "look at the search index", "u1"),
+                _aline(T0 + 30, "Looked; nothing to change.", "a1", "u1")]
+        Path(path).write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        jd.GONEDIR.mkdir(parents=True, exist_ok=True)
+        jd._write_death_marker(SID, {"t": T0 + 100})
+        marker = jd.GONEDIR / (SID + ".json")
+        os.utime(marker, (T0, T0))                         # the oldest marker in the queue
+        before = marker.stat().st_mtime_ns
+
+        def dead_call(*a, **k):                           # the call died: _judge_run's failure traces, no reply
+            jd._judge_ctx.last_call_fail = {"note": "exit -14", "model": "sonnet"}
+            return ""
+        jd.closer_llm = dead_call
+        jd._judge_ctx.paused = False
+        jd._close_session(SID, path, T0 + 5000)
+        self.assertGreater(marker.stat().st_mtime_ns, before, "the cut rotated the marker to the back of the queue")
+        m = json.loads(marker.read_text())
+        self.assertNotIn("endedAt", m, "a cut walk never finalizes the marker (its turns are still unswept)")
+        rows = [json.loads(l) for l in open(jd.ERRORS) if l.strip()]
+        self.assertTrue(any(r.get("err") == "sweep-cut" for r in rows), "the cut is said loudly")
 
 
 if __name__ == "__main__":

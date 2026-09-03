@@ -7011,6 +7011,51 @@ class FailureContract(unittest.TestCase):
         for word in ("exit -14", "model=gpt-5-test", "chars=2", "ms="):
             self.assertIn(word, row["note"], "the row carries the evidence and the call shape")
 
+    def test_codex_engine_served_call_clears_the_latch_and_the_stash(self):
+        # review find 2026-09-03: the codex exits above arm the model-health latch and the sweep-cut stash,
+        # but the codex SERVED path never called _mark_call_served nor cleared last_call_fail (the claude
+        # branch does both) — one failed call left the model 'degraded' for the process's life, three spread
+        # over any span read as "N in a row", and a stale stash outlived served replies. The served exit
+        # now leaves the same recovery edge on both engines.
+        import types
+        from pathlib import Path
+        saved = (jd.subprocess, getattr(jd._judge_ctx, "fsid", None), jd._judge_cmd_codex, jd._judge_engine)
+        captured = {}
+
+        def cmd(model, effort, outp):
+            captured["outp"] = outp
+            return ["codex-stub"]
+
+        def dead(*a, **k):
+            return types.SimpleNamespace(stdout="", stderr="", returncode=-14)
+
+        def served(*a, **k):
+            os.makedirs(os.path.dirname(captured["outp"]), exist_ok=True)
+            Path(captured["outp"]).write_text('{"done": [], "block": []}', encoding="utf-8")
+            return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+        jd._judge_cmd_codex = cmd
+        jd._judge_engine = lambda: "codex"
+        jd._judge_ctx.fsid = "sid-cx2"
+        jd._judge_ctx.last_call_fail = None
+        with jd._health_lock:
+            jd._CALL_HEALTH["stats"].pop("gpt-5-test", None)
+            jd._CALL_HEALTH["degraded"].discard("gpt-5-test")
+        try:
+            jd.subprocess = types.SimpleNamespace(run=dead)
+            self.assertEqual(jd._judge_run("gpt-5-test", "S", "U", judge="closer"), "")
+            self.assertIsInstance(jd._judge_ctx.last_call_fail, dict, "the failure is stashed")
+            with jd._health_lock:
+                self.assertEqual(jd._CALL_HEALTH["stats"]["gpt-5-test"]["fails"], 1, "the failure latched")
+            jd.subprocess = types.SimpleNamespace(run=served)
+            out = jd._judge_run("gpt-5-test", "S", "U", judge="closer")
+        finally:
+            jd.subprocess, jd._judge_ctx.fsid, jd._judge_cmd_codex, jd._judge_engine = saved
+        self.assertEqual(out, '{"done": [], "block": []}', "the served reply reaches the caller")
+        self.assertIsNone(jd._judge_ctx.last_call_fail, "a served reply retires the stash on this engine too")
+        with jd._health_lock:
+            self.assertNotIn("gpt-5-test", jd._CALL_HEALTH["stats"], "the consecutive-failure count resets")
+            self.assertNotIn("gpt-5-test", jd._CALL_HEALTH["degraded"], "the model is not degraded for life")
+
     def test_dead_cli_call_row_carries_the_call_shape(self):
         # 2026-09-03: 192 consecutive alarm kills (exit -14) read as "the CLI is dying" until a reader
         # correlated the served calls' duration with their OUTPUT size — the kills were healthy-but-slow

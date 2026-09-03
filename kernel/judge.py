@@ -1180,6 +1180,9 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
                 _log_judge_usage(judge or tier, tier, (model if str(model).startswith("gpt") else "codex-default"),
                                  fsid, {"duration_ms": int((recv - sent) * 1000)}, sent, recv)
                 _auth_down_clear(fsid)                # a successful billed call clears either engine's latch
+                _mark_call_served(model)              # THIS model serves again → the give-up re-arm edge (the
+                _judge_ctx.last_call_fail = None      # claude branch's pair, review find 2026-09-03: without them a
+                                                      # failed codex call stayed 'degraded' for the process's life)
                 return reply
             finally:
                 try:
@@ -10106,7 +10109,14 @@ def _close_turn(store, turn, samples=None, seg_by_id=None):
     # (each landed call stamps its riders; nothing is lost; no successful close is ever capped). Channel
     # membership (the dedupe order above) and the menu's layout are unchanged: only which riders survive
     # is decided here.
-    renom = [nd for nd, _ in lifted] + cands + starved
+    # NEVER-LOOKED FIRST (review find, 2026-09-03): a landed reply's own filing re-arms the riders an EARLIER
+    # call stamped (_filed_since), and those are older-minted, so under plain mint order they would outrank
+    # riders that have never ridden for as long as the top keeps receiving filings — a backlog past twice
+    # the room never drained while the effort was active. Unstamped riders take the room first; inside each
+    # group the channel order (lifted → steps-finished → starved) and the mint order are unchanged.
+    ranked = [(0, nd) for nd, _ in lifted] + [(1, nd) for nd in cands] + [(2, nd) for nd in starved]
+    ranked.sort(key=lambda p: (bool(p[1].get("closerLookT")), p[0], p[1].get("t", 0)))
+    renom = [nd for _, nd in ranked]
     n_cut = 0
     if CLOSE_RIDER_CAP is not None:
         room = max(0, CLOSE_RIDER_CAP - len(status))
@@ -10423,12 +10433,17 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
     # (_death_pending skips finalized markers): finalizing its marker now would strand those turns for
     # good (review find, 2026-09-03). The one-shot epilogue waits for a pass that walks to the end.
     _death_finalize(fsid, store, settled and not cut)  # the death marker's one-shot epilogue (2026-08-13)
+    if cut:
+        _death_rotate(fsid)                           # …and a cut dead session waits its turn behind the others
     return newly
 DEATH_DRAIN_PER_PASS = CONCURRENCY   # a QUEUE-DRAIN bound on death-pending finalizes per closer pass —
 #   NOT a fairness cap on live sessions (those were removed 2026-06-30 and stay removed): the pending
 #   set is a finite backlog that strictly shrinks (every drained marker gains endedAt, superseded ones
 #   retire), so the bound only spreads the one-time upgrade backfill over successive passes instead of
-#   letting the first post-upgrade pass submit hundreds of dead stores at once.
+#   letting the first post-upgrade pass submit hundreds of dead stores at once. ONE exception (2026-09-03):
+#   a marker whose walk was sweep-CUT stays pending (its turns are reachable only through this drain),
+#   and _death_rotate moves it to the BACK of the oldest-first queue, so it costs one call per pass
+#   behind every newer marker instead of pinning a slot at the head.
 DEATH_BACKFILL_WINDOW = 365 * 86400  # how far back the drain resolves a dead sid's transcript (cached
 #   per (window, forks) like the picker's wide walk — one filesystem walk, not one per marker)
 _gone_memo = {}                      # sid -> (marker mtime_ns, finalized) — a finalized marker is skipped
@@ -10490,6 +10505,24 @@ def _death_pending(exclude):
         if len(out) >= DEATH_DRAIN_PER_PASS:
             break
     return out
+
+
+def _death_rotate(fsid):
+    """A sweep-CUT walk left this dead session's marker pending (see _close_session). _death_pending drains
+    the OLDEST marker first, so a marker whose walk is cut every pass — a turn whose call dies the same way
+    each time — would hold the head of the queue for good, and DEATH_DRAIN_PER_PASS such sessions would
+    starve every newer dead session of its sweep and its 'ended' settle (review find, 2026-09-03). Touch the
+    marker so it takes its place at the BACK: one doomed call per pass, behind everyone else, and the
+    drain's bound stays honest. A give-up after repeated cuts is the follow-up the sweep-cut row names."""
+    m = _death_marker(fsid)
+    if not isinstance(m, dict) or "endedAt" in m:
+        return
+    try:
+        os.utime(GONEDIR / (fsid + ".json"), None)
+    except OSError:
+        pass
+
+
 def _death_finalize(fsid, store, settled):
     """The death marker's one-shot finalize, run at the end of every _close_session (2026-08-13).
     No marker (the common case) → one small-json read, no-op. A marker SUPERSEDED by newer states
