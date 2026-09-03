@@ -533,14 +533,42 @@ class Lifecycle(unittest.TestCase):
         self.addCleanup(setattr, cb, "CLIENT_RETRY_MIN", saved_floor)
         be, _, _ = build(factory=flaky_factory)
         sid = be.spawn("web", "/TESTDIR")
+        # The release below is a KICK, and the worker clears stale kicks right before its backoff
+        # wait (_work: kick.clear() -> dead check -> kick.wait(delay)). A kick landing in the window
+        # between the failed attempt and that clear is swallowed, and the worker then sleeps the
+        # pinned 30s floor -- past any bound (a full suite on a loaded runner, 2026-09-03: one
+        # failure at the recovery bound, green alone). So the release waits for the EVENT it needs,
+        # the worker entering its backoff wait, observed on the one kick.wait call that passes a
+        # timeout. The stall in _client_retry_remaining (called once per failed attempt, just
+        # before the clear) holds that window open on purpose: a release that does not wait for
+        # the park fails here every time instead of once per thousand runs. In production the same
+        # window costs a send or client-generation kick at most one backoff wait (CLIENT_RETRY_MAX)
+        # of latency before the queue is re-read -- bounded, and not what this test is about.
+        s = be._session(sid)
+        parked = threading.Event()
+        real_wait = s.kick.wait
+
+        def wait_marking_the_park(timeout=None):
+            if timeout is not None:
+                parked.set()
+            return real_wait(timeout)
+
+        s.kick.wait = wait_marking_the_park
+        real_remaining = be._client_retry_remaining
+
+        def stalled_remaining():
+            r = real_remaining()
+            time.sleep(0.1)
+            return r
+
+        be._client_retry_remaining = stalled_remaining
         self.assertTrue(be.send(sid, "retry me"))
         self.assertTrue(until(lambda: len(attempts) == 1), "the first attempt fires")
-        time.sleep(0.05)
+        self.assertTrue(parked.wait(5), "the worker parks in its backoff wait after the failure")
         self.assertEqual(len(attempts), 1, "unavailable client must not hot-spin")
         with be._client_lock:
             be._client_retry_at = 0.0                  # the explicit release, not a timer race
-        for _, s in be._session_items():
-            s.kick.set()
+        s.kick.set()                                   # ...delivered to a worker provably past its clear
         # a GENEROUS bound: the recovery is event-shaped (the explicit release above is
         # the event), so only "eventually" matters — the 3s bound starved the worker
         # thread on a runner at load 20+ (the r63 release gate: a 55-minute full suite)
