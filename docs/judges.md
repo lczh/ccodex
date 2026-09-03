@@ -318,6 +318,24 @@ While the account usage window is exhausted, the rate gate skips every call
 across every session and logs one `rate-limited` row per window; gate skips count
 toward nothing.
 
+- **The closer bounds its own call and its own sweep.** Behind a turn's own
+  goals the closer carries *riders*: open work nominated from elsewhere (a goal
+  whose recorded steps are all finished, a starved leaf, a lifted card, and on
+  a status-report turn every open top). One session's closer calls were once
+  killed by the call timer 192 times in a row inside a single per-session
+  sweep, silencing every judge for six hours: the menu carried 24 riders, the
+  reply did not fit under the timer, and a killed call stamps nothing, so the
+  identical menu rode the next turn. Two bounds, neither a fairness cap.
+  `CLOSE_RIDER_CAP` limits the re-nominating riders per call (never the turn's
+  own goals, never the status riders, which are one-shot per status turn),
+  never-looked riders first; a cut rider rides a later landed call, so the
+  backlog drains one landed call at a time. And a FAILED call (a kill, a
+  subprocess error, an API error envelope, on either engine) ends that
+  session's sweep for the pass with one `sweep-cut` row naming the turns left
+  behind and the shape of the menu that died; parse rejects and pause-skips
+  still walk on. A dead session cut this way keeps its marker pending and
+  waits at the back of the death drain, so it cannot starve the others.
+
 ## Billing, and when the credential itself is broken
 
 A judge call bills **the account of the session it judges** — the same pick the
