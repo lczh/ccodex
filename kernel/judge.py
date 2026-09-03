@@ -10,7 +10,7 @@ CLI:
   romp-judge --once               # one caption pass over the live fleet (writes captions/)
   romp-judge --test <transcript>  # caption one transcript's recent units, print them (no write)
 """
-import contextlib, errno, hashlib, json, os, re, secrets, shutil, stat, sys, tempfile, time, subprocess, threading
+import contextlib, errno, hashlib, json, os, re, secrets, shutil, signal, stat, sys, tempfile, time, subprocess, threading
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -207,7 +207,11 @@ JUDGE_FAIL_CAP = 3                       # the same rule for every other retryin
 #                                          3 genuine parse rejects on the SAME work item → a loud "give-up" row,
 #                                          then quiet until the item's own event re-arms it (a turn gaining atoms,
 #                                          a top set changing). Call-level failures never count — only replies the
-#                                          model actually wrote. Closer / grouper / consolidator / courier; the
+#                                          model actually wrote — with ONE exception: the closer strikes a KILLED
+#                                          call (the timer ending it; never an API error or a process that ended
+#                                          another way) against the turn it died on, _call_fail_kill /
+#                                          _close_strike. Closer / grouper /
+#                                          consolidator / courier; the
 #                                          planner (PLAN_PARSE_RETRIES) and distiller/briefer (DISTILL_FAIL_CAP)
 #                                          already had their own.
 PLACEMENTS_V = 9                         # placements-identity schema version (plan P2, the user 2026-07-06).
@@ -281,7 +285,9 @@ JUDGE_JSON_CAP = 20000                    # cap a planner/closer reply BEFORE pa
 DISTILL_FAIL_CAP = 3                      # consecutive distill/brief CALL fails on ONE goal before we give up
                                          # and settle its card to the "" sentinel — so a persistently-failing
                                          # LLM call self-heals instead of looping "(generating…)" every pass
-                                         # forever (the user 2026-06-24). Mirrors PLAN_PARSE_RETRIES.
+                                         # forever (the user 2026-06-24). Mirrors PLAN_PARSE_RETRIES. Also
+                                         # bounds the closer's two no-reply streaks (_close_strike): the
+                                         # safeguards tombstone and, since 2026-09-03, the kill streak.
 DISTILL_WORK_CHARS = 24000               # cap the work history fed to a distill/brief call (keep the most
                                          # recent tail): an unbounded subtree could time out the Sonnet call
                                          # (logged "call"); the recent work is what the brief needs anyway.
@@ -300,7 +306,11 @@ CLOSE_FAIRNESS = None                    # per-session turn-close cap — REMOVE
                                          # That stance stands — successful closes are never capped. Two bounds
                                          # added 2026-09-03 are NOT fairness caps: CLOSE_RIDER_CAP (below) is a
                                          # queue drain across LANDED calls, and _close_session ends a session's
-                                         # walk at its first FAILED call (parse rejects and pause-skips walk on).
+                                         # walk at its first FAILED call (parse rejects and pause-skips walk on)
+                                         # UNTIL that turn's KILLED calls — the timer ending the call; never an
+                                         # API error or a process that ended another way, which leave no
+                                         # strike — reach DISTILL_FAIL_CAP at one size: then the turn is
+                                         # adopted loudly (a give-up row) and the walk goes on.
 CLOSE_RIDER_CAP = 6                      # RIDERS per closer call — the steps-finished / starved / status /
                                          # lifted nominations that ride BEHIND the turn's own menu (which is
                                          # never capped). 2026-09-03: one session's closer calls were
@@ -1052,6 +1062,18 @@ def _with_user_notes(sys_prompt, judge):
             "a note conflicts with the rules above, the note wins:\n<user-notes>\n" + notes + "\n</user-notes>")
 
 
+_KILL_EXC = subprocess.TimeoutExpired    # the CALL_ALARM_S + 5 backstop firing: the ONE subprocess exception that is a
+#                                          KILL (the call ran to the timer; _call_fail_kill). Bound at import so a test
+#                                          that swaps `subprocess` for a stub cannot unbind it. Every other exception is
+#                                          the OS answering (a missing binary, a broken pipe): transient.
+_KILL_RC = -signal.SIGALRM               # the other kill shape: the perl `alarm` wrapper's SIGALRM landing on the exec'd
+#                                          child, read as the returncode at the two empty-output exits. A clean exit of
+#                                          ANY code (0: exec failed under the wrapper — a missing binary; 1: a startup
+#                                          crash, or a codex refusal) or any other signal is the process answering:
+#                                          transient (second review, 2026-09-03 — stamped on every empty exit, a broken
+#                                          install would have tombstoned every turn it touched after three passes).
+
+
 def _call_shape(model, sys_prompt, user, sent):
     """The grep-able shape of a FAILED call for its 'call' row: the model, the prompt size in chars
     (system + user — the SIZE only, never the text) and the wall-clock ms since it was sent. 2026-09-03:
@@ -1154,7 +1176,8 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
                     # the same three traces the claude branch leaves (2026-09-03): the stash the closer's
                     # sweep-cut keys on, the model-health latch, and the call shape for the grep — without
                     # them an alarm-killed closer call on this engine walked on exactly as before the fix
-                    _judge_ctx.last_call_fail = {"note": type(e).__name__, "model": model}
+                    _judge_ctx.last_call_fail = {"note": type(e).__name__, "model": model,
+                                                 "kill": isinstance(e, _KILL_EXC)}   # the backstop timer only
                     _mark_call_failed(model, type(e).__name__)
                     _log_judge_error(judge or tier, fsid, "call",
                                      note="%s %s" % (type(e).__name__, _call_shape(model, sys_prompt, user, sent)))
@@ -1169,7 +1192,11 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
                     # dead/refused call — the -o file is the only success signal; record the evidence, and
                     # leave the same three traces the claude branch leaves (2026-09-03, see the except above)
                     fail = "codex empty reply (exit %s)" % getattr(p, "returncode", "?")
-                    _judge_ctx.last_call_fail = {"note": fail, "model": model}
+                    _judge_ctx.last_call_fail = {"note": fail, "model": model,
+                                                 "kill": getattr(p, "returncode", None) == _KILL_RC}
+                    # ^ a KILL only if the alarm's signal ended it. This engine has no error-envelope exit: a
+                    #   usage-limit refusal, an auth or network failure all end HERE as a clean nonzero exit with
+                    #   no -o file — the process answering, transient (second review, 2026-09-03)
                     _mark_call_failed(model, fail)
                     _log_judge_error(judge or tier, fsid, "call",
                                      note="%s: %s %s"
@@ -1214,7 +1241,8 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
             # _judge_run owns ALL call-level logging (this, the error envelope below, the rate gate above)
             # so callers never double-log: to a caller every failed call is just "", and "call" rows always
             # carry the judge's own name + fsid (pre-07-09 rows said "index"/"triage" with no session).
-            _judge_ctx.last_call_fail = {"note": type(e).__name__, "model": model}
+            _judge_ctx.last_call_fail = {"note": type(e).__name__, "model": model,
+                                         "kill": isinstance(e, _KILL_EXC)}   # the backstop timer only (_call_fail_kill)
             _mark_call_failed(model, type(e).__name__)
             _log_judge_error(judge or tier, fsid, "call",
                              note="%s %s" % (type(e).__name__, _call_shape(model, sys_prompt, user, sent)))
@@ -1275,7 +1303,11 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
             # fallback hides the very breakage we need to know about).
             _judge_ctx.last_call_fail = {
                 "note": "the model CLI died with no output (exit %s)" % getattr(p, "returncode", "?"),
-                "model": model}
+                "model": model,
+                "kill": getattr(p, "returncode", None) == _KILL_RC}   # the alarm's signal, and nothing else: a
+            #                                                          clean exit (0: exec failed under the
+            #                                                          wrapper; 1: a startup crash) or another
+            #                                                          signal is the process answering (transient)
             _mark_call_failed(model, _judge_ctx.last_call_fail["note"])
             _log_judge_error(judge or tier, fsid, "call",
                              note="empty stdout (exit %s): %s %s"
@@ -10212,17 +10244,23 @@ def _close_turn(store, turn, samples=None, seg_by_id=None):
     out = _parse_close(raw, len(menu))
     if out is None:
         if not raw:
-            return None                                # the CALL failed (logged by _judge_run) → retry next
-            #                                            pass; never counts toward the give-up cap
+            return None                                # the CALL failed (logged by _judge_run): _close_session
+            #                                            cuts the session's walk, and strikes THIS turn only
+            #                                            for a KILL (_call_fail_kill) — any other failure
+            #                                            retries next pass with no strike
         _log_judge_error("closer", store.get("rompUuid"), "parse", note="reply tail: %r" % raw[-160:],
                          goal=[nd["id"] for nd in menu])
         fails = store.setdefault("closeFails", {})
-        fails[turn["id"]] = fails.get(turn["id"], 0) + 1
+        prev = fails.get(turn["id"])
+        # a parse streak of its own (an int): a dict here is a NO-REPLY streak — a kill or a safeguards
+        # refusal, see _close_strike — that this served reply just ended, so the parse count starts at 1
+        # (before kinds were kept apart this line did `dict + 1` on a safeguards record: a TypeError)
+        fails[turn["id"]] = (prev + 1) if isinstance(prev, int) else 1
         if fails[turn["id"]] >= JUDGE_FAIL_CAP:
             fails.pop(turn["id"], None)
             _log_judge_error("closer", store.get("rompUuid"), "give-up",
                              goal=[nd["id"] for nd in menu], note="%d parse rejects on turn %s; skipping it until the turn gains atoms"
-                                  % (JUDGE_FAIL_CAP, str(turn["id"])[:12]))
+                                  % (JUDGE_FAIL_CAP, _turn_tag(turn["id"])))
             return []                                  # give up on THIS turn: no verdicts, and the caller
             #                                            marks it closed at its current size — a new atom
             #                                            changes the size signature and re-judges (event re-arm)
@@ -10303,6 +10341,57 @@ def _turn_open(turn, turns):
     no idle terminator. Same gate the captioner/planner use — the closer only runs on ended turns."""
     return (turn is turns[-1] and not turn["ended"]
             and not any(a["type"] == "idle" for a in turn["atoms"]))
+
+
+def _call_fail_kill(last):
+    """True when `last`, _judge_run's per-thread failure stash, records a KILL: the call RAN TO THE TIMER,
+    and nothing else (review finds, 2026-09-03, twice). Two shapes, both stamped by _judge_run as
+    `kill: True` and read here as that flag alone — never a match on note text: the perl `alarm`
+    wrapper's SIGALRM landing on the exec'd child, seen as returncode == -signal.SIGALRM (_KILL_RC) at the
+    two empty-output exits (the claude dead-CLI exit, the codex empty-reply exit); and
+    subprocess.TimeoutExpired (_KILL_EXC, the CALL_ALARM_S + 5 backstop) in either engine's exception
+    handler. Why the timer and only the timer: served duration tracks OUTPUT size (_call_shape), so a
+    call the timer ends is prompt-shaped — plausibly deterministic at one (turn, fp), the way a safeguards
+    refusal is at one prompt — and that is what justifies adopting a turn without verdicts. Everything
+    else is the API or the process ANSWERING, with an error in place of a reply, and says nothing about
+    the prompt: an error envelope (a 529, an auth error, a 429); a clean exit of any code with empty
+    output (0: exec failed under the wrapper — a missing binary; 1: a startup crash, or on codex — which
+    has no envelope exit — a usage-limit refusal, an auth or network failure); any other signal; any other
+    exception. Those stamp no flag and read transient here: they still cut the session's walk, loudly, and
+    leave no strike — their recovery is the storm ending or the install being fixed, and struck against a
+    turn, either would adopt a live turn for good after three passes (an end-known turn of a live session
+    never grows). Only kills are struck (_close_strike, the cut arm of _close_session). The producer knows
+    the class; this reader only asks."""
+    return isinstance(last, dict) and bool(last.get("kill"))
+
+
+def _close_strike(rec, fp, kind):
+    """The closer's strike count for one turn after one more NO-REPLY strike of `kind` — "safeguards" (the
+    filter refused this turn's content) or "kill" (the call ran to the timer: _call_fail_kill) — on a
+    turn of `fp` atoms, given the turn's current `closeFails` record. closeFails holds ONE record per
+    turn, so the rule is: the latest kind wins, and nothing adds up. The count continues only when the
+    record is the same kind at the same size; a record of another kind, or from another size (the turn
+    grew — a different prompt, new evidence), or no dict at all (the parse path's int) starts over at 1,
+    and the caller's new record replaces the old. Kinds never add up because they are different
+    evidence: a refusal is deterministic per prompt and a kill is only plausibly so, so two kills and a
+    refusal would tombstone a turn the filter refused once, and the row would say three refusals. A
+    parse reject is the third kind and lives outside this helper (an int, _close_turn): the model
+    ANSWERED that prompt, which ends any no-reply streak, and one no-reply never counts toward the parse
+    cap. A transient call failure is no strike of any kind and leaves the record as it stands (why: the
+    cut arm). A record with no kind predates kinds and was written by the safeguards arm, the only
+    writer then: it reads as safeguards and continues that count at the same fp."""
+    if not isinstance(rec, dict) or rec.get("fp") != fp or rec.get("kind", "safeguards") != kind:
+        return 1
+    return int(rec.get("fails") or 0) + 1
+
+
+def _turn_tag(tid):
+    """A turn id for a log row. Ids are `sid:t:hash` (event_model), so the first 12 chars name only the
+    session — the same for every turn of it. The tail tells turns apart; the row's fsid already has the sid."""
+    s = str(tid)
+    return s.split(":", 1)[1] if ":" in s else s[:12]
+
+
 def _closed_turns(store):
     """Turn ids the closer has already processed. Reads `closedTurns`, falling back to the pre-rename
     `sweptTurns` key so existing stores don't re-run the whole backlog after the rename."""
@@ -10347,8 +10436,25 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
     clears it) — NOT `res is None`, which a parse reject under the cap also returns. The safeguards
     tombstone keeps its own arm. A loop `break`, never a return: the store still saves below and
     _death_finalize still runs — told NOT settled, so a dead session's marker is never finalized off a
-    walk that left turns unswept (they are reachable only through the death drain). Returns the node ids
-    newly completed."""
+    walk that left turns unswept (they are reachable only through the death drain).
+
+    REPEATED KILLS ON ONE TURN GIVE IT UP (2026-09-03, the follow-up the sweep-cut row named): a cut by
+    a KILL — the call ran to the timer: the alarm's signal as its exit code, or TimeoutExpired
+    (_call_fail_kill) — is also struck against the turn it died on, at its current size, in a streak of
+    its own kind (_close_strike). The walk is cut at a failed call UNTIL that turn's kills reach
+    DISTILL_FAIL_CAP; then the turn is adopted exactly as the safeguards give-up adopts one — swept +
+    closedSig at fp, no verdicts — with one loud give-up row, and the walk CONTINUES to the next turn in
+    the same pass. Without it a live session whose head turn's call died the same way every pass (a menu
+    the timer cannot fit even capped, a prompt the model never finishes) cost one doomed call per pass
+    forever, and its later end-known turns were never reached, since every walk ended at the head; a dead
+    session at least rotated to the back of the death drain. A cut by any OTHER failure — an error
+    envelope (a 529, an auth error), a process that ended any way other than the timer (a crash, a
+    refusal, a missing binary), another exception — is the API or the process answering: it cuts the
+    walk just as loudly but is no strike, and leaves a kill streak exactly as it stands (a storm interleaved
+    with kills is evidence about the API, not about the prompt; erasing the streak would lose what the
+    kills said, and counting it would tombstone a live turn off a thirty-second storm). The re-arm event
+    is the turn GROWING (the closedSig growth check), new evidence, never a clock; a call for the turn
+    LANDING retires the record. Returns the node ids newly completed."""
     _judge_ctx.fsid = fsid                            # usage logging: attribute this session's judge calls
     session = parsed_session(fsid, [path], now)
     store = load_goals(fsid)
@@ -10376,15 +10482,15 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
             # at the cap, adopt the turn exactly as a success would (swept + closedSig at fp), loudly —
             # the turn GROWING then re-judges it through the same closedSig growth check that re-judges
             # any closed turn, so the re-arm event is new evidence, never a clock. Transient failures
-            # (529s, timeouts) keep the plain retry: their recovery is the storm ending, and each pass
-            # costs one call, not a give-up.
+            # (an error envelope: a 529, an auth error) keep the plain retry: their recovery is the storm
+            # ending, and each pass costs one call, not a give-up. A KILL streak — the call running to
+            # the timer, prompt-shaped — takes the cut arm below and its own give-up.
             if not getattr(_judge_ctx, "paused", False):
                 last = getattr(_judge_ctx, "last_call_fail", None)
                 fail_note = str(last.get("note") or "") if isinstance(last, dict) else ""
                 if isinstance(last, dict) and "safeguards flagged" in fail_note:
                     fails = dict(store.get("closeFails") or {})
-                    rec = fails.get(tid) if isinstance(fails.get(tid), dict) else None
-                    k = (rec.get("fails", 0) + 1) if rec and rec.get("fp") == fp else 1
+                    k = _close_strike(fails.get(tid), fp, "safeguards")   # its own streak: a cut never counts here
                     if k >= DISTILL_FAIL_CAP:
                         swept.add(tid); sig[tid] = fp; did += 1
                         fails.pop(tid, None)
@@ -10392,7 +10498,7 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
                                          note="%d safeguards refusals on this turn's content; swept "
                                               "without verdicts; the turn growing re-judges it" % k)
                     else:
-                        fails[tid] = {"fp": fp, "fails": k}
+                        fails[tid] = {"fp": fp, "fails": k, "kind": "safeguards"}
                     store["closeFails"] = fails
                 elif isinstance(last, dict):
                     # SWEEP CUT (2026-09-03): the CALL failed — a dead CLI (the alarm kill), a subprocess
@@ -10401,24 +10507,61 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
                     # just died (its riders re-nominate until a LANDED reply stamps them, so the same
                     # menu rides every turn); one session's 192 consecutive kills held every judge for
                     # every session silent for 6h22m. End THIS session's walk for the pass, loudly, with
-                    # the shape of what was sent. The turn keeps the retry-next-pass contract (no strike,
-                    # no tombstone). A `break`, never a return: the store must still save and
-                    # _death_finalize must still run below.
-                    remaining = sum(1 for t in turns[ti + 1:]
-                                    if not _turn_open(t, turns)
-                                    and not (t["id"] in swept
-                                             and sig.get(t["id"], len(t["atoms"])) == len(t["atoms"])))
+                    # the shape of what was sent. A `break`, never a return: the store must still save
+                    # and _death_finalize must still run below.
+                    # …AND, FOR A KILL, STRIKE THE TURN (2026-09-03, the follow-up that row named): a
+                    # call that ran TO THE TIMER — the alarm's signal as its exit code, or TimeoutExpired
+                    # (_call_fail_kill) — is struck against this turn at its current size, the way
+                    # the arm above strikes a refusal, in its own streak (kind "kill" — a parse reject
+                    # means the model answered, a kill means it never did; _close_strike keeps the kinds
+                    # apart). Below the cap the walk is cut as above and the turn keeps the
+                    # retry-next-pass contract. AT the cap the turn is adopted exactly as the safeguards
+                    # give-up adopts one — swept + closedSig at fp, no verdicts — loudly, and the walk goes
+                    # ON to the next turn in this same pass: a live session whose head turn's call died
+                    # the same way every pass was cut at that turn every pass, so its later end-known
+                    # turns were never reached. The re-arm is the turn GROWING (the closedSig growth
+                    # check): new evidence, never a clock. A landed call for the turn retires the record
+                    # (below), as it does the parse strikes. Any OTHER failure — an error envelope, a
+                    # process that ended any other way (a crash, a refusal, a missing binary), another
+                    # exception: the API or the process answering — is TRANSIENT (review finds,
+                    # 2026-09-03: before them a thirty-second 529 storm, then a broken install, would have
+                    # adopted a live turn for good): it cuts the walk just as loudly, is no strike, and
+                    # leaves a kill streak as it stands — evidence about the API says nothing about the
+                    # prompt, so it neither adds to what the kills said nor erases it.
+                    kill = _call_fail_kill(last)
+                    fails = dict(store.get("closeFails") or {})
+                    k = _close_strike(fails.get(tid), fp, "kill") if kill else 0
                     shape = getattr(_judge_ctx, "close_menu", None)
                     shape_s = ("; menu %d own + %d steps-finished + %d starved + %d status + %d lifted, "
                                "%d rider(s) cut" % (shape["touched"], shape["cands"], shape["starved"],
                                                     shape["status"], shape["lifted"], shape["cut"])
                                if isinstance(shape, dict) else "")
-                    _log_judge_error("closer", fsid, "sweep-cut",
-                                     note="%d end-known turn(s) left unswept behind turn %s: %s (model %s%s)"
-                                          % (remaining, str(tid)[:12], fail_note[:160],
-                                             last.get("model"), shape_s))
-                    cut = True
-                    break
+                    if kill and k >= DISTILL_FAIL_CAP:
+                        swept.add(tid); sig[tid] = fp; did += 1
+                        fails.pop(tid, None)
+                        store["closeFails"] = fails
+                        _log_judge_error("closer", fsid, "give-up",
+                                         note="%d killed calls on turn %s at this size: %s (model %s%s); swept "
+                                              "without verdicts; the turn growing re-judges it, and the "
+                                              "walk goes on to the session's later turns"
+                                              % (k, _turn_tag(tid), fail_note[:160], last.get("model"), shape_s))
+                    else:
+                        if kill:
+                            fails[tid] = {"fp": fp, "fails": k, "kind": "kill"}
+                            store["closeFails"] = fails
+                            klass = "kill %d of %d on this turn at this size" % (k, DISTILL_FAIL_CAP)
+                        else:
+                            klass = "transient: no strike, retry next pass"
+                        remaining = sum(1 for t in turns[ti + 1:]
+                                        if not _turn_open(t, turns)
+                                        and not (t["id"] in swept
+                                                 and sig.get(t["id"], len(t["atoms"])) == len(t["atoms"])))
+                        _log_judge_error("closer", fsid, "sweep-cut",
+                                         note="%d end-known turn(s) left unswept behind turn %s: %s (model %s%s); %s"
+                                              % (remaining, _turn_tag(tid), fail_note[:160],
+                                                 last.get("model"), shape_s, klass))
+                        cut = True
+                        break
             continue                                   # LLM/parse failed → leave unswept, retry next pass
         newly += res
         if isinstance(store.get("closeFails"), dict):
@@ -10513,7 +10656,9 @@ def _death_rotate(fsid):
     each time — would hold the head of the queue for good, and DEATH_DRAIN_PER_PASS such sessions would
     starve every newer dead session of its sweep and its 'ended' settle (review find, 2026-09-03). Touch the
     marker so it takes its place at the BACK: one doomed call per pass, behind everyone else, and the
-    drain's bound stays honest. A give-up after repeated cuts is the follow-up the sweep-cut row names."""
+    drain's bound stays honest. Bounded for kills: DISTILL_FAIL_CAP killed calls on one turn give it up
+    and the walk goes on (_close_session), so a marker waits back here at most that many passes per
+    doomed turn; a transient storm rotates it for as long as the storm lasts — the storm's bound, not ours."""
     m = _death_marker(fsid)
     if not isinstance(m, dict) or "endedAt" in m:
         return

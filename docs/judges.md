@@ -298,7 +298,11 @@ event).
 - **An empty reply never counts.** `parse` means the model's own text was
   rejected, and the row carries the reply tail so the log says why. Empty
   replies (the rate gate, a failed call) log nothing at the caller and
-  never burn a retry cap.
+  never burn a retry cap — with two exceptions, both the closer's, both
+  adopting a turn loudly on their own event: a safeguards refusal of the
+  turn's content, and a *killed* call (one the timer ended; never an API
+  error or a process that ended any other way), each counted against the
+  turn it happened on. The kill streak is described below.
 - **Every judge is capped.** Three genuine parse rejects on the same work
   item (`JUDGE_FAIL_CAP`) and the judge gives up loudly, one `give-up` row
   naming the re-arm event, instead of retrying every pass forever:
@@ -308,7 +312,7 @@ event).
 | opener, live re-plan | hard-places at card level immediately | (no retries needed) |
 | planner (work run) | 3 tries, then hard-place a user message / drop a non-user segment | on its next segment |
 | placer | files at the card immediately | (no retries needed) |
-| closer | 3 tries, then skips the turn | when the turn gains atoms |
+| closer | 3 parse rejects, or 3 killed calls, then skips the turn | when the turn gains atoms |
 | archiver | 3 tries, then keeps serving the old headline | when the session gains a turn |
 | grouper, consolidator | 3 tries, then leaves the board shape as is | when the top set changes |
 | courier | 3 tries, then resolves from the sender's declared kind | (terminal; never orphans a message) |
@@ -333,8 +337,13 @@ toward nothing.
   subprocess error, an API error envelope, on either engine) ends that
   session's sweep for the pass with one `sweep-cut` row naming the turns left
   behind and the shape of the menu that died; parse rejects and pause-skips
-  still walk on. A dead session cut this way keeps its marker pending and
-  waits at the back of the death drain, so it cannot starve the others.
+  still walk on. Three *killed* calls on the same turn at the same size (the
+  timer ending the call; an API error, or a process that ended any way other
+  than the timer, cuts the walk too but leaves no strike) give that turn up
+  loudly (one `give-up` row; the turn growing re-arms it) and the walk moves
+  on, so a session whose one turn always dies still gets its later turns
+  swept. A dead session cut this way keeps its marker pending and waits at
+  the back of the death drain, so it cannot starve the others.
 
 ## Billing, and when the credential itself is broken
 

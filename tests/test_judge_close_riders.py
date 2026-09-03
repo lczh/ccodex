@@ -296,8 +296,9 @@ class SweepCutDrain(_Riders):
         os.utime(marker, (T0, T0))                         # the oldest marker in the queue
         before = marker.stat().st_mtime_ns
 
-        def dead_call(*a, **k):                           # the call died: _judge_run's failure traces, no reply
-            jd._judge_ctx.last_call_fail = {"note": "exit -14", "model": "sonnet"}
+        def dead_call(*a, **k):                           # the call was KILLED: the dead-CLI stash byte-for-byte
+            jd._judge_ctx.last_call_fail = {"note": "the model CLI died with no output (exit -14)",
+                                            "model": "sonnet", "kill": True}
             return ""
         jd.closer_llm = dead_call
         jd._judge_ctx.paused = False
@@ -306,7 +307,14 @@ class SweepCutDrain(_Riders):
         m = json.loads(marker.read_text())
         self.assertNotIn("endedAt", m, "a cut walk never finalizes the marker (its turns are still unswept)")
         rows = [json.loads(l) for l in open(jd.ERRORS) if l.strip()]
-        self.assertTrue(any(r.get("err") == "sweep-cut" for r in rows), "the cut is said loudly")
+        cuts = [r for r in rows if r.get("err") == "sweep-cut"]
+        self.assertEqual(len(cuts), 1, "the cut is said loudly")
+        # the KILL path, which a transient cut would not satisfy: the turn is struck at its size, and the
+        # row says so — DISTILL_FAIL_CAP such passes give the turn up and the marker stops rotating
+        tid = jd.parsed_session(SID, [path], T0 + 5000)["turns"][0]["id"]
+        self.assertEqual(jd.load_goals(SID).get("closeFails"), {tid: {"fp": 2, "fails": 1, "kind": "kill"}},
+                         "a killed call is struck against the turn it died on")
+        self.assertIn("kill 1 of %d" % jd.DISTILL_FAIL_CAP, cuts[0]["note"], "…and the row carries the class")
 
 
 if __name__ == "__main__":
