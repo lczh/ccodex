@@ -2845,7 +2845,9 @@ class SdkSession:
                                                             len(died), "" if len(died) == 1 else "s", reason))
             self.backend._poke()
 
-    _RECONNECT_CAUSE = "a settings switch restarted it"   # the death notice's cause on a reconnect
+    _RECONNECT_CAUSE = "its process was restarted by a settings switch or a rewind"   # the death notice's cause on
+    #   a reconnect: every trigger of the reconnect loop (effort/fast/auth/mode switches, edit-message rewinds and
+    #   rollbacks) is named truthfully — the loop cannot tell them apart here, so the notice names the family
 
     _WF_AGENT_ENDED = frozenset(("done", "error"))
 
