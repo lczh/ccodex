@@ -93,6 +93,11 @@ reads. Two host notes:
 
     (persist it in `/etc/sysctl.d/` to survive reboots).
 
+    That sysctl re-enables **unprivileged user namespaces host-wide**, not just for Codex: every
+    process on the machine regains the ability to create them, which is the surface the Ubuntu
+    default restricts. Prefer an AppArmor profile for the codex binary if your threat model cares;
+    the sysctl is the blunt instrument.
+
 - There is no permission-prompt flow yet (approvals are pinned off; the
   sandbox is the guardrail). Codex approval prompts surfacing as romp's
   needs-you cards is planned.
@@ -155,3 +160,9 @@ stable release rather than weakening verification.
 ccodex versions on its own line (v1.0.0 and up); upstream romp's tags stay
 behind it and are never pushed here, so the updater always resolves the
 newest ccodex release.
+
+## Supply-chain note
+
+`romp-codex-setup` pins the `openai-codex` package by version, but the native `codex` binary
+arrives through a transitive wheel (`codex_cli_bin`) that the pin does not cover. Check the
+installed binary's version after setup if that matters to you; a future setup may pin it too.

@@ -10,6 +10,8 @@ Run:    python3 tests/test_judge_engine.py
 """
 import json
 import os
+import io
+import contextlib
 import stat
 import tempfile
 import time
@@ -52,8 +54,15 @@ class JudgeEngine(unittest.TestCase):
         stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
         os.environ["ROMP_CODEX_BIN"] = str(stub)
         os.environ["STUB_RECORD"] = str(self.rec)
+        # the judge folds the machine's standing user notes into prose judges' prompts (_with_user_notes
+        # reads a file OUTSIDE the rebound state dir) — isolate, or a developer's real notes land in the
+        # stdin pin and the byte-exact prompt assertion fails on their box while CI stays green
+        from unittest import mock
+        self._notes = mock.patch.object(jd, "_user_notes", return_value="")
+        self._notes.start()
 
     def tearDown(self):
+        self._notes.stop()
         os.environ.pop("ROMP_CODEX_BIN", None)
         os.environ.pop("STUB_RECORD", None)
 
@@ -162,3 +171,40 @@ class JudgeEngine(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class CodexChildEnvIsVendorScoped(unittest.TestCase):
+    """The Anthropic key never reaches the codex judge child (upstream PR #885 review, back-ported):
+    _judge_env re-injects it for key-billed sessions, and another vendor's process has no use for it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        jd._rebind_state(self.tmp)
+        jd._state_cache.clear()
+        (jd.STATE / "judge-engine").write_text("codex")
+
+    def test_the_codex_subprocess_env_lacks_the_anthropic_key(self):
+        from unittest import mock
+        seen = {}
+
+        class _P:
+            returncode = 0; stdout = ""; stderr = ""
+
+        def fake_run(cmd, **kw):
+            seen["env"] = kw.get("env")
+            outp = [a for a in cmd if str(a).endswith(".out")]
+            if outp:
+                Path(outp[-1]).write_text("ok")
+            return _P()
+
+        fake_env = dict(os.environ, ANTHROPIC_API_KEY="sk-test-not-real", ROMP_SUMMARIZING="1")
+        with mock.patch.object(jd, "_judge_env", return_value=fake_env), \
+             mock.patch.object(jd.subprocess, "run", side_effect=fake_run), \
+             contextlib.redirect_stderr(io.StringIO()):
+            try:
+                jd._judge_run("gpt-5", "SYS", "payload", judge="captioner", tier="index")
+            except Exception:
+                pass                                  # the reply shape is not under test here
+        self.assertIsNotNone(seen.get("env"), "the codex branch ran through subprocess.run")
+        self.assertNotIn("ANTHROPIC_API_KEY", seen["env"], "the Anthropic key is stripped from the codex child")
+        self.assertEqual(seen["env"].get("ROMP_SUMMARIZING"), "1", "…and the rest of the judge env rides as before")

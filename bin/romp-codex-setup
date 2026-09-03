@@ -11,7 +11,8 @@
 set -euo pipefail
 STATE="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}"
 VENV="$STATE/codexvenv"
-PIN="openai-codex==0.144.4"
+PIN="openai-codex==0.144.4"   # the SDK is pinned; the native codex binary rides the
+#   unpinned transitive codex_cli_bin wheel it pulls in (docs/codex.md § Supply-chain note)
 
 # KEEP IN SYNC with bin/romp-serve's pick_python (same contract as romp-sdk-setup: the kernel must
 # run the interpreter this venv is built with).

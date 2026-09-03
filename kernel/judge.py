@@ -1110,9 +1110,13 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
             outp = os.path.join(JUDGE_SCRATCH, "codex-%d-%d.out" % (os.getpid(), rid))
             try:
                 try:
+                    # another vendor's process has no use for the Anthropic key (_judge_env re-injects
+                    # it for key-billed sessions); strip it from the child's environment (upstream PR
+                    # #885 review, back-ported)
+                    cenv = {k: v for k, v in env.items() if k != "ANTHROPIC_API_KEY"}
                     p = subprocess.run(_judge_cmd_codex(model, _codex_effort(effort, tier), outp),
                                        input=(sys_prompt or "") + "\n\n" + (user or ""),
-                                       capture_output=True, text=True, cwd=JUDGE_SCRATCH, env=env,
+                                       capture_output=True, text=True, cwd=JUDGE_SCRATCH, env=cenv,
                                        timeout=CALL_ALARM_S + 5)
                 except Exception as e:
                     _log_judge_error(judge or tier, fsid, "call", note=type(e).__name__)
