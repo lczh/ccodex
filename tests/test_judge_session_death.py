@@ -189,8 +189,11 @@ class RunClosePins(unittest.TestCase):
         self.assertIn('discover(now, window=DEATH_BACKFILL_WINDOW)', src)
 
     def test_the_finalize_rides_every_close(self):
+        # …told NOT settled when the walk was CUT at a failed call (2026-09-03): a dead session is swept
+        # only through the death drain, so finalizing its marker off a walk that left turns unswept
+        # would strand them for good (the behavioral pin is test_judge.py SweepSession)
         import inspect
-        self.assertIn('_death_finalize(fsid, store, settled)', inspect.getsource(jd._close_session))
+        self.assertIn('_death_finalize(fsid, store, settled and not cut)', inspect.getsource(jd._close_session))
 
 
 if __name__ == "__main__":

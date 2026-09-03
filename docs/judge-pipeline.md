@@ -172,6 +172,6 @@ cards: one in each tree, linked, and the link checks itself off.
 | why is this card in this state? | the node's `log` in `goals/<sid>.json`: every event has source, kind, reason, time |
 | why was this work filed here? | `placements` in the store, plus the node's `why` and `trail` |
 | why did this mint at top level? | the node's `why`: "declared in the agent's own to-do list" means the plan-sync mirror, and nesting it is the grouper's job; anything else is the planner |
-| did a judge fail or get skipped? | `judge-errors.jsonl`: every row carries judge, session, kind (parse, call, give-up, cite-miss, rate-limited, task-store, history-unreadable, drift-skip), and the evidence (reply tail, API message, re-arm event) |
+| did a judge fail or get skipped? | `judge-errors.jsonl`: every row carries judge, session, kind (parse, call, give-up, sweep-cut, cite-miss, rate-limited, task-store, history-unreadable, drift-skip), and the evidence (reply tail, API message, re-arm event) |
 | what did a judge call cost, and when? | `judge-usage.jsonl`, per judge and session |
 | what happened to a peer message? | `timeline/messages.jsonl` by message id, plus the delivered markers in the transcript |

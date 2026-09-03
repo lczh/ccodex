@@ -3695,6 +3695,8 @@ class SweepSession(unittest.TestCase):
         names = td / "names"; names.mkdir()
         (names / SID).write_text("testsess\t%s\t#abcdef\n" % str(cdir))
         jd.NAMES, jd.PROJECTS, jd.GOALDIR = names, proj, td / "goals"
+        self._saved_errors, jd.ERRORS = jd.ERRORS, td / "judge-errors.jsonl"   # the sweep's own rows, readable
+        self.cdir, self.pdir, self.names = cdir, pdir, names   # a test may add a second session beside SID
         # positive-only: always MINT a top, never DONE -> every top is left 'working'
         jd.plan_llm = lambda text, menu, human=False, **_kw: '{"ops":[{"why":"x","do":"mint","text":"Goal"}]}'
         jd.group_llm = lambda menu: '{"ops":[]}'   # planner now groups inline; keep the sweep's tops un-nested
@@ -3702,7 +3704,15 @@ class SweepSession(unittest.TestCase):
 
     def tearDown(self):
         (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.plan_llm, jd.closer_llm, jd.group_llm) = self._saved
+        jd.ERRORS = self._saved_errors
+        jd._judge_ctx.paused, jd._judge_ctx.last_call_fail = False, None   # a stub's per-thread stash dies here
         self._td.cleanup()
+
+    def _errors(self):
+        try:
+            return [json.loads(l) for l in Path(jd.ERRORS).read_text().splitlines()]
+        except OSError:
+            return []
 
     def test_completes_and_settles_finished_tops_on_turn_end(self):
         jd.run_plan(now=self.now)
@@ -3815,18 +3825,129 @@ class SweepSession(unittest.TestCase):
         n = jd.run_close(now=self.now)
         self.assertGreaterEqual(n, 1, "the grown turn re-judged and completed the goal")
 
-    def test_transient_failures_never_tombstone(self):
-        # a 529/timeout recovers when the storm ends — those keep the plain retry-next-pass contract
+    # the dead-CLI stash byte-for-byte as _judge_run leaves it (its DEAD CLI branch): "" back to the
+    # caller, the per-thread dict naming the exit. -14 is SIGALRM — the CALL_ALARM_S kill, the shape of
+    # the 2026-09-03 incident (192 consecutive kills inside ONE session's walk, 6h22m of silence)
+    DEAD_CLI = {"note": "the model CLI died with no output (exit -14)", "model": "sonnet"}
+
+    def _dead_closer(self, calls):
+        return lambda tt, mt, *_a: (calls.append(1), setattr(
+            jd._judge_ctx, "last_call_fail", dict(self.DEAD_CLI)), "")[2]
+
+    def test_a_failed_call_cuts_this_sessions_sweep_for_the_pass(self):
+        # 2026-09-03: one session's closer calls were alarm-killed 192 times in a row inside ONE
+        # _close_session walk — every judge for every session silent for 6h22m, because the walk
+        # `continue`d to the next end-known turn after each kill and the next call died the same way
+        # (the same over-full menu rides every turn until a LANDED reply stamps it). A failed CALL is
+        # evidence about the session's calls, not about one turn: the first one ends this session's
+        # walk for the pass, loudly. The turn keeps the plain retry-next-pass contract — no strike, no
+        # tombstone — and the loop BREAKS rather than returns, so the store still saves and the
+        # death-marker epilogue still runs.
         jd.run_plan(now=self.now)
         calls = []
-        jd.closer_llm = lambda tt, mt, *_a: (calls.append(1), setattr(
-            jd._judge_ctx, "last_call_fail",
-            {"note": "API Error: Repeated 529 Overloaded errors.", "model": "fable"}), "")[2]
-        for _ in range(jd.DISTILL_FAIL_CAP + 2):
+        jd.closer_llm = self._dead_closer(calls)
+        jd.run_close(now=self.now)
+        self.assertEqual(len(calls), 1, "the first failed call ends this session's walk for the pass")
+        store = jd.load_goals(SID)
+        self.assertFalse(store.get("closedTurns"), "nothing swept while the calls fail")
+        self.assertFalse(store.get("closeFails"), "a call failure is never a strike against the turn")
+        self.assertIn("closedSig", store, "a break, not a return: the store was still saved")
+        rows = [r for r in self._errors() if r.get("err") == "sweep-cut"]
+        self.assertEqual(len(rows), 1, "one loud row per cut walk")
+        self.assertEqual((rows[0]["judge"], rows[0]["fsid"]), ("closer", SID))
+        self.assertIn("1 end-known turn(s)", rows[0]["note"], "the row counts the turns left behind")
+        self.assertIn("exit -14", rows[0]["note"], "…and carries the call failure it acted on")
+        for _ in range(jd.DISTILL_FAIL_CAP + 1):
             jd.run_close(now=self.now)
-        self.assertEqual(len(calls), 2 * (jd.DISTILL_FAIL_CAP + 2),
-                         "still retrying every pass — transient failures never adopt the turn")
-        self.assertFalse(jd.load_goals(SID).get("closedTurns"), "nothing swept while the calls fail")
+        self.assertEqual(len(calls), jd.DISTILL_FAIL_CAP + 2,
+                         "ONE call per pass: still retrying (no tombstone), never walking past the failure")
+        self.assertFalse(jd.load_goals(SID).get("closedTurns"), "transient failures never adopt the turn")
+
+    def test_a_cut_walk_leaves_a_death_marker_pending(self):
+        # review find (2026-09-03): a dead session is swept ONLY through the death drain, and the drain
+        # skips finalized markers — so finalizing off a CUT walk (turns left unswept behind the failed
+        # call) would strand those turns for good. The epilogue waits for a walk that reaches the end.
+        jd.run_plan(now=self.now)
+        marker = jd.GONEDIR / (SID + ".json")
+        jd.GONEDIR.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"t": self.now - 100, "by": "kill"}))
+        jd._gone_memo.pop(SID, None)
+        try:
+            calls = []
+            jd.closer_llm = self._dead_closer(calls)
+            jd.run_close(now=self.now)
+            self.assertEqual(len(calls), 1, "the walk was cut at the first failed call")
+            self.assertNotIn("endedAt", json.loads(marker.read_text()),
+                             "a cut walk does not finalize the marker: the session's turns are still owed")
+            jd.closer_llm = lambda tt, mt, *_a: '{"done": [], "block": []}'   # calls land again
+            jd.run_close(now=self.now)
+            self.assertEqual(len(jd.load_goals(SID).get("closedTurns") or []), 2, "the walk reached the end")
+            self.assertIn("endedAt", json.loads(marker.read_text()),
+                          "…and only then does the one-shot epilogue stamp the marker")
+        finally:
+            marker.unlink(missing_ok=True)
+            jd._gone_memo.pop(SID, None)
+
+    def test_a_parse_reject_still_walks_every_turn(self):
+        # the boundary: a served-but-unparseable reply is the MODEL's answer to THIS turn's prompt
+        # (last_call_fail stays None — a served reply retires it), so the next turn is still worth
+        # asking. `res is None` alone would cut here too; the discriminator is the call-failure stash.
+        jd.run_plan(now=self.now)
+        calls = []
+        jd.closer_llm = lambda tt, mt, *_a: (calls.append(1), "not json")[1]
+        jd.run_close(now=self.now)
+        self.assertEqual(len(calls), 2, "a parse reject walks on to the next turn")
+        store = jd.load_goals(SID)
+        self.assertEqual(len(store.get("closeFails") or {}), 2, "each turn took its own parse strike")
+        self.assertFalse(store.get("closedTurns"), "under the cap nothing is swept")
+        self.assertEqual([r for r in self._errors() if r.get("err") == "sweep-cut"], [],
+                         "a parse reject is not a cut")
+
+    def test_a_paused_skip_still_walks_every_turn(self):
+        # the other boundary: the rate gate / retry pause / scratch refusal return "" with paused=True
+        # and NO call was made — nothing failed, so the walk keeps visiting (and skipping) every turn
+        jd.run_plan(now=self.now)
+        calls = []
+        jd.closer_llm = lambda tt, mt, *_a: (calls.append(1), setattr(jd._judge_ctx, "paused", True), "")[2]
+        jd.run_close(now=self.now)
+        self.assertEqual(len(calls), 2, "a pause-skip is not a failed call: every turn is still visited")
+        store = jd.load_goals(SID)
+        self.assertFalse(store.get("closedTurns"), "nothing swept on a pause")
+        self.assertFalse(store.get("closeFails"), "nothing struck on a pause")
+        self.assertEqual([r for r in self._errors() if r.get("err") == "sweep-cut"], [],
+                         "a pause-skip is not a cut")
+
+    def test_other_sessions_close_while_one_is_cut(self):
+        # the incident's cost was not one session's stall but EVERY session's: run_close awaits one
+        # future per session, so the cut session's walk ending lets the pass finish and its peers close.
+        # Two sessions, the second under a PRIVATE synthetic sid (its override journal lives under this
+        # test's GOALDIR tempdir and dies with it in tearDown).
+        sid_b = "22222222-3333-4444-5555-666666666666"
+        records = [uline(T0, "task C", "u1", ps="typed"),
+                   aline(T0 + 30, "did C", "a1", "u1", stop="end_turn"),
+                   uline(T0 + 100, "task D", "u2", "a1", ps="typed"),
+                   aline(T0 + 130, "did D", "a2", "u2", stop="end_turn")]
+        (self.pdir / (sid_b + ".jsonl")).write_text("\n".join(json.dumps(r) for r in records) + "\n")
+        (self.names / sid_b).write_text("testsess2\t%s\t#abcdef\n" % str(self.cdir))
+        jd.run_plan(now=self.now)
+        self.assertTrue(jd.load_goals(sid_b)["nodes"], "the second session planned goals too")
+        calls = []
+
+        def closer(tt, mt, *_a):
+            calls.append(jd._judge_ctx.fsid)
+            if jd._judge_ctx.fsid == SID:
+                jd._judge_ctx.last_call_fail = dict(self.DEAD_CLI)
+                return ""
+            return '{"done": [{"goal": 1, "why": "done"}], "block": []}'
+        jd.closer_llm = closer
+        jd.run_close(now=self.now)
+        self.assertEqual(calls.count(SID), 1, "the failing session made exactly one call")
+        self.assertEqual(calls.count(sid_b), 2, "the healthy session was judged turn by turn")
+        self.assertFalse(jd.load_goals(SID).get("closedTurns"), "the cut session swept nothing")
+        self.assertEqual(len(jd.load_goals(sid_b).get("closedTurns") or []), 2,
+                         "every end-known turn of the healthy session closed in the same pass")
+        rows = [r for r in self._errors() if r.get("err") == "sweep-cut"]
+        self.assertEqual([r["fsid"] for r in rows], [SID], "one cut row, naming the cut session")
 
 
 class CloserKeyMigration(unittest.TestCase):
@@ -6862,6 +6983,81 @@ class FailureContract(unittest.TestCase):
         self.assertIn("exit 134", row["note"], "the returncode is the evidence")
         self.assertIn("heap out of memory", row["note"], "…with the stderr tail")
         self.assertFalse(Path(jd.USAGE).exists(), "a dead CLI logs no usage row")
+
+    def test_codex_engine_dead_call_leaves_the_same_traces(self):
+        # 2026-09-03 review: the closer's sweep-cut keys on _judge_ctx.last_call_fail and the model-health
+        # latch on _mark_call_failed — both written only by the claude branch, so under `romp engine codex`
+        # an alarm-killed closer call walked on exactly as before the fix. The codex exits leave the same
+        # three traces now: the stash, the latch (a failed row), and the call shape on the row.
+        import types
+        saved = (jd.subprocess, getattr(jd._judge_ctx, "fsid", None), jd._judge_cmd_codex, jd._judge_engine)
+        jd.subprocess = types.SimpleNamespace(
+            run=lambda *a, **k: types.SimpleNamespace(stdout="", stderr="", returncode=-14))
+        jd._judge_cmd_codex = lambda model, effort, outp: ["codex-stub"]
+        jd._judge_engine = lambda: "codex"
+        jd._judge_ctx.fsid = "sid-cx"
+        jd._judge_ctx.last_call_fail = None
+        try:
+            out = jd._judge_run("gpt-5-test", "S", "U", judge="closer")
+        finally:
+            jd.subprocess, jd._judge_ctx.fsid, jd._judge_cmd_codex, jd._judge_engine = saved
+        self.assertEqual(out, "", "a dead codex call reads as an empty reply to every caller")
+        last = jd._judge_ctx.last_call_fail
+        self.assertIsInstance(last, dict, "the sweep-cut discriminator sees the failure on this engine too")
+        self.assertIn("codex empty reply (exit -14)", last["note"])
+        self.assertEqual(last["model"], "gpt-5-test")
+        row = self._errors()[-1]
+        self.assertEqual((row["judge"], row["err"], row["fsid"]), ("closer", "call", "sid-cx"))
+        for word in ("exit -14", "model=gpt-5-test", "chars=2", "ms="):
+            self.assertIn(word, row["note"], "the row carries the evidence and the call shape")
+
+    def test_dead_cli_call_row_carries_the_call_shape(self):
+        # 2026-09-03: 192 consecutive alarm kills (exit -14) read as "the CLI is dying" until a reader
+        # correlated the served calls' duration with their OUTPUT size — the kills were healthy-but-slow
+        # calls on an over-full menu. The row now carries the model, the prompt size in chars (no
+        # prompt text — privacy holds) and the wall-clock spent, so that diagnosis is a grep.
+        import re
+        import types
+        saved_sub, saved_fsid = jd.subprocess, getattr(jd._judge_ctx, "fsid", None)
+        jd.subprocess = types.SimpleNamespace(
+            run=lambda *a, **k: types.SimpleNamespace(stdout="", stderr="", returncode=-14))
+        jd._judge_ctx.fsid = "sid-slow"
+        try:
+            out = jd._judge_run("sonnet", "S", "U", judge="closer")
+        finally:
+            jd.subprocess = saved_sub
+            jd._judge_ctx.fsid = saved_fsid
+        self.assertEqual(out, "")
+        row = self._errors()[-1]
+        self.assertEqual((row["judge"], row["err"], row["fsid"]), ("closer", "call", "sid-slow"))
+        self.assertIn("exit -14", row["note"], "the returncode stays the headline evidence")
+        self.assertIn("model=sonnet", row["note"], "…with the model that was asked")
+        self.assertRegex(row["note"], r"\bchars=2\b", "…the size of what was sent (system + user), never its text")
+        self.assertRegex(row["note"], r"\bms=\d+\b", "…and the wall-clock the call took")
+        self.assertNotIn("S U", row["note"])
+
+    def test_subprocess_exception_call_row_carries_the_call_shape(self):
+        # the sibling branch: a subprocess that raised (a timeout past the alarm, an OSError) gets the
+        # same shape, so a grep over 'call' rows reads both kinds alike
+        import types
+
+        def boom(*a, **k):
+            raise OSError("no such binary")
+        saved_sub, saved_fsid = jd.subprocess, getattr(jd._judge_ctx, "fsid", None)
+        jd.subprocess = types.SimpleNamespace(run=boom)
+        jd._judge_ctx.fsid = "sid-boom"
+        try:
+            out = jd._judge_run("sonnet", "SYS", "U", judge="closer")
+        finally:
+            jd.subprocess = saved_sub
+            jd._judge_ctx.fsid = saved_fsid
+        self.assertEqual(out, "")
+        row = self._errors()[-1]
+        self.assertEqual((row["judge"], row["err"], row["fsid"]), ("closer", "call", "sid-boom"))
+        self.assertIn("OSError", row["note"], "the exception name stays the headline evidence")
+        self.assertIn("model=sonnet", row["note"])
+        self.assertRegex(row["note"], r"\bchars=4\b")
+        self.assertRegex(row["note"], r"\bms=\d+\b")
 
     # ── empty replies never count as parse rejects ──
     def test_empty_planner_reply_never_burns_retries_or_logs_parse(self):

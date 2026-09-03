@@ -297,6 +297,24 @@ CLOSE_HISTORY_CHARS = 2000               # per-goal cap in the closer's turn-end
                                          # touched goals at once (so the total scales with menu size).
 CLOSE_FAIRNESS = None                    # per-session turn-close cap — REMOVED (the user 2026-06-30): close
                                          # EVERY end-known turn each pass. The `did >= cap` guard no-ops on None.
+                                         # That stance stands — successful closes are never capped. Two bounds
+                                         # added 2026-09-03 are NOT fairness caps: CLOSE_RIDER_CAP (below) is a
+                                         # queue drain across LANDED calls, and _close_session ends a session's
+                                         # walk at its first FAILED call (parse rejects and pause-skips walk on).
+CLOSE_RIDER_CAP = 6                      # RIDERS per closer call — the steps-finished / starved / status /
+                                         # lifted nominations that ride BEHIND the turn's own menu (which is
+                                         # never capped). 2026-09-03: one session's closer calls were
+                                         # alarm-killed 192 times in a row inside ONE _close_session walk
+                                         # (6h22m, every judge for every session silent). Not hangs: served
+                                         # closer duration tracks OUTPUT tokens, and the menu set the output —
+                                         # 24 riders on most of the backlog, uncapped, so no reply fit under
+                                         # CALL_ALARM_S; and a killed call stamps no closerLookT, so the same
+                                         # menu rode the next turn's call and died the same way. A DRAIN, not
+                                         # a fairness cap (DEATH_DRAIN_PER_PASS's argument): the re-nominating
+                                         # riders (lifted / steps-finished / starved) ride again until a LANDED
+                                         # reply stamps them, so what is cut rides a later landed call. STATUS
+                                         # riders are never cut — one-shot per status turn, they would be lost,
+                                         # not deferred — and take their room off the cap first (why: _close_turn).
 CONCURRENCY = 6                          # concurrent claude -p calls
 # The CLOSER: the turn-end completion backstop (judge.md HYBRID; named the "closer" 2026-06-16 — it
 # closes out goals whose outcome is delivered). SHIPPED as the default 2026-06-15 after the fleet A/B
@@ -663,7 +681,9 @@ def _log_judge_error(judge, fsid, err, note=None, goal=None, seg=None):
              "unmigrated-node", "task-store" (the live task store exists but can't be read —
              plan-sync skipped for the pass rather than silently folding the transcript),
              "scratch" (the judge scratch cwd can't be made private — call skipped, never rerouted
-             to a world-writable directory; see _ensure_judge_scratch)
+             to a world-writable directory; see _ensure_judge_scratch), "sweep-cut" (the closer ended a
+             session's walk for the pass at a FAILED call — _close_session; the note names the turns left
+             behind and the shape of the menu that died)
       note   the evidence — reply tail, error message, exception name, or the give-up scope + re-arm
              event. Callers must pass it; an empty note means the caller has nothing at all to show.
       goal   the node id (or list of node ids) the judge was ruling on, when one exists — the feed's
@@ -1030,6 +1050,18 @@ def _with_user_notes(sys_prompt, judge):
     return (sys_prompt + "\n\nThe user keeps standing notes on how the prose you write for them should "
             "read. They are style preferences, not material: never quote, mention, or answer them. Where "
             "a note conflicts with the rules above, the note wins:\n<user-notes>\n" + notes + "\n</user-notes>")
+
+
+def _call_shape(model, sys_prompt, user, sent):
+    """The grep-able shape of a FAILED call for its 'call' row: the model, the prompt size in chars
+    (system + user — the SIZE only, never the text) and the wall-clock ms since it was sent. 2026-09-03:
+    192 consecutive alarm kills read as "the CLI is dying" until the served calls' usage rows showed
+    duration tracking OUTPUT size (a 24-rider closer menu no reply could finish under CALL_ALARM_S);
+    with the shape on the failure row itself, that diagnosis is a grep over judge-errors.jsonl."""
+    return "model=%s chars=%d ms=%d" % (model, len(sys_prompt or "") + len(user or ""),
+                                        int((time.time() - sent) * 1000))
+
+
 def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", mark=None):
     """Run ONE judge model call. `mark` is the caller's per-call section mark (see _mark/_sec): passing
     it appends UNTRUSTED_SYS, which tells the model that marked sections are material, not orders. It
@@ -1119,7 +1151,13 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
                                        capture_output=True, text=True, cwd=JUDGE_SCRATCH, env=cenv,
                                        timeout=CALL_ALARM_S + 5)
                 except Exception as e:
-                    _log_judge_error(judge or tier, fsid, "call", note=type(e).__name__)
+                    # the same three traces the claude branch leaves (2026-09-03): the stash the closer's
+                    # sweep-cut keys on, the model-health latch, and the call shape for the grep — without
+                    # them an alarm-killed closer call on this engine walked on exactly as before the fix
+                    _judge_ctx.last_call_fail = {"note": type(e).__name__, "model": model}
+                    _mark_call_failed(model, type(e).__name__)
+                    _log_judge_error(judge or tier, fsid, "call",
+                                     note="%s %s" % (type(e).__name__, _call_shape(model, sys_prompt, user, sent)))
                     return ""
                 recv = time.time()
                 try:
@@ -1128,11 +1166,15 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
                 except OSError:
                     reply = ""
                 if not reply:
-                    # dead/refused call — the -o file is the only success signal; record the evidence
+                    # dead/refused call — the -o file is the only success signal; record the evidence, and
+                    # leave the same three traces the claude branch leaves (2026-09-03, see the except above)
+                    fail = "codex empty reply (exit %s)" % getattr(p, "returncode", "?")
+                    _judge_ctx.last_call_fail = {"note": fail, "model": model}
+                    _mark_call_failed(model, fail)
                     _log_judge_error(judge or tier, fsid, "call",
-                                     note="codex empty reply (exit %s): %s"
-                                          % (getattr(p, "returncode", "?"),
-                                             ((p.stderr or "") + (p.stdout or "")).strip()[-200:] or "no output"))
+                                     note="%s: %s %s"
+                                          % (fail, ((p.stderr or "") + (p.stdout or "")).strip()[-200:] or "no output",
+                                             _call_shape(model, sys_prompt, user, sent)))
                     return ""
                 _judge_ctx.last["reply"] = _mid_elide(reply)
                 _log_judge_usage(judge or tier, tier, (model if str(model).startswith("gpt") else "codex-default"),
@@ -1171,7 +1213,8 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
             # carry the judge's own name + fsid (pre-07-09 rows said "index"/"triage" with no session).
             _judge_ctx.last_call_fail = {"note": type(e).__name__, "model": model}
             _mark_call_failed(model, type(e).__name__)
-            _log_judge_error(judge or tier, fsid, "call", note=type(e).__name__)
+            _log_judge_error(judge or tier, fsid, "call",
+                             note="%s %s" % (type(e).__name__, _call_shape(model, sys_prompt, user, sent)))
             return ""
         recv = time.time()                            # literal wall-clock: the response is back
         out = p.stdout or ""
@@ -1232,9 +1275,10 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
                 "model": model}
             _mark_call_failed(model, _judge_ctx.last_call_fail["note"])
             _log_judge_error(judge or tier, fsid, "call",
-                             note="empty stdout (exit %s): %s"
+                             note="empty stdout (exit %s): %s %s"
                                   % (getattr(p, "returncode", "?"),
-                                     (getattr(p, "stderr", "") or "").strip()[-200:] or "no stderr"))
+                                     (getattr(p, "stderr", "") or "").strip()[-200:] or "no stderr",
+                                     _call_shape(model, sys_prompt, user, sent)))
             return ""
         _judge_ctx.last["reply"] = _mid_elide(out)
         _mark_call_served(model)                      # a raw reply is still a served call (recovery edge)
@@ -10031,7 +10075,13 @@ def _close_turn(store, turn, samples=None, seg_by_id=None):
     clear-wrap — a reply that accounts for the session's work as a whole — every open working TOP rides
     the menu too (_status_report_candidates), so one all-shipped reply can settle every card it covers,
     not just the goal it was asked about. Turn-scoped and state-free: closedSig already one-shots the
-    closer per turn."""
+    closer per turn.
+
+    RIDER CAP (2026-09-03): the RE-NOMINATING riders behind the turn's own menu (lifted → steps-finished
+    → starved) are cut to the room CLOSE_RIDER_CAP leaves after the status riders, which always ride
+    (one-shot per status turn: cut, they would be lost, not deferred) — a drain across landed calls, never
+    a bound on the turn's own goals or on successful closes (see the constant and the block below).
+    The menu's SHAPE (counts only) rides _judge_ctx.close_menu for a failed call's sweep-cut row."""
     menu = _turn_menu(turn, store)
     n_touched = len(menu)                              # the TURN's own goals; candidates ride behind them
     seen_ids = {nd["id"] for nd in menu}
@@ -10042,6 +10092,30 @@ def _close_turn(store, turn, samples=None, seg_by_id=None):
     status = [nd for nd in _status_report_candidates(store, turn) if nd["id"] not in seen_ids]
     seen_ids |= {nd["id"] for nd in status}
     lifted = [(nd, why) for nd, why in _lift_riders(store) if nd["id"] not in seen_ids]
+    # RIDER CAP (2026-09-03, CLOSE_RIDER_CAP): the turn's own menu rides whole, and so do the STATUS
+    # riders — turn-scoped and ONE-SHOT (no watermark: closedSig one-shots the closer per turn,
+    # _status_report_candidates), so a status rider cut here would never be judged from THIS reply, the
+    # one the user's question was answered in (a board with more open tops than the cap would lose the
+    # same tops on every status turn — lost, not deferred). Only the RE-NOMINATING riders — lifted,
+    # steps-finished, starved — are cut, to whatever room the cap leaves after the status riders (none,
+    # on a status turn with more tops than the cap: that call is as large as the board, once per status
+    # turn). They come back until a LANDED reply stamps closerLookT below (_look_stamp gates all three
+    # channels), so what is cut rides a LATER landed call — later, not always the next: a verdict a
+    # landed call files is a newer `at` in that top's subtree, which re-arms its earlier-stamped siblings
+    # (_filed_since), and those, older-minted, re-enter ahead of the cut tail. The backlog still drains
+    # (each landed call stamps its riders; nothing is lost; no successful close is ever capped). Channel
+    # membership (the dedupe order above) and the menu's layout are unchanged: only which riders survive
+    # is decided here.
+    renom = [nd for nd, _ in lifted] + cands + starved
+    n_cut = 0
+    if CLOSE_RIDER_CAP is not None:
+        room = max(0, CLOSE_RIDER_CAP - len(status))
+        if len(renom) > room:
+            keep = {nd["id"] for nd in renom[:room]}
+            n_cut = len(renom) - room
+            cands = [nd for nd in cands if nd["id"] in keep]
+            starved = [nd for nd in starved if nd["id"] in keep]
+            lifted = [(nd, why) for nd, why in lifted if nd["id"] in keep]
     menu = menu + cands + starved + status + [nd for nd, _ in lifted]
     if not menu:
         return []
@@ -10120,6 +10194,10 @@ def _close_turn(store, turn, samples=None, seg_by_id=None):
                       "leaving it open is a fine answer if the history is not plain." % i)
     lift_text = "\n".join("#%d: %s" % (i, str(why).strip()[:220])
                           for i, why in lflagged if str(why or "").strip())
+    # the menu's SHAPE (counts only, never text) rides the per-thread ctx so that if this call FAILS,
+    # _close_session's sweep-cut row can say what the call carried
+    _judge_ctx.close_menu = {"touched": n_touched, "cands": len(cands), "starved": len(starved),
+                             "status": len(status), "lifted": len(lifted), "cut": n_cut}
     raw = closer_llm(_unit_text(turn["atoms"]), menu_text, hist, lift_text)
     out = _parse_close(raw, len(menu))
     if out is None:
@@ -10248,7 +10326,19 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
     goal sticks blocked on an already-answered question (the user 2026-06-26, via bugs: g47). closedSig
     fingerprints each turn's atom count at close; a LARGER count next pass means the turn grew → re-judge
     it. Legacy turns (closed before this, no sig) are assumed unchanged so we don't re-judge the whole
-    backlog. Returns the node ids newly completed."""
+    backlog.
+
+    A FAILED CALL ends this session's walk for the pass (2026-09-03): every end-known turn is visited each
+    pass UNTIL the first failed call — a parse reject (the model answered THIS turn's prompt) and a
+    pause-skip (no call was made) still walk on. The 192-kill incident was this loop `continue`-ing past
+    each alarm kill to the next turn, whose identical over-full menu died identically: 6h22m of every
+    judge for every session silent, since run_close awaits every session's walk. The discriminator is
+    _judge_ctx.last_call_fail — a dict only when _judge_run recorded a call-level failure (a served reply
+    clears it) — NOT `res is None`, which a parse reject under the cap also returns. The safeguards
+    tombstone keeps its own arm. A loop `break`, never a return: the store still saves below and
+    _death_finalize still runs — told NOT settled, so a dead session's marker is never finalized off a
+    walk that left turns unswept (they are reachable only through the death drain). Returns the node ids
+    newly completed."""
     _judge_ctx.fsid = fsid                            # usage logging: attribute this session's judge calls
     session = parsed_session(fsid, [path], now)
     store = load_goals(fsid)
@@ -10256,8 +10346,8 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
     swept = _closed_turns(store)
     sig = dict(store.get("closedSig") or {})
     turns = session["turns"]
-    newly, did = [], 0
-    for turn in turns:
+    newly, did, cut = [], 0, False
+    for ti, turn in enumerate(turns):
         if _turn_open(turn, turns):
             continue
         tid, fp = turn["id"], len(turn["atoms"])
@@ -10266,6 +10356,7 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
         if cap is not None and did >= cap:             # cap is None by default now (no per-pass close cap);
             break                                      # an explicit caller (a test) can still bound a backfill
         _judge_ctx.last_call_fail = None               # a stale stash must never charge THIS turn (below)
+        _judge_ctx.close_menu = None                   # …nor a stale menu shape describe this turn's call
         res = _close_turn(store, turn, seg_by_id=seg_by_id)
         if res is None:
             # SAFEGUARDS TOMBSTONE (the user 2026-08-18): a safeguards refusal is the filter ruling on
@@ -10279,7 +10370,8 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
             # costs one call, not a give-up.
             if not getattr(_judge_ctx, "paused", False):
                 last = getattr(_judge_ctx, "last_call_fail", None)
-                if isinstance(last, dict) and "safeguards flagged" in str(last.get("note") or ""):
+                fail_note = str(last.get("note") or "") if isinstance(last, dict) else ""
+                if isinstance(last, dict) and "safeguards flagged" in fail_note:
                     fails = dict(store.get("closeFails") or {})
                     rec = fails.get(tid) if isinstance(fails.get(tid), dict) else None
                     k = (rec.get("fails", 0) + 1) if rec and rec.get("fp") == fp else 1
@@ -10292,6 +10384,31 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
                     else:
                         fails[tid] = {"fp": fp, "fails": k}
                     store["closeFails"] = fails
+                elif isinstance(last, dict):
+                    # SWEEP CUT (2026-09-03): the CALL failed — a dead CLI (the alarm kill), a subprocess
+                    # error, an API error envelope — evidence about this session's calls, not about this
+                    # one turn. Every remaining end-known turn would cost a call shaped like the one that
+                    # just died (its riders re-nominate until a LANDED reply stamps them, so the same
+                    # menu rides every turn); one session's 192 consecutive kills held every judge for
+                    # every session silent for 6h22m. End THIS session's walk for the pass, loudly, with
+                    # the shape of what was sent. The turn keeps the retry-next-pass contract (no strike,
+                    # no tombstone). A `break`, never a return: the store must still save and
+                    # _death_finalize must still run below.
+                    remaining = sum(1 for t in turns[ti + 1:]
+                                    if not _turn_open(t, turns)
+                                    and not (t["id"] in swept
+                                             and sig.get(t["id"], len(t["atoms"])) == len(t["atoms"])))
+                    shape = getattr(_judge_ctx, "close_menu", None)
+                    shape_s = ("; menu %d own + %d steps-finished + %d starved + %d status + %d lifted, "
+                               "%d rider(s) cut" % (shape["touched"], shape["cands"], shape["starved"],
+                                                    shape["status"], shape["lifted"], shape["cut"])
+                               if isinstance(shape, dict) else "")
+                    _log_judge_error("closer", fsid, "sweep-cut",
+                                     note="%d end-known turn(s) left unswept behind turn %s: %s (model %s%s)"
+                                          % (remaining, str(tid)[:12], fail_note[:160],
+                                             last.get("model"), shape_s))
+                    cut = True
+                    break
             continue                                   # LLM/parse failed → leave unswept, retry next pass
         newly += res
         if isinstance(store.get("closeFails"), dict):
@@ -10302,7 +10419,10 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
     settled = _session_settled(fsid, path, session, store)
     rollup_status(store, settled)
     save_goals(fsid, store)
-    _death_finalize(fsid, store, settled)             # the death marker's one-shot epilogue (2026-08-13)
+    # A CUT walk left end-known turns unswept, and a dead session is swept ONLY through the death drain
+    # (_death_pending skips finalized markers): finalizing its marker now would strand those turns for
+    # good (review find, 2026-09-03). The one-shot epilogue waits for a pass that walks to the end.
+    _death_finalize(fsid, store, settled and not cut)  # the death marker's one-shot epilogue (2026-08-13)
     return newly
 DEATH_DRAIN_PER_PASS = CONCURRENCY   # a QUEUE-DRAIN bound on death-pending finalizes per closer pass —
 #   NOT a fairness cap on live sessions (those were removed 2026-06-30 and stay removed): the pending
