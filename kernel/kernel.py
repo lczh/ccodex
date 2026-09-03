@@ -28137,13 +28137,16 @@ def _ws_sender(q, sock, lock, client):
             return
         try:
             if isinstance(s, bytes):
+                # The liveness clock starts when the ping reaches the SOCKET, not when the beat queued it: a
+                # peer with a queue backlog is not judged on time the ping spent behind it. Stamped BEFORE the
+                # write under the client lock, so a pong (which can only echo bytes already written) can
+                # never be cleared before its ping is recorded. Only the oldest unanswered ping counts.
+                if s[:1] == b"\x89":
+                    with client["qlock"]:
+                        if client.get("pingAt") is None:
+                            client["pingAt"] = _ws_clock()
                 with lock:
                     sock.sendall(s)
-                # The liveness clock starts when the ping actually LEAVES, not when the beat queued it: a
-                # slow-but-alive peer (a 300 KB/s tunnel behind a large payload) must not be judged dead for
-                # a ping that was still sitting behind its backlog. Only the oldest unanswered ping counts.
-                if s[:1] == b"\x89" and client.get("pingAt") is None:
-                    client["pingAt"] = _ws_clock()
             else:
                 _ws_send(sock, lock, s)
         except OSError:
@@ -28174,7 +28177,24 @@ def _mk_ws_send(q, sock, client):
     return send
 
 
-_ws_clock = time.time   # the liveness clock — one seam, so the tests can drive the beats deterministically
+_ws_clock = time.monotonic   # the liveness clock: an INTERVAL clock (a suspend/resume or an NTP step must
+#                              not read as thirty seconds of silence); one seam so tests drive the beats
+
+
+def _ws_outq(sock):
+    """Bytes this socket has accepted but the peer has not yet acknowledged (Linux SIOCOUTQ, macOS SO_NWRITE),
+    or None where unknown. A nonzero count that keeps falling across beats is a peer that is alive and
+    draining — a slow tunnel behind a large payload — however late its pong; a count that does not move is a
+    peer that has stopped acknowledging."""
+    try:
+        if sys.platform.startswith("linux"):
+            import fcntl, termios
+            return int.from_bytes(fcntl.ioctl(sock.fileno(), termios.TIOCOUTQ, b"\0\0\0\0"), sys.byteorder)
+        if sys.platform == "darwin":
+            return int(sock.getsockopt(socket.SOL_SOCKET, 0x1024))   # SO_NWRITE
+    except (OSError, ValueError, AttributeError):
+        return None
+    return None
 
 
 def _ws_ping_frame(payload: bytes) -> bytes:
@@ -28193,7 +28213,8 @@ def _new_ws_client(app, wid, sock, lock=None, q=None, start_sender=True):
     lock = lock if lock is not None else threading.Lock()
     now = _ws_clock()
     client = {"app": app, "wid": wid, "alive": True, "qbytes": 0, "qlock": threading.Lock(),
-              "sock": sock, "since": now, "lastIn": now, "pingAt": None}
+              "sock": sock, "since": now, "lastIn": now, "pingAt": None,
+              "inRead": True}      # False while the handler thread is inside a dispatch (see _keepalive_all)
     client["send"] = _mk_ws_send(q, sock, client)
     client["q"] = q
     if start_sender:
@@ -28203,8 +28224,15 @@ def _new_ws_client(app, wid, sock, lock=None, q=None, start_sender=True):
 
 def _note_ws_inbound(client, now=None):
     """The peer spoke (a message or a pong): it is alive as of now, and no ping is outstanding."""
-    client["lastIn"] = now if now is not None else _ws_clock()
-    client["pingAt"] = None
+    lk = client.get("qlock")
+    if lk is not None:
+        with lk:
+            client["lastIn"] = now if now is not None else _ws_clock()
+            client["pingAt"] = None
+            client.pop("outq", None)
+    else:
+        client["lastIn"] = now if now is not None else _ws_clock()
+        client["pingAt"] = None
 
 
 def _drop_dead_ws_client(client, why):
@@ -28366,7 +28394,27 @@ def _keepalive_all(now=None):
         # however open the forwarder in between keeps the socket. Clients from before the factory (no
         # `sock`) are never judged: they cannot be shut down, and they cannot have been pinged.
         pa = c.get("pingAt")                     # any pong or message clears this (see _note_ws_inbound), so an
-        if pa is not None and c.get("sock") is not None and (now - pa) >= WS_DEAD_S:   # outstanding ping IS the silence
+        if pa is not None and c.get("sock") is not None and (now - pa) >= WS_DEAD_S:   # outstanding ping IS the silence…
+            # …only while the handler thread is parked in its READ. Inside a dispatch (`ready` builds every
+            # tab synchronously on that thread — tens of seconds on a cold kernel) the pong sits unread in
+            # the receive buffer: unread is not missing. The handler resets the clock when it re-enters the
+            # read (review 2026-09-03).
+            if not c.get("inRead", True):
+                continue
+            # …and never a peer that is still DRAINING: sendall returning means the ping entered the socket,
+            # not that it left the machine — a slow tunnel with megabytes queued ahead of it cannot pong in
+            # time. Unsent bytes that fell since the last beat prove the peer alive; unsent bytes that have
+            # not moved for a whole window prove it gone (a zero window nobody drains).
+            oq = _ws_outq(c["sock"])
+            if oq:
+                prev = c.get("outq")
+                if prev is None or prev[0] != oq:
+                    c["outq"] = (oq, now)             # draining (or first look) → alive, judge again next beat
+                    continue
+                if (now - prev[1]) < WS_DEAD_S:
+                    continue
+                _drop_dead_ws_client(c, "not acknowledging: %d bytes unsent for %ds" % (oq, int(now - prev[1])))
+                continue
             _drop_dead_ws_client(c, "no pong for %ds (last heard %ds ago)" % (int(now - pa), int(now - c.get("lastIn", 0))))
             continue
         try:
@@ -36885,12 +36933,14 @@ class Handler(BaseHTTPRequestHandler):
             while client["alive"]:
                 # one COMPLETE message per iteration — fragments reassembled, pings answered inline
                 # (browsers fragment large sends: a phone photo's dropFile spans dozens of frames)
+                client["inRead"] = True                # parked in the read: silence here is the peer's
                 op, payload = _ws_recv_message(
                     self.rfile, lambda payload: _ws_pong(self.wfile, lock, payload or b""),
                     on_pong=lambda payload: _note_ws_inbound(client))
                 if op is None:                         # EOF / close / a client overran the reassembly cap
                     break
                 _note_ws_inbound(client)               # any message proves the peer alive
+                client["inRead"] = False               # in a dispatch: pongs wait unread, not judged
                 # webview→kernel messages: on "ready", push the initial state to this client
                 try:
                     msg = json.loads(payload.decode("utf-8", "replace"))
@@ -36902,6 +36952,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise   # a genuine socket failure → let the outer handler tear the connection down
                 except Exception:
                     sys.stderr.write("ws handler [%s]: %s\n" % ((msg or {}).get("type"), traceback.format_exc()))
+                finally:
+                    _note_ws_inbound(client)           # pings sent during the dispatch were unjudgeable: fresh clock
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:

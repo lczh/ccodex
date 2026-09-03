@@ -87,21 +87,31 @@ class _Handler(threading.Thread):
 
 class PhantomPanesAreDropped(unittest.TestCase):
     def setUp(self):
-        self.closeables = []
+        self.closeables, self.threads, self.queues = [], [], []
         self._saved_clients = list(km._clients)
         km._clients[:] = []
         self.clock = [1_800_000_000.0]
-        self._saved_clock = km._ws_clock
+        self._saved_clock, self._saved_outq = km._ws_clock, km._ws_outq
         km._ws_clock = lambda: self.clock[0]
+        km._ws_outq = lambda sock: 0                  # loopback drains instantly; the drain probe has its own test
 
     def tearDown(self):
-        km._ws_clock = self._saved_clock
+        km._ws_clock, km._ws_outq = self._saved_clock, self._saved_outq
         km._clients[:] = self._saved_clients
+        for q in self.queues:
+            q.put(None)                               # end every sender thread the test started
         for s in self.closeables:
+            try:
+                s.shutdown(socket.SHUT_RDWR)          # a thread parked in a read returns EOF (close alone would
+            except OSError:                           # not: the reader's file object keeps the descriptor)
+                pass
             try:
                 s.close()
             except OSError:
                 pass
+        for t in self.threads:
+            t.join(3.0)
+            self.assertFalse(t.is_alive(), "a test thread outlived its test: %r" % t)
 
     def _pair(self):
         srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -115,9 +125,10 @@ class PhantomPanesAreDropped(unittest.TestCase):
     def _connect(self, pongs, app="timeline"):
         kern, peer_sock = self._pair()
         client, q, lock = km._new_ws_client(app, "w1", kern)
-        km._clients.append(client)
+        km._clients.append(client); self.queues.append(q)
         peer = _Peer(peer_sock, pongs); peer.start()
         handler = _Handler(client, kern); handler.start()
+        self.threads += [peer, handler]
         return client, peer, handler
 
     def _settle(self, pred, timeout=3.0):
@@ -179,9 +190,52 @@ class PhantomPanesAreDropped(unittest.TestCase):
         self.clock[0] = t0 + 10 * km.WS_DEAD_S                       # a long backlog later…
         km._keepalive_all(now=self.clock[0])
         self.assertTrue(client["alive"], "…still not judged: no ping has reached the peer")
-        threading.Thread(target=km._ws_sender, args=(q, kern, lock, client), daemon=True).start()   # backlog drains
+        t = threading.Thread(target=km._ws_sender, args=(q, kern, lock, client), daemon=True); t.start()   # backlog drains
+        self.threads.append(t); self.queues.append(q)
         self.assertTrue(self._settle(lambda: client["pingAt"] == self.clock[0]), "stamped as the first ping left")
-        q.put(None)
+
+    def test_c3_a_peer_is_never_judged_while_its_handler_is_inside_a_dispatch(self):
+        """A `ready` runs the connect push on the handler thread — tens of seconds on a cold kernel — and the
+        peer's pongs wait unread in the receive buffer meanwhile. Unread is not missing (review 2026-09-03)."""
+        client, peer, handler = self._connect(pongs=False)
+        t0 = self.clock[0]
+        client["inRead"] = False                                    # as the handler marks itself for a dispatch
+        km._keepalive_all(now=t0)
+        self.assertTrue(self._settle(lambda: client["pingAt"] == t0))
+        self.clock[0] = t0 + 3 * km.WS_DEAD_S
+        km._keepalive_all(now=self.clock[0])
+        self.assertTrue(client["alive"], "silence during a dispatch is the kernel's, not the peer's")
+        km._note_ws_inbound(client); client["inRead"] = True        # the handler returns to its read: fresh clock
+        self.assertIsNone(client["pingAt"])
+        km._keepalive_all(now=self.clock[0])                        # a new ping…
+        self.assertTrue(self._settle(lambda: client["pingAt"] == self.clock[0]))
+        self.clock[0] += km.WS_DEAD_S
+        km._keepalive_all(now=self.clock[0])                        # …judged on its own fresh window
+        self.assertFalse(client["alive"], "back in the read and still silent for a whole window → dropped")
+
+    def test_c4_a_peer_still_draining_its_backlog_is_alive_and_one_that_stopped_acknowledging_is_not(self):
+        client, peer, handler = self._connect(pongs=False)
+        t0 = self.clock[0]
+        outq = [3_000_000]
+        km._ws_outq = lambda sock: outq[0]
+        km._keepalive_all(now=t0)
+        self.assertTrue(self._settle(lambda: client["pingAt"] == t0))
+        self.clock[0] = t0 + km.WS_DEAD_S; outq[0] = 2_000_000       # the window passed, but bytes are leaving
+        km._keepalive_all(now=self.clock[0])
+        self.assertTrue(client["alive"], "unsent bytes fell since the last beat → a slow peer, not a dead one")
+        self.clock[0] += km.KEEPALIVE_S; outq[0] = 1_000_000
+        km._keepalive_all(now=self.clock[0])
+        self.assertTrue(client["alive"])
+        stuck_at = self.clock[0]                                    # from here the count never moves
+        self.clock[0] += km.KEEPALIVE_S
+        km._keepalive_all(now=self.clock[0])
+        self.assertTrue(client["alive"], "unchanged once is not yet a verdict")
+        self.clock[0] = stuck_at + km.KEEPALIVE_S + km.WS_DEAD_S
+        km._keepalive_all(now=self.clock[0])
+        self.assertFalse(client["alive"], "unsent bytes unmoved for a whole window → the peer stopped acknowledging")
+
+    def test_c5_the_liveness_clock_is_monotonic(self):
+        self.assertIs(self._saved_clock, time.monotonic, "a suspend or an NTP step must not read as silence")
 
     def test_d_the_ping_frame_is_well_formed(self):
         f = km._ws_ping_frame(b"1700000000")
