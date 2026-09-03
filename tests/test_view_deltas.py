@@ -306,6 +306,28 @@ class BarsDeltas(unittest.TestCase):
         fr = st.push(_bars({S1: self._turn(S1, 2)}, [], [], now=1005))
         self.assertEqual([f["type"] for f in fr], ["bars"]); self.assertIn("_keys", fr[0], "the stream starts afresh")
 
+    def test_m_after_a_keyless_whole_frame_the_keyed_full_still_goes_even_for_an_unchanged_payload(self):
+        """The failure path sends the whole payload without keys, filling the dedup slot with its signature. If
+        the next cycle's keyed full were deduped, the kernel would hold state for a client holding nothing, and
+        its next delta would be refused (review 2026-09-03). The keyed full always goes once."""
+        import io, contextlib
+        st = _Stream("bars")
+        p1 = _bars({S1: self._turn(S1, 1)}, [], [])
+        real = km._delta_parts
+        km._delta_parts = lambda ftype, payload: (_ for _ in ()).throw(RuntimeError("synthetic"))
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                st.push(p1)
+        finally:
+            km._delta_parts = real
+        self.assertIsNone(st.last)
+        fr = st.push(dict(p1, now=1001))                            # the same payload, only the clock moved
+        self.assertEqual([f["type"] for f in fr], ["bars"]); self.assertIn("_keys", fr[0], "keyed full not deduped away")
+        self.assertEqual(st.held, dict(p1, now=1001))
+        self.assertEqual(st.c["dstate"]["bars"]["rev"], 0)
+        fr = st.push(_bars({S1: self._turn(S1, 2)}, [], [], now=1005))
+        self.assertEqual([f["type"] for f in fr], ["delta"], "…and the stream continues as deltas the client can apply")
+
 
     def test_g_a_bar_appended_to_an_earlier_lane_crosses_alone_and_lands_in_its_lane(self):
         """The flat key order changes (the new bar sits before the later lanes' bars) but the assembled

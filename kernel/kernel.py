@@ -28872,6 +28872,10 @@ def _send_slot_delta(c, key, ftype, payload, pre, sig):
         # would spell null/None, true/True, 1/1.0 differently from Python and hold keys the kernel never sent.
         keys = json.dumps({n: o for n, (_e, o) in colls.items()})
         pre_k = pre[:-1] + ',"_keys":' + keys + "}" if pre.endswith("}") else json.dumps(dict(payload, _keys=json.loads(keys)), default=str)
+        # The keyed full must actually GO: a whole frame sent moments ago without keys (the failure path, or an
+        # unkeyable build) filled the dedup slot with this same signature, and a deduped keyed full would leave
+        # the kernel holding state for a client that holds nothing (review 2026-09-03).
+        c.get("sent", {}).pop(key, None)
         _send_client(c, key, payload, pre=pre_k, sig=sig)
         if c.get("sent", {}).get(key, (None,))[0] == sig:      # it went (or was already held) → rebase
             states[ftype] = {"rev": 0, "rest": rest_sig,

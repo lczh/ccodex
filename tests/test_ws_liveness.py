@@ -53,7 +53,10 @@ class _Peer(threading.Thread):
     def run(self):
         rf = self.sock.makefile("rb")
         while not self.stop:
-            op, payload, fin = km._ws_recv(rf)      # server frames are unmasked; the reader tolerates that
+            try:
+                op, payload, fin = km._ws_recv(rf)  # server frames are unmasked; the reader tolerates that
+            except OSError:
+                return                              # the kernel side shut the pair down under us (teardown)
             if op is None:
                 return
             if op == 0x9:
