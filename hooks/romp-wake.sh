@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # romp-wake.sh — event-driven judge trigger (design: event-based over time heuristics).
 #
-# Fires on the Claude Code events that create NEW work for the judges — a turn
-# ended (Stop) or a prompt landed (UserPromptSubmit) — and pokes the kernel's
-# POST /tick so the producer runs a judge pass NOW instead of waiting out the
-# 20s backstop. Without this the feed can lag up to ~20s behind a completed turn.
+# Fires on the Claude Code events that create NEW work for the kernel — a turn
+# ended (Stop), a prompt landed (UserPromptSubmit), or a compaction ended
+# (PostCompact) — and pokes the kernel's POST /tick so the judge producer runs a
+# pass NOW instead of waiting out its 3 s backstop, and the pusher's parked-op
+# drain runs now instead of on its 0.5 s one. A tmux /compact ends at
+# PostCompact: the poke wakes the drain, and the op queued behind the compact
+# fires once the compaction is corroborated in the transcript (the boundary
+# record). Without this the feed lags a completed turn by a backstop.
 #
 # Fire-and-forget: it MUST never block or fail a turn. The curl is detached into
 # a subshell with a short timeout and every output/error is swallowed. If no
 # kernel is listening (none running, or a headless/non-romp session) the poke
-# fails silently — the producer's 20s backstop still covers it.
+# fails silently — the backstops still cover it.
 set -uo pipefail
 
 # Drain stdin (Claude Code sends the hook event as JSON) so we never SIGPIPE the
@@ -22,7 +26,7 @@ cat >/dev/null 2>&1 || true
 port="${ROMP_SERVE_PORT:-${ROMP_KERNEL_PORT:-29855}}"
 # The kernel gates every request on the serve token, loopback included (Jupyter's model) — read it
 # the way the kernel resolves it: env override, else the 0600 state file. Missing token → the poke
-# 403s silently, same posture as no kernel at all (the 20s backstop covers it).
+# 403s silently, same posture as no kernel at all (the backstops cover it).
 tok="${ROMP_SERVE_TOKEN:-}"
 [[ -n "$tok" ]] || tok="$(cat "${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}/serve-token" 2>/dev/null || true)"
 # The token goes in on STDIN as a curl config, never in argv: /proc/<pid>/cmdline is world-readable,

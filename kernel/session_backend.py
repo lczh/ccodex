@@ -30,6 +30,11 @@ from abc import ABC, abstractmethod
 
 
 class SessionBackend(ABC):
+    # True when busy() may be overruled by the cached transcript parse, so the pusher must keep that parse
+    # current for the sids it holds parked ops for (_refresh_parked_parses); a backend whose busy() is the
+    # whole truth (SDK, Codex) leaves it False and its parked sids are never re-parsed on its account.
+    corroborates_with_transcript = False
+
     # ── liveness / identity ──────────────────────────────────────────────────────────────────────
     @abstractmethod
     def owns(self, sid: str) -> bool:
@@ -60,7 +65,11 @@ class SessionBackend(ABC):
         pressed in that window saw 'not working', bypassed the FIFO, and fired immediately — /compact jumped
         ahead of a model/message pressed right after it, and the parked ops then stalled (the user 2026-07-14,
         reproduced: compact→model→send pressed 150ms apart delivered out of order). The SDK knows its inflight
-        count exactly; tmux has no equivalent (returns None → cached-parse fallback, unchanged)."""
+        count exactly; tmux reads the hook-maintained @claude-state — working / permission / picker → True,
+        waiting / idle → False, compacting → None (the compacting gate owns it), and None for an unknown
+        word, no row, or a row another backend owns — an answer the transcript overrules when the cached
+        parse's newest record is newer than the row's since (an Esc fires no hook, so a stale row can say
+        working over an ended turn)."""
         return None
 
     def compacting(self, sid: str) -> "bool | None":

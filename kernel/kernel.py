@@ -12973,6 +12973,93 @@ class TmuxBackend(sb.SessionBackend):
                          "mode": p[9].strip() if len(p) > 9 else ""}   # @claude-permission-mode (shift+tab cycle)
         return out
 
+    # The @claude-state words this backend answers for, split by what a paste into the pane would do right
+    # now. Writers: hooks/tmux-status.sh (UserPromptSubmit / PostToolUse → working, Stop / SessionStart →
+    # waiting, PostCompact → waiting after a manual compaction and working after an auto one — that turn
+    # goes on —, the permission_prompt notification → permission, idle_prompt → idle) and record_state (the
+    # revive watcher's picker). compacting is deliberately in NEITHER tuple: busy() answers None for it, so
+    # _working_now falls to the cached parse and _compacting_now owns that gate, with the escape that
+    # disbelieves a stuck row (an open turn or a compact_boundary since the row's since). Any other word —
+    # "" before the first hook publish, an unknown spelling — is likewise no answer, never a hold.
+    BUSY_STATES = ("working", "permission", "picker")
+    QUIET_STATES = ("waiting", "idle")
+    corroborates_with_transcript = True   # busy() below may be overruled by the cached parse → the pusher keeps
+    #                                       it current for this backend's parked sids (_refresh_parked_parses)
+
+    def busy(self, sid):
+        """AUTHORITATIVE 'is a turn in flight' for a tmux session: the hook-maintained @claude-state,
+        corroborated against the cached transcript parse by EVENT ORDER (review finds on #904 and on this
+        change's first cut, 2026-09-03).
+
+        Why the row: before it this backend answered None and _working_now fell to the CACHED transcript
+        parse — which is None whenever the transcript's (mtime, size) moved since the last parse, and None
+        reads as idle. A tmux session MID-TURN therefore read as quiet the moment its transcript grew, and
+        the parked-op drain (every pusher cycle, ahead of the push that refreshes the cache) fired the op
+        behind into the open turn: a parked slash command landed as text. UserPromptSubmit flips the row to
+        working the instant the CLI accepts a prompt — no transcript write, no parse, no lag.
+
+        Why not the row alone: Claude Code fires NO hook on an Esc-interrupt (hooks/tmux-status.sh and
+        romp-idle-dots both say so), so an interrupted session's row reads working until romp-idle-dots
+        heals it — two minutes at the earliest, and only once the pane looks idle. Trusted alone, every send
+        typed after a Stop parked for minutes; the cached parse had corrected exactly this, because the
+        CLI's interrupt record (or the kernel's own idle record, _record_idle) ENDS the turn. So the two
+        sources are ordered by the events they record, the way _compacting disbelieves a compacting row: the
+        row carries `since` (@claude-state-since, rewritten on every hook write); when the cached parse
+        matches the file on disk (_parse_cached is not None — the transcript has NOT moved since it was
+        parsed) AND the last turn's newest record is NEWER than `since`, the transcript spoke after the
+        hook and its verdict wins (_session_working); otherwise the hook wins. "Newest record" is the
+        largest atom `t` of the last turn — never turn["end"], which for an idle span at the tail is the
+        PARSE time and would outrank every hook write; an idle atom's `t` is a real event (a states-file
+        record: the Stop hook's waiting, the kernel's interrupt idle, the idle-dots heal). The two shapes:
+          * a turn just STARTED — row working with a fresh since, the transcript not yet written (the cache
+            matches the file; the last turn ended BEFORE since) → the hook wins → True. The gap stays shut.
+          * an Esc-INTERRUPT — row working with an old since; the interrupt record (or the idle record)
+            ends the turn AFTER since → the parse wins → False. Sends deliver.
+        The same rule runs for permission and picker (a phantom or answered prompt strands those rows the
+        same way), and in the other direction for waiting / idle: a row older than an open turn's newer
+        records reads True — which also narrows the gap after an auto-compaction, whose PostCompact once
+        wrote waiting into a turn that went on. A parse that cannot be consulted — None (the file moved
+        since the last parse, or was never parsed) or a row without `since` — leaves the hook standing:
+        the transcript has not spoken since, or cannot be dated against the row. TIES (the same second)
+        go to the hook, deliberately: a hook fires after the record it reports on (Stop after the final
+        assistant record; the permission notification after the tool_use) or before any record exists
+        (UserPromptSubmit, before the prompt is written), so a same-second row is the later word. The one
+        sticky exception is accepted: a PostToolUse rewrite and an Esc in the same second leave working
+        standing until romp-idle-dots heals it or the next pane prompt.
+
+        This never parses — it also serves the WS handler, which must stay cheap — so headless (no chat or
+        timeline client, or every session after a kernel restart until one connects) nothing would fill
+        the cache and the row would stand verbatim; _refresh_parked_parses, at the head of every pusher
+        cycle, re-parses the moved transcripts of the sids that hold parked ops so the drain's gates read a
+        current transcript.
+
+        None when there is no answer: no tmux row for the sid (the hook is not installed, or the pane is
+        gone), a row another backend owns, a state no hook has published yet, an unknown word, or
+        compacting (see BUSY_STATES). Never "hold on unknown": a tmux session whose cache nobody refreshes
+        would otherwise never drain. The row is read through _tmux_sessions() — inside a pusher cycle the
+        cycle's one liveness snapshot, no fork; outside a cycle a fresh Sessions.live(), one tmux fork per
+        user gesture (tens of ms), accepted."""
+        row = _tmux_sessions().get(str(sid))
+        if not row or row.get("backend") != "tmux":
+            return None
+        st = (row.get("state") or "").strip()
+        if st in self.BUSY_STATES:
+            hook = True
+        elif st in self.QUIET_STATES:
+            hook = False
+        else:
+            return None
+        since = row.get("since")
+        path = _path_of(str(sid))
+        turns = ((_parse_cached(path) if path else None) or {}).get("turns") or []
+        if not since or not turns:
+            return hook                                   # the transcript has not spoken since, or cannot be dated
+        last = turns[-1]
+        newest = max([a.get("t") or 0 for a in (last.get("atoms") or [])] + [last.get("t") or 0])
+        if newest <= since:
+            return hook                                   # the row is the later word (a tie goes to the hook — see above)
+        return _session_working(turns)                    # the transcript spoke after the hook: its verdict
+
     # control — map sid→name, delegate to the existing injectors. send() does NOT echo: the kernel adds the
     # optimistic input echo for a composer send (see _optimistic_echo), matching today's split where the
     # command sends (/compact, /model, follow-ups) don't echo on tmux.
@@ -21930,8 +22017,10 @@ def _working_now(sid):
     """Is the session's turn OPEN right now. Prefer the backend's AUTHORITATIVE busy signal (SDK inflight)
     — the CACHED parse below LAGS a just-started turn (transcript-not-yet-written), which raced the drive-op
     gate: a /compact pressed while a turn was truly in flight saw 'not working', skipped the FIFO, and fired
-    immediately, out of press-order (the user 2026-07-14). tmux has no such signal (busy→None) → the cached
-    event-model parse, unchanged. Both are cheap enough for the WS handler + the pusher's drain."""
+    immediately, out of press-order (the user 2026-07-14). tmux answers from the hook-maintained
+    @claude-state, corroborated against the cached parse by event order (TmuxBackend.busy, 2026-09-03);
+    None — no row, no published state, compacting — falls to the cached event-model parse. Both are cheap
+    enough for the WS handler + the pusher's drain."""
     try:
         be = Sessions.backend_for(sid)
         b = be.busy(sid) if be is not None else None
@@ -22057,41 +22146,89 @@ def _parked_md(op):
 
 
 # ── holding a sid's parked queue for a moment (2026-09-03) ────────────────────────────────────
-_TMUX_PROMPT_HOLD_S = 3.0        # after the drain hands a turn-opening op to a backend with NO authoritative
-                                 # busy() (tmux), how long that sid's queue holds before the op behind may fire
-_drain_hold: dict = {}           # sid -> time.monotonic() deadline; _apply_pending_ops skips the sid until then
+_TMUX_PROMPT_HOLD_S = 3.0        # the prompt hold's clock FALLBACK: after the drain hands a session a turn-opening
+                                 # op and busy() did not read True inside send(), the sid holds until busy() is
+                                 # OBSERVED True (tmux: the UserPromptSubmit hook's flip) — or, if no flip ever comes
+                                 # (a paste tmux refused, a builtin that opens no prompt turn), until this many seconds
+_drain_hold: dict = {}           # sid -> (time.monotonic() deadline, until_busy); _apply_pending_ops skips the sid
+                                 # while the hold is open (_drain_hold_open)
 _refused_heads: set = set()      # sids whose HEAD op the backend refused (send/set_* → False) or whose delivery
                                  # raised — this tree RETAINS the op and the drain skips the sid; a KERNEL poke
                                  # (_wake_kernel: a backend's settle or resume; POST /tick: a hook) CLEARS the
                                  # set, so the next visit re-asks — and re-marks the head if refused again
 
 
-def _hold_drain(sid, seconds):
-    """Hold ONE sid's parked queue for `seconds` — the one place the drain must NOT run again at its own
-    cadence, made explicit (2026-09-03). The drain rides the pusher cycle, which any client push, any SDK
-    stream atom of any session, and the drain's own deliveries wake — so "the next cycle" can be
-    milliseconds away. One consumer needs more than that and has NO event to key on: a send / command /
-    compact just handed to a tmux session (TmuxBackend has no busy(); _working_now falls to the cached
-    transcript parse): the keystrokes have landed but the transcript has not recorded the prompt, so the
-    gate reads idle for a moment and the op behind would fire into the opening turn — the mis-delivery the
-    SEND-ends-the-drain contract exists to prevent. That is the judge producer's old 3 s cadence made
-    explicit, which spaced it by accident before. An honest clock, named as one: it retires when
-    TmuxBackend gains an authoritative busy() from the hook-maintained session state; the SDK and Codex
-    backends need no hold (_after_turn_opening). A REFUSED head op is no clock's business — it waits for
-    the event that can end a refusal (_refused_heads, cleared by every kernel poke)."""
-    _drain_hold[str(sid)] = time.monotonic() + seconds
+def _hold_drain(sid, seconds, until_busy=False):
+    """Hold ONE sid's parked queue — the one place the drain must NOT run again at its own cadence, made
+    explicit (2026-09-03). The drain rides the pusher cycle, which any client push, any SDK stream atom of
+    any session, and the drain's own deliveries wake — so "the next cycle" can be milliseconds away. One
+    consumer needs more than that: a send / command / compact just handed to a backend whose busy() did
+    not read True inside send() (_after_turn_opening). tmux: the paste is a daemon thread that clears the
+    box, pastes and presses Enter over ~0.3 s, and the row flips to working only when the CLI accepts the
+    prompt and the UserPromptSubmit hook runs — a cycle inside that window reads the row as still waiting,
+    and the op behind would fire into the opening turn, the mis-delivery the SEND-ends-the-drain contract
+    exists to prevent. Nothing in that path emits an event the kernel can see BEFORE the hook's flip, so
+    the hold is keyed on the flip itself: `until_busy` holds the sid until busy() has been OBSERVED True
+    once after the delivery (the flip, seen in a later cycle's snapshot), whereupon the working gate owns
+    the sid as for any open turn — the turn's Stop flip delivers the op behind; or until the sid reads
+    compacting (a delivered /compact: the compaction IS the event, and the compacting gate holds the op
+    behind until it is corroborated over — a compacting row gives no busy answer). `seconds`
+    (_TMUX_PROMPT_HOLD_S) is only the loud fallback for a flip that never comes — a paste tmux refused, a
+    builtin the CLI runs without a prompt turn — and its release is logged, so a queue that drained on the
+    clock is on the record. A plain clock hold (until_busy False) runs to its deadline and nothing else:
+    no caller in this tree arms one today; the shape is kept for a consumer whose window emits no event
+    when it closes (a CLI-side retry), so both kinds stay one mechanism under one check (_drain_hold_open).
+    The SDK and Codex backends need neither: their send() enqueues under the session lock, so busy() reads
+    True before it returns and _after_turn_opening arms nothing. A REFUSED head op is no hold's business —
+    it waits for the event that can end a refusal (_refused_heads, cleared by every kernel poke)."""
+    _drain_hold[str(sid)] = (time.monotonic() + seconds, bool(until_busy))
 
 
-def _after_turn_opening(be, sid):
-    """The drain just handed `sid` an op that OPENS a turn (a send batch, a typed command, a /compact). A
-    backend with an authoritative busy() (SDK, Codex) closed the working gate synchronously inside send(),
-    so the op behind waits for the turn's end by itself; one without (tmux) gets the hold — _hold_drain."""
+def _drain_hold_open(sid, hold):
+    """Is this sid's hold still in force this cycle? A clock hold: until its deadline. An until_busy hold:
+    over the moment busy() reads True — the delivered prompt's turn is open, and the working gate takes it
+    from here — or the moment the sid reads compacting: a delivered /compact goes working → compacting
+    within a fraction of a second, a compacting row gives no busy answer, and without this arm the hold
+    rode the clock and logged the fallback line although the compaction IS the event it waited for; the
+    compacting gate holds the op behind from here. Else held until the fallback deadline, whose release
+    is logged: neither event came."""
+    deadline, until_busy = hold
+    if not until_busy:
+        return time.monotonic() < deadline
     try:
-        authoritative = be.busy(sid) is not None
+        be = Sessions.backend_for(sid)
+        b = be.busy(sid) if be is not None else None
     except Exception:
-        authoritative = False
-    if not authoritative:
-        _hold_drain(sid, _TMUX_PROMPT_HOLD_S)
+        b = None
+    if b is True:
+        return False                                  # the EVENT: the turn is open; the working gate owns the sid now
+    if _compacting_now(sid):
+        return False                                  # the EVENT for a /compact: it is compacting; that gate takes over
+    if time.monotonic() < deadline:
+        return True
+    sys.stderr.write("drain: %s — no busy state observed within the window after a delivered prompt; "
+                     "releasing the queue on the clock fallback\n" % sid)
+    return False
+
+
+def _after_turn_opening(be, sid, remaining):
+    """The drain just handed `sid` an op that OPENS a turn (a send batch, a typed command, a /compact), with
+    `remaining` still queued behind it. Nothing behind → nothing a hold could protect, and none is armed:
+    a hold armed after the queue's LAST op outlived the queue (the sid leaves _pending_ops, so no cycle
+    evaluated or removed it) and fired the fallback line when a later op parked for an unrelated reason.
+    A backend whose send() closed its own busy gate synchronously (SDK, Codex: the turn is pending under
+    the session lock before send() returns) reads busy() True right here, and the op behind waits for the
+    turn's end by itself. Any other answer — tmux's row still says waiting until the UserPromptSubmit hook
+    runs; a backend with no busy() at all — arms the until_busy hold: the sid waits until busy() has been
+    observed True, or the fallback clock runs out (_hold_drain)."""
+    if not remaining:
+        return
+    try:
+        closed = be.busy(sid) is True
+    except Exception:
+        closed = False
+    if not closed:
+        _hold_drain(sid, _TMUX_PROMPT_HOLD_S, until_busy=True)
 
 
 def _cancel_miss_text(md):
@@ -22128,7 +22265,7 @@ def _cancel_parked(sid, park, md):
             _refused_heads.discard(sid)               # the refused head is gone (or the queue is): the mark with it
         if not ops:
             _pending_ops.pop(sid, None)
-            _drain_hold.pop(sid, None)                # nothing left for a hold to space
+            _drain_hold.pop(sid, None)                # an emptied queue leaves no hold behind (nothing left for it to protect)
         _save_pending_ops()
     _mark_views_dirty()
     return None
@@ -22325,6 +22462,39 @@ def _deliver_send_batch(be, sid, run):
     return len(run), None
 
 
+def _refresh_parked_parses(now):
+    """Before the drain: re-parse the transcript of every sid that HOLDS PARKED OPS and whose cached parse
+    has gone stale (second review of the tmux busy change, 2026-09-03). TmuxBackend.busy corroborates the
+    hook row against the CACHED parse and can overrule a stranded row (an Esc fires no hook) only when
+    _parse_cached returns a session — and _parse_cached never parses. The cache is filled by client builds
+    (build_session, build_timeline), the client-gated warmer, and a few gesture paths; headless — no chat or
+    timeline client, or every session after a kernel restart until one connects — every live tmux session's
+    cache is None from its first transcript write on, so busy() was the hook verbatim, and after a pane Esc
+    every `romp send` parked until romp-idle-dots healed the row, two minutes at the earliest: a regression
+    the parent did not have, whose stale-cache read was idle. A cache miss IS the event "the transcript
+    moved since we last read it", and this job answers it with the evidence the corroboration needs,
+    bounded four ways: only sids whose backend DECLARES that its busy() may be overruled by the transcript
+    (SessionBackend.corroborates_with_transcript — tmux; the SDK and Codex answer busy() and compacting()
+    authoritatively, so no drain gate reads their cache, and re-parsing an SDK transcript here would have
+    run on every cycle of a streaming turn, whose every atom moves the file AND wakes the pusher — load the
+    parent did not have), only sids with parked ops (the only sids the drain gates this cycle), once per
+    cycle, and only when the file moved (_parse_cached None). A sid with no backend is skipped too. busy()
+    itself stays parse-free — it also serves the WS handler, which must stay cheap. The consequence to
+    know: a headless `romp send` typed right after a pane Esc parks ONCE (at that instant the hook is all
+    busy() has), and the next cycle's refresh lets the drain deliver it — within the 0.5 s backstop instead
+    of ~2 minutes."""
+    for sid in list(_pending_ops):
+        try:
+            be = Sessions.backend_for(sid)
+        except Exception:
+            be = None
+        if be is None or not getattr(be, "corroborates_with_transcript", False):
+            continue                                  # its busy() is the whole truth: nothing here reads its cache
+        path = _path_of(sid)
+        if path and _parse_cached(path) is None:
+            _parse(path, sid, now)
+
+
 def _apply_pending_ops():
     """Pusher cycle: FIFO-deliver parked ops once the session is QUIET (neither compacting nor an open
     turn) — in exactly the order they were parked, which is exactly the order the chat rendered their
@@ -22358,11 +22528,14 @@ def _apply_pending_ops():
     the lock (this drain skips the cycle) or while the sid sits behind a gate (_limit_hold lifts on a
     wall-clock stamp, with no poke) leaves the sid unmarked, and the first visit that reaches it re-asks.
     The mark also clears when that head is delivered or popped, cancelled, replaced in place by a newer
-    pick, or the queue empties. A tmux session just handed a turn-opening op is held for a moment
-    instead, because its next step has no event to wait for (_hold_drain / _after_turn_opening). The lock
-    is taken NON-BLOCKING: a handler holding _pending_ops_lock across its backend call (a Codex client
-    connect can take seconds) skips the drain for this cycle rather than stalling every session's push
-    behind it — its own park wakes the pusher when it finishes, so nothing waits longer than it would."""
+    pick, or the queue empties. A session just handed a turn-opening op whose busy gate has not yet been
+    SEEN closed is skipped too, even when it reads quiet — until its backend reads busy (tmux's
+    UserPromptSubmit flip), or it reads compacting, or the fallback clock passes (_hold_drain /
+    _after_turn_opening); the hold check sits inside the lock with the gates, so a handler's park and a
+    hold's release never interleave. The lock is taken NON-BLOCKING: a handler holding _pending_ops_lock
+    across its backend call (a Codex client connect can take seconds) skips the drain for this cycle
+    rather than stalling every session's push behind it — its own park wakes the pusher when it
+    finishes, so nothing waits longer than it would."""
     if not _pending_ops_lock.acquire(blocking=False):
         return                                        # a handler owns the queue mid-handoff: its park wakes us
     try:
@@ -22371,12 +22544,15 @@ def _apply_pending_ops():
             if not ops:
                 _pending_ops.pop(sid, None)
                 _refused_heads.discard(sid)
+                _drain_hold.pop(sid, None)            # no queue, no hold
                 continue
             if sid in _refused_heads:
                 continue                              # the head was refused: a kernel poke clears this (_wake_kernel)
-            if _drain_hold.get(sid, 0.0) > time.monotonic():
-                continue                              # a window is still open for this sid (_hold_drain)
-            _drain_hold.pop(sid, None)
+            hold = _drain_hold.get(sid)
+            if hold is not None:
+                if _drain_hold_open(sid, hold):
+                    continue                          # this sid's window is still open (_hold_drain)
+                _drain_hold.pop(sid, None)
             if _compacting_now(sid) or _working_now(sid) or _limit_hold(sid):
                 continue                              # …or the account can't serve a request yet
             changed = False                           # a real mutation below → save the mirror + wake the pusher
@@ -22394,7 +22570,7 @@ def _apply_pending_ops():
                         if accepted:
                             del ops[:accepted]
                             changed = True
-                            _after_turn_opening(be, sid)
+                            _after_turn_opening(be, sid, ops)
                         else:
                             refused = True
                         break                         # accepted send(s) open one turn; refusal stays at the head
@@ -22411,7 +22587,7 @@ def _apply_pending_ops():
                         if op[1].strip().split()[0] == "/compact":
                             _mark_compacting(sid)     # a TYPED /compact gets the same instant cue as the button's op
                         ops.pop(0); changed = True
-                        _after_turn_opening(be, sid)
+                        _after_turn_opening(be, sid, ops)
                         break                         # its turn must end before anything behind it fires
                     elif op[0] == "compact":
                         if not bool(be.send(sid, "/compact")):
@@ -22419,7 +22595,7 @@ def _apply_pending_ops():
                             break
                         _mark_compacting(sid)
                         ops.pop(0); changed = True
-                        _after_turn_opening(be, sid)
+                        _after_turn_opening(be, sid, ops)
                         break                         # the compaction must finish first
                     elif op[0] == "model":
                         if not bool(be.set_model(sid, op[1])):
@@ -30409,6 +30585,10 @@ def _pusher_cycle():
 
 
 def _pusher_cycle_jobs(now, tmux, any_client):
+    try:                                  # the drain's gates read the CACHED parse: re-parse the parked sids'
+        _refresh_parked_parses(now)       # moved transcripts first, so a stranded hook row can be overruled by
+    except Exception:                     # what the transcript says (headless, nobody else fills the cache)
+        sys.stderr.write("parked-parse refresh: %s\n" % traceback.format_exc())
     try:                                  # parked ops deliver on the settle EVENT this cycle was woken for
         _apply_pending_ops()              # (_wake_kernel, /tick, a park or cancel, the 0.5 s backstop) —
     except Exception:                     # FIRST, so a delivered op's echo / retired chip rides this push;
@@ -34734,9 +34914,10 @@ class Handler(BaseHTTPRequestHandler):
                 now_ = _reveal_request(sid, wid)
                 return self._send(200, json.dumps({"ok": True, "delivered": now_}), "application/json")
             if u.path == "/tick":
-                # Event-driven wake: the Stop / UserPromptSubmit hooks (and the postal drain) poke this the
-                # instant a turn ends / a prompt lands / a message arrives, so the judges run NOW instead of
-                # on the next backstop tick. It ALSO wakes the chat PUSHER, so a tmux turn completing/landing
+                # Event-driven wake: the Stop / UserPromptSubmit / PostCompact hooks (and the postal drain) poke
+                # this the instant a turn ends / a prompt lands / a compaction ends / a message arrives, so the
+                # judges run NOW instead of on the next backstop tick — and the parked-op drain runs on the
+                # event it waits for. It ALSO wakes the chat PUSHER, so a tmux turn completing/landing
                 # appears in the chat immediately (the common 'why hasn't it shown up yet' moment) rather than
                 # waiting out the poll — tmux's per-message event-driven path, the SDK live-tail's analogue.
                 # Cheap + idempotent; the hook authorizes with X-Romp-Token read from the 0600 token file.

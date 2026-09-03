@@ -142,7 +142,9 @@ WANT = {  # event -> [(hook script, timeout secs, async)]
 
     "Notification":     [("tmux-status.sh", 5, False)],
     "PreCompact":       [("tmux-status.sh", 5, False)],
-    "PostCompact":      [("tmux-status.sh", 5, False)],
+    "PostCompact":      [("tmux-status.sh", 5, False),
+                         ("romp-wake.sh", 5, True)],     # compaction ended → wake the drain; the op behind a /compact fires once
+                                                          # the compaction is corroborated in the transcript
 }
 
 try:

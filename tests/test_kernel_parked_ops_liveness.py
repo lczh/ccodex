@@ -14,12 +14,14 @@ SYNTHETIC fixtures only: a placeholder uuid, invented texts.
 """
 import inspect
 import io
+import json
 import os
 import tempfile
 import threading
 import time
 import unittest
 from contextlib import redirect_stderr
+from datetime import datetime, timezone
 from unittest import mock
 from importlib.machinery import SourceFileLoader
 
@@ -36,8 +38,11 @@ km = SourceFileLoader("romp_kernel_parkedlive", os.path.join(BIN, "romp-kernel")
 # The ACCOUNT gate is a separate axis (tests/test_kernel_limit_queue.py); pinned off so the real
 # machine's usage.json can never make these tests park for a reason none of them is about.
 km._limit_hold = lambda sid: None
+REAL_PARSE_CACHED = km._parse_cached          # the never-parsing cache reader, before any test patches it
 
 SID = "11111111-2222-3333-4444-555555555555"
+SID2 = "11111111-2222-3333-4444-666666666666"
+SID3 = "11111111-2222-3333-4444-777777777777"
 
 # Every pusher-cycle job except the drain, quieted so a cycle run here does exactly one thing.
 _OTHER_JOBS = ("_push_all", "_lift_spent_awaiting", "_death_sweep_tick", "_end_on_idle_sweep",
@@ -63,7 +68,10 @@ class _FakeBackend:
 
     def send(self, sid, text):
         self.calls.append(("send", text))
-        return not self.refuse
+        if self.refuse:
+            return False
+        self.open = True                  # as SdkBackend.send: the turn is pending under the lock before send() returns
+        return True
 
     def set_model(self, sid, value):
         self.calls.append(("model", value))
@@ -71,6 +79,13 @@ class _FakeBackend:
 
     def turn_seq(self, sid):
         return 0
+
+
+def _tmux_row(state):
+    """One romp tmux session's row, shaped as TmuxBackend.live_sessions builds it for the cycle snapshot
+    (the @claude-* vars: state/since/model/effort/context/compactPct/color/mode, tagged backend tmux)."""
+    return {"state": state, "since": int(time.time()) - 5, "model": "", "effort": "", "context": None,
+            "compactPct": None, "color": None, "mode": "", "backend": "tmux"}
 
 
 class _Drain(unittest.TestCase):
@@ -81,7 +96,9 @@ class _Drain(unittest.TestCase):
             mock.patch.object(km, "_compacting_now", lambda sid, **k: False),
             mock.patch.object(km, "_optimistic_echo", lambda *a, **k: None),
             mock.patch.object(km, "_mark_compacting", lambda sid: None),
-            mock.patch.object(km, "_tmux_sessions", lambda: {SID: {"state": "waiting", "backend": "tmux"}}),
+            # a tmux-shaped row for the fake's sid: TmuxBackend.busy is not consulted here (the fake's own
+            # busy() answers), but the drain's other reads see one live session of the ordinary shape
+            mock.patch.object(km, "_tmux_sessions", lambda: {SID: _tmux_row("waiting")}),
         ] + [mock.patch.object(km, name, lambda *a, **k: None) for name in _OTHER_JOBS]
         for p in self._patches:
             p.start()
@@ -160,7 +177,8 @@ class DeliveryRidesTheSettle(_Drain):
         km._pusher_cycle()
         self.assertEqual(self.be.calls, [("send", "one")], "the send fired; the compact waits for ITS turn to end")
         self.assertEqual([op[0] for op in km._pending_ops[SID]], ["compact"])
-        self.be.open = True                                                     # the delivered send's turn
+        self.assertNotIn(SID, km._drain_hold, "send() closed the busy gate before it returned: nothing to hold for")
+        self.assertTrue(self.be.open, "the delivered send's turn is in flight")
         km._pusher_cycle()
         self.assertEqual(self.be.calls, [("send", "one")], "nothing fires into an open turn")
         self.be.open = False                                                    # settle #2
@@ -169,27 +187,45 @@ class DeliveryRidesTheSettle(_Drain):
         self.assertNotIn(SID, km._pending_ops)
         self.assertNotIn(SID, km._drain_hold, "an authoritative busy() needs no hold between deliveries")
 
-    def test_a_tmux_shaped_delivery_holds_the_sid_until_the_prompt_can_have_landed(self):
-        # TmuxBackend has no busy(): _working_now falls to the cached transcript parse, which reads idle for a
-        # moment after the keystrokes land — and the drain's own delivery wakes the pusher, so without the hold
-        # the op behind would fire into the opening turn (the SEND-ends-the-drain contract, broken). The hold
-        # is the producer's old cadence made explicit; it retires when tmux gains an authoritative busy().
-        class _TmuxShaped(_FakeBackend):
+    def test_a_backend_that_cannot_say_busy_still_holds_for_the_fallback_window(self):
+        # a backend with NO busy() at all (a test fake, a future backend): nothing can ever observe its gate
+        # close, so the prompt hold arms and only its clock fallback (_TMUX_PROMPT_HOLD_S) releases it —
+        # the op behind never fires back-to-back into a turn that may be opening
+        class _Mute(_FakeBackend):
             def busy(self, sid):
                 return None
-        self.be = _TmuxShaped()
+        self.be = _Mute()
         with mock.patch.object(km, "_working_now", lambda sid: True):             # the turn is open: both park
             km._send_or_park(self.be, SID, "one", echo="human")
             km._park_op(SID, ("compact",))                                        # the compact handler's park
         self.assertEqual([op[0] for op in km._pending_ops[SID]], ["send", "compact"])
-        km._pusher_cycle()                                                        # the cached parse reads idle
-        self.assertEqual(self.be.calls, [("send", "one")], "the send fired")
-        self.assertIn(SID, km._drain_hold, "…and the sid is held while its prompt lands")
-        km._pusher_cycle()                                                        # back-to-back, as a wake would
-        self.assertEqual(self.be.calls, [("send", "one")], "the compact does NOT fire into the opening turn")
-        km._drain_hold.clear()                                                    # the window passed
-        km._pusher_cycle()
+        with mock.patch.object(km, "_TMUX_PROMPT_HOLD_S", 3600.0):
+            km._pusher_cycle()                                                    # the cached parse reads idle
+            self.assertEqual(self.be.calls, [("send", "one")], "the send fired")
+            self.assertIn(SID, km._drain_hold, "…and the sid is held while its prompt lands")
+            km._pusher_cycle()                                                    # back-to-back, as a wake would
+            self.assertEqual(self.be.calls, [("send", "one")], "the compact does NOT fire into the opening turn")
+        far = time.monotonic() + 7200.0                                           # the fallback window passed
+        with mock.patch.object(km.time, "monotonic", lambda: far), redirect_stderr(io.StringIO()):
+            km._pusher_cycle()
         self.assertEqual(self.be.calls, [("send", "one"), ("send", "/compact")])
+
+    def test_a_raising_delivery_retains_the_queue_and_arms_no_hold(self):
+        # this tree RETAINS a head op whose delivery raised (never a dropped queue — RefusedHeadRetriesOnPoke),
+        # so there is no queue drop for a hold to go with; what is pinned is that a delivery that never opened
+        # a turn arms no hold either — the hold check precedes delivery, and the only writer of a hold in this
+        # tree is the drain's own _after_turn_opening, reached only past a delivery that returned
+        class _Dead(_FakeBackend):
+            def send(self, sid, text):
+                raise RuntimeError("the session is gone")
+        self.be = _Dead()
+        self.be.open = False
+        km._pending_ops[SID] = [("send", "one", "human"), ("compact",)]
+        with redirect_stderr(io.StringIO()):
+            km._apply_pending_ops()
+        self.assertEqual([op[0] for op in km._pending_ops[SID]], ["send", "compact"], "retained, in order")
+        self.assertIn(SID, km._refused_heads, "…and marked: a kernel poke re-asks it")
+        self.assertNotIn(SID, km._drain_hold, "no turn opened, so nothing is held")
 
     def test_wake_kernel_sets_both_events_and_is_the_backends_poke(self):
         km._producer_wake.clear()
@@ -229,6 +265,7 @@ class DeliveryRidesTheSettle(_Drain):
         km._pusher_cycle()
         self.assertEqual(self.be.calls[-1], ("send", "please retry me"), "…then the retry fires")
         self.assertNotIn(SID, km._pending_ops)
+        self.be.open = False                                                      # the retry's turn settled
         km._pusher_wake.clear()
         km._pending_ops[SID] = [("model", "opus")]
         km._apply_pending_ops()
@@ -404,7 +441,7 @@ class RefusedHeadRetriesOnPoke(_Drain):
 
     def test_cancelling_the_last_op_drops_the_tmux_hold(self):
         km._pending_ops[SID] = [("send", "one", None), ("send", "two", None)]
-        km._drain_hold[SID] = time.monotonic() + 60
+        km._hold_drain(SID, 60.0, until_busy=True)                                # the shape the drain arms
         self.assertIsNone(km._cancel_parked(SID, 1, ""))
         self.assertIn(SID, km._drain_hold, "a hold still has something to space")
         self.assertIsNone(km._cancel_parked(SID, 0, ""))
@@ -461,6 +498,365 @@ class RefusedHeadRetriesOnPoke(_Drain):
         km._pusher_cycle()
         self.assertEqual(self.be.calls, [("model", "opus")], "the next cycle drains")
         self.assertNotIn(SID, km._pending_ops)
+
+
+
+class TmuxBusyFromHookState(unittest.TestCase):
+    """TmuxBackend.busy() answers from the hook-maintained @claude-state the cycle snapshot already carries
+    (hooks/tmux-status.sh: UserPromptSubmit / PostToolUse → working, Stop / SessionStart → waiting,
+    PostCompact → waiting after a manual compaction and working after an auto one, PreCompact →
+    compacting, a permission_prompt notification → permission, an idle_prompt one → idle; the revive
+    watcher writes picker). Review find on #904: with busy() None, _working_now fell to the
+    cached transcript parse, which is None whenever the transcript's (mtime, size) moved since the last
+    parse — so a tmux session MID-TURN read as quiet the moment its transcript grew, and the drain fired a
+    parked op into the open turn (a parked slash command lands there as text). The drain runs every cycle
+    now and before _push_all refreshes the cache, so the stale read was the common case, not a corner.
+
+    The row is not trusted alone (review find on this change's first cut): Claude Code fires NO hook on an
+    Esc-interrupt, so an interrupted session's row reads working until romp-idle-dots heals it minutes later
+    — every send after a Stop would have parked. busy() corroborates by EVENT ORDER: when the cached parse
+    matches the file on disk and the last turn's newest record is NEWER than the row's since, the transcript
+    spoke after the hook and its verdict wins; otherwise the hook's does. compacting is no answer at all —
+    _compacting_now owns that gate.
+
+    These drive the REAL TmuxBackend (km._TMUX) with its paste stubbed: what it would have pasted, and
+    when, is the whole question."""
+
+    def setUp(self):
+        self.rows = {SID: _tmux_row("waiting")}
+        self.sent = []                                    # (tmux name, text) TmuxBackend.send handed to the paste
+        self._tmux_patch = mock.patch.object(km, "_tmux_sessions", lambda: self.rows)
+        self._patches = [
+            mock.patch.object(km.Sessions, "backend_for", staticmethod(lambda sid: km._TMUX)),
+            mock.patch.object(km, "_tmux_send", lambda name, text, **k: self.sent.append((name, text))),
+            mock.patch.object(km, "_compacting_now", lambda sid, **k: False),
+            mock.patch.object(km, "_optimistic_echo", lambda *a, **k: None),
+            mock.patch.object(km, "_mark_compacting", lambda sid: None),
+            mock.patch.object(km, "_name_of", lambda sid: None),   # TmuxBackend.send pastes to _name_of(sid) or sid
+            # the cached parse is STALE: the transcript moved since the last parse, so it answers None —
+            # which the fallback reads as idle. Every correct answer below has to come from the row.
+            mock.patch.object(km, "_parse_cached", lambda path: None),
+            mock.patch.object(km, "_path_of", lambda sid, now=None: "/nonexistent/" + str(sid) + ".jsonl"),
+            self._tmux_patch,
+        ] + [mock.patch.object(km, name, lambda *a, **k: None) for name in _OTHER_JOBS]
+        for p in self._patches:
+            p.start()
+        km._pending_ops.clear()
+        km._drain_hold.clear()
+        km._refused_heads.clear()
+        km._pusher_wake.clear()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        km._pending_ops.clear()
+        km._drain_hold.clear()
+        km._refused_heads.clear()
+
+    def test_busy_reads_the_hook_state_words(self):
+        # the class default: the cache is stale (None), so the transcript cannot be consulted and the row stands
+        for word in ("working", "permission", "picker"):
+            self.rows[SID] = _tmux_row(word)
+            self.assertIs(km._TMUX.busy(SID), True, word)
+        for word in ("waiting", "idle"):
+            self.rows[SID] = _tmux_row(word)
+            self.assertIs(km._TMUX.busy(SID), False, word)
+        self.rows[SID] = _tmux_row("compacting")
+        self.assertIsNone(km._TMUX.busy(SID), "compacting is no answer: _compacting_now owns that gate, with the "
+                                              "open-turn / compact_boundary escape that disbelieves a stuck row")
+        self.rows[SID] = _tmux_row("")                    # a fresh pane: no hook has published yet
+        self.assertIsNone(km._TMUX.busy(SID), "an unpublished state is no answer — never a hold")
+        self.rows[SID] = _tmux_row("frobnicating")
+        self.assertIsNone(km._TMUX.busy(SID), "an unknown word is no answer")
+        self.rows.clear()
+        self.assertIsNone(km._TMUX.busy(SID), "no tmux row → None → the cached parse decides")
+        self.rows[SID] = dict(_tmux_row("working"), backend="sdk")
+        self.assertIsNone(km._TMUX.busy(SID), "another backend's row is not tmux's to read")
+
+    def test_busy_inside_a_cycle_reads_the_snapshot_not_a_fork(self):
+        self._tmux_patch.stop()                           # the real delegator: snapshot inside a cycle, else live
+        try:
+            km._live_scope.snapshot = {SID: _tmux_row("working")}
+            with mock.patch.object(km.Sessions, "live", staticmethod(lambda: self.fail("forked tmux inside a cycle"))):
+                self.assertIs(km._TMUX.busy(SID), True)
+        finally:
+            km._live_scope.snapshot = None
+            self._tmux_patch.start()
+
+    def test_a_working_row_holds_a_parked_op_the_stale_cache_would_release(self):
+        # THE review find: the hook says mid-turn, the stale cache says idle. The row wins.
+        km._pending_ops[SID] = [("command", "/frobnicate now", None)]
+        self.rows[SID] = _tmux_row("working")             # UserPromptSubmit flipped it; the transcript grew since
+        self.assertTrue(km._working_now(SID))
+        km._pusher_cycle()
+        self.assertEqual(self.sent, [], "the slash command must not land as text in the open turn")
+        self.assertEqual(km._pending_ops[SID], [("command", "/frobnicate now", None)], "still parked")
+        self.rows[SID] = _tmux_row("waiting")             # Stop
+        km._pusher_cycle()
+        self.assertEqual(self.sent, [(SID, "/frobnicate now")], "the settle delivers it, alone")
+        self.assertNotIn(SID, km._pending_ops)
+
+    def test_an_idle_row_delivers(self):
+        km._pending_ops[SID] = [("command", "/frobnicate now", None)]
+        self.rows[SID] = _tmux_row("idle")                # the idle_prompt notification
+        km._pusher_cycle()
+        self.assertEqual(self.sent, [(SID, "/frobnicate now")])
+
+    def test_no_row_falls_to_the_cached_parse(self):
+        # no tmux row for this sid (the hook never published, the pane is gone): busy() is None and the
+        # cached event-model parse decides, exactly as before — pinned in both directions
+        self.rows.clear()
+        km._pending_ops[SID] = [("command", "/frobnicate now", None)]
+        now = int(time.time())
+        open_turn = {"turns": [{"ended": False, "atoms": [{"type": "user"}], "t": now, "end": now}]}
+        with mock.patch.object(km, "_parse_cached", lambda path: open_turn), \
+             mock.patch.object(km, "_downtime", []):
+            self.assertIsNone(km._TMUX.busy(SID))
+            self.assertTrue(km._working_now(SID), "an open turn in the cached parse → working")
+            km._pusher_cycle()
+            self.assertEqual(self.sent, [], "held on the parse")
+        km._pusher_cycle()                                # the class default: a stale cache reads idle
+        self.assertEqual(self.sent, [(SID, "/frobnicate now")])
+
+    def test_tmux_double_fire_closes_on_the_hook_flip_not_the_clock(self):
+        # SEND-ends-the-drain on tmux, through the EVENT. Two ops park mid-turn (a send, then a compact); the
+        # turn settles; the send is pasted. Between that paste and the CLI accepting the prompt the row still
+        # reads waiting — a back-to-back cycle (the delivery's own wake) would fire the compact into the
+        # opening turn, so the sid holds until the row has been SEEN working once after the delivery (the
+        # UserPromptSubmit hook's flip); from there the working gate owns it, and the Stop flip delivers the
+        # compact. The clock fallback is pinned out of reach: only the event can carry this test.
+        with mock.patch.object(km, "_TMUX_PROMPT_HOLD_S", 3600.0):
+            self.rows[SID] = _tmux_row("working")
+            self.assertTrue(km._send_or_park(km._TMUX, SID, "one", echo="human"), "mid-turn per the hook → parked")
+            self.assertTrue(km._ops_gate(SID), "…and the compact parks behind it (queued)")   # the drive handler's gate…
+            km._park_op(SID, ("compact",))                                          # …and the op it parks
+            self.assertEqual([op[0] for op in km._pending_ops[SID]], ["send", "compact"])
+            self.assertEqual(self.sent, [])
+            self.rows[SID] = _tmux_row("waiting")         # Stop: the turn settled
+            km._pusher_cycle()
+            self.assertEqual(self.sent, [(SID, "one")], "the send is pasted")
+            self.assertIn(SID, km._drain_hold, "…and the sid holds until the hook has seen the prompt")
+            km._pusher_cycle()                            # back-to-back: the paste is in flight, no hook yet
+            self.assertEqual(self.sent, [(SID, "one")], "the compact does NOT fire into the opening turn")
+            self.rows[SID] = _tmux_row("working")         # UserPromptSubmit: the CLI accepted the prompt
+            km._pusher_cycle()
+            self.assertEqual(self.sent, [(SID, "one")], "the turn is open: the working gate holds it now")
+            self.assertNotIn(SID, km._drain_hold, "the flip is the event that ends the hold")
+            self.rows[SID] = _tmux_row("waiting")         # Stop: the delivered turn ended
+            km._pusher_cycle()
+            self.assertEqual(self.sent, [(SID, "one"), (SID, "/compact")])
+            self.assertNotIn(SID, km._pending_ops)
+
+    def test_the_prompt_hold_falls_back_to_the_clock_loudly_when_no_flip_comes(self):
+        # a paste tmux refused (the input would not clear, the server died), or a builtin the CLI runs
+        # without opening a prompt turn: the row never reads busy, so the event cannot end the hold — the
+        # clock does, and says so on stderr (the sid, never the text)
+        km._pending_ops[SID] = [("send", "a private sentence", "human"), ("compact",)]
+        with mock.patch.object(km, "_TMUX_PROMPT_HOLD_S", 3600.0):
+            km._pusher_cycle()
+            self.assertEqual(self.sent, [(SID, "a private sentence")])
+            km._pusher_cycle()
+            self.assertEqual(self.sent, [(SID, "a private sentence")], "held: no flip, the clock not yet passed")
+        far = time.monotonic() + 7200.0                    # the fallback window passed, still no flip
+        buf = io.StringIO()
+        with mock.patch.object(km.time, "monotonic", lambda: far), redirect_stderr(buf):
+            km._pusher_cycle()
+        self.assertEqual(self.sent, [(SID, "a private sentence"), (SID, "/compact")], "the clock releases the queue")
+        self.assertIn(SID, buf.getvalue(), "loud: the release is on the record")
+        self.assertNotIn("a private sentence", buf.getvalue(), "the body is user text — never logged")
+        self.assertNotIn(SID, km._drain_hold, "the compact was the queue's LAST op: nothing behind it to hold for")
+
+    def test_the_hold_is_armed_and_the_docstrings_tell_the_final_truth(self):
+        src = inspect.getsource(km._hold_drain) + inspect.getsource(km._after_turn_opening)
+        self.assertNotIn("has no busy()", src, "tmux has an authoritative busy() now — the docstrings say so")
+        self.assertIn("until_busy", inspect.getsource(km._after_turn_opening),
+                      "a turn-opening delivery holds until busy() has been observed True, not for a clock")
+
+    # ── corroboration by event order ──
+    def _cached(self, turns):
+        """The cached parse MATCHES the file on disk: the transcript has not moved since it was parsed."""
+        return mock.patch.object(km, "_parse_cached", lambda path: {"turns": turns})
+
+    def test_a_turn_just_started_stays_busy_on_the_fresh_hook_row(self):
+        # shape 1 (the maintainer's gap): UserPromptSubmit flipped the row a moment ago; the transcript has not
+        # recorded the prompt yet, so the cache still matches the file and shows the previous turn ended
+        # BEFORE since → the hook wins
+        now = int(time.time())
+        self.rows[SID] = dict(_tmux_row("working"), since=now)
+        ended_before = [{"ended": True, "t": now - 40, "end": now - 30,
+                         "atoms": [{"type": "user", "t": now - 40}, {"type": "assistant", "t": now - 30}]}]
+        with self._cached(ended_before), mock.patch.object(km, "_downtime", []):
+            self.assertIs(km._TMUX.busy(SID), True)
+            km._pending_ops[SID] = [("command", "/frobnicate now", None)]
+            km._pusher_cycle()
+            self.assertEqual(self.sent, [], "the slash command stays parked: the turn is opening")
+
+    def test_an_interrupted_turn_delivers_once_the_transcript_spoke_after_the_hook(self):
+        # shape 2: Esc fires no hook, so the row still says working from the last PostToolUse (an old since);
+        # the CLI's interrupt record ended the turn AFTER that → the transcript's verdict wins and a send
+        # typed after the Stop is handed over now, not parked for minutes
+        now = int(time.time())
+        self.rows[SID] = dict(_tmux_row("working"), since=now - 60)
+        interrupted = [{"ended": True, "t": now - 90, "end": now - 5,
+                        "atoms": [{"type": "user", "t": now - 90}, {"type": "assistant", "t": now - 70},
+                                  {"type": "user", "t": now - 5,
+                                   "message": {"role": "user", "content": "[Request interrupted by user]"}}]}]
+        with self._cached(interrupted), mock.patch.object(km, "_downtime", []):
+            self.assertIs(km._TMUX.busy(SID), False)
+            self.assertFalse(km._send_or_park(km._TMUX, SID, "a correction", echo="human"), "delivered, not parked")
+            self.assertEqual(self.sent, [(SID, "a correction")])
+        # the kernel's OWN Stop button writes no interrupt record but an idle record (_record_idle), which the
+        # parse turns into an idle span at the tail — same verdict, dated by the record's t, not the span's end
+        self.sent.clear()
+        kernel_stop = [{"ended": False, "t": now - 90, "end": now,
+                        "atoms": [{"type": "user", "t": now - 90}, {"type": "assistant", "t": now - 70},
+                                  {"type": "idle", "t": now - 6, "end": now}]}]
+        with self._cached(kernel_stop), mock.patch.object(km, "_downtime", []):
+            self.assertIs(km._TMUX.busy(SID), False)
+
+    def test_a_parse_time_idle_tail_never_outranks_the_hook(self):
+        # an idle span at the tail carries end = the PARSE time; only atom `t` (a real record) dates the
+        # transcript — else every fresh parse of an idle session would outrank a hook write that just landed
+        # and reopen shape 1
+        now = int(time.time())
+        self.rows[SID] = dict(_tmux_row("working"), since=now - 1)
+        idle_tail = [{"ended": True, "t": now - 40, "end": now,
+                      "atoms": [{"type": "user", "t": now - 40}, {"type": "assistant", "t": now - 30},
+                                {"type": "idle", "t": now - 30, "end": now}]}]
+        with self._cached(idle_tail), mock.patch.object(km, "_downtime", []):
+            self.assertIs(km._TMUX.busy(SID), True, "the newest RECORD (now-30) predates since (now-1): the hook wins")
+
+    def test_a_stale_waiting_row_yields_to_an_open_turn_the_transcript_shows(self):
+        # the other direction: a waiting row OLDER than an open turn's records reads busy (PostCompact once
+        # wrote waiting into an auto-compaction's continuing turn); a waiting row NEWER than the last record
+        # stands — the ordinary settle, where the Stop hook fires after the final assistant record
+        now = int(time.time())
+        open_turn = [{"ended": False, "t": now - 90, "end": now - 5,
+                      "atoms": [{"type": "user", "t": now - 90}, {"type": "assistant", "t": now - 5}]}]
+        with self._cached(open_turn), mock.patch.object(km, "_downtime", []):
+            self.rows[SID] = dict(_tmux_row("waiting"), since=now - 60)
+            self.assertIs(km._TMUX.busy(SID), True)
+            self.rows[SID] = dict(_tmux_row("waiting"), since=now)
+            self.assertIs(km._TMUX.busy(SID), False)
+
+    def test_a_row_without_since_stands(self):
+        now = int(time.time())
+        self.rows[SID] = dict(_tmux_row("working"), since=None)
+        interrupted = [{"ended": True, "t": now - 90, "end": now - 5,
+                        "atoms": [{"type": "user", "t": now - 90}, {"type": "user", "t": now - 5}]}]
+        with self._cached(interrupted), mock.patch.object(km, "_downtime", []):
+            self.assertIs(km._TMUX.busy(SID), True, "undated against the row, the transcript cannot overrule it")
+
+    # ── the hold and the queue's tail ──
+    def test_no_hold_outlives_the_queue(self):
+        # the queue's LAST op has nothing behind it for a hold to protect; a hold armed then outlived the queue
+        # (the sid leaves _pending_ops, so no cycle evaluated or removed it) and fired the fallback line when a
+        # later op parked for an unrelated reason
+        km._pending_ops[SID] = [("send", "one", "human")]
+        km._pusher_cycle()
+        self.assertEqual(self.sent, [(SID, "one")])
+        self.assertNotIn(SID, km._pending_ops)
+        self.assertNotIn(SID, km._drain_hold, "no op behind → no hold")
+        self.rows[SID] = _tmux_row("working")             # later: a new op parks because a turn is open…
+        self.assertTrue(km._send_or_park(km._TMUX, SID, "two", echo="human"))
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            km._pusher_cycle()
+            self.rows[SID] = _tmux_row("waiting")         # …and delivers at the settle
+            km._pusher_cycle()
+        self.assertEqual(self.sent, [(SID, "one"), (SID, "two")])
+        self.assertNotIn("drain:", buf.getvalue(), "no stale hold, no spurious fallback line")
+
+    def test_a_delivered_compact_releases_its_hold_on_the_compacting_row_not_the_clock(self):
+        # a delivered /compact with an op behind arms an until_busy hold, but the row goes working →
+        # compacting within a fraction of a second and compacting is no busy answer — so the hold rode the
+        # clock and logged the fallback line although the compaction IS the event it waited for. The
+        # compacting gate is the release, and then holds the op behind until the compaction is over.
+        km._pending_ops[SID] = [("compact",), ("send", "after the compaction", "human")]
+        with mock.patch.object(km, "_TMUX_PROMPT_HOLD_S", 3600.0), \
+             mock.patch.object(km, "_compacting_now", lambda sid, **k: self.rows[SID]["state"] == "compacting"):
+            km._pusher_cycle()
+            self.assertEqual(self.sent, [(SID, "/compact")])
+            self.assertIn(SID, km._drain_hold, "the send behind the compact is held")
+            self.rows[SID] = _tmux_row("compacting")      # PreCompact
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                km._pusher_cycle()
+            self.assertEqual(self.sent, [(SID, "/compact")], "the compacting gate holds the send")
+            self.assertNotIn(SID, km._drain_hold, "the compaction is the event: the hold is over")
+            self.assertNotIn("drain:", buf.getvalue(), "no fallback line — the clock was never the release")
+            self.rows[SID] = _tmux_row("waiting")         # PostCompact (manual)
+            km._pusher_cycle()
+            self.assertEqual(self.sent, [(SID, "/compact"), (SID, "after the compaction")])
+
+    def test_the_cycle_refreshes_a_parked_sids_moved_transcript_before_the_drain(self):
+        # the headless defect (second review): busy() can overrule the hook only through _parse_cached, which
+        # NEVER parses — the cache is filled by client builds and the client-gated warmer. With no client, every
+        # live tmux session's cache is None from its first transcript write on, so busy() was the hook verbatim
+        # and a pane Esc parked every `romp send` for minutes. The cycle now re-parses the parked TMUX sids'
+        # moved transcripts before the drain — not a sid without parked ops, not a parked sid whose backend
+        # answers busy() authoritatively (SDK/Codex: re-parsing a streaming turn's transcript on every atom's
+        # wake was load the parent did not have — third review), and not again while the file is unmoved.
+        # REAL transcript files, the real cache reader and the real cache-filling parse; only the paths, the
+        # rows and the backend routing are stubbed.
+        now = int(time.time())
+        td = tempfile.mkdtemp()
+
+        def z(t):
+            return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+        def transcript(sid):
+            recs = [{"type": "user", "timestamp": z(now - 90), "uuid": "u1", "parentUuid": None,
+                     "promptSource": "typed", "message": {"role": "user", "content": "please frobnicate"}},
+                    {"type": "assistant", "timestamp": z(now - 70), "uuid": "a1", "parentUuid": "u1",
+                     "message": {"role": "assistant", "content": [{"type": "text", "text": "frobnicating"}],
+                                 "stop_reason": None}},
+                    {"type": "user", "timestamp": z(now - 5), "uuid": "u2", "parentUuid": "a1",
+                     "message": {"role": "user", "content": "[Request interrupted by user]"}}]   # the pane Esc
+            path = os.path.join(td, sid + ".jsonl")
+            with open(path, "w") as f:
+                f.write("".join(json.dumps(r) + "\n" for r in recs))
+            return path
+        paths = {SID: transcript(SID), SID2: transcript(SID2), SID3: transcript(SID3)}
+        self.rows[SID] = dict(_tmux_row("working"), since=now - 60)     # Esc fired no hook: the row is stale
+        self.rows[SID2] = dict(_tmux_row("working"), since=now - 60)    # …a second tmux session, same state, no ops
+        km._pending_ops[SID] = [("send", "a correction", "human"), ("compact",)]   # a headless `romp send`, parked
+        #                                                                              once, with an op behind it
+        sdk = _FakeBackend()                                            # an SDK-shaped backend mid-turn: busy() is
+        km._pending_ops[SID3] = [("send", "queued behind the stream", "human")]   # the whole truth, no cache read
+        self.assertFalse(getattr(sdk, "corroborates_with_transcript", False), "the ABC default")
+        self.assertTrue(km._TMUX.corroborates_with_transcript)
+        parsed = []
+        real_parse = km._parse
+        with mock.patch.object(km.Sessions, "backend_for", staticmethod(lambda sid: sdk if str(sid) == SID3 else km._TMUX)), \
+             mock.patch.object(km, "_path_of", lambda sid, now=None: paths.get(str(sid))), \
+             mock.patch.object(km, "_parse_cached", REAL_PARSE_CACHED), \
+             mock.patch.object(km, "_parse", lambda path, sid, now: (parsed.append(path), real_parse(path, sid, now))[1]), \
+             mock.patch.object(km, "_downtime", []):
+            self.assertIsNone(REAL_PARSE_CACHED(paths[SID]), "never parsed: the cache is empty")
+            self.assertIs(km._TMUX.busy(SID), True, "at this instant the hook is all busy() has")
+            km._pusher_cycle()
+            self.assertIsNotNone(REAL_PARSE_CACHED(paths[SID]), "the cycle filled the cache")
+            self.assertEqual(parsed, [paths[SID]], "the parked tmux sid's moved transcript parsed once; not the idle "
+                                                    "tmux sid's, not the parked SDK sid's")
+            self.assertEqual(self.sent, [(SID, "a correction")], "the interrupt record overruled the stale row: delivered")
+            self.assertEqual([op[0] for op in km._pending_ops[SID]], ["compact"], "the op behind is held (until_busy)")
+            self.assertIn(SID, km._drain_hold)
+            km._pusher_cycle()                                          # the transcript is UNMOVED: the cache still matches
+            self.assertEqual(parsed, [paths[SID]], "no second parse while the file has not moved")
+            self.assertEqual(self.sent, [(SID, "a correction")])
+        self.assertEqual(sdk.calls, [], "the SDK-shaped sid stayed parked behind its turn — and was never parsed")
+
+    def test_cancelling_the_last_parked_op_drops_the_sids_hold(self):
+        km._pending_ops[SID] = [("send", "one", "human"), ("compact",)]
+        with mock.patch.object(km, "_TMUX_PROMPT_HOLD_S", 3600.0):
+            km._pusher_cycle()
+            self.assertEqual(self.sent, [(SID, "one")])
+            self.assertIn(SID, km._drain_hold, "the compact behind the send is what the hold protects")
+            with redirect_stderr(io.StringIO()):
+                self.assertIsNone(km._cancel_parked(SID, 0, "/compact"))
+        self.assertNotIn(SID, km._pending_ops)
+        self.assertNotIn(SID, km._drain_hold, "an emptied queue leaves no hold behind")
 
 
 if __name__ == "__main__":

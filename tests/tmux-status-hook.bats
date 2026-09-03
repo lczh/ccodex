@@ -120,6 +120,23 @@ run_hook() {
     grep -q 'tmux set -t test @claude-state waiting' "$MOCK_LOG"
 }
 
+@test "PostCompact trigger=manual sets waiting (the /compact was the whole exchange)" {
+    export MOCK_PREV_STATE=compacting
+    run run_hook '{"hook_event_name":"PostCompact","trigger":"manual","cwd":"/tmp/project"}'
+    [ "$status" -eq 0 ]
+    grep -q 'tmux set -t test @claude-state waiting' "$MOCK_LOG"
+    ! grep -q '@claude-state working' "$MOCK_LOG"
+}
+
+@test "PostCompact trigger=auto keeps working (the compaction ran inside a turn that goes on)" {
+    export MOCK_PREV_STATE=compacting
+    run run_hook '{"hook_event_name":"PostCompact","trigger":"auto","cwd":"/tmp/project"}'
+    [ "$status" -eq 0 ]
+    grep -q 'tmux set -t test @claude-state working' "$MOCK_LOG"
+    ! grep -q '@claude-state waiting' "$MOCK_LOG"
+    ! grep -q '@claude-state compacting' "$MOCK_LOG"
+}
+
 # ─── Notification mapping tests ───────────────────────────────────────
 
 @test "Notification permission_prompt sets state to permission" {

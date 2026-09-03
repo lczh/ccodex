@@ -46,6 +46,10 @@ input=$(cat)
 # mode's transient permission notifications (which the classifier allows moments
 # later) — an event-based replacement for the feed's old time-threshold debounce.
 [[ "$input" =~ \"permission_mode\":\"([^\"]+)\" ]] && PERM_MODE="${BASH_REMATCH[1]}" || PERM_MODE=""
+# PreCompact / PostCompact carry trigger = "manual" | "auto" (the CLI's own hook-input schema, verified on
+# 2.1.257; it is also the matcher those events filter on). An AUTO compaction runs INSIDE an open turn that
+# then continues; a MANUAL /compact is its own exchange and leaves the session idle.
+[[ "$input" =~ \"trigger\":\"([^\"]+)\" ]] && TRIGGER="${BASH_REMATCH[1]}" || TRIGGER=""
 
 case "$EVENT" in
     SessionStart)          state="waiting" ;;
@@ -53,7 +57,11 @@ case "$EVENT" in
     PostToolUse)           state="working" ;;
     Stop)                  state="waiting" ;;
     PreCompact)            state="compacting" ;;   # context compaction STARTED (manual /compact or auto)
-    PostCompact)           state="waiting" ;;      # compaction done → idle for next prompt (any real event re-corrects)
+    PostCompact)           # compaction done. MANUAL: the /compact was the whole exchange → idle for the next
+                           # prompt. AUTO: it ran inside an open turn that now goes on → still working (until
+                           # 2026-09-03 both wrote waiting, and the kernel read the continuing turn as quiet until
+                           # the next PostToolUse re-corrected it — a parked op could fire into it)
+        if [[ "$TRIGGER" == "auto" ]]; then state="working"; else state="waiting"; fi ;;
     Notification)
         case "$NOTIF_TYPE" in
             permission_prompt) state="permission" ;;
