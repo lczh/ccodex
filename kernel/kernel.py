@@ -28223,15 +28223,19 @@ def _new_ws_client(app, wid, sock, lock=None, q=None, start_sender=True):
 
 
 def _register_ws_client(client):
-    """Add a connected pane to _clients — and retire any OTHER socket the same pane held. A pane is
-    (app, dashboard id): the shim reconnects with the same wid after its silence watchdog, and the VS Code
-    extension with its window id, so a second socket for one pane means the first is dead on the peer's
-    side however open a forwarder keeps it here (the 2026-09-03 phantoms: VS Code's port forwarder never
-    closed the devbox end). The reconnect IS the event; the ping timeout below is the backstop for panes
-    that never come back. A pane that reports no wid is left alone (nothing identifies its twin)."""
+    """Add a connected pane to _clients — and retire any OTHER socket the same pane INSTANCE held. The
+    instance id (`iid`) is minted by the shim once per page load and sent on every connect of that page,
+    so a second socket carrying it means the page reconnected after its silence watchdog: its side of the
+    old socket is dead however open a forwarder keeps ours (the 2026-09-03 phantoms: VS Code's port
+    forwarder never closed the devbox end). The reconnect IS the event; the ping timeout is the backstop
+    for pages that never come back (a reload mints a new id, so its old socket falls to the pings).
+    The DASHBOARD id (wid) is deliberately not the key (review 2026-09-03): a duplicated browser tab
+    inherits it through sessionStorage, and the VS Code extension's status pipe and its feed panel share
+    one — keyed on wid, the twins retired each other every 1.5 s for as long as both lived. A socket that
+    reports no instance id is never superseded."""
     with _clients_lock:
         twins = [c for c in _clients if c is not client and c.get("app") == client.get("app")
-                 and client.get("wid") and c.get("wid") == client.get("wid") and c.get("sock") is not None]
+                 and client.get("iid") and c.get("iid") == client.get("iid") and c.get("sock") is not None]
         _clients.append(client)
     for c in twins:
         _drop_dead_ws_client(c, "superseded by a reconnect of the same %s pane" % client.get("app"))
@@ -31063,6 +31067,10 @@ def _shim(app, v=0):
 // (a focus, a jump) at the dashboard that asked instead of at every one that is open (the user 2026-07-29).
 var wid=new URLSearchParams(location.search).get("wid")||"";
 try{if(!wid)wid=window.sessionStorage.getItem("romp:wid")||"";}catch(e){}
+// This PAGE's instance id — minted once per load, never stored: every connect of this page carries it, so the
+// kernel retires this page's previous socket on a reconnect, and never another page's (a duplicated tab copies
+// sessionStorage, and with it wid; it must not copy this).
+var IID="";try{IID=(window.crypto&&crypto.randomUUID)?crypto.randomUUID():"";}catch(e){}if(!IID)IID=String(Math.random()).slice(2)+"-"+Date.now();
 var APP="%s";var LOADEDV=%d;var lastRecv=0;var STALE_MS=30000;   // watchdog: no frame (incl. keepalive) for this long → the socket is dead → reconnect
 var connT=0;   // when the current socket's connect() attempt started — the progress watchdog's reference point
 // Tell the shell this pane's WS state so it can show ONE "disconnected" banner (the user 2026-06-27): a real
@@ -31130,7 +31138,7 @@ else selfBar("A newer romp build is available.","build");}
 function connect(){if(ws&&(ws.readyState===0||ws.readyState===1))return;   // one live attempt at a time — a lost timer + the watchdog can both call in
 connT=Date.now();var proto=location.protocol==="https:"?"wss://":"ws://";
 var active="";try{var st0=JSON.parse(localStorage.getItem(SK)||"null");active=(st0&&st0.activeId)||"";}catch(e){}
-ws=new WebSocket(proto+location.host+"/ws?app=%s&delta=1"+(wid?"&wid="+encodeURIComponent(wid):"")+(active?"&active="+encodeURIComponent(active):""));
+ws=new WebSocket(proto+location.host+"/ws?app=%s&delta=1&iid="+encodeURIComponent(IID)+(wid?"&wid="+encodeURIComponent(wid):"")+(active?"&active="+encodeURIComponent(active):""));
 // onopen: flush the queue; a RECONNECT (after a drop) also PROMPTS a reload — the fresh socket resyncs live via
 // the kernel's next push, and the banner offers a full reload for anything a live push doesn't cover. This
 // replaces the old silent location.reload() (the user: don't foist a reload; let me click — [[prefer-reload-banner-not-auto]]).
@@ -37191,6 +37199,7 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(urlparse(self.path).query)
         app = (q.get("app") or ["chat"])[0]
         wid = (q.get("wid") or [""])[0]         # which DASHBOARD this pane belongs to → _send_to_view aims at one
+        iid = (q.get("iid") or [""])[0]         # which page INSTANCE: a reconnect carrying it retires its old socket
         active = (q.get("active") or [""])[0]   # the tab this client is looking at → _push builds it FIRST
         self.send_response(101)
         self.send_header("Upgrade", "websocket")
@@ -37210,6 +37219,8 @@ class Handler(BaseHTTPRequestHandler):
             client["active"] = active                  # active-tab-first streaming (the user 2026-06-24)
         if (q.get("delta") or [""])[0] == "1":
             client["delta"] = True                     # the shim reassembles view deltas (see _send_slot)
+        if iid:
+            client["iid"] = iid
         _register_ws_client(client)
         try:
             while client["alive"]:

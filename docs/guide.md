@@ -332,8 +332,10 @@ own a direct path; the dashboard is then a plain URL on your tailnet.
     deltas instead of whole payloads. That keeps a forwarded dashboard usable,
     but the forwarder still carries every byte over a channel it shares with
     your editor, so prefer one of the two paths above. The VS Code romp view
-    itself is unaffected: its WebSocket runs on the kernel's own machine, and
-    only the rendered view crosses the link.
+    is a different case: its sockets run on the kernel's own machine and close
+    when a panel closes, so it never leaks connections, but under Remote or
+    Tunnels the extension still relays each whole view payload to the local
+    window as it changes. It does not yet take the deltas the browser panes do.
 
 ### From your phone
 

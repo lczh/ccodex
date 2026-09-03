@@ -251,22 +251,35 @@ class PhantomPanesAreDropped(unittest.TestCase):
     def test_c5_the_liveness_clock_is_monotonic(self):
         self.assertIs(self._saved_clock, time.monotonic, "a suspend or an NTP step must not read as silence")
 
-    def test_c6_a_reconnect_of_the_same_pane_retires_its_previous_socket_at_once(self):
-        """The exact event behind the leak: a pane reconnects (same app, same dashboard id) because its side
-        of the old socket is dead, however open a forwarder keeps our side. The old socket goes now, not
-        after a ping window; a pane with another id, or no id, is untouched (review + user 2026-09-03)."""
-        old, peer_old, h_old = self._connect(pongs=True)
-        other_kern, other_peer = self._pair()
-        other, oq, _ = km._new_ws_client("timeline", "w2", other_kern); km._clients.append(other); self.queues.append(oq)
-        anon_kern, anon_peer = self._pair()
-        anon, aq, _ = km._new_ws_client("timeline", "", anon_kern); km._clients.append(anon); self.queues.append(aq)
-        new_kern, new_peer = self._pair()
-        new, nq, _ = km._new_ws_client("timeline", "w1", new_kern); self.queues.append(nq)
-        km._register_ws_client(new)                                  # the same pane again
-        self.assertFalse(old["alive"], "the pane's previous socket is retired on the reconnect itself")
-        self.assertTrue(new["alive"] and other["alive"] and anon["alive"], "the reconnected pane, another pane and an id-less pane stand")
+    def test_c6_a_reconnect_of_the_same_page_retires_its_previous_socket_at_once(self):
+        """The exact event behind the leak: a page reconnects (same app, same page-instance id) because its
+        side of the old socket is dead, however open a forwarder keeps our side. The old socket goes now, not
+        after a ping window. Keyed on the INSTANCE id, not the dashboard id: two sockets that share a
+        dashboard id without an instance id (the VS Code extension's status pipe beside its feed panel), or
+        with different instance ids (a duplicated browser tab, which inherits sessionStorage), are twins that
+        must BOTH live — keyed on wid they retired each other every 1.5 s (review 2026-09-03)."""
+        old, peer_old, h_old = self._connect(pongs=True); old["iid"] = "page-1"
+        def pane(wid, iid):
+            kern, _peer = self._pair()
+            c, q, _ = km._new_ws_client("timeline", wid, kern); self.queues.append(q)
+            if iid:
+                c["iid"] = iid
+            km._clients.append(c)
+            return c
+        dup_tab = pane("w1", "page-2")                                # same dashboard id, another page
+        twin_pipe_a, twin_pipe_b = pane("w1", ""), pane("w1", "")      # the extension's shape: no instance id
+        other_dash = pane("w2", "page-3")
+        new_kern, _np = self._pair()
+        new, nq, _ = km._new_ws_client("timeline", "w1", new_kern); self.queues.append(nq); new["iid"] = "page-1"
+        km._register_ws_client(new)                                  # the same page again
+        self.assertFalse(old["alive"], "the page's previous socket is retired on the reconnect itself")
+        for c in (new, dup_tab, twin_pipe_a, twin_pipe_b, other_dash):
+            self.assertTrue(c["alive"], "every other socket stands")
         self.assertIn(new, km._clients)
         h_old.join(3.0); self.assertFalse(h_old.is_alive(), "the old handler's read ended")
+        # and the extension's shape from the other side: a second id-less socket retires nothing
+        km._register_ws_client(pane("w1", ""))
+        self.assertTrue(twin_pipe_a["alive"] and twin_pipe_b["alive"] and new["alive"])
 
     def test_d_the_ping_frame_is_well_formed(self):
         f = km._ws_ping_frame(b"1700000000")

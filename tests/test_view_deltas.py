@@ -468,3 +468,59 @@ process.stdout.write(JSON.stringify({refused:r===null,rev:LAST.bars.rev}));"""
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HandlerWiring(unittest.TestCase):
+    """The handshake end to end, with the real handler: the shim asks for deltas and carries its page id, the
+    connect handler records both, a needSlot is flagged for the pusher, and the shim reacts to a refused delta.
+    A mutation review (2026-09-03) turned each of these off with every test still green."""
+
+    def _fake_self(self, path):
+        import io
+        class FakeSelf:
+            headers = {"Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ=="}
+            rfile = io.BytesIO(); wfile = io.BytesIO()
+            connection = type("FakeSock", (), {"sendall": lambda self, b: None, "shutdown": lambda self, how: None})()
+            close_connection = False
+            def send_response(self, *a): pass
+            def send_header(self, *a): pass
+            def end_headers(self): pass
+        FakeSelf.path = path
+        return FakeSelf()
+
+    def test_a_the_connect_handler_records_the_delta_flag_and_the_page_id(self):
+        import contextlib, io
+        got = []
+        real_reg, real_recv = km._register_ws_client, km._ws_recv
+        km._register_ws_client = lambda c: (got.append(c), km._clients.append(c))
+        km._ws_recv = lambda rfile: (0x8, b"", True)              # the peer closes at once
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                km.Handler._ws(self._fake_self("/ws?app=feed&delta=1&iid=page-9&wid=w1"))
+        finally:
+            km._register_ws_client, km._ws_recv = real_reg, real_recv
+            for c in got:
+                if c in km._clients:
+                    km._clients.remove(c)
+        self.assertEqual(len(got), 1)
+        c = got[0]
+        self.assertTrue(c.get("delta")); self.assertEqual(c.get("iid"), "page-9"); self.assertEqual(c.get("wid"), "w1")
+        self.assertEqual(c.get("app"), "feed")
+
+    def test_b_a_needslot_is_flagged_for_the_pusher_and_wakes_it(self):
+        client = _Client(); client["dstate"] = {"bars": {"rev": 3}}
+        km._pusher_wake.clear()
+        km.Handler._dispatch_ws(self._fake_self("/ws?app=timeline"), {"type": "needSlot", "slot": "bars"}, client)
+        self.assertEqual(client.get("resync"), {"bars"})
+        self.assertTrue(km._pusher_wake.is_set(), "the pusher is woken to re-base on its own thread")
+        self.assertEqual(client["dstate"], {"bars": {"rev": 3}}, "the handler itself touches no held state")
+        km.Handler._dispatch_ws(self._fake_self("/ws?app=timeline"), {"type": "needSlot", "slot": "nope"}, client)
+        self.assertEqual(client.get("resync"), {"bars"}, "an unknown slot is ignored")
+
+    def test_c_the_shim_asks_for_deltas_carries_its_page_id_and_asks_again_when_refused(self):
+        js = km._shim("timeline", 1)
+        self.assertIn('/ws?app=timeline&delta=1&iid="+encodeURIComponent(IID)', js)
+        self.assertIn('send({type:"needSlot",slot:msg.slot})', js)
+        self.assertIn("var IID=", js)
+        self.assertNotIn('sessionStorage.setItem("romp:iid"', js, "the page id is never stored: a duplicated tab must not inherit it")
+
