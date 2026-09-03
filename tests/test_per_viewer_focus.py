@@ -90,7 +90,7 @@ class Wiring(unittest.TestCase):
         # it was written to replace. The tests above all hand-build clients WITH a wid, so none saw it.
         src = inspect.getsource(km.Handler)
         self.assertIn('wid = (q.get("wid") or [""])[0]', src, "the connect query is where a dashboard names itself")
-        self.assertIn('client, q, lock = _new_ws_client(app, wid, self.connection', src, "…and it has to reach the client dict")
+        self.assertIn('client, sendq, lock = _new_ws_client(app, wid, self.connection', src, "…and it has to reach the client dict")
         self.assertIn('client = {"app": app, "wid": wid,', inspect.getsource(km._new_ws_client),
                       "…which the factory builds with it (the liveness change of 2026-09-03 moved the construction there)")
 

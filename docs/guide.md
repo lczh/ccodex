@@ -297,6 +297,44 @@ The mechanics, including how the tunnels and the check-in handshake work, are in
 You reach Romp in a browser tab, in the VS Code / Cursor extension, or from your
 phone.
 
+### From another machine
+
+The kernel listens only on `127.0.0.1`, so a browser on another machine needs a
+path to that port. Two paths work well; one common one does not.
+
+**Plain ssh port forwarding.** From the machine with the browser:
+
+```bash
+ssh -N -L 29855:127.0.0.1:29855 <the machine running romp>
+```
+
+Then open `http://127.0.0.1:29855` as usual. OpenSSH forwards each browser
+socket one-to-one and propagates closes, so a pane that goes away is gone on
+both ends.
+
+**Tailscale.** The same setup as for your phone below gives every device you
+own a direct path; the dashboard is then a plain URL on your tailnet.
+
+!!! warning "The VS Code port forwarder is not a good path for the browser dashboard"
+
+    VS Code's Remote and Tunnels port forwarder multiplexes every forwarded
+    socket over one channel and does not close the far end when the browser
+    side goes away. The dashboard's panes are long-lived WebSockets that stream
+    view updates, and each pane reconnects when it hears nothing for thirty
+    seconds, so through that forwarder every reconnect left a dead connection
+    behind on the kernel's side, all of them still receiving full view payloads
+    over the one shared channel, and the live panes starved. One such incident
+    counted 84 connections from three real panes.
+
+    The kernel now protects itself: it pings every pane on each heartbeat and
+    drops one whose ping goes unanswered, a reconnecting pane retires its own
+    previous socket at once, and the timeline and feed cross the wire as
+    deltas instead of whole payloads. That keeps a forwarded dashboard usable,
+    but the forwarder still carries every byte over a channel it shares with
+    your editor, so prefer one of the two paths above. The VS Code romp view
+    itself is unaffected: its WebSocket runs on the kernel's own machine, and
+    only the rendered view crosses the link.
+
 ### From your phone
 
 The user interface is a web page, so your phone can run it against a kernel on

@@ -237,6 +237,23 @@ class PhantomPanesAreDropped(unittest.TestCase):
     def test_c5_the_liveness_clock_is_monotonic(self):
         self.assertIs(self._saved_clock, time.monotonic, "a suspend or an NTP step must not read as silence")
 
+    def test_c6_a_reconnect_of_the_same_pane_retires_its_previous_socket_at_once(self):
+        """The exact event behind the leak: a pane reconnects (same app, same dashboard id) because its side
+        of the old socket is dead, however open a forwarder keeps our side. The old socket goes now, not
+        after a ping window; a pane with another id, or no id, is untouched (review + user 2026-09-03)."""
+        old, peer_old, h_old = self._connect(pongs=True)
+        other_kern, other_peer = self._pair()
+        other, oq, _ = km._new_ws_client("timeline", "w2", other_kern); km._clients.append(other); self.queues.append(oq)
+        anon_kern, anon_peer = self._pair()
+        anon, aq, _ = km._new_ws_client("timeline", "", anon_kern); km._clients.append(anon); self.queues.append(aq)
+        new_kern, new_peer = self._pair()
+        new, nq, _ = km._new_ws_client("timeline", "w1", new_kern); self.queues.append(nq)
+        km._register_ws_client(new)                                  # the same pane again
+        self.assertFalse(old["alive"], "the pane's previous socket is retired on the reconnect itself")
+        self.assertTrue(new["alive"] and other["alive"] and anon["alive"], "the reconnected pane, another pane and an id-less pane stand")
+        self.assertIn(new, km._clients)
+        h_old.join(3.0); self.assertFalse(h_old.is_alive(), "the old handler's read ended")
+
     def test_d_the_ping_frame_is_well_formed(self):
         f = km._ws_ping_frame(b"1700000000")
         self.assertEqual(f[0], 0x89, "FIN + ping opcode")
