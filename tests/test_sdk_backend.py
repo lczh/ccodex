@@ -10,12 +10,14 @@ Two layers:
     AskUserQuestion -> it surfaces as an askLive picker -> the UI answers ->
     PermissionResultAllow(updated_input={questions, answers}) goes back.
 """
+import io
 import os
 import json
 import threading
 import time
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from unittest import mock
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
@@ -3215,10 +3217,10 @@ class WriteNameStaging(unittest.TestCase):
 
 class LiveSubagentsRetire(unittest.TestCase):
     """The lane's live subagent count only ever GREW (the user 2026-09-02, whose session read Working with
-    37 subagents for hours). The CLI fires SubagentStart for every workflow agent but SubagentStop only
-    for the ones that finish cleanly (probe-verified on CLI 2.1.257: a run with one agent on a nonexistent
-    model got one stop hook; the failed agent's slot in the run's `workflow_progress` list read state
-    "error" and nothing else), so the set is retired on the events that DO arrive: a run's per-agent
+    37 subagents for hours). The CLI fires SubagentStart for every workflow agent but not SubagentStop for
+    every one of them (probe-verified on CLI 2.1.257: a run with one agent on a nonexistent model got one
+    stop hook; the failed agent's slot in the run's `workflow_progress` list read state "error" and
+    nothing else), so the set is retired on the events that DO arrive: a run's per-agent
     progress list (an end state, or a slot re-minted for a retry), the run's end, a Task agent's own
     task end (its task_id IS the agent id), and the client teardown. Every id and uuid here is synthetic."""
 
@@ -3312,7 +3314,9 @@ class LiveSubagentsRetire(unittest.TestCase):
 
     def test_d_a_task_agents_own_task_end_retires_it(self):
         """A Task/Agent subagent's lifecycle task carries the agent id as its task_id (probe-verified), so
-        the task ending — here as a failure, which leaves no SubagentStop — retires the agent."""
+        the task ending retires the agent — here as a failure. Whether a failed Task agent gets a
+        SubagentStop is unverified (the probe saw a failed WORKFLOW agent get none); its task end retires
+        it either way."""
         s = self._sess()
         self._start(s, "t1", "general-purpose")
         s._on_task_event("task_started", {"task_id": "t1", "task_type": "local_agent", "subagent_type": "general-purpose"})
@@ -3405,6 +3409,90 @@ class LiveSubagentsRetire(unittest.TestCase):
         s._on_task_event("task_progress", {"task_id": "w1", "workflow_progress": [
             self._wf(1, "a1", "done"), self._wf(2, "a2", "progress")]})
         self.assertEqual(set(s._subagents), {"a2"})
+
+
+class WorkflowProgressShapeIsLoud(unittest.TestCase):
+    """The retirement parser keys on the field names the probe recorded. If the CLI renames them, the
+    ever-growing live count comes back — and would come back SILENTLY, so a list this build cannot read is
+    reported once per process, naming what arrived (the api_retry shape warning's pattern)."""
+
+    SID = "11111111-2222-3333-4444-888888888888"
+
+    def setUp(self):
+        sb.SdkSession._wf_shape_warned = False
+
+    def tearDown(self):
+        sb.SdkSession._wf_shape_warned = False
+
+    def _sess(self):
+        be = sb.SdkBackend(tempfile.mkdtemp(), "/bin/true", lambda *a, **k: None, log=lambda m, problem=None: None)
+        s = sb.SdkSession(be, {"sid": self.SID, "name": "web", "cwd": "/tmp"})
+        s.inflight = 0
+        s._on_task_event("task_started", {"task_id": "w1", "task_type": "local_workflow"})
+        return s
+
+    def _feed(self, s, progress):
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            s._on_task_event("task_progress", {"task_id": "w1", "workflow_progress": progress})
+        return buf.getvalue()
+
+    def test_a_renamed_list_says_so_once_and_names_what_arrived(self):
+        s = self._sess()
+        out = self._feed(s, [{"type": "wf_agent", "agent_ref": "a1", "phase": "done"}])
+        self.assertIn("workflow_progress payload", out)
+        self.assertIn("workflow_agent", out, "the diagnostic names the type it expected")
+        self.assertIn("agent_ref", out, "…and the keys it actually got")
+        self.assertIn("live subagent count", out, "…and what the user will see go wrong")
+        self.assertIn("until the session reconnects", out, "…stated for the worst case: a type/agentId rename "
+                                                          "leaves the roster empty, so a run's end retires nothing")
+        self.assertEqual(self._feed(s, [{"type": "wf_agent", "agent_ref": "a2"}]), "", "once per process, not per event")
+
+    def test_b_the_probe_recorded_shapes_are_silent(self):
+        """Every shape CLI 2.1.257 was seen to ship on an ordinary run must stay silent, or the latch is spent
+        on a false alarm and a real rename later in the process goes unreported (review 2026-09-03)."""
+        s = self._sess()
+        cases = {
+            "phases only, before any agent is queued": [
+                {"type": "workflow_phase", "index": 0, "title": "Review", "kind": "review"},
+                {"type": "workflow_phase", "index": 1, "title": "Verify"}],
+            "a log line beside the phases": [
+                {"type": "workflow_log", "message": "scanning"}, {"type": "workflow_phase", "index": 0, "title": "Review"}],
+            "a queued slot has no agentId yet": [
+                {"type": "workflow_agent", "index": 1, "label": "a", "agentId": "a1", "state": "done", "queuedAt": 1, "startedAt": 2},
+                {"type": "workflow_agent", "index": 2, "label": "b", "state": "start", "queuedAt": 1},
+                {"type": "workflow_phase", "index": 0, "title": "Review"}],
+            "a slot blocked before spawn: error, no agentId, no startedAt": [
+                {"type": "workflow_agent", "index": 1, "label": "a", "state": "error", "blocked": True,
+                 "error": "blocked", "queuedAt": 1, "lastProgressAt": 2}],
+            "a slot whose spawn threw: error, no agentId, no startedAt": [
+                {"type": "workflow_agent", "index": 1, "label": "a", "state": "error", "error": "spawn failed", "queuedAt": 1}],
+        }
+        for name, shape in cases.items():
+            self.assertEqual(self._feed(s, shape), "", name)
+        self.assertFalse(sb.SdkSession._wf_shape_warned)
+
+    def test_c_a_missing_field_is_named(self):
+        for entry, word in (({"type": "workflow_agent", "index": 1, "agentId": "a1", "startedAt": 2}, "'state'"),
+                            ({"type": "workflow_agent", "agentId": "a1", "state": "done"}, "'index'"),
+                            ({"type": "workflow_agent", "index": 1, "state": "done", "startedAt": 2}, "'agentId'"),
+                            ({"type": "workflow_step", "index": 1, "agentId": "a1", "state": "done"}, "'workflow_agent'")):
+            sb.SdkSession._wf_shape_warned = False
+            out = self._feed(self._sess(), [entry])
+            self.assertIn(word, out, "the diagnostic names the missing field: %r → %r" % (entry, out))
+
+    def test_d_an_unknown_state_word_is_named(self):
+        out = self._feed(self._sess(), [{"type": "workflow_agent", "index": 1, "agentId": "a1", "state": "failed", "startedAt": 2}])
+        self.assertIn("failed", out)
+        self.assertIn("unknown state word", out)
+
+    def test_e_a_throttled_tick_without_the_list_is_not_a_shape(self):
+        s = self._sess()
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            s._on_task_event("task_progress", {"task_id": "w1"})
+            s._on_task_event("task_progress", {"task_id": "w1", "workflow_progress": []})
+        self.assertEqual(buf.getvalue(), "")
 
 
 if __name__ == "__main__":

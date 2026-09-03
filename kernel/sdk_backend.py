@@ -1456,9 +1456,10 @@ class SdkSession:
         self._sub_lock = threading.Lock()            #   hooks mutate on the loop thread; snapshot() reads from the kernel thread
         #                                                (guards _subagents AND _bg_tasks)
         self._wf_agents: dict[str, set] = {}         # LIVE Workflow runs: task_id -> the agent ids its progress
-        #   lists have named (the roster). The CLI fires SubagentStart for every workflow agent but SubagentStop
-        #   ONLY for the ones that finish cleanly (probe-verified on CLI 2.1.257, 2026-09-02: a failed agent
-        #   leaves no stop hook), so a run's own per-agent list is what retires the rest — _reconcile_workflow_agents.
+        #   lists have named (the roster). The CLI fires SubagentStart for every workflow agent but NOT
+        #   SubagentStop for every one of them (probe-verified on CLI 2.1.257, 2026-09-02: a workflow agent whose
+        #   model did not exist got a start hook and no stop hook), so a run's own per-agent list is what retires
+        #   the rest — _reconcile_workflow_agents.
         self._wf_slots: dict[str, dict] = {}         # task_id -> {slot index: the agent id it last held}: a retried
         #   slot is re-minted with a NEW id, and the displaced id is over the moment the slot changes hands
         self.chosen_model = reg.get("model") or ""   # the alias the user picked (opus/sonnet/…); self.model is the display name
@@ -2795,11 +2796,11 @@ class SdkSession:
         return {}
 
     async def _subagent_stop_hook(self, inp, tool_use_id, context):
-        """A subagent FINISHED CLEANLY — drop it from the live set (SubagentStop carries the same agent_id).
-        The CLI fires this only for clean finishes; a failed agent's end arrives through its run's progress
-        list or its own task end instead (see _reconcile_workflow_agents / _on_task_event). When the last
-        one clears, the session falls back to its real state (working if the main turn is still in flight,
-        else idle)."""
+        """A subagent FINISHED — drop it from the live set (SubagentStop carries the same agent_id). Not every
+        agent gets one: probe-verified on 2.1.257, a workflow agent that failed (its model did not exist) got
+        no stop hook, so a failed agent's end arrives through its run's progress list or its own task end
+        instead (see _reconcile_workflow_agents / _on_task_event). When the last one clears, the session
+        falls back to its real state (working if the main turn is still in flight, else idle)."""
         aid = inp.get("agent_id") if isinstance(inp, dict) else None
         if aid:
             with self._sub_lock:
@@ -2850,6 +2851,60 @@ class SdkSession:
     #   rollbacks) is named truthfully — the loop cannot tell them apart here, so the notice names the family
 
     _WF_AGENT_ENDED = frozenset(("done", "error"))
+    _WF_AGENT_STATES = frozenset(("start", "progress", "done", "error"))   # the vocabulary the probe recorded
+    _WF_ENTRY_TYPES = frozenset(("workflow_agent", "workflow_phase", "workflow_log"))   # the entry types it recorded
+    _wf_shape_warned = False   # once per process, like _retry_shape_warned
+
+    @classmethod
+    def _wf_shape_problem(cls, progress) -> str | None:
+        """Why this `workflow_progress` list cannot be read by this build, or None when it can — or when there
+        is nothing to read yet. Only the fields the parser keys on: an entry typed `workflow_agent`, its
+        `index`, its `state` from the known vocabulary, and an `agentId` on every slot that has STARTED. Two
+        recorded shapes that are NOT renames: a list of only phase/log entries (a run announces its phases
+        before any agent is queued), and an error slot with no `agentId` or `startedAt` at all (an agent
+        blocked, or thrown before its id was minted) — a queued slot has none yet either. Only an entry of
+        a type this build has never seen counts as a rename when no agent entry is present."""
+        if not isinstance(progress, list) or not progress:
+            return None
+        rows = [e for e in progress if isinstance(e, dict)]
+        if not rows:
+            return "no entry is an object"
+        agents = [e for e in rows if e.get("type") == "workflow_agent"]
+        if not agents:
+            unknown = sorted({str(e.get("type")) for e in rows} - cls._WF_ENTRY_TYPES)
+            if not unknown:
+                return None                       # phases/logs only — nothing to read yet, not a rename
+            return "no entry is typed 'workflow_agent' (unknown types seen: %r)" % unknown[:6]
+        if not any("state" in e for e in agents):
+            return "no 'workflow_agent' entry carries a 'state'"
+        if not any("index" in e for e in agents):
+            return "no 'workflow_agent' entry carries an 'index'"
+        started = [e for e in agents if e.get("startedAt") is not None or e.get("state") in ("progress", "done")]
+        if started and not any(e.get("agentId") for e in started):
+            return "no started 'workflow_agent' entry carries an 'agentId'"
+        odd = sorted({str(e.get("state")) for e in agents if "state" in e and e.get("state") not in cls._WF_AGENT_STATES})
+        if odd:
+            return "unknown state word%s %r (this build ends an agent on %r)" % (
+                "" if len(odd) == 1 else "s", odd, sorted(cls._WF_AGENT_ENDED))
+        return None
+
+    def _warn_wf_shape(self, progress):
+        """Fail LOUDLY, once per process, when a run's per-agent list has a shape this build cannot read —
+        otherwise a renamed field silently brings back the ever-growing live count this parser exists to
+        prevent (CLAUDE.md: a visible error beats data that looks fine and misleads). Covers renames INSIDE
+        the list; the `workflow_progress` key itself is not checked (a payload without the list is a
+        throttled tick, indistinguishable from a renamed key)."""
+        if SdkSession._wf_shape_warned:
+            return
+        why = self._wf_shape_problem(progress)
+        if not why:
+            return
+        SdkSession._wf_shape_warned = True
+        keys = sorted({k for e in progress if isinstance(e, dict) for k in e})[:20]
+        sys.stderr.write(
+            "romp: workflow_progress payload has a shape this build cannot read — %s; keys seen=%r. Failed "
+            "workflow agents will stay in the live subagent count until the session reconnects (a run's end "
+            "can only retire agents this build managed to read), until these are mapped.\n" % (why, keys))
 
     def _reconcile_workflow_agents(self, tid: str, progress, terminal: bool):
         """Retire the live workflow-subagent entries the Workflow run `tid` has finished with, from the run's
@@ -2858,12 +2913,19 @@ class SdkSession:
         done/error and never capped (only the run's log lines are trimmed), the full list re-sent on every
         state change. Called on the run's task-stream events, never a timer.
 
-        Why not the stop hook alone: the CLI fires SubagentStart for every workflow agent but SubagentStop
-        only for the ones that finish CLEANLY (probe-verified on 2.1.257, 2026-09-02: a run with one agent
-        on a nonexistent model got one stop hook; the failed agent's slot read state "error" and nothing
-        else). Left to the hooks the live set only grows — three sessions carried 192, 37 and 10 stale
-        entries, each EXACTLY the number of agents its runs recorded as failed, and read Working with
-        "37 subagents" for hours (the user 2026-09-02).
+        Why not the stop hook alone: the CLI fires SubagentStart for every workflow agent but not SubagentStop
+        for every one of them. What was observed (probe-verified on 2.1.257, 2026-09-02): a run with one
+        agent on a nonexistent model got one stop hook; the failed agent's slot read state "error" and
+        nothing else. (The bundle does attempt the stop hook on an interrupted query, so the gap seen is
+        failures, not interrupts; what other endings skip it is not known.) Left to the hooks the live set
+        only grows — three sessions carried 192, 37 and 10 stale entries, each EXACTLY the number of agents
+        its runs recorded as failed, and read Working with "37 subagents" for hours (the user 2026-09-02).
+
+        The parser keys on the field names the probe recorded (`workflow_agent`, `agentId`, `index`,
+        `state`, and the four state words). A CLI rename inside the list would bring the growth back
+        SILENTLY, so a list whose entries carry none of them is reported once per process — the api_retry
+        shape warning's pattern (_retry_shape_warned): a visible line naming what arrived beats a count
+        that quietly drifts. The key itself is not checked; see _warn_wf_shape.
 
         Three exact ends: a slot's done/error state; a slot re-minted with a NEW agent id (a retried
         attempt — the displaced id is over the moment the slot changes hands); and the run's END, which
@@ -2872,6 +2934,7 @@ class SdkSession:
         absence of something else rather than from an event about the agent, and every retirement here
         keys on an exact event (an earlier draft had that inference; review 2026-09-02). Such an agent
         ends on its own stop hook, its task's end, or the client teardown."""
+        self._warn_wf_shape(progress)
         ended = set()
         with self._sub_lock:
             seen = self._wf_agents.setdefault(tid, set())
@@ -2912,7 +2975,7 @@ class SdkSession:
         Pokes a push only when the set actually changed, so progress chatter stays cheap.
 
         Two live-subagent retirements ride the same stream (2026-09-02), for the agents whose
-        SubagentStop never comes (a failed agent leaves none — see _reconcile_workflow_agents): a
+        SubagentStop never comes (a failed agent got none in the probe — see _reconcile_workflow_agents): a
         Task/Agent subagent's lifecycle task carries the AGENT ID as its task_id (probe-verified on
         2.1.257), so the task's end is the agent's end; and a Workflow run's progress events carry its
         per-agent list, its end the roster's end."""
