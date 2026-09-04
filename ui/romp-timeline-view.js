@@ -324,7 +324,7 @@ function niceStep(W) { for (const s of NICE) if (W / s <= 8) return s; return 17
 // Clamp the advance to [0, maxAheadSec]: never run backward (a clock hiccup), and never fling the edge
 // far ahead if the tab was backgrounded (rAF paused → huge elapsed) or the kernel went quiet.
 const MAX_INTERP_AHEAD = 30;   // seconds the edge may glide past the last data.now before it just waits
-const LIVE_MIN_PX = 0.15;      // live-tick repaints once the edge would move ≥ this many px — small so the
+const LIVE_MIN_PX = 1;         // live-tick repaints once the edge would move ≥ this many px (was 0.15: at a
                                // glide stays smooth at high zoom (effectively native rAF), but >0 so a
                                // near-static (zoomed-out) edge idles instead of repainting for nothing
 function perfNow() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
@@ -794,6 +794,15 @@ function crossX(lo0, hi0, xs, xe, obstacles) {
 // through here so both hosts resolve.
 function mediaUrl(name) {
   return ((typeof window !== 'undefined' && window.__rompMediaBase) || '/media') + '/' + name;
+}
+
+// Does the SORTED numeric array hold a value within ±tol of t? Binary search for the first value ≥ t - tol.
+function sortedHasWithin(arr, t, tol) {
+  if (!arr || !arr.length) return false;
+  let lo = 0, hi = arr.length;
+  const lower = t - tol;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid] < lower) lo = mid + 1; else hi = mid; }
+  return lo < arr.length && arr[lo] <= t + tol;
 }
 
 class TimelinePanel {
@@ -1595,25 +1604,37 @@ class TimelinePanel {
   // update(), so even after the loop self-stops it returns within one poll once we're live again. NOT
   // called from draw() — draw() runs inside the tick, and re-arming there would double the loop.
   _startLiveTick() {
-    if (this._liveRAF != null || !this._liveFollowing() || !this._isVisible()) return;
+    if (this._liveRAF != null || this._liveTO != null || !this._liveFollowing() || !this._isVisible()) return;
     this._liveRAF = requestAnimationFrame(() => this._tickLive());
+  }
+  // How long until the live edge has moved LIVE_MIN_PX at the current zoom — the loop sleeps exactly that
+  // long between looks instead of waking every animation frame. A full redraw is what a look costs, so at a
+  // one-hour window over a few hundred px that is a redraw every several seconds, not two a second; and the
+  // sleeping loop touches no layout (the old per-frame _isVisible() read forced one — measured 2026-09-04:
+  // ~40% of the main thread on an idle four-pane dashboard, on the thread the chat pane's clicks share).
+  _liveWaitMs() {
+    const g = this._geom;
+    if (!g || !g.winSec || !g.plotW) return 1000;
+    const pxPerSec = g.plotW / g.winSec;
+    return Math.max(100, Math.min(2000, Math.round(LIVE_MIN_PX / Math.max(pxPerSec, 1e-6) * 1000)));
   }
   _tickLive() {
-    this._liveRAF = null;
+    this._liveRAF = null; this._liveTO = null;
     if (!this._liveFollowing() || !this._isVisible() || !this.data) return;   // gate closed → stop the loop
-    // Click-safe: don't rebuild the SVG under a pressed pointer (a click in progress) — skip this frame's draw
+    // Click-safe: don't rebuild the SVG under a pressed pointer (a click in progress) — skip this look's draw
     // but keep the loop alive so the edge resumes gliding the moment the pointer releases. See the constructor.
-    if (this._pointerHeld) { this._liveRAF = requestAnimationFrame(() => this._tickLive()); return; }
-    const g = this._geom;
-    // Only repaint when the edge would actually move ≥ LIVE_MIN_PX since the last live draw — a wide
-    // (zoomed-out) window where the edge barely creeps costs ~nothing, a zoomed-in one repaints every
-    // native frame. Keep looping either way so we catch the moment it does move.
-    if (!g || this._lastLiveNow == null || ((this._liveNow() - this._lastLiveNow) / g.winSec * g.plotW) >= LIVE_MIN_PX) {
-      this.draw();
+    if (!this._pointerHeld) {
+      const g = this._geom;
+      if (!g || this._lastLiveNow == null || ((this._liveNow() - this._lastLiveNow) / g.winSec * g.plotW) >= LIVE_MIN_PX) {
+        this.draw();
+      }
     }
-    this._liveRAF = requestAnimationFrame(() => this._tickLive());
+    this._liveTO = setTimeout(() => { this._liveTO = null; this._liveRAF = requestAnimationFrame(() => this._tickLive()); }, this._pointerHeld ? 100 : this._liveWaitMs());
   }
-  _stopLiveTick() { if (this._liveRAF != null) { cancelAnimationFrame(this._liveRAF); this._liveRAF = null; } }
+  _stopLiveTick() {
+    if (this._liveRAF != null) { cancelAnimationFrame(this._liveRAF); this._liveRAF = null; }
+    if (this._liveTO != null) { clearTimeout(this._liveTO); this._liveTO = null; }
+  }
 
   // (The restart ↻ handler moved to the feed's top-right gear (the kernel's _GEAR_JS) along with the
   // button — the user 2026-06-17. It POSTs the same /restart, polls /healthz, and reloads, as before.)
@@ -4821,12 +4842,18 @@ class TimelinePanel {
 
     // turn process-start (prompt) dots — at startAt; CLICKABLE → jump to the prompt that started
     // the period. Skipped where a PROCESSED message dot coincides (the message dot stands in).
+    // Processed messages indexed by recipient, exec times sorted — one pass over the messages instead of
+    // one per TURN (1270 turns × 591 messages was 750k comparisons per redraw, measured 2026-09-04).
+    const execByTo = new Map();
+    data.messages.forEach((mm) => { if (!mm.pending && vidx[mm.toId] != null) { let a = execByTo.get(mm.toId); if (!a) { a = []; execByTo.set(mm.toId, a); } a.push(execAt(mm)); } });
+    execByTo.forEach((a) => a.sort((p, q) => p - q));
+    const execNear = (sid, t) => sortedHasWithin(execByTo.get(sid), t, 1);
     vis.forEach((s, i) => {
       const y = laneY(i);
       turnsOf(s.id).forEach((t) => {
         if (t.cont) return;                  // a post-sleep continuation piece of one segment: its prompt dot belongs to the FIRST piece, not here
         if (!inWin(startAt(t))) return;
-        if (data.messages.some((mm) => mm.toId === s.id && !mm.pending && Math.abs(execAt(mm) - startAt(t)) <= 1)) return;
+        if (execNear(s.id, startAt(t))) return;
         const dx = x(startAt(t));
         // cross-hover focus (dot GROWN in place, via dot()'s lit param): DAG journey node, a coarse card
         // hover (whole-turn id), OR a prompt-atom hover (promptId) — never a work-only (workId) hover

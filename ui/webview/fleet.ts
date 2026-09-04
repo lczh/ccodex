@@ -377,10 +377,25 @@ function hostLoadStrip(): HTMLElement {
   return strip;
 }
 
+// The pane is hidden by default in the dashboard shell (a display:none iframe) yet it received every feed
+// push and rebuilt its whole list for nobody, on the main thread every pane shares (2026-09-04). While the
+// list is not on screen the payload is kept and the rebuild deferred to the moment it comes into view.
+let fleetVisible = true;
+let fleetDirty = false;
+function watchFleetVisibility(list: HTMLElement): void {
+  if (typeof IntersectionObserver === "undefined") return;   // no observer → always render, as before
+  new IntersectionObserver((entries) => {
+    fleetVisible = entries.some((e) => e.isIntersecting);
+    if (fleetVisible && fleetDirty) { fleetDirty = false; render(); }
+  }).observe(list);
+}
+let fleetWatching = false;
 function render() {
   syncFleetTagBtn?.();
   const list = document.getElementById("fleet-list");
   if (!list) return;
+  if (!fleetWatching) { fleetWatching = true; watchFleetVisibility(list); }
+  if (!fleetVisible) { fleetDirty = true; return; }   // nobody can see it: paint when it is shown
   list.replaceChildren();
   // BEFORE the first payload: leave the list EMPTY so the page's romp loader (_pane_spin over #fleet-list)
   // stays up — no child means it never hides — instead of flashing a false "no work" message (the user
