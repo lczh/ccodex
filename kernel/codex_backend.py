@@ -39,6 +39,7 @@ from pathlib import Path
 
 HERE = Path(os.path.dirname(os.path.realpath(__file__)))
 _events = SourceFileLoader("romp_codex_events", str(HERE / "codex_events.py")).load_module()
+_runtime = SourceFileLoader("romp_codex_runtime", str(HERE / "codex_runtime.py")).load_module()
 
 SDK_PIN = "openai-codex==0.144.4"     # bin/romp-codex-setup installs exactly this into codexvenv
 SETUP_HINT = ("Session not created: the Codex backend isn't installed. "
@@ -134,13 +135,20 @@ def _execution_permissions(cwd, thread_start=False):
     return {"permissions": WORKSPACE_PERMISSION, "runtimeWorkspaceRoots": [root]}
 
 
-def _codex_config(config_cls, codex_bin):
-    """Build the pinned SDK launch config in one testable place.
+def _codex_config(config_cls, codex_bin, state_dir=None):
+    """Launch ROMP's managed CLI, with its matching helpers, independently of PATH.
 
-    In 0.144.4, custom profiles are process config while each thread/turn supplies its runtime root.
+    An explicit executable remains available for callers testing another runtime.
     """
+    extra = {}
+    if codex_bin is None:
+        exe = _runtime.runtime_path(state_dir)
+        codex_bin = str(exe)
+    helpers = Path(codex_bin).parent.parent / "codex-path"
+    if helpers.is_dir():
+        extra["env"] = {"PATH": str(helpers) + os.pathsep + os.environ.get("PATH", os.defpath)}
     return config_cls(codex_bin=codex_bin, client_name="romp",
-                      config_overrides=CODEX_CONFIG_OVERRIDES)
+                      config_overrides=CODEX_CONFIG_OVERRIDES, **extra)
 
 
 def ensure_codex_sdk(state_dir):
@@ -497,7 +505,7 @@ class CodexBackend:
                     if not ensure_codex_sdk(self.state):
                         raise RuntimeError(SETUP_HINT)
                     from openai_codex.client import CodexClient, CodexConfig
-                    cfg = _codex_config(CodexConfig, self.codex_bin)
+                    cfg = _codex_config(CodexConfig, self.codex_bin, self.state)
                     candidate = CodexClient(config=cfg, approval_handler=self._handle_approval)
                     candidate.start()
                     candidate.initialize()

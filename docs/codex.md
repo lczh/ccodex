@@ -19,10 +19,18 @@ Codex sessions need, once per machine:
 
         romp-codex-setup
 
-    This provisions a dedicated, pinned venv under romp's state dir (it never
-    touches your system Python) and bundles the Codex binary.
-    Sessions use that SDK-bundled runtime even if another `codex` is on PATH.
-    Your existing CLI remains available for `codex login`.
+    This installs Python SDK **0.144.4** in a dedicated venv and Codex runtime
+    **0.153.3** under `codex-runtime/0.153.3/` in ROMP's state directory.
+    The runtime comes from OpenAI's official release wheels, pinned by SHA-256,
+    with its sandbox and code-mode helpers. Linux and macOS, x86-64 and ARM64,
+    are supported. Neither system Python nor the SDK's own dependency is replaced.
+    Sessions explicitly use this managed runtime even if another `codex` is on
+    PATH. Your existing CLI remains available for `codex login`.
+
+    Rerun setup to install the runtime when upgrading from an older ROMP version.
+    Restart the ROMP kernel after setup if its Codex backend is already running.
+    A missing or incomplete runtime produces a setup error; ROMP does not fall
+    back to an older SDK runtime or a CLI from PATH.
 
 2. **A Codex login:**
 
@@ -89,8 +97,9 @@ execution scope than Sandboxed. It does not disable AppArmor or modify host
 security settings. It also cannot repair a runtime that fails before a thread
 starts, and reviewer availability is determined by Codex and your account.
 If the API says a model needs a newer Codex, select a compatible model from the
-model picker or upgrade the SDK and its runtime together; Auto cannot fix a
-model/runtime version mismatch.
+model picker or update ROMP's pinned runtime; Auto cannot fix a model/runtime
+version mismatch. Bundling 0.153.3 addresses the older runtime's Astra version
+requirement, but does not guarantee startup on a host that blocks its sandbox.
 
 ## Sandboxing
 
@@ -101,22 +110,15 @@ and supplies exactly that session's working directory in
 files plus that workspace, so other user files on the host are not readable.
 Network remains enabled so git and web work keep working.
 
-There is an important pinned-runtime limitation: Codex 0.144.4 does not enforce
-narrower child rules against arbitrary processes inside a custom writable root.
-A shell command can therefore still modify `.git`, `.agents`, and `.codex`.
-The built-in `:workspace` profile enforces the metadata masks, but also grants
-read access to the whole host; romp currently chooses user-file
-confidentiality and documents this
-remaining metadata-integrity gap rather than silently restoring host-wide
-reads. Two host notes:
+The current profile grants write access to the entire workspace, including
+`.git`, `.agents`, and `.codex`. Metadata protection needs narrower filesystem
+rules; it is not provided by this profile. Two host notes:
 
-- The sandbox needs **unprivileged user namespaces**. Some images (notably
-  newer GCP Ubuntu) restrict them; every command then fails visibly with
-  `bwrap: … Permission denied`. To enable:
-
-        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-
-    (persist it in `/etc/sysctl.d/` to survive reboots).
+- The Linux sandbox needs **unprivileged user namespaces**. Host policy can
+  block it with a `bwrap: … Permission denied` error, including while Codex
+  reads instructions during thread creation. Installing 0.153.3 does not change
+  that policy. Follow your host's approved sandbox configuration; ROMP setup
+  does not modify AppArmor or system-wide namespace settings.
 
 - Manual approval prompts are not yet interactive in ROMP. Auto mode uses
   Codex's reviewer; a manual request that reaches ROMP is declined, never

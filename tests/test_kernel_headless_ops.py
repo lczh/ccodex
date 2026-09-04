@@ -202,7 +202,7 @@ class HeadlessRoutes(unittest.TestCase):
 
 
 class CodexRuntimeSelection(unittest.TestCase):
-    def test_path_codex_does_not_override_sdk_runtime(self):
+    def test_path_codex_does_not_override_managed_runtime(self):
         fake_mod = mock.Mock()
         fake_loader = mock.Mock()
         fake_loader.load_module.return_value = fake_mod
@@ -214,7 +214,7 @@ class CodexRuntimeSelection(unittest.TestCase):
             self.assertIs(km._codex(), backend)
         fake_mod.CodexBackend.assert_called_once()
         self.assertIsNone(fake_mod.CodexBackend.call_args.kwargs.get("codex_bin"),
-                          "the SDK must resolve its bundled runtime even when codex is on PATH")
+                          "the backend must resolve its managed runtime even when codex is on PATH")
 
 
 class SdkSingleFlight(unittest.TestCase):

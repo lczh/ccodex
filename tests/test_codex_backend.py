@@ -309,6 +309,7 @@ class ApprovalModes(unittest.TestCase):
     def test_real_client_is_constructed_with_fail_closed_handler(self):
         be, _, _ = build()
         be._client_factory = None
+        be.codex_bin = "/TESTBIN/codex"
         fake = FakeClient()
         fake.start = lambda: None
         module = SimpleNamespace(CodexClient=mock.Mock(return_value=fake),

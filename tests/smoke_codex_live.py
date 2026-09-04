@@ -5,7 +5,8 @@ Deliberately not named test_* : it needs a `codex login` on the machine and bill
 to the logged-in account, so CI never runs it. Run by hand when validating the backend against a
 new Codex release:
 
-    uv run --with 'openai-codex==0.144.4' python tests/smoke_codex_live.py
+    romp-codex-setup
+    python3 tests/smoke_codex_live.py
 
 Exercises the seams the unit tests fake: a real turn's notification stream materializing the
 transcript (items → tokenUsage → completed), the parse of that file into ended turns, live
@@ -23,6 +24,8 @@ from pathlib import Path
 HERE = os.path.dirname(os.path.realpath(__file__))
 ROOT = os.path.dirname(HERE)
 
+RUNTIME_STATE = Path(os.environ.get("ROMP_STATE_DIR") or
+                     str(Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "romp"))
 os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp()
 os.environ.pop("ROMP_STATE_DIR", None)
 cb = SourceFileLoader("romp_codex_backend_live", os.path.join(ROOT, "kernel", "codex_backend.py")).load_module()
@@ -47,11 +50,13 @@ def main():
         # sandbox at all (bwrap: setting up uid map: Permission denied) — every command/patch
         # fails. This override exercises the SAME protocol machinery without the sandbox; the
         # shipped default stays romp's custom profile with one runtime workspace root.
-        # Fix the box for sandboxed operation:
-        #   sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0   (+ persist in sysctl.d)
         cb.TURN_SANDBOX = {"type": "dangerFullAccess"}
         print("(sandbox override: dangerFullAccess — bwrap unavailable on this box)")
-    be = cb.CodexBackend(str(state))
+    if not cb.ensure_codex_sdk(RUNTIME_STATE):
+        print("SMOKE SKIPPED: run romp-codex-setup first")
+        return 2
+    runtime = cb._runtime.runtime_path(RUNTIME_STATE)
+    be = cb.CodexBackend(str(state), codex_bin=str(runtime))
     if not be.available():
         print("SMOKE SKIPPED: %s" % (be._client_err or "codex backend unavailable"))
         return 2

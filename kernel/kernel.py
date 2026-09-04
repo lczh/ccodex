@@ -9719,7 +9719,7 @@ def _codex():
                     jd.STATE, notify=_send_to_app,
                     poke=_wake_kernel, push=_pusher_wake.set,
                     push_session=_push_session_now,
-                    # Keep the app-server runtime paired with the installed SDK.
+                    # Let the backend choose ROMP's managed runtime and helpers.
                     # A separately installed CLI on PATH may use a different protocol.
                     log=lambda m: sys.stderr.write("codex-backend: %s\n" % m))
             except Exception:
