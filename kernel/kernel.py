@@ -28714,6 +28714,46 @@ def _dedup_sig(msg, s):
     return s
 
 
+def _client_lock(c):
+    """The client's slot lock (see _send_slot): made once by _new_ws_client; a client dict made without one (a
+    test, an older caller) gets one here. `get` first — setdefault would build and discard an RLock per call,
+    and _send_client runs per slot per client per cycle."""
+    lk = c.get("dlock")
+    return lk if lk is not None else c.setdefault("dlock", threading.RLock())
+
+
+def _client_reset_chat_sid(client, sid):
+    """needFull's per-sid half of _client_reset_chat_base: forget the tail we believe this client holds for ONE
+    session and drop its dedup slot — under the client's slot lock, for the same reason (review find,
+    2026-09-04): the pusher's _send_chat must land as a whole before or after these pops, or a tail decided
+    before them lands after them, echat is written back, and the repair push sends a chatTail the renderer
+    cannot apply (render.ts latches awaitingFull until a full session lands: the tab froze until reconnect)."""
+    with _client_lock(client):
+        client.get("echat", {}).pop(sid, None)
+        client.get("sent", {}).pop(("chat", sid), None)
+
+
+def _client_reset_chat_base(client):
+    """Forget every session tail we believe this client holds. Both suppressors must go: the echat
+    entries (their absence is what routes _send_chat down its full-session path) AND the ("chat", sid)
+    dedup slots (_DEDUP_REPOST_S would otherwise eat the re-send as unchanged for 60s). The needFull
+    handler does this per-sid; `ready` does it for the whole client — a renderer that just evaluated
+    holds NOTHING, whatever this socket was sent before its listener existed (the stuck-« opening … »
+    class, the user 2026-09-02).
+    Under the client's slot lock (2026-09-04): this runs on the handler thread while the pusher's
+    _send_client inserts keys into the same `sent` dict — unserialized, the comprehension below raised
+    "dictionary changed size during iteration" (reproduced 161/200 runs at the default switch interval,
+    rarer live), the `ready` dispatch died in the handler's generic except, and the _push_one repair this
+    exists for was skipped for that pane, once per renderer life. The same lock serializes the two — and
+    _send_chat holds it across its read-decide-send-write, so a pusher chat send lands as a whole either
+    before the reset (its slot and tail entry are cleared, _push_one re-sends) or after it."""
+    with _client_lock(client):
+        client.get("echat", {}).clear()
+        snt = client.get("sent", {})
+        for k in [k for k in snt if isinstance(k, tuple) and k and k[0] == "chat"]:
+            snt.pop(k, None)
+
+
 # View deltas (2026-09-03). The timeline's bars and the feed used to cross the wire WHOLE on every change —
 # 2.95 MB and 0.86 MB here — and on a board of many working sessions something changes every few seconds,
 # so a dashboard on a forwarded or tunnelled link streamed ~0.5 MB/s of mostly-unchanged JSON and its
@@ -28863,7 +28903,7 @@ def _send_slot(c, ftype, payload, pre, sig):
     holding payload A while the kernel believed B, and every later delta was computed against B: silent
     divergence until the next full. Before deltas the same race touched only the dedup dict, where a double
     full was harmless. Re-entrant: the size fallback in _send_slot_delta calls back in on the same thread."""
-    with c.setdefault("dlock", threading.RLock()):     # setdefault is atomic: a client made without one gets one
+    with _client_lock(c):                             # one per client, made by _new_ws_client
         _send_slot_locked(c, ftype, payload, pre, sig)
 
 
@@ -28984,17 +29024,18 @@ def _send_client(c, key, msg, pre=None, sig=None):
     WebSocket client; the log makes the next one obvious."""
     s = pre if pre is not None else json.dumps(msg)
     sig = sig if sig is not None else _dedup_sig(msg, s)
-    prev = c.setdefault("sent", {}).get(key)
-    now = time.time()
-    if prev is not None and prev[0] == sig and (now - prev[1]) < _DEDUP_REPOST_S:
-        _perf("send", slot=_perf_slot(key), bytes=len(s), deduped=1)
-        return
-    c["sent"][key] = (sig, now)
-    _perf("send", slot=_perf_slot(key), bytes=len(s), deduped=0)
-    try:
-        c["send"](s)
-    except Exception:
-        c["alive"] = False
+    with _client_lock(c):    # the dedup dict is shared with the handler thread's `ready`
+        prev = c.setdefault("sent", {}).get(key)      # reset (_client_reset_chat_base) — one writer at a time
+        now = time.time()
+        if prev is not None and prev[0] == sig and (now - prev[1]) < _DEDUP_REPOST_S:
+            _perf("send", slot=_perf_slot(key), bytes=len(s), deduped=1)
+            return
+        c["sent"][key] = (sig, now)
+        _perf("send", slot=_perf_slot(key), bytes=len(s), deduped=0)
+        try:
+            c["send"](s)                              # enqueue only (never blocks): the lock is held for microseconds
+        except Exception:
+            c["alive"] = False
 
 
 def _send_chat(c, m, ms, change_from, led_changed):
@@ -29013,7 +29054,19 @@ def _send_chat(c, m, ms, change_from, led_changed):
     `ms` is the payload's full serialization, LAZY (the 2026-08-10 CPU fix, round two): None until some
     client actually takes the untrimmed full-send branch — the only consumer — at which point it is
     materialized ONCE and RETURNED, so the caller can hand it to the next client and keep it in the build
-    cache. The steady-state delta path never serializes the whole payload at all."""
+    cache. The steady-state delta path never serializes the whole payload at all.
+
+    Under the client's slot lock, read-decide-send-write as one step (2026-09-04): the handler thread's
+    `ready` reset (_client_reset_chat_base) clears echat and the dedup slots so its connect push sends the
+    full session to a renderer that holds nothing. With only the inner _send_client locked, a pusher send
+    DECIDED before the reset (pc read, tail branch chosen) could land after it — the popped slot let the
+    tail through and the write-back re-populated echat — and the connect push then found a held tail and
+    sent a chatTail the renderer had to refuse (needFull) and repair on a second round trip."""
+    with _client_lock(c):
+        return _send_chat_locked(c, m, ms, change_from, led_changed)
+
+
+def _send_chat_locked(c, m, ms, change_from, led_changed):
     sid = m["id"]
     evs = m.get("events") or []
     total = len(evs)
@@ -36371,8 +36424,7 @@ class Handler(BaseHTTPRequestHandler):
             # whole session (_send_chat's full path fires when echat has no entry for the sid) and the
             # delta stream re-bases from there. Per-CLIENT, so one stale pane never re-sends for the rest.
             sid = str(msg["id"])
-            client.get("echat", {}).pop(sid, None)
-            client.get("sent", {}).pop(("chat", sid), None)   # …and drop the dedup slot, so the full send lands
+            _client_reset_chat_sid(client, sid)               # …and drop the dedup slot, so the full send lands
             self._push_one(client)                            # repair NOW, not on the next 0.5-3s tick
             return
         if msg and msg.get("type") == "loadOlder" and msg.get("id"):
@@ -36411,6 +36463,16 @@ class Handler(BaseHTTPRequestHandler):
             _mark_views_dirty()
             return
         if msg and msg.get("type") == "ready":
+            # `ready` = the render bundle JUST evaluated, so this renderer holds NOTHING — but this
+            # socket may already have been served: the pusher fires from the moment the WS opens
+            # (the inline shim dials during HTML parse), while the 1.4MB bundle can still be
+            # downloading/evaluating, so the first full session frames can land in a document with
+            # no message listener and vanish. echat then believes the client holds those tails and
+            # every later push is a delta the client drops — the tab stuck on « opening … » until
+            # its socket died (the user 2026-09-02; duplicating the browser tab always recovered
+            # because cached bundles win the race). Same repair as needFull above, client-wide;
+            # ready is posted once per renderer life, so this cannot loop.
+            _client_reset_chat_base(client)
             self._push_one(client)
             # Push the SHARED, STABLE tab order so the UI honors it on connect/reload. Without this
             # the webview only learns the order from a live drag, loses it on every reload, and falls
