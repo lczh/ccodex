@@ -18,7 +18,11 @@ import subprocess
 import tempfile
 import time
 import unittest
+import io
+import threading
+from contextlib import redirect_stderr
 from importlib.machinery import SourceFileLoader
+from unittest import mock
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
@@ -487,6 +491,105 @@ process.stdout.write(JSON.stringify({refused:r===null,rev:LAST.bars.rev}));"""
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout), {"refused": True, "rev": 0}, "a base mismatch is refused and nothing moves")
 
+class TwoThreadsOneClient(unittest.TestCase):
+    """The socket handler's connect push (`ready` runs _push_one on the handler thread) and the pusher's cycle
+    both reach _send_slot for the same client, and both read and write that client's held delta state.
+    Review find (2026-09-04): unserialized, one interleaving — both see nothing held, a rebuild lands between
+    them, the handler's dedup slot is written first but its bytes go second — left the client holding payload
+    A while the kernel believed B, and every later delta was computed against B: silent divergence until the
+    next full. The pre-PR race was on the stateless dedup dict alone, where a double full was harmless."""
+
+    def setUp(self):
+        km._delta_parts_cache.clear()
+        self._frac = km._DELTA_MAX_FRACTION
+        km._DELTA_MAX_FRACTION = 10.0
+
+    def tearDown(self):
+        km._DELTA_MAX_FRACTION = self._frac
+
+    def test_a_a_second_sender_waits_for_the_first_frame_and_the_client_ends_holding_the_newer_payload(self):
+        c = _Client()
+        gate, entered = threading.Event(), threading.Event()
+        real_send = c["send"]
+
+        def parked_send(s):                     # thread A parks INSIDE its frame: dedup slot written, state not yet
+            entered.set()
+            gate.wait(5)
+            real_send(s)
+        c["send"] = parked_send
+        bar = lambda i: {"id": "seg-%d" % i, "t": i, "end": i + 1, "open": False}
+        pa = _bars({S1: [bar(1)]}, [], [], now=1)
+        pb = _bars({S1: [bar(1), bar(2)]}, [], [], now=2)
+
+        def push(p):
+            pre = json.dumps(p)
+            km._send_slot(c, "bars", p, pre, km._dedup_sig(p, pre))
+        ta = threading.Thread(target=push, args=(pa,)); ta.start()
+        self.assertTrue(entered.wait(5), "thread A is inside its frame")
+        tb = threading.Thread(target=push, args=(pb,)); tb.start()
+        tb.join(0.3)
+        self.assertTrue(tb.is_alive(), "thread B waits: the client's slot state is one thread's at a time")
+        self.assertEqual(c.frames, [], "…and nothing of B's crossed ahead of A's frame")
+        gate.set(); ta.join(5); tb.join(5)
+        self.assertFalse(ta.is_alive() or tb.is_alive())
+        last = None                             # replay what the wire carried through the shim's mirror
+        for fr in c.frames:
+            if fr.get("type") == "delta":
+                out = _py_apply(last, fr)
+                self.assertIsNotNone(out, "the client could apply every delta it was sent")
+            else:
+                keys = fr.get("_keys")
+                msg = {kk: v for kk, v in fr.items() if kk != "_keys"}
+                last = {"rev": 0, "msg": msg, "maps": _py_maps(msg, keys)}
+        self.assertEqual([f["type"] for f in c.frames], ["bars", "delta"], "A's keyed full, then B's delta against it")
+        self.assertEqual(last["msg"], pb, "the client holds the newer payload…")
+        self.assertEqual(c["dstate"]["bars"]["rev"], 1, "…and the kernel's belief about it agrees")
+        self.assertEqual(c["dstate"]["bars"]["coll"]["turns"], {S1 + SEP + "seg-1": json.dumps(bar(1)), S1 + SEP + "seg-2": json.dumps(bar(2))})
+
+    def test_b_a_collection_that_is_neither_list_nor_dict_goes_whole_and_is_logged_once(self):
+        # _delta_split used to split an unexpected value (None where a list belongs) into ZERO entries, and the
+        # remainder did not carry it either: the client kept its assembled [] while the kernel held None, with no
+        # resync ever asked. Now the payload is unkeyable → the whole frame goes, and stderr says so once per shape.
+        st = _Stream("bars")
+        p1 = _bars({S1: [{"id": "seg-1", "t": 1, "end": 2, "open": False}]}, [], [{"id": "m1", "sent": 1}], now=1)
+        st.push(p1)
+        p2 = dict(p1, messages=None, now=2)
+        p3 = dict(p2, now=3, warming=True)      # a real change (`now` alone is volatile and dedups)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            frames = st.push(p2)
+            frames2 = st.push(p3)
+        self.assertEqual(frames, [p2], "unkeyable: the whole payload crossed, no keys, no empty split")
+        self.assertEqual(frames2, [p3])
+        self.assertNotIn("bars", st.c.get("dstate", {}), "the kernel holds nothing for a client it sent a keyless whole")
+        self.assertEqual(err.getvalue().count("cannot be keyed"), 1, "said once, not once per cycle")
+        self.assertIn("messages", err.getvalue())
+
+    def test_c_the_beat_reads_the_read_state_before_the_ping_stamp(self):
+        # the handler ends a dispatch with two writes: pingAt = None, THEN inRead = True. A beat reading pingAt
+        # first could pair the stale stamp with the fresh read state and drop a live peer as silent. Modelled
+        # exactly: whichever of the two keys the beat reads FIRST sees the pre-end state, the second the post state.
+        class _Handoff(dict):
+            def __init__(self):
+                super().__init__(app="timeline", wid="w1", alive=True, sock=object(), send=lambda s: None,
+                                 qlock=threading.Lock(), lastIn=0.0)
+                self.reads = 0
+
+            def get(self, k, d=None):
+                if k in ("pingAt", "inRead"):
+                    self.reads += 1
+                    pre = self.reads == 1
+                    return (0.0 if pre else None) if k == "pingAt" else (False if pre else True)
+                return super().get(k, d)
+        c = _Handoff()
+        dropped = []
+        with mock.patch.object(km, "_drop_dead_ws_client", lambda cl, why: dropped.append(why)), \
+             mock.patch.object(km, "_clients", [c]):
+            km._keepalive_all(now=km.WS_DEAD_S + 1)
+        self.assertEqual(dropped, [], "a live peer finishing its dispatch is never judged silent")
+        self.assertEqual(c.reads, 2, "both keys were read once, read state first")
+
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -545,4 +648,3 @@ class HandlerWiring(unittest.TestCase):
         self.assertIn('send({type:"needSlot",slot:msg.slot})', js)
         self.assertIn("var IID=", js)
         self.assertNotIn('sessionStorage.setItem("romp:iid"', js, "the page id is never stored: a duplicated tab must not inherit it")
-

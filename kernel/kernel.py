@@ -28213,6 +28213,8 @@ def _new_ws_client(app, wid, sock, lock=None, q=None, start_sender=True):
     lock = lock if lock is not None else threading.Lock()
     now = _ws_clock()
     client = {"app": app, "wid": wid, "alive": True, "qbytes": 0, "qlock": threading.Lock(),
+              "dlock": threading.RLock(),   # serializes _send_slot per client: the handler's connect push and the
+              #                               pusher both send slots to one client (see _send_slot)
               "sock": sock, "since": now, "lastIn": now, "pingAt": None,
               "inRead": True}      # False while the handler thread is inside a dispatch (see _keepalive_all)
     client["send"] = _mk_ws_send(q, sock, client)
@@ -28339,8 +28341,8 @@ def _ws_recv_message(rfile, on_ping, on_pong=None):
     (a multi-MB base64 message) dissolved into one unparseable JSON prefix plus a train of silently
     dropped continuation frames, so the 📎 pick looked like it did nothing (the user 2026-08-10,
     Chrome on a phone; small desktop files sat under the threshold, which is why it never surfaced).
-    Control frames may interleave between fragments: pings are answered via on_ping, pongs are
-    dropped, close ends the read."""
+    Control frames may interleave between fragments: pings are answered via on_ping, pongs go to
+    on_pong (the liveness beat's answer) or are dropped without one, close ends the read."""
     frag_op, frag = None, None
     while True:
         op, payload, fin = _ws_recv(rfile)
@@ -28412,6 +28414,10 @@ def _keepalive_all(now=None):
         # LIVENESS (2026-09-03): a ping whose pong never came within WS_DEAD_S means the peer is gone —
         # however open the forwarder in between keeps the socket. Clients from before the factory (no
         # `sock`) are never judged: they cannot be shut down, and they cannot have been pinged.
+        in_read = c.get("inRead", True)          # read BEFORE the stamp: the handler ends a dispatch by clearing pingAt
+        #                                          and THEN setting inRead — read the other way round, a beat between
+        #                                          those two writes paired a stale ping with a fresh read state and
+        #                                          dropped a live peer (review find, 2026-09-04)
         pa = c.get("pingAt")                     # any pong or message clears this (see _note_ws_inbound), so an
         if pa is not None and c.get("sock") is not None and (now - pa) >= WS_DEAD_S:   # outstanding ping IS the silence…
             why = None
@@ -28419,7 +28425,7 @@ def _keepalive_all(now=None):
             # tab synchronously on that thread — tens of seconds on a cold kernel) the pong sits unread in
             # the receive buffer: unread is not missing. The handler resets the clock when it re-enters the
             # read (review 2026-09-03).
-            if not c.get("inRead", True):
+            if not in_read:
                 pass
             else:
                 # …and never a peer that is still DRAINING: sendall returning means the ping entered the socket,
@@ -28730,6 +28736,7 @@ _DELTA_SLOTS = {
 _DELTA_SEP = "\u001f"          # joins composite keys; never appears in an id or a sid
 _DELTA_MAX_FRACTION = 0.6      # a delta this large a fraction of the full payload is sent as the full instead
 _delta_parts_cache = {}        # frame type -> (payload object identity, parts) — one split per BUILD, shared by clients
+_delta_unkeyable_said = set()  # (frame type, why) already written to stderr: an unkeyable shape is said once, not per cycle
 
 
 def _delta_key(kind, it, prefix=""):
@@ -28777,6 +28784,12 @@ def _delta_split(kind, value):
                 continue
             for it in lst:
                 put(_delta_key(kind, it, pre), it, pre)
+    else:
+        # a value the kind cannot key (None where a list belongs, a list where a dict does): NOT zero entries —
+        # that split carried the value nowhere, and the client kept its assembled [] / {} while the kernel held
+        # something else, with no resync ever asked (review find, 2026-09-04). Unkeyable → the whole frame goes.
+        raise ValueError("%s collection is a %s, not a %s" % (
+            kind, type(value).__name__, "dict" if kind == "dict" or kind.startswith("dictlist:") else "list"))
     return ents, order
 
 
@@ -28787,9 +28800,17 @@ def _delta_parts(ftype, payload):
         return hit[1]
     kinds = _DELTA_SLOTS[ftype][1]
     try:
-        colls = {name: _delta_split(kind, payload.get(name)) for name, kind in kinds.items()}
-    except ValueError:
+        colls = {}
+        for name, kind in kinds.items():
+            try:
+                colls[name] = _delta_split(kind, payload.get(name))
+            except ValueError as e:
+                raise ValueError("%s: %s" % (name, e)) from None     # name the collection for the log line
+    except ValueError as e:
         parts = None                                   # a payload the protocol cannot key: this build goes whole
+        if (ftype, str(e)) not in _delta_unkeyable_said:   # …and says so once: a silent whole is a silent perf loss
+            _delta_unkeyable_said.add((ftype, str(e)))
+            sys.stderr.write("view-delta %s: payload cannot be keyed (%s); sending whole frames\n" % (ftype, e))
     else:
         rest = {kk: v for kk, v in payload.items() if kk not in kinds}
         rest_sig = json.dumps({kk: v for kk, v in rest.items() if kk not in _DEDUP_VOLATILE}, sort_keys=True, default=str)
@@ -28834,7 +28855,19 @@ def _order_shape(kind, order):
 def _send_slot(c, ftype, payload, pre, sig):
     """Send a bars/feed payload to one client: whole for a client without delta support (exactly as before),
     else as a delta against what that client holds. `pre`/`sig` are the shared full serialization and
-    dedup signature the pusher computed once per build."""
+    dedup signature the pusher computed once per build.
+    One thread at a time per client (review find, 2026-09-04): the socket handler's connect push (`ready` →
+    _push_one, on the handler thread) and the pusher's cycle both reach here for the same client, and both
+    read and write its held delta state. Unserialized, one interleaving — both find nothing held, a rebuild
+    lands between them, the handler's dedup slot is written first but its bytes go second — left the client
+    holding payload A while the kernel believed B, and every later delta was computed against B: silent
+    divergence until the next full. Before deltas the same race touched only the dedup dict, where a double
+    full was harmless. Re-entrant: the size fallback in _send_slot_delta calls back in on the same thread."""
+    with c.setdefault("dlock", threading.RLock()):     # setdefault is atomic: a client made without one gets one
+        _send_slot_locked(c, ftype, payload, pre, sig)
+
+
+def _send_slot_locked(c, ftype, payload, pre, sig):
     key = _DELTA_SLOTS[ftype][0]
     if not c.get("delta"):
         _send_client(c, key, payload, pre=pre, sig=sig)
@@ -31174,7 +31207,8 @@ reset machinery re-sends CURRENT state; claims are socket-scoped by design. */}
 else queue.push(s);}
 // The delta reassembler. DELTA_KINDS mirrors the kernel's _DELTA_SLOTS: which top-level collections of each
 // slot are keyed, and how — "dict" (an object keyed by its own keys), "byid" (a list keyed by item id),
-// "bysid" (a list grouped by item sid, one entry per group). LAST holds, per slot, the revision, the last
+// "bykeys:a,b" (a list keyed by a composite of item fields), "dictlist:id" (an object of lists, each item keyed by its
+// lane and id). LAST holds, per slot, the revision, the last
 // full message handed to the bundle, and per-collection maps {order:[keys], items:{key:value}}. A delta
 // builds a NEW message object (the bundle may still hold the previous one) reusing every unchanged part.
 var DELTA_KINDS={bars:{turns:"dictlist:id",judging:"bykeys:sid,t,judge,t1",messages:"byid"},feed:{asks:"byid:itemId"}};var LAST={};var SEP="\u001f";
