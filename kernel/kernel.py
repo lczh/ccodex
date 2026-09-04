@@ -10659,9 +10659,11 @@ def _drive(msg, client):
         # mode only through the shift+tab cycle, so Bypass — which the picker offers on SDK sessions —
         # has no keystroke there. Without this the badge just sat on the old mode with no reason given.
         if not be.set_mode(sid, str(msg["value"])):
-            client["send"](json.dumps({"type": "warn",
-                                       "text": "A terminal session can only reach the modes in its "
-                                               "shift+tab cycle — Normal, Accept, Auto, Plan."}))
+            text = ("Codex mode changes require an idle session. Choose Sandboxed or Auto "
+                    "after the current turn finishes." if be is _codex_backend else
+                    "A terminal session can only reach the modes in its "
+                    "shift+tab cycle — Normal, Accept, Auto, Plan.")
+            client["send"](json.dumps({"type": "warn", "text": text}))
         _push_soon()
     elif t == "setAuth" and msg.get("value") in ("login", "key"):
         # per-session billing (login vs the manager env's API key) — SDK-only, applied via reconnect

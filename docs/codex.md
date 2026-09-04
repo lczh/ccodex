@@ -69,6 +69,29 @@ Honest caveats while this is new:
   default model — a `gpt-*` value in `~/.local/state/romp/judge-model` is
   honored where the plan permits).
 
+## Approval modes
+
+Click the session's mode badge in the chat status line to choose **Sandboxed** or
+**Auto** while the session is idle. The choice is saved per session and restored
+when the kernel restarts. Existing and new sessions default to Sandboxed.
+
+- **Sandboxed:** commands stay within the workspace permission profile;
+  requests to execute outside it are denied.
+- **Auto:** the same sandbox stays enabled. Codex's own automatic reviewer
+  evaluates escalation requests (`on-request` with `auto_review`); ROMP does not
+  approve them itself. A reviewer refusal remains a refusal. Requests routed
+  back to ROMP for manual approval are declined with a warning because the
+  current SDK cannot wait for a UI answer without blocking its shared reader.
+
+Change modes between turns; an in-flight turn retains the mode it started with.
+Auto may allow a reviewed command to run outside the sandbox, so it has a wider
+execution scope than Sandboxed. It does not disable AppArmor or modify host
+security settings. It also cannot repair a runtime that fails before a thread
+starts, and reviewer availability is determined by Codex and your account.
+If the API says a model needs a newer Codex, select a compatible model from the
+model picker or upgrade the SDK and its runtime together; Auto cannot fix a
+model/runtime version mismatch.
+
 ## Sandboxing
 
 Codex runs its commands inside its own Linux sandbox (bubblewrap). Every
@@ -95,9 +118,9 @@ reads. Two host notes:
 
     (persist it in `/etc/sysctl.d/` to survive reboots).
 
-- There is no permission-prompt flow yet (approvals are pinned off; the
-  sandbox is the guardrail). Codex approval prompts surfacing as romp's
-  needs-you cards is planned.
+- Manual approval prompts are not yet interactive in ROMP. Auto mode uses
+  Codex's reviewer; a manual request that reaches ROMP is declined, never
+  silently accepted. Interactive needs-you approval cards remain planned.
 
 ## What works, what's coming
 

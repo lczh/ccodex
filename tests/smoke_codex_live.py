@@ -61,6 +61,8 @@ def main():
     err = be.launch_error(sid)
     assert not err, "spawn launch_error: %r" % err
     print("   sid=%s tid=%s model=%s" % (sid, be._sessions[sid].tid, be._sessions[sid].model))
+    mode = os.environ.get("ROMP_SMOKE_MODE", "sandboxed")
+    assert be.set_mode(sid, mode), "unsupported smoke mode: %s" % mode
 
     print("== turn 1: file-writing task")
     be.send(sid, "Create a file named hello.txt in the current directory containing exactly "
