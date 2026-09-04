@@ -47,8 +47,14 @@ test("the kernel handles needFull by forgetting what that client holds", () => {
   assert.ok(KERNEL.includes('msg.get("type") == "needFull"'), "the kernel must handle the frame");
   const i = KERNEL.indexOf('msg.get("type") == "needFull"');
   const body = KERNEL.slice(i, i + 1200);
-  assert.ok(body.includes('"echat"'), "drop the client's tail base → next push sends a full session");
-  assert.ok(body.includes('("chat", sid)'), "drop the dedup slot → the full send isn't swallowed");
+  // the two pops live in _client_reset_chat_sid since 2026-09-04 (they run under the client's slot lock, so
+  // the pusher's _send_chat lands whole before or after them) — pin the handler's call AND the helper's body
+  assert.ok(body.includes("_client_reset_chat_sid(client, sid)"), "the handler forgets through the locked helper");
+  const h = KERNEL.indexOf("def _client_reset_chat_sid(client, sid):");
+  assert.ok(h >= 0, "the helper must exist");
+  const helper = KERNEL.slice(h, h + 1500);
+  assert.ok(helper.includes('"echat"'), "drop the client's tail base → next push sends a full session");
+  assert.ok(helper.includes('("chat", sid)'), "drop the dedup slot → the full send isn't swallowed");
   assert.ok(body.includes("_push_one(client)"), "repair immediately, not on the next tick");
 });
 
