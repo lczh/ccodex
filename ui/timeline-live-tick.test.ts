@@ -14,9 +14,11 @@ const SRC = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "romp-timeli
 test("the live tick sleeps until the edge has moved a whole pixel, instead of waking every frame", () => {
   assert.match(SRC, /const LIVE_MIN_PX = 1;/);
   assert.match(SRC, /_liveWaitMs\(\) \{[\s\S]*?const pxPerSec = g\.plotW \/ g\.winSec;/);
-  assert.match(SRC, /this\._liveTO = setTimeout\(\(\) => \{ this\._liveTO = null; this\._liveRAF = requestAnimationFrame\(\(\) => this\._tickLive\(\)\); \}, this\._pointerHeld \? 100 : this\._liveWaitMs\(\)\);/);
+  assert.match(SRC, /_sleep\(ms\) \{\n\s*this\._liveTO = setTimeout\(\(\) => \{ this\._liveTO = null; this\._liveRAF = requestAnimationFrame\(\(\) => this\._tickLive\(\)\); \}, ms\);/);
+  assert.match(SRC, /this\._sleep\(this\._liveWaitMs\(\)\);/);
   assert.match(SRC, /_stopLiveTick\(\) \{[\s\S]*?clearTimeout\(this\._liveTO\)/, "stopping the loop clears the sleep too");
-  assert.match(SRC, /_startLiveTick\(\) \{\n\s*if \(this\._liveRAF != null \|\| this\._liveTO != null/, "a sleeping loop is a running loop: no second one");
+  assert.match(SRC, /_startLiveTick\(\) \{[\s\S]*?if \(this\._liveRAF != null\) return;[\s\S]*?if \(this\._liveTO != null\) \{ clearTimeout\(this\._liveTO\); this\._liveTO = null; \}/,
+    "a restart re-paces a pending sleep (a zoom or a frame changed the geometry) but never doubles an imminent look");
 });
 
 test("the live wait is bounded and scales with the zoom", () => {
@@ -57,4 +59,29 @@ test("sortedHasWithin answers the ±1 s question exactly", () => {
   // brute-force parity with the scan it replaces
   const xs = [0.5, 1.7, 1.9, 8, 8.2, 20, 33.3].sort((a, b) => a - b);
   for (let t = -2; t < 40; t += 0.37) assert.equal(f(xs, t, 1), xs.some((v) => Math.abs(v - t) <= 1), "t=" + t);
+});
+
+test("a hidden pane keeps the loop alive on a long sleep; a held pointer yields to the release event", () => {
+  const tick = /  _tickLive\(\) \{([\s\S]*?)\n  \}/.exec(SRC)![1];
+  assert.match(tick, /if \(!this\._isVisible\(\)\) \{ this\._sleep\(2000\); return; \}/);
+  assert.match(tick, /if \(this\._pointerHeld\) \{ this\._liveResume = true; return; \}/);
+  assert.match(SRC, /if \(this\._liveResume\) \{ this\._liveResume = false; this\._startLiveTick\(\); \}/, "_release restarts it");
+  assert.match(SRC, /this\._liveRAF = null; this\._liveTO = null; this\._liveResume = false;/, "the constructor knows every handle");
+});
+
+test("a bars frame re-anchors the live edge, and the glide cap outlasts the kernel's 60 s repost", () => {
+  const bars = /  applyBars\(m\) \{([\s\S]*?)\n  \}/.exec(SRC)![1];
+  assert.match(bars, /this\._anchorNow\(this\.data\.now\);/);
+  assert.match(SRC, /_anchorNow\(sample\) \{[\s\S]*?reanchorEdge\(this\._nowBaseSec, this\._nowBaseMs, tMs, sample, this\._wasLive\)/);
+  const cap = Number(/const MAX_INTERP_AHEAD = (\d+);/.exec(SRC)![1]);
+  assert.ok(cap >= 120, "the edge must be able to glide through a whole repost interval: got " + cap);
+  // the pure functions, extracted and run: a 61 s silence neither stalls the edge nor makes it jump
+  const consts = "const MAX_INTERP_AHEAD = " + cap + "; const REANCHOR_SEC = " + /const REANCHOR_SEC = ([\d.]+);/.exec(SRC)![1] + ";";
+  const fi = /function interpNow\([\s\S]*?\n\}/.exec(SRC)![0];
+  const fr = /function reanchorEdge\([\s\S]*?\n\}/.exec(SRC)![0];
+  const { interpNow, reanchorEdge } = new Function(consts + fi + fr + "; return { interpNow, reanchorEdge };")();
+  assert.equal(interpNow(1000, 0, 61000, true, cap), 1061, "still gliding after 61 s");
+  assert.equal(interpNow(1000, 0, 61000, true, 30), 1030, "…where the old 30 s cap had frozen it at +30");
+  const a = reanchorEdge(1000, 0, 61000, 1061, true);
+  assert.equal(a.baseSec, 1061, "the repost's sample matches the displayed edge: no jump");
 });

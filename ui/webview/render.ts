@@ -12123,7 +12123,10 @@ function chatTail(msg: any) {
     const v = views.get(msg.id);
     if (v) {
       v.rendered = Math.min(v.rendered, from);
-      if (shrank) v.stale = true;
+      // Still a full window rebuild when the tail shrank, or when the change landed INSIDE a window the user
+      // had scrolled away from the tail: the incremental path assumes new events lie below such a window.
+      const atTail = (v.winEnd ?? Infinity) >= (v.unitTotal ?? 0);
+      if (shrank || (!atTail && from < (v.winEnd ?? 0))) v.stale = true;
     }
     schedulePrebuild(); // rebuild the now-stale off-screen view in idle, before the user switches to it (an incremental repaint now)
   }

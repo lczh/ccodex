@@ -1650,16 +1650,31 @@ function applySections(a: any, it: AskItem, distillShown: boolean): void {
 // repainted. Every feed frame used to rewrite all ~155 cards (about a hundred DOM writes each) when the frame
 // changed one of them (2026-09-04). The display-side state a paint also reads (hover/pin focus, the pending
 // bell, the done ticks) is folded into the key, so a change to any of it repaints as before.
+// Bumped whenever a display-side input EVERY card reads changes: the view prefs (grouped, collapsed), the
+// working/awaiting/unknown status sets and the self host that the session dots and delegation lines read.
+// A card's key carries it, so such a change repaints every card once, as before. The coarse clock repaints
+// each card at most every 15 s so the durations it renders (waited, working for, paragraph ages) keep
+// ticking — the old cadence was every kernel push, at most 60 s apart.
+let paintEpoch = 0;
+let statusSig = "";
+function noteStatusInputs(): void {
+  const sig = [...workingSet].sort().join(",") + "|" + [...awaitingSet].sort().join(",") + "|" + [...unknownSet].sort().join(",") + "|" + feedSelfHost;
+  if (sig !== statusSig) { statusSig = sig; paintEpoch++; }
+}
 function cardPaintKey(it: AskItem): string {
   return JSON.stringify(it) + "|" + (it.itemId === (hoverAskId ?? pinnedAskId) ? "f" : "") + (it.itemId === pinnedAskId ? "p" : "")
-    + "|" + (pendingNotify.has(it.itemId) ? String(pendingNotify.get(it.itemId)) : "") + "|" + [...pendingDone].join(",");
+    + "|" + (pendingNotify.has(it.itemId) ? String(pendingNotify.get(it.itemId)) : "") + "|" + [...pendingDone].join(",")
+    + "|" + paintEpoch + "|" + Math.floor(Date.now() / 15000);
 }
 
 function updateAskCard(card: HTMLElement, it: AskItem) {
   const a = card as any;
   a._it = it;   // the freshest payload copy — the right-click bell menu reads this, never a stale closure
   const pk = cardPaintKey(it);
-  if (a._paintKey === pk) return;   // nothing this card shows has changed → leave its DOM alone
+  // Nothing this card shows has changed → leave its DOM alone. Except a card with a LATCHED button (Approve →
+  // Delivering…, Retry → Retrying…, Revive → Reviving…): those rely on the next paint to re-enable when the
+  // refused action left the payload unchanged, so a card with a disabled button always repaints.
+  if (a._paintKey === pk && !card.querySelector("button[disabled]")) return;
   a._paintKey = pk;
   // per-card bell: retire the optimistic value once the kernel's payload agrees (event-based, no timer),
   // then render whichever stands. Same sticky-optimism shape as the timeline lane's _pendingFlags.
@@ -4150,10 +4165,10 @@ let prevCols: Map<string, string> = new Map();
 function columnsOf(buckets: Record<Column, Entry[]>): Map<string, string> {
   const m = new Map<string, string>();
   for (const col of Object.keys(buckets) as Column[]) {
-    for (const e of buckets[col]) {
+    buckets[col].forEach((e, i) => {
       const key = e.kind === "ask" ? "a:" + e.ask.itemId : e.kind === "group" ? "g:" + e.group.turnId : "s:" + col + ":" + e.sid;
-      m.set(key, col);
-    }
+      m.set(key, col + ":" + i);   // column AND position: a card that moved within its column glides too (the user 2026-06-29)
+    });
   }
   return m;
 }
@@ -4806,6 +4821,7 @@ window.addEventListener("blur", () => { if (kbMode) kbExit(); });   // shell mov
 // same-page toggle both land here).
 let lastCollapsedPref = feedPrefs().collapsed;
 function onSettingsChanged(): void {
+  paintEpoch++;   // grouped/collapsed/stacked reach into every card's paint (name row, row2, sections)
   const p = feedPrefs();
   if (p.collapsed !== lastCollapsedPref) { lastCollapsedPref = p.collapsed; secChoice.clear(); }
   applyStacked(p.stacked);
@@ -5126,6 +5142,7 @@ function applyFeedPayload(m: any): void {
   }
   awaitingSet = new Set(Array.isArray(m.awaiting) ? m.awaiting : []);   // await-green awaiting dots (the user 2026-07-13)
   unknownSet = new Set(Array.isArray(m.stateUnknown) ? m.stateUnknown : []);   // listed-but-unreadable → gray ring, never a blank
+  noteStatusInputs();   // the dots and delegation lines every card paints read these → a change repaints every card
   bgServicesMap = m.bgServices && typeof m.bgServices === "object" ? m.bgServices : {};   // session name -> judge-classified service descs → the session-header chip (2026-07-24)
   if (Array.isArray(m.order)) sessionOrder = m.order.filter((x: any) => typeof x === "string");   // grouped-mode session rank (tab/lane order)
   pendingHosts = Array.isArray(m.pendingHosts) ? m.pendingHosts.filter((h: any) => typeof h === "string") : [];

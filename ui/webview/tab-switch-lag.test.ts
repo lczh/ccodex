@@ -16,7 +16,8 @@ const chatTail = /^function chatTail\([\s\S]*?\n\}/m.exec(RENDER)![0];
 test("a background tab's tail lowers `rendered` to the changed point instead of marking the view stale", () => {
   const bg = /\} else \{\n([\s\S]*?)\n  \}\n\}$/.exec(chatTail)![1];
   assert.match(bg, /v\.rendered = Math\.min\(v\.rendered, from\);/);
-  assert.match(bg, /if \(shrank\) v\.stale = true;/, "a truncation still needs the window rebuilt");
+  assert.match(bg, /const atTail = \(v\.winEnd \?\? Infinity\) >= \(v\.unitTotal \?\? 0\);\n\s*if \(shrank \|\| \(!atTail && from < \(v\.winEnd \?\? 0\)\)\) v\.stale = true;/,
+    "a truncation, or a change inside a scrolled-away window, still needs the window rebuilt");
   assert.doesNotMatch(bg, /if \(v\) v\.stale = true;/, "the blanket stale mark is gone");
   assert.match(bg, /schedulePrebuild\(\);/, "the off-screen view still catches up in idle");
 });

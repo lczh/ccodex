@@ -323,10 +323,16 @@ function niceStep(W) { for (const s of NICE) if (W / s <= 8) return s; return 17
 //   baseMs  — monotonic ms when baseSec observed  nowMs — monotonic ms now
 // Clamp the advance to [0, maxAheadSec]: never run backward (a clock hiccup), and never fling the edge
 // far ahead if the tab was backgrounded (rAF paused → huge elapsed) or the kernel went quiet.
-const MAX_INTERP_AHEAD = 30;   // seconds the edge may glide past the last data.now before it just waits
-const LIVE_MIN_PX = 1;         // live-tick repaints once the edge would move ≥ this many px (was 0.15: at a
-                               // glide stays smooth at high zoom (effectively native rAF), but >0 so a
-                               // near-static (zoomed-out) edge idles instead of repainting for nothing
+const MAX_INTERP_AHEAD = 150;  // seconds the edge may glide past the last data.now before it just waits: past
+                               // the kernel's 60 s repost of an unchanged frame (a quiet board sends nothing
+                               // sooner, since 2026-09-04 the skeleton dedups too), so a healthy kernel never
+                               // stalls the edge; a dead one is announced by the socket, not by this cap
+// The live edge advances in whole-pixel steps: the loop looks once the edge could have moved this far at the
+// current zoom (see _liveWaitMs, 100-2000 ms between looks) and rebuilds then. It used to be 0.15 px on every
+// animation frame — a full SVG rebuild about twice a second at a one-hour window, on the main thread every
+// pane shares, which is what a chat tab click waited behind (measured 2026-09-04). A sub-pixel glide would
+// need the now-line and open bars translated between rebuilds, not a lower threshold.
+const LIVE_MIN_PX = 1;
 function perfNow() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
 function interpNow(baseSec, baseMs, nowMs, live, maxAheadSec) {
   if (!live || baseMs == null) return baseSec;
@@ -886,7 +892,7 @@ class TimelinePanel {
     // _lastLiveNow = effective-now of the last live repaint (sub-pixel guard so we only repaint when the
     // edge would actually move). Re-armed each poll; self-stops when not live.
     this._nowBaseSec = null; this._nowBaseMs = null; this._wasLive = false;
-    this._liveRAF = null; this._lastLiveNow = null;
+    this._liveRAF = null; this._liveTO = null; this._liveResume = false; this._lastLiveNow = null;
     // Newest data.now sample ever seen this page-lifetime (see isFreshNowSample): a push carrying an
     // OLDER now is a RE-EMISSION — federation re-emits the STORED local payload whenever a remote host
     // pushes, and _cached_timeline re-serves its build-time now — never a fresh clock sample, so it must
@@ -1032,6 +1038,7 @@ class TimelinePanel {
       this._pointerHeld = false;
       const tipUp = this.tip && this.tip.classList && this.tip.classList.contains('show');
       if (this._dirtyWhileTip && !tipUp) { this._dirtyWhileTip = false; setTimeout(() => { if (this.data) this.draw(); }, 0); }
+      if (this._liveResume) { this._liveResume = false; this._startLiveTick(); }   // the look skipped under the press
     };
     window.addEventListener('pointerup', _release);
     window.addEventListener('pointercancel', _release);
@@ -1603,9 +1610,19 @@ class TimelinePanel {
   // Arm the rAF loop (no-op if already running or not currently live+visible). Re-armed each poll by
   // update(), so even after the loop self-stops it returns within one poll once we're live again. NOT
   // called from draw() — draw() runs inside the tick, and re-arming there would double the loop.
+  // The live-follow loop: a look (draw if the edge moved LIVE_MIN_PX; see _tickLive), then a sleep sized to
+  // the edge's speed, then the next look on an animation frame. Restarted by update()/applyBars() (each frame
+  // re-paces it: a pending sleep computed for the old zoom or data is dropped), by gestures, and by the
+  // pointer release when a look was skipped under a held pointer. Hidden pane: it keeps sleeping (long) so it
+  // resumes by itself when shown; not live-following: it stops until a gesture pins the edge again.
   _startLiveTick() {
-    if (this._liveRAF != null || this._liveTO != null || !this._liveFollowing() || !this._isVisible()) return;
+    if (!this._liveFollowing() || !this._isVisible()) return;
+    if (this._liveRAF != null) return;                                        // a look is already imminent
+    if (this._liveTO != null) { clearTimeout(this._liveTO); this._liveTO = null; }   // re-pace: the geometry may have changed
     this._liveRAF = requestAnimationFrame(() => this._tickLive());
+  }
+  _sleep(ms) {
+    this._liveTO = setTimeout(() => { this._liveTO = null; this._liveRAF = requestAnimationFrame(() => this._tickLive()); }, ms);
   }
   // How long until the live edge has moved LIVE_MIN_PX at the current zoom — the loop sleeps exactly that
   // long between looks instead of waking every animation frame. A full redraw is what a look costs, so at a
@@ -1620,20 +1637,21 @@ class TimelinePanel {
   }
   _tickLive() {
     this._liveRAF = null; this._liveTO = null;
-    if (!this._liveFollowing() || !this._isVisible() || !this.data) return;   // gate closed → stop the loop
-    // Click-safe: don't rebuild the SVG under a pressed pointer (a click in progress) — skip this look's draw
-    // but keep the loop alive so the edge resumes gliding the moment the pointer releases. See the constructor.
-    if (!this._pointerHeld) {
-      const g = this._geom;
-      if (!g || this._lastLiveNow == null || ((this._liveNow() - this._lastLiveNow) / g.winSec * g.plotW) >= LIVE_MIN_PX) {
-        this.draw();
-      }
+    if (!this._liveFollowing() || !this.data) return;          // gate closed → stop; a gesture or a frame re-arms
+    if (!this._isVisible()) { this._sleep(2000); return; }      // hidden pane: stay alive cheaply, resume when shown
+    // Click-safe: don't rebuild the SVG under a pressed pointer (a click in progress). The release event
+    // (_release) restarts the loop — no polling for it. See the constructor.
+    if (this._pointerHeld) { this._liveResume = true; return; }
+    const g = this._geom;
+    if (!g || this._lastLiveNow == null || ((this._liveNow() - this._lastLiveNow) / g.winSec * g.plotW) >= LIVE_MIN_PX) {
+      this.draw();
     }
-    this._liveTO = setTimeout(() => { this._liveTO = null; this._liveRAF = requestAnimationFrame(() => this._tickLive()); }, this._pointerHeld ? 100 : this._liveWaitMs());
+    this._sleep(this._liveWaitMs());
   }
   _stopLiveTick() {
     if (this._liveRAF != null) { cancelAnimationFrame(this._liveRAF); this._liveRAF = null; }
     if (this._liveTO != null) { clearTimeout(this._liveTO); this._liveTO = null; }
+    this._liveResume = false;
   }
 
   // (The restart ↻ handler moved to the feed's top-right gear (the kernel's _GEAR_JS) along with the
@@ -1848,6 +1866,19 @@ class TimelinePanel {
   // The heavy second half of a timeline push (the user 2026-06-25): the per-segment work BARS + the judging
   // band + message connectors + nudge marks — ~95% of the payload, deferred so the lanes (update()) paint
   // first. The skeleton always lands first (TCP-ordered on the one socket), so this.data.sessions is set.
+  // Re-anchor the live edge's free-running clock on a fresh sample, the way update() does for the skeleton.
+  // Since the skeleton dedups (2026-09-04) a quiet board sends it only every 60 s, and the bars frame is
+  // then the fresher clock; without this the edge would glide to MAX_INTERP_AHEAD and wait.
+  _anchorNow(sample) {
+    const live = this._liveFollowing(), tMs = perfNow();
+    if (live) {
+      const a = reanchorEdge(this._nowBaseSec, this._nowBaseMs, tMs, sample, this._wasLive);
+      this._nowBaseSec = a.baseSec; this._nowBaseMs = a.baseMs;
+    } else {
+      this._nowBaseSec = sample; this._nowBaseMs = tMs;
+    }
+    this._wasLive = live;
+  }
   applyBars(m) {
     if (!m || !this.data || !this.data.sessions) return;
     this.data.turns = m.turns || {};
@@ -1875,6 +1906,7 @@ class TimelinePanel {
     if (typeof m.now === 'number') {
       if (isFreshNowSample(this._newestNow, m.now)) this._newestNow = m.now;
       this.data.now = (this._newestNow != null) ? this._newestNow : m.now;
+      this._anchorNow(this.data.now);
     }
     if (!this.fitted && Object.keys(this.data.turns).length && this.fitWindow()) this.fitted = true;   // no latch without a clock sample (see fitWindow)
     // honor the same freeze-on-hover / click-hold guard update() uses (don't relayout under a held pointer/tip)
