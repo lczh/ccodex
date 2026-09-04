@@ -121,7 +121,14 @@ class BackendRuntimeSelection(unittest.TestCase):
                 config = cb._codex_config(lambda **kwargs: kwargs, None, state)
             self.assertEqual(config['codex_bin'], str(exe))
             self.assertEqual(config['env']['PATH'], str(exe.parent.parent / 'codex-path') + ':/TESTBIN')
-            self.assertEqual(config['config_overrides'], cb.CODEX_CONFIG_OVERRIDES)
+            profile = config['config_overrides'][0]
+            for path in (exe, exe.parent / 'codex-code-mode-host',
+                         exe.parent.parent / 'codex-package.json',
+                         exe.parent.parent / 'codex-resources', exe.parent.parent / 'codex-path'):
+                self.assertIn(json.dumps(str(path)) + ' = "read"', profile)
+            self.assertNotIn(json.dumps(state) + ' = "read"', profile)
+            self.assertNotIn(json.dumps(str(exe.parent.parent)) + ' = "read"', profile)
+            self.assertNotIn('":root"', profile)
 
     def test_missing_runtime_does_not_fall_back_to_sdk_or_path(self):
         cb = SourceFileLoader('runtime_missing_backend', str(HERE / 'kernel/codex_backend.py')).load_module()
@@ -138,3 +145,14 @@ class BackendRuntimeSelection(unittest.TestCase):
             config = cb._codex_config(lambda **kwargs: kwargs, str(exe))
             self.assertEqual(config['codex_bin'], str(exe))
             self.assertTrue(config['env']['PATH'].startswith(str(exe.parent.parent / 'codex-path')))
+
+    def test_bare_executable_does_not_grant_reads_to_its_parent(self):
+        cb = SourceFileLoader('runtime_bare_backend', str(HERE / 'kernel/codex_backend.py')).load_module()
+        with tempfile.TemporaryDirectory(prefix='romp runtime ') as state:
+            exe = Path(state) / 'codex'
+            exe.touch()
+            (Path(state) / 'private.json').write_text('synthetic private fixture')
+            profile = cb._codex_config(lambda **kwargs: kwargs, str(exe))['config_overrides'][0]
+            self.assertIn(json.dumps(str(exe)) + ' = "read"', profile)
+            self.assertNotIn(json.dumps(state) + ' = "read"', profile)
+            self.assertNotIn('private.json', profile)

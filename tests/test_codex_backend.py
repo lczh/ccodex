@@ -1063,8 +1063,9 @@ for i in range(20):
         self.assertEqual(captured[0]["codex_bin"], "/opt/codex")
         self.assertEqual(captured[0]["client_name"], "romp")
         overrides = captured[0]["config_overrides"]
-        self.assertEqual(overrides, cb.CODEX_CONFIG_OVERRIDES)
         profile = overrides[0]
+        self.assertIn('"/opt/codex" = "read"', profile)
+        self.assertNotIn('"/opt" = "read"', profile)
         self.assertIn('":minimal" = "read"', profile)
         self.assertIn('"." = "write"', profile)
         for metadata in (".git", ".agents", ".codex"):

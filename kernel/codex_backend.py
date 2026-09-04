@@ -54,9 +54,17 @@ LOGIN_HINT = "Codex isn't logged in on this machine — run: codex login"
 # metadata directories remain writable (documented in docs/codex.md) rather than carrying misleading
 # read-only entries that its arbitrary-process sandbox ignores.
 WORKSPACE_PERMISSION = "romp_workspace"
-_WORKSPACE_PROFILE_OVERRIDE = (
-    'permissions.romp_workspace={ filesystem = { ":minimal" = "read", '
-    '":workspace_roots" = { "." = "write" } }, network = { enabled = true } }')
+
+
+def _workspace_profile_override(runtime_reads=()):
+    entries = ['":minimal" = "read"', '":workspace_roots" = { "." = "write" }']
+    entries.extend('%s = "read"' % json.dumps(str(path), ensure_ascii=False)
+                   for path in runtime_reads)
+    return ('permissions.romp_workspace={ filesystem = { %s }, '
+            'network = { enabled = true } }') % ", ".join(entries)
+
+
+_WORKSPACE_PROFILE_OVERRIDE = _workspace_profile_override()
 # 0.144.4 rejects any custom [permissions] table unless default_permissions is also selected.
 # Selecting it globally is a defense in depth; thread/resume/turn still name it explicitly.
 CODEX_CONFIG_OVERRIDES = (_WORKSPACE_PROFILE_OVERRIDE,
@@ -144,11 +152,20 @@ def _codex_config(config_cls, codex_bin, state_dir=None):
     if codex_bin is None:
         exe = _runtime.runtime_path(state_dir)
         codex_bin = str(exe)
-    helpers = Path(codex_bin).parent.parent / "codex-path"
+    exe = Path(codex_bin).resolve()
+    package = exe.parent.parent if exe.parent.name == "bin" else exe.parent
+    helpers = package / "codex-path"
     if helpers.is_dir():
         extra["env"] = {"PATH": str(helpers) + os.pathsep + os.environ.get("PATH", os.defpath)}
+    # bwrap re-enters Codex to apply seccomp before launching the requested command.
+    # :minimal covers OS runtime files, not an installation in the user's state directory.
+    # Expose only the executable and known packaged assets, never its containing state/home dir.
+    assets = (exe.parent / "codex-code-mode-host", package / "codex-package.json",
+              package / "codex-resources", helpers)
+    reads = tuple(dict.fromkeys([exe, *(path.resolve() for path in assets if path.exists())]))
+    overrides = (_workspace_profile_override(reads), *CODEX_CONFIG_OVERRIDES[1:])
     return config_cls(codex_bin=codex_bin, client_name="romp",
-                      config_overrides=CODEX_CONFIG_OVERRIDES, **extra)
+                      config_overrides=overrides, **extra)
 
 
 def ensure_codex_sdk(state_dir):

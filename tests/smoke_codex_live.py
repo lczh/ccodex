@@ -6,7 +6,7 @@ to the logged-in account, so CI never runs it. Run by hand when validating the b
 new Codex release:
 
     romp-codex-setup
-    python3 tests/smoke_codex_live.py
+    ROMP_SMOKE_MODEL=gpt-6-astra ROMP_SMOKE_EFFORT=low ROMP_SMOKE_MODE=auto python3 tests/smoke_codex_live.py
 
 Exercises the seams the unit tests fake: a real turn's notification stream materializing the
 transcript (items → tokenUsage → completed), the parse of that file into ended turns, live
@@ -68,6 +68,12 @@ def main():
     print("   sid=%s tid=%s model=%s" % (sid, be._sessions[sid].tid, be._sessions[sid].model))
     mode = os.environ.get("ROMP_SMOKE_MODE", "sandboxed")
     assert be.set_mode(sid, mode), "unsupported smoke mode: %s" % mode
+    model = os.environ.get("ROMP_SMOKE_MODEL")
+    effort = os.environ.get("ROMP_SMOKE_EFFORT")
+    if model:
+        assert be.set_model(sid, model), "unsupported smoke model: %s" % model
+    if effort:
+        assert be.set_effort(sid, effort), "unsupported smoke effort: %s" % effort
 
     print("== turn 1: file-writing task")
     be.send(sid, "Create a file named hello.txt in the current directory containing exactly "
@@ -87,7 +93,8 @@ def main():
     if settles[-1].get("message", {}).get("usage"):
         print("   usage on settle: %s" % settles[-1]["message"]["usage"])
     hello = workdir / "hello.txt"
-    print("   hello.txt exists: %s (%r)" % (hello.exists(), hello.read_text().strip() if hello.exists() else ""))
+    assert hello.is_file() and hello.read_text().strip() == "hello from codex", "file-writing turn failed"
+    print("   hello.txt has the expected content")
     ctx = be.live_sessions()[sid]["context"]
     print("   context%%: %s" % ctx)
 
@@ -104,7 +111,13 @@ def main():
     assert until(lambda: be.live_sessions()[sid]["state"] == "working", 60, what="turn 2 start")
     # wait for the sleep command's tool_use to MATERIALIZE (the command is genuinely running),
     # then cut it — a fixed grace raced turns that settled early (a sandbox-refused sleep)
-    assert until(lambda: "sleep 300" in path.read_text(), 90, what="sleep tool_use record")
+    def sleep_started():
+        for record in map(json.loads, path.read_text().splitlines()):
+            for block in record.get("message", {}).get("content", []):
+                if block.get("type") == "tool_use" and "sleep 300" in json.dumps(block.get("input", {})):
+                    return True
+        return False
+    assert until(sleep_started, 90, what="sleep tool_use record")
     assert be.live_sessions()[sid]["state"] == "working", "turn settled before interrupt"
     assert be.interrupt(sid), "interrupt refused"
     assert until(lambda: be.live_sessions()[sid]["state"] == "waiting", 120, what="turn 2 settle")

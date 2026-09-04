@@ -98,8 +98,8 @@ security settings. It also cannot repair a runtime that fails before a thread
 starts, and reviewer availability is determined by Codex and your account.
 If the API says a model needs a newer Codex, select a compatible model from the
 model picker or update ROMP's pinned runtime; Auto cannot fix a model/runtime
-version mismatch. Bundling 0.153.3 addresses the older runtime's Astra version
-requirement, but does not guarantee startup on a host that blocks its sandbox.
+version mismatch. Runtime 0.153.3 supports Astra, but the host must also support
+sandbox creation as described below.
 
 ## Sandboxing
 
@@ -107,18 +107,30 @@ Codex runs its commands inside its own Linux sandbox (bubblewrap). Every
 thread and turn selects romp's custom `romp_workspace` permission profile
 and supplies exactly that session's working directory in
 `runtimeWorkspaceRoots`. The profile permits only Codex's minimal runtime
-files plus that workspace, so other user files on the host are not readable.
-Network remains enabled so git and web work keep working.
+files, the selected Codex executable and its packaged helpers, plus that
+workspace. Runtime assets are read-only; unrelated user files and the containing
+ROMP state directory are not exposed. Codex needs its own executable inside the
+sandbox to apply seccomp before starting a command. Network remains enabled so
+git and web work keep working.
 
 The current profile grants write access to the entire workspace, including
 `.git`, `.agents`, and `.codex`. Metadata protection needs narrower filesystem
 rules; it is not provided by this profile. Two host notes:
 
-- The Linux sandbox needs **unprivileged user namespaces**. Host policy can
-  block it with a `bwrap: … Permission denied` error, including while Codex
-  reads instructions during thread creation. Installing 0.153.3 does not change
-  that policy. Follow your host's approved sandbox configuration; ROMP setup
-  does not modify AppArmor or system-wide namespace settings.
+- On Linux, install the distribution's **bubblewrap** package. Codex 0.153.3
+  prefers a compatible system `bwrap` from PATH over its bundled helper.
+  Ubuntu 24.04 can additionally require its standard **bwrap-userns-restrict**
+  AppArmor profile, supplied by `apparmor-profiles`. That confined profile lets
+  `/usr/bin/bwrap` create the sandbox and denies capabilities to its children;
+  AppArmor and the global unprivileged-user-namespace restriction stay enabled.
+  Have the host administrator review and load that profile as appropriate;
+  see [Codex's Linux prerequisites](https://learn.chatgpt.com/docs/sandboxing#prerequisites).
+  ROMP setup does not change host security policy automatically.
+
+  Without a working helper, startup can fail while loading instructions with
+  `bwrap: … Permission denied` or `Failed RTM_NEWADDR: Operation not permitted`.
+  Auto review cannot repair this earlier initialization stage. The legacy
+  Landlock fallback cannot enforce this profile's restricted host reads.
 
 - Manual approval prompts are not yet interactive in ROMP. Auto mode uses
   Codex's reviewer; a manual request that reaches ROMP is declined, never
