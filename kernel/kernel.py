@@ -19858,6 +19858,26 @@ def _session_chip(sid, path, session, tm, now):
 # the moment compaction ends. A repeated model/effort pick REPLACES its earlier parked op in place (last
 # pick wins — one queued chip, not a pile), since only the final setting can matter.
 _PENDING_OPS_FILE = Path(jd.STATE) / "pending-ops.json"
+# ONE lock around every MUTATION of _pending_ops (2026-09-05): the WS/HTTP handler threads park and cancel,
+# the move thread re-inserts a head, and the pusher thread drains — all on this dict, and since the drain
+# moved onto the pusher cycle (#904) it runs every 0.5 s and on every wake. Unlocked, two races were
+# confirmed by review: (1) a ✕ — or the move thread's head re-insert — changed a sid's list between the
+# drain's head read and its pop, so the drain popped a list the ✕ had just emptied (an IndexError the
+# blanket except turned into a dropped queue) or the ✕, re-locating by index+body and then popping,
+# removed the op BEHIND the one clicked once the drain's pop had shifted the list; (2) two writers tore the
+# disk mirror through one shared temp path (a kernel death then restored a wrong queue). The lock guards the
+# mutations ONLY: no backend call ever runs under it (CodexBackend.send can synchronously spawn and
+# initialize `codex app-server` with no request timeout; SdkBackend.busy/turn_seq take the backend's own
+# lock), and a handler evaluates only the queue-presence check under it (_park_behind_queue) — its
+# expensive gates (_compacting_now / _working_now / _limit_hold: a tmux fork, a discover sweep, the usage
+# file) run outside. So a holder owns it for a dict read, a list append or pop, and the mirror write —
+# microseconds. Re-entrant, because _park_op and _save_pending_ops take it and are called from under it.
+# The drain takes it NON-BLOCKING at the top of its walk (_apply_pending_ops). No backend thread ever takes
+# it (the poke, push and push_session callbacks the backends hold touch no queue). Reads stay unlocked
+# (build_session's chip list, the nudge guard, the parse refresh, _ops_gate's advisory queue read): a dict
+# get or list iteration under the GIL never raises, and a chip one cycle early or late is corrected by the
+# next push.
+_pending_ops_lock = threading.RLock()
 
 
 def _load_pending_ops():
@@ -19878,13 +19898,18 @@ def _load_pending_ops():
 
 def _save_pending_ops():
     """Mirror _pending_ops to disk on every mutation, atomically, so parked ops survive a kernel
-    death. Tiny file, mutation-rate writes (a park or a delivery), not a hot path."""
-    try:
-        tmp = _PENDING_OPS_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps({k: [list(o) for o in v] for k, v in _pending_ops.items() if v}))
-        os.replace(tmp, _PENDING_OPS_FILE)
-    except Exception:
-        sys.stderr.write("pending-ops save: %s\n" % traceback.format_exc())
+    death. Tiny file, mutation-rate writes (a park or a delivery), not a hot path. Under the queue lock,
+    so the snapshot is whole (an unlocked writer iterating the dict while a handler parked raised
+    "dictionary changed size during iteration" and skipped the save), and through _atomic_write's
+    per-writer temp: the old fixed `pending-ops.tmp` was shared by every thread, so the loser renamed a
+    temp the winner had already moved, or wrote into one mid-rename — a torn mirror that the next boot
+    restored as the queue (review find on #904, 2026-09-05)."""
+    with _pending_ops_lock:
+        try:
+            _atomic_write(_PENDING_OPS_FILE,
+                          json.dumps({k: [list(o) for o in v] for k, v in _pending_ops.items() if v}))
+        except Exception:
+            sys.stderr.write("pending-ops save: %s\n" % traceback.format_exc())
 
 
 _pending_ops = _load_pending_ops()   # sid -> [("send", text, echo) | ("model", v) | ("effort", v) | ("fast", v) | ("env", {…}) | ("cwd", path, busy_retries) | ("compact",), …] in park order
@@ -20021,13 +20046,61 @@ def _ops_gate(sid):
     sid = str(sid)
     return (_compacting_now(sid) or _working_now(sid) or bool(_pending_ops.get(sid))
             or sid in _moving or _limit_hold(sid) is not None)   # a move in flight holds the queue too
+    # ^ EXPENSIVE (a tmux fork, a discover sweep, the usage file, the backend's busy()) — the handlers call
+    #   it OUTSIDE _pending_ops_lock; its queue read is advisory, and the one that decides is the locked
+    #   re-check in _park_behind_queue (_gate_or_park). A backend must never be called under that lock.
+
+
+def _gate_or_park(sid, op):
+    """The park-or-hand-over decision every drive op except a send takes (a send composes its own gates in
+    _send_or_park, same shape). Returns True when PARKED — the caller answers "queued" — and False when the
+    caller should hand the op to the backend now. Two steps, in this order (2026-09-05): the EXPENSIVE gates
+    (_ops_gate) run outside the queue lock, since they fork tmux, sweep discover, read the usage file and
+    call the backend's busy() — none of which a lock that the pusher's drain also takes may wait on; then
+    the CHEAP queue-presence check and the park run as ONE locked step (_park_behind_queue), so an op never
+    slips past a queue that another handler filled between the two reads."""
+    sid = str(sid)
+    if _ops_gate(sid):
+        _park_op(sid, op)
+        return True
+    return _park_behind_queue(sid, op)
+
+
+def _park_behind_queue(sid, op):
+    """A handler's cheap gate — does a queue exist for this sid right now? — and its park, as ONE step under
+    _pending_ops_lock (2026-09-05). True when parked behind the existing queue; False when there is none
+    (the caller hands over). The only gate a handler evaluates under the lock: a queue-presence read is a
+    dict get and the park is an append plus the tiny mirror write, so a handler owns the lock for
+    microseconds, and the drain — which takes it non-blocking at the top of its walk and blocks on it per
+    pop — is never held behind a backend call. Why this pair is all press order needs: a park that completed
+    before this read is seen here, and this op lines up behind it; two handlers that both find no queue both
+    hand over, and reach the backend in call order — the same order a lock held across the handover would
+    have imposed, as lock-acquisition order. Nothing is lost by releasing before the backend call, and a
+    slow backend (a Codex client connect can take seconds) stalls no other handler and no push."""
+    sid = str(sid)
+    with _pending_ops_lock:
+        if not _pending_ops.get(sid):
+            return False
+        _park_op_locked(sid, op)
+    _mark_views_dirty()               # the wake AFTER the release, so the cycle it brings finds the lock free
+    return True
 
 
 def _park_op(sid, op):
     """Park one mid-compaction drive op in the sid's FIFO queue and push at once (the queued bubble
     appears immediately, never waiting out the backstop poll). A repeat model/effort pick REPLACES the
     earlier parked op of the same kind IN PLACE — its queue position stands, its value updates — so the
-    chat shows one "/model …" chip carrying the latest pick. Messages always append."""
+    chat shows one "/model …" chip carrying the latest pick. Messages always append. The mutation runs
+    under the queue lock (_park_op_locked: the drain's pops, a ✕, the move thread's re-park all touch this
+    list); the pusher wake comes AFTER the release, so the cycle it brings finds the lock free."""
+    with _pending_ops_lock:
+        _park_op_locked(sid, op)
+    _mark_views_dirty()               # the queue lives in memory — no sig sees it; the woken push renders the chip
+
+
+def _park_op_locked(sid, op):
+    """_park_op's mutation + mirror write, for a caller that already holds _pending_ops_lock and will wake
+    the pusher itself after releasing (_park_behind_queue)."""
     q = _pending_ops.setdefault(str(sid), [])
     if op[0] in ("model", "effort", "fast", "env", "cwd"):
         for i, o in enumerate(q):
@@ -20039,7 +20112,6 @@ def _park_op(sid, op):
     else:
         q.append(op)
     _save_pending_ops()               # mirror the park to disk (survives a kernel death)
-    _mark_views_dirty()               # the queue lives in memory — no sig sees it; the woken push renders the chip
 
 
 def _parked_md(op):
@@ -20084,6 +20156,15 @@ _TMUX_PROMPT_HOLD_S = 3.0        # the prompt hold's clock FALLBACK: after the d
 _drain_hold: dict = {}           # sid -> (time.monotonic() deadline, until_busy); _apply_pending_ops skips the sid
                                  # while the hold is open (_drain_hold_open)
 _refresh_parse_failures: dict = {}   # sid -> consecutive cycles its parked-parse refresh raised (_refresh_parked_parses)
+_inflight_ops: dict = {}         # sid -> the HEAD op the drain has handed to the backend, lock released, and not yet
+                                 # popped (2026-09-05; never a cwd op — a move hands nothing over while its turn_seq
+                                 # is read, so a ✕ on a waiting move must still succeed). It stays the visible head
+                                 # for the whole call, so every handler's gate still sees the queue and parks BEHIND
+                                 # it (SdkBackend.send runs _ensure before it enqueues, CodexBackend.send may spawn
+                                 # the app server first — busy() flips only once the backend has the op, so an empty
+                                 # queue in that window let a pane send hand over AHEAD of a parked /clear), and a ✕
+                                 # on it is refused as too late (_cancel_parked). Popped only if still the head when
+                                 # the call returns (_apply_pending_ops). Read and written under _pending_ops_lock.
 
 
 def _hold_drain(sid, seconds, until_busy=False):
@@ -20168,8 +20249,7 @@ def _move_or_park(be, sid, path, client=None):
     fires at the turn's end (_apply_pending_ops); quiet, it fires now."""
     sid = str(sid)
     wid = (client or {}).get("wid") or ""
-    if _ops_gate(sid):
-        _park_op(sid, ("cwd", path, 0))
+    if _gate_or_park(sid, ("cwd", path, 0)):
         _move_askers[sid] = wid
         return None
     return _fire_move(be, sid, path, 0, wid)
@@ -20211,11 +20291,14 @@ def _move_now(be, sid, path, tries, wid):
             res = "%s: %s" % (type(e).__name__, str(e)[:200])
         if res == "busy":
             # re-park and hold BEFORE `_moving` releases the queue (review find, #904): a drain cycle landing
-            # between the release and the re-park would fire the op behind the move, or burn a retry
+            # between the release and the re-park would fire the op behind the move, or burn a retry. The
+            # backend's turn_seq is read OUTSIDE the queue lock (it takes the backend's own); the re-insert
+            # and its hold are one locked step against a handler's park and the drain's pops (2026-09-05)
             seq = be.turn_seq(sid) if hasattr(be, "turn_seq") else None  # the turn end this retry waits on
-            _pending_ops.setdefault(sid, []).insert(0, ("cwd", path, tries + 1, seq))   # head: it was already first
-            _move_askers[sid] = wid
-            _hold_drain(sid, _MOVE_BUSY_RETRY_S)   # the retry waits out the CLI's post-result window (_hold_drain)
+            with _pending_ops_lock:
+                _pending_ops.setdefault(sid, []).insert(0, ("cwd", path, tries + 1, seq))   # head: it was already first
+                _move_askers[sid] = wid
+                _hold_drain(sid, _MOVE_BUSY_RETRY_S)   # the retry waits out the CLI's post-result window (_hold_drain)
     finally:
         _moving.discard(sid)
     if res == "busy":
@@ -20257,19 +20340,39 @@ def _cancel_parked(sid, park, md):
     read as a successful cancel while the message got answered anyway (the user 2026-07-20). Persists +
     wakes the pusher like every queue mutation. LOGGED — sid and op kind, never the body, which is user
     text — so an emptied queue can be told apart from one that was never delivered: the 2026-09-03
-    diagnosis of a parked /clear that vanished had to infer this ✕ by elimination."""
+    diagnosis of a parked /clear that vanished had to infer this ✕ by elimination. The locate and the
+    pop are ONE step under the queue lock: unlocked, the drain could pop its head between the body check
+    and the pop, and the ✕ removed whatever had shifted into the clicked slot (2026-09-05). An op the
+    drain has already popped for delivery is simply gone from here — the honest 'too late' below — and
+    the op the drain is handing to the backend RIGHT NOW (_inflight_ops: still the head, so the chip
+    still shows) is the same miss: the backend has it, and a ✕ must never report a delivered op as
+    cancelled. That refusal keys on the HEAD SLOT, not on identity alone: the in-flight op is always
+    ops[0] while it is listed (read as the head, its own ✕ refused, a replace-in-place swaps in a new
+    object; a handler-fired move can only start on an empty queue (_park_behind_queue), and the
+    drain-fired one holds _moving until it has re-inserted) — and identity alone would be wrong, because
+    _compact_or_park parks the literal ("compact",), one interned tuple per code object, so a second
+    compact press appends an op that `is` the first; a ✕ on that SECOND chip while the first is with the
+    backend is a cancel, and the redundant compaction must not run. The body re-locate skips that head
+    slot too, so a STALE index for the second chip (a send ahead delivered between the push and the
+    click) lands on the chip and not on the head it cannot take; with only the in-flight op listed it
+    finds nothing, the same miss as today."""
     sid = str(sid)
-    ops = _pending_ops.get(sid) or []
-    if not (0 <= park < len(ops)) or (md and _parked_md(ops[park]) != md):
-        park = next((j for j, op in enumerate(ops) if _parked_md(op) == md), -1) if md else -1
-        if park < 0:
-            return _cancel_miss_text(md)
-    sys.stderr.write("parked-op cancel: %s %s\n" % (sid, ops[park][0]))
-    ops.pop(park)
-    if not ops:
-        _pending_ops.pop(sid, None)
-        _drain_hold.pop(sid, None)        # an emptied queue leaves no hold behind (nothing left for it to protect)
-    _save_pending_ops()
+    with _pending_ops_lock:
+        ops = _pending_ops.get(sid) or []
+        inflight_head = bool(ops) and ops[0] is _inflight_ops.get(sid)   # the head is with the backend this instant
+        if not (0 <= park < len(ops)) or (md and _parked_md(ops[park]) != md):
+            park = next((j for j, op in enumerate(ops)
+                         if _parked_md(op) == md and not (j == 0 and inflight_head)), -1) if md else -1
+            if park < 0:
+                return _cancel_miss_text(md)
+        if park == 0 and inflight_head:
+            return _cancel_miss_text(md)          # too late, not a wrong-op removal
+        sys.stderr.write("parked-op cancel: %s %s\n" % (sid, ops[park][0]))
+        ops.pop(park)
+        if not ops:
+            _pending_ops.pop(sid, None)
+            _drain_hold.pop(sid, None)    # an emptied queue leaves no hold behind (nothing left for it to protect)
+        _save_pending_ops()
     _mark_views_dirty()
     return None
 
@@ -20356,7 +20459,18 @@ def _send_or_park(be, sid, text, echo=None):
     Returns True when PARKED, False when handed over now, so a route can tell its caller which: POST
     /send answers `queued` and `romp send` prints it. An agent sending ITSELF a slash command from inside
     its own turn otherwise read 'ok' and had no way to know the command was waiting for that turn to end
-    (2026-09-03, a /clear that then never fired)."""
+    (2026-09-03, a /clear that then never fired).
+
+    THE LOCK (2026-09-05): the gates above are EXPENSIVE — _compacting_now and _working_now fork tmux or
+    sweep discover and call the backend's busy(), _limit_hold reads the usage file — so they run OUTSIDE
+    _pending_ops_lock, on this handler thread, as they always did (the queue read among them is advisory).
+    What runs under the lock is the cheap queue-presence re-check and the park, as ONE step
+    (_park_behind_queue), so a queue another handler filled between the two reads is never slipped past.
+    The handover (`be.send`) runs outside the lock too: it is not a queue mutation, and a backend call can
+    be slow (a Codex client connect takes seconds), during which no other handler's park and no drain pop
+    may wait. Press order loses nothing: two handovers reach the backend in call order — a lock held across
+    them would only have substituted lock-acquisition order — and a park behind an existing queue is atomic
+    with the check that found the queue."""
     cmd = _is_slash_command(text)
     op = ("command", text, echo) if cmd else ("send", text, echo)
     if _compacting_now(sid) or _pending_ops.get(sid) or _limit_hold(sid):
@@ -20364,6 +20478,8 @@ def _send_or_park(be, sid, text, echo=None):
         return True
     if _working_now(sid) and (cmd or not _forwards_sends(be)):
         _park_op(sid, op)
+        return True
+    if _park_behind_queue(sid, op):
         return True
     be.send(sid, text)
     if echo:
@@ -20377,8 +20493,7 @@ def _compact_or_park(be, sid):
     account hold) → park as a ("compact",) op, which fires ALONE at turn end; quiet → /compact NOW with
     the instant 'compacting' cue. Returns True when parked (queued), False when fired now — the route
     tells its caller which ("compacting now" vs "queued")."""
-    if _ops_gate(sid):
-        _park_op(sid, ("compact",))
+    if _gate_or_park(sid, ("compact",)):
         return True
     be.send(sid, "/compact")
     _mark_compacting(sid)
@@ -20431,9 +20546,7 @@ def _set_model_or_park(be, sid, value, floating=False):
         _forget_model_pick(value)
     _mark_model_pending(sid, value)
     _note_model_pick(value)          # a version pick becomes its family's remembered default (2026-08-25)
-    if _ops_gate(sid):
-        _park_op(sid, ("model", value))
-    else:
+    if not _gate_or_park(sid, ("model", value)):
         be.set_model(sid, value)
 
 
@@ -20441,9 +20554,7 @@ def _set_effort_or_park(be, sid, value):
     """Apply an effort change now — or park it while the session compacts (the user 2026-07-02: /effort
     is a slash command like /model, so it must queue the same way — it used to slip straight through,
     with no queued chip and the same derail risk the /model park was built for)."""
-    if _ops_gate(sid):
-        _park_op(sid, ("effort", value))
-    else:
+    if not _gate_or_park(sid, ("effort", value)):
         be.set_effort(sid, value)
 
 
@@ -20452,9 +20563,7 @@ def _set_env_or_park(be, sid, value):
     the session compacts, in the same FIFO as /model and /effort: a CHANGE applies by reconnecting
     (env is connect-time, like effort), which mid-compaction would derail the compaction exactly the
     way an effort switch would. An unchanged re-assert is a no-op inside set_env either way."""
-    if _ops_gate(sid):
-        _park_op(sid, ("env", value))
-    else:
+    if not _gate_or_park(sid, ("env", value)):
         be.set_env(sid, value)
 
 
@@ -20464,8 +20573,7 @@ def _set_auth_or_park(be, sid, value):
     exactly the way a model switch would). Returns the backend's verdict so the caller can be loud."""
     if value not in ("login", "key"):
         return False
-    if _ops_gate(sid):
-        _park_op(sid, ("auth", value))
+    if _gate_or_park(sid, ("auth", value)):
         return True
     return be.set_auth(sid, value)
 
@@ -20476,8 +20584,7 @@ def _set_fast_or_park(be, sid, value):
     verdict so the caller can be loud when a live apply refuses (dormant SDK session)."""
     if value not in ("on", "off"):
         return False
-    if _ops_gate(sid):
-        _park_op(sid, ("fast", value))
+    if _gate_or_park(sid, ("fast", value)):
         return True
     return be.set_fast(sid, value)
 
@@ -20616,6 +20723,43 @@ def _apply_pending_ops():
     reset stamp passes, so the whole sequence goes in at the reset in the order it was typed); a dead
     session's queue is dropped (fails once, logged), never retried.
 
+    ONE LOCK, HELD FOR THE MUTATIONS ONLY (2026-09-05): every writer of _pending_ops — a handler's park or
+    cancel, the move thread's head re-insert, this walk — takes _pending_ops_lock, and this walk takes it
+    for exactly two things: reading a sid's head, and popping what a step has delivered. Every backend
+    call — send, set_*, turn_seq, busy() inside the gates and the hold check — runs with the lock
+    RELEASED, because a backend call can be slow (CodexBackend.send may synchronously spawn and initialize
+    `codex app-server`, with no request timeout) and every handler's queue check + park would otherwise
+    wait behind it. The lock closes the two races review confirmed: (1) a ✕, or the move thread's head
+    re-insert, changing the list between this walk's head read and its pop — the pop landed on a list the
+    ✕ had emptied (an IndexError the except below turned into a dropped queue), or the ✕'s own check-then-
+    pop landed on a list this walk had shifted (the op BEHIND the clicked one vanished); (2) two writers
+    tearing the mirror through one shared temp (_save_pending_ops). Only this one thread ever walks the
+    queue (the pusher); the handlers and the move thread are the other writers.
+
+    THE HEAD STAYS VISIBLE WHILE THE BACKEND HAS IT (2026-09-05, second review): every gate a handler
+    decides on keys on queue presence (_ops_gate, _send_or_park's first gate, _park_behind_queue) and
+    otherwise on busy() — which flips only once the backend has REGISTERED the op (SdkBackend.send runs
+    _ensure under the backend lock before it enqueues; CodexBackend.send may spawn the app server first).
+    So a command / compact / settings op is NOT popped before its call: it is read under the lock and
+    recorded in _inflight_ops, the call runs with the lock released and the op still at the head, and
+    afterwards the head is popped only if it `is` still that op — a same-kind pick that replaced it in
+    place meanwhile is a new tuple, so the identity fails and the replacement delivers on the next
+    iteration; a ✕ on the in-flight head is refused as too late (_cancel_parked). A cwd op takes the same
+    read-then-identity-pop shape but is NOT recorded: its only mid-call action is the turn_seq read,
+    nothing is handed over, and a ✕ on a move still waiting for its turn end must succeed — recorded, it
+    was refused with a message-shaped 'already reached the session' every cycle the move waited (delta
+    review, 2026-09-05). A pane send landing during the call therefore sees the queue and parks BEHIND
+    the parked /clear, as it did before the drain moved (the parent called first and popped after for
+    these kinds), and the chip retires only once the backend accepted the op. The SEND run alone is
+    popped before delivery — pre-existing on the parent, and kept as is: the batch is handed over as one
+    unit, and a ✕ on it after the pop is the same honest 'too late' it always was. The top-of-walk
+    acquire is NON-BLOCKING: a handler that owns the lock skips the drain for this cycle rather than
+    stalling every session's push, and its own park wakes the pusher after it releases; the per-step
+    acquires inside the walk block, since every holder owns the lock for a dict read, a list mutation and
+    the tiny mirror write. No backend thread takes this lock (the poke, push and push_session callbacks
+    touch no queue), so it never nests inside a backend's. The failure contract is UNCHANGED: a raise
+    anywhere in a sid's pass drops that sid's queue once, logged.
+
     WHO runs this (2026-09-03): the pusher cycle (_pusher_cycle_jobs), woken by the backends' turn-end poke
     (_wake_kernel), by /tick, by every park / cancel / move, and by its own 0.5 s backstop — NOT the tail
     of the judge producer's pass, where it lived before. A judge pass can run for hours (one session's
@@ -20631,11 +20775,18 @@ def _apply_pending_ops():
     emits no event), and a session just handed a turn-opening op whose busy gate has not yet been SEEN
     closed (until its backend reads busy — tmux's UserPromptSubmit flip — or the fallback clock passes) —
     see _hold_drain."""
-    for sid, ops in list(_pending_ops.items()):
-        if not ops:
-            _pending_ops.pop(sid, None)
-            _drain_hold.pop(sid, None)                # no queue, no hold
-            continue
+    if not _pending_ops_lock.acquire(blocking=False):
+        return                                        # a handler owns the queue mid-park: its wake brings the next cycle
+    try:
+        sids = list(_pending_ops)
+    finally:
+        _pending_ops_lock.release()
+    for sid in sids:
+        with _pending_ops_lock:
+            if not _pending_ops.get(sid):
+                _pending_ops.pop(sid, None)
+                _drain_hold.pop(sid, None)            # no queue, no hold
+                continue
         if sid in _moving:
             continue                                  # a move is mid-flight: its relocation must finish first
         hold = _drain_hold.get(sid)
@@ -20648,8 +20799,24 @@ def _apply_pending_ops():
         changed = False                               # a real mutation below → save the mirror + wake the pusher
         try:
             be = Sessions.backend_for(sid)
-            while ops:
-                op = ops[0]
+            while True:
+                with _pending_ops_lock:               # READ the head. A send run is popped here (pre-existing on the
+                    ops = _pending_ops.get(sid) or [] # parent); every other kind stays the visible head, recorded
+                    if not ops:                       # in flight, until the backend has it
+                        break
+                    op = ops[0]
+                    if op[0] == "send":
+                        run = []                      # coalesce the leading run of sends → deliver them AT ONCE
+                        while ops and ops[0][0] == "send":
+                            run.append(ops.pop(0))
+                    elif op[0] != "cwd":
+                        _inflight_ops[sid] = op       # (a move hands nothing over below: not recorded)
+                if op[0] == "send":
+                    changed = True
+                    _deliver_send_batch(be, sid, run)
+                    _after_turn_opening(be, sid, _pending_ops.get(sid) or [])
+                    break                             # the delivered turn must END before any op behind it fires
+                # every other kind: the backend call runs with the lock RELEASED and the op still at the head
                 if op[0] == "cwd":
                     # a parked move: fires on its own thread and CLAIMS _moving before this cycle ends, so
                     # the ops behind it wait for the relocation to finish (the next cycle skips the sid
@@ -20659,61 +20826,59 @@ def _apply_pending_ops():
                     if (seq is not None and tries >= _MOVE_BUSY_RETRIES and hasattr(be, "turn_seq")
                             and be.turn_seq(sid) == seq):
                         break      # the CLI still owns a turn romp cannot see: its ResultMessage is the cue (_move_now)
-                    ops.pop(0)
-                    changed = True
-                    _fire_move(be, sid, op[1], tries, _move_askers.pop(sid, ""))
-                    break
-                changed = True                        # every arm below pops at least one op
-                if op[0] == "send":
-                    run = []                          # coalesce the leading run of sends → deliver them AT ONCE
-                    while ops and ops[0][0] == "send":
-                        run.append(ops.pop(0))
-                    _deliver_send_batch(be, sid, run)
-                    _after_turn_opening(be, sid, ops)
-                    break                             # the delivered turn must END before any op behind it fires
                 elif op[0] == "command":
                     # a typed slash command fires ALONE as its own fresh top-level prompt — folded into a
                     # send batch (or forwarded mid-turn) it reaches the model as text instead of executing
                     # (the user 2026-08-13: /autocompact absorbed mid-turn got a polite reply and no
                     # setting change). Echo stamped at fire time, like a delivered send.
                     be.send(sid, op[1])
-                    if len(op) > 2 and op[2]:
-                        _optimistic_echo(sid, op[1], author=op[2])
-                    if op[1].strip().split()[0] == "/compact":
-                        _mark_compacting(sid)         # a TYPED /compact gets the same instant cue as the button's op
-                    ops.pop(0)
-                    _after_turn_opening(be, sid, ops)
-                    break                             # its turn must end before anything behind it fires
                 elif op[0] == "compact":
                     be.send(sid, "/compact")
-                    _mark_compacting(sid)
-                    ops.pop(0)
-                    _after_turn_opening(be, sid, ops)
-                    break                             # the compaction must finish first
                 elif op[0] == "model":
                     be.set_model(sid, op[1])
-                    ops.pop(0)
                 elif op[0] == "effort":
                     be.set_effort(sid, op[1])
-                    ops.pop(0)
                 elif op[0] == "fast":
                     be.set_fast(sid, op[1])
-                    ops.pop(0)
                 elif op[0] == "auth":
                     be.set_auth(sid, op[1])
-                    ops.pop(0)
                 elif op[0] == "env":
                     be.set_env(sid, op[1])
-                    ops.pop(0)
-                else:
-                    ops.pop(0)                        # unknown op kind → drop, never wedge the queue
+                # (an unknown op kind gets no call: it is popped below and dropped — never wedge the queue)
+                with _pending_ops_lock:               # POP the head — only if it is still the op the backend got
+                    _inflight_ops.pop(sid, None)      # (a no-op for a cwd op, which was never recorded)
+                    ops = _pending_ops.get(sid) or []
+                    took = bool(ops) and ops[0] is op
+                    if took:
+                        ops.pop(0)
+                        changed = True
+                if op[0] == "cwd":
+                    if not took:
+                        continue                      # a repeat pick replaced the head while turn_seq was read: read it
+                    _fire_move(be, sid, op[1], tries, _move_askers.pop(sid, ""))
+                    break
+                if op[0] in ("command", "compact"):
+                    # the backend HAS a turn-opening op: its cue, the hold and the end of this pass follow
+                    # regardless of `took` (which is always True here — a ✕ on an in-flight op is refused and
+                    # these kinds are never replaced in place)
+                    if op[0] == "command" and len(op) > 2 and op[2]:
+                        _optimistic_echo(sid, op[1], author=op[2])
+                    if op[0] == "compact" or op[1].strip().split()[0] == "/compact":
+                        _mark_compacting(sid)         # a TYPED /compact gets the same instant cue as the button's op
+                    _after_turn_opening(be, sid, _pending_ops.get(sid) or [])
+                    break                             # its turn / compaction must end before anything behind it fires
+                # a settings op (or an unknown kind): delivery continues. `took` False means a same-kind pick
+                # replaced the head in place while it was with the backend — the replacement delivers next
         except Exception:
             sys.stderr.write("pending ops apply: %s\n" % traceback.format_exc())
-            _pending_ops.pop(sid, None)               # a dead session's queue is dropped, never retried
-            _drain_hold.pop(sid, None)                # …and its hold with it
+            with _pending_ops_lock:
+                _inflight_ops.pop(sid, None)
+                _pending_ops.pop(sid, None)           # a dead session's queue is dropped, never retried
+                _drain_hold.pop(sid, None)            # …and its hold with it
             changed = True
-        if not _pending_ops.get(sid):
-            _pending_ops.pop(sid, None)
+        with _pending_ops_lock:
+            if not _pending_ops.get(sid):
+                _pending_ops.pop(sid, None)
         if changed:
             _save_pending_ops()           # every delivery/drop shrinks the disk mirror too
             _mark_views_dirty()           # the queue shrank (in-memory) → rebuild past the sig so chips retire
@@ -34959,8 +35124,7 @@ class Handler(BaseHTTPRequestHandler):
                         'no live session named "%s" (a dormant one can be moved by sid)' % target}),
                                       "application/json")
                 be = Sessions.backend_for(tsid)
-                if _ops_gate(tsid):
-                    _park_op(tsid, ("cwd", path, 0))
+                if _gate_or_park(tsid, ("cwd", path, 0)):
                     return self._send(200, json.dumps({"ok": True, "id": tsid, "queued": True, "dir": path}),
                                       "application/json")
                 _moving.add(tsid)

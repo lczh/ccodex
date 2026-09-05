@@ -559,7 +559,7 @@ class DrivePlumbing(unittest.TestCase):
         self.assertIn('"setAuth", "endSession"', src.replace("\n", " "), "an ID_OPS member")
         self.assertIn('elif t == "setAuth" and msg.get("value") in ("login", "key"):', src)
         self.assertIn("def _set_auth_or_park(be, sid, value):", src)
-        self.assertIn('_park_op(sid, ("auth", value))', src)
+        self.assertIn('_gate_or_park(sid, ("auth", value))', src)   # parks on the gate, or hands over (2026-09-05)
         self.assertIn('elif op[0] == "auth":', src)
         self.assertIn("be.set_auth(sid, op[1])", src)
 

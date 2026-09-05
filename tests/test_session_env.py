@@ -464,7 +464,7 @@ class DrivePlumbing(unittest.TestCase):
     def test_the_op_is_routed_parked_and_replayed(self):
         src = open(os.path.join(BIN, "romp-kernel")).read()
         self.assertIn("def _set_env_or_park(be, sid, value):", src)
-        self.assertIn('_park_op(sid, ("env", value))', src)
+        self.assertIn('_gate_or_park(sid, ("env", value))', src)   # parks on the gate, or hands over (2026-09-05)
         self.assertIn('elif op[0] == "env":', src)
         self.assertIn("be.set_env(sid, op[1])", src)
         self.assertIn('("model", "effort", "fast", "env", "cwd")', src,
