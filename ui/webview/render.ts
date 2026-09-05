@@ -11019,7 +11019,7 @@ function upsert(msg: any) {
 
 function update(msg: any) {
   const s = sessions.get(msg.id);
-  if (!s) return;
+  if (!s) { requestFullSession(msg.id); return; }   // a delta with no base is PROOF of desync (see chatTail)
   s.events = msg.events || s.events;
   s.status = msg.status || s.status;
   reconcileRewind(s);                    // pending-rewind overlay + the editable-bubble set, from the fresh payload
@@ -11056,10 +11056,23 @@ function requestFullSession(id: string): void {
   awaitingFull.add(id);
   vscodeApi?.postMessage({ type: "needFull", id });
 }
+// A reconnect mints a FRESH kernel-side client (its echat starts empty, so full frames are already
+// guaranteed) — but an ask parked against the dead socket would gag the new socket's repair path
+// forever (awaitingFull only clears when the reply lands, and the dead socket's never will).
+window.addEventListener("romp:wsup", () => awaitingFull.clear());
 
 function chatTail(msg: any) {
   const s = sessions.get(msg.id);
-  if (!s) return;                                  // no base yet → ignore; a full session must arrive first
+  if (!s) {
+    // A delta for a session we hold NO base for is PROOF of desync, not noise to ignore: the full
+    // frame was sent while this document had no message listener yet (the pusher fires from the
+    // moment the socket opens; the 1.4MB bundle can still be evaluating), and the kernel's echat
+    // advances on SEND — so deltas are all it will ever volunteer, and the tab sat on the
+    // « opening … » placeholder forever (the user 2026-09-02; a duplicated browser tab won the
+    // race via cached bundles, a reload only sometimes). Ask for the base instead of waiting.
+    requestFullSession(msg.id);
+    return;
+  }
   // msg.from is a GLOBAL transcript index; the resident events are the tail [headFrom, …) → map to local.
   const from = (msg.from | 0) - (s.headFrom || 0);
   // The kernel's coordinate space ends at ITS OWN events — our injected optimistic tail is not in it.
@@ -11199,7 +11212,7 @@ function requestOlder(sid: string, v: View, content: HTMLElement): void {
 
 function statusOnly(msg: any) {
   const s = sessions.get(msg.id);
-  if (!s) return;
+  if (!s) { requestFullSession(msg.id); return; }   // a delta with no base is PROOF of desync (see chatTail)
   s.status = msg.status || s.status;
   renderTabs();                          // status-only push → repaint the chip; order is untouched
   if (msg.id === activeId) updateStatusline();
