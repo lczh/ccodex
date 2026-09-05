@@ -30,8 +30,8 @@ from abc import ABC, abstractmethod
 
 
 class SessionBackend(ABC):
-    # True when busy() may be overruled by the cached transcript parse, so the pusher must keep that parse
-    # current for the sids it holds parked ops for (_refresh_parked_parses); a backend whose busy() is the
+    # True when busy() may be overruled by the cached transcript parse, so the parked-op drain must keep that
+    # parse current for a sid before it reads busy() (_refresh_parked_parse); a backend whose busy() is the
     # whole truth (SDK, Codex) leaves it False and its parked sids are never re-parsed on its account.
     corroborates_with_transcript = False
 

@@ -11240,8 +11240,8 @@ class TmuxBackend(sb.SessionBackend):
     # "" before the first hook publish, an unknown spelling — is likewise no answer, never a hold.
     BUSY_STATES = ("working", "permission", "picker")
     QUIET_STATES = ("waiting", "idle")
-    corroborates_with_transcript = True   # busy() below may be overruled by the cached parse → the pusher keeps
-    #                                       it current for this backend's parked sids (_refresh_parked_parses)
+    corroborates_with_transcript = True   # busy() below may be overruled by the cached parse → the drain keeps
+    #                                       it current for a parked sid before reading busy() (_refresh_parked_parse)
 
     def busy(self, sid):
         """AUTHORITATIVE 'is a turn in flight' for a tmux session: the hook-maintained @claude-state,
@@ -11286,9 +11286,9 @@ class TmuxBackend(sb.SessionBackend):
 
         This never parses — it also serves the WS handler, which must stay cheap — so headless (no chat or
         timeline client, or every session after a kernel restart until one connects) nothing would fill
-        the cache and the row would stand verbatim; _refresh_parked_parses, at the head of every pusher
-        cycle, re-parses the moved transcripts of the sids that hold parked ops so the drain's gates read a
-        current transcript.
+        the cache and the row would stand verbatim; the drain (_apply_pending_ops) re-parses a parked sid's
+        moved transcript (_refresh_parked_parse) right before the gate that reads busy() — after the account
+        hold, so a session held by a usage limit is not re-parsed for a verdict nothing reads.
 
         None when there is no answer: no tmux row for the sid (the hook is not installed, or the pane is
         gone), a row another backend owns, a state no hook has published yet, an unknown word, or
@@ -19947,9 +19947,19 @@ def _working_now(sid):
     return _session_working(session["turns"])
 
 
+_UNSET = object()
+_UNREADABLE = object()   # _live_scope.usage when the drain's one usage.json read failed: 'no hold', never 'empty usage'
+
+
 def _limit_hold(sid):
     """Is this session's input HELD because the ACCOUNT cannot serve it yet — a 5h/7d rate window sitting
     at its cap, or the monthly spend cap? Returns the hold {reason, resetsAt, what} or None.
+
+    Inside the parked-op drain the readings of usage.json (with its colormap ramps) and of the retry-pause
+    file come from the drain's scope (_live_scope.usage / _live_scope.spend_pause — the same thread-confined
+    idiom as the cycle's liveness snapshot and path memo), read ONCE per drain instead of once per held
+    session: an account limit parks every session's input for hours, and the per-session re-read was most
+    of the drain's 46 ms on a seventeen-session board (measured 2026-09-05). Elsewhere it reads fresh.
 
     The gap this closes (the user 2026-07-24): hitting a usage limit turned every following gesture into
     its own failure. /compact came back refused ("this would take you over your limit"), the message typed
@@ -19984,10 +19994,15 @@ def _limit_hold(sid):
     if _le and _le.get("limit"):
         return {"reason": "limit", "resetsAt": None,
                 "what": "waiting for your usage limit to reset", "detail": _le.get("text") or ""}
-    try:
-        u = _usage() or {}
-    except Exception:
-        return None                                   # unreadable usage → never invent a hold
+    usage = getattr(_live_scope, "usage", _UNSET)
+    if usage is _UNSET:
+        try:
+            usage = _usage()
+        except Exception:
+            usage = _UNREADABLE
+    if usage is _UNREADABLE:
+        return None                                   # unreadable usage → never invent a hold (the drain's
+    u = usage or {}                                   # hoisted reading says so the same way: review find 2026-09-05)
     lim = u.get("limited") or {}
     resets = [(u.get(k) or {}).get("resetsAt") for k in ("fiveHour", "sevenDay") if lim.get(k)]
     if resets:
@@ -19998,7 +20013,8 @@ def _limit_hold(sid):
                 # epoch) → nothing to count down to, so promise no clock rather than a wrong one.
                 "resetsAt": max(known) if len(known) == len(resets) else None,
                 "what": "waiting for your usage limit to reset"}
-    spend = _retry_paused_on() and _retry_pause_reason() == "spend"
+    spend_pause = getattr(_live_scope, "spend_pause", None)
+    spend = (_retry_paused_on() and _retry_pause_reason() == "spend") if spend_pause is None else spend_pause
     if not spend:
         path = _path_of(sid)                          # the pause is account-wide, but the transcript is the
         e = _api_error(path) if path else None        # first place the cap shows — hold from that edge too
@@ -20083,7 +20099,7 @@ _TMUX_PROMPT_HOLD_S = 3.0        # the prompt hold's clock FALLBACK: after the d
                                  # (a paste tmux refused, a builtin that opens no prompt turn), until this many seconds
 _drain_hold: dict = {}           # sid -> (time.monotonic() deadline, until_busy); _apply_pending_ops skips the sid
                                  # while the hold is open (_drain_hold_open)
-_refresh_parse_failures: dict = {}   # sid -> consecutive cycles its parked-parse refresh raised (_refresh_parked_parses)
+_refresh_parse_failures: dict = {}   # sid -> consecutive cycles its parked-parse refresh raised (_refresh_parked_parse)
 
 
 def _hold_drain(sid, seconds, until_busy=False):
@@ -20557,9 +20573,9 @@ def _deliver_send_batch(be, sid, run):
         _optimistic_echo(sid, merged, author=author)
 
 
-def _refresh_parked_parses(now):
-    """Before the drain: re-parse the transcript of every sid that HOLDS PARKED OPS and whose cached parse
-    has gone stale (second review of the tmux busy change, 2026-09-03). TmuxBackend.busy corroborates the
+def _refresh_parked_parse(sid, now):
+    """For ONE sid the drain is about to gate: re-parse its transcript when it HOLDS PARKED OPS and its cached
+    parse has gone stale (second review of the tmux busy change, 2026-09-03). TmuxBackend.busy corroborates the
     hook row against the CACHED parse and can overrule a stranded row (an Esc fires no hook) only when
     _parse_cached returns a session — and _parse_cached never parses. The cache is filled by client builds
     (build_session, build_timeline), the client-gated warmer, and a few gesture paths; headless — no chat or
@@ -20578,31 +20594,30 @@ def _refresh_parked_parses(now):
     know: a headless `romp send` typed right after a pane Esc parks ONCE (at that instant the hook is all
     busy() has), and the next cycle's refresh lets the drain deliver it — within the 0.5 s backstop instead
     of ~2 minutes."""
-    for sid in list(_pending_ops):
-        try:
-            be = Sessions.backend_for(sid)
-        except Exception:
-            be = None
-        if be is None or not getattr(be, "corroborates_with_transcript", False):
-            continue                                  # its busy() is the whole truth: nothing here reads its cache
-        try:                                          # per sid: one sid whose parse raises must not starve the
-            path = _path_of(sid)                      # OTHER parked sids' refresh, cycle after cycle (review find,
-            if path and _parse_cached(path) is None:  # 2026-09-04) — that sid stays held on its hook row, and the
-                _parse(path, sid, now)                # failure is on the record
-            _refresh_parse_failures.pop(sid, None)    # a parse that came back clears its count
-        except Exception:
-            # the failing sid is retried every cycle (a parse that raises writes nothing to _parse_cache), so the
-            # line is count-gated like _chat_fold_warned: the first with its traceback, then at 10, 100, 1000
-            n = _refresh_parse_failures.get(sid, 0) + 1
-            if len(_refresh_parse_failures) > 256:
-                _refresh_parse_failures.clear()
-            _refresh_parse_failures[sid] = n
-            if n in (1, 10, 100, 1000):
-                sys.stderr.write("parked-parse refresh %s (failure %d): %s\n"
-                                 % (sid, n, traceback.format_exc() if n == 1 else repr(sys.exc_info()[1])))
+    try:
+        be = Sessions.backend_for(sid)
+    except Exception:
+        be = None
+    if be is None or not getattr(be, "corroborates_with_transcript", False):
+        return                                        # its busy() is the whole truth: nothing here reads its cache
+    try:                                              # per sid: one sid whose parse raises must not starve the
+        path = _path_of(sid)                          # OTHER parked sids' refresh, cycle after cycle (review find,
+        if path and _parse_cached(path) is None:      # 2026-09-04) — that sid stays held on its hook row, and the
+            _parse(path, sid, now)                    # failure is on the record
+        _refresh_parse_failures.pop(sid, None)        # a parse that came back clears its count
+    except Exception:
+        # the failing sid is retried every cycle (a parse that raises writes nothing to _parse_cache), so the
+        # line is count-gated like _chat_fold_warned: the first with its traceback, then at 10, 100, 1000
+        n = _refresh_parse_failures.get(sid, 0) + 1
+        if len(_refresh_parse_failures) > 256:
+            _refresh_parse_failures.clear()
+        _refresh_parse_failures[sid] = n
+        if n in (1, 10, 100, 1000):
+            sys.stderr.write("parked-parse refresh %s (failure %d): %s\n"
+                             % (sid, n, traceback.format_exc() if n == 1 else repr(sys.exc_info()[1])))
 
 
-def _apply_pending_ops():
+def _apply_pending_ops(now=None):
     """Pusher cycle: FIFO-deliver parked ops once the session is QUIET (neither compacting nor an open
     turn) — in exactly the order they were parked, which is exactly the order the chat rendered their
     queued bubbles (the user 2026-07-02: what you see is what runs). SEQUENTIAL by construction (the user
@@ -20630,93 +20645,124 @@ def _apply_pending_ops():
     Two sids are skipped even when they read quiet — a move the CLI answered busy (a clock: its window
     emits no event), and a session just handed a turn-opening op whose busy gate has not yet been SEEN
     closed (until its backend reads busy — tmux's UserPromptSubmit flip — or the fallback clock passes) —
-    see _hold_drain."""
-    for sid, ops in list(_pending_ops.items()):
-        if not ops:
-            _pending_ops.pop(sid, None)
-            _drain_hold.pop(sid, None)                # no queue, no hold
-            continue
-        if sid in _moving:
-            continue                                  # a move is mid-flight: its relocation must finish first
-        hold = _drain_hold.get(sid)
-        if hold is not None:
-            if _drain_hold_open(sid, hold):
-                continue                              # this sid's window is still open (_hold_drain)
-            _drain_hold.pop(sid, None)
-        if _compacting_now(sid) or _working_now(sid) or _limit_hold(sid):
-            continue                                  # …or the account can't serve a request yet
-        changed = False                               # a real mutation below → save the mirror + wake the pusher
-        try:
-            be = Sessions.backend_for(sid)
-            while ops:
-                op = ops[0]
-                if op[0] == "cwd":
-                    # a parked move: fires on its own thread and CLAIMS _moving before this cycle ends, so
-                    # the ops behind it wait for the relocation to finish (the next cycle skips the sid
-                    # until then) — a send fed mid-move could make the CLI reject the move as busy
-                    tries = int(op[2]) if len(op) > 2 else 0
-                    seq = op[3] if len(op) > 3 else None
-                    if (seq is not None and tries >= _MOVE_BUSY_RETRIES and hasattr(be, "turn_seq")
-                            and be.turn_seq(sid) == seq):
-                        break      # the CLI still owns a turn romp cannot see: its ResultMessage is the cue (_move_now)
-                    ops.pop(0)
-                    changed = True
-                    _fire_move(be, sid, op[1], tries, _move_askers.pop(sid, ""))
-                    break
-                changed = True                        # every arm below pops at least one op
-                if op[0] == "send":
-                    run = []                          # coalesce the leading run of sends → deliver them AT ONCE
-                    while ops and ops[0][0] == "send":
-                        run.append(ops.pop(0))
-                    _deliver_send_batch(be, sid, run)
-                    _after_turn_opening(be, sid, ops)
-                    break                             # the delivered turn must END before any op behind it fires
-                elif op[0] == "command":
-                    # a typed slash command fires ALONE as its own fresh top-level prompt — folded into a
-                    # send batch (or forwarded mid-turn) it reaches the model as text instead of executing
-                    # (the user 2026-08-13: /autocompact absorbed mid-turn got a polite reply and no
-                    # setting change). Echo stamped at fire time, like a delivered send.
-                    be.send(sid, op[1])
-                    if len(op) > 2 and op[2]:
-                        _optimistic_echo(sid, op[1], author=op[2])
-                    if op[1].strip().split()[0] == "/compact":
-                        _mark_compacting(sid)         # a TYPED /compact gets the same instant cue as the button's op
-                    ops.pop(0)
-                    _after_turn_opening(be, sid, ops)
-                    break                             # its turn must end before anything behind it fires
-                elif op[0] == "compact":
-                    be.send(sid, "/compact")
-                    _mark_compacting(sid)
-                    ops.pop(0)
-                    _after_turn_opening(be, sid, ops)
-                    break                             # the compaction must finish first
-                elif op[0] == "model":
-                    be.set_model(sid, op[1])
-                    ops.pop(0)
-                elif op[0] == "effort":
-                    be.set_effort(sid, op[1])
-                    ops.pop(0)
-                elif op[0] == "fast":
-                    be.set_fast(sid, op[1])
-                    ops.pop(0)
-                elif op[0] == "auth":
-                    be.set_auth(sid, op[1])
-                    ops.pop(0)
-                elif op[0] == "env":
-                    be.set_env(sid, op[1])
-                    ops.pop(0)
-                else:
-                    ops.pop(0)                        # unknown op kind → drop, never wedge the queue
-        except Exception:
-            sys.stderr.write("pending ops apply: %s\n" % traceback.format_exc())
-            _pending_ops.pop(sid, None)               # a dead session's queue is dropped, never retried
-            _drain_hold.pop(sid, None)                # …and its hold with it
-            changed = True
-        if not _pending_ops.get(sid):
-            _pending_ops.pop(sid, None)
-        if changed:
-            _save_pending_ops()           # every delivery/drop shrinks the disk mirror too
-            _mark_views_dirty()           # the queue shrank (in-memory) → rebuild past the sig so chips retire
+    see _hold_drain.
+
+    COST ORDER (2026-09-05): `now` is the drain's clock — the pusher calls it bare and it stamps its own
+    (a caller may hand one in); the liveness snapshot already reaches every gate through the cycle's
+    scope. usage.json and the retry-pause file are read ONCE per drain, not once per held session (an
+    account limit parks every session's input for hours — that re-read was most of a 46 ms drain on a
+    seventeen-session board); and each sid's gates run cheapest first: the move and hold windows, then the
+    account hold, and only for a sid that passes those the transcript refresh a tmux busy() needs and the
+    compacting/working reads — a held session's transcript is not re-parsed for a verdict nothing reads.
+    The one hold that READS busy() — an until-busy drain hold (_hold_drain) — gets the refresh first, so a
+    tmux row the transcript overrules can still release it (review find 2026-09-05)."""
+    now = int(time.time()) if now is None else now
+    if not _pending_ops:
+        return
+    # ONE reading each for the whole drain, on the cycle's thread-confined scope (see _limit_hold): an
+    # unreadable usage.json is stored as _UNREADABLE, which _limit_hold answers with "no hold" exactly as
+    # its own failed read does (None would read as an EMPTY usage and fall through to the spend arm —
+    # a verdict the WS thread's fresh _ops_gate would not share; review find 2026-09-05).
+    try:
+        _live_scope.usage = _usage()
+    except Exception:
+        _live_scope.usage = _UNREADABLE
+    _live_scope.spend_pause = _retry_paused_on() and _retry_pause_reason() == "spend"
+    try:
+        for sid, ops in list(_pending_ops.items()):
+            if not ops:
+                _pending_ops.pop(sid, None)
+                _drain_hold.pop(sid, None)                # no queue, no hold
+                continue
+            if sid in _moving:
+                continue                                  # a move is mid-flight: its relocation must finish first
+            hold = _drain_hold.get(sid)
+            if hold is not None:
+                if hold[1]:                               # an until-busy hold READS busy(), which a tmux backend
+                    _refresh_parked_parse(sid, now)       # corroborates against the cached parse: keep it current
+                if _drain_hold_open(sid, hold):           # for that read (only a held sid pays; the refresh below
+                    continue                              # finds the cache fresh). Window still open → next cycle.
+                _drain_hold.pop(sid, None)
+            if _limit_hold(sid):
+                continue                                  # the account can't serve a request yet: no parse, no gates
+            _refresh_parked_parse(sid, now)               # a stranded hook row can be overruled by what the transcript says
+            if _compacting_now(sid) or _working_now(sid):
+                continue
+            changed = False                               # a real mutation below → save the mirror + wake the pusher
+            try:
+                be = Sessions.backend_for(sid)
+                while ops:
+                    op = ops[0]
+                    if op[0] == "cwd":
+                        # a parked move: fires on its own thread and CLAIMS _moving before this cycle ends, so
+                        # the ops behind it wait for the relocation to finish (the next cycle skips the sid
+                        # until then) — a send fed mid-move could make the CLI reject the move as busy
+                        tries = int(op[2]) if len(op) > 2 else 0
+                        seq = op[3] if len(op) > 3 else None
+                        if (seq is not None and tries >= _MOVE_BUSY_RETRIES and hasattr(be, "turn_seq")
+                                and be.turn_seq(sid) == seq):
+                            break      # the CLI still owns a turn romp cannot see: its ResultMessage is the cue (_move_now)
+                        ops.pop(0)
+                        changed = True
+                        _fire_move(be, sid, op[1], tries, _move_askers.pop(sid, ""))
+                        break
+                    changed = True                        # every arm below pops at least one op
+                    if op[0] == "send":
+                        run = []                          # coalesce the leading run of sends → deliver them AT ONCE
+                        while ops and ops[0][0] == "send":
+                            run.append(ops.pop(0))
+                        _deliver_send_batch(be, sid, run)
+                        _after_turn_opening(be, sid, ops)
+                        break                             # the delivered turn must END before any op behind it fires
+                    elif op[0] == "command":
+                        # a typed slash command fires ALONE as its own fresh top-level prompt — folded into a
+                        # send batch (or forwarded mid-turn) it reaches the model as text instead of executing
+                        # (the user 2026-08-13: /autocompact absorbed mid-turn got a polite reply and no
+                        # setting change). Echo stamped at fire time, like a delivered send.
+                        be.send(sid, op[1])
+                        if len(op) > 2 and op[2]:
+                            _optimistic_echo(sid, op[1], author=op[2])
+                        if op[1].strip().split()[0] == "/compact":
+                            _mark_compacting(sid)         # a TYPED /compact gets the same instant cue as the button's op
+                        ops.pop(0)
+                        _after_turn_opening(be, sid, ops)
+                        break                             # its turn must end before anything behind it fires
+                    elif op[0] == "compact":
+                        be.send(sid, "/compact")
+                        _mark_compacting(sid)
+                        ops.pop(0)
+                        _after_turn_opening(be, sid, ops)
+                        break                             # the compaction must finish first
+                    elif op[0] == "model":
+                        be.set_model(sid, op[1])
+                        ops.pop(0)
+                    elif op[0] == "effort":
+                        be.set_effort(sid, op[1])
+                        ops.pop(0)
+                    elif op[0] == "fast":
+                        be.set_fast(sid, op[1])
+                        ops.pop(0)
+                    elif op[0] == "auth":
+                        be.set_auth(sid, op[1])
+                        ops.pop(0)
+                    elif op[0] == "env":
+                        be.set_env(sid, op[1])
+                        ops.pop(0)
+                    else:
+                        ops.pop(0)                        # unknown op kind → drop, never wedge the queue
+            except Exception:
+                sys.stderr.write("pending ops apply: %s\n" % traceback.format_exc())
+                _pending_ops.pop(sid, None)               # a dead session's queue is dropped, never retried
+                _drain_hold.pop(sid, None)                # …and its hold with it
+                changed = True
+            if not _pending_ops.get(sid):
+                _pending_ops.pop(sid, None)
+            if changed:
+                _save_pending_ops()           # every delivery/drop shrinks the disk mirror too
+                _mark_views_dirty()           # the queue shrank (in-memory) → rebuild past the sig so chips retire
+    finally:
+        _live_scope.usage = _UNSET
+        _live_scope.spend_pause = None
 
 
 # ── the chat's pinned "system context" card (the user 2026-06-19) ──────────────────────────────────
@@ -20728,6 +20774,7 @@ def _apply_pending_ops():
 # rides each assistant message — it writes no system:init atom, so the event model never carries them.
 _GLOBAL_CLAUDE_MD = Path(os.path.expanduser("~/.claude/CLAUDE.md"))   # overridable in tests
 _session_meta_cache = {}   # path -> ((mtime,size), {...})
+
 
 
 def _tilde(p):
@@ -30040,12 +30087,10 @@ def _pusher_cycle():
 
 
 def _pusher_cycle_jobs(now, tmux, any_client):
-    try:                                  # the drain's gates read the CACHED parse: re-parse the parked sids'
-        _refresh_parked_parses(now)       # moved transcripts first, so a stranded hook row can be overruled by
-    except Exception:                     # what the transcript says (headless, nobody else fills the cache)
-        sys.stderr.write("parked-parse refresh: %s\n" % traceback.format_exc())
     try:                                  # parked ops deliver on the settle EVENT this cycle was woken for
         _apply_pending_ops()              # (_wake_kernel, /tick, a park/cancel/move, the 0.5 s backstop) —
+        #                                   the parked-parse refresh runs inside, per sid, after the
+        #                                   holds (2026-09-05)
     except Exception:                     # FIRST, so a delivered op's echo / retired chip rides this push;
         sys.stderr.write("pending-ops: %s\n" % traceback.format_exc())   # never behind a judge pass (2026-09-03)
     if any_client:
