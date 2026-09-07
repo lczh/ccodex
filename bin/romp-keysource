@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+"""romp-keysource — set up, check, or probe the API key source the sessions bill through.
+
+Why this exists (the user 2026-09-07, after a box on API-key billing whose env file carried no key
+line lost its board for twenty minutes): before the runtime key source landed, such a session
+quietly launched WITHOUT an injected key and Claude Code's own `apiKeyHelper` supplied one; after it,
+the launch failed hard and nothing said what to write where. The kernel now HOLDS such a session with
+the remedy on its card instead of crashing it, `romp refresh` refuses to restart into that state, and
+this command is the walk-through the remedy points at.
+
+`romp keysource` with no flags reports the configured source (kind, fingerprint, file — and whether
+op's own credential is present in the file, BY NAME) and then asks, in order: the 1Password reference
+(validated as op://vault/item/[section/]field, re-asked on error), how `op` authenticates on this box
+(a service-account token pasted without echo and written as OP_SERVICE_ACCOUNT_TOKEN, or the desktop
+app / `op signin`, which a headless login service cannot use), and finally whether to restart the
+manager so the service's OWN environment carries the new token line too. When a kernel is running it
+ends by PROBING the new route on it (one `op read`, kernel-side), so sessions the kernel was holding
+for want of a source resume from the operator's fix without a restart.
+
+`romp keysource --check` is the preflight `romp refresh` runs. It asks the RUNNING kernel first
+(`GET /keysource`: the authoritative answer, since the kernel is what launches sessions — an
+unsupervised `romp up` box launching on an environment key has no file line to read); a kernel
+reporting a configured source is exit 0. With no kernel answering it reads the file, and exits 1 with
+the remedy only when the kernel about to be deployed would actually HOLD a launch: an ALIVE session
+registered with an explicit API-key pick, or a remembered Billing pick of `key` (which seeds every new
+session keyed), and no source and no apiKeyHelper. `ROMP_EXPECTED_AUTH=key` alone holds nobody (an
+unpicked session launches login-side, and the declaration is inert once a Billing pick exists), so it
+is mentioned as context, never a reason to refuse. A box that no login service supervises gets a
+warning and exit 0 instead of a refusal: its manager may hold a key this file cannot show.
+
+`romp keysource --probe` asks the running kernel to resolve the source once and release every session
+it holds (`POST /keysource/probe`) — the way to lift the hold right after fixing op or the token.
+
+Same discipline as `romp keyswap`: the SAME module the kernel reads the key with (kernel/keysource.py),
+the same kernel URL and token discovery, and no key, token or reference value is ever printed —
+references show as fingerprints, the token only by its NAME.
+
+Usage:
+    romp keysource                          # report, then the guided setup
+    romp keysource --ref op://vault/item/field --token-stdin --yes     # non-interactive: token on stdin
+    romp keysource --ref op://vault/item/field --no-token --yes        # desktop app / op signin route
+    romp keysource --check                  # the refresh preflight (exit 1 = sessions would hold)
+    romp keysource --probe                  # resolve once on the running kernel, release held sessions
+Flags: --ref <op://…>  --token-stdin  --no-token  --yes  --restart  --path <file>  --check  --probe
+"""
+import getpass
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+# The SAME module the kernel reads the key with, not a second copy of the rules (romp-keyswap does the
+# same): writer and reader then cannot disagree about which file holds the key or which line wins.
+ks = sys.modules.get("romp_keysource") or SourceFileLoader(
+    "romp_keysource", str(ROOT / "kernel" / "keysource.py")).load_module()
+
+TOKEN_VAR = "OP_SERVICE_ACCOUNT_TOKEN"
+LAUNCHD_LABEL_FALLBACK = "com.romp.manager"          # bin/romp-service's LABEL, read live when it can be
+HEADLESS_CAVEAT = ("an interactive sign-in (the desktop app, `op signin`) does not by itself let a HEADLESS "
+                   "login service read the secret: the service has no desktop app to unlock. For a "
+                   "systemd/launchd-run manager use a 1Password service-account token instead.")
+# Unexpected failure exit: distinct from 1, which `romp refresh` reads as "refuse to restart".
+EXIT_UNEXPECTED = 3
+# Where the local kernel may answer (bin/romp-keyswap's list; the ports `romp version` probes).
+KPORTS = ["http://127.0.0.1:29855", "http://127.0.0.1:7878", "http://127.0.0.1:7432"]
+
+
+class NotInteractive(Exception):
+    """A question had to be asked and stdin is not a terminal."""
+
+
+def _default_ask(prompt):
+    if not sys.stdin.isatty():
+        raise NotInteractive(prompt)
+    return input(prompt)
+
+
+def _default_secret(prompt):
+    if not sys.stdin.isatty():
+        raise NotInteractive(prompt)
+    return getpass.getpass(prompt)
+
+
+def state_dir():
+    """The kernel's state root, resolved the way bin/romp-keyswap and bin/romp do (ROMP_STATE_DIR, else
+    XDG_STATE_HOME/romp, else ~/.local/state/romp) — where the SDK session registry lives."""
+    return Path(os.environ.get("ROMP_STATE_DIR")
+                or Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local/state")) / "romp")
+
+
+# ---- the running kernel: URL + token discovery exactly as bin/romp-keyswap's, never a value ----------
+def _kernel_urls():
+    """ROMP_KERNEL_PORT / ROMP_SERVE_PORT when set — and ONLY that one: a renumbered second-OS-user
+    instance must never hand its serve token to whatever answers on the primary user's default port
+    (review find, 2026-09-04). Unset, the defaults `romp version` and `romp update` probe."""
+    for var in ("ROMP_KERNEL_PORT", "ROMP_SERVE_PORT"):
+        p = (os.environ.get(var) or "").strip()
+        if not p:
+            continue
+        if not (p.isdigit() and 0 < int(p) < 65536):
+            raise ValueError("%s=%r is not a port" % (var, p))
+        return ["http://127.0.0.1:%s" % p]
+    return list(KPORTS)
+
+
+def _token():
+    """The serve token — required on every kernel request, loopback included. Env override, else the
+    0600 state file (romp-update's resolution)."""
+    t = (os.environ.get("ROMP_SERVE_TOKEN") or "").strip()
+    if t:
+        return t
+    try:
+        return (state_dir() / "serve-token").read_text().strip()
+    except OSError:
+        return ""
+
+
+def _kernel():
+    """The base URL of the running local kernel, or None (none answers, or the port override is unusable —
+    the callers say which through _kernel_urls)."""
+    try:
+        urls = _kernel_urls()
+    except ValueError:
+        return None
+    for u in urls:
+        try:
+            with urllib.request.urlopen(u + "/version", timeout=1.5) as r:   # /version is auth-exempt
+                if r.status == 200:
+                    return u
+        except Exception:
+            continue
+    return None
+
+
+def _request(u, path, body=None):
+    """One kernel call → (HTTP status, decoded JSON dict). 0 for no answer at all. The body carries no
+    value in either direction: these routes speak in kinds, fingerprints, names and fixed notes."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(u + path, data=data, method="POST" if data is not None else "GET",
+                                 headers={"Content-Type": "application/json", "X-Romp-Token": _token()})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, _json_dict(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, _json_dict(e.read())
+        except Exception:
+            return e.code, {}
+    except Exception:
+        return 0, {}
+
+
+def _json_dict(raw):
+    try:
+        d = json.loads(raw.decode() if isinstance(raw, bytes) else raw or "{}")
+    except Exception:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def kernel_keysource(u=None):
+    """The running kernel's own account of its key source (GET /keysource: configured, kind, sourceFp,
+    the names it holds) — None when no kernel answers or it predates the route. A kernel that answers
+    but refuses (a stale token) is reported as {"_http": <status>} so the caller can SAY so rather than
+    silently trusting the file."""
+    u = u or _kernel()
+    if not u:
+        return None
+    status, body = _request(u, "/keysource")
+    if status == 200 and "configured" in body:
+        return body
+    if status in (0, 404):
+        return None
+    return {"_http": status}
+
+
+def service_is_active(platform=None):
+    """Does a login service supervise the manager here? True/False when the platform tool answered
+    (`systemctl --user is-active` on Linux, `launchctl print` on macOS — the checks bin/romp-service's
+    `status` runs), False when there is no such tool (nothing supervises then), None when it could not
+    be asked. ROMP_SUPERVISED=1 in this shell (the service unit exports it) is a yes without asking."""
+    if os.environ.get("ROMP_SUPERVISED") == "1":
+        return True
+    platform = platform or sys.platform
+    try:
+        if platform == "darwin":
+            r = subprocess.run(["launchctl", "print", "gui/%d/%s" % (os.getuid(), launchd_label())],
+                               capture_output=True, timeout=5)
+            return r.returncode == 0
+        r = subprocess.run(["systemctl", "--user", "is-active", "romp-manager.service"],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() == "active"
+    except FileNotFoundError:
+        return False
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def is_kernel_file(path):
+    """Is `path` the file the kernel reads (keysource.service_env_path), by real path? --path to any
+    other file is a dry run: nothing in it is live until the kernel is pointed at it."""
+    try:
+        return os.path.realpath(path) == os.path.realpath(ks.service_env_path())
+    except OSError:
+        return False
+
+
+def file_assignment_names(path):
+    """The NAMES assigned in the env file, in order — never their values. A literal line-by-line read like
+    keysource._assignments (no sourcing, no expansion), widened to every name so the report can say
+    whether op's own credential is present and --check can read ROMP_EXPECTED_AUTH."""
+    names = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                name, sep, _ = line.partition("=")
+                if sep and name.strip():
+                    names.append(name.strip())
+    except OSError:
+        return []
+    return names
+
+
+def file_value(path, name):
+    """One non-secret setting's value from the env file (last assignment wins, one layer of quotes
+    stripped, like systemd) — used for ROMP_EXPECTED_AUTH only; never call it for a credential name."""
+    assert not ks.is_op_env_name(name) and name not in (ks.KEY_VAR, ks.REF_VAR), name
+    val = ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                n, sep, v = line.partition("=")
+                if sep and n.strip() == name:
+                    v = v.strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                        v = v[1:-1]
+                    val = v
+    except OSError:
+        return ""
+    return val
+
+
+def op_credential_names(path):
+    """Which of op's credential names the file carries (OP_SERVICE_ACCOUNT_TOKEN, OP_SESSION_*, …)."""
+    return sorted({n for n in file_assignment_names(path) if ks.is_op_env_name(n)})
+
+
+def source_label(source):
+    """A source as the only thing that may be shown of it: kind + fingerprint, never a value."""
+    if source.kind == "op":
+        return "1Password reference %s" % source.fingerprint()
+    if source.kind == "error":
+        return "(invalid key source: %s)" % (source.error or "unreadable")
+    if source.kind == "file" and source.value:
+        return "static key sha256:%s" % source.fingerprint()
+    if source.kind == "file":
+        return "an EMPTY %s= line (no key)" % ks.KEY_VAR
+    return "(no key source)"
+
+
+def key_billing_selected(sdir):
+    """Would the kernel HOLD a launch here for want of a key source? The kernel's own predicate
+    (sdk_backend._options: `launch_keyed = auth == "key" or (auth != "login" and source.configured)` —
+    with no source, only an EXPLICIT key pick is keyed), read from the two places that pick lives: the
+    remembered Billing pick (`auth` in sdk-defaults.json, what every NEW session is seeded from), and any
+    ALIVE session registered with auth `key` (the `sdk/<sid>.json` regs sdk_backend.read_reg reads —
+    read here as JSON directly, so this command needs no kernel import). Returns the reason as a short
+    phrase, "" when nothing would hold. The box-wide declaration ROMP_EXPECTED_AUTH=key is deliberately
+    NOT a door: an unpicked session on a declared box launches login-side (where the login or a helper
+    serves it), and the declaration goes inert the moment a Billing pick exists — refusing a refresh on
+    it refused boxes the kernel would have run fine (review find, 2026-09-07)."""
+    try:
+        d = json.loads((Path(sdir) / "sdk-defaults.json").read_text())
+        if isinstance(d, dict) and d.get("auth") == "key":
+            return "the remembered Billing pick is API key (every new session is seeded from it)"
+    except (OSError, ValueError):
+        pass
+    regs = Path(sdir) / "sdk"
+    try:
+        entries = sorted(os.scandir(regs), key=lambda e: e.name)
+    except OSError:
+        return ""
+    for ent in entries:
+        if not ent.name.endswith(".json"):
+            continue
+        try:
+            reg = json.loads(Path(ent.path).read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(reg, dict) and reg.get("alive") and reg.get("auth") == "key":
+            return "session %s bills an API key" % (reg.get("name") or ent.name[:-5][:8])
+    return ""
+
+
+def check(path, out, sdir=None, kernel=None, service_active=None):
+    """The refresh preflight. 0: a launch on API-key billing has a key to inject (or nobody asks for one);
+    1: API-key billing is selected and there is no source and no apiKeyHelper — the kernel about to be
+    deployed would HOLD every such session, so print the remedy and let `romp refresh` refuse.
+
+    The RUNNING kernel is asked first (kernel_keysource): it is the process that launches sessions, so
+    its answer is the authoritative one — a foreground `romp up` on an environment key has nothing in
+    the file, and the file read alone refused a working box (review find, 2026-09-07). A kernel
+    reporting a configured source passes at once. Only when none answers does the file speak: its
+    source, the marker beside it, the registry — and a box no login service supervises is warned, not
+    refused, because its manager may hold a key this file cannot show. --path to a file the kernel does
+    not read is a dry run of the file logic alone. `kernel`/`service_active` are injectable for tests."""
+    sdir = sdir or state_dir()
+    kernel = kernel or kernel_keysource
+    service_active = service_active or service_is_active
+    live = is_kernel_file(path)
+    answer = None
+    if not live:
+        out("dry run against %s (the kernel reads %s)" % (path, ks.service_env_path()))
+    else:
+        answer = kernel()
+        if isinstance(answer, dict) and answer.get("configured"):
+            out("key source  the running kernel reports its source: %s %s" % (
+                answer.get("kind") or "configured", answer.get("sourceFp") or ""))
+            return 0
+        if isinstance(answer, dict) and answer.get("_http"):
+            out("kernel      answered HTTP %s on /keysource (a stale serve token?); reading %s instead"
+                % (answer["_http"], path))
+    source = ks.read_source(path)
+    if source.kind == "error":
+        out("key source  %s — %s" % (path, source.error or "unreadable"))
+        return 1
+    if source.kind == "none" and ks.read_marker(path) == "op":
+        # the durable memory keysource.select_source consults: the reference line vanished, and the kernel
+        # refuses to fall to a login for it — the same hold as no source, with a different cause
+        out("key source  the 1Password reference was removed from %s and nothing replaced it" % path)
+        out(ks.REMEDY % path)
+        return 1
+    if source.configured:
+        out("key source  %s in %s" % (source_label(source), path))
+        return 0
+    declared = file_value(path, "ROMP_EXPECTED_AUTH").lower() == "key"
+    why = key_billing_selected(sdir)
+    if not why:
+        out("key source  none in %s; nothing selects API-key billing%s, so sessions bill the login" % (
+            path, (" (ROMP_EXPECTED_AUTH=key is declared there, but only an explicit API-key pick holds; "
+                   "an unpicked session launches login-side)" if declared else "")))
+        return 0
+    if ks.cli_self_auth():
+        out("key source  none in %s; %s, and launches ride Claude Code's apiKeyHelper" % (path, why))
+        return 0
+    held = answer.get("held") if isinstance(answer, dict) else None
+    if held:
+        out("kernel      holding %s" % ", ".join(str(n) for n in held))
+    if live and answer is None:
+        active = service_active()
+        if active is False:
+            out("key source  none in %s, but %s" % (path, why))
+            out("warning     no login service runs the manager here (and no kernel answered), so the key "
+                "may reach it another way — through its environment — that this file cannot show; not "
+                "refusing on the file alone. If sessions hold after the restart: %s" % (ks.REMEDY % path))
+            return 0
+    out("key source  none in %s, but %s" % (path, why))
+    out(ks.REMEDY % path)
+    return 1
+
+
+def probe(out, err_out, u=None):
+    """`romp keysource --probe`: one resolve on the running kernel (POST /keysource/probe — single flight
+    and the reuse window make it one `op read` for the whole board), which then releases every session
+    it holds whose reason is gone. 0 when the kernel resolved; 1 when it could not, when no kernel
+    answers, or when the kernel predates the route (then the next launch, judge pass or `romp refresh`
+    picks the source up). Prints kinds, fingerprints, names and the kernel's fixed note — never a value."""
+    u = u or _kernel()
+    if not u:
+        err_out("no running kernel answered, so nothing to probe; a kernel picks the source up at its "
+                "next launch, judge pass or `romp refresh`")
+        return 1
+    status, body = _request(u, "/keysource/probe", {})
+    if status in (0, 404):
+        out("probe       the running kernel predates `romp keysource --probe` (no /keysource/probe route); "
+            "its next launch or `romp refresh` picks the source up")
+        return 1
+    if status != 200:
+        err_out("the kernel answered HTTP %s on /keysource/probe (a stale serve token?)" % status)
+        return 1
+    ok = bool(body.get("ok"))
+    lifted = [str(n) for n in (body.get("lifted") or [])]
+    if ok:
+        out("probe       ok — the kernel resolved its %s source %s" % (body.get("kind") or "key",
+                                                                        body.get("sourceFp") or ""))
+    else:
+        out("probe       FAILED — %s" % (body.get("note") or "the kernel could not resolve its key source"))
+    out("released    %s" % (", ".join(lifted) if lifted else "no held session (none was waiting, or its reason stands)"))
+    return 0 if ok else 1
+
+
+def restart_command(platform=None, uid=None):
+    """The exact command that restarts the login service that runs the manager — the one thing a NEW
+    OP_* line in the file cannot reach without it (the manager's own environment is fixed at its start).
+    Linux: the systemd --user unit bin/romp-service writes. macOS: launchd's kickstart of the agent whose
+    label bin/romp-service carries (read from that script so a rename there is followed; falls back to
+    the long-standing label). bin/romp-service itself has install/uninstall/status and NO restart verb —
+    checked 2026-09-07 — so the platform tool is named directly."""
+    platform = platform or sys.platform
+    if platform == "darwin":
+        uid = os.getuid() if uid is None else uid
+        return ["launchctl", "kickstart", "-k", "gui/%d/%s" % (uid, launchd_label())]
+    return ["systemctl", "--user", "restart", "romp-manager.service"]
+
+
+def launchd_label():
+    try:
+        src = (ROOT / "bin" / "romp-service").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return LAUNCHD_LABEL_FALLBACK
+    m = re.search(r'^LABEL="([^"$]+)"', src, re.M)
+    return m.group(1) if m else LAUNCHD_LABEL_FALLBACK
+
+
+def parse_args(argv):
+    """Options only, no positionals. Returns (opts, error)."""
+    o = {"ref": "", "token_stdin": False, "no_token": False, "yes": False, "restart": False,
+         "path": "", "check": False, "probe": False}
+    i, err = 0, ""
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--ref", "--path") or a.startswith(("--ref=", "--path=")):
+            key = a[2:].split("=", 1)[0]
+            if "=" in a:
+                val = a.split("=", 1)[1]
+            else:
+                i += 1
+                val = argv[i] if i < len(argv) else ""
+            if not val:
+                err = err or ("--%s needs a value" % key)
+            o[key] = val
+        elif a == "--token-stdin":
+            o["token_stdin"] = True
+        elif a == "--no-token":
+            o["no_token"] = True
+        elif a in ("--yes", "-y"):
+            o["yes"] = True
+        elif a == "--restart":
+            o["restart"] = True
+        elif a == "--check":
+            o["check"] = True
+        elif a == "--probe":
+            o["probe"] = True
+        else:
+            err = err or ("unknown option %s" % a)
+        i += 1
+    if o["token_stdin"] and o["no_token"]:
+        err = err or "--token-stdin and --no-token exclude each other"
+    if o["check"] and o["probe"]:
+        err = err or "--check and --probe exclude each other"
+    return o, err
+
+
+def _valid_ref(ref):
+    """"" when the reference validates, else the error text (keysource's own rule, never a second one)."""
+    try:
+        ks.KeySource("op", ref).validate()
+    except ks.KeySourceError as exc:
+        return str(exc)
+    return ""
+
+
+def _valid_token(tok):
+    if not tok:
+        return "the token is empty"
+    if any(c.isspace() or c == "\0" for c in tok):
+        return "the token must be a single line with no spaces"
+    return ""
+
+
+def report(path, out):
+    src = ks.read_source(path)
+    out("service.env %s%s" % (path, "" if os.path.exists(path) else "  (does not exist yet)"))
+    out("key source  %s" % source_label(src))
+    names = op_credential_names(path)
+    out("op auth     %s" % (("credential present in the file: " + ", ".join(names)) if names
+                            else "no op credential line in the file (the desktop app / `op signin` route, "
+                                 "or not set up yet)"))
+    # The same name in this shell's environment too: say which one counts. The kernel hands `op read`
+    # the FILE's line over any environment copy (keysource.op_subprocess_env), so an operator exporting
+    # a fresh token in their shell and wondering why op still fails is told where the live one is.
+    shell_too = [n for n in names if os.environ.get(n)]
+    if shell_too:
+        out("op auth     %s also set in this shell's environment; the kernel's `op read` uses the file's line"
+            % ", ".join(shell_too))
+    return src
+
+
+def main(argv, out=None, ask=None, secret=None, run=None, stdin=None):
+    """`out` prints a line; `ask`/`secret` answer prompts (the secret one never echoes); `run` executes the
+    restart command; `stdin` feeds --token-stdin. All injectable so the tests drive every branch without
+    a terminal, a service or a token on disk anywhere but the temp file."""
+    out = out or (lambda line: sys.stdout.write(line + "\n"))
+    ask = ask or _default_ask
+    secret = secret or _default_secret
+    run = run or (lambda cmd: subprocess.run(cmd, check=False).returncode)
+    stdin = stdin or sys.stdin
+    err_out = lambda line: sys.stderr.write("romp keysource: " + line + "\n")
+    o, err = parse_args(list(argv))
+    if err:
+        err_out(err)
+        return 2
+    path = os.path.expanduser(o["path"]) if o["path"] else ks.service_env_path()
+    if o["check"]:
+        return check(path, out)
+    if o["probe"]:
+        return probe(out, err_out)
+    try:
+        return _setup(o, path, out, ask, secret, run, stdin, err_out)
+    except NotInteractive:
+        # only a PRE-WRITE question lands here: the restart question after the write handles its own
+        # non-terminal (nothing was written when this fires, so "file untouched" holds)
+        err_out("stdin is not a terminal — pass --ref <op://…> with --token-stdin or --no-token, and --yes")
+        return 2
+
+
+def _setup(o, path, out, ask, secret, run, stdin, err_out):
+    report(path, out)
+    out("")
+    # 1. the reference: validated by the kernel's own rule, re-asked while interactive, refused when given
+    ref = o["ref"]
+    if ref:
+        bad = _valid_ref(ref)
+        if bad:
+            err_out("%s (file untouched)" % bad)
+            return 2
+    else:
+        if o["yes"]:
+            err_out("--yes needs --ref <op://vault/item/field> (file untouched)")
+            return 2
+        while True:
+            ref = ask("1Password reference for the API key (op://vault/item/[section/]field): ").strip()
+            bad = _valid_ref(ref)
+            if not bad:
+                break
+            out("  %s — try again" % bad)
+    # 2. how op authenticates on this box
+    token = ""
+    token_mode = "keep"                     # keep: leave whatever OP_* lines the file has as they are
+    if o["token_stdin"]:
+        token = (stdin.readline() if hasattr(stdin, "readline") else str(stdin)).rstrip("\r\n")
+        bad = _valid_token(token)
+        if bad:
+            err_out("%s (read from stdin; file untouched)" % bad)
+            return 2
+        token_mode = "token"
+    elif o["no_token"]:
+        token_mode = "none"
+    elif not o["yes"]:
+        out("How does `op` authenticate on this box?")
+        out("  [1] a 1Password service-account token (pasted here, never echoed; written as %s)" % TOKEN_VAR)
+        out("  [2] the desktop app or `op signin` (no token line)")
+        while True:
+            choice = ask("choice [1/2]: ").strip()
+            if choice in ("1", "2"):
+                break
+            out("  1 or 2")
+        if choice == "1":
+            while True:
+                token = secret("service-account token (input hidden): ").rstrip("\r\n")
+                bad = _valid_token(token)
+                if not bad:
+                    break
+                out("  %s — try again" % bad)
+            token_mode = "token"
+        else:
+            token_mode = "none"
+    # 3. write — the token FIRST: a token beside no reference is inert (romp is not the op consumer until a
+    #    reference governs), while a reference beside no token would already hold key-billed launches, so a
+    #    failure between the two writes must leave the harmless half, not the harmful one.
+    had_token = TOKEN_VAR in op_credential_names(path)
+    want_fp = ks.KeySource("op", ref).fingerprint()
+    changed = []
+    try:
+        if token_mode == "token":
+            res_t = ks.write_assignment(TOKEN_VAR, token, path)
+            changed.append("%s %s" % (TOKEN_VAR, "replaced" if res_t.get("replaced") else "added"))
+        res = ks.write_source(ks.KeySource("op", ref), path)
+    except (OSError, ks.KeySourceError) as e:
+        # Say what actually LANDED before the error: the two writes are separate rewrites, so a failure
+        # on the second leaves the first in the file, and "could not rewrite" alone read as "nothing
+        # changed" (review find, 2026-09-07). Both reads are read-only and value-free.
+        now = ks.read_source(path)
+        ref_landed = now.kind == "op" and now.fingerprint() == want_fp
+        parts = []
+        if token_mode == "token":
+            parts.append(changed[0] if changed else "%s NOT written" % TOKEN_VAR)
+        parts.append("%s %s" % (ks.REF_VAR, "written" if ref_landed else "NOT written"))
+        out("landed      %s" % "; ".join(parts))
+        err_out("could not rewrite %s: %s" % (path, e))
+        return 1
+    del token                                # nothing below may see the value
+    landed = ks.read_source(path)
+    if landed.kind != "op" or landed.fingerprint() != want_fp:
+        err_out("the rewrite did not land (file reads %s) — check %s by hand" % (source_label(landed), path))
+        return 1
+    old = res["old"]
+    changed.append("%s %s" % (ks.REF_VAR, "replaced" if old.kind == "op" else
+                              ("added, %s= removed" % ks.KEY_VAR if old.kind == "file" else "added")))
+    # 4. what changed, by name
+    out("")
+    out("written     %s" % path)
+    if res.get("target") and res["target"] != res["path"]:
+        out("            (a link: written through to %s)" % res["target"])
+    out("changed     %s" % "; ".join(changed))
+    out("key source  %s -> %s  (mode %o%s)" % (source_label(old), source_label(landed), res["mode"],
+                                               ", tightened from a group/other-readable mode" if res["tightened"] else ""))
+    live = is_kernel_file(path)
+    if live:
+        out("effect      the reference is live at once: every new or revived session, judge call and catalog")
+        out("            read now bills through it, and sessions held for want of a key source resume on their own")
+    else:
+        out("effect      NOT live: this is not the file the kernel reads (%s). Select it with `romp keyswap <name>`"
+            % ks.service_env_path())
+        out("            if it is a service.env.<name> sibling, or point ROMP_SERVICE_ENV_FILE at it and restart the service")
+    if token_mode == "none":
+        out("op auth     no token line written; %s" % HEADLESS_CAVEAT)
+    elif token_mode == "keep":
+        names = op_credential_names(path)
+        out("op auth     %s" % (("left as it was: " + ", ".join(names)) if names
+                                else "NONE in the file — add a service-account token with --token-stdin, or " + HEADLESS_CAVEAT))
+    # 5. release what the kernel holds, now: one resolve on the running kernel lifts every hold whose
+    #    reason this write removed, so the operator's fix reaches the board without a restart. The
+    #    probe's verdict is said, never the exit code's business — the setup itself succeeded.
+    if live:
+        u = _kernel()
+        if u:
+            out("probing the route on the running kernel…")
+            probe(out, err_out, u)
+    want_restart = token_mode == "token"
+    cmd = restart_command()
+    if want_restart:
+        out("op auth     %s %s — the kernel's own `op read` picks a token line up live, but the manager's" % (TOKEN_VAR, "rotated" if had_token else "added"))
+        out("            environment (and a kernel that predates this version) only sees it after a service restart:")
+        out("            " + " ".join(cmd))
+    else:
+        return 0
+    if o["restart"]:
+        do_it = True
+    elif o["yes"]:
+        do_it = False
+        out("            (not run: --yes without --restart)")
+    else:
+        try:
+            do_it = ask("restart the manager now? [y/N] ").strip().lower() in ("y", "yes")
+        except NotInteractive:
+            # Both lines are WRITTEN by now, so a pipe here is not the refusal the pre-write questions
+            # give (that read as "nothing happened" — review find, 2026-09-07): it is --yes without
+            # --restart, said as such.
+            out("            (not run: stdin is not a terminal; run %s yourself)" % " ".join(cmd))
+            return 0
+    if not do_it:
+        return 0
+    try:
+        rc = run(cmd)
+    except OSError as e:
+        err_out("could not run %s: %s" % (" ".join(cmd), e))
+        return 1
+    out("restart     %s" % ("done — the service restarted, sessions revive with their history" if rc == 0
+                            else "FAILED (exit %s) — is the login service installed? `romp-service status`" % rc))
+    return 0 if rc == 0 else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.stderr.write("\nromp keysource: cancelled; file untouched unless a line above says otherwise\n")
+        sys.exit(130)
+    except Exception as e:      # noqa: BLE001 — a crash must not read as "refuse" (exit 1) to `romp refresh`
+        sys.stderr.write("romp keysource: unexpected error: %s: %s\n" % (type(e).__name__, e))
+        sys.exit(EXIT_UNEXPECTED)

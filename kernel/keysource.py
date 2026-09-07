@@ -7,7 +7,10 @@ The design, in four rules:
   needs to KNOW about the key — the Billing picker, status displays, ``romp keyswap``'s listing and
   identity checks — reads the source. Only resolve() ever runs ``op read``, at the moment a Claude
   session launches, an API-key-billed judge call is made, or the model catalog refreshes; the value
-  is handed to that one operation and never written to disk or cached for a later one.
+  is handed to that operation and never written to disk. A SUCCESSFUL read is kept in memory for
+  ``ROMP_OP_REUSE_S`` seconds (60 by default, 0 disables) so a wave of launches and judge calls
+  shares one retrieval; a failure is never kept, and forget_resolved() drops the memory the moment
+  the source or the file moves.
 * A selected source is AUTHORITATIVE. A file that once carried a key line or a reference keeps
   governing this process: emptying it, removing the line, or making it unreadable is an error the
   operation reports, never permission to fall back to the key the manager started with or to a
@@ -32,14 +35,31 @@ Legacy environment/file keys and Claude login remain supported without 1Password
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import re
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 from dataclasses import dataclass, field
 
 KEY_VAR = "ANTHROPIC_API_KEY"
 REF_VAR = "ROMP_API_KEY_REF"
 OP_TIMEOUT = 15
+# One bounded retry of a failed or timed-out `op read` (2 attempts, ~1 s apart): a transient blip in op's
+# own network leg used to fail a judge pass and kill every connecting session outright (2026-09-07). The
+# worst case, 2 x OP_TIMEOUT + the delay, still fits under one judge call.
+OP_ATTEMPTS = 2
+OP_RETRY_DELAY_S = 1.0
+# ROMP_OP_REUSE_S: how long (seconds) a value resolve() just retrieved is handed to the NEXT caller for the
+# same source without another `op read`; 0 disables. In memory only, never on disk; a failure is never kept.
+OP_REUSE_S_DEFAULT = 60
+# The one sentence an `op read` that failed for a reason outside op's own vocabulary (an exception the
+# subprocess machinery raised, a codec error) is reported with — never the exception's text.
+OP_UNEXPECTED_ERROR = "1Password credential retrieval failed unexpectedly; check the manager's op installation and env file"
+OP_ENV_INVALID_ERROR = "the op credential lines in the env file contain invalid characters"
 # The environment names the 1Password CLI authenticates from. Claimed out of the kernel's environment
 # once (claim_op_env) and given back to the `op read` subprocess only (resolve): a service-account
 # token reads every field the account can see, and a child that inherits it — a Claude session's
@@ -173,6 +193,150 @@ class KeySourceError(RuntimeError):
     """A credential failure whose message is safe for user-visible logs."""
 
 
+# The ONE remedy text for "API-key billing selected, no source configured": the launch card, the kernel
+# log, the judge note, the boot preflight and the CLI all say this, so an operator reads the same line
+# wherever the failure surfaces (the user 2026-09-07, whose board was down for twenty minutes while every
+# surface described the outage differently). %s is service_env_path().
+REMEDY = ("No API key source is configured for API-key billing. Run `romp keysource`, or add "
+          "ROMP_API_KEY_REF=op://vault/item/field (and OP_SERVICE_ACCOUNT_TOKEN for a headless service) "
+          "to %s; held sessions resume on their own once it is there.")
+
+
+def remedy() -> str:
+    return REMEDY % service_env_path()
+
+
+# Claude Code's own settings files, in the order the CLI consults them: the user's ($CLAUDE_CONFIG_DIR or
+# ~/.claude) and the managed (admin) files. Read for the PRESENCE of an apiKeyHelper only.
+CLI_MANAGED_SETTINGS = ("/etc/claude-code/managed-settings.json",
+                        "/Library/Application Support/ClaudeCode/managed-settings.json")
+_CLI_SETTINGS_CACHE: dict[str, tuple] = {}     # path -> (file identity, names a helper) — never the command
+
+
+def cli_settings_paths() -> tuple:
+    d = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    return (os.path.join(d, "settings.json"),) + CLI_MANAGED_SETTINGS
+
+
+def _settings_name_a_helper(path: str) -> bool:
+    """Whether one settings file carries a non-empty "apiKeyHelper". Stat-cached like read_source; the
+    helper COMMAND is never read into anything that outlives this call, let alone returned or logged."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        _CLI_SETTINGS_CACHE.pop(path, None)
+        return False
+    ident = (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+    hit = _CLI_SETTINGS_CACHE.get(path)
+    if hit is not None and hit[0] == ident:
+        return hit[1]
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            d = json.load(fh)
+        has = isinstance(d, dict) and bool(str(d.get("apiKeyHelper") or "").strip())
+    except (OSError, ValueError):
+        has = False
+    _CLI_SETTINGS_CACHE[path] = (ident, has)
+    return has
+
+
+def cli_self_auth() -> str:
+    """"apiKeyHelper" when Claude Code's own settings (user or managed) name an API-key helper, else "".
+    Presence only: this says whether a CLI child launched WITHOUT an injected key can still authenticate
+    itself the way it did before runtime retrieval existed (the pre-2026-09-07 behaviour a hard error
+    replaced, taking the board down); it never reads, returns or runs the helper command."""
+    for p in cli_settings_paths():
+        if _settings_name_a_helper(p):
+            return "apiKeyHelper"
+    return ""
+
+
+# ---- in-process retrieval memory (K3): single flight per source, bounded reuse, never on disk ----
+class _Flight:
+    """One `op read` in progress for a source fingerprint; waiters take its verdict instead of spawning
+    their own op. repr hides the value: module state is dumped into test assertions and debug output."""
+    __slots__ = ("done", "value", "error")
+
+    def __init__(self):
+        self.done, self.value, self.error = False, "", ""
+
+    def __repr__(self):
+        return "<op read %s>" % ("failed" if self.error else "done" if self.done else "in flight")
+
+
+class _Resolved:
+    __slots__ = ("value", "t")
+
+    def __init__(self, value: str, t: float):
+        self.value, self.t = value, t
+
+    def __repr__(self):
+        return "<resolved t=%.0f>" % self.t
+
+
+_RESOLVE_CV = threading.Condition()            # guards _RESOLVED, _RESOLVING and _HEALTH
+_RESOLVED: dict[str, _Resolved] = {}           # source fingerprint -> value retrieved within the reuse window
+_RESOLVING: dict[str, _Flight] = {}            # source fingerprint -> the `op read` in flight for it
+_HEALTH = {"kind": "", "sourceFp": "", "lastOkT": 0.0, "lastFailT": 0.0, "note": ""}
+_SLEEP = time.sleep                            # the retry delay; bound at import so tests can make it instant
+
+
+def op_reuse_s() -> float:
+    """The reuse window from ROMP_OP_REUSE_S (seconds; 0 disables), read at call time; the default when
+    the variable is unset or not a number."""
+    raw = (os.environ.get("ROMP_OP_REUSE_S") or "").strip()
+    if not raw:
+        return float(OP_REUSE_S_DEFAULT)
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return float(OP_REUSE_S_DEFAULT)
+
+
+def forget_resolved() -> None:
+    """Drop every value the reuse window still holds: the next resolve() runs `op read` again. Called when
+    the env file changes identity (read_source), when write_source / write_assignment rewrite it, and by a
+    caller that knows the world moved (a keyswap, a rotation)."""
+    with _RESOLVE_CV:
+        _RESOLVED.clear()
+
+
+def health() -> dict:
+    """The one health line for credential retrieval: the selected source's kind and fingerprint (never a
+    value), when a retrieval last succeeded / failed (epoch seconds, 0.0 for never), and the last failure's
+    fixed note. select_source() keeps kind/sourceFp current; resolve() stamps the times."""
+    with _RESOLVE_CV:
+        return dict(_HEALTH)
+
+
+def _health_result(ok: bool, note: str = "") -> None:
+    with _RESOLVE_CV:
+        if ok:
+            _HEALTH["lastOkT"], _HEALTH["note"] = time.time(), ""
+        else:
+            _HEALTH["lastFailT"], _HEALTH["note"] = time.time(), note
+
+
+def _op_failure_class(stderr) -> str:
+    """op's stderr reduced to a FIXED vocabulary — auth, not-found, network, other — from a few substring
+    rules. The text itself is never stored, logged or returned: 1Password's messages can echo the
+    reference, an account name, or a token fragment."""
+    try:
+        text = (stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else str(stderr or "")).lower()
+    except Exception:
+        return "other"
+    if any(k in text for k in ("isn't an item", "is not an item", "not found", "no item", "isn't a vault",
+                               "doesn't exist", "does not exist", "no such field")):
+        return "not-found"
+    if any(k in text for k in ("401", "unauthorized", "token", "not signed in", "session expired",
+                               "authentication", "sign in", "signin")):
+        return "auth"
+    if any(k in text for k in ("dial", "timeout", "timed out", "network", "connection", "no such host",
+                               "tls", "unreachable", "connect:")):
+        return "network"
+    return "other"
+
+
 @dataclass(frozen=True)
 class KeySource:
     kind: str
@@ -206,9 +370,70 @@ class KeySource:
         return fingerprint(self.value)
 
     def resolve(self) -> str:
-        self.validate()
+        """The key itself, for ONE operation. For an op source: one `op read` per source at a time — a wave
+        of concurrent callers (six judge threads, several sessions connecting at once) shares the read in
+        flight instead of each spawning op — and a value retrieved within the reuse window (op_reuse_s) is
+        handed out again without a new read. A failure is shared with the callers that waited on that very
+        read and remembered by nobody: the next caller retrieves afresh (judge.py's per-pass gate composes
+        with this — the memory here shares success, the gate shares failure)."""
+        try:
+            self.validate()
+        except KeySourceError as e:
+            _health_result(False, str(e))
+            raise
         if self.kind != "op":
+            _health_result(True)
             return self.value
+        fp, reuse, now = self.fingerprint(), op_reuse_s(), time.monotonic()
+        with _RESOLVE_CV:
+            hit = _RESOLVED.get(fp)
+            if hit is not None and reuse > 0 and now - hit.t < reuse:
+                return hit.value
+            flight = _RESOLVING.get(fp)
+            if flight is not None:
+                deadline = now + OP_ATTEMPTS * OP_TIMEOUT + OP_RETRY_DELAY_S + 5
+                while not flight.done:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break              # a reader that never reported: read for ourselves below
+                    _RESOLVE_CV.wait(timeout=left)
+                if flight.done:
+                    if flight.error:
+                        raise KeySourceError(flight.error)
+                    return flight.value
+            flight = _RESOLVING[fp] = _Flight()
+        # The flight is retired on EVERY exit — a KeySourceError, any other exception, even a
+        # KeyboardInterrupt — or the waiters above sit out their whole deadline on a reader that never
+        # reported, and the next caller finds a flight nobody owns (review find, 2026-09-07). An
+        # unexpected exception becomes a KeySourceError with a FIXED sentence: str(e) of a subprocess
+        # or codec error can carry the env value or the reference it choked on.
+        value, error = "", ""
+        try:
+            value = self._op_read()
+        except KeySourceError as e:
+            error = str(e)
+            raise
+        except Exception:
+            error = OP_UNEXPECTED_ERROR
+            raise KeySourceError(error) from None
+        except BaseException:               # an interrupt stays an interrupt for this caller; the waiters
+            error = OP_UNEXPECTED_ERROR     # still get a verdict instead of a deadline
+            raise
+        finally:
+            with _RESOLVE_CV:
+                flight.value, flight.error, flight.done = ("" if error else value), error, True
+                if not error and reuse > 0:
+                    _RESOLVED[fp] = _Resolved(value, time.monotonic())
+                if _RESOLVING.get(fp) is flight:
+                    del _RESOLVING[fp]
+                _RESOLVE_CV.notify_all()
+            _health_result(not error, error)
+        return value
+
+    def _op_read(self) -> str:
+        """Run `op read` (with the one bounded retry) and validate what came back. Neither op's stderr nor a
+        subprocess exception's repr is safe to log: stderr is reduced to _op_failure_class's vocabulary and
+        the exit code, and every raise is `from None`."""
         # op authenticates from the credential names claimed at startup; they ride into THIS subprocess
         # and no other (see claim_op_env). The rest of the environment is a whitelist, not a copy
         # (review find, 2026-09-06: the copy carried ROMP_SERVE_TOKEN — full control of every session —
@@ -216,21 +441,36 @@ class KeySource:
         # XDG_* names to find `~/.config/op` and the desktop app's socket, PATH to run, TMPDIR/LANG/LC_*/
         # TERM for ordinary CLI behaviour, USER/LOGNAME for its account defaults; nothing else of romp's.
         op_env = op_subprocess_env()
-        try:
-            result = subprocess.run(
-                ["op", "read", "--no-newline", self.value], stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=OP_TIMEOUT,
-                check=False, env=op_env,
-            )
-        except FileNotFoundError:
-            raise KeySourceError("1Password CLI (op) is not on the manager's PATH") from None
-        except subprocess.TimeoutExpired:
-            raise KeySourceError("1Password credential retrieval timed out; check op authentication") from None
-        except OSError:
-            raise KeySourceError("Cannot run 1Password CLI; check the manager's op installation") from None
-        if result.returncode:
-            # Neither subprocess stderr nor its exception repr is safe to log.
-            raise KeySourceError("1Password credential retrieval failed; check op authentication and vault access")
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                result = subprocess.run(
+                    ["op", "read", "--no-newline", self.value], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=OP_TIMEOUT,
+                    check=False, env=op_env,
+                )
+            except FileNotFoundError:
+                raise KeySourceError("1Password CLI (op) is not on the manager's PATH") from None
+            except subprocess.TimeoutExpired:
+                if attempt < OP_ATTEMPTS:
+                    _SLEEP(OP_RETRY_DELAY_S)
+                    continue
+                raise KeySourceError("1Password credential retrieval timed out; check op authentication "
+                                     "(op: network, timeout after %d attempts)" % attempt) from None
+            except OSError:
+                raise KeySourceError("Cannot run 1Password CLI; check the manager's op installation") from None
+            except ValueError:
+                # subprocess refuses an env value with an embedded NUL (file_op_env drops those, but the
+                # claimed stash and os.environ are not filtered); the ValueError's text quotes the value
+                raise KeySourceError(OP_ENV_INVALID_ERROR) from None
+            if result.returncode:
+                if attempt < OP_ATTEMPTS:
+                    _SLEEP(OP_RETRY_DELAY_S)
+                    continue
+                raise KeySourceError("1Password credential retrieval failed; check op authentication and vault "
+                                     "access (op: %s, exit %d)" % (_op_failure_class(result.stderr), result.returncode))
+            break
         try:
             value = result.stdout.decode("utf-8")
         except UnicodeError:
@@ -247,11 +487,56 @@ OP_ENV_PASSTHROUGH_PREFIXES = ("LC_", "XDG_")
 def op_subprocess_env() -> dict:
     """The environment the `op read` subprocess gets and nothing more: the passthrough names above, op's
     own credential names — the claimed stash, plus any still in os.environ (a caller resolving a
-    reference on a box where romp never became the consumer) — and no romp variable of any kind."""
+    reference on a box where romp never became the consumer), with the env FILE's own OP_* lines winning
+    over both (file_op_env) — and no romp variable of any kind."""
     env = {k: v for k, v in os.environ.items()
            if k in OP_ENV_PASSTHROUGH or k.startswith(OP_ENV_PASSTHROUGH_PREFIXES) or is_op_env_name(k)}
     env.update(claim_op_env())
+    env.update(file_op_env())
     return env
+
+
+def file_op_env(path: str | None = None) -> dict:
+    """op's credential lines (the OP_* names, is_op_env_name) read from the service env file at RESOLVE
+    time: literal assignments, never `source`d, never exported into os.environ, handed to the `op read`
+    subprocess alone. The file outranks the stash claim_op_env took from the manager's start-time
+    environment because a supervised manager keeps that environment until the service restarts — so a
+    token written after start (a keyswap to a reference, a token rotation) could not authenticate op
+    until an operator restarted the service, and nothing said so (2026-09-07). Unreadable file → {} (the
+    retrieval then fails loudly on its own)."""
+    try:
+        with open(path or service_env_path(), "r", encoding="utf-8", errors="replace") as fh:
+            values = _assignments(fh.read(), is_op_env_name)
+    except OSError:
+        return {}
+    # A value with a control character (a NUL, a stray escape) is dropped like a garbled one (_garbled):
+    # subprocess would refuse the NUL with a ValueError that quotes the value, and no op credential
+    # legitimately carries one. Dropping it leaves the retrieval to fail on its own, loudly and safely.
+    return {k: v for k, v in values.items()
+            if v and "\ufffd" not in v and not any(c < " " or c == "\x7f" for c in v)}
+
+
+_NO_OP_CRED_SAID = False
+_OP_CRED_SEEN = False
+
+
+def _note_missing_op_credential(path: str) -> None:
+    """Said ONCE per process when a 1Password reference is selected but op has nothing to authenticate
+    with — no OP_* name in the claimed stash, the environment, or the env file. Before this the only
+    evidence was a failed retrieval per session and per judge call."""
+    global _NO_OP_CRED_SAID, _OP_CRED_SEEN
+    if _NO_OP_CRED_SAID or _OP_CRED_SEEN:
+        return
+    if _OP_ENV or any(is_op_env_name(k) for k in os.environ) or file_op_env(path):
+        _OP_CRED_SEEN = True
+        return
+    _NO_OP_CRED_SAID = True
+    # Worded for both boxes it can land on: a headless service (the token line is missing, or was
+    # added after the manager started) and a desktop-app sign-in (no OP_* name anywhere, and op is
+    # fine) — the second must not be sent to write a token it does not need.
+    sys.stderr.write("1Password reference selected but this kernel has no op credential (no OP_* name in "
+                     "its environment or in %s): a headless service needs OP_SERVICE_ACCOUNT_TOKEN in that "
+                     "file, then restart the service; a desktop-app sign-in needs nothing here\n" % path)
 
 
 def service_env_path() -> str:
@@ -283,15 +568,16 @@ def sibling_path(name: str, path: str | None = None) -> str:
     return (path or service_env_path()) + "." + name
 
 
-def _assignments(text: str) -> dict[str, str]:
-    """Read literal env assignments; never execute or expand the file's contents."""
+def _assignments(text: str, keep=None) -> dict[str, str]:
+    """Read literal env assignments; never execute or expand the file's contents. `keep` selects the
+    names (a predicate); default: the key and reference lines."""
     out = {}
     for raw in str(text or "").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         name, sep, value = line.partition("=")
-        if not sep or name.strip() not in (KEY_VAR, REF_VAR):
+        if not sep or not (keep(name.strip()) if keep else name.strip() in (KEY_VAR, REF_VAR)):
             continue
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
@@ -334,12 +620,15 @@ def read_source(path: str | None = None) -> KeySource:
         st = os.stat(p)
         ident = (p, st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_mode)
     except FileNotFoundError:
+        if _CACHE[0] != (p, "absent"):
+            forget_resolved()                 # a new file identity: nothing retrieved under the old one is reused
         _CACHE = ((p, "absent"), KeySource("none"))
         return _CACHE[1]
     except OSError:
         return KeySource("error", error="Cannot read the API key source configuration")
     if _CACHE[0] == ident:
         return _CACHE[1]
+    forget_resolved()
     try:
         with open(p, "r", encoding="utf-8", errors="replace") as fh:   # a stray byte in a comment is not an outage
             source = parse_source(fh.read())
@@ -350,6 +639,17 @@ def read_source(path: str | None = None) -> KeySource:
 
 
 def select_source(startup_key: str = "") -> KeySource:
+    """_select_source, plus the bookkeeping every selection carries: health()'s kind/sourceFp, and the
+    one-shot notice when an op reference is selected with nothing for op to authenticate from."""
+    source = _select_source(startup_key)
+    with _RESOLVE_CV:
+        _HEALTH["kind"], _HEALTH["sourceFp"] = source.kind, source.fingerprint()
+    if source.kind == "op":
+        _note_missing_op_credential(service_env_path())
+    return source
+
+
+def _select_source(startup_key: str = "") -> KeySource:
     """Choose a source without fetching it; only a never-configured file permits env fallback.
 
     Track the path, not one global flag, so isolated kernels/tests with different config roots
@@ -477,6 +777,37 @@ def write_source(source: KeySource, path: str | None = None) -> dict:
     if source.kind not in ("op", "file", "environment"):
         raise KeySourceError("Select an API key or a 1Password reference")
     given = path or service_env_path()
+    new_line = "%s=%s" % (REF_VAR if source.kind == "op" else KEY_VAR, source.value)
+    r = _rewrite_assignment(given, (KEY_VAR, REF_VAR), new_line)
+    # The durable op memory follows the write: a swap to a reference arms it, a swap to a static key
+    # clears it, so the marker never outlives the choice it records (select_source consults it).
+    remember_file_source(given, "op" if source.kind == "op" else "file")
+    return {"path": given, "old": parse_source(r["body"]), "new": source, "mode": r["mode"],
+            "tightened": r["tightened"], "lines": r["lines"], "target": r["target"]}
+
+
+def write_assignment(name: str, value: str, path: str | None = None) -> dict:
+    """Atomically set ONE `NAME=VALUE` line in the env file, with write_source's guarantees (the last
+    assignment replaced in place, earlier duplicates dropped, every other line byte-identical, 0600 temp
+    file + os.replace, a symlink written through, mode narrowed to 0600). The CLI's way of adding
+    OP_SERVICE_ACCOUNT_TOKEN beside a reference without an operator hand-editing a 0600 file. Returns
+    {"path", "target", "mode", "tightened", "replaced"}; `replaced` says whether a line was already there."""
+    name = str(name or "").strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise KeySourceError("Environment variable names are letters, digits and underscores")
+    value = str(value or "")
+    if any(c in value for c in ("\r", "\n", "\0")):
+        raise KeySourceError("Environment values must be a single line")
+    given = path or service_env_path()
+    r = _rewrite_assignment(given, (name,), "%s=%s" % (name, value))
+    return {"path": given, "target": r["target"], "mode": r["mode"], "tightened": r["tightened"],
+            "replaced": r["replaced"]}
+
+
+def _rewrite_assignment(given: str, names: tuple, new_line: str) -> dict:
+    """The shared rewrite under write_source and write_assignment (see write_source for the guarantees).
+    Returns the file's previous body, the target actually written, the mode, whether it was tightened,
+    the line count, and whether an existing assignment of one of `names` was replaced."""
     p = os.path.realpath(given) if os.path.islink(given) else given
     try:
         with open(p, "r", encoding="utf-8", errors="replace") as fh:
@@ -484,15 +815,13 @@ def write_source(source: KeySource, path: str | None = None) -> dict:
         existed = True
     except FileNotFoundError:
         body, existed = "", False
-    old = parse_source(body)
     lines = body.splitlines()
     trailing_nl = (not body) or body.endswith("\n")
-    # Which physical lines assign the key: the LAST one is rewritten in place, earlier ones drop.
+    # Which physical lines assign the name: the LAST one is rewritten in place, earlier ones drop.
     hits = [i for i, raw in enumerate(lines)
             if raw.strip() and not raw.strip().startswith("#")
             and raw.strip().partition("=")[1]
-            and raw.strip().partition("=")[0].strip() in (KEY_VAR, REF_VAR)]
-    new_line = "%s=%s" % (REF_VAR if source.kind == "op" else KEY_VAR, source.value)
+            and raw.strip().partition("=")[0].strip() in names]
     if hits:
         lines[hits[-1]] = new_line
         for i in reversed(hits[:-1]):
@@ -527,11 +856,9 @@ def write_source(source: KeySource, path: str | None = None) -> dict:
         except OSError:
             pass
         raise
-    # The durable op memory follows the write: a swap to a reference arms it, a swap to a static key
-    # clears it, so the marker never outlives the choice it records (select_source consults it).
-    remember_file_source(given, "op" if source.kind == "op" else "file")
-    return {"path": given, "old": old, "new": source, "mode": mode, "tightened": tightened,
-            "lines": len(lines), "target": p}
+    forget_resolved()                          # the file moved under every value retrieved so far
+    return {"body": body, "target": p, "mode": mode, "tightened": tightened, "lines": len(lines),
+            "replaced": bool(hits)}
 
 
 def write_key(key: str, path: str | None = None) -> dict:

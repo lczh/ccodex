@@ -97,6 +97,7 @@ MOCK
     # names map under XDG_STATE_HOME (was polluting the REAL state dir).
     export HOME="$TEST_DIR/home"
     export XDG_STATE_HOME="$HOME/.local/state"
+    export XDG_CONFIG_HOME="$HOME/.config"   # `romp refresh` now preflights the key source from ${XDG_CONFIG_HOME:-~/.config}/romp/service.env (2026-09-07): CI exports its own XDG_CONFIG_HOME
     mkdir -p "$HOME"
     cd "$WORK_DIR"
 }

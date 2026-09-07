@@ -20,11 +20,12 @@ update` starts a session called "update".
 | `romp new -t <name>` | Start it as a terminal (tmux) session and attach; add `--detach` to leave it running |
 | `romp resume` | Resume a past conversation, chosen from a full-screen picker |
 | `romp status` | Manager and kernel status |
-| `romp refresh` | Restart the postal bus and every kernel immediately, picking up new code (cut turns resume with their history) |
+| `romp refresh [--quiet] [--force]` | Restart the postal bus and every kernel immediately, picking up new code (cut turns resume with their history). Runs `romp keysource --check` first and refuses to restart into a state where API-key-billed sessions would hold for want of a key source; `--force` restarts anyway |
 | `romp update [host…]` | Push this machine's committed Romp to attached remotes and restart them |
 | `romp up` | Run the kernel manager in the foreground; rare, since the login service runs it |
 | `romp version` | Version report across the moving parts |
 | `romp keyswap [<name>] [--cycle <session,…>\|--cycle-all]` | Switch the API key source without restarting the manager: selects a 1Password reference or a legacy key from `service.env.<name>`, and `--cycle` reconnects running sessions onto it. Bare, it reports the configured source and candidates without fetching secrets. See [Switching which API key the sessions bill](#switching-which-api-key-the-sessions-bill-romp-keyswap) |
+| `romp keysource [--check\|--probe] [--ref <op://…>] [--token-stdin\|--no-token] [--yes] [--restart] [--path <file>]` | Set up the 1Password route, guided: the reference (validated), how `op` authenticates (a service-account token pasted without echo and written as `OP_SERVICE_ACCOUNT_TOKEN`, or the desktop app / `op signin`), then what is live at once and what needs the login service restarted, with the exact command and a `[y/N]`; with a kernel running it ends by probing the new route on it so held sessions resume without a restart. Bare, it first reports the configured source and whether an `op` credential line is present, by name. `--check` is the preflight `romp refresh` runs: it asks the running kernel first, and exits 1 with the remedy only when sessions would actually hold (an explicit API-key pick, or a remembered `key` Billing pick, and no source). `--probe` asks the running kernel to resolve the source once and release the sessions it holds. Never prints a key, token or reference value. See [Updating onto the 1Password route](#updating-onto-the-1password-route) |
 | `romp help` | The same list, from the terminal |
 
 These are for scripting and for agents rather than daily use:
@@ -368,18 +369,29 @@ selected configuration. An empty or invalid reference is an error, not a
 request to use the legacy key. Remove competing plaintext assignments when
 migrating; `romp keyswap` does this automatically when selecting a profile.
 
-Romp runs [`op read --no-newline`](https://www.1password.dev/cli/reference/commands/read)
-for each Claude SDK session launch or reconnect, each API-key-billed judge
-call, and each direct model-catalog refresh. A paginated catalog refresh uses
-that credential for all its pages. An explicit `romp keyswap --cycle` resolves
-the key once per request to check which quiet sessions need a reconnect. When
-a retrieval fails, the judges do not retry it on every call: the failure holds
-for the rest of that judging pass and is retried when the next pass begins or
-the source changes, so an unreachable `op` costs one timeout per pass. Romp
-captures the value in memory and passes it to that operation. It does not write the resolved key
-to disk or cache it for later operations. A running Claude process retains
-the key it received at launch until it reconnects; this is not retrieval
-before every message in an existing session.
+Romp resolves the reference with
+[`op read --no-newline`](https://www.1password.dev/cli/reference/commands/read)
+for a Claude SDK session launch or reconnect, an API-key-billed judge call,
+and a direct model-catalog refresh — at most once per `ROMP_OP_REUSE_S`
+window (60 s by default; `0` restores one read per operation). A paginated
+catalog refresh uses that credential for all its pages. An explicit `romp
+keyswap --cycle` resolves the key once per request to check which quiet
+sessions need a reconnect. When a retrieval fails, the judges do not retry it
+on every call: the failure holds for the rest of that judging pass and is
+retried when the next pass begins or the source changes, so an unreachable
+`op` costs one timeout per pass. Romp captures the value in memory and passes
+it to that operation. It never writes the resolved key to disk. Within the
+reuse window it keeps the last successful `op read` in memory, so the N judge
+calls of one pass and a burst of session launches share one `op` process
+instead of running N, and a transient `op` blip inside that window cannot
+fail them; a failed read is retried once before it is reported, and a
+failure is never kept — the next call runs `op` again. The window is per
+process and per reference: a `romp keyswap` to another reference reads
+afresh, and a kernel restart starts empty. A key rotated behind the SAME
+reference is picked up within the window on its own, or at once by `romp
+keyswap --cycle`, which reads afresh. A running Claude process retains the
+key it received at launch until it reconnects; this is not retrieval before
+every message in an existing session.
 
 The `op` executable must be on the **service's PATH**, and 1Password access
 must work for the OS user running the service. The service installer records
@@ -426,10 +438,16 @@ This keeps the token out of every agent's shell by default; it is
 inheritance hygiene, not isolation. The file stays readable to the same OS
 user (keep it `chmod 600`), and a same-user process can read the manager's
 original environment, which is why the account must see only the one vault.
-Like the rest of `service.env`, the token line loads when the manager starts;
-changing it needs a manager restart, where the reference itself is read live.
-Do not put the token in a per-session environment (`romp new --env`), which
-is copied into per-session files.
+The `OP_*` lines of `service.env` now reach the kernel's `op read` live: a
+token added or rotated in the file works for the KERNEL's reads (session
+launches, judge calls, the catalog) without a manager restart. The manager's
+OWN environment is still fixed at its start, so a service restart is what
+makes the new token the service's too — `systemctl --user restart
+romp-manager.service` on Linux, `launchctl kickstart -k gui/$(id -u)/com.romp.manager`
+on macOS; `romp keysource` prints the right one and offers to run it. The
+reference itself has always been read live. Do not put the token in a
+per-session environment (`romp new --env`), which is copied into per-session
+files.
 
 A supervised manager (the systemd or launchd service) reads its key source
 from `service.env` **only**. A key that reaches the manager some other way, a
@@ -474,6 +492,65 @@ reference line and restarting does not make sessions fall to the login.
 Selecting a static key — `romp keyswap <static profile>`, or writing an
 `ANTHROPIC_API_KEY=` line — removes the marker, so an intentional switch is
 not an error. `romp keyswap` does not list the marker as a profile.
+
+#### Updating onto the 1Password route
+
+What happens when a box that predates the runtime key source takes this
+version depends on how its sessions were getting their key:
+
+- **A box that billed a key through Claude Code's `apiKeyHelper`** (the key
+  never rode `service.env`) keeps working. Launches still ride the helper,
+  and the kernel says so once in its log; nothing to do unless you want Romp
+  to hold the reference itself.
+- **A box on API-key billing with no key source** — sessions with an explicit
+  API-key Billing pick (or seeded from a remembered `key` pick), and neither a
+  `ROMP_API_KEY_REF=` nor an `ANTHROPIC_API_KEY=` line in `service.env` — no
+  longer crashes its sessions at launch. Each such session is HELD, with the remedy on its card and one
+  line in the kernel log, and resumes on its own the moment a source appears
+  in the file: no restart, no re-send.
+- **`romp refresh` refuses to restart into that state.** It runs
+  `romp keysource --check` first; on exit 1 it prints the remedy and stops
+  before the audit row and the restart. `romp refresh --force` restarts
+  anyway. A preflight that cannot run at all (no `python3`) is a one-line
+  warning, never a block. The check asks the RUNNING kernel first (`GET
+  /keysource`, with the serve token): the kernel is what launches sessions,
+  so a source it reports as configured passes at once, whatever the file
+  says — a foreground `romp up` on an environment key has no file line to
+  read. Only when no kernel answers does the file decide, and then it refuses
+  only for what the kernel would actually hold: an alive session with an
+  explicit API-key pick, or a remembered `key` Billing pick (which seeds
+  every new session), with no source and no `apiKeyHelper`.
+  `ROMP_EXPECTED_AUTH=key` alone holds nobody — an unpicked session launches
+  login-side, and the declaration goes inert once a Billing pick exists — so
+  it is mentioned as context, never a reason to refuse. A box that no login
+  service supervises gets a warning and exit 0 instead of a refusal, because
+  its manager may hold a key the file cannot show. `romp update` and the
+  dashboard's Update button restart WITHOUT this preflight; on a box without
+  a key source the result is the held state, reported on that kernel's cards
+  and in its log.
+- **After fixing `op` or the token, `romp keysource --probe`** asks the
+  running kernel to resolve the source once (`POST /keysource/probe`; one
+  `op read` for the whole board) and release every session it holds whose
+  reason is gone, printing the outcome and the released sessions by name. A
+  guided `romp keysource` run does this itself at the end when a kernel is
+  reachable. Without the probe, the next judge pass, session launch or `romp
+  refresh` picks the fix up.
+- **`romp keysource`** walks through the setup: it reports the configured
+  source and whether an `op` credential is present in the file (by name),
+  asks for the reference and validates it, asks how `op` authenticates (a
+  service-account token, pasted without echo and written as
+  `OP_SERVICE_ACCOUNT_TOKEN`; or the desktop app / `op signin`, which a
+  headless service cannot use), writes both lines atomically at mode 600,
+  and says what is live at once (the reference) and what the login service
+  only sees after a restart (a NEW token line, for the manager's own
+  environment), with the exact command and a `[y/N]`. Non-interactive:
+  `romp keysource --ref op://vault/item/field --token-stdin --yes` (token on
+  stdin) or `--no-token --yes`; `--restart` runs the restart without asking;
+  `--path <file>` names another env file — when it is not the one the kernel
+  reads, the write is reported as NOT live (select it with `romp keyswap
+  <name>` if it is a `service.env.<name>` sibling, or point
+  `ROMP_SERVICE_ENV_FILE` at it and restart the service), and `--check --path`
+  is a dry run of the file logic alone.
 
 Removing or emptying an explicit service-file key source cannot revive the
 key inherited when the kernel started. After removing a selected provider,
@@ -558,9 +635,10 @@ without resolving it; this cannot verify the secret value or detect a rotation
 behind an unchanged reference. An explicit `--cycle` resolves the current key
 for each quiet session and reconnects it if that key differs from its launch
 key, including when the reference itself is unchanged. A session already
-using that key reads `current` and stays connected. A reconnect resolves the
-source again at the actual launch, so it does not reuse a key cached by the
-cycle check.
+using that key reads `current` and stays connected. A reconnect inside the
+reuse window (`ROMP_OP_REUSE_S`, 60 s by default) launches on the key the
+cycle check just resolved; outside it, or with the window set to `0`, the
+launch resolves the source again.
 
 **One restart, once:** a running kernel needs to load this version to support
 runtime providers. Take the update with `romp refresh` — or `romp refresh

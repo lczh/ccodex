@@ -1046,6 +1046,21 @@ def _work_key_configured():
     return _keysrc.select_source(os.environ.get("ANTHROPIC_API_KEY", "") or "").configured
 
 
+def _key_source_unconfigured():
+    """True only when the selected key source is KNOWN to be unconfigured without retrieving anything: the
+    kernel's configured wire when it is up; a standalone caller wiring the key callback alone leaves the
+    verdict to the retrieval (as before); no wire at all reads the source descriptor. Never _work_key():
+    a resolve here would run outside the per-pass gate."""
+    if _WORK_KEY_CONFIGURED_FN is not None:
+        return not _WORK_KEY_CONFIGURED_FN()
+    if _WORK_KEY_FN is not None:
+        return False
+    return not _keysrc.select_source(os.environ.get("ANTHROPIC_API_KEY", "") or "").configured
+
+
+_CLI_SELF_AUTH_SAID = set()   # the judges-bill-through-the-helper line: said once per process
+
+
 def _login_auth_env():
     if _LOGIN_AUTH_ENV_FN is not None:
         return _LOGIN_AUTH_ENV_FN()
@@ -1327,9 +1342,22 @@ def _judge_env(tier, auth="login", model=None):
         # _judge_run is the lever that lands. Both ride together; neither can hurt the other.
         env["MAX_THINKING_TOKENS"] = "0"
     if auth == "key":
+        # No source configured at all (a supervised box whose env file carries no key line: the session's
+        # `key` pick outlived the line) is decided BEFORE any retrieval, so a retrieval FAILURE keeps its own
+        # path below. When Claude Code's own settings name an apiKeyHelper the child authenticates itself
+        # exactly as every judge did before runtime retrieval existed — the pre-2026-09-07 behaviour whose
+        # replacement by a hard error logged err=auth on every pass and took the board down; said once.
+        if _key_source_unconfigured():
+            if _keysrc.cli_self_auth():
+                if not _CLI_SELF_AUTH_SAID:
+                    _CLI_SELF_AUTH_SAID.add(True)
+                    sys.stderr.write("romp-judge: judges bill through Claude Code's apiKeyHelper — no romp key "
+                                     "source is configured; %s\n" % _keysrc.remedy())
+                return env
+            raise _keysrc.KeySourceError(_keysrc.remedy())
         wk = _resolve_work_key_gated()               # resolve only at the call boundary — once per pass on failure
         if not wk:
-            raise _keysrc.KeySourceError("No API key source is configured for this judge call")
+            raise _keysrc.KeySourceError(_keysrc.remedy())
         env["ANTHROPIC_API_KEY"] = wk
     return env
 

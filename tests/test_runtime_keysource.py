@@ -39,27 +39,42 @@ def env(tmp_path, monkeypatch):
     monkeypatch.delenv("ROMP_API_KEY_REF", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ROMP_SUPERVISED", raising=False)
-    ks._CACHE = ((), "")
-    ks._AUTHORITATIVE_PATHS.clear()
-    ks._ENV_PROVIDER_PATHS.clear()
-    ks._TMUX_SCRUBBED.clear()
+    # The reuse window is its own subject (the tests that name it set it); the contract tests above it
+    # observe EVERY retrieval, as they always did.
+    monkeypatch.setenv("ROMP_OP_REUSE_S", "0")
+    # Never this box's real Claude Code settings: cli_self_auth reads $CLAUDE_CONFIG_DIR/settings.json
+    # and the managed files, and a developer's own apiKeyHelper must not decide a test.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setattr(ks, "CLI_MANAGED_SETTINGS", ())
+    _reset_module_state()
     # Unexpected retrieval fails locally: no test may invoke the real executable. The tmux scrub the
     # claim runs has its own runner (keysource._TMUX_RUN, bound at import for exactly this reason):
-    # recorded here, never run — no test may touch a tmux server, private socket dir or not.
+    # recorded here, never run — no test may touch a tmux server, private socket dir or not. The retry
+    # delay is recorded the same way (keysource._SLEEP), so a retried failure is instant here.
     with mock.patch.object(
         ks.subprocess, "run", side_effect=AssertionError("unexpected credential retrieval")
-    ) as op, mock.patch.object(ks, "_TMUX_RUN") as tmux:
-        yield SimpleNamespace(path=path, root=tmp_path, op=op, tmux=tmux)
+    ) as op, mock.patch.object(ks, "_TMUX_RUN") as tmux, mock.patch.object(ks, "_SLEEP") as sleep:
+        yield SimpleNamespace(path=path, root=tmp_path, op=op, tmux=tmux, sleep=sleep)
+    _reset_module_state()
+
+
+def _reset_module_state():
     ks._CACHE = ((), "")
     ks._AUTHORITATIVE_PATHS.clear()
     ks._ENV_PROVIDER_PATHS.clear()
     ks._TMUX_SCRUBBED.clear()
+    ks.forget_resolved()
+    ks._RESOLVING.clear()
+    ks._CLI_SETTINGS_CACHE.clear()
+    ks._NO_OP_CRED_SAID = False
+    ks._OP_CRED_SEEN = False
+    ks._HEALTH.update(kind="", sourceFp="", lastOkT=0.0, lastFailT=0.0, note="")
 
 
-def result(value=OLD_KEY.encode(), returncode=0):
+def result(value=OLD_KEY.encode(), returncode=0, stderr=SECRET_STDERR.encode()):
     return subprocess.CompletedProcess(
         ["op", "read", "--no-newline", REF], returncode,
-        stdout=value, stderr=SECRET_STDERR.encode(),
+        stdout=value, stderr=stderr,
     )
 
 
@@ -103,7 +118,7 @@ def test_resolve_executes_literal_reference_with_bounded_noninteractive_io(env):
     assert not kwargs.get("shell", False)
     assert kwargs["stdin"] == subprocess.DEVNULL
     assert kwargs["stdout"] == subprocess.PIPE
-    assert kwargs["stderr"] == subprocess.DEVNULL
+    assert kwargs["stderr"] == subprocess.PIPE      # captured for classification only; never logged (below)
     assert 0 < kwargs["timeout"] <= 30
     assert kwargs["check"] is False
     assert not (env.root / "SHOULD_NOT_EXIST").exists()
@@ -116,7 +131,14 @@ def test_each_resolution_observes_rotation_without_caching_or_disk_writes(env):
     names = sorted(env.root.iterdir())
     env.op.side_effect = [result(OLD_KEY.encode()), result(NEW_KEY.encode())]
 
-    with mock.patch.object(ks, "open", create=True, side_effect=AssertionError("disk access")), \
+    real_open = open
+
+    def read_only(path, mode="r", *a, **k):
+        # resolve() may READ the env file (op's own credential lines ride from it, 2026-09-07); it never writes
+        assert set(mode) <= {"r", "b", "t"}, "disk access"
+        return real_open(path, mode, *a, **k)
+
+    with mock.patch.object(ks, "open", create=True, side_effect=read_only), \
             mock.patch.object(ks.os, "open", side_effect=AssertionError("disk access")), \
             mock.patch.object(ks.tempfile, "mkstemp", side_effect=AssertionError("disk access")):
         assert source.resolve() == OLD_KEY
@@ -145,7 +167,9 @@ def test_provider_failures_are_safe_credential_errors(env, provider_failure):
         env.op.side_effect = OSError(SECRET_STDERR)
 
     safe_failure(ks.KeySource("op", REF).resolve)
-    assert env.op.call_count == 1
+    # a nonzero exit or a timeout gets ONE bounded retry; a missing or unrunnable binary is final at once
+    assert env.op.call_count == (2 if provider_failure in ("nonzero", "timeout") else 1)
+    assert env.sleep.call_count == env.op.call_count - 1
 
 
 @pytest.mark.parametrize("value", [
@@ -352,16 +376,16 @@ def test_provider_failure_does_not_fall_back_to_competing_keys(env, monkeypatch)
 
     safe_failure(lambda: ks.select_source(BOOT_KEY).resolve())
     assert ks.select_source(BOOT_KEY).kind == "op"
-    assert env.op.call_count == 1
+    assert env.op.call_count == 2                    # the one bounded retry, then the failure stands
 
 
 def test_provider_failure_after_success_cannot_reuse_previous_resolved_key(env):
     env.path.write_text(f"ROMP_API_KEY_REF={REF}\n")
-    env.op.side_effect = [result(), result(returncode=1)]
+    env.op.side_effect = [result(), result(returncode=1), result(returncode=1)]
     assert ks.select_source(BOOT_KEY).resolve() == OLD_KEY
 
     safe_failure(lambda: ks.select_source(BOOT_KEY).resolve())
-    assert env.op.call_count == 2
+    assert env.op.call_count == 3
 
 
 @pytest.mark.parametrize("edit", ["remove-file", "remove-assignment", "empty-reference"])
@@ -714,3 +738,342 @@ def test_op_read_gets_a_minimal_environment(env, tmp_path, monkeypatch):
     for present in ("PATH", "HOME", "XDG_CONFIG_HOME", "LC_ALL", "OP_SERVICE_ACCOUNT_TOKEN"):
         assert present in names, present
     assert not any(n.startswith("ROMP_") for n in names), "nothing of romp's reaches op"
+
+
+# ───────────────────────── 2026-09-07: the outage that a hard error caused ─────────────────────────
+# A session whose pick said "key" on a box whose env file carried no key line used to launch without an
+# injected key and let Claude Code's own apiKeyHelper authenticate it; making that a hard error killed
+# the session thread, logged err=auth on every judge pass, and kept the board down until an operator
+# wrote a reference + op token into the file and restarted the service. The pieces below are what the
+# kernel, the judges and the CLI now share to say the same thing and to keep op's blips from being outages.
+
+
+def test_remedy_is_one_text_that_names_the_env_file_and_the_cli(env):
+    text = ks.remedy()
+    assert text == ks.REMEDY % str(env.path)
+    assert "romp keysource" in text and "ROMP_API_KEY_REF=op://vault/item/field" in text
+    assert "OP_SERVICE_ACCOUNT_TOKEN" in text and str(env.path) in text
+    assert ks.REMEDY.count("%s") == 1
+
+
+def test_cli_self_auth_reports_presence_only_and_never_the_helper_command(env, tmp_path, monkeypatch):
+    settings = tmp_path / "claude" / "settings.json"
+    settings.parent.mkdir()
+    assert ks.cli_self_auth() == "", "no settings file: nothing authenticates a keyless child"
+    settings.write_text('{"apiKeyHelper": "/opt/TEST-helper-command --secret"}')
+    assert ks.cli_self_auth() == "apiKeyHelper"
+    assert "TEST-helper-command" not in repr(vars(ks)), "presence only: the command is never kept"
+    settings.write_text('{"apiKeyHelper": "   "}')
+    assert ks.cli_self_auth() == "", "a blank helper is no helper; the stat cache noticed the rewrite"
+    settings.write_text("not json at all")
+    assert ks.cli_self_auth() == ""
+    settings.unlink()
+    managed = tmp_path / "managed-settings.json"
+    managed.write_text('{"apiKeyHelper": "/opt/TEST-managed-helper"}')
+    monkeypatch.setattr(ks, "CLI_MANAGED_SETTINGS", (str(managed),))
+    assert ks.cli_self_auth() == "apiKeyHelper", "a managed (admin) settings file counts too"
+    assert "TEST-managed-helper" not in repr(vars(ks))
+    env.op.assert_not_called()
+
+
+def test_write_assignment_sets_one_line_and_leaves_every_other_byte_alone(env):
+    original = (f"# keep this comment\nOP_SERVICE_ACCOUNT_TOKEN=ops_TEST_stale_one\nROMP_PERF=1\n"
+                f"ROMP_API_KEY_REF={REF}\nOP_SERVICE_ACCOUNT_TOKEN=ops_TEST_stale_two\n")
+    env.path.write_text(original)
+    env.path.chmod(0o644)
+    r = ks.write_assignment("OP_SERVICE_ACCOUNT_TOKEN", "ops_TEST_fresh")
+    assert r == {"path": str(env.path), "target": str(env.path), "mode": 0o600, "tightened": True, "replaced": True}
+    assert env.path.read_text() == (f"# keep this comment\nROMP_PERF=1\nROMP_API_KEY_REF={REF}\n"
+                                    f"OP_SERVICE_ACCOUNT_TOKEN=ops_TEST_fresh\n")
+    assert stat.S_IMODE(env.path.stat().st_mode) == 0o600
+    assert sorted(env.root.iterdir()) == [env.path], "no temp file left behind"
+    # the reference line and its marker are not this call's business
+    assert ks.select_source(BOOT_KEY).value == REF
+    # a file with no such line gets one appended; a missing file is created 0600
+    r = ks.write_assignment("OP_ACCOUNT", "my.1password.example")
+    assert r["replaced"] is False and env.path.read_text().endswith("OP_ACCOUNT=my.1password.example\n")
+    fresh = env.root / "fresh.env"
+    r = ks.write_assignment("OP_SERVICE_ACCOUNT_TOKEN", "ops_TEST_new", str(fresh))
+    assert (r["replaced"], r["mode"], r["tightened"]) == (False, 0o600, False)
+    assert fresh.read_text() == "OP_SERVICE_ACCOUNT_TOKEN=ops_TEST_new\n"
+    assert stat.S_IMODE(fresh.stat().st_mode) == 0o600
+    # a symlinked env file is written THROUGH, like write_source
+    target = env.root / "dotfiles.env"
+    target.write_text("ROMP_PERF=1\n")
+    link = env.root / "link.env"
+    link.symlink_to(target)
+    r = ks.write_assignment("OP_SERVICE_ACCOUNT_TOKEN", "ops_TEST_linked", str(link))
+    assert r["target"] == str(target) and link.is_symlink()
+    assert target.read_text() == "ROMP_PERF=1\nOP_SERVICE_ACCOUNT_TOKEN=ops_TEST_linked\n"
+    with pytest.raises(ks.KeySourceError):
+        ks.write_assignment("not a name", "x")
+    with pytest.raises(ks.KeySourceError):
+        ks.write_assignment("OP_SERVICE_ACCOUNT_TOKEN", "two\nlines")
+    env.op.assert_not_called()
+
+
+def test_health_carries_kind_fingerprint_and_times_but_never_a_value(env):
+    env.path.write_text(f"ROMP_API_KEY_REF={REF}\n")
+    source = ks.select_source(BOOT_KEY)
+    h = ks.health()
+    assert (h["kind"], h["sourceFp"]) == ("op", source.fingerprint())
+    assert h["lastOkT"] == 0.0 and h["lastFailT"] == 0.0 and h["note"] == ""
+    env.op.side_effect = [result(), result(returncode=1, stderr=b"401: unauthorized " + SECRET_STDERR.encode()),
+                          result(returncode=1, stderr=SECRET_STDERR.encode())]
+    assert source.resolve() == OLD_KEY
+    assert ks.health()["lastOkT"] > 0 and ks.health()["lastFailT"] == 0.0
+    err = safe_failure(source.resolve)
+    h = ks.health()
+    assert h["lastFailT"] >= h["lastOkT"] and h["note"] == str(err)
+    assert SECRET_STDERR not in repr(h) and OLD_KEY not in repr(h) and REF not in repr(h)
+    assert set(h) == {"kind", "sourceFp", "lastOkT", "lastFailT", "note"}
+
+
+@pytest.mark.parametrize("stderr_text,klass", [
+    ("[ERROR] 2026/09/07 401: Unauthorized — invalid session token", "auth"),
+    ('[ERROR] "credential" isn\'t an item in the "test-vault" vault', "not-found"),
+    ("[ERROR] Get https://example: dial tcp: connection refused", "network"),
+    ("[ERROR] something nobody classified", "other"),
+])
+def test_a_failed_op_read_is_retried_once_then_classified_without_echoing_stderr(env, capsys, stderr_text, klass):
+    env.op.side_effect = [result(returncode=1, stderr=(stderr_text + " " + SECRET_STDERR).encode())] * 2
+    err = safe_failure(ks.KeySource("op", REF).resolve)
+    assert str(err).endswith("(op: %s, exit 1)" % klass)
+    assert env.op.call_count == 2, "one bounded retry"
+    env.sleep.assert_called_once_with(ks.OP_RETRY_DELAY_S)
+    # the text of op's stderr appears nowhere: not the error, not the health line, not the log wire
+    assert SECRET_STDERR not in str(err) and stderr_text.split("]")[-1].strip()[:12] not in str(err)
+    assert SECRET_STDERR not in ks.health()["note"] and SECRET_STDERR not in capsys.readouterr().err
+    assert SECRET_STDERR not in repr(vars(ks))
+
+
+def test_a_transient_blip_is_absorbed_by_the_retry(env):
+    env.op.side_effect = [result(returncode=1, stderr=b"dial tcp: i/o timeout"), result(NEW_KEY.encode())]
+    assert ks.KeySource("op", REF).resolve() == NEW_KEY
+    assert env.op.call_count == 2 and env.sleep.call_count == 1
+    env.op.side_effect = [subprocess.TimeoutExpired(["op"], 15, stderr=SECRET_STDERR.encode()), result(OLD_KEY.encode())]
+    assert ks.KeySource("op", REF).resolve() == OLD_KEY
+    assert env.op.call_count == 4
+    env.op.side_effect = [subprocess.TimeoutExpired(["op"], 15)] * 2
+    err = safe_failure(ks.KeySource("op", REF).resolve)
+    assert "timed out" in str(err) and "(op: network, timeout after 2 attempts)" in str(err)
+    assert env.op.call_count == 6, "a timeout is retried once and then stands"
+
+
+def test_concurrent_callers_for_one_source_share_a_single_op_read(env):
+    import threading
+    release, started = threading.Event(), threading.Event()
+
+    def slow(*a, **k):
+        started.set()
+        assert release.wait(5.0)
+        return result(NEW_KEY.encode())
+    env.op.side_effect = slow
+    source, got = ks.KeySource("op", REF), []
+    threads = [threading.Thread(target=lambda: got.append(source.resolve())) for _ in range(6)]
+    for t in threads:
+        t.start()
+    assert started.wait(5.0)
+    release.set()
+    for t in threads:
+        t.join(5.0)
+    assert got == [NEW_KEY] * 6
+    assert env.op.call_count == 1, "one `op` process for the whole wave, even with the reuse window off"
+    assert not ks._RESOLVING and not ks._RESOLVED, "the flight is gone; with ROMP_OP_REUSE_S=0 nothing is kept"
+    assert NEW_KEY not in repr(vars(ks))
+
+
+def test_waiters_on_a_failed_read_share_its_verdict_and_the_next_caller_retrieves_afresh(env):
+    import threading
+    release, started = threading.Event(), threading.Event()
+
+    def slow_fail(*a, **k):
+        started.set()
+        assert release.wait(5.0)
+        return result(returncode=1, stderr=SECRET_STDERR.encode())
+    env.op.side_effect = slow_fail
+    source, outcomes = ks.KeySource("op", REF), []
+
+    def worker():
+        try:
+            outcomes.append(source.resolve())
+        except ks.KeySourceError as e:
+            outcomes.append(str(e))
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    assert started.wait(5.0)
+    release.set()
+    for t in threads:
+        t.join(5.0)
+    assert len(outcomes) == 4 and all("(op: other, exit 1)" in o for o in outcomes)
+    assert env.op.call_count == 2, "the one read (plus its bounded retry) for the whole wave"
+    env.op.side_effect = None
+    env.op.return_value = result(OLD_KEY.encode())
+    assert source.resolve() == OLD_KEY, "a failure is never memoized: the next caller reads again"
+    assert env.op.call_count == 3
+
+
+def test_a_value_within_the_reuse_window_is_handed_out_without_a_new_read(env, monkeypatch):
+    monkeypatch.setenv("ROMP_OP_REUSE_S", "60")
+    env.path.write_text(f"ROMP_API_KEY_REF={REF}\n")
+    env.op.side_effect = None
+    env.op.return_value = result(OLD_KEY.encode())
+    assert ks.select_source(BOOT_KEY).resolve() == OLD_KEY
+    assert ks.select_source(BOOT_KEY).resolve() == OLD_KEY
+    assert env.op.call_count == 1, "the second resolve inside the window spawned no op"
+    assert OLD_KEY not in repr(vars(ks)), "kept in memory, but never where a repr of module state shows it"
+    assert sorted(env.root.iterdir()) == [env.path, Path(ks.marker_path(str(env.path)))], "never on disk"
+    ks.forget_resolved()
+    assert ks.select_source(BOOT_KEY).resolve() == OLD_KEY and env.op.call_count == 2
+    env.path.write_text(f"ROMP_PERF=1\nROMP_API_KEY_REF={REF}\n")            # a new file identity
+    assert ks.select_source(BOOT_KEY).resolve() == OLD_KEY and env.op.call_count == 3
+    ks.write_source(ks.KeySource("op", REF))                                   # a rewrite clears it too
+    assert ks.select_source(BOOT_KEY).resolve() == OLD_KEY and env.op.call_count == 4
+    ks.write_assignment("OP_ACCOUNT", "my.1password.example")
+    assert ks.select_source(BOOT_KEY).resolve() == OLD_KEY and env.op.call_count == 5
+    assert ks.KeySource("op", OTHER_REF).resolve() == OLD_KEY and env.op.call_count == 6, "another source: its own read"
+    monkeypatch.setenv("ROMP_OP_REUSE_S", "0")
+    for n in (7, 8):
+        assert ks.select_source(BOOT_KEY).resolve() == OLD_KEY and env.op.call_count == n, "0 disables reuse"
+    monkeypatch.setenv("ROMP_OP_REUSE_S", "60")
+    ks.forget_resolved()                      # the value memoized at the fifth read is still inside its window
+    env.op.side_effect = [result(returncode=1)] * 2 + [result(NEW_KEY.encode())]
+    safe_failure(lambda: ks.select_source(BOOT_KEY).resolve())
+    assert ks.select_source(BOOT_KEY).resolve() == NEW_KEY, "a failure was not memoized; the retry that worked is"
+    assert ks.select_source(BOOT_KEY).resolve() == NEW_KEY and env.op.call_count == 11
+
+
+def test_op_reuse_window_reads_the_environment_at_call_time(monkeypatch):
+    monkeypatch.delenv("ROMP_OP_REUSE_S", raising=False)
+    assert ks.op_reuse_s() == 60.0
+    monkeypatch.setenv("ROMP_OP_REUSE_S", "5")
+    assert ks.op_reuse_s() == 5.0
+    monkeypatch.setenv("ROMP_OP_REUSE_S", "-3")
+    assert ks.op_reuse_s() == 0.0
+    monkeypatch.setenv("ROMP_OP_REUSE_S", "soon")
+    assert ks.op_reuse_s() == 60.0
+
+
+def test_the_env_files_op_token_reaches_op_and_outranks_the_stash(env, monkeypatch):
+    """The op credential follows the FILE (2026-09-07): a supervised manager keeps its start-time
+    environment until the service restarts, so a token written after start could not authenticate op
+    until then. Read as literal assignments at resolve time; never exported into os.environ."""
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "ops_TEST_from_env")
+    env.path.write_text(f"ROMP_API_KEY_REF={REF}\nOP_SERVICE_ACCOUNT_TOKEN='ops_TEST_from_file'\nOP_ACCOUNT=acct.example\n")
+    ks._OP_ENV.clear(); ks._OP_CLAIM_SAID = False
+    try:
+        env.op.side_effect = None
+        env.op.return_value = result(NEW_KEY.encode())
+        assert ks.select_source(BOOT_KEY).resolve() == NEW_KEY
+        sub_env = env.op.call_args.kwargs["env"]
+        assert sub_env["OP_SERVICE_ACCOUNT_TOKEN"] == "ops_TEST_from_file", "the file wins over the claimed stash"
+        assert sub_env["OP_ACCOUNT"] == "acct.example"
+        assert ks._OP_ENV.get("OP_SERVICE_ACCOUNT_TOKEN") == "ops_TEST_from_env", "the stash is untouched"
+        assert "ops_TEST_from_file" not in os.environ.values(), "never exported into the process"
+        assert "ops_TEST_from_file" not in repr(ks._OP_ENV)
+        # env-only still works: without a line in the file the stash rides
+        env.path.write_text(f"ROMP_API_KEY_REF={REF}\n")
+        assert ks.select_source(BOOT_KEY).resolve() == NEW_KEY
+        assert env.op.call_args.kwargs["env"]["OP_SERVICE_ACCOUNT_TOKEN"] == "ops_TEST_from_env"
+        assert ks.file_op_env(str(env.path)) == {}
+    finally:
+        ks._OP_ENV.clear(); ks._OP_CLAIM_SAID = False
+
+
+def test_a_reference_with_no_op_credential_anywhere_is_said_once_and_names_no_value(env, monkeypatch, capsys):
+    for k in [k for k in os.environ if ks.is_op_env_name(k)]:
+        monkeypatch.delenv(k)
+    ks._OP_ENV.clear()
+    env.path.write_text(f"ROMP_API_KEY_REF={REF}\n")
+    assert ks.select_source(BOOT_KEY).kind == "op"
+    assert ks.select_source(BOOT_KEY).kind == "op"
+    err = capsys.readouterr().err
+    assert err.count("no op credential") == 1, "once per process"
+    assert str(env.path) in err and "OP_SERVICE_ACCOUNT_TOKEN" in err and "restart the service" in err
+    # a box that HAS the credential (here: in the file) never hears it
+    _reset_module_state()
+    env.path.write_text(f"ROMP_API_KEY_REF={REF}\nOP_SERVICE_ACCOUNT_TOKEN=ops_TEST_present\n")
+    assert ks.select_source(BOOT_KEY).kind == "op"
+    err = capsys.readouterr().err
+    assert "no op credential" not in err and "ops_TEST_present" not in err
+    env.op.assert_not_called()
+
+
+# ---- the flight is retired on EVERY exit, and the env file's op lines never carry a control character ----
+def _wait_for_a_waiter(deadline_s=5.0):
+    """Block until some thread is parked on the resolve condition — the exact event the waiter tests need,
+    read off the Condition's own waiter list rather than slept for."""
+    import time
+    end = time.monotonic() + deadline_s
+    while not ks._RESOLVE_CV._waiters:
+        assert time.monotonic() < end, "no resolve() waiter appeared"
+        time.sleep(0.005)
+
+
+def test_op_credential_lines_with_control_characters_never_reach_op(env):
+    env.path.write_text("OP_SERVICE_ACCOUNT_TOKEN=ops_TEST\x00bad\nOP_ACCOUNT=my.1password.example\n"
+                        "OP_CONNECT_TOKEN=ops_TEST\x1bbad\nOP_CONNECT_HOST=https://connect.example\n")
+    assert ks.file_op_env(str(env.path)) == {"OP_ACCOUNT": "my.1password.example",
+                                            "OP_CONNECT_HOST": "https://connect.example"}, \
+        "a NUL or an escape in a credential line drops that line, like a garbled key line; the clean ones stay"
+
+
+def test_a_subprocess_refusal_of_the_env_is_a_fixed_error_that_frees_the_waiters(env):
+    """subprocess rejects an environment value with an embedded NUL by raising ValueError — whose text QUOTES
+    the value — before op ever runs. Before the fold, that exception escaped resolve() with the flight still
+    registered, so every concurrent caller sat out the whole op deadline on a reader that never reported."""
+    import threading
+    release, started = threading.Event(), threading.Event()
+
+    def refuse(*a, **k):
+        started.set()
+        assert release.wait(5.0)
+        raise ValueError("embedded null byte in %r" % ("ops_TEST-token\x00", ))
+    env.op.side_effect = refuse
+    source, outcomes = ks.KeySource("op", REF), []
+
+    def worker():
+        try:
+            outcomes.append(source.resolve())
+        except ks.KeySourceError as e:
+            outcomes.append(str(e))
+    reader = threading.Thread(target=worker)
+    reader.start()
+    assert started.wait(5.0)
+    waiter = threading.Thread(target=worker)
+    waiter.start()
+    _wait_for_a_waiter()
+    release.set()
+    for t in (reader, waiter):
+        t.join(5.0)
+        assert not t.is_alive(), "a caller hung on a flight nobody retired"
+    assert outcomes == [ks.OP_ENV_INVALID_ERROR] * 2, "one fixed sentence for the reader and its waiter"
+    assert env.op.call_count == 1, "a refused environment is not retried (nothing transient about it)"
+    env.sleep.assert_not_called()
+    assert not ks._RESOLVING and not ks._RESOLVED
+    assert ks.health()["note"] == ks.OP_ENV_INVALID_ERROR
+    assert "ops_TEST-token" not in repr(outcomes) + repr(ks.health()) + repr(vars(ks))
+
+
+def test_an_unexpected_exception_in_the_read_retires_the_flight_with_a_fixed_sentence(env):
+    env.op.side_effect = RuntimeError(SECRET_STDERR)
+    source = ks.KeySource("op", REF)
+    error = safe_failure(source.resolve)
+    assert str(error) == ks.OP_UNEXPECTED_ERROR
+    assert error.__cause__ is None and error.__suppress_context__, "raised `from None`: the original text never rides the chain"
+    assert not ks._RESOLVING, "the flight is gone"
+    assert ks.health()["note"] == ks.OP_UNEXPECTED_ERROR and ks.health()["lastFailT"] > 0
+    env.op.side_effect = None
+    env.op.return_value = result(NEW_KEY.encode())
+    assert source.resolve() == NEW_KEY, "the next caller retrieves afresh instead of waiting on the dead flight"
+    assert ks.health()["note"] == ""
+
+
+def test_an_interrupt_during_the_read_stays_an_interrupt_but_still_retires_the_flight(env):
+    env.op.side_effect = KeyboardInterrupt
+    source = ks.KeySource("op", REF)
+    with pytest.raises(KeyboardInterrupt):
+        source.resolve()
+    assert not ks._RESOLVING and not ks._RESOLVED
+    assert ks.health()["note"] == ks.OP_UNEXPECTED_ERROR, "the waiters' verdict is a failure, not a value"

@@ -307,7 +307,7 @@ class LiveSpawnEnv(_Backend):
 
     def test_an_empty_key_line_refuses_an_explicit_key_launch(self):
         self.write_env("", lines=["ROMP_PERF=1"])       # `ANTHROPIC_API_KEY=` with nothing after it
-        with self.assertRaisesRegex(ks.KeySourceError, "no API key source"):
+        with self.assertRaisesRegex(ks.KeySourceError, "[Nn]o API key source"):
             self._launch_env(4)
 
     def test_the_live_key_reaches_the_has_a_key_bool_and_the_auth_default(self):

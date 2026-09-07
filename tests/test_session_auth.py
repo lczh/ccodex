@@ -170,7 +170,7 @@ class OptionsInjection(_OptionsHarness):
 
     def test_a_key_pick_with_no_key_refuses_to_launch_on_the_login(self):
         self.be.work_key = ""
-        with self.assertRaisesRegex(sb._keysrc.KeySourceError, "no API key source"):
+        with self.assertRaisesRegex(sb._keysrc.KeySourceError, "[Nn]o API key source"):
             self._options_kw(self._sess(3, auth="key"))
 
 

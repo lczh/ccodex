@@ -58,6 +58,20 @@ os.environ.pop("ROMP_API_KEY_REF", None)
 # suite ran from inside a romp session while CI stayed green (review find, 2026-09-05). The floor is
 # the unsupervised case; a test that wants supervision sets the variable itself.
 os.environ.pop("ROMP_SUPERVISED", None)
+# No test may read the REAL Claude Code settings (2026-09-07): keysource.cli_self_auth() reads
+# $CLAUDE_CONFIG_DIR (else ~/.claude)/settings.json and the managed-settings files for an
+# `apiKeyHelper`, and a keyed launch with no romp key source now rides that helper instead of
+# refusing — so on a developer box that bills through a helper, every "refuses to launch" test would
+# have launched. An empty private dir under the temp state root: the "no helper" case, exactly what
+# CI has. Tests that want a helper write their own settings.json under their own CLAUDE_CONFIG_DIR.
+_NO_CLAUDE_CONFIG = os.path.join(os.environ["XDG_STATE_HOME"], "no-claude-config")
+os.makedirs(_NO_CLAUDE_CONFIG, exist_ok=True)
+os.environ["CLAUDE_CONFIG_DIR"] = _NO_CLAUDE_CONFIG
+# Every `op read` resolves afresh under test (2026-09-07): keysource reuses a key it resolved within
+# ROMP_OP_REUSE_S seconds (default 60) so a busy board issues one read per window, and the suite's
+# call-count assertions were written for one read per operation. The floor is 0; the reuse tests set
+# their own window.
+os.environ["ROMP_OP_REUSE_S"] = "0"
 
 
 def _reset_keysource_state():
@@ -70,6 +84,21 @@ def _reset_keysource_state():
             m._AUTHORITATIVE_PATHS.clear()
             getattr(m, "_ENV_PROVIDER_PATHS", set()).clear()
             m._CACHE = ((), "")
+            # the 2026-09-07 additions: the resolved-key memo and in-flight table, the health record,
+            # the once-per-process notices, the settings stat cache, and the managed-settings paths
+            # (floored to none: a developer box's /etc file must not decide a test)
+            getattr(m, "_RESOLVED", {}).clear()
+            getattr(m, "_RESOLVING", {}).clear()
+            if isinstance(getattr(m, "_HEALTH", None), dict):
+                m._HEALTH.update({"kind": "", "sourceFp": "", "lastOkT": 0.0, "lastFailT": 0.0, "note": ""})
+            for flag in ("_NO_OP_CRED_SAID", "_OP_CRED_SEEN"):
+                if hasattr(m, flag):
+                    setattr(m, flag, False)
+            getattr(m, "_CLI_SETTINGS_CACHE", {}).clear()
+            if hasattr(m, "CLI_MANAGED_SETTINGS"):
+                m.CLI_MANAGED_SETTINGS = ()
+        if "judge" in name and isinstance(getattr(m, "_CLI_SELF_AUTH_SAID", None), set):
+            m._CLI_SELF_AUTH_SAID.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -82,6 +111,8 @@ def _no_real_service_env():
         os.environ[var] = _NO_SERVICE_ENV
     os.environ.pop("ROMP_API_KEY_REF", None)
     os.environ.pop("ROMP_SUPERVISED", None)
+    os.environ["CLAUDE_CONFIG_DIR"] = _NO_CLAUDE_CONFIG    # re-asserted per test, same reasoning as above
+    os.environ["ROMP_OP_REUSE_S"] = "0"
     _reset_keysource_state()
     yield
 

@@ -1125,7 +1125,18 @@ def _refresh_model_catalog(reason, _async=True):
     def go():
         try:
             try:
-                cred = _models_api_credential()
+                try:
+                    cred = _models_api_credential()
+                except jd._keysrc.KeySourceError as e:
+                    # A credential that could not be RETRIEVED (op down, token missing) is not an unreachable
+                    # Models API: the line says which, and names the retrieval's own fixed note (2026-09-07,
+                    # when "Models API unreachable" sent an operator looking at the network during an outage of
+                    # op's credential). The note is keysource's safe text — never op's output or a value.
+                    _catalog_status["lastError"] = "credential retrieval failed: %s" % str(e)[:200]
+                    sys.stderr.write("model catalog (%s): %s — serving the %s list (%d extra id(s) beyond the "
+                                     "seed)\n" % (reason, _catalog_status["lastError"], _catalog_status["source"],
+                                                  len(_catalog_status["added"])))
+                    return
                 if cred is None:
                     _catalog_status["lastError"] = "no API credential in the kernel's environment"
                     sys.stderr.write("model catalog (%s): no API credential the kernel can use — serving the "
@@ -32740,6 +32751,23 @@ def _pusher_cycle():
         _live_scope.paths = None
 
 
+def _keysrc_hold_sweep_tick():
+    """Lift key-source HOLDS on the pusher cycle (2026-09-07). A keyed launch with no configured source
+    and no apiKeyHelper records launchError.keysrc and stands down (sdk_backend._record_launch_error);
+    the hold lifts on NEW information — a source line written, a helper installed, a fingerprint that
+    moved, a retrieval that succeeded after the hold (keysource.health) — which the backend's
+    keysrc_hold_sweep checks WITHOUT running `op` (a stat-cached file read plus a settings stat) and
+    only when some alive session holds such a record: an in-memory set of held sids makes the empty
+    case one membership test per cycle. The lifted sessions are _ensure()d by the backend, under its
+    spawn semaphore and boot stagger; their launch events wake the pusher, so this tick pushes
+    nothing itself. Returns how many lifted. A backend without the method (a stub in tests, an older
+    backend) sweeps nothing."""
+    be = _sdk()
+    if be is None or not hasattr(be, "keysrc_hold_sweep"):
+        return 0
+    return int(be.keysrc_hold_sweep() or 0)
+
+
 def _pusher_cycle_jobs(now, tmux, any_client):
     try:                                  # parked ops deliver on the settle EVENT this cycle was woken for
         _apply_pending_ops()              # (_wake_kernel, /tick, a park/cancel/move, the 0.5 s backstop) —
@@ -32808,6 +32836,10 @@ def _pusher_cycle_jobs(now, tmux, any_client):
         _idle_queue_drive_tick(now, tmux)  # turn driven (crons/monitors/task notices — see the tick)
     except Exception:
         sys.stderr.write("idle-queue-drive: %s\n" % traceback.format_exc())
+    try:                                  # sessions HELD on a key-source launch error start again the cycle
+        _keysrc_hold_sweep_tick()         # after the source appears (O(1) when nothing is held)
+    except Exception:
+        sys.stderr.write("keysrc-hold-sweep: %s\n" % traceback.format_exc())
     try:                                  # expire stale set_working notes once a session goes idle + done (cheap when no notes)
         _clear_done_working_notes(now, tmux)
     except Exception:
@@ -37061,6 +37093,24 @@ class Handler(BaseHTTPRequestHandler):
                 if (q.get("threads") or [""])[0] == "1":       # opt-in: comment-thread rows for the postal
                     rows = rows + _thread_rows()               # bus (the user 2026-08-22); every existing
                 return self._send(200, json.dumps(rows), "application/json", cache="no-cache")   # consumer unchanged
+            if p == "/keysource":
+                # `romp keysource` (the user 2026-09-07): the configured API key SOURCE as this kernel
+                # reads it — kind and fingerprint, the sessions held on a missing or failing source,
+                # keysource.health()'s last-ok/last-fail stamps — never a value, and never an `op` run
+                # (a status read retrieves nothing, the rule /keycycle's read keeps; POST
+                # /keysource/probe is the door that retrieves). Token-gated like /keycycle.
+                be = _sdk()
+                if be is None or not hasattr(be, "keysource_status"):
+                    return self._send(503, json.dumps({"ok": False, "error": "no SDK backend"}),
+                                      "application/json")
+                try:
+                    st = be.keysource_status()
+                except Exception as e:
+                    return self._send(200, json.dumps({"ok": False, "error": jd._credential_error_note(e)}),
+                                      "application/json")
+                st = dict(st) if isinstance(st, dict) else {}
+                st["ok"] = True
+                return self._send(200, json.dumps(st), "application/json", cache="no-cache")
             if p == "/commands":                              # slash-command list for the composer's "/" autocomplete (SDK get_server_info, per-cwd cached)
                 sid = (q.get("sid") or [""])[0]
                 cmds, warming = _commands_for_cwd(_cwd_of(sid) if sid else "")
@@ -37803,6 +37853,11 @@ class Handler(BaseHTTPRequestHandler):
                             probes[sid] = "error: %s" % jd._credential_error_note(e)
                 needs_key = any(v == "cycle" for v in probes.values())
                 if needs_key:
+                    # A cycle exists to pick up a ROTATION behind the same reference, so the retrieval
+                    # below must hit the store: a value the reuse window still holds (keysource
+                    # ROMP_OP_REUSE_S) would report "current" for a key that just changed and cycle
+                    # nothing (review find, 2026-09-07). Same module object the backend resolves through.
+                    jd._keysrc.forget_resolved()
                     try:
                         key, _src = be._work_key_and_source(source)
                         if not key:
@@ -37832,6 +37887,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"ok": True, "keyFp": keyfp,
                                                   "sourceFp": sourcefp, "rows": rows}),
                                   "application/json")
+            if u.path == "/keysource/probe":
+                # `romp keysource --check` / `romp refresh`'s preflight (the user 2026-09-07): ONE
+                # retrieval through the backend's own path (single flight + the reuse window make it
+                # one `op read` for the whole board), which stamps keysource.health(); then every
+                # session HELD on a key-source launch error (launchError.keysrc) whose hold the new
+                # information lifts is started again. Like /keycycle: no key from the caller, none in
+                # the answer — {"ok", "note", "lifted", "kind", "sourceFp"}, the note a fixed sentence.
+                be = _sdk()
+                if be is None or not hasattr(be, "keysource_probe"):
+                    return self._send(503, json.dumps({"ok": False, "error": "no SDK backend"}),
+                                      "application/json")
+                try:
+                    res = be.keysource_probe()
+                except Exception as e:
+                    res = {"ok": False, "note": jd._credential_error_note(e), "lifted": []}
+                res = res if isinstance(res, dict) else {"ok": False, "note": "API credential source failed", "lifted": []}
+                if res.get("lifted"):
+                    _push_soon()                      # held sessions are launching: the board changed
+                return self._send(200, json.dumps(res), "application/json")
             if u.path in ("/interrupt", "/end"):
                 # Headless session control (2026-07-05): interrupt/end existed ONLY as WS drive ops, so
                 # a session could be FED without a browser (POST /send, postal) but never STOPPED — a

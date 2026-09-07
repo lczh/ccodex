@@ -1290,6 +1290,12 @@ def launch_failure_text(exc: BaseException, tail: str = "") -> str:
     every captured stderr part first (_without_scope_fallback_notices: the log already has it, and it
     crowded the CLI's reason out). Truncated, since a stderr dump can run long and this lands in a chat
     card."""
+    if isinstance(exc, _keysrc.KeySourceError):
+        # A credential failure is romp's OWN sentence — the remedy names the file and the command — so it
+        # is the card text verbatim. The "KeySourceError:" prefix explained nothing to the reader (the
+        # user 2026-09-07, whose board was down for twenty minutes on a line nobody could act on).
+        text = str(exc).strip()
+        return text if len(text) <= 600 else text[:600].rstrip() + "…"
     parts = []
     for attr in ("stderr", "stdout"):
         v = getattr(exc, attr, None)
@@ -2424,6 +2430,9 @@ class SdkSession:
         #   _note_auth_source compares the init's apiKeySource against THIS, so a CLI that lands on
         #   the other auth (a stale login, a key found via apiKeyHelper) is flagged loudly instead
         #   of silently billing the wrong account
+        self._launched_via_helper = False  # an API-key pick launched with NO key injected because romp
+        #   holds no key source and Claude Code's own apiKeyHelper authenticates the CLI (_options);
+        #   a keyed landing is then the INTENDED one, and _note_auth_source stays quiet on it
         self._last_cost_total = 0.0   # the CLI's totalCostUSD is CUMULATIVE per process (verified in
         #   the bundle: the result event's total_cost_usd sits beside total_duration/lines counters),
         #   so spend folds the DELTA between results — folding the raw value re-added the whole
@@ -3301,6 +3310,17 @@ class SdkSession:
             self._reconcile_stranded()
             try:
                 opts = self.backend._options(self, ClaudeAgentOptions)
+            except _keysrc.KeySourceError as e:
+                # HOLD, don't crash. No key source (or a source that cannot be read right now) is a
+                # box-wide configuration state, not a defect in this session: the session records
+                # WHY on its reg (launchError.keysrc — the card, the idle-queue drive and the boot
+                # sweep read it), its queued sends stay persisted exactly as under the usage-limit
+                # hold, and this thread ends CLEANLY — no traceback, no "crashed" line — so the
+                # source appearing (or an apiKeyHelper) lifts the hold on the next event
+                # (_keysrc_hold_lifted) instead of waiting for a hand-resume (the user 2026-09-07,
+                # whose sessions died at launch and stayed dead until a service restart).
+                self.backend._record_launch_error(self, e)
+                return
             except Exception as e:
                 # Credential retrieval precedes CLI construction. Surface its failure
                 # as a launch problem without treating it as a refused rewind.
@@ -5047,6 +5067,12 @@ class SdkBackend:
         #   EVERY session whatever its pick. The VALUE is read per launch off `work_key` below, live,
         #   so a keyswap needs no kernel restart (the user 2026-09-04).
         self._key_fp_said = None                  # last key fingerprint written to the log (change-only)
+        self._helper_launch_said = False          # the "launching on Claude Code's apiKeyHelper" row: once per process
+        self._keysrc_failing = False              # a CONFIGURED source's retrieval streak is failing (S5: one line per transition)
+        self._keysrc_held: set[str] = set()       # sids whose reg carries a key-source HOLD (launchError.keysrc):
+        #                                           filled by _record_launch_error and from the regs at boot, pruned
+        #                                           when a hold clears — so keysrc_hold_sweep is O(1) per pusher
+        #                                           cycle whenever nothing is held (the common case)
         # Backend PROBLEMS, kept in a bounded ring so the dashboard can show them (see _log): until
         # 2026-07-28 every SDK failure went to the kernel log alone, which nobody tails, so a session
         # whose stream died or whose model switch was refused just looked odd with no way to find out.
@@ -5096,6 +5122,9 @@ class SdkBackend:
         for reg in regs:
             if reg.get("alive"):
                 self._heal_stale_awaiting(reg["sid"])
+                le = reg.get("launchError")
+                if isinstance(le, dict) and le.get("keysrc"):
+                    self._keysrc_held.add(str(reg["sid"]))   # the previous kernel's holds: the sweep watches them from here
         self._reseed_echoes(regs)   # unlanded input echoes survive the restart (reg['echoes'] mirror)
         # Boot reconcile (reconcile=True: the KERNEL passes it at boot; tests and ad-hoc constructions
         # opt in explicitly): recover what the previous kernel's death left behind — reap orphaned
@@ -5146,7 +5175,287 @@ class SdkBackend:
             return self._work_key_pin, ("pin" if self._work_key_pin else "")
         if source is None:
             source = work_api_key_source()
-        return source.resolve(), ("startup" if source.kind == "environment" else source.kind)
+        try:
+            key = source.resolve()
+        except _keysrc.KeySourceError as e:
+            if source.configured:            # an unconfigured source has nothing to retrieve — not a streak
+                self._note_keysrc_health(False, e)
+            raise
+        self._note_keysrc_health(True)
+        return key, ("startup" if source.kind == "environment" else source.kind)
+
+    def _note_keysrc_health(self, ok: bool, exc: BaseException | None = None) -> None:
+        """ONE log line per TRANSITION of a CONFIGURED source's retrieval — never per call. Every
+        consumer used to report its own failure (a session card here, a judge's err=auth there, one
+        `op read` each), so a 1Password blip read as a dozen unrelated breakages and its recovery was
+        never said at all (the user 2026-09-07). The streak state lives on this backend; the times
+        and the note come from keysource.health(), the module's own record of its last success and
+        failure (the note is a safe sentence, never a value). Best-effort: a health() hiccup must
+        never fail the launch that asked."""
+        try:
+            if ok:
+                if self._keysrc_failing:
+                    self._keysrc_failing = False
+                    self._log("API key source: retrieval recovered")
+                return
+            if self._keysrc_failing:
+                return
+            self._keysrc_failing = True
+            h = _keysrc.health() or {}
+            since = h.get("lastFailT") or time.time()
+            note = h.get("note") or (str(exc) if exc is not None else "")
+            self._log("API key source: retrieval failing since %s — %s; sessions and judges hold"
+                      % (time.strftime("%H:%M", time.localtime(since)), note), problem=True)
+        except Exception:
+            self._log("key source health note failed: %s" % traceback.format_exc())
+
+    def _keyed_reg_names(self, regs=None, explicit_only: bool = False) -> list:
+        """Names of the alive sessions whose launch MEANS the API key: an explicit key pick, or no pick
+        on a box whose declaration (_declared_auth) says key. The count the two key-source rows carry
+        (the boot preflight, the helper-launch notice) so the operator sees how much is waiting.
+        `explicit_only` narrows to the explicit picks: with NO source configured only those hold (an
+        unpicked session on a declared-key box launches login-side, where a helper or the login serves
+        it), so the preflight's "will hold" must not count the unpicked ones."""
+        if regs is None:
+            regs = [r for r in list_regs(self.state_dir) if r.get("alive")]
+        declared = (not explicit_only) and _declared_auth(self.state_dir)[0] == "key"
+        return [str(r.get("name") or str(r.get("sid") or "")[:8]) for r in regs
+                if r.get("auth") == "key" or (declared and r.get("auth") != "login")]
+
+    def _note_helper_launch(self) -> None:
+        """Said ONCE per process, as a problem row: sessions picking the API key are launching with
+        no key of romp's, on Claude Code's own apiKeyHelper. It works — it is exactly how these boxes
+        ran before runtime key sources — but it is a source romp cannot see, swap or fingerprint, so
+        the row names the remedy that puts romp back in charge of who pays."""
+        if self._helper_launch_said:
+            return
+        self._helper_launch_said = True
+        try:
+            # explicit picks only: with no source configured an UNPICKED session on a declared-key box
+            # launches login-side (_options' launch_keyed is false for it), so counting it here would
+            # overstate how many sessions ride the helper (review find, 2026-09-07)
+            n = len(self._keyed_reg_names(explicit_only=True)) or 1
+        except Exception:
+            n = 1
+        self._log("%d session(s) pick API-key billing but romp holds no key source; launching on "
+                  "Claude Code's apiKeyHelper. %s" % (n, _keysrc.remedy()), problem=True)
+
+    def _keysrc_preflight(self, alive: list) -> None:
+        """Boot: ONE problem row, before anything launches, when sessions set to API-key billing are
+        about to hold because no key source is configured and no apiKeyHelper exists — so the operator
+        reads one line naming the sessions and the fix, not one "holding" line per session per boot
+        (the user 2026-09-07). Quiet when a source or a helper exists, or nothing is keyed."""
+        try:
+            if self.work_key_configured or _keysrc.cli_self_auth():
+                return
+            names = self._keyed_reg_names(alive, explicit_only=True)
+            if not names:
+                return
+            self._log("%d session(s) [%s] are set to API-key billing but no API key source is configured "
+                      "— they will hold until it is. %s" % (len(names), ", ".join(names), _keysrc.remedy()),
+                      problem=True)
+        except Exception:
+            self._log("boot reconcile: key source preflight failed: %s" % traceback.format_exc())
+
+    def _keysrc_source_identity(self, source=None) -> str:
+        """The non-empty, stable identity a key-source HOLD is recorded against and later compared
+        with: the source's fingerprint, or `kind:<kind>` when it has none. KeySource.fingerprint() is
+        "" for the `error` kind (an unreadable env file), and an empty recorded identity read as "no
+        source existed at the hold" — so an UNCHANGED unreadable file lifted every hold as "configured
+        now" on every event and relaunched into the same failure (review find, 2026-09-07). Never a
+        value: the fingerprint is a sha256 head of the reference, the kind is a word."""
+        if source is None:
+            source = self._work_key_source()
+        try:
+            fp = source.fingerprint()
+        except Exception:
+            fp = ""
+        return fp or ("kind:" + str(source.kind or "none"))
+
+    def _keysrc_hold_lift_why(self, reg: dict) -> str:
+        """Why `reg`'s key-source hold may lift NOW, or "" when it stands. Pure: reads the source
+        selection, Claude Code's settings and keysource.health(); never runs `op`, never writes. The
+        rules mirror _options' launch decision exactly, in the same order, so a lift never relaunches
+        into the failure that placed the hold:
+          * NO source configured: only Claude Code's apiKeyHelper appearing lifts it (a launch would
+            ride the helper). Before 2026-09-07 the helper check ran FIRST, so on a helper box a hold
+            against a CONFIGURED-but-failing source lifted with a false reason and relaunched — two
+            `op read`s, ~31 s — on every event (review find).
+          * A CONFIGURED source: the hold was placed either when no source existed (its recorded
+            identity differs — the source appearing IS the event) or when THIS source failed to
+            resolve. Then the tick is not new information: the events that justify a retry are exact
+            — the source changed (a keyswap, a rewritten line) or a resolve succeeded AFTER the hold
+            (any consumer's: keysource.health() carries the time) — and nothing else."""
+        le = reg.get("launchError")
+        if not (isinstance(le, dict) and le.get("keysrc")):
+            return ""
+        if not self.work_key_configured:
+            return "Claude Code's apiKeyHelper exists now" if _keysrc.cli_self_auth() else ""
+        fp_then = str(le.get("sourceFp") or "")
+        if fp_then and fp_then == self._keysrc_source_identity():
+            try:
+                ok_t = float((_keysrc.health() or {}).get("lastOkT") or 0)
+            except Exception:
+                ok_t = 0.0
+            # atT is the float hold time; `at` (int seconds, the card's) is the fallback for a record
+            # written before atT existed — an int truncation made a success in the hold's own second
+            # read as "before" it (review find, 2026-09-07)
+            if ok_t <= float(le.get("atT") or le.get("at") or 0):
+                return ""
+            return "its key source resolved again"
+        return "an API key source is configured now"
+
+    def _keysrc_hold_release(self, sid: str, reg: dict, why: str) -> None:
+        self._clear_launch_error(sid)
+        self._log("session %s: %s — the hold is lifted" % (reg.get("name") or sid[:8], why))
+
+    def _keysrc_hold_lifted(self, sid_or_reg) -> bool:
+        """The self-heal for a key-source HOLD (launchError.keysrc, recorded by _record_launch_error):
+        True — and the record CLEARED — when the hold may lift (_keysrc_hold_lift_why says why), so
+        the caller proceeds with the session; False for anything else, including a record that is not
+        a key-source hold (the usage-limit hold and real failures keep their own release rules).
+        Event-based: called at the exact points a recorded launchError makes the backend stand down
+        (the idle-queue drive, the boot sweep, the per-cycle keysrc_hold_sweep, the operator's
+        keysource_probe), never on a timer, and the check itself is a stat-cached file read plus a
+        settings stat — never an `op read`."""
+        if isinstance(sid_or_reg, str):
+            sid, reg = sid_or_reg, (read_reg(self.state_dir, sid_or_reg) or {})
+        else:                                  # a caller's reg dict MUST carry its sid (a raw reg file may not)
+            reg = sid_or_reg or {}
+            sid = str(reg.get("sid") or "")
+        if not sid:
+            return False
+        why = self._keysrc_hold_lift_why(reg)
+        if not why:
+            return False
+        self._keysrc_hold_release(sid, reg, why)
+        return True
+
+    def _keysrc_boot_probe(self, alive: list) -> None:
+        """Boot: ONE resolve when a held session waits on the CURRENT configured source. A kernel
+        restart forgets keysource.health() — lastOkT starts at 0 — so a hold recorded against this very
+        source could never see "a resolve succeeded after the hold" and the boot sweep skipped those
+        sessions forever, until some other consumer happened to resolve (review find, 2026-09-07). The
+        probe goes through _work_key_and_source, which stamps health and says the failing/recovered
+        transition once; single flight + the reuse memo make it one `op read` however many are held.
+        Quiet (no `op`) when nothing is held against this identity."""
+        try:
+            if not self.work_key_configured:
+                return
+            ident = self._keysrc_source_identity()
+            if not any(isinstance(r.get("launchError"), dict) and r["launchError"].get("keysrc")
+                       and str(r["launchError"].get("sourceFp") or "") == ident for r in alive):
+                return
+            try:
+                self._work_key_and_source()
+            except _keysrc.KeySourceError:
+                pass   # _note_keysrc_health said the streak; the sweep below keeps these sessions held
+        except Exception:
+            self._log("boot reconcile: key source probe failed: %s" % traceback.format_exc())
+
+    def _keysrc_sweep(self, regs=None) -> list:
+        """Re-check every key-source HOLD and revive the sessions whose hold lifts; returns their names.
+        `regs` None → the in-memory held set (O(1) when empty: the per-cycle path); a caller with fresh
+        regs (the operator's probe) passes them and the set is re-seeded from what they carry. A lifted
+        session is _ensure()d under the machine-wide spawn stagger (_spawn_sem): no slot free right now
+        → its hold STANDS untouched for the next sweep (the evidence that lifts it keeps), so a dozen
+        revivals never burst past the boot budget."""
+        if regs is None:
+            if not self._keysrc_held:
+                return []
+            regs = []
+            for sid in sorted(self._keysrc_held):
+                reg = read_reg(self.state_dir, sid)
+                if reg is None:
+                    self._keysrc_held.discard(sid)   # the reg is gone: nothing left to hold
+                    continue
+                reg.setdefault("sid", sid)
+                regs.append(reg)
+        lifted: list[str] = []
+        for reg in regs:
+            sid = str(reg.get("sid") or "")
+            le = reg.get("launchError")
+            if not (sid and reg.get("alive") and isinstance(le, dict) and le.get("keysrc")):
+                if sid:
+                    self._keysrc_held.discard(sid)
+                continue
+            self._keysrc_held.add(sid)
+            try:
+                why = self._keysrc_hold_lift_why(reg)
+                if not why:
+                    continue
+                if not self._spawn_sem.acquire(timeout=0.1):
+                    continue                       # stagger full: hold stands, re-read next sweep
+                try:
+                    self._keysrc_hold_release(sid, reg, why)
+                    lifted.append(str(reg.get("name") or sid[:8]))
+                    self._ensure(sid, on_boot_settled=self._spawn_sem.release)   # the no-spawn paths fire it
+                except Exception:
+                    self._spawn_sem.release()
+                    raise
+            except Exception:
+                self._log("key source hold sweep: session %s failed (sweep continues): %s"
+                          % (reg.get("name") or sid[:8], traceback.format_exc()))
+        return lifted
+
+    def keysrc_hold_sweep(self) -> int:
+        """The kernel's per-pusher-cycle job: how many key-source holds lifted this cycle. Free when
+        nothing is held (one set test); otherwise one reg read + _keysrc_hold_lift_why per held session
+        — never an `op read`. This is what notices an operator writing the reference line (or a
+        settings.json gaining an apiKeyHelper) at runtime: before it, only a drive tick, a boot or a
+        user send re-checked a hold, so a session with nothing queued stayed held on a box that had
+        long since been fixed (review find, 2026-09-07)."""
+        return len(self._keysrc_sweep())
+
+    def keysource_status(self) -> dict:
+        """What `romp keysource` shows: whether a source is selected and of what kind, its identity
+        (fingerprint, never a value), the names of the sessions held on it, and keysource.health().
+        Reads the selection and the regs only — no `op` runs here."""
+        source = self._work_key_source()
+        held = []
+        try:
+            for r in list_regs(self.state_dir):
+                le = r.get("launchError")
+                if r.get("alive") and isinstance(le, dict) and le.get("keysrc"):
+                    held.append(str(r.get("name") or str(r.get("sid") or "")[:8]))
+        except Exception:
+            self._log("key source status: reg listing failed: %s" % traceback.format_exc())
+        try:
+            health = _keysrc.health() or {}
+        except Exception:
+            health = {}
+        return {"configured": bool(source.configured), "kind": str(source.kind or ""),
+                "sourceFp": self.work_key_source_fp(), "held": held, "health": health}
+
+    def keysource_probe(self) -> dict:
+        """The operator's verification gesture (`romp keysource --check` / `romp refresh`'s preflight):
+        ONE resolve of the selected source through _work_key_and_source — which stamps
+        keysource.health() and says the failing/recovered transition once; single flight + the reuse
+        memo make it one `op read` for the whole board — then a sweep of every held session, so holds
+        whose only key consumers are the held sessions themselves can release (nothing else would ever
+        move lastOkT for them; review find, 2026-09-07). Returns {ok, note, lifted, kind, sourceFp};
+        `note` is the fixed KeySourceError sentence on failure, never a value or provider output."""
+        source = self._work_key_source()
+        out = {"ok": False, "note": "", "lifted": [], "kind": str(source.kind or ""),
+               "sourceFp": self.work_key_source_fp()}
+        try:
+            # An explicit probe reads AFRESH: a value the reuse memo still holds from before the hold
+            # would answer without moving health().lastOkT, and the hold would stand although the
+            # operator just verified the route (review find, 2026-09-07).
+            _keysrc.forget_resolved()
+            key, _kind = self._work_key_and_source(source)
+            if not key:
+                raise _keysrc.KeySourceError(_keysrc.remedy())
+            out["ok"] = True
+            out["note"] = "the API key source resolved"
+        except _keysrc.KeySourceError as e:
+            out["note"] = str(e)
+        try:
+            regs = [dict(r, sid=str(r.get("sid") or "")) for r in list_regs(self.state_dir) if r.get("alive")]
+            out["lifted"] = self._keysrc_sweep(regs)
+        except Exception:
+            self._log("key source probe: hold sweep failed: %s" % traceback.format_exc())
+        return out
 
     def work_key_fp(self) -> str:
         """The renderable form of the key sessions launch on: the sha256 head, "" for none. The
@@ -5235,6 +5544,11 @@ class SdkBackend:
         if current_key_fp is not None:
             fp = current_key_fp
         else:
+            # An explicit cycle says the world moved (a rotated item, a rewritten reference): the
+            # value keysource remembered inside its reuse window is exactly what the operator wants
+            # gone, so drop it before this resolve (review find, 2026-09-07). The request-level
+            # current_key_fp path resolved once for the whole request and does its own forgetting.
+            _keysrc.forget_resolved()
             key, _source = self._work_key_and_source(source)
             if not key:
                 raise _keysrc.KeySourceError("API key billing selected but no API key source is configured")
@@ -5315,6 +5629,8 @@ class SdkBackend:
                             pass
                 except Exception:
                     self._log("boot reconcile: orphan reap failed: %s" % traceback.format_exc())
+            self._keysrc_preflight(alive)   # ONE row for every keyed session about to hold on no key source
+            self._keysrc_boot_probe(alive)  # ONE resolve when holds wait on the current source (health forgot)
             resumed, restored, notified = 0, 0, 0
             to_start: list[str] = []   # sids to spawn — collected first, spawned STAGGERED below
             for r in alive:
@@ -5341,8 +5657,12 @@ class SdkBackend:
                     # The switch is moot at the next connect (effort + chosen alias both ride
                     # _options), so heal here for sessions that stay DORMANT; SdkSession.__init__
                     # heals the same way for ones that respawn.
-                    if r.get("effortPending") or r.get("modelPending"):
-                        self._update_reg(sid, effortPending=False, modelPending=False)
+                    if r.get("effortPending") or r.get("modelPending") or r.get("authPending"):
+                        self._update_reg(sid, effortPending=False, modelPending=False, authPending=False)
+                    le = r.get("launchError")
+                    if isinstance(le, dict) and le.get("keysrc") and not self._keysrc_hold_lifted(r):
+                        continue   # held on a missing key source: the preflight row said why, and a
+                    #                spawn now would only re-hold; the source appearing lifts it (above)
                     queued = [t for t in (r.get("queue") or []) if isinstance(t, str) and t]
                     if r.get("threadOf") and not queued:
                         # a comment THREAD is never auto-resumed at boot (the user 2026-09-01: threads
@@ -5508,8 +5828,10 @@ class SdkBackend:
                     reg = read_reg(self.state_dir, sid)
                     if not reg or not reg.get("alive"):
                         continue                   # the user ended this session — never revive it for housekeeping
-                    if reg.get("launchError"):
-                        continue                   # can't even start (usage limit etc.) — that hold owns it
+                    if reg.get("launchError") and not self._keysrc_hold_lifted(dict(reg, sid=sid)):
+                        continue                   # can't even start (usage limit etc.) — that hold owns it;
+                    #                                a key-source hold whose source has since appeared is
+                    #                                cleared right there and the drive proceeds
                     if last_state_value(self.state_dir, sid) in ("working", "retrying", "compacting"):
                         continue                   # a CUT turn — any MACHINE-ACTIVE last state, the same
                     #                                discriminator boot reconcile uses (a restart mid-retry or
@@ -5995,7 +6317,10 @@ class SdkBackend:
         # PICK — judged (and worded) against what the pick launched, so a landing honoring the pick
         # stays quiet whatever the box declares, and one contradicting it still rings.
         exp, exp_src = ("", "") if sess.auth in ("login", "key") else _declared_auth(self.state_dir)
-        if keyed != ((exp == "key") if exp else sess._launched_keyed):
+        # a helper launch (_options: an API-key pick with no key source, Claude Code's apiKeyHelper
+        # authenticating) injected no key yet MEANT the key — a keyed landing is the quiet one there
+        meant_key = sess._launched_keyed or sess._launched_via_helper
+        if keyed != ((exp == "key") if exp else meant_key):
             if exp:
                 what = ("ROMP_EXPECTED_AUTH=%s" % exp) if exp_src == "env" \
                     else ("the remembered Billing pick is %s" % exp)
@@ -6005,7 +6330,7 @@ class SdkBackend:
             else:
                 self._log("auth (%s): launched for %s but the CLI reports apiKeySource=%r — this session "
                           "is billing the %s. Check the login (claude /login) and service.env."
-                          % (sess.name, "the API key" if sess._launched_keyed else "the login", source,
+                          % (sess.name, "the API key" if meant_key else "the login", source,
                              "API key" if keyed else "login"), problem=True)
         sess.auth_live = "key" if keyed else "login"   # the CLI's own report, for the Billing row
         if keyed == sess.api_key_auth:
@@ -6452,17 +6777,36 @@ class SdkBackend:
         # Source presence is metadata; a provider failure cannot turn it into login.
         launch_keyed = sess.auth == "key" or (sess.auth != "login" and key_source.configured)
         work_key = ""
-        if launch_keyed:
+        via_helper = False
+        if launch_keyed and not key_source.configured:
+            # An explicit API-key pick on a box that holds NO key source (an empty supervised
+            # service.env, or nothing anywhere) — not a configured source that failed to resolve,
+            # which stays the hard failure below. Before 2026-09-05 this launched with no key
+            # injected and Claude Code's own apiKeyHelper (user or managed settings) supplied it;
+            # the hard refusal that replaced it took every such session down with no way back
+            # until an operator rewrote service.env and restarted the service (the user
+            # 2026-09-07). So: a helper present → launch on it, exactly as before, said ONCE per
+            # process as a problem row with the remedy; no helper → the remedy IS the error, and
+            # the session HOLDS (the _amain except) until a source appears.
+            if _keysrc.cli_self_auth():
+                via_helper = True
+                self._note_helper_launch()
+            else:
+                raise _keysrc.KeySourceError(_keysrc.remedy())
+        if launch_keyed and not via_helper:
             work_key, key_src = self._work_key_and_source(key_source)
             if not work_key:
-                raise _keysrc.KeySourceError("API key billing selected but no API key source is configured")
+                raise _keysrc.KeySourceError(_keysrc.remedy())
             self._note_work_key(work_key, key_src)
             kw["env"] = dict(kw["env"], ANTHROPIC_API_KEY=work_key,
                              **key_fast_org_env(work_key, self._log))
-        else:
+        elif not launch_keyed:
             kw["env"] = dict(kw["env"], **startup_auth_env())
-        sess._launched_keyed = launch_keyed
-        sess._launched_key_fp = _keysrc.fingerprint(work_key) if launch_keyed else ""
+        # (a helper launch injects NOTHING: no key — the helper is the key — and none of the claimed
+        #  login tokens either, which would outrank the helper and bill the login the pick refused)
+        sess._launched_keyed = launch_keyed and not via_helper
+        sess._launched_via_helper = via_helper
+        sess._launched_key_fp = _keysrc.fingerprint(work_key) if (launch_keyed and not via_helper) else ""
         return ClaudeAgentOptions(**kw)
 
     # ---- lifecycle (kernel-thread API) ----
@@ -8701,15 +9045,38 @@ class SdkBackend:
         dep = isinstance(exc, ImportError)
         # A provider failure happened before a new CLI existed. The previous
         # connection's stderr must not replace it or turn it into a quota hold.
-        tail = "" if dep or isinstance(exc, _keysrc.KeySourceError) else sess.stderr_tail()
+        keysrc = isinstance(exc, _keysrc.KeySourceError)
+        tail = "" if dep or keysrc else sess.stderr_tail()
         text = SDK_MISSING_TEXT if dep else launch_failure_text(exc, tail)
-        rec = {"text": text, "at": int(time.time()), "limit": is_launch_limit(text), "dep": dep}
+        now = time.time()
+        rec = {"text": text, "at": int(now), "limit": is_launch_limit(text), "dep": dep}
+        if keysrc:
+            # A HOLD, not a failure: no key source is configured (or the configured one cannot be
+            # read right now). The flag is what the idle-queue drive and the boot sweep key their
+            # stand-down on, and what _keysrc_hold_lifted clears the moment a source (or an
+            # apiKeyHelper) exists — the session resumes on its own, no Retry needed. The source's
+            # fingerprint at the failure rides along: for a CONFIGURED source that failed to resolve,
+            # "new information" is that fingerprint changing or a later resolve succeeding, never the
+            # next drive tick (see _keysrc_hold_lifted).
+            rec["keysrc"] = True
+            rec["atT"] = now                       # the float twin of `at` — the lift compares against this
+            try:
+                rec["sourceFp"] = self._keysrc_source_identity()   # non-empty even for an unreadable file
+            except Exception:
+                rec["sourceFp"] = ""
         try:
             self._update_reg(sess.sid, launchError=rec)
         except Exception:
             self._log("record launch error (%s): %s" % (sess.name, traceback.format_exc()))
-        self._log("session %s: claude CLI failed to start%s — %s"
-                  % (sess.name, " (account usage limit)" if rec["limit"] else "", text))
+        if keysrc:
+            self._keysrc_held.add(sess.sid)        # keysrc_hold_sweep watches it from here
+        else:
+            self._keysrc_held.discard(sess.sid)    # a real failure replaced the hold: its own rules now
+        if keysrc:
+            self._log("session %s: holding — %s" % (sess.name, text), problem=True)
+        else:
+            self._log("session %s: claude CLI failed to start%s — %s"
+                      % (sess.name, " (account usage limit)" if rec["limit"] else "", text))
         # The FULL captured stderr to the log, once, at the failure. The card gets one truncated line
         # (it has to stay glanceable); the log is where the whole thing belongs, and it is what the
         # user goes looking for the moment a session won't start (the user 2026-07-29, whose fleet all
@@ -8724,6 +9091,7 @@ class SdkBackend:
         """Drop a recorded launch failure — called from the connect that DISPROVES it. Read-then-write so
         a session that never failed doesn't churn the reg on every reconnect."""
         try:
+            self._keysrc_held.discard(sid)
             if not (read_reg(self.state_dir, sid) or {}).get("launchError"):
                 return
             self._update_reg(sid, launchError=None)
@@ -8777,6 +9145,14 @@ class SdkBackend:
                 self._update_reg(sess.sid, effortPending=False)
             except Exception as e:
                 self._log("session gone (%s): effort-pending clear failed: %s" % (sess.name, e))
+        if sess._auth_pending:            # a Billing switch whose applying reconnect never landed — a key-source
+            #                               HOLD ends the thread here, and left set the badge wore switching-dots
+            #                               for the whole hold (review find, 2026-09-07); the pick itself persists
+            sess._auth_pending = ""
+            try:
+                self._update_reg(sess.sid, authPending=False)
+            except Exception as e:
+                self._log("session gone (%s): auth-pending clear failed: %s" % (sess.name, e))
         # Background tasks are the CLI's children, so they just died too. A session idle-waiting on a
         # timer/watcher would wait FOREVER for a completion that can never arrive — tell it, visibly,
         # and wake it so it can relaunch what still matters (the user 2026-07-11: nimbus's campaign

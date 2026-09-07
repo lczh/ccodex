@@ -645,6 +645,7 @@ EOF
     _romp_cmd "romp up"                    romp-manager "Run the kernel manager in the foreground (rare — the login service runs it)"
     _romp_cmd "romp version"               romp-version "Versions across the parts (tree, kernel, served vs built bundles)"
     _romp_cmd "romp keyswap [<name>]"      romp-keyswap "Select a 1Password reference or legacy key (service.env.<name>; --cycle-all reconnects running sessions)"
+    _romp_cmd "romp keysource [--check]"   romp-keysource "Set up the 1Password key source (reference + op credential, guided); --check is the refresh preflight"
     _romp_cmd "romp spend-rebuild"         romp-spend-rebuild "Recount the spend ledger's token columns from the transcripts (dry run; --apply writes, dollars untouched)"
     _romp_cmd "romp uninstall"             romp-uninstall "Remove romp's installed footprint (--purge also deletes recorded state)"
     _romp_cmd "romp help"                  -            "Show this help"
@@ -726,6 +727,15 @@ fi
 if [[ "${1:-}" == "keyswap" ]]; then
     shift
     exec romp-keyswap "$@"
+fi
+
+# `romp keysource` walks through setting up the 1Password route (the reference, and how op authenticates —
+# a service-account token written as OP_SERVICE_ACCOUNT_TOKEN, never echoed) and says which of it is live
+# at once and which needs the login service restarted; `--check` is the preflight `romp refresh` runs
+# below. Delegates to romp-keysource (python); never prints a key, a token or a reference value.
+if [[ "${1:-}" == "keysource" ]]; then
+    shift
+    exec romp-keysource "$@"
 fi
 
 # Is romp itself the one running `op`? Yes when a 1Password reference is configured — in this
@@ -1704,6 +1714,39 @@ case "${1:-}" in
                # Append who/where/when to restart-audit.jsonl BEFORE acting, so "who restarted the
                # kernel?" is one command (tail) instead of forensics. Best-effort: never blocks the
                # restart itself.
+               #
+               # KEY-SOURCE PREFLIGHT (the user 2026-09-07): a refresh onto a kernel that HOLDS every
+               # API-key-billed launch for want of a key source took the board down for twenty minutes.
+               # Ask THIS tree's romp-keysource — the code about to be deployed is the one that must be
+               # satisfied, so never whatever `romp-keysource` the caller's PATH resolves — and refuse
+               # to restart on its exit 1 unless --force is among the args. Any OTHER failure (no
+               # python, a crash: exit 3) is a one-line warning and the refresh goes on: the preflight
+               # may never be the reason a deploy cannot happen. --force is consumed HERE so the
+               # manager's restart-all keeps seeing only its own word (`--quiet`) in $2.
+               _rf_force=0; _rf_rest=()
+               for _rf_a in "${@:2}"; do
+                   if [[ "$_rf_a" == "--force" ]]; then _rf_force=1; else _rf_rest+=("$_rf_a"); fi
+               done
+               # (the `[@]+` form: an EMPTY array under `set -u` is "unbound" to bash < 4.4 — macOS's
+               # /bin/bash 3.2 — so a bare "${_rf_rest[@]}" aborts a flagless `romp refresh` there)
+               set -- refresh ${_rf_rest[@]+"${_rf_rest[@]}"}
+               _rf_ks="${ROMP_KEYSOURCE_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/romp-keysource}"
+               if _rf_out="$("$_rf_ks" --check 2>&1)"; then
+                   :
+               else
+                   _rf_rc=$?
+                   if [[ "$_rf_rc" -eq 1 ]]; then
+                       printf '%s\n' "$_rf_out"
+                       if [[ "$_rf_force" -eq 1 ]]; then
+                           echo "romp refresh: restarting anyway (--force)" >&2
+                       else
+                           echo "romp refresh: refusing to restart: sessions on API-key billing would hold until a key source exists (pass --force to restart anyway)" >&2
+                           exit 1
+                       fi
+                   else
+                       echo "romp refresh: key-source preflight could not run (exit $_rf_rc); continuing" >&2
+                   fi
+               fi
                {
                    _ra_dir="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}"
                    mkdir -p "$_ra_dir"

@@ -49,6 +49,10 @@ os.environ.pop("ROMP_STATE_DIR", None)  # a live kernel's export outranks the XD
 os.environ["ROMP_SERVICE_ENV_FILE"] = os.path.join(os.environ["XDG_STATE_HOME"], "no-such-service.env")
 os.environ["ROMP_SERVICE_ENV"] = os.environ["ROMP_SERVICE_ENV_FILE"]
 os.environ.pop("ROMP_API_KEY_REF", None)
+# Never this box's real Claude Code settings: keysource.cli_self_auth reads $CLAUDE_CONFIG_DIR/settings.json
+# (and the managed files, floored per test below), and a developer's own apiKeyHelper must not decide
+# whether a keyless judge child is an error here.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()
 jd = SourceFileLoader("romp_judge_authbill", os.path.join(BIN, "romp-judge")).load_module()
 
 FAKE_KEY = "romp-test-fixture-key-not-real"   # nothing under test validates the shape, so no sk- prefix:
@@ -70,6 +74,11 @@ class _JudgeAuthBase(unittest.TestCase):
         jd._WORK_KEY_CONFIGURED_FN = None
         jd._LOGIN_AUTH_ENV_FN = None
         jd._auth_cache[:] = [None, {}]
+        self._managed_before = jd._keysrc.CLI_MANAGED_SETTINGS
+        jd._keysrc.CLI_MANAGED_SETTINGS = ()
+        jd._keysrc._CLI_SETTINGS_CACHE.clear()
+        jd._CLI_SELF_AUTH_SAID.clear()
+        jd._keysrc.forget_resolved()
         jd.SDKDIR.mkdir(parents=True, exist_ok=True)
         for p in (jd.JUDGE_AUTH, jd.SDKDIR / (SID + ".json"),
                   jd.STATE / "retry-paused.json", jd.STATE / "usage.json"):
@@ -79,6 +88,7 @@ class _JudgeAuthBase(unittest.TestCase):
                 pass
 
     def tearDown(self):
+        jd._keysrc.CLI_MANAGED_SETTINGS = self._managed_before
         jd._WORK_KEY_FN = self._fn_before
         jd._WORK_KEY_CONFIGURED_FN = self._configured_before
         jd._LOGIN_AUTH_ENV_FN = self._login_before
@@ -186,7 +196,9 @@ class RuntimeJudgeBilling(_JudgeAuthBase):
             path = os.path.join(directory, "service.env")
             with open(path, "w") as config:
                 config.write("ROMP_API_KEY_REF=op://test-vault/test-item/credential\n")
-            with patch.dict(os.environ, {"ROMP_SERVICE_ENV_FILE": path}), \
+            # the reuse window off: this test is about the CALL boundary — every key call retrieves, no
+            # metadata read does; the window's own sharing is keysource's subject (test_runtime_keysource)
+            with patch.dict(os.environ, {"ROMP_SERVICE_ENV_FILE": path, "ROMP_OP_REUSE_S": "0"}), \
                     patch.object(jd._keysrc.subprocess, "run", return_value=SimpleNamespace(
                         returncode=0, stdout=FAKE_KEY.encode())) as provider:
                 for count in (1, 2):
@@ -519,6 +531,89 @@ class OpCredentialAndRetrievalGate(_JudgeAuthBase):
             self.assertEqual(len(calls), 2)
         finally:
             jd._KEY_GATE.update(saved); jd._PASS_GEN[0] = saved_gen
+
+
+class CliSelfAuthFallback(_JudgeAuthBase):
+    """2026-09-07: a session whose pick said `key` on a box whose env file carried NO key line. Before runtime
+    retrieval, its judge children launched without an injected key and Claude Code's own apiKeyHelper
+    authenticated them; the hard error that replaced that logged err=auth on every pass while the board was
+    down. Now: an UNCONFIGURED source (decided before any retrieval) with a CLI helper present launches the
+    child keyless, said once; without a helper it raises the one shared remedy; a retrieval FAILURE keeps
+    its own path either way."""
+
+    def _stderr(self, fn):
+        import io
+        from contextlib import redirect_stderr
+        out = io.StringIO()
+        with redirect_stderr(out):
+            r = fn()
+        return r, out.getvalue()
+
+    def test_an_unconfigured_source_with_a_cli_helper_launches_the_child_keyless_and_says_so_once(self):
+        self._reg("key")
+        with patch.object(jd._keysrc, "cli_self_auth", return_value="apiKeyHelper"):
+            env, err = self._stderr(lambda: jd._judge_env("triage", "key"))
+            self.assertNotIn("ANTHROPIC_API_KEY", env, "the CLI's helper authenticates it — removal, not blanking")
+            self.assertEqual(env.get("ROMP_SUMMARIZING"), "1", "the rest of the env contract is untouched")
+            self.assertIn("judges bill through Claude Code's apiKeyHelper", err)
+            self.assertIn("no romp key source is configured", err)
+            self.assertIn(jd._keysrc.remedy(), err, "the ONE remedy text every surface shares")
+            _, err2 = self._stderr(lambda: jd._judge_env("index", "key"))
+            self.assertEqual(err2, "", "said once per process")
+
+    def test_an_unconfigured_source_without_a_helper_raises_the_shared_remedy(self):
+        self._reg("key")
+        with patch.object(jd._keysrc, "cli_self_auth", return_value=""):
+            with self.assertRaises(jd._keysrc.KeySourceError) as caught:
+                jd._judge_env("triage", "key")
+        self.assertEqual(str(caught.exception), jd._keysrc.remedy())
+        self.assertIn("romp keysource", str(caught.exception))
+
+    def test_the_kernel_wire_decides_configuredness_without_a_retrieval(self):
+        jd._WORK_KEY_CONFIGURED_FN = lambda: False
+        jd._WORK_KEY_FN = Mock(side_effect=AssertionError("an unconfigured source is never resolved"))
+        with patch.object(jd._keysrc, "cli_self_auth", return_value="apiKeyHelper"):
+            env, _ = self._stderr(lambda: jd._judge_env("triage", "key"))
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        jd._WORK_KEY_FN.assert_not_called()
+
+    def test_a_retrieval_failure_keeps_its_own_path_even_with_a_helper_present(self):
+        def failing():
+            raise jd._keysrc.KeySourceError("1Password credential retrieval timed out; check op authentication")
+        jd._WORK_KEY_FN = failing
+        jd._WORK_KEY_CONFIGURED_FN = lambda: True
+        with patch.object(jd._keysrc, "cli_self_auth", return_value="apiKeyHelper"):
+            with self.assertRaisesRegex(jd._keysrc.KeySourceError, "timed out"):
+                jd._judge_env("triage", "key")
+
+    def test_a_configured_source_that_resolves_to_nothing_raises_the_remedy(self):
+        # standalone wiring of the key callback alone: the retrieval decides, as before, and an empty answer
+        # is the same configuration failure with the same remedy
+        self._reg("key")
+        jd._WORK_KEY_FN = lambda: ""
+        with patch.object(jd._keysrc, "cli_self_auth", return_value="apiKeyHelper"):
+            with self.assertRaises(jd._keysrc.KeySourceError) as caught:
+                jd._judge_env("triage", "key")
+        self.assertEqual(str(caught.exception), jd._keysrc.remedy())
+        self.assertFalse(jd._key_source_unconfigured(), "a wired key callback is a configured source")
+
+    def test_a_keyless_helper_call_runs_end_to_end_and_latches_nothing(self):
+        self._reg("key")
+        jd._judge_ctx.fsid = SID
+        seen = {}
+
+        def fake_run(cmd, input=None, capture_output=None, text=None, cwd=None, env=None, timeout=None):
+            seen["env"] = env
+            return SimpleNamespace(stdout=json.dumps({"result": "ok", "usage": {}, "duration_ms": 3}),
+                                   stderr="", returncode=0)
+        with patch.object(jd._keysrc, "cli_self_auth", return_value="apiKeyHelper"), \
+                patch.object(jd, "_judge_engine", return_value="claude"), \
+                patch.object(jd.subprocess, "run", side_effect=fake_run):
+            out, _ = self._stderr(lambda: jd._judge_run("sonnet", "SYS", "u", judge="planner", tier="triage"))
+        self.assertEqual(out, "ok")
+        self.assertNotIn("ANTHROPIC_API_KEY", seen["env"])
+        self.assertEqual(jd._auth_down_map(), {}, "a call that ran is not an auth failure")
+        self.assertFalse(jd._judge_ctx.paused)
 
 
 if __name__ == "__main__":

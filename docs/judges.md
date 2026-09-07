@@ -378,8 +378,12 @@ each key-billed judge call resolves the reference through `op read --no-newline`
 retrieval that fails is not retried by later calls in the same judging pass, and the first
 call of a pass to reach the key gates the others until its retrieval returns. The next pass,
 or a changed source, retries.
-The resolved key is used for that call without a provider cache or a plaintext
-file. The same source selection applies to standalone `romp-judge --once`.
+The resolved key is used for that call and never written to a file; it is kept
+in memory only for the bounded reuse window (`ROMP_OP_REUSE_S`, 60 s by default,
+`0` disables it), so the N key-billed judge calls of one pass share one `op
+read` instead of running N, and a failure is never kept — a failed read is
+retried once, reported, and the next pass runs `op` again. The same source
+selection applies to standalone `romp-judge --once`.
 Every judge child environment strips ambient Anthropic credentials and injects
 the selected key only for a key-mode call. A provider failure fails that call
 with a credential error; it cannot silently use the machine login or a stale
