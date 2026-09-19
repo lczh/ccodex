@@ -323,6 +323,36 @@ class CodexClearDrain(_Base):
         self.assertNotIn(SID, km._pending_ops)
         self.assertEqual(self._warns(), [])
 
+    def test_the_drain_and_the_fold_read_one_clear_predicate(self):
+        # One rule for what a parked op IS (review find, 2026-09-19): the drain ran a ("command", "/new") op as a clear
+        # while the chat's fold keyed on the kind "clear" or the literal "/clear", so that op's queued chip drew beside
+        # the live "Clearing conversation…" element. _parked_clear_op is the predicate both read: a ("clear", …) op of
+        # any length, or a one-line ("command", …) op whose head is a registered clear head, on the Codex backend.
+        be = self.be
+        for op in (("clear",), ("clear", "/new"), ("command", "/clear", "human", QID, True),
+                   ("command", "/new", "human", QID, True), ("command", "  /clear now  ", "human", QID, True)):
+            self.assertTrue(km._parked_clear_op(op, be), op)
+        for op in (("command", "/new\nand more", "human", QID, True), ("command", "/compact", "human", QID, True),
+                   ("command", "/clearx", "human", QID, True), ("command", "", "human", QID, True),
+                   ("send", "/new", None), ("effort", "high"), ("command",)):
+            self.assertFalse(km._parked_clear_op(op, be), op)
+        other = _Backend()      # not the Codex singleton: a ("command", "/clear") there is that backend's own command
+        self.assertFalse(km._parked_clear_op(("command", "/new", "human", QID, True), other))
+        self.assertFalse(km._parked_clear_op(("command", "/clear", "human", QID, True), None))
+        self.assertTrue(km._parked_clear_op(("clear", "/new"), other), "a clear op is a clear on any backend")
+        # the drain's arm consults it for the op at its head, with the session's backend
+        seen = []
+        real = km._parked_clear_op
+        with mock.patch.object(km, "_parked_clear_op", lambda op, b: (seen.append((op, b)), real(op, b))[1]):
+            km._pending_ops[SID] = [("command", "/new", "human", QID, True)]
+            km._save_pending_ops()
+            km._apply_pending_ops()
+        self.assertEqual(self.be.calls, [("clear", SID)])
+        self.assertEqual(self.be.texts, ["/new"])
+        self.assertIn((("command", "/new", "human", QID, True), be), seen, "the drain read the predicate for its head")
+        self.assertNotIn(SID, km._pending_ops)
+        self.assertEqual(self._warns(), [])
+
     def test_a_command_op_with_a_second_line_is_refused_in_the_drain_never_cleared(self):
         # The route's whole-message rule holds in the drain too (review find, 2026-09-19): a pre-upgrade ("command", …)
         # op whose text has a second line under the head is not a clear (the lines after it would reach no one) — it
@@ -648,6 +678,20 @@ class RealBackendClear(unittest.TestCase):
         kinds = [e.get("kind") for e in m["events"]]
         self.assertIn("clearing", kinds, "the live element represents the running clear")
         self.assertNotIn("queued", kinds, "…and the parked chip folds under it, keyed on the op's kind: %r" % kinds)
+        # A ("command", "/new") op reaches the drain by roads that skip the route into _send_or_park (a pending-ops.json
+        # written before the heads registered, a notice card's plain action, a follow-up with no item id), and the drain
+        # runs it as a clear; keyed on the kind "clear" or the literal "/clear", the fold let this chip draw beside the
+        # live element (review find, 2026-09-19). The fold now reads the drain's own predicate, _parked_clear_op.
+        km._pending_ops[sid] = [("command", "/new", "human", QID, True)]
+        km._save_pending_ops()
+        m = km.build_session(sid, int(time.time()))
+        queued = [e for e in m["events"] if e.get("kind") == "queued"]
+        self.assertEqual([x["md"] for x in queued[0]["texts"]], ["/new"], "the command op renders as typed")
+        with mock.patch.object(km, "_clearing_now", lambda s: str(s) == sid):
+            m = km.build_session(sid, int(time.time()))
+        kinds = [e.get("kind") for e in m["events"]]
+        self.assertIn("clearing", kinds)
+        self.assertNotIn("queued", kinds, "a command op the drain runs as a clear folds by the drain's own rule: %r" % kinds)
 
     def test_the_cycle_that_drains_a_parked_clear_builds_the_fresh_file_from_the_hook_on(self):
         # The drain runs inside a pusher cycle whose memos (_live_scope.sessions, .paths) its own gates filled BEFORE
