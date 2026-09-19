@@ -2959,19 +2959,133 @@ class NativeClear(unittest.TestCase):
         self.assertIs(be.clearing(sid), False, "dropped the instant the new tid is durable")
         self.assertEqual(self._row(be, sid)["tid"], "T-2")
 
+    def test_a_model_pick_landing_inside_the_bracket_survives_the_swap(self):
+        # Nothing reads busy through the bracket and the model setter never takes the turn lock the bracket holds,
+        # so a /model pick can land while thread/start is in flight: accepted and saved — and the swap then wrote
+        # the model read BEFORE the request back onto the row (review find, 2026-09-19): memory, the registry, the
+        # live listing and the next turn's params all back on the pre-clear model. The swap takes the row's current
+        # value, as _create_thread does; the pre-request model rides the start params only.
+        class Blocking(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.block = threading.Event()
+                self.entered = threading.Event()
+
+            def thread_start(self, params=None):
+                if self.called("thread_start"):          # spawn's first create returns at once
+                    self.entered.set()
+                    self.block.wait(5)
+                return super().thread_start(params)
+
+        fake = Blocking()
+        be, _, _ = build(factory=lambda: fake)
+        sid = be.spawn("web", "/TESTDIR")
+        self.assertTrue(be.set_model(sid, "gpt-5-picked"))
+        out = []
+        th = threading.Thread(target=lambda: out.append(be.clear(sid)), daemon=True)
+        th.start()
+        self.assertTrue(fake.entered.wait(5), "thread/start is in flight")
+        self.assertIs(be.clearing(sid), True)
+        self.assertTrue(be.set_model(sid, "gpt-5-later"), "the pick lands inside the bracket")
+        self.assertEqual(self._row(be, sid)["model"], "gpt-5-later", "and is saved")
+        fake.block.set()
+        th.join(5)
+        self.assertEqual(out, [""])
+        self.assertEqual(fake.called("thread_start")[-1][1]["model"], "gpt-5-picked",
+                         "the start carried the model read before the request")
+        s = be._session(sid)
+        with s.lock:
+            self.assertEqual(s.model, "gpt-5-later", "memory keeps the pick")
+        self.assertEqual(self._row(be, sid)["model"], "gpt-5-later", "the registry keeps the pick")
+        self.assertEqual(be.live_sessions()[sid]["model"], "gpt-5-later", "the live listing keeps the pick")
+        self.assertTrue(be.send(sid, "next synthetic turn"))
+        self.assertTrue(until(lambda: not be.busy(sid)))
+        last = fake.called("turn_start")[-1]
+        self.assertEqual((last[1], last[3]["model"]), ("T-2", "gpt-5-later"),
+                         "the next turn runs the pick on the fresh thread")
+
+    def test_the_chip_carries_the_command_as_typed(self):
+        # The composer retires its optimistic bubble only by the exact text it sent (or a copy id, which a clear
+        # does not carry), so a typed /new or "/clear now" acknowledged by a literal "/clear" chip left the sending
+        # bubble standing (review find, 2026-09-19): the words as typed ride the verb onto the echo, its uuid and the
+        # durable twin; the contract's default is "/clear".
+        be, fake, tmp, sid = self._turned()
+        self.assertEqual(be.clear(sid, "/new"), "")
+        a = be.live_atoms(sid)[-1]
+        self.assertEqual((a["_echo_text"], a["command"], a["uuid"]), ("/new", "/new", "cmd:%d:new" % a["t"]))
+        self.assertEqual(be.clear(sid, "/clear now"), "")
+        a = be.live_atoms(sid)[-1]
+        self.assertEqual((a["_echo_text"], a["command"]), ("/clear now", "/clear now"))
+        rows = [json.loads(l) for l in (Path(tmp) / "states" / (sid + ".jsonl")).read_text().splitlines()]
+        self.assertEqual([r["cmdGesture"] for r in rows if "cmdGesture" in r], ["/new", "/clear now"],
+                         "the twins carry the same words")
+        self.assertEqual(self._row(be, sid)["tid"], "T-3")
+
+    def test_create_thread_touches_the_file_before_the_save_that_names_its_tid(self):
+        # The order the clear keeps, in the create branch too (review find, 2026-09-19): discovery skips a row whose
+        # file does not stat, so a registry write naming a tid whose file did not exist yet opened a gap in which a
+        # discovery (the restart fallback's included) listed the board without the session until the next save.
+        # Pinned at the save itself: every save naming tid finds the file; a rollback removes it, on both branches.
+        be, fake, tmp = build()
+        sid = be.spawn("web", "/TESTDIR")
+        s = be._session(sid)
+        enc = cb._enc_cwd("/TESTDIR")
+        real_save = be._save_registry
+        at_save = []
+
+        def save(sess, *, fields=(), **k):
+            if "tid" in fields:
+                at_save.append(be._path_for(sess.cwd, sess.tid).exists())
+            return real_save(sess, fields=fields, **k)
+        be._save_registry = save
+        self.assertTrue(be._create_thread(s, fake, "/TESTDIR", ""))
+        self.assertEqual(at_save, [True], "the file exists at the save that names the tid")
+        self.assertEqual(self._row(be, sid)["tid"], "T-2")
+        self.assertEqual((Path(tmp) / "codex" / "projects" / enc / "T-2.jsonl").read_text(), "")
+        # a raising save: the swap rolls back and the touched file leaves with it
+        be._save_registry = mock.Mock(side_effect=OSError(28, "no space"))
+        with self.assertRaises(OSError):
+            be._create_thread(s, fake, "/TESTDIR", "")
+        with s.lock:
+            self.assertEqual(s.tid, "T-2", "rolled back")
+        self.assertFalse((Path(tmp) / "codex" / "projects" / enc / "T-3.jsonl").exists(),
+                         "the touched file left with the rollback")
+        self.assertEqual(self._row(be, sid)["tid"], "T-2", "nothing published")
+        # a session killed while the create was in flight: nothing published, no file left behind
+        be._save_registry = real_save
+
+        class Killing(FakeClient):
+            def thread_start(self, params=None):
+                self._rec("thread_start", params)
+                with s.lock:
+                    s.dead = True
+                return SimpleNamespace(thread=SimpleNamespace(id="K-1"), model="gpt-5-test")
+        self.assertFalse(be._create_thread(s, Killing(), "/TESTDIR", ""))
+        self.assertFalse((Path(tmp) / "codex" / "projects" / enc / "K-1.jsonl").exists(),
+                         "the dead branch leaves no file behind")
+        self.assertEqual(self._row(be, sid)["tid"], "T-2")
+
     def test_clear_rolls_back_when_the_registry_write_raises(self):
         be, fake, tmp, sid = self._turned()
         s = be._session(sid)
-        with mock.patch.object(be, "_save_registry", side_effect=OSError(28, "no space")):
+        new_file = Path(tmp) / "codex" / "projects" / cb._enc_cwd("/TESTDIR") / "T-2.jsonl"
+        at_save = []
+
+        def save(*a, **k):
+            # the file the write would have named exists ALREADY (review find, 2026-09-19): the verb catches
+            # Exception, so an assert here would surface only as the refusal's text; recorded, asserted after
+            at_save.append(new_file.exists())
+            raise OSError(28, "no space")
+        with mock.patch.object(be, "_save_registry", side_effect=save):
             why = be.clear(sid)
+        self.assertEqual(at_save, [True], "the fresh file existed at the registry write that would have named it")
         self.assertTrue(why.startswith("Couldn't start a fresh conversation"), why)
         self.assertIn("no space", why)
         self.assertIs(be.clearing(sid), False)
         with s.lock:
             self.assertEqual(s.tid, "T-1", "the swap rolled back")
             self.assertEqual(s.model, "gpt-5-picked")
-        self.assertFalse((Path(tmp) / "codex" / "projects" / cb._enc_cwd("/TESTDIR") / "T-2.jsonl").exists(),
-                         "the touched file leaves with the rollback")
+        self.assertFalse(new_file.exists(), "the touched file leaves with the rollback")
         self.assertEqual(self._row(be, sid)["tid"], "T-1")
         self.assertTrue(be.send(sid, "after the failed clear"))
         self.assertTrue(until(lambda: not be.busy(sid)))
@@ -3148,7 +3262,9 @@ class NativeClear(unittest.TestCase):
         self.assertTrue(a["uuid"].startswith("cmd:"), "the SDK's acknowledging-chip id form, not a kernel echo id")
         self.assertEqual(a["fsid"], "T-2", "the chip belongs to the fresh conversation")
         rows = [json.loads(l) for l in (Path(tmp) / "states" / (sid + ".jsonl")).read_text().splitlines()]
-        self.assertIn({"t": a["t"], "cmdGesture": "/clear"}, rows, "the durable twin the kernel interleaves later")
+        self.assertIn({"t": a["t"], "cmdGesture": "/clear"}, rows,
+                      "the durable twin: it renders in the fresh conversation until the boundary tick, then closes the "
+                      "cleared conversation's episode")
         be.prune_live(sid, set(), {}, human_floor=a["t"])
         self.assertEqual(len(be.live_atoms(sid)), 1, "a human record in the chip's own second keeps it")
         be.prune_live(sid, set(), {}, human_floor=a["t"] + 1)

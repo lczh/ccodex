@@ -155,11 +155,15 @@ class SessionBackend(ABC):
         surfaced as a fork lane with no bracket, the gap plans/clear-episodes.md records)."""
         return None
 
-    def clear(self, sid: str) -> str:
+    def clear(self, sid: str, text: str = "/clear") -> str:
         """Start a FRESH conversation for the same session (2026-09-19): name, mailbox, tags, color, note, mode,
         model, effort and any queued sends stay; the conversation the agent can see restarts. "" on success;
         "busy" when a turn is in flight (the kernel parks the op and retries at turn end); any other string is
-        the reason, shown to the user verbatim. Codex implements it as a new app-server thread under the same
+        the reason, shown to the user verbatim. `text` is the command as the user typed it, whitespace-trimmed
+        ("/clear", "/new", "/clear now"): the acknowledging chip a backend leaves carries those exact words,
+        because the composer retires its optimistic bubble only by that text (or a copy id, which a clear does
+        not carry), and a typed /new acknowledged by a literal "/clear" chip left the bubble standing (review
+        find, 2026-09-19). Codex implements it as a new app-server thread under the same
         sid (CodexBackend.clear), bracketed by clearing() from before thread/start until the new thread id is
         durable. The Claude Code backend does not implement it: a typed /clear on an SDK session still goes to
         the CLI as literal text, which executes it (SdkBackend.send brackets it); the kernel routes to this

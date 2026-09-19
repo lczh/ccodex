@@ -252,12 +252,24 @@ def _dump(payload):
 def _append_cmd_gesture(state_dir, sid, text, t):
     """Record a command GESTURE at the moment it was asked for — the twin of sdk_backend.append_cmd_gesture,
     same record ({"t", "cmdGesture"}) in the same file (<state>/states/<sid>.jsonl), because this module cannot
-    import the SDK-gated one and the kernel reads both (_cmd_gestures interleaves a durable chip from it once
-    the live one is retired by the next human record). Written by clear() for its "/clear" chip (2026-09-19)."""
+    import the SDK-gated one and the kernel reads both (_cmd_gestures). How the twin renders (2026-09-19): it is
+    stamped at the clear, before the fresh conversation's first record, so it shows in the fresh conversation only
+    until the boundary tick, which records the boundary at that first record's time and floors the live build's
+    notes there; from then on it renders as the last gesture row of the cleared conversation's episode. Written by
+    clear() for its acknowledging chip, with the command as typed."""
     p = Path(state_dir) / "states" / (str(sid) + ".jsonl")
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a", encoding="utf-8") as f:
         f.write(json.dumps({"t": int(t), "cmdGesture": str(text)}) + "\n")
+
+
+def _unlink_quiet(path):
+    """Remove a file this module touched and no longer wants (a rollback's), swallowing a filesystem refusal: the
+    caller is already on its failure path, and a second raise there would mask the first (2026-09-19)."""
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _tail_state(path):
@@ -1293,14 +1305,16 @@ class CodexBackend:
     def set_fast(self, sid, value):
         return False   # no Codex equivalent
 
-    def clear(self, sid):
+    def clear(self, sid, text="/clear"):
         """A fresh conversation for the SAME session (SessionBackend.clear, 2026-09-19): a new app-server thread
         under the same sid — thread/start with sessionStartSource "clear" (Codex's own tag for its /clear and
         /new; the runtime validates the enum and reflects nothing back, live probe 2026-09-19) and the row's
         cwd, mode and picked model — swapped into the registry row under the turn lock, the normalizer reset on
         the new EMPTY file so its first record is a ROOT (what the kernel's episode boundary keys on: the old
         cards settle and the "Conversation cleared" card appears on the fresh thread's first prompt), and an
-        acknowledging "/clear" chip left in the live tail. Everything else on the row survives because it lives
+        acknowledging chip carrying `text` as typed ("/clear", "/new", "/clear now") left in the live tail: the
+        composer retires its optimistic bubble by that exact text, so a literal "/clear" chip for a typed /new
+        left the bubble standing (review find, 2026-09-19). Everything else on the row survives because it lives
         on the row, keyed by sid: name, cwd, model, effort, mode, color, note, the durable queue; tags and the
         mailbox are kernel stores keyed by sid. The old thread is LEFT on the app-server: romp reads only its own
         materialized file, which stays where build_episode's sibling lookup finds it; an archive would be one
@@ -1323,11 +1337,12 @@ class CodexBackend:
         session until the next registry write. A raising registry write publishes NOTHING (_prepare_thread's
         discipline): the in-memory swap rolls back and the touched file leaves with it. The chip lives here and
         not in the kernel because the composer's optimistic "/clear" bubble ends only on a landed user event with
-        its text (the "cmd:<t>:clear" id is not the kernel-echo form, so send-pending takes it by text) and the
+        its text (the "cmd:<t>:<command>" id is not the kernel-echo form, so send-pending takes it by text) and the
         kernel has no live-atom store of its own — the SDK puts the same chip in its setters (_ack_cmd_chip)."""
+        cmd = str(text or "").strip() or "/clear"   # the words as typed ride the chip, its uuid and the twin (see above)
         s = self._session(sid)
         if not s:
-            return _contract.SessionBackend.clear(self, sid)
+            return _contract.SessionBackend.clear(self, sid, cmd)
         c = self._get_client()
         if c is None:
             return self._client_failure_text()
@@ -1351,7 +1366,6 @@ class CodexBackend:
             try:
                 resp = c.thread_start(params)
                 new_tid = resp.thread.id
-                new_model = model or getattr(resp, "model", "") or ""   # the pick outlives the create (_prepare_thread)
                 loaded_client_generation = self._client_generation_for(c)
                 touched = self._path_for(cwd, new_tid)
                 touched.touch()                # the fresh file exists before the row names it (see above)
@@ -1362,7 +1376,12 @@ class CodexBackend:
                         return "this session has ended — revive it first"
                     prior = (s.tid, s.model, s.loaded, s.loaded_client_generation, s.launch_error)
                     s.tid = new_tid
-                    s.model = new_model
+                    # the row's CURRENT model, as _create_thread reads it (review find, 2026-09-19): nothing reads busy
+                    # through the bracket and set_model never takes mode_lock, so a /model pick can land while
+                    # thread/start is in flight, accepted and saved — and the model read before the request, written
+                    # back here, reverted it in memory, the registry, the live listing and the next turn's params. The
+                    # pre-request model rides the start params only; the server's reply fills an empty pick
+                    s.model = s.model or getattr(resp, "model", "") or ""
                     s.loaded = True
                     s.loaded_client_generation = loaded_client_generation
                     s.launch_error = None      # the fresh thread starts clean; a parked rejection named the old one
@@ -1413,8 +1432,8 @@ class CodexBackend:
         t = int(time.time())
         try:
             with s.lock:
-                s.echoes.append({"text": "/clear", "t": t, "uuid": "cmd:%d:clear" % t, "command": "/clear"})
-            _append_cmd_gesture(self.state, sid, "/clear", t)   # the durable twin, on disk before the push that rebuilds the chat
+                s.echoes.append({"text": cmd, "t": t, "uuid": "cmd:%d:%s" % (t, cmd.lstrip("/")), "command": cmd})
+            _append_cmd_gesture(self.state, sid, cmd, t)     # the durable twin, on disk before the push that rebuilds the chat
             try:
                 c.thread_set_name(new_tid, name)
             except Exception:
@@ -1691,8 +1710,14 @@ class CodexBackend:
             params["model"] = model    # picked while the row was a placeholder: born on it
         resp = c.thread_start(params)
         loaded_client_generation = self._client_generation_for(c)
+        touched = self._path_for(cwd, resp.thread.id)
+        touched.touch()                # BEFORE the row names the tid (review find, 2026-09-19): discovery skips a row whose
+        #                                file does not stat, so saved first, a discover landing in the gap (the restart
+        #                                fallback's included) listed the board without this session until the next save;
+        #                                the order clear() keeps. Both rollbacks below remove it again
         with s.lock:
             if s.dead:
+                _unlink_quiet(touched)
                 return False
             prior = (s.tid, s.model, s.loaded, s.loaded_client_generation)
             s.tid = resp.thread.id
@@ -1712,11 +1737,11 @@ class CodexBackend:
                 # verification). Rolled back, the loud retry re-runs thread_start; an
                 # orphaned server-side thread beats a silently forked conversation.
                 (s.tid, s.model, s.loaded, s.loaded_client_generation) = prior
+                _unlink_quiet(touched)
                 raise
         with s.norm_lock:
             s.norm = None
         self._ensure_norm(s)
-        self.transcript_path(s.sid).touch()
         return True
 
     @staticmethod

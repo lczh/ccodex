@@ -34746,7 +34746,7 @@ def _save_pending_ops():
             sys.stderr.write("pending-ops save: %s\n" % traceback.format_exc())
 
 
-_pending_ops = _load_pending_ops()   # sid -> [("send", text, echo[, qid]) | ("command", text, echo[, qid]) | ("model", v) | ("effort", v) | ("fast", v) | ("env", {…}) | ("cwd", path, busy_retries) | ("compact",) | ("clear",), …] in park order
+_pending_ops = _load_pending_ops()   # sid -> [("send", text, echo[, qid]) | ("command", text, echo[, qid]) | ("model", v) | ("effort", v) | ("fast", v) | ("env", {…}) | ("cwd", path, busy_retries) | ("compact",) | ("clear", text), …] in park order
 
 
 _PATH_UNRESOLVED = object()   # _compacting_now's "no path was passed" sentinel — None is a real value (no transcript)
@@ -34976,7 +34976,11 @@ def _parked_md(op):
     if op[0] == "compact":
         return "/compact"
     if op[0] == "clear":
-        return "/clear"                  # a parked native clear (2026-09-19): the queued chip the clearing fold and the ✕ read
+        # a parked native clear renders as the words it was typed with ("/new", "/clear now"): the queued chip the
+        # composer matches its bubble against, the drain's arm and the ✕ handshake all read this one string; length-
+        # guarded because the parked-ops file survives a restart and a mirror written before the slot existed holds
+        # ("clear",) (2026-09-19)
+        return str(op[1]).strip() if len(op) > 1 and op[1] else "/clear"
     if op[0] == "env":
         # a dict payload, rendered as the sorted NAME list it was asked as — NAMES ONLY: env values can
         # be secrets, and this string is the visible chat chip (PR #889 review). Sorted so the bubble
@@ -35904,13 +35908,18 @@ def _codex_clear_command(be, sid, text, client=None, state=None, qid=None):
     delivering socket with the session and the press named (the chat retires the bubble it drew and puts the words
     back in an empty composer; a broadcast when no socket carried the op), filed as state["refused_clear"] so POST
     /send and `romp send` answer ok:false with them (its own key: _deliver_text rewords the "refused" key for the
-    unowned route), kept on the bell, and logged once. `text` is taken whole: the head decided the dispatch, and
-    "/clear now" is a clear like the SDK's _is_clear_cmd reads it; a message with more lines than the command never
-    arrives here (the route refuses it: _slash_alone). Returns True: the command was taken."""
-    parked = _gate_or_park(sid, ("clear",))
-    why = "" if parked else be.clear(sid)
+    unowned route), kept on the bell, and logged once. `text` is taken whole, and whitespace-trimmed it rides the
+    parked op and the verb (review find, 2026-09-19): the chip the backend leaves and the queued chip both carry the
+    words as typed ("/new", "/clear now"), the one thing the composer retires its optimistic bubble by, so a literal
+    "/clear" chip for a typed /new left the bubble standing and a /new parked mid-turn drew a queued "/clear" chip
+    beside it; the head decided the dispatch, and "/clear now" is a clear like the SDK's _is_clear_cmd reads it; a
+    message with more lines than the command never arrives here (the route refuses it: _slash_alone). Returns True:
+    the command was taken."""
+    cmd = str(text or "").strip() or "/clear"
+    parked = _gate_or_park(sid, ("clear", cmd))
+    why = "" if parked else be.clear(sid, cmd)
     if why == "busy":
-        _park_op(sid, ("clear",))
+        _park_op(sid, ("clear", cmd))
         parked, why = True, ""
     if why:
         if state is not None:
@@ -36028,7 +36037,10 @@ def _apply_pending_ops(now=None):
     call — send, set_*, turn_seq, busy() inside the gates and the hold check — runs with the lock
     RELEASED, because a backend call can be slow (CodexBackend.send may synchronously spawn and initialize
     `codex app-server`, with no request timeout) and every handler's queue check + park would otherwise
-    wait behind it. The lock closes the two races review confirmed: (1) a ✕, or the move thread's head
+    wait behind it. The waits this walk takes with no bound of its own today: a parked effort pick's model
+    listing (CodexBackend.set_effort reads the catalog), a parked send's handshake (bounded by _handshake's own
+    clock) and, since 2026-09-19, a parked clear's `thread_start` (CodexBackend.clear); a watchdog over them is a
+    separate change. The lock closes the two races review confirmed: (1) a ✕, or the move thread's head
     re-insert, changing the list between this walk's head read and its pop — the pop landed on a list the
     ✕ had emptied (an IndexError the except below turned into a dropped queue), or the ✕'s own check-then-
     pop landed on a list this walk had shifted (the op BEHIND the clicked one vanished); (2) two writers
@@ -36139,7 +36151,7 @@ def _apply_pending_ops(now=None):
                             _inflight_ops[sid] = op       # (a move hands nothing over below: not recorded)
                     refused = False
                     said = False                          # the refusal was worded already (the Codex arm below): no generic toast, no backend blamed
-                    # a parked native clear (2026-09-19): the ("clear",) op the route parks, or a ("command", "/clear" | "/new")
+                    # a parked native clear (2026-09-19): the ("clear", text) op the route parks, or a ("command", "/clear" | "/new")
                     # op a Codex session parked before the head registered (pending-ops.json survives a restart) — the same
                     # verb, not the guard's refusal; the copy's id rides a refusal so the chat retires its bubble
                     is_clear = op[0] == "clear" or (op[0] == "command" and be is not None and be is _codex()
@@ -36169,7 +36181,10 @@ def _apply_pending_ops(now=None):
                         # poke brings finds the lock free, and a cycle that delivers nothing re-wakes nothing, so the
                         # backstop retries by itself; the move's hold spaces COUNTED retries against a CLI window that
                         # emits no event, which a clear has not got
-                        clear_why = be.clear(sid) if hasattr(be, "clear") else _UNOWNED.clear(sid)
+                        # the words the op was parked with ride to the verb and its chip (_parked_md: a ("clear", text) op's
+                        # text, a pre-upgrade ("command", "/new") op's, the default for a one-slot op from an older mirror),
+                        # else a parked /new landed as a "/clear" chip the composer's bubble never matched (2026-09-19)
+                        clear_why = be.clear(sid, _parked_md(op)) if hasattr(be, "clear") else _UNOWNED.clear(sid)
                         if clear_why == "busy":
                             with _pending_ops_lock:
                                 _inflight_ops.pop(sid, None)
@@ -38818,8 +38833,11 @@ def build_session(sid, now, live_map=None, path_override=None, tail_cap_t=None, 
         # the backend's _pending for cancelQueued). CANCELABLE too (the user 2026-07-08): these are
         # romp-owned on EVERY backend — `park` is the op's _pending_ops position, and the body doubles as
         # the ✕ handshake (_parked_md/_cancel_parked verify it so a shifted queue never drops the wrong op).
-        for j, op in enumerate(pending_ops):
+        _clear_chips = []                                 # a parked native clear's chip, by identity: the clearing fold below
+        for j, op in enumerate(pending_ops):              # keys on the op's KIND, not on the words it renders as
             m = {"md": _parked_md(op), "park": j, "cancelable": True, **(_queued_romp_flags(op[1]) if op[0] == "send" else {})}
+            if op[0] == "clear":
+                _clear_chips.append(m)
             # a PARKED copy's identity is the id the client minted at the press, when one rode the park (the
             # op's fourth slot, _send_or_park): the chat's bubble and its ✕ name the copy by it before the
             # drain, and the drain hands the same id to the backend. A copy the kernel parked itself (a
@@ -38849,10 +38867,13 @@ def build_session(sid, now, live_map=None, path_override=None, tail_cap_t=None, 
                 if (m.get("md") or "").strip() == "/compact":
                     del qmsgs[i]
                     break
-        # Same fold for a running /clear: the live "Clearing conversation…" element already represents it.
+        # Same fold for a running /clear: the live "Clearing conversation…" element already represents it. Keyed on the
+        # op's KIND for a parked native clear (2026-09-19): it renders as the words it was typed with ("/new", "/clear
+        # now"), which the text match missed, so the queued chip drew beside the live element; the SDK's running /clear
+        # is a ("command", "/clear") head and keeps the text match.
         if clearing_now:
             for i, m in enumerate(qmsgs):
-                if (m.get("md") or "").strip() == "/clear":
+                if any(m is c for c in _clear_chips) or (m.get("md") or "").strip() == "/clear":
                     del qmsgs[i]
                     break
         if qmsgs:                                         # don't emit an empty "queued" (folding the running /compact could empty it)
@@ -53409,6 +53430,22 @@ def _push_session_now(sid):
     the build cache/_last_tab_order bookkeeping, which belong to the pusher. Never a fleet build (the
     push-architecture rule, 2026-07-05): callers sit on WS-handler / spawn / backend threads."""
     sid = str(sid)
+    # Under an OPEN pusher scope this is the backend's hook running inside the cycle that drained a parked op (the
+    # drain's arm calls the verb on the pusher thread), and the cycle's memos — _live_scope.sessions, the discover
+    # rows, and _live_scope.paths, this sid's path — were filled by the drain's own gates BEFORE the verb ran. A
+    # clear that swapped the registry row onto a fresh transcript then built the OLD file with its chip appended,
+    # here and in the cycle's post-drain build alike, and the fresh conversation appeared a cycle later (review
+    # find, 2026-09-19). Reset at hook entry, before any read and whether or not a client is connected: the row
+    # memo to a fresh dict (the fingerprinted cache under it, jd.discover, follows the registry's mtime, which the
+    # swap rewrote, so no reset there) and this sid's path dropped, so this build and every build after it in the
+    # cycle resolve the row as it is now. The sessions reset carries the weight (_path_of resolves through
+    # _sessions); a reset in the drain's arm alone would come too late for this frame. Outside a cycle both memos
+    # are absent and every read is fresh already.
+    if getattr(_live_scope, "sessions", None) is not None:
+        _live_scope.sessions = {}
+    _paths = getattr(_live_scope, "paths", None)
+    if _paths is not None:
+        _paths.pop(sid, None)
     with _clients_lock:
         targets = [c for c in _clients if c["app"] == "chat" and c.get("alive", True)]
     if not targets:

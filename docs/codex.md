@@ -159,7 +159,11 @@ and postal delivery into Codex sessions.
 Slash commands: `/model` and `/effort` work (they apply at the session's next
 turn). `/clear` (and `/new`, Codex's own word for it) starts a fresh conversation
 for the session: a new Codex thread under the same session, so its name, mail,
-tags, color, mode, model and effort stay and queued messages carry over. The
+tags, color, mode, model and effort stay. Messages keep their order around it:
+a message typed after the `/clear` lands on the fresh conversation; a message
+queued before it runs first, on the conversation it was typed into, and the
+`/clear` waits behind it; only a queue stuck behind a failed start of the old
+conversation rides into the fresh one. The
 cleared conversation stays reachable from the "Conversation cleared" card in the
 chat and leaves the timeline, feed and judges, as it does after a Claude `/clear`;
 that card, the bell notice and the settling of the old conversation's open cards

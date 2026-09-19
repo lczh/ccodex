@@ -80,7 +80,8 @@ class AbcContract(unittest.TestCase):
         self.assertIn("fresh conversation", why)
         self.assertNotIn("backend", why, "a toast in the user's terms")
         src = open(os.path.join(os.path.dirname(HERE), "kernel", "codex_backend.py"), encoding="utf-8").read()
-        self.assertIn("\n    def clear(self, sid):", src, "CodexBackend implements clear")
+        self.assertIn("\n    def clear(self, sid, text=\"/clear\"):", src,
+                      "CodexBackend implements clear, and takes the command as typed for its chip (2026-09-19)")
         sdk = open(os.path.join(BIN, "romp_sdk_backend.py"), encoding="utf-8").read()
         self.assertNotIn("\n    def clear(self, sid", sdk, "the SDK backend leaves /clear to the CLI")
 

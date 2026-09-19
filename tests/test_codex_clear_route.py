@@ -69,10 +69,12 @@ class _Backend:
     """The kernel's view of a backend that has the verb."""
     def __init__(self):
         self.calls = []
+        self.texts = []      # the words each clear was asked with (2026-09-19)
         self.answer = ""
 
-    def clear(self, sid):
+    def clear(self, sid, text="/clear"):
         self.calls.append(("clear", sid))
+        self.texts.append(text)
         return self.answer
 
     def send(self, sid, text):
@@ -192,7 +194,7 @@ class CodexClearRoute(_Base):
         self.verdict = True                               # mid-turn, behind a queue, compacting or under a hold
         state = {}
         self.assertTrue(km._route_meta_command(self.be, SID, "/clear", self.client, state=state, qid=QID))
-        self.assertEqual(km._pending_ops[SID], [("clear",)], "a visible '/clear' chip in press order")
+        self.assertEqual(km._pending_ops[SID], [("clear", "/clear")], "a visible '/clear' chip in press order")
         self.assertIs(state["queued"], True)
         self.assertEqual(self.be.calls, [], "parked: the drain asks the backend at the turn's end")
         self.assertEqual(self.sent, [])
@@ -202,10 +204,33 @@ class CodexClearRoute(_Base):
         state = {}
         self.assertTrue(km._route_meta_command(self.be, SID, "/new", self.client, state=state))
         self.assertEqual(self.be.calls, [("clear", SID)])
-        self.assertEqual(km._pending_ops[SID], [("clear",)], "parked after the answer; the drain retries")
+        self.assertEqual(km._pending_ops[SID], [("clear", "/new")], "parked after the answer; the drain retries")
         self.assertIs(state["queued"], True)
         self.assertEqual(self.sent, [], "'busy' is an internal answer, never shown")
         self.assertEqual(km._parked_md(("clear",)), "/clear", "the queued chip's body, and the cancel handshake's")
+
+    def test_a_typed_new_or_clear_with_words_carries_them_to_the_verb_and_the_chip(self):
+        # The composer retires its optimistic bubble by the exact text it sent, and the chip is the backend's
+        # acknowledgment: a typed /new acknowledged by a literal "/clear" chip left the sending bubble standing, and
+        # a /new parked mid-turn drew a queued "/clear" chip beside it (review find, 2026-09-19). The words as typed
+        # ride the verb and the parked op; a one-slot op from a mirror written before the slot existed still renders.
+        for text in ("/new", "/clear now", "  /new  "):
+            self.be.texts.clear()
+            self.assertTrue(km._route_meta_command(self.be, SID, text, self.client, state={}))
+            self.assertEqual(self.be.texts, [text.strip()], repr(text))
+        self.verdict = True
+        self.assertTrue(km._route_meta_command(self.be, SID, "/new", self.client, state={}, qid=QID))
+        self.assertEqual(km._pending_ops[SID], [("clear", "/new")], "the parked op carries the words")
+        self.assertEqual(km._parked_md(km._pending_ops[SID][0]), "/new", "the queued chip shows what was typed")
+        self.assertEqual(km._parked_md(("clear",)), "/clear", "an older mirror's one-slot op still renders")
+        self.assertIsNone(km._cancel_parked(SID, 0, "/new"), "the chip's cancel handshake reads the same words")
+        self.assertNotIn(SID, km._pending_ops)
+        self.verdict = False
+        self.be.answer = "busy"
+        self.be.texts.clear()
+        self.assertTrue(km._route_meta_command(self.be, SID, "/clear now", self.client, state={}))
+        self.assertEqual((self.be.texts, km._pending_ops[SID]), (["/clear now"], [("clear", "/clear now")]),
+                         "a 'busy' answer parks the same words")
 
     def test_a_refused_clear_is_said_and_filed(self):
         why = "this session has ended — revive it first"
@@ -286,6 +311,38 @@ class CodexClearDrain(_Base):
         self.assertEqual(len(warns), 1)
         self.assertEqual((warns[0]["sid"], warns[0]["qid"], warns[0]["text"]), (SID, QID, self.be.answer))
         self.assertNotIn(SID, km._pending_ops)
+
+    def test_the_drain_hands_the_parked_words_to_the_verb(self):
+        # a parked /new must not land as a /clear chip (review find, 2026-09-19): the drain's arm passes the words the
+        # op was parked with — a ("clear", text) op, a ("command", "/new") op parked before the upgrade, and a one-slot
+        # ("clear",) op from an older mirror, which takes the contract's default
+        km._pending_ops[SID] = [("clear", "/new"), ("command", "/clear now", "human", QID, True), ("clear",)]
+        km._save_pending_ops()
+        km._apply_pending_ops()
+        self.assertEqual(self.be.texts, ["/new", "/clear now", "/clear"])
+        self.assertNotIn(SID, km._pending_ops)
+        self.assertEqual(self._warns(), [])
+
+    def test_a_command_op_with_a_second_line_is_refused_in_the_drain_never_cleared(self):
+        # The route's whole-message rule holds in the drain too (review find, 2026-09-19): a pre-upgrade ("command", …)
+        # op whose text has a second line under the head is not a clear (the lines after it would reach no one) — it
+        # takes the guard's refusal ONCE, with the press named so the chat retires its bubble, and the message parked
+        # behind it still delivers; without the rule the op ran as a clear with its second line dropped.
+        for head in ("/clear", "/new"):
+            self.broadcast.clear()
+            self.be.calls.clear()
+            km._pending_ops[SID] = [("command", head + "\nand more", "human", QID, True), ("send", "after it", None)]
+            km._save_pending_ops()
+            km._apply_pending_ops()
+            self.assertEqual(self.be.calls, [("send", "after it")],
+                             "%s: the verb never ran; the send behind it delivered" % head)
+            warns = self._warns()
+            self.assertEqual(len(warns), 1, head)
+            self.assertEqual((warns[0]["sid"], warns[0]["qid"]), (SID, QID), "one warn, with the press named")
+            self.assertIn(head, warns[0]["text"])
+            self.assertIn("must be the whole message", warns[0]["text"])
+            self.assertNotIn(SID, km._pending_ops, "nothing parked")
+            self.assertEqual(self._last_notice()["kind"], "refused")
 
     def test_a_backend_without_the_verb_gets_the_contracts_refusal(self):
         class Bare:
@@ -410,6 +467,28 @@ class CodexClearEpisode(unittest.TestCase):
         notices = km._boundary_clear_notices([{"sid": SID_EPI, "name": "cx"}])
         self.assertEqual(notices[0]["titles"], [self.TOP], "the bell rings once with the dropped card")
 
+    def test_the_twin_renders_in_the_fresh_conversation_until_the_boundary_tick_then_closes_the_episode(self):
+        # The chip's durable twin is stamped at the clear, between the old file's last record and the fresh
+        # conversation's first (a real session's order). Until the boundary tick the live build has no floor past
+        # it, so the twin renders in the fresh conversation; the tick records the boundary at the new head's time,
+        # the live build drops every note at or before it, and the twin renders only as the last gesture row of
+        # the old file's episode (review find, 2026-09-19).
+        (jd.STATE / "states").mkdir(parents=True, exist_ok=True)
+        (jd.STATE / "states" / (SID_EPI + ".jsonl")).write_text(json.dumps({"t": NOW - 100, "cmdGesture": "/clear"}) + "\n")
+        km._episode_boundary_check(SID_EPI, str(self.old_path), NOW)          # the seed: one row, no floor
+        kinds = [e.get("kind") for e in km.build_session(SID_EPI, NOW)["events"]]
+        self.assertIn("cmdGesture", kinds, "before the tick the twin renders in the fresh conversation: %r" % kinds)
+        self.assertNotIn("clear", kinds)
+        km._episode_boundary_check(SID_EPI, str(self.new_path), NOW)          # the boundary, at the new head's time
+        kinds = [e.get("kind") for e in km.build_session(SID_EPI, NOW)["events"]]
+        self.assertEqual(kinds[0], "clear", "the head card leads the fresh conversation: %r" % kinds)
+        self.assertNotIn("cmdGesture", kinds, "the twin is under the floor: no /clear chip in the fresh conversation")
+        ep = km.build_episode(SID_EPI, NOW)
+        self.assertNotIn("error", ep, ep.get("error"))
+        last = ep["events"][-1]
+        self.assertEqual((last.get("kind"), last.get("cmd")), ("cmdGesture", "/clear"),
+                         "the episode ends with the /clear row: %r" % [e.get("kind") for e in ep["events"]])
+
 
 class RealBackendClear(unittest.TestCase):
     """The route and the drain over the REAL CodexBackend with the codex-backend module's own scripted client,
@@ -448,13 +527,17 @@ class RealBackendClear(unittest.TestCase):
             self.addCleanup(_forget, sid)
         self._reg = self.root / "codex" / "registry.json"
         self._reg_before = self._reg.read_bytes() if self._reg.exists() else None
+        self._lock = self.root / "codex" / "registry.lock"
+        self._lock_before = self._lock.exists()
         projects = self.root / "codex" / "projects"
         self._files_before = set(projects.rglob("*")) if projects.exists() else set()
         self.addCleanup(self._scrub)                    # after tearDown (cleanup order): no worker writes then
 
     def _scrub(self):
         """Leave the root as found: every transcript the test's threads wrote (a clear swaps the tid, so the old
-        thread's file is no longer reachable through the row), the names/ entries and the registry rows."""
+        thread's file is no longer reachable through the row), the names/ entries, the registry rows, the chip's
+        durable twin (states/<sid>.jsonl, the clear's cmdGesture record) for both sids, and the registry's lock
+        sidecar when set-up found none (the save creates it)."""
         projects = self.root / "codex" / "projects"
         if projects.exists():
             for path in sorted(set(projects.rglob("*")) - self._files_before, key=lambda q: -len(q.parts)):
@@ -463,10 +546,11 @@ class RealBackendClear(unittest.TestCase):
                 except OSError:
                     pass
         for sid in (SID_REAL, SID_REAL2):
-            try:
-                (self.root / "names" / sid).unlink()
-            except FileNotFoundError:
-                pass
+            for path in (self.root / "names" / sid, self.root / "states" / (sid + ".jsonl")):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
         if self._reg_before is None:
             try:
                 self._reg.unlink()
@@ -474,6 +558,11 @@ class RealBackendClear(unittest.TestCase):
                 pass
         else:
             self._reg.write_bytes(self._reg_before)
+        if not self._lock_before:
+            try:
+                self._lock.unlink()
+            except FileNotFoundError:
+                pass
 
     def tearDown(self):
         for _, sess in self.be._session_items():        # a worker returns when it wakes to a dead session
@@ -535,6 +624,65 @@ class RealBackendClear(unittest.TestCase):
         self.assertFalse(km._session_working(merged["turns"]), "no working cue from the merged turns")
         self.assertEqual(km.Sessions.live()[sid]["state"], "waiting", "the backend's row agrees")
 
+    def test_a_typed_new_leaves_a_new_chip_and_a_parked_one_folds_under_the_clearing_indicator(self):
+        # The kernel road for the composer's bubble (review find, 2026-09-19): the words as typed reach the chip, so
+        # the bubble retires by exact text; and the fold that hides the queued chip behind the live "Clearing
+        # conversation…" element keys on the op's KIND, since a parked native clear renders as the words it was
+        # typed with, not the literal "/clear" the fold used to look for.
+        sid = self.be.spawn("web", "/TESTDIR-new", sid=SID_REAL)
+        self.assertTrue(self.be.send(sid, "first synthetic turn"))
+        self.assertTrue(self.cbt._lock_free(self.be, sid))
+        state = {}
+        self.assertTrue(km._route_meta_command(self.be, sid, "/new", self.client, state=state, qid=QID))
+        self.assertEqual(state, {"queued": False})
+        self.assertEqual([(a["_echo_text"], a["command"]) for a in self.be.live_atoms(sid)], [("/new", "/new")])
+        m = km.build_session(sid, int(time.time()))
+        self.assertEqual([e["md"] for e in m["events"] if e.get("kind") == "user"], ["/new"], "the chat shows the words typed")
+        km._pending_ops[sid] = [("clear", "/new")]        # a second one, parked mid-turn and now with the backend
+        km._save_pending_ops()
+        m = km.build_session(sid, int(time.time()))
+        queued = [e for e in m["events"] if e.get("kind") == "queued"]
+        self.assertEqual([x["md"] for x in queued[0]["texts"]], ["/new"], "the queued chip shows what was typed")
+        with mock.patch.object(km, "_clearing_now", lambda s: str(s) == sid):
+            m = km.build_session(sid, int(time.time()))
+        kinds = [e.get("kind") for e in m["events"]]
+        self.assertIn("clearing", kinds, "the live element represents the running clear")
+        self.assertNotIn("queued", kinds, "…and the parked chip folds under it, keyed on the op's kind: %r" % kinds)
+
+    def test_the_cycle_that_drains_a_parked_clear_builds_the_fresh_file_from_the_hook_on(self):
+        # The drain runs inside a pusher cycle whose memos (_live_scope.sessions, .paths) its own gates filled BEFORE
+        # the verb; the verb's push hook (push_session -> _push_session_now) built on that thread, and the old file
+        # rendered with the chip appended, in the hook's frame and in the cycle's post-drain build alike, the fresh
+        # conversation appearing a cycle later (review find, 2026-09-19). The hook resets the row memo and drops the
+        # sid's path under an open scope, so what it resolves during the verb is the row as it is now. The scope is
+        # opened here the way _pusher_cycle opens it, and the hook records what its own frame resolved.
+        sid = self.be.spawn("web", "/TESTDIR-cycle", sid=SID_REAL)
+        self.assertTrue(self.be.send(sid, "first synthetic turn"))
+        self.assertTrue(self.cbt._lock_free(self.be, sid))
+        old_path = str(self.be.transcript_path(sid))
+        resolved = []
+
+        def hook(s):
+            km._push_session_now(s)
+            resolved.append(km._path_of(s))               # what a build in the hook's frame resolves
+        self.be.push_session = hook
+        km._pending_ops[sid] = [("clear", "/clear")]
+        km._save_pending_ops()
+        km._live_scope.snapshot = km._live_map()
+        km._live_scope.paths, km._live_scope.sessions = {}, {}
+        try:
+            self.assertEqual(km._path_of(sid), old_path, "the gates fill the memo with the old row")
+            km._apply_pending_ops()
+            after = km._path_of(sid)                      # the cycle's post-drain build
+        finally:
+            km._live_scope.snapshot = km._live_scope.paths = km._live_scope.sessions = None
+        new_path = str(self.be.transcript_path(sid))
+        self.assertEqual(self._registry_tid(sid), "T-2")
+        self.assertNotEqual(new_path, old_path)
+        self.assertEqual(resolved[-1], new_path, "the hook's own frame resolved the fresh file during the verb: %r" % resolved)
+        self.assertEqual(after, new_path, "and so does every build after it in the cycle")
+        self.assertNotIn(sid, km._pending_ops)
+
     def test_a_clear_parked_mid_turn_fires_on_the_turn_end_poke_with_no_clock(self):
         sid = self.be.spawn("api", "/TESTDIR-parked", sid=SID_REAL2)
         self.cbt._hold_turn_open(self.fake)
@@ -552,7 +700,7 @@ class RealBackendClear(unittest.TestCase):
         self.be.poke = poke
         state = {}
         self.assertTrue(km._route_meta_command(self.be, sid, "/clear", self.client, state=state, qid=QID))
-        self.assertEqual(km._pending_ops[sid], [("clear",)], "mid-turn: parked, a visible chip")
+        self.assertEqual(km._pending_ops[sid], [("clear", "/clear")], "mid-turn: parked, a visible chip")
         self.assertIs(state["queued"], True)
         self.assertEqual(len(self.fake.called("thread_start")), 1)
         m = km.build_session(sid, int(time.time()))
