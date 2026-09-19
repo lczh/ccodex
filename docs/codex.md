@@ -157,14 +157,22 @@ turn, interrupts, model and reasoning-effort switches, resume after restarts,
 and postal delivery into Codex sessions.
 
 Slash commands: `/model` and `/effort` work (they apply at the session's next
-turn). Anything else (`/clear`, `/compact`, `/new`, a skill) typed into the
-composer, sent from the timeline's lane menu, or sent with `romp send` is
-refused with a notice and not sent to the model as text, and the composer's
-`/` list shows only what a Codex session takes. Two paths still reach the
-model as text until the native clear lands: a follow-up typed from a card
+turn). `/clear` (and `/new`, Codex's own word for it) starts a fresh conversation
+for the session: a new Codex thread under the same session, so its name, mail,
+tags, color, mode, model and effort stay and queued messages carry over. The
+cleared conversation stays reachable from the "Conversation cleared" card in the
+chat and leaves the timeline, feed and judges, as it does after a Claude `/clear`;
+that card, the bell notice and the settling of the old conversation's open cards
+land on the FIRST prompt into the fresh conversation, not at the `/clear` itself
+(the boundary is the new conversation's first record), so open cards stay open
+until then. Typed mid-turn it queues and runs at the turn's end. Anything else
+(`/compact`, a skill) typed into the composer, sent from the timeline's lane
+menu, or sent with `romp send` is refused with a notice and not sent to the
+model as text, and the composer's `/` list shows only what a Codex session
+takes. Two paths still reach the model as text: a follow-up typed from a card
 whose whole body is a slash command, and a slash command a Codex session had
-already queued before this guard existed. Clearing and compacting a Codex
-conversation natively are coming (`plans/codex-backend.md`).
+already queued before the guard existed. Compacting a Codex conversation
+natively is coming (`plans/codex-backend.md`).
 
 The chat and timeline effort menus use the selected model's supported levels
 from the Codex app-server's model catalog. Romp also validates effort changes

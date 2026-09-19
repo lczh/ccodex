@@ -18859,11 +18859,13 @@ def _commands_for_cwd(cwd):
 
 
 # What the kernel accepts for a Codex session today (_route_meta_command): the composer's "/" palette for a Codex sid
-# lists these and nothing else. /mcp is listed although the route refuses it, because the composer intercepts a bare
-# "/mcp" client-side (it opens the MCP panel, whose Codex answer names the servers in ~/.codex/config.toml) and it never
-# reaches the kernel; a native /clear and /new, then /compact, add their rows here as they register in
-# _CODEX_SLASH_HANDLERS (2026-09-19).
+# lists these and nothing else. /clear and /new are the native clear (_codex_clear_command, registered in
+# _CODEX_SLASH_HANDLERS, 2026-09-19); /mcp is listed although the route refuses it, because the composer intercepts a
+# bare "/mcp" client-side (it opens the MCP panel, whose Codex answer names the servers in ~/.codex/config.toml) and it
+# never reaches the kernel; a native /compact adds its row here when it registers.
 _CODEX_COMMANDS = (
+    {"name": "clear", "description": "Start a fresh conversation for this session (its name, mail, tags and settings stay)"},
+    {"name": "new", "description": "Same as /clear (Codex's own word for it)"},
     {"name": "model", "description": "Switch this session's model (applies at its next turn)", "argumentHint": "<gpt-…>"},
     {"name": "effort", "description": "Set this session's reasoning effort (applies at its next turn)", "argumentHint": "<level>"},
     {"name": "mcp", "description": "Show this session's MCP servers"},
@@ -24727,6 +24729,8 @@ def _deliver_text(sid, text, plain=False):
     if not plain and _route_meta_command(be, sid, text, state=meta):
         if meta.get("refused_effort"):
             return False, str(meta["refused_effort"]), False   # the route's own words for a level the backend refused (the review of #1814)
+        if meta.get("refused_clear"):
+            return False, str(meta["refused_clear"]), False    # the backend's own words for a clear it could not run (2026-09-19)
         if meta.get("refused"):
             if be is _UNOWNED:
                 return False, "no running backend owns %s — the command was not delivered" % sid, False
@@ -29991,8 +29995,9 @@ def _cmd_gestures(sid):
     SDK backend writes the moment a /model-/effort-/auth-style pick is made (append_cmd_gesture). Returns
     [{"t":epoch,"cmd":str}, …] oldest first, so build_session can interleave a persistent right-side gesture
     chip once prune_live retires the synthesized live one (the user 2026-08-14: the user's side of the history
-    keeps what they did; the applied note keeps that it happened). SDK-only — a command typed into a CLI is a
-    real transcript turn already; the SDK gesture is not."""
+    keeps what they did; the applied note keeps that it happened). Two writers land the same record: the SDK
+    backend for its setter picks, and the Codex backend for its native /clear (codex_backend._append_cmd_gesture,
+    2026-09-19) — a command typed into a CLI is a real transcript turn already; these gestures are not."""
     return sorted((dict(r) for r in _states_notes(sid)["gestures"]), key=lambda r: r["t"])   # one folded pass serves
     #                                                                                  all five; oldest first
 
@@ -34741,7 +34746,7 @@ def _save_pending_ops():
             sys.stderr.write("pending-ops save: %s\n" % traceback.format_exc())
 
 
-_pending_ops = _load_pending_ops()   # sid -> [("send", text, echo[, qid]) | ("command", text, echo[, qid]) | ("model", v) | ("effort", v) | ("fast", v) | ("env", {…}) | ("cwd", path, busy_retries) | ("compact",), …] in park order
+_pending_ops = _load_pending_ops()   # sid -> [("send", text, echo[, qid]) | ("command", text, echo[, qid]) | ("model", v) | ("effort", v) | ("fast", v) | ("env", {…}) | ("cwd", path, busy_retries) | ("compact",) | ("clear",), …] in park order
 
 
 _PATH_UNRESOLVED = object()   # _compacting_now's "no path was passed" sentinel — None is a real value (no transcript)
@@ -34970,6 +34975,8 @@ def _parked_md(op):
         return op[1]                     # the typed slash command IS the bubble (so the running-/compact fold matches it too)
     if op[0] == "compact":
         return "/compact"
+    if op[0] == "clear":
+        return "/clear"                  # a parked native clear (2026-09-19): the queued chip the clearing fold and the ✕ read
     if op[0] == "env":
         # a dict payload, rendered as the sorted NAME list it was asked as — NAMES ONLY: env values can
         # be secrets, and this string is the visible chat chip (PR #889 review). Sorted so the bubble
@@ -35846,7 +35853,8 @@ def _route_meta_command(be, sid, text, client=None, floating=False, state=None, 
     (which returned False for a bare /clear and let it fall to _send_or_park as prose the model then answered),
     by the same predicate that parks (_is_slash_command), so the refused set equals the parked set and a refused
     command is never a ("command",) op. _CODEX_SLASH_HANDLERS is the seam a native /clear or /compact plugs
-    into: a head registered there takes the text instead of the refusal. `qid` is the press-minted copy id
+    into: a head registered there takes the text instead of the refusal — when the command is the WHOLE message
+    (_slash_alone; a message that merely opens with the head is refused in words). `qid` is the press-minted copy id
     (the sendMessage arm's _wire_qid), carried on the refusal frame so the chat retires the bubble it drew. The
     Claude Code and unowned routes are unchanged and take the setter body directly: a dead Codex session routes
     to _UNOWNED (CodexBackend.owns is False once dead) and keeps the unowned refusal, so the identity test is
@@ -35857,7 +35865,7 @@ def _route_meta_command(be, sid, text, client=None, floating=False, state=None, 
     if _is_slash_command(text) and be is not None and be is not _UNOWNED and be is _codex():
         head = (text or "").strip().split()[0]
         handler = _CODEX_SLASH_HANDLERS.get(head)
-        if handler is not None:
+        if handler is not None and _slash_alone(text):
             return handler(be, sid, text, client, state, qid)
         if head in _CODEX_SETTER_HEADS and _route_setter_command(be, sid, text, client, floating=floating, state=state):
             return True
@@ -35874,9 +35882,57 @@ def _not_claude_code_reason(be):
 # The setter arms own these for a Codex session (one Codex value each, _route_setter_command); every other slash-shaped
 # text is refused for it (_route_meta_command, 2026-09-19).
 _CODEX_SETTER_HEADS = ("/model", "/effort")
-# head -> handler(be, sid, text, client, state, qid) -> bool. Empty in this change: a native /clear and /new, then a
-# native /compact, register here, and the refusal stops for each by that one registration (2026-09-19).
-_CODEX_SLASH_HANDLERS = {}
+
+
+def _slash_alone(text):
+    """Is the slash command the WHOLE message — one line (review find, 2026-09-19)? _is_slash_command's trailing
+    whitespace class admits a newline, so "/clear\\nand more" (a paste from notes, a Shift-Enter slip while typing
+    /clear, a file attached to a bare /clear) is slash-shaped with the head "/clear", and a handler registered for
+    that head takes no text: the lines after it would reach no one, after a clear the composer's open-cards confirm
+    never gated (its isClearCmd wants a space after the head, as the SDK's _is_clear_cmd does; both read that text as
+    NOT a clear). Such a message takes the guard's refusal instead, in words that name what the message must be
+    (_codex_slash_refusal): nothing silently drops. The setter body refuses a multiline pick by the same rule."""
+    return len(str(text or "").strip().splitlines()) == 1
+def _codex_clear_command(be, sid, text, client=None, state=None, qid=None):
+    """The Codex arm for a typed or sent /clear or /new (2026-09-19; the first head in _CODEX_SLASH_HANDLERS, so the
+    guard's refusal stops for these two by this registration): the backend's clear verb (SessionBackend.clear —
+    CodexBackend mints a fresh app-server thread under the same sid) through the drive-op FIFO, exactly the /effort
+    and /fast arms' shape and cost — ONE _ops_gate evaluation (_gate_or_park): mid-turn, behind a queue, compacting or
+    under an account hold it parks as a visible "/clear" chip in press order and the drain fires it at the turn's
+    end; quiet, it runs now. "busy" from the backend is the worker's lock sliver after a turn (or a concurrent clear)
+    and parks the same way, never shown. Any other answer is a refusal in the backend's own words, said on the
+    delivering socket with the session and the press named (the chat retires the bubble it drew and puts the words
+    back in an empty composer; a broadcast when no socket carried the op), filed as state["refused_clear"] so POST
+    /send and `romp send` answer ok:false with them (its own key: _deliver_text rewords the "refused" key for the
+    unowned route), kept on the bell, and logged once. `text` is taken whole: the head decided the dispatch, and
+    "/clear now" is a clear like the SDK's _is_clear_cmd reads it; a message with more lines than the command never
+    arrives here (the route refuses it: _slash_alone). Returns True: the command was taken."""
+    parked = _gate_or_park(sid, ("clear",))
+    why = "" if parked else be.clear(sid)
+    if why == "busy":
+        _park_op(sid, ("clear",))
+        parked, why = True, ""
+    if why:
+        if state is not None:
+            state["refused_clear"] = why
+        frame = {"type": "warn", "text": why, "sid": str(sid)}
+        if qid:
+            frame["qid"] = qid
+        if client:
+            client["send"](json.dumps(frame))
+        else:
+            _send_to_app("chat", dict(frame, id=str(sid)))
+        _sync_notice("%s: %s" % (_name_of(sid) or str(sid)[:8], why), ok=False, kind="refused")
+        sys.stderr.write("clear for %s refused by %s: %s\n" % (sid, type(be).__name__, why))
+    if state is not None:
+        state["queued"] = parked
+    return True
+
+
+# head -> handler(be, sid, text, client, state, qid) -> bool. A head registered here takes the text instead of the
+# guard's refusal: /clear and /new are the native clear (2026-09-19); a native /compact registers next.
+_CODEX_SLASH_HANDLERS = {"/clear": _codex_clear_command, "/new": _codex_clear_command}
+_CODEX_CLEAR_HEADS = ("/clear", "/new")   # the drain reads a ("command", …) op parked before the registration by these
 _CODEX_VALUE_EXAMPLE = {"/model": "/model gpt-5", "/effort": "/effort high"}
 
 
@@ -35886,6 +35942,10 @@ def _codex_slash_refusal(head):
     if head in _CODEX_SETTER_HEADS:
         return ("This session runs in Codex: %s takes one Codex value here (for example %s); nothing was sent."
                 % (head, _CODEX_VALUE_EXAMPLE[head]))
+    if head in _CODEX_SLASH_HANDLERS:
+        # a taken head that was not the whole message (_slash_alone, 2026-09-19): the command exists here and the
+        # lines after it reach no one, so the words say what the message must be, not that Codex has no such command
+        return "This session runs in Codex: %s must be the whole message here; nothing was sent." % head
     return "This session runs in Codex, which has no %s; nothing was sent." % head
 
 
@@ -36079,6 +36139,13 @@ def _apply_pending_ops(now=None):
                             _inflight_ops[sid] = op       # (a move hands nothing over below: not recorded)
                     refused = False
                     said = False                          # the refusal was worded already (the Codex arm below): no generic toast, no backend blamed
+                    # a parked native clear (2026-09-19): the ("clear",) op the route parks, or a ("command", "/clear" | "/new")
+                    # op a Codex session parked before the head registered (pending-ops.json survives a restart) — the same
+                    # verb, not the guard's refusal; the copy's id rides a refusal so the chat retires its bubble
+                    is_clear = op[0] == "clear" or (op[0] == "command" and be is not None and be is _codex()
+                                                    and str(op[1]).strip().split()[0] in _CODEX_CLEAR_HEADS
+                                                    and _slash_alone(op[1]))   # the route's rule: the whole message
+                    clear_why = ""
                     if op[0] == "send":
                         changed = True
                         _deliver_send_batch(be, sid, run)
@@ -36094,6 +36161,19 @@ def _apply_pending_ops(now=None):
                         if (seq is not None and tries >= _MOVE_BUSY_RETRIES and hasattr(be, "turn_seq")
                                 and be.turn_seq(sid) == seq):
                             break      # the CLI still owns a turn romp cannot see: its ResultMessage is the cue (_move_now)
+                    elif is_clear:
+                        # SessionBackend.clear: "" ran, "busy" the worker's lock sliver (or a concurrent clear), else the
+                        # reason. On "busy" the head STAYS and nothing is recorded as in flight (nothing was handed over:
+                        # the cwd arm's rule, so the chip's ✕ still cancels it) and the pass ends with NO clock hold — the
+                        # backend's turn-end poke follows its lock's release (CodexBackend._run_turn), so the cycle that
+                        # poke brings finds the lock free, and a cycle that delivers nothing re-wakes nothing, so the
+                        # backstop retries by itself; the move's hold spaces COUNTED retries against a CLI window that
+                        # emits no event, which a clear has not got
+                        clear_why = be.clear(sid) if hasattr(be, "clear") else _UNOWNED.clear(sid)
+                        if clear_why == "busy":
+                            with _pending_ops_lock:
+                                _inflight_ops.pop(sid, None)
+                            break
                     elif op[0] == "command":
                         # a typed slash command fires ALONE as its own fresh top-level prompt — folded into a
                         # send batch (or forwarded mid-turn) it reaches the model as text instead of executing
@@ -36139,6 +36219,18 @@ def _apply_pending_ops(now=None):
                             continue                      # a repeat pick replaced the head while turn_seq was read: read it
                         _fire_move(be, sid, op[1], tries, _move_askers.pop(sid, ""))
                         break
+                    if is_clear:
+                        if clear_why:
+                            # the backend's own words, on the chat panes (no socket reaches the drain) with the parked copy's
+                            # id when the op carried one, and on the bell; popped above, never replayed forever
+                            frame = {"type": "warn", "id": sid, "sid": sid, "text": clear_why}
+                            if _op_qid(op):
+                                frame["qid"] = _op_qid(op)
+                            sys.stderr.write("clear for %s refused by %s: %s\n" % (sid, type(be).__name__, clear_why))
+                            _send_to_app("chat", frame)
+                            _sync_notice("%s: %s" % (_name_of(sid) or str(sid)[:8], clear_why), ok=False, kind="refused")
+                        continue                          # a clear opens no turn: the ops behind it — a message typed after
+                        #                                   the /clear — land on the fresh conversation in press order
                     if op[0] in ("command", "compact"):
                         if refused:
                             # the backend refused the handover (a session it no longer holds): no echo for a command the
@@ -58771,7 +58863,7 @@ sdk:"romp's SDK backend, the machinery that actually runs your sessions, hit an 
 sync:"romp moved commits between your machines by itself: a push to a remote, a pull from one, or an ask that a peer fast-forward itself. Successes are logged as well as failures, so this is the record of what romp did to your machines; the network panel shows a sync while it is still running",
 locate:"a click that should have jumped to a message in the chat couldn't find it. Usually the chat is missing part of its history; reload the pane if it keeps happening",
 cleared:"a /clear in a session dropped still-open cards at the boundary; Undo on the feed restores them",
-refused:"a setting that could not be saved, or a state file that could not be read. A change you made (a lane or tab setting, a card bell, a lane order) was not saved because romp could not read or write the file that holds it; nothing changed, the entry carries the reason, and the same change can be tried again. Or one of those files could not be read (the last values are shown until it can), or held bytes romp could not parse and was moved aside, so what it held starts over as defaults. Or a slash command sent to a session that has no such command (a Codex session has no /clear or /compact): nothing was sent, and the entry names it",
+refused:"a setting that could not be saved, or a state file that could not be read. A change you made (a lane or tab setting, a card bell, a lane order) was not saved because romp could not read or write the file that holds it; nothing changed, the entry carries the reason, and the same change can be tried again. Or one of those files could not be read (the last values are shown until it can), or held bytes romp could not parse and was moved aside, so what it held starts over as defaults. Or a slash command sent to a session that has no such command (a Codex session has no /compact): nothing was sent, and the entry names it. Or a /clear a Codex session could not run (the fresh conversation could not be started): the entry carries the reason",
 undelivered:"something you sent never reached a session: the kernel it was addressed to has no session by that id, which on a board showing more than one machine means the pane addressed the wrong one. Nothing was delivered. Your text is kept verbatim in undelivered.jsonl under ~/.local/state/romp"};
 // the toggles ARE the chips (same pill, same colours) — lit = shown, dimmed = muted. Built once on a
 // STABLE container; only classes flip on click, so the buttons stay click-safe.
